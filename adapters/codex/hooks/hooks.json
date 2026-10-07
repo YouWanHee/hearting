@@ -141,6 +141,16 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'for root in \"${AGENT_HOME:-}\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/core/CORE.md\" ] && [ -x \"$root/adapters/codex/hooks/run-hook.sh\" ]; then exec \"$root/adapters/codex/hooks/run-hook.sh\" start-receipt-context.py --codex; fi; done; echo \"agent harness Codex hook launcher not found\" >&2; exit 69'",
+            "timeout": 3
+          }
+        ]
       }
     ]
   }

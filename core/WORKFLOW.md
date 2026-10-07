@@ -108,7 +108,7 @@ deciding that reanalysis is needed.
 | code work under `plans/` | `autopilot-code` | `plans/<date>_<slug>/` |
 | documents | `autopilot-draft` or `autopilot-refine` | `_internal/versions/v{N}/` for major refinement; minor history in `pipeline_summary.md` |
 | experiments | `autopilot-lab` | `_RUNLOG.md` |
-| DB records with `type=profile` | `analyze-user` or `post-it --scope user` | changelog inside the record body |
+| DB records with `type=profile` | `analyze-user` or `mem profile-append` | changelog inside the record body |
 
 This document plus the runtime adapter bootstrap is the routing source of truth. Violation signals include ad-hoc artifact edits, code before its gates, or updating an artifact through a capability that does not own it.
 
@@ -401,8 +401,10 @@ pending; only an elapsed bounded wait is a timeout.
 ### 0.3. Pre-Execution Gate for Long-Running Work
 
 Before starting a long-running command, GPU or checkpoint evaluation, bulk
-figure/media generation, or a full report regeneration, the main session
-answers this gate; it does not enter long-running execution inline without it:
+figure/media generation, or a full report regeneration, compose displays these
+seven answers from the selected route. Unobserved meaning or runtime limits
+remain explicitly unknown; the display is not an approval or a new launch gate.
+The main session resolves any material unknown from the task's existing evidence:
 
 1. What is the semantic primary capability under §0.2?
 2. Does the work create new empirical output?
@@ -488,6 +490,9 @@ for `direct` or `solo` (`quick`). A received peer envelope (the existing
 `(peer-from: …)` trailer or notice path) uses one non-blocking `[경로]` line
 `compose` prints (capability · shape · route id · human gates) plus one clause
 of scope and proceeds in the same turn; a steward cannot approve for the user.
+Compose's notice and receipt name this confirmation method from the current
+turn's existing peer-receive observation. Unknown origin uses the card method;
+the label is observational, with existing approval and routing unchanged.
 `confirmation.small_work` and its sealed value retain their existing route
 metadata meaning, without changing this distinction. The card stays blocking,
 whatever the sealed value, when the work is destructive (data, history, or
@@ -930,7 +935,7 @@ projection mechanics; `CONVENTIONS §3` carries the cross-document invariants.
 [apps]                    autopilot-spec ↻ → autopilot-design → autopilot-code ↻ → autopilot-ship ↻
 ```
 
-`↻` marks an iteration point. Common post-work capabilities are read-only `audit` and Markdown correction through `autopilot-refine`. Cross-project capabilities are `analyze-user` and `post-it --scope user`.
+`↻` marks an iteration point. Common post-work capabilities are read-only `audit` and Markdown correction through `autopilot-refine`. Cross-project profile updates go through `analyze-user` and `mem profile-append`.
 
 ## 1.1. Pipeline Intensity Routing
 

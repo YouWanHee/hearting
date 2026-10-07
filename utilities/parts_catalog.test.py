@@ -144,6 +144,19 @@ def _historical_gpu_card(route, card, case):
         case.assertEqual(typed_gpu_nodes, ["eval-run"])
         case.assertEqual(lines.count(GPU_EVAL_ADVISORY), 1)
         lines.remove(GPU_EVAL_ADVISORY)
+    # The later confirmation display is independent of the pre-catalog graph.
+    confirmation = [i for i, line in enumerate(lines) if line.startswith("  확인 방식 ")]
+    if confirmation:
+        case.assertEqual(len(confirmation), 1)
+        start = confirmation[0]
+        prefixes = ("  확인 방식 ", "  1. 주 capability: ", "  2. 새 실측: ",
+                    "  3. standard+: ", "  4. 분리 단계: ", "  5. inline 예외: ",
+                    "  6. 위임 표면: ", "  7. lineage·RUNLOG: ")
+        block = lines[start:start + len(prefixes)]
+        case.assertEqual(len(block), len(prefixes))
+        for line, prefix in zip(block, prefixes):
+            case.assertTrue(line.startswith(prefix), line)
+        del lines[start:start + len(prefixes)]
     return "\n".join(lines)
 
 

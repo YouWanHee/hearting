@@ -58,6 +58,7 @@ shared-utility-deferred	spec_merge.py
 shared-utility-deferred	transcript_turn.py
 shared-utility-deferred	verification-background-lease.py
 shared-utility-deferred	work_start.py
+shared-utility-deferred	start_receipt.py
 utility-deferred	artifact-root.test.sh
 utility-deferred	artifact-sink.sh
 utility-deferred	artifact-sink.test.sh

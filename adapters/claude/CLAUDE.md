@@ -56,11 +56,11 @@ The runtime prepares the cycle, picks each leg's harness from live usage within
 the sealed candidates, starts frames and the owner, reuses exact attempts, and
 closes the route and cycle at success or once idle.
 
-Follow the receipt. `parent_next=end-turn`: a runtime carrier owns the attempt;
-end the turn with no wait, poll or recap. `parent_next=bounded-wait`: run
-`parent_next_command` once. An absent directive is not `end-turn`, so never
-filter the command's stdout. After a wake or a correction, run
-`resume_command`; answer a BLOCKED owner with `correction_command
+Follow the receipt. `parent_next=end-turn`: end with no wait, poll or recap;
+a runtime carrier owns it. `parent_next=bounded-wait`: run `parent_next_command`
+once. Start saves `receipt_file`; read it if hooks omit `parent_next`.
+No directive is not `end-turn`; never filter stdout.
+After wake/correction, run `resume_command`; answer a BLOCKED owner with `correction_command
 --message-file <file>`. At `needs-question`, compare the two frame briefs and
 follow the receipt's `next_step`: `resume_command --interview <file>` registers
 the question, the person answers it once in the native question surface, and

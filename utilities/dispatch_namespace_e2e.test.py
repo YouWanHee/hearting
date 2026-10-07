@@ -188,7 +188,8 @@ def load(rel, name):
     return module
 
 dispatch_contract = load("utilities/dispatch_contract.py", "pidns_dispatch_contract")
-fleet_model = load("tools/fleet/model.py", "pidns_fleet_model")
+from fleet import model as fleet_model
+sys.modules["pidns_fleet_model"] = fleet_model
 
 now = time.time()
 base_identity = {"attempt_id": "att-x", "route_id": "rt-x", "route_node": "plan"}
@@ -277,7 +278,8 @@ def load(rel, name):
     return module
 
 dispatch_contract = load("utilities/dispatch_contract.py", "pidns_live_dispatch_contract")
-fleet_model = load("tools/fleet/model.py", "pidns_live_fleet_model")
+from fleet import model as fleet_model
+sys.modules["pidns_live_fleet_model"] = fleet_model
 observer_ns = dispatch_contract.process_namespace_identity()
 scan = dispatch_contract.attempt_tagged_descendants({
     "attempt_id": attempt_id,

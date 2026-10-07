@@ -4262,6 +4262,24 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
                         summary_ts=getattr(job, "summary_ts", None))
 
 
+def _resource_child_rows(job, term_width=None, depth=1, in_card=False):
+    """Observed resource children, never log-parsed progress or model dispatch rows."""
+    rows = []
+    shown_depth = min(depth, 1) if in_card else depth
+    indent = _SUBAGENT_IND + "  " * max(0, shown_depth)
+    width = (_dispatch_box_width(term_width) - 1 if in_card else term_width) if term_width else None
+    for child in getattr(job, "resource_children", ()):
+        if not _SHOW_ALL and child.liveness != "working":
+            continue
+        glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
+        node = child.route_node or child.node or child.run_id
+        tail = "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min))
+        budget = max(1, width - _dw(indent + glyph + " resource " + tail)) if width else 44
+        rows.append([(indent, None), (glyph, key), (" resource ", "dim"),
+                     (_clip_w(str(node), budget), "name_dim"), (tail, "dim")])
+    return rows
+
+
 # F-100b (user 2026-09-03) — the context row's lead cell is the WHERE word, not the state
 # word. F-55's `working`/`idle` word duplicated the harness row's glyph (same state, same
 # color, one line apart), so it is retired; the L1 glyph is the one status indicator. The
@@ -4387,6 +4405,9 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     context = getattr(entity, "context", None)
     pct = getattr(context, "used_pct", None) if context is not None else getattr(entity, "ctx_pct", None)
     now_text = getattr(entity, "summary", None)
+    resource_wait = getattr(entity, "resource_wait", None)
+    if resource_wait:
+        now_text = "%s · resource-parked" % ",".join(resource_wait["nodes"])
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
     indent = " " * max(0, int(indent_width))
@@ -4429,8 +4450,12 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             # F-63: same reserved-width age tag as the dispatch subtitle row — the
             # tag survives clipping; only when the zone cannot hold tag + any text
             # does it drop and the bare NOW clip behaves exactly as before.
-            tag = _summary_age_tag(getattr(entity, "summary_ts", None))
+            tag = None if resource_wait else _summary_age_tag(getattr(entity, "summary_ts", None))
             text_room = now_room - _dw(sep)
+            if resource_wait and text_room < _dw(now_text):
+                # The declared node already rides the breadcrumb and child row.
+                # Preserve the complete current wait state before repeating that node.
+                now_text = resource_wait["state"]
             tag_w = (_dw(tag) + 1) if tag else 0
             if tag and text_room > tag_w:
                 clipped = _clip_w(str(now_text), text_room - tag_w)
@@ -4650,10 +4675,78 @@ def _gpu_model_key(model, active=False):
     return key + "_active" if active else key
 
 
-def _gpu_display_command(command):
-    """Shorten the first command token only; retain the argument text verbatim."""
-    return re.sub(r"^(\s*)(\S+)",
-                  lambda match: match[1] + os.path.basename(match[2]), command, count=1)
+def _gpu_command_words(command):
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _gpu_path_argument(word):
+    """Display-only path value; exclude URLs, ratios and expression-shaped text."""
+    prefix, separator, value = word.partition("=")
+    if not separator:
+        prefix, value = "", word
+    if ("/" not in value or "://" in value
+            or re.fullmatch(r"\d+/\d+", value)
+            or any(char in value for char in "(){};|")):
+        return None
+    return prefix + separator, value
+
+
+def _gpu_path_collisions(commands):
+    paths = {}
+    for command in commands:
+        for word in _gpu_command_words(command)[1:]:
+            argument = _gpu_path_argument(word)
+            if argument:
+                value = argument[1].rstrip("/")
+                paths.setdefault(os.path.basename(value), set()).add(value)
+    return {name for name, values in paths.items() if len(values) > 1}
+
+
+def _gpu_display_command(command, ambiguous=()):
+    """Compact argv paths for the terminal only; structured command stays raw."""
+    words = _gpu_command_words(command)
+    if not words:
+        return ""
+    collisions = set(ambiguous) | _gpu_path_collisions([command])
+    words[0] = os.path.basename(words[0]) or words[0]
+    for index, word in enumerate(words[1:], 1):
+        argument = _gpu_path_argument(word)
+        if argument:
+            prefix, value = argument
+            path = value.rstrip("/")
+            name = os.path.basename(path)
+            if name in collisions:
+                parent = os.path.basename(os.path.dirname(path))
+                name = parent + "/" + name if parent else name
+            words[index] = prefix + (name or value)
+    return shlex.join(words)
+
+
+def _gpu_clip_command(command, width):
+    """Cell-bounded middle ellipsis keeps the script prefix and final argv."""
+    if _dw(command) <= width:
+        return command
+    if width <= 1:
+        return "…" if width > 0 else ""
+    room = width - 1
+    head_width = (room + 1) // 2
+    words = _gpu_command_words(command)
+    for index, word in enumerate(words[1:], 1):
+        if word.endswith((".py", ".sh")) and not word.startswith("-"):
+            script_width = _dw(shlex.join(words[:index + 1]))
+            if index == len(words) - 1:
+                # When only interpreter + script remain, the complete filename
+                # matters more than the interpreter's last few characters.
+                head_width = min(head_width, max(0, room - _dw(shlex.quote(word))))
+            else:
+                head_width = max(head_width, min(script_width, room - room // 3))
+            break
+    head = _clip_w(command, head_width, ellipsis="")
+    tail = _clip_w(command[::-1], room - _dw(head), ellipsis="")[::-1]
+    return head + "…" + tail
 
 
 def _gpu_process_rows(gpu, indent, width):
@@ -4666,227 +4759,19 @@ def _gpu_process_rows(gpu, indent, width):
         if isinstance(process.get("used_memory_mib"), (int, float)) else 0,
         process.get("pid") if isinstance(process.get("pid"), int) else 2**63,
     ))
+    ambiguous = _gpu_path_collisions(
+        _gpu_safe_text(process.get("command")) for process in processes)
     for process in processes:
-        command = _gpu_display_command(_gpu_safe_text(process.get("command")))
+        command = _gpu_display_command(_gpu_safe_text(process.get("command")), ambiguous)
         if not command:
             command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
-        row = [(indent + "    ", None), ("↳ ", "dim"), (command, "dim")]
+        prefix = [(indent + "    ", None), ("↳ ", "dim")]
+        # Curses' _addline reserves the rightmost cell; do not let its final
+        # clipping remove the suffix we deliberately kept here.
+        room = max(0, width - 1 - sum(_dw(text) for text, _key in prefix))
+        row = prefix + [(_gpu_clip_command(command, room), "dim")]
         rows.append(_clip_segs(row, width)[0])
-        progress = _gpu_progress_row(process, indent, width)
-        if progress:
-            rows.append(progress)
     return rows
-
-
-# A tqdm-shaped line (`desc: NN%|bar| n/total [elapsed<left, rate, k=v]`, metrics may also
-# follow the bracket) is compacted by shape alone; any other line is shown clipped as is.
-_PROGRESS_TQDM_RE = re.compile(
-    r"^(?P<desc>.*?)\s*(?P<pct>\d{1,3}(?:\.\d+)?)%\s*\|[^|]*\|\s*"
-    r"(?P<count>[\d.]+[kMGTPE]?/[\d.]+[kMGTPE]?)(?P<rest>.*)$")
-_PROGRESS_LEFT_RE = re.compile(r"\s*\[[^<\]]*<\s*(?P<left>\d[\d:]*)")
-_PROGRESS_METRIC_RE = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*=[^\s,;\[\]]+")
-_PROGRESS_LEADING_STATE_RE = re.compile(r"^(?P<state>waiting:|ERROR:|error:)(?:\s*)(?P<detail>.*)$")
-_PROGRESS_STALLED_S = 300
-_PROGRESS_BODY_CACHE = {}   # {(pid, line): immutable compact segments}; bounded below
-
-
-def _progress_fields_segments(phase, percent, count, left=None, metrics=()):
-    """One body grammar for observed tqdm fields and verified structured facts."""
-    if phase == "training-updates":
-        phase = "TRAIN"
-    parts = []
-    fields = [(phase, "resource_active") if phase else None,
-              ("%.0f%%" % percent, "lvl_g"), (count, "dim")]
-    for field in fields:
-        if field is not None:
-            if parts:
-                parts.append((" ", "dim"))
-            parts.append(field)
-    if left:
-        parts.extend(((" · ", "dim"), (left + " left", "dim")))
-    for index, (label, value) in enumerate(metrics):
-        value = str(value)
-        # Format loss presentation, leaving model names and non-loss metrics intact.
-        if label.lower() == "loss" or label.startswith("L_"):
-            try:
-                number = float(value)
-                if math.isfinite(number):
-                    value = "%.2e" % number
-            except (ValueError, OverflowError):
-                pass
-        parts.extend(((" · " if index == 0 else " ", "dim"),
-                      (label + "=", "dim"), (value, "resource_active")))
-    return tuple(parts)
-
-
-def _progress_body_segments(line):
-    match = _PROGRESS_TQDM_RE.match(line)
-    if not match:
-        state = _PROGRESS_LEADING_STATE_RE.match(line)
-        if state:
-            key = "lvl_y" if state.group("state") == "waiting:" else "lvl_r"
-            parts = [(state.group("state"), key)]
-            if state.group("detail"):
-                parts.extend([(" ", "dim"), (state.group("detail"), "dim")])
-            return tuple(parts)
-        return ((line, "dim"),)
-    desc = match.group("desc").strip().rstrip(":").strip()[:24]
-    rest = match.group("rest")
-    left = _PROGRESS_LEFT_RE.match(rest)
-    metrics = [metric.split("=", 1) for metric in _PROGRESS_METRIC_RE.findall(rest)[:2]]
-    return _progress_fields_segments(desc, float(match.group("pct")), match.group("count"),
-                                     left.group("left") if left else None, metrics)
-
-
-def _progress_body(line):
-    """The historical compact plain-text form of one training line."""
-    return "".join(text for text, _key in _progress_body_segments(line))
-
-
-_PROGRESS_EPOCH_RE = re.compile(r"\d{1,7}(?:\.\d{1,4})?\Z")
-
-
-def _progress_epoch(epoch):
-    """`Epoch 3/200`, or `Epoch 2 done` once an epoch's finishing lines were seen; else None."""
-    if not isinstance(epoch, dict):
-        return None
-    number = epoch.get("n")
-    if not isinstance(number, str) or not _PROGRESS_EPOCH_RE.match(number):
-        return None
-    text = "Epoch " + number
-    total = epoch.get("of")
-    if isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7:
-        text += "/%d" % total
-    return text + " done" if epoch.get("done") is True else text
-
-
-def _progress_epoch_segments(epoch):
-    text = _progress_epoch(epoch)
-    if text is None:
-        return ()
-    total = epoch.get("of")
-    if not (isinstance(total, int) and not isinstance(total, bool) and 0 < total < 10**7):
-        total = None
-    return _progress_epoch_fields(epoch["n"], total, epoch.get("done") is True)
-
-
-def _progress_epoch_fields(number, total=None, done=False):
-    parts = [("Epoch ", "dim"), (str(number), "resource_active")]
-    if total is not None:
-        parts.extend((("/", "dim"), (str(total), "dim")))
-    if done:
-        parts.extend(((" ", "dim"), ("done", "lvl_g")))
-    return tuple(parts)
-
-
-def _progress_age(age_s):
-    # Only a stall is worth a suffix: a live run rewrites its log every few seconds,
-    # so a fresh age read "0s ago" on every frame and said nothing.
-    if not isinstance(age_s, (int, float)) or isinstance(age_s, bool) \
-            or not math.isfinite(age_s) or age_s < 0:
-        return None, None
-    age_s = int(age_s)
-    if age_s > _PROGRESS_STALLED_S:
-        minutes = age_s // 60
-        return ("stalled %dm" % minutes if minutes < 120
-                else "stalled %dh" % (minutes // 60)), "lvl_y"
-    return None, None
-
-
-def _clip_progress_segments(segs, width):
-    """Clip role segments to the same text, including ellipsis, as the old plain row."""
-    if sum(_dw(text) for text, _key in segs) <= width:
-        return list(segs)
-    room = max(0, width - 1)  # reserve the historical one-cell ellipsis
-    out = []
-    used = 0
-    for text, key in segs:
-        if used >= room:
-            break
-        piece = _clip_w(text, room - used, ellipsis="")
-        if piece:
-            out.append((piece, key))
-            used += _dw(piece)
-        if _dw(piece) < _dw(text):
-            break
-    if width > 0:
-        out.append(("…", "dim"))
-    return out
-
-
-def _structured_progress_segments(training):
-    """Project only display facts; the full training observation stays unchanged."""
-    if not isinstance(training, dict):
-        return None
-    attempt, total, successful, skipped = (training.get(key) for key in
-        ("attempt", "attempt_total", "successful", "skipped"))
-    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
-               for value in (attempt, total, successful, skipped)) \
-            or total <= 0 or attempt > total or attempt != successful + skipped:
-        return None
-    count, denominator = attempt, total
-    epoch = training.get("schedule_epoch")
-    epoch_segs = []
-    if isinstance(epoch, dict):
-        current, epochs, span = (epoch.get(key) for key in
-                                 ("current", "total", "attempts_per_epoch"))
-        if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
-               for value in (current, epochs, span)) and epochs > 0 and span > 0 \
-                and epochs * span == total and current == (attempt + span - 1) // span:
-            epoch_segs = _progress_epoch_fields(current, epochs)
-            # At a boundary, show the interval just completed, not the next zero.
-            count = (attempt - 1) % span + 1 if attempt else 0
-            denominator = span
-    metrics = []
-    loss = training.get("loss")
-    if isinstance(loss, (int, float)) and not isinstance(loss, bool) and math.isfinite(loss):
-        metrics = [("loss", loss)]
-    phase = _gpu_safe_text(training.get("phase")).strip()[:24]
-    body = _progress_fields_segments(phase, count * 100.0 / denominator,
-                                     "%d/%d" % (count, denominator), metrics=metrics)
-    return body, epoch_segs
-
-
-def _gpu_progress_row(process, indent, width):
-    """One compact, role-colored line from the process snapshot, or None."""
-    progress = process.get("progress")
-    if not isinstance(progress, dict):
-        return None
-    structured = _structured_progress_segments(progress.get("training"))
-    if structured is not None:
-        body, epoch = structured
-        age = progress["training"].get("progress_age_s")
-    else:
-        summary = _gpu_safe_text(progress.get("summary")).strip()
-        line = summary or _gpu_safe_text(progress.get("line")).strip()
-        if not line:
-            return None
-        key = (process.get("pid"), line)
-        body = _PROGRESS_BODY_CACHE.get(key)
-        if body is None:
-            if len(_PROGRESS_BODY_CACHE) >= 256:
-                _PROGRESS_BODY_CACHE.clear()
-            body = _PROGRESS_BODY_CACHE[key] = _progress_body_segments(line)
-        epoch = () if summary else _progress_epoch_segments(progress.get("epoch"))
-        age = progress.get("age_s")
-    return _render_progress_row(body, epoch, age, indent, width)
-
-
-def _render_progress_row(body, epoch, age, indent, width):
-    """Shared row layout, color roles, age reservation and clipping in both views."""
-    body = list(body)
-    if epoch:
-        body = list(epoch) + [(" · ", "dim")] + body
-    prefix = [(indent + "      ", None), ("↳ ", "dim")]
-    age_text, age_key = _progress_age(age)
-    suffix = [(" · ", "dim"), (age_text, age_key)] if age_text else []
-    # The age is the stall signal, so the body yields width before it does.
-    room = width - sum(_dw(text) for text, _key in prefix + suffix)
-    if room >= 2:
-        segs = prefix + _clip_progress_segments(body, room) + suffix
-    else:
-        segs = prefix + ([(age_text, age_key)] if age_text else body)
-    return _clip_segs(segs, width)[0]
 
 
 def _fresh_compute_hosts():
@@ -4961,23 +4846,59 @@ def _gpu_session_resources(snapshot=None):
     }
 
 
-def _gpu_resources_for_session(session, resource_index):
+def _gpu_session_keys(session):
     harness = getattr(session, "harness", None)
     session_id = (getattr(session, "session_id", None)
                   or getattr(session, "_runtime_session_id", None))
     if harness not in {"claude", "codex", "opencode"} or not session_id:
         return []
-    return list(resource_index.get((harness, session_id), ()))
+    ids = [session_id] + list(getattr(session, "session_aliases", None) or ())
+    ids += list(getattr(session, "_gpu_session_aliases", None) or ())
+    return [(harness, sid) for sid in dict.fromkeys(ids) if isinstance(sid, str) and sid]
+
+
+def _gpu_resources_for_session(session, resource_index):
+    resources = {}
+    for session_key in _gpu_session_keys(session):
+        for source in resource_index.get(session_key, ()):
+            key = (source["host"], source["index"])
+            if key not in resources:
+                resources[key] = {**source, "processes": list(source.get("processes") or ())}
+                continue
+            resource = resources[key]
+            resource["process_count"] += source["process_count"]
+            resource["used_memory_mib"] += source["used_memory_mib"]
+            resource["has_memory"] |= source["has_memory"]
+            resource["processes"].extend(source.get("processes") or ())
+    return [resources[key] for key in sorted(resources)]
 
 
 def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
-    """Exact-session GPU resources with claim-backed process names in place."""
+    """One compact GPU line; optional telemetry and names yield before identities."""
     if not resources:
         return []
     indent = _conn_indent(depth, in_card)
-    width = max(20, int(term_width or 200))
+    width = max(20, int(term_width or 200)) - 1
 
-    def build(shown, show_model, show_memory):
+    labels = {}
+    for resource in resources:
+        names = []
+        seen = set()
+        for process in resource.get("processes") or ():
+            exact = (process["pid"], process["proc_start"])
+            if exact in seen:
+                continue
+            seen.add(exact)
+            command = process["command"]
+            name = _gpu_process_label(command)
+            if name == command:
+                name = _gpu_display_command(command)
+            if name not in names:
+                names.append(name)
+        labels[id(resource)] = ", ".join(names)
+
+    def build(shown, show_model=False, show_memory=False, show_time=False,
+              show_tag=False, name_width=None, remaining=0):
         segs = [(indent, None)]
         for position, resource in enumerate(shown):
             if position:
@@ -4985,18 +4906,11 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
             identity = "GPU %s:%s" % (resource["host"], resource["index"])
             pulse_key = "g_work" if _BLINK_ON else "g_work_off"
             segs += [("●", pulse_key), (" ", None), (identity, "name_dim")]
-            labels = []
-            seen = set()
-            for process in resource.get("processes") or ():
-                exact = (process["pid"], process["proc_start"])
-                if exact in seen:
-                    continue
-                seen.add(exact)
-                label = _gpu_process_label(process["command"])
-                if label not in labels:
-                    labels.append(label)
-            if labels:
-                segs += [(" (", "dim"), (", ".join(labels), "name_dim"), (")", "dim")]
+            label = labels[id(resource)]
+            if name_width is not None:
+                label = (_gpu_clip_command(label, name_width) if name_width > 0 else "")
+            if label:
+                segs += [(" (", "dim"), (label, "name_dim"), (")", "dim")]
             if show_model and resource.get("model"):
                 model = _gpu_display_model(resource["model"])
                 segs += [(" · ", "dim"),
@@ -5004,28 +4918,66 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
             if show_memory and resource.get("has_memory"):
                 segs += [(" · " + _gpu_gib(resource.get("used_memory_mib", 0))
                           + " GB", "dim")]
+            elapsed = resource.get("elapsed_s")
+            if show_time and isinstance(elapsed, int) and not isinstance(elapsed, bool):
+                segs += [(" · " + fmt_min(elapsed // 60), "dim")]
+            if show_tag and resource.get("owner_label"):
+                segs += [(" · ", "dim"), (resource["owner_label"], "lvl_y")]
+        if remaining:
+            segs += [(" · +%d GPU" % remaining, "dim")]
         return segs
 
-    def fit(shown):
-        return _fit_strip([lambda: build(shown, True, True),
-                           lambda: build(shown, False, True),
-                           lambda: build(shown, False, False)], width)
+    for model, memory, elapsed, tag in ((True, True, True, True),
+                                       (False, True, True, False),
+                                       (False, False, False, False)):
+        segs = build(resources, model, memory, elapsed, tag)
+        if sum(_dw(text) for text, _key in segs) <= width:
+            return [segs]
+    shown = list(resources)
+    while len(shown) > 1 and sum(_dw(text) for text, _key in
+            build(shown, name_width=0, remaining=len(resources) - len(shown))) > width:
+        shown.pop()
+    remaining = len(resources) - len(shown)
+    bare = build(shown, name_width=0, remaining=remaining)
+    named = sum(bool(labels[id(resource)]) for resource in shown)
+    room = width - sum(_dw(text) for text, _key in bare)
+    name_width = max(0, room // max(1, named) - 3)
+    return [_clip_segs(build(shown, name_width=name_width, remaining=remaining), width)[0]]
 
-    # Keep the usual compact strip when every GPU's name fits. At narrow
-    # widths, split GPUs so the next one's label is not lost to clipping.
-    if sum(_dw(text) for text, _key in build(resources, False, False)) <= width:
-        return [fit(resources)]
-    return [fit([resource]) for resource in resources]
+
+def _gpu_work_strip(entries, term_width=None):
+    """F-104 processes retain their raw JSON, but share one card GPU line."""
+    grouped = {}
+    for entry in entries:
+        key = (entry["host"], tuple(entry["gpu_indexes"]))
+        resource = grouped.setdefault(key, {
+            "host": entry["host"], "index": ",".join(map(str, entry["gpu_indexes"])),
+            "model": _gpu_safe_text(entry.get("gpu_name")).replace("NVIDIA ", ""),
+            "processes": [], "used_memory_mib": 0, "has_memory": False,
+            "elapsed_s": None, "owner_label": entry.get("owner_label") or "미등록",
+        })
+        resource["processes"].append({
+            "pid": entry["pid"], "proc_start": entry.get("proc_start"),
+            "command": entry.get("command") or entry.get("process_name") or "process",
+        })
+        if entry.get("used_memory_mib") is not None:
+            resource["used_memory_mib"] += entry["used_memory_mib"]
+            resource["has_memory"] = True
+        if entry.get("elapsed_s") is not None:
+            resource["elapsed_s"] = max(resource["elapsed_s"] or 0, entry["elapsed_s"])
+    return _gpu_resource_strip([grouped[key] for key in sorted(grouped)], term_width)
 
 
 def _gpu_work_row(entry, term_width=None):
     """F-104 card row for a live GPU process no run registry or session line shows."""
     indent = _conn_indent(0, False)
-    width = max(20, int(term_width or 200))
+    width = max(20, int(term_width or 200)) - 1
     command = _gpu_safe_text(entry.get("command"))
+    command_label = False
     if command:
         name = _gpu_process_label(command)
         if name == command:
+            command_label = True
             name = _gpu_display_command(command)
     else:
         name = os.path.basename(_gpu_safe_text(entry.get("process_name"))) or "process"
@@ -5046,17 +4998,17 @@ def _gpu_work_row(entry, term_width=None):
             segs += [(" · ", "dim"), (tag, "lvl_y")]
         return segs
 
-    # The name earns whatever the barest variant leaves: optional time/tag
-    # yield first through the existing levels, so a long argv tail is cut
-    # only by the real terminal width (with an ellipsis mark), never by a
-    # fixed clamp. Labels that already fit stay byte-identical.
+    # Optional time/tag yield first. A command then loses its middle instead
+    # of its script suffix; identifier-based labels keep their existing clip.
     for show_time, show_tag in ((True, True), (True, False), (False, False)):
         segs = build(show_time, show_tag)
         if sum(_dw(text) for text, _key in segs) <= width:
             return segs
     bare = build(False, False, "")
     room = width - sum(_dw(text) for text, _key in bare)
-    return _clip_segs(build(False, False, _clip_w(name, max(1, room))), width)[0]
+    label = (_gpu_clip_command(name, max(1, room)) if command_label
+             else _clip_w(name, max(1, room)))
+    return _clip_segs(build(False, False, label), width)[0]
 
 
 def _gpu_process_label(command):
@@ -5280,7 +5232,7 @@ def _gpu_token(gpu, available, show_name=False, sessions=None, index_width=1,
 
 
 def _compute_host_rows(term_width=None, sessions=None, resources=None):
-    snapshot = _compute_hosts.with_training_progress(_COMPUTE_HOSTS, resources)
+    snapshot = _COMPUTE_HOSTS
     if not isinstance(snapshot, dict):
         return []
     width = max(20, int(term_width or 200))
@@ -5703,7 +5655,7 @@ def _subagents_for_job(session_by_identity, job):
     return getattr(session, "subagents", None) if session is not None else None
 
 
-def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
+def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, resource_owners=()):
     """One F-30 card. Returns (out_lines, meta) — meta = {"card_key", "fold_line" (index into
     out_lines of the header row), "job_rows": [(index_into_out_lines, DispatchJob), ...]}. The
     caller (`_build_process_lines`) owns translating these to ABSOLUTE line indices for
@@ -5756,6 +5708,13 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
         out.append([("    ", None)] + l2_line)
 
     job_rows = []
+    # A parked owner has no live model stage job. Keep its exact resource edge
+    # visible in process view too, anchored to the owner rather than the route title.
+    for owner in resource_owners:
+        out.append(_route_job_row(owner, max_width=term_width))
+        job_rows.append((len(out) - 1, owner))
+        out.extend(_dispatch_summary_detail_row(owner, term_width=term_width))
+        out.extend(_resource_child_rows(owner, term_width=term_width))
     # route._record_view already preserves sealed record order within each
     # topological level; never sort opaque node ids here.
     active_nodes = [n for n in nodes if n["state"] == "active" and n.get("job") is not None]
@@ -5777,6 +5736,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
                          if session else [])
         if resources:
             out.extend(_gpu_resource_strip(resources, term_width=term_width))
+        out.extend(_resource_child_rows(job, term_width=term_width))
 
     if _SHOW_ALL:
         # prd.md:310 — completion gates stay behind the `a` toggle, never on the base screen.
@@ -5872,6 +5832,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
                      if session else [])
     if resources:
         out.extend(_gpu_resource_strip(resources, term_width=term_width))
+    out.extend(_resource_child_rows(job, term_width=term_width))
     return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
 
 
@@ -5976,7 +5937,13 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         first = False
         base = len(lines)
         card_lines, meta = _route_card(
-            view, session_by_identity, term_width, now, gpu_resources=gpu_resources)
+            view, session_by_identity, term_width, now, gpu_resources=gpu_resources,
+            resource_owners=[j for j in jobs
+                             if getattr(getattr(j, "work_projection", None), "route_id", None)
+                             == view.get("route_id")
+                             and getattr(j, "worker_type", None) == "owner"
+                             and any(r.liveness == "working" or _SHOW_ALL
+                                     for r in getattr(j, "resource_children", ()))])
         lines.extend(card_lines)
         _FOLDABLE.append({"line": base + meta["fold_line"], "card_key": meta["card_key"],
                           "folded": meta["folded"]})
@@ -6417,7 +6384,7 @@ def _gpu_strip_keys(shown, gpu_resources, drawn_jobs=(), session_by_identity=Non
         if getattr(s, "mem_worker", False):
             continue  # a mem row is drawn by _mem_row alone, without a GPU strip
         if _gpu_resources_for_session(s, gpu_resources):
-            keys.add((s.harness, s.session_id or getattr(s, "_runtime_session_id", None)))
+            keys.update(key for key in _gpu_session_keys(s) if gpu_resources.get(key))
     for job in drawn_jobs:
         owner = job if _gpu_resources_for_session(job, gpu_resources) else None
         if owner is None and session_by_identity:
@@ -6425,9 +6392,7 @@ def _gpu_strip_keys(shown, gpu_resources, drawn_jobs=(), session_by_identity=Non
             if job_session is not None and _gpu_resources_for_session(job_session, gpu_resources):
                 owner = job_session
         if owner is not None:
-            keys.add((owner.harness,
-                      getattr(owner, "session_id", None)
-                      or getattr(owner, "_runtime_session_id", None)))
+            keys.update(key for key in _gpu_session_keys(owner) if gpu_resources.get(key))
     return keys
 
 
@@ -6511,7 +6476,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         try:
             from .projection import attach_projections
             attach_projections(sessions, jobs, node_evidence=_node_evidence, now=time.time(),
-                               degradations=_degradations)
+                               degradations=_degradations, resources=resources)
         except Exception:
             pass
     # A completed route can have no live entity at all.  Keep an ephemeral projection
@@ -6905,7 +6870,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             if depth == 1 or detached_root:
                 unit_working = (job.liveness == "working"
                                 or any(s2.liveness == "working"
-                                       for s2 in job_children.get(job.slug, [])))
+                                       for s2 in job_children.get(job.slug, []))
+                                or any(r.liveness == "working"
+                                       for r in getattr(job, "resource_children", ())))
             # F-27: a job row is a target only with an exact pid to verify (prd.md:253).
             if job.pid:
                 _SELECTABLE.append(_select_entry_job(job, len(lines)))
@@ -6967,6 +6934,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             # NOW line, its own sub-agent strip). Descendants start here, so this index
             # is where the header divider goes once the frame is drawn.
             header_end = len(lines)
+            resource_rows = _resource_child_rows(
+                job, term_width=term_width, depth=depth, in_card=in_card)
+            lines.extend(resource_rows)
             # The map contains depth-2 workers keyed by their depth-1 owner's
             # slug. A worker can reuse that slug (or another owner's), so looking
             # it up from a leaf would revisit itself or a sibling tree forever.
@@ -7045,7 +7015,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 # route_label`, which drew a divider for a childless multi-node route
                 # too). Inserted/appended AFTER framing so neither rail row is itself
                 # passed through `_frame_dispatch_line` (frame members, not content rows).
-                has_children = bool(job_children.get(job.slug))
+                has_children = bool(job_children.get(job.slug) or resource_rows)
                 if has_children:
                     divider_label = (route_label or []) + campaign_segs if campaign_segs else route_label
                     lines.insert(header_end,
@@ -7197,8 +7167,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             _emit_dispatch_tree(gj, orphan=False)
 
         # F-104: live GPU work that no registry run or session GPU strip shows.
-        for entry in emission["gpu"]:
-            lines.append(_gpu_work_row(entry, term_width))
+        lines.extend(_gpu_work_strip(emission["gpu"], term_width))
 
         # F-19 repo rows (사용자 확정 2026-07-16): this card's own today-mem events, below a
         # subtle in-band divider — entirely silent when the repo has none (healthy-silent,

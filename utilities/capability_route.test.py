@@ -7203,6 +7203,43 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual([n["id"] for n in route["nodes"]],["eval-run","metrics","report"])
   with self.assertRaisesRegex(ValueError,r"compose-mode-unknown:nosuch \(modes: eval,setup\)"):
    self.compose(capability="autopilot-lab",capability_mode="nosuch")
+ def test_compose_observation_keeps_peer_and_unknown_confirmation_distinct_without_resealing(self):
+  import types
+  route=self.compose(shape="direct",graph=None)
+  before=json.dumps(route,sort_keys=True)
+  caller=types.SimpleNamespace(known=True,harness="codex",session_id="this-turn")
+  with mock.patch("session_identity.identity",return_value=caller):
+   for origin,expected in (("peer:verifier·ref","peer-notice"),("unattributed","user-card")):
+    with self.subTest(origin=origin), mock.patch.object(R,"_turn_peer_source",return_value=origin):
+     observed=R.compose_observations(route)
+     self.assertEqual(observed["confirmation"]["method"],expected)
+     self.assertIn("확인 방식 "+expected,R.compose_card(route))
+  self.assertEqual(json.dumps(route,sort_keys=True),before)
+  R.verify_route(route)
+ def test_seven_answers_show_route_facts_and_keep_unobserved_limits_unknown(self):
+  direct=self.compose(shape="direct",graph=None)
+  answers=R.compose_observations(direct)["pre_execution_answers"]
+  self.assertEqual([a["question"] for a in answers],list(range(1,8)))
+  self.assertEqual(answers[0]["answer"],"autopilot-code")
+  self.assertEqual(answers[2]["answer"],"아니오")
+  self.assertEqual(answers[4]["answer"],"atomic-direct")
+  self.assertIn("native 미확인",answers[5]["answer"])
+  self.assertIn("미확인",answers[6]["answer"])
+  for answer in answers:
+   self.assertIn(str(answer["question"])+". "+answer["name"]+": ",R.compose_card(direct))
+ def test_lab_and_staged_answers_follow_declared_nodes(self):
+  route=self.compose(capability="autopilot-lab",capability_mode="eval",graph="eval-run,metrics,report")
+  answers=R.compose_observations(route)["pre_execution_answers"]
+  self.assertEqual(answers[1]["answer"],"예 (lab 실행 선언됨)")
+  self.assertEqual(answers[2]["answer"],"예")
+  self.assertEqual(answers[3]["answer"],"3개 선언됨")
+  self.assertEqual(answers[4]["answer"],"해당 없음")
+ def test_peer_ship_full_execution_keeps_card_method(self):
+  import types
+  route=self.compose(shape="direct",graph=None,capability="autopilot-ship",capability_mode="default")
+  with mock.patch("session_identity.identity",return_value=types.SimpleNamespace(known=True,harness="codex",session_id="s")), \
+       mock.patch.object(R,"_turn_peer_source",return_value="peer:source·ref"):
+   self.assertEqual(R.compose_observations(route)["confirmation"]["method"],"user-card")
  def test_compose_names_its_slug_from_the_task(self):
   self.assertEqual(R.compose_default_slug("# Fix the streaming window sim for r5 today\nmore"),"fix-the-streaming-window-sim-for")
   self.assertEqual(R.compose_default_slug("표면 정리\nPR #197 검증 요청"),"pr-197")
@@ -7299,6 +7336,7 @@ class ComposeRouteTest(TestRoute):
      route=self.compose(capability="autopilot-lab",capability_mode="eval",graph=graph,intensity=intensity,work_request=request)
      self.assertEqual(route["capability"],"autopilot-lab")
      self.assertEqual(route["capability_mode"],"eval")
+     self.assertIn("미확인",R.compose_observations(route)["pre_execution_answers"][1]["answer"])
      self.assertEqual(route["effective_intensity"],intensity)
      expected=graph.split(",")
      if intensity=="strong": expected.insert(expected.index("publish"),"independent-verify-alternative")

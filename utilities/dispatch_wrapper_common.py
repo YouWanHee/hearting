@@ -15,6 +15,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -26,7 +27,8 @@ from pathlib import Path
 
 from artifact_producer import ProducerError, prepare_review_output_binding
 from dispatch_contract import (
-    REPLICA_RESERVATION_ROW_KEYS, SUPERVISOR_LEASE_KIND, DispatchContractError, diff_attribution_lines,
+    REPLICA_RESERVATION_ROW_KEYS, STANDARD_PLUS_INTENSITIES, SUPERVISOR_LEASE_KIND,
+    DispatchContractError, diff_attribution_lines,
     dispatch_state_root, dispatch_state_roots, resolve_dispatch_state_root, runtime_ancestry_binding,
     sealed_launch_home, source_lineage_row_fields, supervisor_lease_path, workflow_completion_receipt,
     ensure_terminal_claim_absent, _atomic_registry_replace, close_attempt_row,
@@ -424,6 +426,38 @@ def diff_attribution_prompt(args: argparse.Namespace) -> str:
 
 # The completion deliveries whose owner a runtime supervisor holds under a lease.
 SUPERVISED_DELIVERIES = frozenset({"session-resume-supervised", "app-server-supervised"})
+
+
+def registered_owner(args: argparse.Namespace) -> bool:
+    return args.dispatch_depth == 1 and args.worker_type == "owner"
+
+
+def completion_owner(args: argparse.Namespace, *, registered=registered_owner) -> bool:
+    return registered(args) and args.intensity in STANDARD_PLUS_INTENSITIES
+
+
+def async_wait_policy(args: argparse.Namespace, *, supervised: bool, deny_tools) -> str:
+    """The adapter declares its supervisor and proven tool names; policy lives here.
+
+    Look up the deny tools only for an unsupervised turn, preserving the wrapper's
+    call-time dependency and the supervised path's short circuit.
+    """
+    if supervised:
+        return "runtime-supervised"
+    return "deny-proven" if deny_tools(args) else "unsupported"
+
+
+def completion_state_path(args: argparse.Namespace) -> Path:
+    state_root = dispatch_state_root(args.jobs_path)
+    if not args.attempt_id:
+        return state_root / "supervisor-state" / "preview-only.json"
+    attempt_id = args.attempt_id
+    if re.fullmatch(r"att-[A-Za-z0-9._-]{1,240}", attempt_id) is None:
+        raise DispatchContractError(
+            "completion-state-attempt-invalid",
+            "supervised completion requires a path-safe exact attempt id",
+        )
+    return state_root / "supervisor-state" / f"{attempt_id}.json"
 
 
 def completion_lease_path(jobs: Path, args: argparse.Namespace) -> Path:
