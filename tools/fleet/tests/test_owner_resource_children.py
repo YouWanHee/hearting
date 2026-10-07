@@ -283,6 +283,101 @@ class OwnerResourceChildrenTest(unittest.TestCase):
         item.update(pid=self.resource.pid, proc_start=456, pgid=900)
         self.assertEqual(render._resource_gpu_resources(self.resource, snapshot), [])
 
+    def test_remote_parent_attempt_merges_resource_and_project_gpu_rows(self):
+        self.resource.elapsed_min = 720
+        snapshot = {"configured": True, "hosts": [{"host": "xavier", "self": False,
+            "reachable": True, "gpus": [{"index": index, "name": "NVIDIA A100", "processes": [{
+                "pid": 900, "proc_start": 999, "pgid": 900, "cwd": "/other/project",
+                "owner": {"kind": "job", "id": self.owner.attempt_id}, "used_memory_mib": 12000,
+            }]} for index in (0, 1)]}]}
+        before = copy.deepcopy(snapshot)
+        render.set_compute_hosts(snapshot)
+        self.addCleanup(render.set_compute_hosts, None)
+        for harness in ("claude", "codex", "opencode"):
+            self.owner.harness = harness
+            self.attach()
+            for process_view in (False, True):
+                render.set_process_view(process_view)
+                for width in (60, 80, 168):
+                    with self.subTest(harness=harness, process=process_view, width=width):
+                        lines = render._build_lines([], [self.owner], "both", width < 80, 0,
+                            layout=render._layout_mode(width), term_width=width,
+                            resources=[self.resource], governor=None)
+                        gpu = [line for line in lines if line and "● GPU" in flatten([line])]
+                        self.assertEqual(len(gpu), 1)
+                        self.assertIn("GPU xavier:0", flatten(gpu))
+                        self.assertIn("eval-run 12h", flatten(gpu))
+                        self.assertNotIn("resource eval-run", flatten(lines))
+                        self.assertNotIn("job:", flatten(gpu))
+                        self.assertNotIn("미등록", flatten(lines))
+                        self.assertLessEqual(sum(render._dw(t) for t, _ in gpu[0]), width)
+        self.assertEqual(snapshot, before)
+        for gpu in snapshot["hosts"][0]["gpus"]:
+            gpu["processes"] = []
+        lines = render._build_lines([], [self.owner], "both", False, 0,
+            term_width=168, resources=[self.resource], governor=None)
+        self.assertIn("resource eval-run", flatten(lines))
+
+    def test_remote_parent_match_requires_remote_host_and_exact_nonempty_attempt(self):
+        process = {"pid": 900, "proc_start": 999, "pgid": 900,
+                   "owner": {"kind": "job", "id": self.owner.attempt_id}}
+        host = {"host": "xavier", "self": False, "reachable": True,
+                "gpus": [{"index": 0, "processes": [process]}]}
+        snapshot = {"hosts": [host]}
+        self.assertTrue(render._resource_gpu_resources(self.resource, snapshot))
+        for changes in ({"self": True}, {"self": None}, {"reachable": False}):
+            with self.subTest(host=changes):
+                self.assertEqual(render._resource_gpu_resources(self.resource, {"hosts": [{**host, **changes}]}), [])
+        for attempt in (None, "", "att-other"):
+            with self.subTest(attempt=attempt):
+                child = replace(self.resource, parent_attempt_id=attempt)
+                self.assertEqual(render._resource_gpu_resources(child, snapshot), [])
+
+    def test_drawn_owner_gpu_is_removed_from_parent_but_other_processes_remain(self):
+        self.owner.is_child = True
+        self.owner.parent_sid = "parent-session"
+        for harness in ("claude", "codex", "opencode"):
+            self.owner.parent_harness = harness
+            parent = Session(harness=harness, pid=91, proc_start="91", cwd=self.owner.cwd,
+                             session_id=self.owner.parent_sid, title="parent", liveness="working")
+            claim = {"kind": "session", "harness": harness, "id": parent.session_id,
+                     "source": "persistent-claim+ancestry"}
+            gpu = {"index": 0, "name": "NVIDIA A100", "processes": [{
+                "pid": self.resource.pid, "proc_start": 123, "pgid": self.resource.pid,
+                "owner": claim, "session_owner": claim, "used_memory_mib": 6144,
+            }]}
+            snapshot = {"configured": True, "hosts": [{"host": "moving4", "self": True,
+                "reachable": True, "gpus": [gpu]}]}
+            render.set_compute_hosts(snapshot)
+            self.addCleanup(render.set_compute_hosts, None)
+            self.attach()
+            for process_view in (False, True):
+                render.set_process_view(process_view)
+                with self.subTest(harness=harness, process=process_view):
+                    lines = render._build_lines([parent], [self.owner], "both", False, 0,
+                        term_width=168, resources=[self.resource], governor=None)
+                    rows = [line for line in lines if line and "● GPU" in flatten([line])]
+                    self.assertEqual(len(rows), 1)
+                    self.assertIn("eval-run", flatten(rows))
+            extra = {"pid": 90, "proc_start": 456, "pgid": 90, "owner": claim,
+                     "session_owner": claim, "used_memory_mib": 1024, "command": "python other.py"}
+            gpu["processes"].append(extra)
+            before = copy.deepcopy(snapshot)
+            for process_view in (False, True):
+                render.set_process_view(process_view)
+                lines = render._build_lines([parent], [self.owner], "both", False, 0,
+                    term_width=168, resources=[self.resource], governor=None)
+                rows = [line for line in lines if line and "● GPU" in flatten([line])]
+                self.assertEqual(len(rows), 2)
+                parent_rows = [line for line in rows if "eval-run" not in flatten([line])]
+                self.assertIn("1 GB", flatten(parent_rows))
+                self.assertNotIn("7 GB", flatten(parent_rows))
+            self.assertEqual(snapshot, before)
+            render.set_process_view(False)
+            lines = render._build_lines([parent], [self.owner], "fleet", False, 0,
+                term_width=168, resources=[self.resource], governor=None)
+            self.assertIn("7 GB", flatten(lines))
+
 
     def test_declared_progress_stays_on_the_resource_row_in_every_view(self):
         self.attach()

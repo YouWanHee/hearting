@@ -4336,7 +4336,7 @@ def _resource_gpu_suffix(children, room=None):
 
 
 def _resource_gpu_resources(child, snapshot):
-    """Reuse registered PID/start/group marks or the exact host-qualified run id."""
+    """Reuse local PID/start/group marks, exact run id or remote parent attempt."""
     if not isinstance(snapshot, dict):
         return []
     exact, groups = _compute_hosts._registered_run_marks([child])
@@ -4359,7 +4359,10 @@ def _resource_gpu_resources(child, snapshot):
                     (process.get("pid"), str(process.get("proc_start"))) in exact
                     or process.get("pgid") in groups)
                 run = isinstance(owner, dict) and owner.get("kind") == "run" and owner.get("id") == child.run_id
-                if local or run:
+                parent = (host.get("self") is False and isinstance(owner, dict)
+                          and owner.get("kind") == "job" and child.parent_attempt_id
+                          and owner.get("id") == child.parent_attempt_id)
+                if local or run or parent:
                     matched.append(process)
             if matched:
                 used = [process.get("used_memory_mib") for process in matched
@@ -4373,13 +4376,29 @@ def _resource_gpu_resources(child, snapshot):
     return resources
 
 
-def _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width=None,
-                             depth=0, in_card=False):
-    """One GPU line plus existing CPU-only resource rows for this exact owner."""
+def _job_gpu_resources(job, session_by_identity, gpu_resources):
     resources = _gpu_resources_for_session(job, gpu_resources or {})
     if not resources:
         session = _session_for_job(session_by_identity, job)
         resources = _gpu_resources_for_session(session, gpu_resources or {}) if session else []
+    return resources
+
+
+def _drawn_gpu_processes(jobs, session_by_identity, gpu_resources, snapshot):
+    keys = set()
+    for job in jobs:
+        for resource in _job_gpu_resources(job, session_by_identity, gpu_resources):
+            keys.update(resource.get("_process_keys") or ())
+        for child in getattr(job, "resource_children", ()):
+            for resource in _resource_gpu_resources(child, snapshot):
+                keys.update(resource["_process_keys"])
+    return keys
+
+
+def _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width=None,
+                             depth=0, in_card=False):
+    """One GPU line plus existing CPU-only resource rows for this exact owner."""
+    resources = _job_gpu_resources(job, session_by_identity, gpu_resources)
     combined = {(resource["host"], resource["index"]): resource for resource in resources}
     snapshot, _age = _fresh_compute_hosts()
     linked = []
@@ -4905,7 +4924,7 @@ def _fresh_compute_hosts():
     return _COMPUTE_HOSTS, max(0.0, age)
 
 
-def _gpu_session_resources(snapshot=None):
+def _gpu_session_resources(snapshot=None, excluded_processes=()):
     """Exact full-session-id GPU relations, normalized once for every Fleet view."""
     if snapshot is None:
         snapshot, _age = _fresh_compute_hosts()
@@ -4926,6 +4945,9 @@ def _gpu_session_resources(snapshot=None):
             for process in (gpu.get("processes") or ()):
                 if not isinstance(process, dict):
                     continue
+                process_key = (host.get("host") or "?", process.get("pid"), str(process.get("proc_start")))
+                if process_key in excluded_processes:
+                    continue
                 owner = process.get("session_owner")
                 if (not isinstance(owner, dict) or owner.get("kind") != "session"
                         or owner.get("harness") not in {"claude", "codex", "opencode"}
@@ -4937,9 +4959,10 @@ def _gpu_session_resources(snapshot=None):
                     "host": host_name, "index": gpu_index,
                     "model": _gpu_safe_text(gpu.get("name")).replace("NVIDIA ", ""),
                     "process_count": 0, "used_memory_mib": 0,
-                    "has_memory": False, "processes": [],
+                    "has_memory": False, "processes": [], "_process_keys": [],
                 })
                 resource["process_count"] += 1
+                resource["_process_keys"].append(process_key)
                 pid, proc_start = process.get("pid"), process.get("proc_start")
                 primary = process.get("owner")
                 if (isinstance(primary, dict) and primary.get("kind") == "session"
@@ -4980,13 +5003,15 @@ def _gpu_resources_for_session(session, resource_index):
         for source in resource_index.get(session_key, ()):
             key = (source["host"], source["index"])
             if key not in resources:
-                resources[key] = {**source, "processes": list(source.get("processes") or ())}
+                resources[key] = {**source, "processes": list(source.get("processes") or ()),
+                                  "_process_keys": list(source.get("_process_keys") or ())}
                 continue
             resource = resources[key]
             resource["process_count"] += source["process_count"]
             resource["used_memory_mib"] += source["used_memory_mib"]
             resource["has_memory"] |= source["has_memory"]
             resource["processes"].extend(source.get("processes") or ())
+            resource["_process_keys"].extend(source.get("_process_keys") or ())
     return [resources[key] for key in sorted(resources)]
 
 
@@ -6044,6 +6069,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     seen_keys = set()
     _seen_glyphs = set()
     covered_pids = set()
+    drawn_gpu_jobs = []
     first = True
     for view in real_views:
         if not first:
@@ -6059,6 +6085,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
                              and any(r.liveness == "working" or _SHOW_ALL
                                      for r in getattr(j, "resource_children", ()))])
         lines.extend(card_lines)
+        drawn_gpu_jobs.extend(job for _row, job in meta["job_rows"])
         _FOLDABLE.append({"line": base + meta["fold_line"], "card_key": meta["card_key"],
                           "folded": meta["folded"]})
         for rel_idx, job in meta["job_rows"]:
@@ -6085,15 +6112,24 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         card_lines, meta = _degrade_card(
             job, session_by_identity, term_width, gpu_resources=gpu_resources)
         lines.extend(card_lines)
+        if not meta["folded"]:
+            drawn_gpu_jobs.append(job)
         _FOLDABLE.append({"line": base + meta["fold_line"], "card_key": meta["card_key"],
                           "folded": meta["folded"]})
         if job.pid:
             covered_pids.add(job.pid)
         seen_keys.add(meta["card_key"])
 
+    snapshot, _age = _fresh_compute_hosts()
+    excluded = _drawn_gpu_processes(drawn_gpu_jobs, session_by_identity, gpu_resources, snapshot)
+    parent_gpu_resources = (_gpu_session_resources(snapshot, excluded)
+                            if excluded else gpu_resources)
     # Routeless sessions with active sub-agents — one minimal owner anchor + the same strip,
     # skipping any pid already shown under a route/degrade card above (no double draw).
     for s, s_subs, session_resources, plugin_subs in agent_sessions:
+        session_resources = _gpu_resources_for_session(s, parent_gpu_resources)
+        if not (s_subs or session_resources or plugin_subs):
+            continue
         covered = bool(s.pid and s.pid in covered_pids)
         if covered and not plugin_subs:
             continue
@@ -6754,6 +6790,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # F-104: live GPU processes neither a registered run nor a drawn session/job GPU
     # strip shows land on their cwd's project card.
     gpu_work = {}
+    parent_gpu_resources = gpu_resources
     if show_jobs:
         strip_keys = set()
         resource_processes = set()
@@ -6763,15 +6800,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 gname, g, show_sessions, show_jobs, gpu_resources, session_by_identity)
             shown = _shown_group_sessions(g["sessions"]) if show_sessions else []
             classified = _classify_group_jobs(gname, _emitted_group_jobs(g, show_sessions, show_jobs), shown)
-            for job in _drawn_group_jobs(classified, shown):
-                for child in getattr(job, "resource_children", ()):
-                    for resource in _resource_gpu_resources(child, snapshot):
-                        resource_processes.update(resource["_process_keys"])
+            resource_processes.update(_drawn_gpu_processes(
+                _drawn_group_jobs(classified, shown), session_by_identity, gpu_resources, snapshot))
         for entry in _compute_hosts.unregistered_gpu(
                 snapshot, resources or (), strip_keys, age_s or 0.0):
             if (entry["host"], entry["pid"], str(entry.get("proc_start"))) in resource_processes:
                 continue
             gpu_work.setdefault(entry["project"], []).append(entry)
+        if resource_processes:
+            parent_gpu_resources = _gpu_session_resources(snapshot, resource_processes)
     for gk, entries in gpu_work.items():
         groups.setdefault(gk, {"sessions": [], "jobs": []})["gpu"] = entries
 
@@ -7262,7 +7299,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                          if sa.active or _SHOW_ALL]
             if shown_subs:
                 lines.extend(_subagent_strip(shown_subs, term_width=term_width))
-            session_resources = _gpu_resources_for_session(s, gpu_resources)
+            session_resources = _gpu_resources_for_session(s, parent_gpu_resources)
             if session_resources:
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
             # Two relation lines at most: one for messages, one for stewarding. Each
