@@ -520,6 +520,10 @@ def cmd_verify(args):
         })
         if not row["ok"]:
             ok = False
+    pyyaml = host_probes.probe_pyyaml()
+    all_checks.append({"id": pyyaml["id"], "ok": pyyaml["status"] == "ok", "detail": pyyaml["detail"]})
+    if pyyaml["status"] != "ok":
+        ok = False
     launcher = bootstrap.compute_hosts_status()
     launcher_expected = bootstrap.compute_hosts_expected()
     launcher_skipped = launcher["status"] == "missing" and not launcher_expected

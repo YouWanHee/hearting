@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Regression tests for warn-only installer host fitness probes."""
 
+import importlib.machinery
 import subprocess
 import sys
+import types
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -142,6 +144,52 @@ class HerdrProbeTest(unittest.TestCase):
                 }))
             result = installer.cmd_install(args)
         self.assertEqual(result["exit"], installer.EXIT_OK)
+
+
+def _fake_yaml():
+    module = types.ModuleType("yaml")
+    module.__spec__ = importlib.machinery.ModuleSpec("yaml", None)
+    return module
+
+
+class PyYamlProbeTest(unittest.TestCase):
+    def test_pyyaml_importable_is_ok(self):
+        with mock.patch.dict(sys.modules, {"yaml": _fake_yaml()}):
+            probe = host_probes.probe_pyyaml()
+        self.assertEqual((probe["id"], probe["status"]), ("host.pyyaml", "ok"))
+
+    def test_pyyaml_missing_is_a_warning_that_names_the_fix_and_the_other_shapes(self):
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            probe = host_probes.probe_pyyaml()
+        self.assertEqual(probe["status"], "warning")
+        self.assertIn("-m pip install --user pyyaml", probe["detail"])
+        self.assertIn("non-framed shape", probe["detail"])
+        with mock.patch.object(host_probes.shutil, "which", return_value=None):
+            self.assertIn("host.pyyaml", {p["id"] for p in host_probes.run()})
+
+    def test_verify_passes_with_pyyaml_and_fails_without_it(self):
+        args = SimpleNamespace(runtimes=["claude"], target=None, scope="global", plugin=False)
+        ok_config = {"ok": True, "status": "ok", "path": "x"}
+        for module, ok, code in ((_fake_yaml(), True, installer.EXIT_OK),
+                                 (None, False, installer.EXIT_VERIFY_FAIL)):
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(sys.modules, {"yaml": module}))
+                stack.enter_context(mock.patch.object(
+                    installer.paths, "harness_state_dir", return_value=Path("/nonexistent/hearting-state")))
+                stack.enter_context(mock.patch.object(installer.verifier, "run", return_value=[]))
+                stack.enter_context(mock.patch.object(installer.routing_config, "validate", return_value=ok_config))
+                stack.enter_context(mock.patch.object(
+                    installer.report_bundle_config, "validate", return_value=ok_config))
+                stack.enter_context(mock.patch.object(
+                    installer.user_config, "status", return_value=[{"ok": True, "reading": "ok", "path": "x"}]))
+                stack.enter_context(mock.patch.object(
+                    installer.bootstrap, "compute_hosts_status", return_value={"status": "missing", "target": "x"}))
+                stack.enter_context(mock.patch.object(installer.bootstrap, "compute_hosts_expected", return_value=False))
+                result = installer.cmd_verify(args)
+            row = next(c for c in result["checks"] if c["id"] == "host.pyyaml")
+            self.assertEqual((row["ok"], result["exit"]), (ok, code), row)
+            if not ok:
+                self.assertIn("-m pip install --user pyyaml", row["detail"])
 
 
 class HostProbesWarnOnlyContractTest(unittest.TestCase):

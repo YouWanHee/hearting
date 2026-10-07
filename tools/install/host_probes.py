@@ -4,10 +4,14 @@
 Standalone and Python-stdlib-only, matching ``distribution.py`` — these probes
 may run before a harness root exists. Every probe returns ``status in
 {"ok", "warning"}`` and never raises; a probe result is advisory only and
-must never influence the installer's exit code.
+must never influence ``install``'s exit code (``verify`` checks the PyYAML
+probe, which framed routes need).
 """
+import importlib.util
+import shlex
 import shutil
 import subprocess
+import sys
 
 
 def probe_node() -> dict:
@@ -106,5 +110,26 @@ def probe_herdr() -> dict:
     }
 
 
+def probe_pyyaml() -> dict:
+    """PyYAML for the Python running the harness: a framed route reads its frame proposals with it."""
+    python = shlex.quote(sys.executable or "python3")
+    try:
+        found = importlib.util.find_spec("yaml") is not None
+    except (ImportError, ValueError):
+        found = False
+    if found:
+        return {"id": "host.pyyaml", "status": "ok", "detail": f"importable by {python}"}
+    return {
+        "id": "host.pyyaml",
+        "status": "warning",
+        "detail": (
+            f"PyYAML is not importable by {python}; a framed route reads its frame "
+            "proposals with it and stops before any frame leg runs without it. Install it "
+            f"for that Python (e.g. `{python} -m pip install --user pyyaml`) or use a "
+            "non-framed shape (direct, solo or staged)"
+        ),
+    }
+
+
 def run() -> list:
-    return [probe_node(), probe_bwrap_userns(), probe_herdr()]
+    return [probe_node(), probe_bwrap_userns(), probe_herdr(), probe_pyyaml()]
