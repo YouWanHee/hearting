@@ -307,7 +307,8 @@ def dispatch_command(
         "--jobs", str(jobs),
         "--prompt-text", (
             f"Execute sub-session {session['subsession_id']} from phase brief "
-            f"{session['phase_brief']}. Run only: {session['narrow_verify']}"
+            f"{session['phase_brief']} within the fixed files. "
+            f"Then verify only with: {session['narrow_verify']}"
         ),
         "--subsession-id", session["subsession_id"],
         "--subsession-index", str(session["index"]),
