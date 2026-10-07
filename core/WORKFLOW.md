@@ -709,8 +709,10 @@ python3 utilities/capability-route.py finish [--route <route.json|rt-id>] --evid
 Without `--route` it finishes this session's latest route under the cwd's
 artifact root.
 
-Ineligible inline routes and legacy recovery retain their explicit guarded
-completion and close steps; use their recorded route and producer evidence:
+Ineligible inline routes and legacy recovery also finish with the one command
+above (it completes the terminal marker, closes the route allowing an unproven
+gate, and finalizes the cycle when one is bound); the explicit guarded
+completion and close steps below keep working for recovery consoles:
 
 ```text
 python3 utilities/capability-route.py close --route <route.json> [--commit <sha>] [--summary <line>]
