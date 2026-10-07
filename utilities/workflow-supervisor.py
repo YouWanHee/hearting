@@ -477,6 +477,54 @@ def _checked_resource_row(armed, evidence):
     return row
 
 
+def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs):
+    """Resolve a late output at exact owner settlement, without starting work.
+
+    Called under the ledger lock after the owner's terminal gates pass. The
+    original successful exit tuple must still be current; the journal retains
+    the earlier missing-output observation and its legal recovery transitions.
+    """
+    import dispatch_resource_wait as OWNER_RESOURCE
+    resolved_nodes = []
+    for node, armed in read_armed(ledger).items():
+        stage = ledger.state()["nodes"].get(node, {})
+        evidence = stage.get("evidence") or {}
+        artifacts = evidence.get("artifacts") or {}
+        if (stage.get("state") != "FAILED_RETRYABLE"
+                or evidence.get("succeeded") is not True or evidence.get("exit_code") != 0
+                or artifacts.get("reason") != "declared-artifact-missing"
+                or not artifacts.get("missing") or armed.get("predecessor_kind") != "resource"):
+            continue
+        try:
+            row = _checked_resource_row(armed, evidence)
+            current_artifacts = artifact_evidence(armed)
+            if (row is None or row.get("resource_policy") != "supervised-owner"
+                    or row.get("parent_attempt_id") != owner_attempt_id
+                    or (row.get("owner_wait") or {}).get("parent_attempt_id") != owner_attempt_id
+                    or row.get("route") != armed.get("route_file") or row.get("node") != node
+                    or row.get("jobs") != str(jobs) or armed.get("jobs") != str(jobs)
+                    or armed.get("route_id") != route["route_id"]
+                    or armed.get("route_hash") != route["route_hash"]
+                    or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(row)
+                    or not current_artifacts.get("checked") or current_artifacts.get("missing")):
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        resolved = {**evidence, "artifacts": current_artifacts}
+        for state in ("READY", "RUNNING", "STAGE_SUCCEEDED"):
+            ledger.record(node, state, evidence=resolved, actor="completion-controller")
+        resolved_nodes.append(node)
+    current = ledger.state()
+    failed_workflow = next((entry for entry in reversed(ledger.journal())
+                            if entry.get("workflow_state")), {})
+    if (resolved_nodes and current["workflow_state"] == "FAILED_RETRYABLE"
+            and (failed_workflow.get("evidence") or {}).get("node") in resolved_nodes
+            and not any(row.get("state") in WS.vocabulary(ledger.registry_path)["failure_states"]
+                        for row in current["nodes"].values())):
+        ledger.set_workflow_state("READY", evidence={"resolved_resource_artifacts": resolved_nodes},
+                                  actor="completion-controller")
+
+
 def _evaluate(route, ledger, armed, results):
     node_id = armed["node"]
     kind = armed["continuation_kind"]

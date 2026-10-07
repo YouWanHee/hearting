@@ -832,6 +832,11 @@ The completion writer validates and records the remaining legal path through
 `STAGE_SUCCEEDED` and `TERMINAL_VERIFY` to `COMPLETE`. Repeated or interrupted
 closure resumes from the journal. Markers cannot erase unresolved human gates,
 failures, or cancellation.
+If an owned resource exited successfully but its declared output arrived after
+the watch recorded it missing, exact owner settlement rechecks the same resource
+and the now-present output and records that resolved observation in the journal.
+It neither reruns the resource nor launches a successor; actual resource failure,
+changed evidence, and missing outputs remain unresolved.
 
 **Every non-terminal stage declares exactly one continuation.** A stage graph
 that leaves a stage with no way to reach the next one is the defect this

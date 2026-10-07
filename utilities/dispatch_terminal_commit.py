@@ -1789,6 +1789,8 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
             result = TerminalCommitResult("needs-owner", "terminal-marker-not-current", json.dumps(missing, sort_keys=True))
         else:
             with ledger.lock():
+                from dispatch_resource_wait import supervisor
+                supervisor().reconcile_resource_artifacts(route, ledger, request.owner_attempt_id, request.jobs)
                 ledger.completion_paths(workflow.route_terminal_nodes(route), gates)
             result = settle_terminal_commit(request)
         if result.result == "completed":
