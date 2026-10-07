@@ -624,6 +624,9 @@ than the REPORT used to prove terminal PASS. Pending closure preserves
 PASS and carries a supervision notice with exact transaction recovery. Carrier mechanics — the Claude `asyncRewake` hook, the Codex native
 queue and sidecar, human-gate-in-flight wakes, receipt schema, refusal classes,
 and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
+Runtime completion carriers report a bounded native log line for skipped delivery,
+claims and prompt admission, with the session and reason. Observing transport never
+changes the settled result or grants another execution.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
