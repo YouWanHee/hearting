@@ -445,17 +445,22 @@ def granted_permissions(applied, launch_home=None) -> dict:
     """``applied_permissions`` without the values the launcher's location decides.
 
     With ``launch_home`` (the release the launch ran from), a path into the harness's own tree
-    reads the same however its root was spelled: that release directory, or a pointer such as
-    ``<share>/hearting/current`` (which may point at a newer release by now). The spelling
-    depends only on how the launcher was invoked, and the release is ``launch_home``'s axis."""
+    reads the same however its root was spelled: that release directory, or, for a managed
+    release, another release of the same install or its ``<share>/hearting/current`` pointer
+    (which may point at a newer release by now). The spelling depends only on how the launcher
+    was invoked, and the release is ``launch_home``'s axis. Any other harness tree, such as a
+    development checkout, stays a different path."""
     granted = {key: value for key, value in (applied or {}).items() if key not in LAUNCH_LOCATION_VALUES}
     if not launch_home:
         return granted
     text = json.dumps(granted, sort_keys=True)
     home = os.path.realpath(str(launch_home))
+    releases = os.path.dirname(home)
+    managed = os.path.basename(releases) == "releases"
+    pointer = os.path.join(os.path.dirname(releases), "current")
     roots = {root for root in _RELEASE_TREE_PATH.findall(text)
              if root == str(launch_home) or os.path.realpath(root) == home
-             or os.path.isfile(os.path.join(root, "core", "CORE.md"))}
+             or (managed and (root == pointer or os.path.dirname(os.path.realpath(root)) == releases))}
     for root in sorted(roots, key=len, reverse=True):
         text = re.sub(r"(?<![^\s\"'(])" + re.escape(root) + "/", RELEASE_ROOT_TOKEN + "/", text)
     return json.loads(text)

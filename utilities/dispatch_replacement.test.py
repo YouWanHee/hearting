@@ -1697,9 +1697,9 @@ class ReplacementTest(unittest.TestCase):
         # TF rt-34ca7756: the owner's rules named releases/v3.13.0, the correcting session's
         # replacement named the `current` pointer to it, and the same work was refused.
         share=self.root/'share'
-        for version in ('v1','v2'):
-            (share/'releases'/version/'core').mkdir(parents=True)
-            (share/'releases'/version/'core'/'CORE.md').write_text('core')
+        for tree in (share/'releases'/'v1',share/'releases'/'v2',self.root/'dev'):
+            (tree/'core').mkdir(parents=True)
+            (tree/'core'/'CORE.md').write_text('core')
         (share/'current').symlink_to(share/'releases'/'v1')
         def launch(root,home,*extra):
             rules=[f'Bash(python3 {root}/utilities/capability-route.py *)',f'Edit(//{self.root}/wt/**)',*extra]
@@ -1716,7 +1716,8 @@ class ReplacementTest(unittest.TestCase):
             (share/'current').unlink();(share/'current').symlink_to(v2)
             R._check_tuple(launch(v2,v2),launch(share/'current',v1))
             R._check_tuple(launch(share/'current',v2),launch(share/'current',v1))
-            for changed in (launch(share/'current',v1,'Bash(git push *)'),
+            # Another harness tree, such as a development checkout, is not the same release root.
+            for changed in (launch(self.root/'dev',v1),launch(share/'current',v1,'Bash(git push *)'),
                             {**launch(share/'current',v1),'applied_permissions':{'claude':{'mode':'bypass',
                              'allowed_tools':[f'Bash(python3 {v1}/utilities/capability-route.py *)',
                                               f'Edit(//{self.root}/other/**)']}}}):

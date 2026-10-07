@@ -124,8 +124,9 @@ registry's release fields are neither refused nor reported
 (`route_authority.release_moved`), and each launch row keeps the `launch_home`
 it ran from; a replacement on another release likewise follows the release in
 the values the runtime derives from it, and a permission path into the harness
-tree compares the same whether it names the release directory or a pointer such
-as `<share>/hearting/current` (`route_authority.granted_permissions`). Route close keeps its existing integrity
+tree compares the same whether it names the release directory, another release of
+the same managed install, or its `<share>/hearting/current` pointer; any other
+checkout stays a different path (`route_authority.granted_permissions`). Route close keeps its existing integrity
 and currentness policy. This compile-time exception changes neither lifecycle
 fence and cannot hide session-root drift.
 
