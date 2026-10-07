@@ -1189,6 +1189,9 @@ predecessor's open depth-1 routes pass to the successor, on any harness: it may
 `start` and `correct` them, and their stored completion records reach it
 (`retire ... handover=<n>`). Registry rows, their registered parent and worker
 identities stay as they are; cards and notices are not moved.
+An owner's terminal row and an acknowledged completion message do not close its
+route. Its verified open route still passes to the successor until the route's
+outcome is committed; an acknowledged message is never delivered again.
 
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused
