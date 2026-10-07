@@ -1,1 +1,0 @@
-../../../../../tools/fleet/tests/test_training_progress.py
