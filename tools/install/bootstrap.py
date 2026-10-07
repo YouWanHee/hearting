@@ -1,8 +1,8 @@
 """Runtime-neutral installer bootstrap helpers.
 
-``restore_memory`` imports ``dump.jsonl`` when ``memory.db`` is absent (and drops
-the retired distiller's leftover state files from the store, see
-``retired_memory_state``).
+``restore_memory`` imports ``dump.jsonl`` when ``memory.db`` is absent or, on a
+first install, creates the empty default store (and drops the retired
+distiller's leftover state files from the store, see ``retired_memory_state``).
 ``install_launchers`` creates guarded
 ``~/.local/bin/{hearting,harness,fleet,mem,compute-hosts}`` symlinks.
 The helpers remain usable independently of installer command wiring.
@@ -18,17 +18,28 @@ import retired_memory_state
 import safe_fs
 
 
-def restore_memory(mem_store=None):
-    """Restore ``memory.db`` from ``dump.jsonl`` when the database is absent.
+def restore_memory(mem_store=None, *, import_dump=True):
+    """Restore ``memory.db`` from ``dump.jsonl``, or create it on a first install.
+
+    ``mem`` refuses to create a store at a path it derived, so that a
+    mis-resolved AGENT_HOME never looks like an empty memory. The default store
+    of a new machine is therefore created here, and only when no store was named
+    and no legacy store exists: ``mem`` creates a named store on first use, and
+    an empty default store would hide a legacy one from callers that resolve the
+    default.
 
     Args:
         mem_store: Store directory. If omitted, use ``MEM_STORE``, an existing
             legacy `paths.agent_home() / "memory"`, and then the local XDG data
             store.
+        import_dump: False leaves an existing ``dump.jsonl`` alone (runtime
+            activation only creates a missing first store; importing a dump
+            stays with ``install``).
 
     Returns:
-        dict — {"action": "skipped"|"imported"|"failed", "detail": str}
+        dict — {"action": "skipped"|"imported"|"initialized"|"failed", "detail": str}
     """
+    derived = mem_store is None and "MEM_STORE" not in os.environ
     if mem_store is None:
         mem_store = os.environ.get("MEM_STORE")
     if mem_store is None:
@@ -48,27 +59,58 @@ def restore_memory(mem_store=None):
         return {"action": "skipped", "detail": "memory.db already present"}
 
     if not dump_path.exists():
+        if derived and not _legacy_store_exists():
+            # `mem index` opens (and so creates) the schema and writes no record.
+            return _run_mem(
+                mem_store, ["index"], "initialized",
+                f"created an empty memory.db in {mem_store}",
+            )
         return {
             "action": "skipped",
             "detail": "no dump.jsonl to restore from, and no existing memory.db",
         }
 
+    if not import_dump:
+        return {"action": "skipped", "detail": "dump.jsonl present; not imported here"}
+
+    return _run_mem(
+        mem_store, ["import", str(dump_path)], "imported",
+        f"mem import from {dump_path}",
+    )
+
+
+def _legacy_store_exists():
+    """Return whether a legacy store exists that a ``mem`` caller may resolve.
+
+    The installer looks under its own root, but a hook or shell may run ``mem``
+    without AGENT_HOME, and mem.py's ``default_agent_home`` then falls back to
+    CLAUDE_HOME, ~/hearting, ~/agent_setting or ~/.claude.
+    """
+    home = Path.home()
+    roots = [paths.agent_home(), home / "hearting", home / "agent_setting", home / ".claude"]
+    if os.environ.get("CLAUDE_HOME"):
+        roots.append(Path(os.environ["CLAUDE_HOME"]))
+    return any((root / "memory").exists() or (root / "memory").is_symlink() for root in roots)
+
+
+def _run_mem(mem_store, args, action, detail):
+    """Run one ``mem`` command on ``mem_store``; report ``action`` on success."""
     mem_script = paths.resolve_source("tools/memory/mem.py")
     env = {**os.environ, "MEM_STORE": str(mem_store)}
     result = subprocess.run(
-        ["python3", str(mem_script), "import", str(dump_path)],
+        ["python3", str(mem_script), *args],
         env=env,
         capture_output=True,
         text=True,
     )
     if result.returncode == 0:
-        return {"action": "imported", "detail": f"mem import from {dump_path}"}
+        return {"action": action, "detail": detail}
 
     # Best effort: optional memory restoration must not fail the installation.
     return {
         "action": "failed",
         "detail": (
-            f"mem import failed: exit={result.returncode} "
+            f"mem {args[0]} failed: exit={result.returncode} "
             f"stderr={result.stderr[:300]}"
         ),
     }
