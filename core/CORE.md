@@ -458,7 +458,7 @@ directory.
 Cycles may move between artifact roots through `cycle-move`, including merging
 same-key campaigns and attaching explicitly named unregistered logs. The move
 records original roots, identities and locators automatically. Historical reads
-follow committed provenance; root-local writers never follow it. Moving intact
+follow committed provenance; writer addresses remain local to their root. Moving intact
 history with no live work transfers no parent or successor execution authority.
 Source routes and outcomes retain their original bytes and remain historical.
 A new current manifest names the target root and campaign while preserving
