@@ -48,6 +48,95 @@ class WiringFixture(unittest.TestCase):
              "artifact_root": str(self.root)}) + "\n")
 
 
+class HookReleasePinningTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="hook-release-pin-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.projection = self.root / "runtime-hooks"
+        self.projection.mkdir()
+        self.runner = self.projection / "run-hook.sh"
+        self.runner.write_bytes((ROOT / "hooks/run-hook.sh").read_bytes())
+        self.hook = "pin-probe.sh"
+        projected = self.projection / self.hook
+        projected.write_text("#!/bin/sh\necho CURRENT_PROJECTION_RAN\nexit 17\n")
+        projected.chmod(0o755)
+        self.pinned = self.root / "release"
+        (self.pinned / "core").mkdir(parents=True)
+        (self.pinned / "core/CORE.md").write_text("fixture harness root\n")
+        (self.pinned / "hooks").mkdir()
+
+    def run_hook(self, interpreter, agent_home):
+        env = dict(os.environ)
+        env.pop("AGENT_HOME", None)
+        if agent_home is not None:
+            env["AGENT_HOME"] = str(agent_home)
+        return subprocess.run(["sh", str(self.runner), interpreter, self.hook],
+                              text=True, capture_output=True, env=env)
+
+    def test_missing_pinned_hook_keeps_its_release_and_native_missing_file_result(self):
+        for interpreter in ("sh", "exec"):
+            with self.subTest(interpreter=interpreter):
+                result = self.run_hook(interpreter, self.pinned)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("CURRENT_PROJECTION_RAN", result.stdout)
+                self.assertIn(str(self.pinned / "hooks" / self.hook), result.stderr)
+
+    def test_existing_pinned_hook_and_interactive_fallback_keep_the_hook_exit(self):
+        pinned_hook = self.pinned / "hooks" / self.hook
+        pinned_hook.write_text("#!/bin/sh\necho PINNED_RELEASE_RAN\nexit 13\n")
+        pinned_hook.chmod(0o755)
+        for interpreter in ("sh", "exec"):
+            for root, text, code in ((self.pinned, "PINNED_RELEASE_RAN", 13),
+                                     (None, "CURRENT_PROJECTION_RAN", 17),
+                                     (self.root / "not-a-harness", "CURRENT_PROJECTION_RAN", 17)):
+                with self.subTest(interpreter=interpreter, root=root):
+                    result = self.run_hook(interpreter, root)
+                    self.assertEqual((result.returncode, result.stdout.strip()), (code, text))
+
+
+class CodexHookReleasePinningTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="codex-hook-release-pin-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.pinned = self.root / "pinned"
+        self.current = self.root / "home/.codex/hearting"
+        self.script = "stop-lifecycle.py"
+        for root in (self.pinned, self.current):
+            (root / "core").mkdir(parents=True)
+            (root / "core/CORE.md").write_text("fixture\n")
+            (root / "adapters/codex/hooks").mkdir(parents=True)
+        self.runner = self.pinned / "adapters/codex/hooks/run-hook.sh"
+        self.runner.write_bytes((ROOT / "adapters/codex/hooks/run-hook.sh").read_bytes())
+        bridge = self.current / "adapters/codex/hooks" / self.script
+        bridge.write_text("print('CURRENT_CODEX_BRIDGE_RAN')\nraise SystemExit(17)\n")
+        bridge.chmod(0o755)
+
+    def run_hook(self, root):
+        env = {**os.environ, "HOME": str(self.root / "home")}
+        env.pop("AGENT_HOME", None)
+        if root is not None:
+            env["AGENT_HOME"] = str(root)
+        return subprocess.run(["sh", str(self.runner), self.script], capture_output=True, text=True, env=env)
+
+    def test_valid_pinned_root_never_replaces_a_missing_bridge(self):
+        result = self.run_hook(self.pinned)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("CURRENT_CODEX_BRIDGE_RAN", result.stdout)
+        self.assertIn(str(self.pinned / "adapters/codex/hooks" / self.script), result.stderr)
+
+    def test_existing_bridge_and_unpinned_fallback_preserve_exit_codes(self):
+        for root in (None, self.root / "invalid"):
+            result = self.run_hook(root)
+            self.assertEqual((result.returncode, result.stdout.strip()), (17, "CURRENT_CODEX_BRIDGE_RAN"))
+        bridge = self.pinned / "adapters/codex/hooks" / self.script
+        bridge.write_text("print('PINNED_CODEX_BRIDGE_RAN')\nraise SystemExit(13)\n")
+        bridge.chmod(0o755)
+        result = self.run_hook(self.pinned)
+        self.assertEqual((result.returncode, result.stdout.strip()), (13, "PINNED_CODEX_BRIDGE_RAN"))
+
+
 class ClaudeWiringTest(WiringFixture):
     def test_settings_register_the_bridge_for_edits_and_bash(self):
         settings = json.loads((ROOT / "adapters/claude/settings.json").read_text())
@@ -56,7 +145,8 @@ class ClaudeWiringTest(WiringFixture):
         self.assertEqual(len(entries), 1)
         self.assertEqual(set(entries[0]["matcher"].split("|")),
                          {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"})
-        self.assertIn('"$HOME/.claude/hooks/route-presence-gate.py"', entries[0]["hooks"][0]["command"])
+        self.assertIn('"$HOME/.claude/hooks/run-hook.sh" python3 route-presence-gate.py',
+                      entries[0]["hooks"][0]["command"])
         link = ROOT / "adapters/claude/hooks/route-presence-gate.py"
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.resolve(), (ROOT / "hooks/route-presence-gate.py").resolve())

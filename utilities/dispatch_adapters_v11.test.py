@@ -499,13 +499,14 @@ class AdapterV11Test(unittest.TestCase):
         "AGENT_HOME":str(pointer),"CODEX_HOME":str(source),"AGENT_DISPATCH_JOBS":str(jobs),
         "PYTHONDONTWRITEBYTECODE":"1"}
    with mock.patch.dict(os.environ,env,clear=True):
-    args=SimpleNamespace(agent_home=wrapper.resolve_agent_home())
-    self.assertEqual(args.agent_home,pointer)
-    args.nested_codex_root=wrapper.sealed_launch_home(args.agent_home)
+    self.assertEqual(wrapper.resolve_agent_home(),pointer)
+    # What `main` sets: the release the pointer names now, for the whole tree.
+    args=SimpleNamespace(agent_home=wrapper.sealed_launch_home(wrapper.resolve_agent_home()))
+    self.assertEqual(args.agent_home,ROOT.resolve())
     args.nested_codex_home=wrapper.prepare_nested_codex_home(
-     worktree,source,jobs=jobs,projection_root=args.nested_codex_root)
+     worktree,source,jobs=jobs,projection_root=args.agent_home)
    pointer.unlink(); pointer.symlink_to(later)            # the release switch
-   child=wrapper.child_runtime_homes(args,None)
+   child={**wrapper.child_runtime_homes(args,None),"AGENT_HOME":str(args.agent_home)}
    self.assertEqual(child,{"CODEX_HOME":str(args.nested_codex_home),"AGENT_HOME":str(ROOT.resolve())})
    self.assertEqual(wrapper.child_runtime_homes(SimpleNamespace(nested_codex_home=None),root/"profile"),
                     {"CODEX_HOME":str(root/"profile")})
