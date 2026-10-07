@@ -721,20 +721,24 @@ gate_unmet = _ROUND.gate_unmet
 # (the fence attaches to the envelope; closing sentences follow the fence).
 # The verdict still comes from the block alone.
 #
-# Envelope-shaped lines are excluded both from the tail and from inside the
-# fence, so an earlier decoy can never swallow a later envelope; the search
-# then either skips the decoy for the later block or fails closed. The check
-# ignores case and strips leading decorations (`#`, `*`, `-`) and accepts the
-# Korean `평결:` mirror, so a dressed opposite verdict in the tail fails
-# closed instead of reading as prose (PR #281 review round 2). Every tail
-# element starts at a required newline (`_TAIL_GAP`), which keeps the
-# failing-search cost linear instead of cubic (round 1).
-_TAIL_GAP = r"(?:\n[ \t]*)+"
+# A tail line is ambiguous when it mentions a verdict at all -- `verdict`/
+# `평결` anywhere (any case), or a bare uppercase PASS/FAIL/BLOCKED -- so
+# those fail closed, as do lines shaped like envelope fields; `Done.` and
+# `All tests pass.` stay ordinary sentences. The same check guards the
+# fence body, so an earlier decoy can never swallow a later envelope
+# (PR #281 review rounds 1-3). Tail elements start at newlines only
+# (`_TAIL_GAP`; the fence's own indentation is part of the fence element),
+# which keeps the failing search linear.
+_TAIL_EDGE = (
+    r"(?![ \t#*\-]*(?i:artifact|verdict|blocker|평결)[ \t]*:)"
+    r"(?![^\n]*(?i:verdict|평결))"
+    r"(?![^\n]*\b(?:PASS|FAIL|BLOCKED)\b)"
+)
+_TAIL_GAP = r"\n+"
 _TAIL_BLANK = r"(?:\n[ \t]*)*"
-_ENVELOPE_SHAPED = r"(?![ \t#*\-]*(?i:artifact|verdict|blocker|평결)[ \t]*:)"
-_TAIL_LINE = _ENVELOPE_SHAPED + r"[^\n]+"
-_TAIL_FENCE_BODY = r"(?:" + _ENVELOPE_SHAPED + r"[^\n]*\n)*?"
-_TAIL_FENCE = r"```[^\n]*\n" + _TAIL_FENCE_BODY + r"[ \t]*```"
+_TAIL_LINE = _TAIL_EDGE + r"[^\n]+"
+_TAIL_FENCE_BODY = r"(?:" + _TAIL_EDGE + r"[^\n]*\n)*?"
+_TAIL_FENCE = r"[ \t]*```[^\n]*\n" + _TAIL_FENCE_BODY + r"[ \t]*```"
 HANDOFF_RE = re.compile(
     r"(?:\A|\n)artifact: (?P<artifact>[^\n]+)\n"
     r"verdict: (?P<verdict>PASS|FAIL|BLOCKED)\n"

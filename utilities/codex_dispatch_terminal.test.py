@@ -501,11 +501,14 @@ class CodexDispatchTerminalTest(unittest.TestCase):
             "artifact: -\nverdict: PASS\nblocker: none\n```\nverdict: FAIL\n```"
         )))
         self.assertEqual(fenced_decoy["reason"], "malformed-handoff")
-        # PR #281 round 2: a dressed opposite verdict in the tail fails closed.
-        dressed = self.inspect(self.write_log(final_text=(
-            "artifact: -\nverdict: PASS\nblocker: none\n## 평결: FAIL"
-        )))
-        self.assertEqual(dressed["reason"], "malformed-handoff")
+        # PR #281 rounds 2-3: a dressed or prose-carrying opposite verdict in
+        # the tail fails closed.
+        for tail in ("## 평결: FAIL", "The verdict: FAIL."):
+            with self.subTest(tail=tail):
+                dressed = self.inspect(self.write_log(final_text=(
+                    "artifact: -\nverdict: PASS\nblocker: none\n" + tail
+                )))
+                self.assertEqual(dressed["reason"], "malformed-handoff")
         # A line that merely ends with the field name does not open a block.
         glued = self.inspect(
             self.write_log(final_text="see artifact: -\nverdict: PASS\nblocker: none")

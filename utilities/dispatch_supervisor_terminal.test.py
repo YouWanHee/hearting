@@ -220,7 +220,8 @@ class OpencodeGap1TerminalClassificationTest(unittest.TestCase):
                     self.assertEqual(terminal(base + tail).note, note)
         for text in ("artifact: -\nverdict: PASS\nblocker: none\nOne.\nTwo.\nThree.",
                      "artifact: -\nverdict: PASS\nblocker: none\nverdict: FAIL",
-                     "artifact: -\nverdict: PASS\nblocker: none\n## 평결: FAIL"):
+                     "artifact: -\nverdict: PASS\nblocker: none\n## 평결: FAIL",
+                     "artifact: -\nverdict: PASS\nblocker: none\nThe verdict: FAIL."):
             with self.subTest(text=text[:40]):
                 result = terminal(text)
                 self.assertEqual((result.note, result.reconcile_reason),

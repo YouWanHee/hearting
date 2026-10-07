@@ -485,23 +485,31 @@ class Case6UncappedAndEnvelopeTest(unittest.TestCase):
                         handoff.groupdict(),
                         {"artifact": "-", "verdict": verdict, "blocker": blocker},
                     )
-        # Three sentences, an envelope-shaped tail, or no envelope still fail closed.
+        # Three sentences, a verdict-mentioning tail, or no envelope still fail closed.
         for text in (
             "artifact: -\nverdict: PASS\nblocker: none\nOne.\nTwo.\nThree.",
             "artifact: -\nverdict: PASS\nblocker: none\nverdict: FAIL",
             "artifact: -\nverdict: PASS\nblocker: none\nVerdict: FAIL",
             "artifact: -\nverdict: PASS\nblocker: none\n## 평결: FAIL",
+            "artifact: -\nverdict: PASS\nblocker: none\nThe verdict: FAIL.",
+            "artifact: -\nverdict: PASS\nblocker: none\nFinal verdict: FAIL",
+            "artifact: -\nverdict: PASS\nblocker: none\n`verdict: FAIL`",
+            "artifact: -\nverdict: PASS\nblocker: none\n> verdict: FAIL",
+            "artifact: -\nverdict: PASS\nblocker: none\nThe verdict: all good",
+            "artifact: -\nverdict: PASS\nblocker: none\nAll tests PASS.",
             "artifact: -\nverdict: PASS\nblocker: none\nartifact: -",
             "artifact: -\nverdict: PASS\nblocker: none\n```\nverdict: FAIL\n```",
             "see artifact: -\nverdict: PASS\nblocker: none",
         ):
             with self.subTest(text=text[:40]):
                 self.assertIsNone(RA.HANDOFF_RE.search(text))
-        # A prose sentence that merely mentions the word stays a sentence.
-        mentioned = RA.HANDOFF_RE.search(
-            "artifact: -\nverdict: PASS\nblocker: none\nThe verdict: all good after review."
-        )
-        self.assertEqual(mentioned.group("verdict"), "PASS")
+        # A sentence that names no verdict stays a sentence.
+        for tail in ("\nAll tests pass.", "\nDONE.", "\n검증을 마쳤습니다."):
+            with self.subTest(tail=tail):
+                mentioned = RA.HANDOFF_RE.search(
+                    "artifact: -\nverdict: PASS\nblocker: none" + tail
+                )
+                self.assertEqual(mentioned.group("verdict"), "PASS")
         # Two envelopes still resolve to the last one.
         last = RA.HANDOFF_RE.search(
             "artifact: -\nverdict: PASS\nblocker: none\n\nartifact: -\nverdict: FAIL\nblocker: real"
@@ -520,12 +528,17 @@ class Case6UncappedAndEnvelopeTest(unittest.TestCase):
         self.assertEqual(handoff.group("artifact"), "/r.md")
 
     def test_a_long_failing_tail_stays_linear(self):
-        # PR #281 review round 1: optional newlines between tail elements made
-        # the failing search cubic (4k chars did not finish in 250s); a
-        # required newline keeps it linear.
+        # PR #281 review rounds 1-3: optional newlines between tail elements
+        # made the failing search cubic (4k chars did not finish in 250s), and
+        # a long indented line re-scanned the space run per giveback
+        # (80k spaces: 2.7s). Newline-only gaps keep both cases linear.
         text = "artifact: -\nverdict: BLOCKED\nblocker: " + "a" * 100_000 + "\nx\ny\nz"
         start = time.monotonic()
         self.assertIsNone(RA.HANDOFF_RE.search(text))
+        self.assertLess(time.monotonic() - start, 5.0)
+        spaces = "artifact: -\nverdict: BLOCKED\nblocker: b\n" + " " * 200_000 + "verdict: FAIL"
+        start = time.monotonic()
+        self.assertIsNone(RA.HANDOFF_RE.search(spaces))
         self.assertLess(time.monotonic() - start, 5.0)
 
 
