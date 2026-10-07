@@ -3889,6 +3889,46 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual((rc, line), (0, handed_line + " handover=skipped:successor-unverified"))
         handed.assert_not_called()
 
+    def test_only_opencode_waits_for_a_slow_normal_exit(self):
+        for harness in ("opencode", "codex", "claude"):
+            with self.subTest(harness=harness):
+                world = _RetireWorld(harness=harness, exits=False)
+                normal_info = world.info
+
+                def delayed_info():
+                    if world.sent and peer_steward.time.monotonic() >= 8:
+                        world.exits = True
+                    return normal_info()
+
+                world.info = delayed_info
+                rc, line = self.retire(world)
+                if harness == "opencode":
+                    self.assertEqual(rc, 0)
+                    self.assertIn("retired=true reason=normal-exit", line)
+                    self.assertEqual(world.actions(), [
+                        ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+                        ["herdr", "pane", "close", "w1:pOld"],
+                    ])
+                else:
+                    self.assertEqual(rc, 1)
+                    self.assertIn("retired=false reason=agent-still-running", line)
+                    expected = ([
+                        ["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+                        ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+                    ] if harness == "claude" else [
+                        ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+                    ])
+                    self.assertEqual(world.actions(), expected)
+
+    def test_opencode_still_running_is_bounded_without_another_exit_key(self):
+        world = _RetireWorld(harness="opencode", exits=False)
+        rc, line = self.retire(world)
+        self.assertEqual(rc, 1)
+        self.assertIn("retired=false reason=agent-still-running", line)
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+        ])
+
     def test_busy_form_draft_unknown_self_or_changed_target_receives_no_exit(self):
         cases = [(_RetireWorld(status=s), "agent-" + s) for s in ("working", "blocked", "unknown")]
         cases += [(_RetireWorld(screen=s), reason) for s, reason in
