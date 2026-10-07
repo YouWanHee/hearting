@@ -60,6 +60,7 @@ _A_REVERSE = getattr(curses, "A_REVERSE", 0)
 # cyan/magenta/blue, but the stock primaries are replaced with softer midtones.
 # Eight-color terminals keep their native colors as a checked fallback.
 _MUTED_256 = {
+    "steward_pink": 219,
     "orange": 137,
     "soft": 253,       # #dadada — focal text, below pure white
     "green": 150,     # #afd787 — richer sage
@@ -182,8 +183,8 @@ _HUE_OF = {
     # white as `herdr_on` (user 2026-09-03: white, so it separates from the harness hue).
     "tag": ("w", 0), "tag_dim": ("d", _A_D),
     # F-100c: a STEWARD session (depth −1: `steward on`, or it watched/started a session) wears
-    # a filled badge rather than another foreground hue on the identity column.
-    "tag_steward": ("m", _A_B | getattr(curses, "A_REVERSE", 0)),
+    # bright pink text: distinct from white/yellow, without a special background.
+    "tag_steward": ("p", _A_B),
     # Badge text, NOT the glyph: plain yellow, distinct from the dim g_unused glyph so the
     # ●>○>◌ ink-weight gradient still reads.
     "g_unused_b": ("y", 0),
@@ -276,8 +277,6 @@ NAME_KEYS = frozenset(list(_NAME_KEY.values()) + list(_NAME_KEY_DIM.values())
 
 def _key_attr(key, tint=None):
     """Attr for a color_key, composed with the row's tint background when active (spec §5.3)."""
-    if key == "tag_steward":
-        return _COLOR.get(key, _A_BOLD | getattr(curses, "A_REVERSE", 0))
     if tint is None or not _TINT_OK:
         return _COLOR.get(key, 0)
     hue, attr = _HUE_OF.get(key, ("d", 0))
@@ -409,12 +408,10 @@ def _init_colors():
     _COLOR["tag"] = _COLOR.get("soft", 0)
     _COLOR["tag_dim"] = curses.A_DIM
     try:
-        # Pair 18 is a fixed-contrast badge, independent of light/dark default bg.
-        badge_bg = 219 if curses.COLORS >= 256 else curses.COLOR_WHITE
-        curses.init_pair(18, curses.COLOR_BLACK, badge_bg)
+        curses.init_pair(18, _palette_fg("steward_pink", curses.COLOR_MAGENTA), bg)
         _COLOR["tag_steward"] = curses.color_pair(18) | curses.A_BOLD
     except Exception:
-        _COLOR["tag_steward"] = curses.A_REVERSE | curses.A_BOLD
+        _COLOR["tag_steward"] = (_COLOR.get("h_codex", 0) & ~curses.A_DIM) | curses.A_BOLD
     _COLOR["herdr_on"] = _COLOR.get("soft", 0)
     _COLOR["grp"] = _COLOR.get("soft", 0) | curses.A_BOLD  # group card title
     _COLOR["grp_live"] = _COLOR.get("green", 0)
@@ -509,6 +506,7 @@ def _init_colors():
                     "c": _palette_fg("cyan", curses.COLOR_CYAN),
                     "m": _palette_fg("magenta", curses.COLOR_MAGENTA),
                     "o": _palette_fg("orange", curses.COLOR_YELLOW),
+                    "p": _palette_fg("steward_pink", curses.COLOR_MAGENTA),
                     "l": _palette_fg("blue", curses.COLOR_BLUE)}
             n_pair = 20
             for tch, lvl in _TINT_LVL.items():
@@ -7464,7 +7462,7 @@ def _snapshot_line(segs, colored=False, colors=256):
     for text, key in segs:
         piece = _plain([(text, key)])
         if key == "tag_steward":
-            style = "\033[1;38;5;0;48;5;219m" if colors >= 256 else "\033[1;30;47m"
+            style = "\033[1;38;5;219m" if colors >= 256 else "\033[1;35m"
             piece = style + piece + "\033[0m"
         elif key in {"gpu_legacy", "gpu_legacy_active"}:
             style = "\033[38;5;137m" if colors >= 256 else "\033[33m"

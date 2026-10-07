@@ -318,10 +318,34 @@ def _delivery_open(jobs, meta: dict) -> bool:
     return False
 
 
+def _route_open(jobs, meta: dict) -> bool:
+    """An acknowledged terminal attempt can still own an unfinished route."""
+    route, digest, _ = route_identity(meta)
+    filename = meta.get("owner_route_file") or meta.get("route_file")
+    try:
+        if meta.get("worker_type") == "owner" and meta.get("owner_route_file"):
+            # Follow the existing verified owner generation, not an old closed anchor.
+            from owner_route_binding import resolve_owner_route_lifecycle
+            binding, status = resolve_owner_route_lifecycle(jobs, owner_attempt_id=meta["attempt_id"])
+            if binding is None or status not in {"owner-route-launch-binding",
+                    "owner-route-post-launch-attachment", "owner-route-advance-current"}:
+                return False
+            filename, route, digest = binding.route_file, binding.route_id, binding.route_hash
+        if not filename:
+            return False
+        path = Path(filename)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return (isinstance(value, dict) and value.get("route_id") == route
+                and value.get("route_hash") == digest
+                and not os.path.lexists(path.with_suffix(".outcome.json")))
+    except Exception:  # noqa: BLE001 - unreadable identity grants no new ownership
+        return False
+
+
 def current_bindings(harness: str, sid: str, jobs=None) -> list:
-    """The live depth-1 attempts ``sid`` answers for: those it registered and those handed to it,
-    whatever harness registered them.  A finished one counts only while its completion record
-    is still open.  ``harness`` is kept for callers; ownership alone decides."""
+    """The depth-1 attempts ``sid`` answers for, whatever harness registered them.
+    A finished one counts while its route or completion record is still open.
+    ``harness`` is kept for callers; ownership alone decides."""
     jobs = jobs or _default_jobs()
     if jobs is None or not Path(jobs).is_file():
         return []
@@ -329,9 +353,10 @@ def current_bindings(harness: str, sid: str, jobs=None) -> list:
     for aid, (status, meta) in latest_rows(jobs).items():
         if not eligible_row(meta):
             continue
-        if status not in OPEN_ROW_STATUSES and not (status == "done" and _delivery_open(jobs, meta)):
-            continue
         if not owns(meta, sid, jobs):
+            continue
+        if status not in OPEN_ROW_STATUSES and not (status == "done" and
+                (_delivery_open(jobs, meta) or _route_open(jobs, meta))):
             continue
         found.append(binding_of(jobs, meta))
     return found[-MAX_BINDINGS:]
@@ -401,7 +426,7 @@ def record_retire_handover(predecessor_sid: str, predecessor_harness: str, succe
     """Hand a retired predecessor's routes to its seat successor, across harnesses.
 
     Called after ``peer-steward retire`` proved the predecessor exited and the caller runs in the
-    pane started beside it.  The predecessor's live depth-1 attempts (registered or inherited)
+    pane started beside it.  The predecessor's unfinished depth-1 work (registered or inherited)
     are bound to the successor in the successor's seat: one ledger row, whose bindings name the
     registered parent their pending records stay stored under, and the seat's snapshot (now
     naming the successor) that lets :func:`effective_parent` find it.  Registry rows are untouched.

@@ -13,6 +13,7 @@ from fleet import render  # noqa: E402
 class MutedPaletteTest(unittest.TestCase):
     def test_256_color_palette_is_low_chroma(self):
         self.assertEqual(render._MUTED_256, {
+            "steward_pink": 219,
             "orange": 137,
             "soft": 253,
             "green": 150,
@@ -29,6 +30,9 @@ class MutedPaletteTest(unittest.TestCase):
             self.assertEqual(render._palette_fg("green", 2), 150)
             self.assertEqual(render._palette_fg("blue", 4), 147)
             self.assertEqual(render._palette_fg("orange", 3), 137)
+            self.assertEqual(render._palette_fg("steward_pink", 5), 219)
+            self.assertNotEqual(render._palette_fg("steward_pink", 5), render._palette_fg("soft", 7))
+            self.assertNotEqual(render._palette_fg("steward_pink", 5), render._palette_fg("yellow", 3))
 
     def test_low_color_terminal_keeps_native_fallback(self):
         with mock.patch.object(render.curses, "COLORS", 8, create=True):
