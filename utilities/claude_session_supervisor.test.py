@@ -117,8 +117,26 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                                 'execution_surface=registered-headless,registered_worker=1,'
                                 'launch_started=1,attempt_id=att-child-retry,'
                                 'parent_attempt_id=att-parent\\n')
+                launch_race = os.environ.get('FAKE_LAUNCH_STARTED_RACE') == '1'
+                if launch_race and not resume:
+                    # Registered now, fenced start published a moment after this turn ends.
+                    import subprocess
+                    jobs = os.environ['FAKE_JOBS']
+                    row = ('2026-08-11T00:00:0{n}Z\\topen\\t/repo\\t/wt\\tchild-race-{s}\\t'
+                           'attempt_schema_version=2,dispatch_depth=2,transport=headless,'
+                           'execution_surface=registered-headless,registered_worker=1,'
+                           'launch_started={n},attempt_id=att-child-race-{s},parent_attempt_id=att-parent\\n')
+                    with open(jobs, 'a', encoding='utf-8') as h:
+                        h.write(row.format(n=0, s='a') + row.format(n=0, s='b'))
+                    subprocess.Popen([sys.executable, '-c',
+                                      'import sys, time; time.sleep(0.3); '
+                                      'open(sys.argv[1], "a", encoding="utf-8").write(sys.argv[2])',
+                                      jobs, row.format(n=1, s='a') + row.format(n=1, s='b')],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
                 final_first = os.environ.get('FAKE_NO_CHILD') == '1'
-                text = ('runtime_wait: registered-children' if dry_first and not delivered
+                text = ('Started both children.' if launch_race and not resume
+                        else 'runtime_wait: registered-children' if dry_first and not delivered
                         else 'artifact: -\\nverdict: PASS\\nblocker: none'
                         if resume or final_first else 'runtime_wait: registered-children')
                 if os.environ.get('FAKE_BREAK_STATE_AUDIT') == '1':
@@ -1073,6 +1091,26 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             and row.get("state") == "registration-required"
             for row in rows
         ))
+
+    def test_turn_without_the_sentinel_settles_the_launch_started_race(self):
+        # Two children registered, their fenced start published just after the owner's turn
+        # ended without `runtime_wait`: the runtime waits for them, as Codex does.
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        command = self.command()
+        command[command.index("--join-interval") + 1] = "0.4"
+        result = subprocess.run(
+            command, input="initial assignment", text=True, capture_output=True, timeout=20,
+            env=self.child_env(FAKE_TRACE=str(self.trace), FAKE_LAUNCH_STARTED_RACE="1",
+                               FAKE_JOBS=str(self.jobs)))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(len([row for row in trace if row["event"] == "turn-start"]), 2)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertNotIn('"state": "registration-required"', result.stdout)
+        self.assertEqual([row["attempt_count"] for row in rows
+                          if row.get("type") == "dispatch.supervisor.launch-settled"], [2])
+        self.assertEqual([row["attempt_count"] for row in rows
+                          if row.get("type") == "dispatch.supervisor.parked"], [2])
 
     def test_started_child_is_collected_before_correcting_unstarted_sibling(self):
         pending = child_row().replace("att-child", "att-pending").replace("launch_started=1", "launch_started=0")

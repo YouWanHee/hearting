@@ -176,6 +176,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                         text = ('runtime_wait: registered-children' if dry_first and turns <= 2
                                 else 'artifact: -\\nverdict: PASS\\nblocker: none'
                                 if turns > 1 or final_first else 'runtime_wait: registered-children')
+                        if launch_race and turns == 1 and os.environ.get('FAKE_RACE_TEXT'):
+                            text = os.environ['FAKE_RACE_TEXT']
                         if os.environ.get('FAKE_BREAK_STATE_AUDIT') == '1':
                             state_path = os.environ['AGENT_DISPATCH_COMPLETION_STATE_FILE']
                             audit = state_path + '.transitions.jsonl'
@@ -776,9 +778,16 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(correction["state"], "registration-required")
 
     def test_runtime_wait_settles_launch_started_race_without_retry(self):
+        self._assert_launch_started_race_settles()
+
+    def test_turn_without_the_sentinel_settles_the_launch_started_race(self):
+        # Registered children are waited for whatever the turn ended with, as in Claude and OpenCode.
+        self._assert_launch_started_race_settles(FAKE_RACE_TEXT="Started both children.")
+
+    def _assert_launch_started_race_settles(self, **extra_env):
         self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
         result = self.run_supervisor(
-            FAKE_LAUNCH_STARTED_RACE="1", FAKE_JOBS=str(self.jobs)
+            FAKE_LAUNCH_STARTED_RACE="1", FAKE_JOBS=str(self.jobs), **extra_env
         )
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]

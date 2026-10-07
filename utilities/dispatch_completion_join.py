@@ -1160,6 +1160,36 @@ def partition_runtime_wait_children(
     return RuntimeWaitPartition(joinable, chain_pending, unstarted, refusal_settled, tuple(frontiers))
 
 
+def settle_runtime_wait_children(
+    jobs: Path, parent_attempt_id: str, delivered: set[str], *, join_interval: float,
+    route_id: str | None = None, route_hash: str | None = None,
+) -> tuple[list[ChildRow], bool]:
+    """Reread the exact registry through the register-to-start publication race.
+
+    Atomic reservation can become visible just before the fenced wrapper appends
+    ``launch_started=1``. Treating that single snapshot as register-only wakes
+    the model and invites a duplicate start, whatever the owner's turn ended
+    with. This bounded, lock-free settle window accepts only the existing
+    durable launch fence and otherwise leaves the normal correction path
+    unchanged. Every harness's owner supervisor uses it the same way.
+    """
+
+    timeout = min(max(join_interval * 5.0, 0.2), 5.0)
+    interval = min(max(join_interval / 10.0, 0.01), 0.1)
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = current_children(Path(jobs), parent_attempt_id, route_id=route_id, route_hash=route_hash)
+        new_attempts = {row.attempt_id for row in rows} - delivered
+        partition = partition_runtime_wait_children(
+            Path(jobs), parent_attempt_id, [row for row in rows if row.attempt_id in new_attempts], new_attempts)
+        if new_attempts and not partition.unstarted:
+            return rows, True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return rows, False
+        time.sleep(min(interval, remaining))
+
+
 def start_retry_prompt(attempts: set[str] | None = None) -> str:
     """Bounded same-session correction for a preview/register-only park."""
 
