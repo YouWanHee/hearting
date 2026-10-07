@@ -782,3 +782,44 @@ def bind_parent_completion_delivery(args: argparse.Namespace, *, probe) -> None:
 
 def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path, *, launch, annotate) -> None:
     parent_completion.launch_parent_completion_sidecar(args, jobs, launch=launch, annotate=annotate)
+
+
+def acquire_review_lease_after_claim(
+    args, jobs: Path, identity: dict[str, str], *,
+    detached, lease_held, acquire_admission, acquire_foreground_admission, lease_acquire,
+) -> dict[str, str]:
+    """The review lease for a just-claimed attempt; the wrapper passes its own
+    lifecycle constant and admission/probe/acquire functions, looked up in its
+    module at call time so the reviewer_report_binding mocks keep working."""
+    if not args.review_output:
+        return {}
+    binding = args.review_output_binding
+    budget = getattr(args, "watchdog_budget", None)
+    if budget is None:
+        raise ProducerError("review-watchdog-budget-missing")
+    witness_metadata = {
+        "attempt_id": args.attempt_id,
+        "review_cycle_id": binding["cycle_id"],
+        "review_governed_lease": "summary-flock-v1",
+        "review_governed_lease_nonce": args.review_governed_lease_nonce,
+    }
+    witness_unlocked = lambda: not lease_held(
+        Path(args.artifact_root), witness_metadata
+    )
+    if args.launch_lifecycle == detached:
+        handle = getattr(args, "review_watchdog_handle", None)
+        if handle is None:
+            raise ProducerError("review-watchdog-handle-missing")
+        return acquire_admission(
+            handle=handle, budget=budget, identity=identity,
+            root=Path(args.artifact_root), cycle_id=binding["cycle_id"],
+            attempt_id=args.attempt_id, review_output=binding["output_path"],
+            binding=binding, jobs=jobs, nonce=args.review_governed_lease_nonce,
+            lease_acquire=lease_acquire, witness_probe=witness_unlocked,
+        )
+    return acquire_foreground_admission(
+        budget=budget, identity=identity, root=Path(args.artifact_root),
+        cycle_id=binding["cycle_id"], attempt_id=args.attempt_id,
+        review_output=binding["output_path"], binding=binding, jobs=jobs,
+        lease_acquire=lease_acquire, witness_probe=witness_unlocked,
+    )
