@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -1442,6 +1443,69 @@ def no_arm_notice(payload: object, *, reason: str | None = None) -> int:
     return 2
 
 
+def _record_carrier_exit(claim: ArmClaim, observation: dict[str, Any]) -> None:
+    """Append diagnostics only; never replace an arm or affect its decision."""
+    for held in (claim, *claim.predecessors):
+        fd = -1
+        try:
+            row = {"schema": "carrier-exit/v1", "ended_at": datetime.now(timezone.utc).isoformat(),
+                   "attempt_id": held.attempt_id, "session_id": held.session_id,
+                   "arms": held.arms, "holder": list(held.holder), **observation}
+            raw = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+            fd = os.open(held.path.with_suffix(".exits.jsonl"),
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                os.write(fd, raw)
+        except (OSError, ValueError, TypeError):
+            pass
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def _observe_carrier(launch: Launch, claim: ArmClaim, payload: Any) -> int:
+    observation: dict[str, Any] = {"wait_state": "starting", "reason": "carrier-return",
+                                   "exit_code": 1, "exit_kind": "exception", "exit_text": ""}
+    holder = {"claim": claim}
+    handlers = {}
+
+    def terminated(signum, _frame):
+        observation.update(reason=f"signal:{signal.Signals(signum).name}",
+                           exit_code=-signum, exit_kind="signal", exit_text=str(signum))
+        _record_carrier_exit(holder["claim"], observation)
+        # Retain native signal termination and its raw subprocess return code.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            if signal.getsignal(signum) == signal.SIG_DFL:
+                handlers[signum] = signal.signal(signum, terminated)
+        except (OSError, ValueError):
+            pass
+    try:
+        code = _run_carrier(launch, claim, payload, observation, holder)
+        observation.update(exit_code=code, exit_kind="return", exit_text=str(code))
+        return code
+    except BaseException as exc:
+        observation.update(reason=f"exception:{type(exc).__name__}", exit_text=str(exc)[:2048])
+        if isinstance(exc, SystemExit):
+            observation["exit_code"] = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        elif isinstance(exc, KeyboardInterrupt):
+            observation["exit_code"] = 130
+        raise
+    finally:
+        _record_carrier_exit(holder["claim"], observation)
+        for signum, handler in handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+
+
 def main() -> int:
     try:
         payload: Any = json.load(sys.stdin)
@@ -1465,6 +1529,10 @@ def main() -> int:
         if resolved is None:
             return no_arm_notice(payload)
         launch, claim = resolved
+    return _observe_carrier(launch, claim, payload)
+
+
+def _run_carrier(launch, claim, payload, observation, holder) -> int:
     root = agent_home()
     readiness = root / "utilities" / "dispatch-attempt-ready.py"
     if not readiness.is_file():
@@ -1473,6 +1541,7 @@ def main() -> int:
         # see a whole home again (review R1 B3).
         settle_arm(claim, "lapsed")
         wait_state = "bridge-error"
+        observation.update(wait_state=wait_state, reason="readiness-helper-missing")
         state, message = classified_receipt(
             launch, wait_state, "readiness-helper-missing", root
         )
@@ -1489,6 +1558,7 @@ def main() -> int:
                 launch, readiness, gate_probe=lambda: _open_gate_pending(launch),
                 deadline=deadline,
             )
+            observation.update(wait_state=wait_state, reason=wait_reason)
             if wait_state in {"ready", "attention"}:
                 try:
                     successor = follow_replacement(launch, claim)
@@ -1501,10 +1571,12 @@ def main() -> int:
                     time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
                     continue
                 if isinstance(successor, ArmRefusal):
+                    observation["reason"] = successor.reason
                     settle_arm(claim, "ended" if successor.watched else "lapsed")
                     return 0 if successor.watched else no_arm_notice(payload, reason=successor.reason)
                 if successor is not None:
                     launch, claim = successor
+                    holder["claim"] = claim
                     continue  # Same deadline; one registry-bound successor only.
                 if _owner_status(launch) in {"open", "running"}:
                     # A transient attention (or a ready readout the current
@@ -1535,12 +1607,14 @@ def main() -> int:
                 launch, attempt_only=True, settle="sent-ambiguous", announced=announced
             )
             if notices:
+                observation.update(wait_state="gate", reason="human-gate-open")
                 code = emit_receipt("attention", gate_wake_message(launch, notices), block=False)
                 settle_arm(claim, "gate-wake-sent", gate_delivery_id=announced[0])
                 return code
             time.sleep(interval)
         if wait_state not in {"ready", "attention"}:
             settle_arm(claim, "lapsed")
+        observation.update(wait_state=wait_state, reason=wait_reason)
         state, message = classified_receipt(launch, wait_state, wait_reason, root)
         if state == "attention":
             try:
@@ -1568,6 +1642,7 @@ def main() -> int:
         # The window was cleared: the successor session re-armed this wait (or will receive the
         # durable record on its next prompt). This stale carrier must not speak into the new
         # conversation, and it leaves the record unclaimed for the session that now owns it.
+        observation["reason"] = "arm-not-held-or-handed-away"
         return 0
     block = _attention_has_open_child(message)
     if block:
@@ -1600,6 +1675,7 @@ def main() -> int:
         # Another carrier holds (or already acked) the durable record: the
         # completion is delivered by it, so this attempt is finished here --
         # and the recipient's gates are that carrier's (or the sweep's) too.
+        observation["reason"] = "completion-claim-unavailable"
         return _ended(claim, 0, terminal=True)
     exit_code = _emit_with_gates(launch, claim, state, message, block=False, owner_closed=True)
     try:

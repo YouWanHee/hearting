@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
@@ -2020,6 +2021,115 @@ class TransientAttentionCompletionTest(unittest.TestCase):
             code, out, err, wait = self._run(("attention", "terminal-failure-or-unclosed"))
         self.assertEqual(code, 2)
         self.assertEqual(self._arm_state(), "gate-wake-sent")
+
+
+class CarrierExitRecordTest(unittest.TestCase):
+    def setUp(self):
+        self.fixture = LosingCarrierLeavesGatesTest("runTest")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.path = rewake.arm_path(self.fixture.jobs, "att-owner-1")
+
+    def rows(self):
+        return [json.loads(line) for line in self.path.with_suffix(".exits.jsonl").read_text().splitlines()]
+
+    def test_normal_wake_keeps_original_exit_two_and_records_reason(self):
+        self.fixture._open_row()
+        self.fixture._close_and_materialize()
+        with mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.fixture.ANCESTRY):
+            code, out, err = self.fixture._run_main()
+        self.assertEqual(code, 2)
+        self.assertIn("Hearting dispatch requires attention", err)
+        self.assertTrue(out)
+        row, = self.rows()
+        self.assertEqual((row["wait_state"], row["reason"], row["exit_code"], row["exit_text"]),
+                         ("ready", "terminal-quiescent", 2, "2"))
+        self.assertEqual(row["arms"], 1)
+        self.assertEqual(row["holder"], rewake._read_arm(self.path)["holder"])
+        self.assertIsNotNone(datetime.fromisoformat(row["ended_at"]).tzinfo)
+
+    def test_timeout_and_bridge_error_keep_raw_reason_and_existing_outcome(self):
+        for wait_state in ("timeout", "bridge-error"):
+            with self.subTest(wait_state=wait_state):
+                self.fixture._open_row()
+                code, _out, _err = self.fixture._run_main_patched(
+                    wait_for_attempt=mock.Mock(return_value=(wait_state, "original probe detail")))
+                row = self.rows()[-1]
+                self.assertEqual((row["wait_state"], row["reason"], row["exit_code"]),
+                                 (wait_state, "original probe detail", code))
+                self.assertEqual(rewake._read_arm(self.path)["state"], "lapsed")
+                self.path.unlink()
+
+    def test_old_carrier_and_rearm_append_without_overwriting_current_arm(self):
+        self.path.parent.mkdir()
+        self.path.write_text('current successor arm\n')
+        before = self.path.read_bytes()
+        first = rewake.ArmClaim(self.path, "att-owner-1", "session-1", 1, ("7", "8", "ns"))
+        second = replace(first, arms=2, holder=("9", "10", "ns"))
+        rewake._record_carrier_exit(first, {"reason": "first", "exit_code": 0})
+        first_bytes = self.path.with_suffix(".exits.jsonl").read_bytes()
+        rewake._record_carrier_exit(second, {"reason": "second", "exit_code": 2})
+        self.assertTrue(self.path.with_suffix(".exits.jsonl").read_bytes().startswith(first_bytes))
+        self.assertEqual([(r["arms"], r["holder"][0]) for r in self.rows()], [(1, "7"), (2, "9")])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_exception_is_recorded_and_still_raised(self):
+        self.path.parent.mkdir()
+        claim = rewake.ArmClaim(self.path, "att-owner-1", "session-1", 1, ("7", "8", "ns"))
+        with mock.patch.object(rewake, "_run_carrier", side_effect=RuntimeError("raw failure")):
+            with self.assertRaisesRegex(RuntimeError, "raw failure"):
+                rewake._observe_carrier(rewake.Launch(claim.attempt_id, self.fixture.jobs, claim.session_id), claim, {})
+        row, = self.rows()
+        self.assertEqual((row["exit_kind"], row["reason"], row["exit_code"], row["exit_text"]),
+                         ("exception", "exception:RuntimeError", 1, "raw failure"))
+
+    def test_diagnostic_write_failure_never_changes_return_or_foreign_file(self):
+        self.path.parent.mkdir()
+        foreign = self.fixture.root / "foreign"
+        foreign.write_text("keep me")
+        self.path.with_suffix(".exits.jsonl").symlink_to(foreign)
+        claim = rewake.ArmClaim(self.path, "att-owner-1", "session-1", 1, ("7", "8", "ns"))
+        with mock.patch.object(rewake, "_run_carrier", return_value=2):
+            self.assertEqual(rewake._observe_carrier(rewake.Launch(claim.attempt_id, self.fixture.jobs, claim.session_id), claim, {}), 2)
+        self.assertEqual(foreign.read_text(), "keep me")
+
+    def test_term_and_hup_record_then_keep_native_signal_exit(self):
+        import select
+        import signal
+        import subprocess
+        script = '''import importlib.util, pathlib, signal, sys
+spec = importlib.util.spec_from_file_location("carrier_fixture", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+path = pathlib.Path(sys.argv[2])
+claim = mod.ArmClaim(path, "att-owner-1", "session-1", 1, ("7", "8", "ns"))
+def wait(*args):
+    print("ready", flush=True)
+    signal.pause()
+mod._run_carrier = wait
+mod._observe_carrier(mod.Launch(claim.attempt_id, path.parent.parent / "jobs.log", claim.session_id), claim, {})
+'''
+        self.path.parent.mkdir()
+        self.path.write_text("original arm")
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig):
+                proc = subprocess.Popen([sys.executable, "-c", script, str(MODULE_PATH), str(self.path)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertTrue(select.select([proc.stdout], [], [], 5)[0])
+                    self.assertEqual(proc.stdout.readline().strip(), "ready")
+                    proc.send_signal(sig)
+                    out, err = proc.communicate(timeout=5)
+                    self.assertEqual((proc.returncode, out, err), (-sig, "", ""))
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                row = self.rows()[-1]
+                self.assertEqual((row["exit_kind"], row["reason"], row["exit_code"]),
+                                 ("signal", f"signal:{sig.name}", -sig))
+                self.assertEqual(self.path.read_text(), "original arm")
 
 
 class DispatchOwnerRewakeMaterializeAbsenceTest(unittest.TestCase):
