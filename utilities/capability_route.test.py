@@ -7230,7 +7230,7 @@ class ComposeRouteTest(TestRoute):
  def test_lab_and_staged_answers_follow_declared_nodes(self):
   route=self.compose(capability="autopilot-lab",capability_mode="eval",graph="eval-run,metrics,report")
   answers=R.compose_observations(route)["pre_execution_answers"]
-  self.assertEqual(answers[1]["answer"],"예 (lab 경로)")
+  self.assertEqual(answers[1]["answer"],"예 (lab 실행 선언됨)")
   self.assertEqual(answers[2]["answer"],"예")
   self.assertEqual(answers[3]["answer"],"3개 선언됨")
   self.assertEqual(answers[4]["answer"],"해당 없음")
@@ -7336,6 +7336,7 @@ class ComposeRouteTest(TestRoute):
      route=self.compose(capability="autopilot-lab",capability_mode="eval",graph=graph,intensity=intensity,work_request=request)
      self.assertEqual(route["capability"],"autopilot-lab")
      self.assertEqual(route["capability_mode"],"eval")
+     self.assertIn("미확인",R.compose_observations(route)["pre_execution_answers"][1]["answer"])
      self.assertEqual(route["effective_intensity"],intensity)
      expected=graph.split(",")
      if intensity=="strong": expected.insert(expected.index("publish"),"independent-verify-alternative")

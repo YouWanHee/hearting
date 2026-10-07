@@ -4325,7 +4325,9 @@ def compose_observations(route):
     confirmation = {"method": "peer-notice" if peer and not external else "user-card", "origin": origin,
                     "meaning": "display only; existing approval and destructive/external/user-requested card exceptions remain"}
     nodes = [n for n in route.get("nodes", []) if not _frame_node(n)]
-    lab = route.get("capability") == "autopilot-lab" or any(str(n.get("part", "")).startswith("autopilot-lab:") for n in nodes)
+    lab_run = any(n.get("kind") == "resource-runner" and
+                  (route.get("capability") == "autopilot-lab" or
+                   str(n.get("part", "")).startswith("autopilot-lab:")) for n in nodes)
     selection = route.get("selection") or {}
     evidence = route.get("dispatch_evidence") or {}
     native = evidence.get("native_subagent")
@@ -4333,7 +4335,7 @@ def compose_observations(route):
     headless = bool(evidence.get("tuples") or route.get("registered_headless_candidates"))
     answers = [
         ("주 capability", route["capability"]),
-        ("새 실측", "예 (lab 경로)" if lab else "미확인 (작업 의미에 따름)"),
+        ("새 실측", "예 (lab 실행 선언됨)" if lab_run else "미확인 (작업 의미에 따름)"),
         ("standard+", "예" if route["effective_intensity"] in {"standard", "strong", "thorough", "adversarial"} else "아니오"),
         ("분리 단계", f"{len(nodes)}개 선언됨" if shape == "staged" else "frame 결정 대기" if shape == "framed" else "없음 (단일 실행)"),
         ("inline 예외", str(selection.get("inline_reason") or selection.get("selection_basis") or "미확인") if shape == "direct" else "해당 없음"),
