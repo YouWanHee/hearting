@@ -2660,8 +2660,8 @@ def _flush_delay_banner(ref, created):
 def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
     """Deliver this recipient's deferred rows before a new send.
 
-    Returns (flushed, stuck): flushed counts rows the receiver's hook marked
-    received after our resend; stuck lists (age_hours, from_name, ref) rows
+    Returns (flushed, stuck): flushed counts observed redeliveries closed
+    through the ordinary receive path; stuck lists (age_hours, from_name, ref) rows
     still pending older than _FLUSH_STUCK_HOURS so their senders learn on
     their next prompt. `skip` is (source_sha256, from_harness, from_sid) of
     this send: a row from the same sender with the same content is left to
@@ -2671,10 +2671,10 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
     without a live delivery claim go out -- `queued` rows were accepted
     somewhere already, `unverified` rows are ambiguous, and claimed rows may
     be moving on another path already (native queue, plugin pull); none of
-    those is retried. Codex targets keep their native-queue path only. A row
-    is never marked received here, never deleted, and every check -- entry
-    and per row -- uses the same state-gated form judgment as a send, so a
-    transcript quote can delay but never strand a row.
+    those is retried. Codex targets keep their native-queue path only. Each
+    row is claimed before input, never deleted, and an observed send closes
+    it without waiting for a receiver hook. An ambiguous send stays inflight
+    for the hook to acknowledge and is not blindly resubmitted.
     Rows older than _FLUSH_STUCK_HOURS go out intact preceded by a delay
     banner prompt (the seal pins the row text, so the banner is separate).
     Never raises; failures print to stderr and leave rows for a later prompt.
@@ -2706,7 +2706,7 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
     flushed = 0
     if t_harness == "codex":
         return flushed, stuck
-    entry_wait = entry_state in ("idle", "done")
+    recipient = {"harness": t_harness, "session_id": t_sid}
     rows.sort(key=lambda row: row.get("created") or 0)
     for row in rows[:_FLUSH_MAX_ROWS]:
         ref = row.get("ref")
@@ -2717,37 +2717,47 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
                     and (row.get("from") or {}).get("harness") == skip[1] \
                     and (row.get("from") or {}).get("session_id") == skip[2]:
                 continue
-            if _prompt_form_open(target, entry_state):
+            state, _pane = _agent_state(target)
+            if _prompt_form_open(target, state):
                 print("pending-flush-stopped target=%s reason=form-open" % target, file=sys.stderr)
                 break
-            text = row.get("text")
-            if not text:
+            current_harness, current_sid, _name = _resolve_target(target)
+            if (current_harness, current_sid) != (t_harness, t_sid):
+                break
+            row = peer_message.claim_pending_herdr(ref, recipient)
+            if row is None:
                 continue
+            text = row["text"]
             banner = _flush_delay_banner(ref, row.get("created"))
             if banner:
-                try:
-                    _herdr_prompt(target, banner, wait=entry_wait,
-                                  timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
-                except (OSError, subprocess.SubprocessError, ValueError):
-                    pass
-            rc, _payload = _herdr_prompt(target, text, wait=entry_wait,
-                                         timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
-            if rc is None or rc != 0:
+                banner_rc, _banner_payload = _herdr_prompt(
+                    target, banner, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+                if banner_rc != 0:
+                    peer_message.release_unsent_herdr_claim(row)
+                    continue
+                state, _pane = _agent_state(target)
+                if _prompt_form_open(target, state):
+                    peer_message.release_unsent_herdr_claim(row)
+                    break
+            sent_at = time.time()
+            rc, payload = _herdr_prompt(target, text, wait=state != "working",
+                                        timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+            if rc is None:
                 continue
-            deadline = time.monotonic() + _FLUSH_ROW_TIMEOUT_S
-            while time.monotonic() < deadline:
-                try:
-                    current = peer_message._read_pending(ref)
-                except (OSError, ValueError):
-                    break
-                if current is None or current.get("state") == "received":
-                    break
-                time.sleep(0.5)
-            try:
+            if rc == 0 and state != "working":
+                outcome, observed = "true", "state-flip"
+            elif rc == 0 or _herdr_error_reason(payload, rc) == "timeout":
+                _settle(target)
+                outcome, observed, _reason = _verify_after_send(
+                    target, text.splitlines()[0], t_harness, t_sid, sent_at)
+            else:
+                continue
+            if outcome == "true":
+                ack = peer_message.receive_peer_message(
+                    text, recipient, summary_text="herdr redelivery observed: " + observed)
                 current = peer_message._read_pending(ref)
-            except (OSError, ValueError):
-                current = None
-            if current is None or current.get("state") == "received":
+                if ack or not current or current.get("state") != "received":
+                    continue
                 flushed += 1
                 try:
                     age_h = (now - float(row.get("created") or now)) / 3600
@@ -2881,6 +2891,13 @@ def cmd_prompt(args):
         print("prompted=unverified reason=peer-pending-unavailable")
         return 5
     surface = "herdr"
+    claimed = None
+    if pending and t_harness != "codex" and not form_open:
+        try:
+            claimed = peer_message.claim_pending_herdr(
+                transfer_ref, {"harness": t_harness, "session_id": t_sid})
+        except (OSError, ValueError):
+            claimed = None
     if pending and t_harness == "codex":
         surface = "codex-queue"
         try:
@@ -2895,6 +2912,8 @@ def cmd_prompt(args):
                    "queued" if pending else "failed")
         verify = "private-pending" if pending else "none"
         reason = pending["receipt"] if pending and pending["state"] == "unverified" else "target-form-open"
+    elif pending and claimed is None:
+        outcome, verify, reason = "unverified", "private-pending", "peer-delivery-already-submitted"
     elif args.no_verify:
         state_before = "-"
         rc, _payload = _herdr_prompt(args.target, text, wait=False,
@@ -2931,6 +2950,10 @@ def cmd_prompt(args):
                         args.target, first, t_harness, t_sid, sent_at)
                 else:
                     outcome = "failed"
+    if claimed is not None and outcome == "true" and not args.no_verify:
+        peer_message.receive_peer_message(
+            text, {"harness": t_harness, "session_id": t_sid},
+            summary_text="herdr send observed: " + verify)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     ledger_status = _PROMPT_LEDGER_STATUS[outcome]
     # SD-122 (11): one ledger row per send, whatever happened -- target pane,

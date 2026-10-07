@@ -350,6 +350,38 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=()):
         return text, ref
 
 
+def claim_pending_herdr(ref, recipient):
+    """Reserve one exact deferred row before any pane input, using the existing claim state.
+
+    Other senders and native callbacks cannot submit it again once it is
+    unverified/inflight. An ambiguous send preserves the payload for actual
+    receiver acknowledgement rather than blindly typing it a second time.
+    """
+    if not _valid_transfer_endpoint(recipient):
+        return None
+    from dispatch_contract import process_start_ticks
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        if (not row or row["state"] != "pending" or row.get("rpc_claim")
+                or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id"))):
+            return None
+        claim = {"token": secrets.token_hex(16), "pid": os.getpid(),
+                 "start": process_start_ticks(os.getpid())}
+        _save_pending(dict(row, state="unverified", receipt="herdr-delivery-inflight", rpc_claim=claim))
+        return dict(row, rpc_claim=claim)
+
+
+def release_unsent_herdr_claim(row):
+    """Release this exact claim only when its caller has not submitted the message."""
+    with pending_lock(row["ref"]):
+        current = _read_pending(row["ref"])
+        if (not current or current["state"] != "unverified"
+                or current.get("rpc_claim") != row.get("rpc_claim")):
+            return False
+        _save_pending(dict(current, state="pending", rpc_claim=None, receipt="target-form-open"))
+        return True
+
+
 def deliver_pending_codex(ref, *, timeout=1.0):
     """Claim/publish briefly; all external RPC runs outside metadata locks."""
     from codex_queue_delivery import send_at_least_once, QueueDeliveryError
@@ -448,8 +480,15 @@ def usable_session_id(value):
 
 def _arrived_body_digests(text):
     """Digests the sealed body may have once it arrives: a runtime's input surface can add or
-    trim whitespace around a prompt (OpenCode appends a trailing space), never change it."""
-    return {hashlib.sha256(v.encode("utf-8")).hexdigest() for v in (text, text.rstrip(), text.strip())}
+    trim whitespace or wrap a Claude paste; the inner message must remain exact."""
+    variants = [text, text.rstrip(), text.strip()]
+    wrapped = re.fullmatch(
+        r'<pasted_content id="(?P<id>[^"\r\n]+)">\n?(?P<body>.*?)\n?'
+        r'</pasted_content(?: id="(?P=id)")?>', text.strip(), re.DOTALL)
+    if wrapped:
+        body = wrapped.group("body")
+        variants.extend((body, body.rstrip(), body.strip()))
+    return {hashlib.sha256(v.encode("utf-8")).hexdigest() for v in variants}
 
 
 def parse_peer_trailer(text, recipient=None, *, include_ref=False):
@@ -523,7 +562,8 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
             ref=[ref, *(pending.get("refs", []) if pending else [])] if ref else [], transfer_ref=ref,
             body_file=None, body_stdin=False, body_text=summary_text))
         if rc == 0 and pending:
-            _save_pending(dict(pending, state="received", text=None, rpc_claim=None))
+            _save_pending(dict(pending, state="received", text=None, rpc_claim=None,
+                               receipt="exact-peer-ref", received_at=time.time()))
         return rc
 
 
