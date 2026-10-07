@@ -95,6 +95,48 @@ class HookReleasePinningTest(unittest.TestCase):
                     self.assertEqual((result.returncode, result.stdout.strip()), (code, text))
 
 
+class CodexHookReleasePinningTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="codex-hook-release-pin-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.pinned = self.root / "pinned"
+        self.current = self.root / "home/.codex/hearting"
+        self.script = "stop-lifecycle.py"
+        for root in (self.pinned, self.current):
+            (root / "core").mkdir(parents=True)
+            (root / "core/CORE.md").write_text("fixture\n")
+            (root / "adapters/codex/hooks").mkdir(parents=True)
+        self.runner = self.pinned / "adapters/codex/hooks/run-hook.sh"
+        self.runner.write_bytes((ROOT / "adapters/codex/hooks/run-hook.sh").read_bytes())
+        bridge = self.current / "adapters/codex/hooks" / self.script
+        bridge.write_text("print('CURRENT_CODEX_BRIDGE_RAN')\nraise SystemExit(17)\n")
+        bridge.chmod(0o755)
+
+    def run_hook(self, root):
+        env = {**os.environ, "HOME": str(self.root / "home")}
+        env.pop("AGENT_HOME", None)
+        if root is not None:
+            env["AGENT_HOME"] = str(root)
+        return subprocess.run(["sh", str(self.runner), self.script], capture_output=True, text=True, env=env)
+
+    def test_valid_pinned_root_never_replaces_a_missing_bridge(self):
+        result = self.run_hook(self.pinned)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("CURRENT_CODEX_BRIDGE_RAN", result.stdout)
+        self.assertIn(str(self.pinned / "adapters/codex/hooks" / self.script), result.stderr)
+
+    def test_existing_bridge_and_unpinned_fallback_preserve_exit_codes(self):
+        for root in (None, self.root / "invalid"):
+            result = self.run_hook(root)
+            self.assertEqual((result.returncode, result.stdout.strip()), (17, "CURRENT_CODEX_BRIDGE_RAN"))
+        bridge = self.pinned / "adapters/codex/hooks" / self.script
+        bridge.write_text("print('PINNED_CODEX_BRIDGE_RAN')\nraise SystemExit(13)\n")
+        bridge.chmod(0o755)
+        result = self.run_hook(self.pinned)
+        self.assertEqual((result.returncode, result.stdout.strip()), (13, "PINNED_CODEX_BRIDGE_RAN"))
+
+
 class ClaudeWiringTest(WiringFixture):
     def test_settings_register_the_bridge_for_edits_and_bash(self):
         settings = json.loads((ROOT / "adapters/claude/settings.json").read_text())
