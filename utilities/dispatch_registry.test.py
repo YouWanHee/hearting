@@ -2814,6 +2814,13 @@ class OrphanReconcileTest(unittest.TestCase):
   applied=json.loads(self.invoke("reconcile","--attempt","att-owner-unstarted","--apply").stdout)
   self.assertEqual(applied["decisions"][0]["cascade"][0]["status"],"dead-parent-exited")
   self.assertIn("note=dead-parent-exited",self.jobs.read_text())
+  # Nothing ever ran, so its cleanup settles (BC rt-96bab699: it stayed process-identity-missing).
+  child=next(line for line in self.jobs.read_text().splitlines() if "att-child-unstarted" in line)
+  self.assertIn("launch_outcome=never-launched",child)
+  self.assertIn("failure_class=cancelled",child)
+  import dispatch_contract
+  meta=dispatch_contract.parse_registry_metadata(child.split("\t")[5])
+  self.assertEqual(dispatch_contract.attempt_process_quiescence(meta).state,"quiescent")
  def test_claimed_child_without_process_identity_remains_open(self):
   self.mark("plan")
   rows=[

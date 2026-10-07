@@ -68,6 +68,17 @@ def child_row(status: str = "open", harness: str = "claude") -> str:
     )
 
 
+def chain_successor_row(index: int) -> str:
+    """A serial sub-session registered up front and never started."""
+    return (
+        f"2026-07-23T00:00:0{index}Z\topen\t/repo\t/wt\tchain-{index}\t"
+        "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
+        "execution_surface=registered-headless,registered_worker=1,launch_claimed=0,"
+        f"session_chain_id=ssc-fixture,subsession_mode=serial,subsession_index={index},"
+        f"attempt_id=att-chain-{index},parent_attempt_id={PARENT}\n"
+    )
+
+
 class ClaudeSessionSupervisorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -1111,6 +1122,21 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
                           if row.get("type") == "dispatch.supervisor.launch-settled"], [2])
         self.assertEqual([row["attempt_count"] for row in rows
                           if row.get("type") == "dispatch.supervisor.parked"], [2])
+
+    def test_a_finished_owner_ends_without_starting_its_unstarted_chain(self):
+        # BC rt-96bab699: after a correction the owner reported its result; the successors it
+        # never started drew "rerun with --start" until the supervisor died. They close instead.
+        self.jobs.write_text(owner_row(self.lease) + chain_successor_row(2) + chain_successor_row(3),
+                             encoding="utf-8")
+        result = self.run_supervisor(FAKE_NO_CHILD="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("registration-required", result.stdout)
+        self.assertNotIn("runtime-wait-without-started-child", result.stdout)
+        rows = self.jobs.read_text(encoding="utf-8").splitlines()
+        for index in (2, 3):
+            row = next(line for line in rows if f"attempt_id=att-chain-{index}," in line + ",")
+            self.assertIn("\tdone\t", row)
+            self.assertIn("launch_outcome=never-launched", row)
 
     def test_started_child_is_collected_before_correcting_unstarted_sibling(self):
         pending = child_row().replace("att-child", "att-pending").replace("launch_started=1", "launch_started=0")

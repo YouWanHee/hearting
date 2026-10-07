@@ -2526,6 +2526,11 @@ def _close_cascade_child(
         if not selected_note:
             return False, "no-terminal-evidence"
         decision = {}
+        evidence = {
+            "classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
+            "parent_attempt_id": owner["meta"].get("attempt_id", ""),
+            "reconcile_reason": terminal_reason or "post-exit-child-cascade",
+        }
 
         def still_safe(_fields):
             fresh_rows = read_rows(args.jobs)
@@ -2578,6 +2583,10 @@ def _close_cascade_child(
             if fresh_category == "active":
                 decision["reason"] = "stronger-child-live-evidence"
                 return False
+            if state == "never-launched" and not fresh["meta"].get("launch_outcome"):
+                # Nothing ever ran (a serial successor registered up front, say), so nothing is
+                # left to clean up: the row says so and its cleanup settles.
+                evidence.update(launch_outcome="never-launched", failure_class="cancelled")
             return state in {"gone", "gone-pid-reused", "never-launched"}
 
         closed = close_attempt_row_if(
@@ -2585,11 +2594,7 @@ def _close_cascade_child(
             child_attempt,
             selected_note,
             still_safe,
-            evidence={
-                "classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
-                "parent_attempt_id": owner["meta"].get("attempt_id", ""),
-                "reconcile_reason": terminal_reason or "post-exit-child-cascade",
-            },
+            evidence=evidence,
             teardown_claim=teardown_claim,
         )
         if closed:
