@@ -9957,12 +9957,13 @@ def _close_route_argument(a):
     return str(path)
 
 
-def _legacy_inline_finish(a, route, route_file, api):
+def _legacy_inline_finish(a, route, route_file, api, entry_error=None):
     """Close a legacy inline-shaped route with the one `finish` command.
 
-    Only actual legacy inline shapes reach here: one inline depth-0
-    unregistered terminal node. Non-direct intensities stay refused by the
-    caller. The caller's identity, registry, cycle-local evidence and
+    The gate is the shape, not the intensity: one inline depth-0
+    unregistered terminal node has no stages to skip, so any intensity with
+    that shape is safe here. Anything else re-raises the entry refusal.
+    The caller's identity, registry, cycle-local evidence and
     already-closed checks run here exactly as `inline_finish.finish` runs
     them -- this path adds no bypass. Old explicit steps keep working.
     """
@@ -9973,6 +9974,8 @@ def _legacy_inline_finish(a, route, route_file, api):
             or nodes[0].get("dispatch_depth") != 0
             or nodes[0].get("registered_worker") is not False
             or nodes[0].get("terminal") is not True):
+        if entry_error is not None:
+            raise entry_error
         raise inline_finish.InlineFinishError("finish-inline-owner-sentinel-required")
     node, node_id = nodes[0], nodes[0].get("id")
     from dispatch_parent_completion import interactive_parent_identity
@@ -10016,13 +10019,8 @@ def _legacy_inline_finish(a, route, route_file, api):
     summary = (summary_text[0].strip() if summary_text and summary_text[0].strip() else f"legacy inline {node_id}")[:200]
     if not summary:
         raise SystemExit("completion summary missing")
-    attempt_id = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or f"{route.get('route_id')}-{node_id}-inline"
-    try:
-        depth = int(node.get("dispatch_depth"))
-    except (TypeError, ValueError):
-        depth = 0
-    explicit = {"attempt_schema_version": 2, "dispatch_depth": depth, "transport": "headless",
-                "execution_surface": "inline", "registered_worker": "0", "fallback_hop": "inline"}
+    attempt_id = None
+    explicit = None
     marker, _row = complete_node(route, node, node_id, evidence, jobs=None,
                                  attempt_id=attempt_id, explicit_attempt_metadata=explicit)
     outcome, _created = close_route(route, str(route_file), a.commit if getattr(a, "commit", None) else None,
@@ -10597,9 +10595,9 @@ def main():
         try:
             receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
         except inline_finish.InlineFinishError as exc:
-            if str(exc) != "finish-inline-owner-sentinel-required":
+            if str(exc) not in {"finish-route-not-direct", "finish-inline-owner-sentinel-required"}:
                 raise
-            receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__])
+            receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__], entry_error=exc)
         print(json.dumps(receipt,sort_keys=True))
     else:
         if a.command=="close":
