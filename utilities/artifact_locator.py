@@ -1355,3 +1355,63 @@ def find_path_by_id(root: Path, identifier: str) -> Optional[Path]:
 
 def resolve_path(root: Path, identifier: str) -> Optional[Path]:
     return locate(root, identifier)
+
+
+def resolve_historical(root, identifier, *, max_hops=8):
+    """Typed observational ID address. Never used by `locate` or writer helpers.
+
+    Committed relocation provenance may cross roots; every landed binding is
+    checked against the canonical ID. Source campaign IDs remain original IDs.
+    """
+    import artifact_cross_root_move as move
+    root = Path(root).resolve()
+    original = {"artifact_root": str(root), "campaign_id": None, "cycle_id": None, "locator": None}
+    current, requested = root, identifier
+    chain, seen = [], set()
+    cycle = str(identifier).startswith("cyc_")
+    for _ in range(max_hops):
+        key = (str(current), requested)
+        if key in seen:
+            raise LocatorError("historical-relocation-loop", str(key))
+        seen.add(key)
+        match = None
+        for path in sorted((current / move.JOURNALS).glob("*.json")):
+            move._safe(current, path)
+            journal = move._json(path)
+            if journal.get("state") != "committed" or journal.get("source_root") != str(current):
+                continue
+            item = next((row for row in journal["cycles"] if row["cycle_id"] == requested), None) if cycle else None
+            if item or (not cycle and journal.get("merge") and journal["source_campaign"] == requested):
+                if match:
+                    raise LocatorError("historical-relocation-ambiguous", requested)
+                match = (journal, item)
+        if match:
+            journal, item = match
+            if not chain:
+                original.update(campaign_id=journal["source_campaign"], cycle_id=requested if cycle else None,
+                    locator=item["source"] if item else str(Path(journal["source_campaign_path"]).parent))
+            chain.append({"operation_id": journal["operation_id"], "state": "committed"})
+            current = Path(journal["target_root"]).resolve()
+            requested = requested if cycle else journal["target_campaign"]
+            continue
+        if cycle:
+            record_path = current / ".runtime/artifact-producer/v1/cycles" / (requested + ".json")
+            move._safe(current, record_path)
+            record = move._json(record_path)
+            campaign_path, campaign_record = move._campaign(current, record["campaign_id"])
+            path = move._safe(current, campaign_path.parent / record["locator"])
+            binding = read_cycle_binding(path)
+            if not binding or binding.get("cycle_id") != requested or binding.get("campaign_id") != record["campaign_id"]:
+                raise LocatorError("historical-binding-invalid", requested)
+            canonical = {"artifact_root": str(current), "campaign_id": record["campaign_id"],
+                         "cycle_id": requested, "locator": str(path.relative_to(current))}
+        else:
+            campaign_path, campaign_record = move._campaign(current, requested)
+            canonical = {"artifact_root": str(current), "campaign_id": campaign_record["campaign_id"],
+                         "cycle_id": None, "locator": str(campaign_path.parent.relative_to(current))}
+        if not chain:
+            original = dict(canonical)
+        return {"resolution": "relocated" if chain else "present", "migration_state": "committed" if chain else None,
+                "original": original, "canonical": canonical, "provenance": chain,
+                "absolute": str(current / canonical["locator"])}
+    raise LocatorError("historical-relocation-chain-limit", identifier)

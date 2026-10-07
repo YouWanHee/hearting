@@ -1035,5 +1035,16 @@ class TestUpdateDocument(unittest.TestCase):
                       _codes(m.validate_update(after, preserved=[before], previous=before)))
 
 
+class CampaignSupersededFoldTest(unittest.TestCase):
+    def test_superseded_is_terminal_from_active_or_satisfied(self):
+        transition = {"event_type": "campaign.superseded", "actor": {"kind": "producer"}}
+        self.assertEqual(m.fold_campaign_closure([transition]).state, "superseded")
+        self.assertIsNotNone(m.fold_campaign_closure([transition, transition]).error)
+        satisfied = {"event_type": "campaign.satisfied", "actor": {"kind": "producer"}, "event_id": "old"}
+        self.assertEqual(m.fold_campaign_closure([satisfied, transition]).state, "superseded")
+        reopened = {"event_type": "campaign.reopened", "actor": {"kind": "producer"}, "payload": {"reopens_event_id": "old"}}
+        self.assertIsNotNone(m.fold_campaign_closure([transition, reopened]).error)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

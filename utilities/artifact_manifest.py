@@ -89,7 +89,7 @@ def fold_campaign_closure(events: Sequence[Mapping[str, Any]]) -> CampaignClosur
         payload = event.get("payload")
         payload = payload if isinstance(payload, Mapping) else {}
         if event_type == "campaign.satisfied":
-            if state == "satisfied":
+            if state in {"satisfied", "superseded"}:
                 return CampaignClosureFold(state, last_satisfied,
                                            ("campaign-event-transition-invalid", "satisfied-while-satisfied"))
             if not isinstance(actor, Mapping) or actor.get("kind") not in SATISFIED_ACTOR_KINDS:
@@ -110,6 +110,11 @@ def fold_campaign_closure(events: Sequence[Mapping[str, Any]]) -> CampaignClosur
                 return CampaignClosureFold(state, last_satisfied,
                                            ("campaign-event-transition-invalid", "reopened-actor-kind"))
             state = "active"
+        elif event_type == "campaign.superseded":
+            if state == "superseded" or not isinstance(actor, Mapping) or actor.get("kind") != "producer":
+                return CampaignClosureFold(state, last_satisfied,
+                                           ("campaign-event-transition-invalid", "superseded-transition"))
+            state = "superseded"
         else:
             return CampaignClosureFold(state, last_satisfied,
                                        ("campaign-event-transition-invalid", "unexpected-event-type"))
@@ -751,6 +756,15 @@ def _all_keys_str(value: Any) -> bool:
     return True
 
 
+def _v_relocation_provenance(value, path, violations):
+    # Campaign supersession is not a manifest close; an all-open stream has
+    # no source manifest. Its automatic journal is the actual provenance.
+    _check_closed_object(value, path, {
+        "source_root": _v_nonempty_str, "operation_id": _v_nonempty_str,
+        "algorithm_version": _v_str, "schema_version": _v_int, "source_digest": _v_digest,
+    }, {}, violations)
+
+
 def _v_event_row(value: Any, path: str, violations: List[Violation]) -> None:
     _check_closed_object(
         value,
@@ -763,7 +777,11 @@ def _v_event_row(value: Any, path: str, violations: List[Violation]) -> None:
             "target_id": _v_nonempty_str,
             "actor": _v_event_actor,
             "recorded_at": _v_rfc3339,
-            "provenance": _v_provenance,
+            "provenance": (_v_relocation_provenance if isinstance(value, dict)
+                           and value.get("event_type") == "campaign.superseded"
+                           and isinstance(value.get("payload"), dict)
+                           and value["payload"].get("contract") == "artifact-campaign-closure/v2"
+                           else _v_provenance),
             "evidence_ids": _v_list_of_str,
             "payload": _v_event_payload,
         },
@@ -804,6 +822,15 @@ def _v_array(item_validator):
     return validator
 
 
+def _v_manifest_relocation(value, path, violations):
+    _check_closed_object(value, path, {
+        "operation_id": _v_nonempty_str, "source_root": _v_nonempty_str,
+        "source_repository_id": _v_typed_id("repository"),
+        "source_artifact_root_id": _v_typed_id("artifact_root"),
+        "historical_root_ids": _v_array(_v_typed_id("artifact_root")),
+    }, {}, violations)
+
+
 _TOP_REQUIRED = {
     "schema_version": _v_literal(SCHEMA_VERSION),
     "manifest_kind": _v_literal(MANIFEST_KIND),
@@ -827,7 +854,7 @@ def validate_shape(document: Any) -> ValidationReport:
     violations: List[Violation] = []
     if not isinstance(document, dict):
         return _report([Violation("shape-not-object", "$", "document must be an object")])
-    _check_closed_object(document, "$", _TOP_REQUIRED, {}, violations)
+    _check_closed_object(document, "$", _TOP_REQUIRED, {"relocation": _v_manifest_relocation}, violations)
     _check_no_float(document, "$", violations)
     return _report(violations)
 
@@ -1080,7 +1107,8 @@ def validate_lineage(
             )
 
     for i, row in enumerate(routes):
-        if row.get("artifact_root_id") is not None and row.get("artifact_root_id") != top_root_id:
+        if (row.get("artifact_root_id") is not None and row.get("artifact_root_id") != top_root_id
+                and row.get("artifact_root_id") not in (document.get("relocation") or {}).get("historical_root_ids", [])):
             violations.append(
                 Violation(
                     "route-root-id-mismatch",
@@ -1628,8 +1656,12 @@ def validate_update(
             elif changed[0].get("terminal_evidence_id") != terminal_events[0].get("event_id"):
                 violations.append(Violation("update-completion-event-binding-invalid", "$.routes",
                                             "the terminal route row must name its appended event"))
+    relocation = document.get("relocation") or {}
+    moving_root = (relocation.get("source_artifact_root_id") == previous.get("artifact_root_id")
+                   and relocation.get("source_repository_id") == previous.get("repository_id")
+                   and previous.get("artifact_root_id") in relocation.get("historical_root_ids", []))
     for key in ("manifest_id", "artifact_root_id", "repository_id"):
-        if previous.get(key) != document.get(key):
+        if previous.get(key) != document.get(key) and not (key != "manifest_id" and moving_root):
             violations.append(Violation(
                 "update-identity-changed", "$.%s" % key, "a refresh keeps the manifest identity"))
     if violations:
