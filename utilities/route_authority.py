@@ -436,9 +436,29 @@ RELAUNCH_STABLE_KEYS = (
 )
 
 
-def granted_permissions(applied) -> dict:
-    """``applied_permissions`` without the values the launcher's location decides."""
-    return {key: value for key, value in (applied or {}).items() if key not in LAUNCH_LOCATION_VALUES}
+# A path into the harness's own tree inside a permission value (`<root>/utilities/...`).
+_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:utilities|adapters|hooks|tools)/")
+RELEASE_ROOT_TOKEN = "<launch_home>"
+
+
+def granted_permissions(applied, launch_home=None) -> dict:
+    """``applied_permissions`` without the values the launcher's location decides.
+
+    With ``launch_home`` (the release the launch ran from), a path into the harness's own tree
+    reads the same however its root was spelled: that release directory, or a pointer such as
+    ``<share>/hearting/current`` (which may point at a newer release by now). The spelling
+    depends only on how the launcher was invoked, and the release is ``launch_home``'s axis."""
+    granted = {key: value for key, value in (applied or {}).items() if key not in LAUNCH_LOCATION_VALUES}
+    if not launch_home:
+        return granted
+    text = json.dumps(granted, sort_keys=True)
+    home = os.path.realpath(str(launch_home))
+    roots = {root for root in _RELEASE_TREE_PATH.findall(text)
+             if root == str(launch_home) or os.path.realpath(root) == home
+             or os.path.isfile(os.path.join(root, "core", "CORE.md"))}
+    for root in sorted(roots, key=len, reverse=True):
+        text = re.sub(r"(?<![^\s\"'(])" + re.escape(root) + "/", RELEASE_ROOT_TOKEN + "/", text)
+    return json.loads(text)
 
 
 # A sealed fact and the same value computed again now. The release a launch ran from is where it
@@ -495,8 +515,8 @@ def release_moved(sealed: dict, current: dict, *, managed_release) -> frozenset:
 def same_sealed_work(previous, current) -> bool:
     """Whether two sealed launch inputs describe the same work with the same granted permissions."""
     return (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
-            and granted_permissions(previous.get("applied_permissions"))
-            == granted_permissions(current.get("applied_permissions")))
+            and granted_permissions(previous.get("applied_permissions"), previous.get("launch_home"))
+            == granted_permissions(current.get("applied_permissions"), current.get("launch_home")))
 
 
 # ---------------------------------------------------------------------------

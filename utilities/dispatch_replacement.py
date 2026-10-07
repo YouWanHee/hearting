@@ -1170,9 +1170,10 @@ def _check_tuple(candidate, replay, transition=None, access=None):
                 continue  # the one lower launch the frame rule allows
             if not (drift and key in RUNTIME_DERIVED_KEYS):
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'resolved')
-    # Where the replacement's launcher runs is not a permission change (route_authority).
-    granted = route_authority.granted_permissions(candidate.get('applied_permissions'))
-    sealed = route_authority.granted_permissions(replay.get('applied_permissions'))
+    # Where the replacement's launcher runs, and how it spelled its release, is not a permission
+    # change (route_authority).
+    granted = route_authority.granted_permissions(candidate.get('applied_permissions'), candidate.get('launch_home'))
+    sealed = route_authority.granted_permissions(replay.get('applied_permissions'), replay.get('launch_home'))
     if access:
         # The access request the claim recorded replaces the source's, and what realizes it.
         if (granted.get('execution_access') or {}).get('request_sha256') != access['request_sha256']:
