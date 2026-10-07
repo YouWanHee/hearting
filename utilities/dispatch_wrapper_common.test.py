@@ -338,6 +338,33 @@ class ReviewLeaseTest(unittest.TestCase):
                     # called (the reviewer_report_binding pattern).
                     with mock.patch.object(wrapper, "review_governed_lease_is_held", return_value=True):
                         self.assertFalse(acquire.call_args.kwargs["witness_probe"]())
+class ModelPolicyTest(unittest.TestCase):
+    def test_model_policy_reads_the_wrappers_harness_and_error(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(C, "resolve_config", return_value=({"a": "b"}, None)) as resolve:
+                    self.assertEqual(wrapper._model_policy(), {"a": "b"})
+                self.assertEqual(resolve.call_args.args[0], harness)
+                with mock.patch.object(C, "resolve_config", side_effect=C.ModelConfigError("x")):
+                    with self.assertRaises(wrapper.ModelSelectionError) as caught:
+                        wrapper._model_policy()
+                self.assertEqual(caught.exception.reason, "dispatch-model-policy-unavailable")
+
+    def test_require_headless_model_uses_the_wrappers_policy_and_error(self):
+        from unittest import mock
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                with mock.patch.object(C, "headless_model_refusal", return_value=("r", "m")):
+                    with self.assertRaises(wrapper.ModelSelectionError) as caught:
+                        wrapper._require_headless_model("m", "src")
+                self.assertEqual((caught.exception.reason, caught.exception.args[0]), ("r", "m"))
+                with mock.patch.object(wrapper, "_model_policy", return_value={}) as policy, \
+                     mock.patch.object(C, "headless_model_refusal", return_value=None):
+                    wrapper._require_headless_model("m", "src")
+                policy.assert_called_once_with()
 
 
 class RegistrationFenceTest(unittest.TestCase):
