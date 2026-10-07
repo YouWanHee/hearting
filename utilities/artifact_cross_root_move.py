@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from contextlib import contextmanager
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import fcntl
 import hashlib
@@ -58,32 +59,42 @@ def _campaign(root, selector):
 def tree(path):
     """Content inventory without dereferencing any symlink (including directories)."""
     rows = {}
+    files = []
     def visit(node, rel):
         mode = node.lstat().st_mode
         if stat.S_ISLNK(mode):
             rows[rel] = {"kind": "symlink", "target": os.readlink(node)}
         elif stat.S_ISREG(mode):
-            digest = hashlib.sha256()
-            before = node.lstat()
-            fd = os.open(node, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd, "rb") as stream:
-                opened = os.fstat(stream.fileno())
-                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-                    _error("payload replaced during read: " + str(node))
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-                after = os.fstat(stream.fileno())
-            signature = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-            if signature(before) != signature(node.lstat()) or signature(opened) != signature(after):
-                _error("payload changed during read: " + str(node))
-            rows[rel] = {"kind": "file", "bytes": after.st_size, "sha256": digest.hexdigest()}
+            files.append((node, rel))
         elif stat.S_ISDIR(mode):
             rows[rel] = {"kind": "directory"}
             for child in sorted(node.iterdir()):
                 visit(child, str(Path(rel) / child.name) if rel else child.name)
         else:
             _error("special payload: " + str(node))
+    def read_file(item):
+        node, rel = item
+        digest = hashlib.sha256()
+        before = node.lstat()
+        fd = os.open(node, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                _error("payload replaced during read: " + str(node))
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+            after = os.fstat(stream.fileno())
+        signature = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        if signature(before) != signature(node.lstat()) or signature(opened) != signature(after):
+            _error("payload changed during read: " + str(node))
+        return rel, {"kind": "file", "bytes": after.st_size, "sha256": digest.hexdigest()}
     visit(Path(path), "")
+    if len(files) > 1:
+        # Bound I/O fan-out; every read retains the same identity/stability checks.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows.update(pool.map(read_file, files))
+    elif files:
+        rows.update([read_file(files[0])])
     return rows
 
 
