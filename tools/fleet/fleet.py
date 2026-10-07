@@ -209,6 +209,24 @@ def _arm_stall_dump():
         faulthandler.register(signal.SIGUSR1, file=handle, all_threads=True, chain=False)
     except (OSError, RuntimeError, ValueError):
         handle.close()
+        _discard_empty(path)
+        return
+
+    def _on_exit():
+        # A dump is evidence and stays. A file nobody dumped into is only the
+        # arming: left behind, every fleet run adds one more to the temp dir.
+        _discard_empty(path)
+
+    import atexit
+    atexit.register(_on_exit)
+
+
+def _discard_empty(path):
+    try:
+        if os.path.getsize(path) == 0:
+            os.unlink(path)
+    except OSError:
+        pass
 
 
 def main(argv=None):
