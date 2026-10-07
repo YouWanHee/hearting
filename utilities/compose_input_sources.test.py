@@ -152,6 +152,15 @@ class SealedSourceTest(SourceBase):
         for field in ("model_profile", "profile_selection", "profile_demand"):
             self.assertEqual(self.node(route, "execute").get(field), self.node(baseline, "execute").get(field))
 
+    def test_a_plan_check_without_its_plan_node_reviews_the_sealed_earlier_plan(self):
+        prior = self.cycle()
+        route = self.compose(graph="plan-check,execute,test,report", parent_cycle_id=prior["cycle_id"])
+        check = self.node(route, "plan-check")
+        self.assertIn("plan.md", check["input_sources"])
+        import review_input
+        candidate = review_input.resolve_input(route, check, self.root / "jobs.log")      # no --reviewed-evidence
+        self.assertEqual(candidate["path"], str((Path(prior["cycle_dir"]) / "artifacts" / "plan.md").resolve()))
+
     def test_a163_3a_campaign_latest_cycle_is_the_source(self):
         self.cycle(files=("a/plan.md",))
         latest = self.cycle(files=("plan.md",))

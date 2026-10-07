@@ -2222,7 +2222,8 @@ def cmd_run(args):
     else:
         print(f"started {run_id} on {name}")
         if watching:
-            print("  done: this session gets one notice when it ends")
+            print("  done: " + ("the route's parent session" if (meta.get("provenance") or {}).get("notify")
+                                else "this session") + " gets one notice when it ends")
         print(f"  log:  {run_dir / 'log'}")
         print(f"  tail: compute-hosts tail {run_id}")
     return 0
@@ -2232,16 +2233,56 @@ COMPLETION_WATCH_SECONDS = 14 * 24 * 3600
 COMPLETION_POLL_SECONDS = 60
 
 
-def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Popen):
-    """Watch for this run's exit code and tell the launching session once (audit §4 #18).
+def route_parent_session(route_id, jobs):
+    """`{harness, id}` of the session that started this route's owner (its newest owner row in
+    the jobs registry), or None when the registry names none."""
+    found = None
+    try:
+        from dispatch_contract import parse_registry_metadata
+        lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ImportError):
+        return None
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        meta = parse_registry_metadata(fields[5])
+        if (meta.get("worker_type") == "owner" and route_id in (meta.get("owner_route_id"), meta.get("route_id"))
+                and meta.get("parent_harness") and meta.get("parent_sid")):
+            found = {"harness": meta["parent_harness"], "id": meta["parent_sid"]}
+    return found
 
-    Only an interactive (dispatch-depth-0) launch in one known harness session is
-    watched; a registered worker's own flow tracks its runs. Returns whether a watch
-    was started. Never refuses the launch.
+
+def _spawn_completion_watch(run_dir, meta, *, environ=None, spawn=subprocess.Popen):
+    """Watch for this run's exit code and tell one session once (audit §4 #18, settlement I4).
+
+    An interactive (dispatch-depth-0) launch tells its own session. A registered owner or
+    worker's launch inside a route tells the session that started the route's owner (its
+    parent in the jobs registry), recorded in the run's meta as `notify`. Returns whether a
+    watch was started. Never refuses the launch.
     """
     env = os.environ if environ is None else environ
-    session = (meta.get("provenance") or {}).get("session")
-    if not session or str(env.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
+    provenance = meta.get("provenance") or {}
+    session = provenance.get("session")
+    if str(env.get("AGENT_DISPATCH_DEPTH") or "0") != "0":
+        route = provenance.get("route") or {}
+        jobs = env.get("AGENT_DISPATCH_JOBS")
+        if not jobs:
+            try:
+                from dispatch_contract import stable_state_root
+                jobs = stable_state_root(env) / "jobs.log"
+            except Exception:  # noqa: BLE001 -- no registry, no parent to tell
+                return False
+        session = route_parent_session(route.get("route_id"), jobs) if route.get("route_id") else None
+        if not session:
+            return False
+        provenance["notify"] = session
+        try:
+            (Path(run_dir) / "meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError:
+            return False
+    if not session:
         return False
     try:
         with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as out:
@@ -2268,13 +2309,16 @@ def cmd_watch_run(args, *, sleep=time.sleep, now=time.time):
     except (OSError, ValueError):
         return 0
     provenance = meta.get("provenance") or {}
-    session, route = provenance.get("session") or {}, provenance.get("route") or {}
+    route = provenance.get("route") or {}
+    session = provenance.get("notify") or provenance.get("session") or {}
     if not session.get("harness") or not session.get("id"):
         return 0
     run_id = meta.get("run_id") or run_dir.name
     stop = _read_stop_reason(run_dir)
     text = (f"run {run_id} on {meta.get('host', '-')} ended with exit {code}"
             + (f" ({stop})" if stop else "")
+            + (f"; started by attempt {provenance.get('attempt_id')} in route {route.get('route_id')}"
+               if provenance.get("notify") else "")
             + f"; read it with: compute-hosts tail {run_id}")
     here = str(Path(__file__).resolve().parent)
     if here not in sys.path:

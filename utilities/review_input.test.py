@@ -63,6 +63,21 @@ class ReviewInputTest(unittest.TestCase):
         self.assertEqual(self.jobs.read_bytes(), b'')
         self.assertFalse((self.root / 'review-inputs').exists())
 
+    def test_producerless_review_reads_the_plan_compose_sealed_from_an_earlier_cycle(self):
+        earlier = self.root / 'campaigns' / 'c' / 'cyc' / 'artifacts' / 'plans'
+        earlier.mkdir(parents=True)
+        (earlier / 'plan.md').write_text('the earlier cycle plan')
+        route = dict(self.route, artifact_root=str(self.root))
+        node = dict(self.node, inputs=['plan.md', 'checklist.md'],
+                    input_sources={'plan.md': {'cycle_id': 'cyc', 'path': 'campaigns/c/cyc/artifacts/plans/plan.md'}})
+        candidate = R.resolve_input(route, node, self.jobs)
+        self.assertEqual(candidate['path'], str((earlier / 'plan.md').resolve()))
+        self.assertEqual(candidate['sha256'], hashlib.sha256(b'the earlier cycle plan').hexdigest())
+        self.assertEqual(R.resolve_input(route, node, self.jobs, self.evidence)['path'],
+                         str(self.evidence.resolve()))                 # an explicit file still wins
+        (earlier / 'plan.md').unlink()
+        self.assert_reason('reviewed-evidence-unreadable', R.resolve_input, route, node, self.jobs)
+
     def test_parallel_review_identity_uses_unit_not_literal_node_name(self):
         node = dict(self.node, id='plan-review-alternative')
         self.assertTrue(R.is_review_node(node))

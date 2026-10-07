@@ -3722,7 +3722,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     if unassigned and (campaign_key is not None or parent_cycle_id is not None):
         raise ValueError("compose-campaign-selection-conflict:--unassigned excludes --campaign-key and --parent-cycle")
     if campaign_key is None and parent_cycle_id is None and not unassigned:
-        raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root))
+        raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root, cwd))
     if tracking is None:
         tracking = "tracked" if shape in ("staged", "framed") or resume_graph else "untracked"
     gate = {
@@ -4103,7 +4103,38 @@ def compose_campaign_summaries(artifact_root):
         return None
 
 
-def compose_campaign_hint(artifact_root):
+CWD_CAMPAIGN_SCAN_ROUTES = 100
+CWD_CAMPAIGN_KEYS_SHOWN = 3
+
+
+def cwd_campaign_keys(artifact_root, cwd, rows=None):
+    """The active work streams of this folder, newest first: the campaign keys of the newest
+    routes under the artifact root that were sealed for `cwd` (at most `CWD_CAMPAIGN_SCAN_ROUTES`
+    route files are read, and the scan stops at `CWD_CAMPAIGN_KEYS_SHOWN` keys)."""
+    rows = compose_campaign_summaries(artifact_root) if rows is None else rows
+    active = {r.get("key") for r in rows or [] if r.get("state") == "active"} - {None, "_unassigned"}
+    here, keys = os.path.realpath(str(cwd)), []
+    try:
+        with os.scandir(canonical_routes_dir(artifact_root)) as entries:
+            files = sorted((entry for entry in entries if entry.name.startswith("rt-") and entry.name.endswith(".json")),
+                           key=lambda entry: entry.stat().st_mtime, reverse=True)[:CWD_CAMPAIGN_SCAN_ROUTES]
+    except OSError:
+        return []
+    for path in files:
+        if len(keys) >= CWD_CAMPAIGN_KEYS_SHOWN:
+            break
+        try:
+            route = json.loads(Path(path.path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        key = route.get("campaign_key") if isinstance(route, dict) else None
+        if (key in active and key not in keys and isinstance(route.get("cwd"), str)
+                and os.path.realpath(route["cwd"]) == here):
+            keys.append(key)
+    return keys
+
+
+def compose_campaign_hint(artifact_root, cwd=None):
     rows = compose_campaign_summaries(artifact_root)
     if rows is None:
         shown = "unavailable (campaign scan failed)"
@@ -4112,7 +4143,9 @@ def compose_campaign_hint(artifact_root):
         shown = ", ".join(f"{r['key']}({r['cycle_count']})" for r in keyed[:COMPOSE_CAMPAIGN_LIST_CAP])
         if len(keyed) > COMPOSE_CAMPAIGN_LIST_CAP:
             shown += f", … +{len(keyed) - COMPOSE_CAMPAIGN_LIST_CAP}"
-    return (f"name the work stream with --campaign-key <existing|new> (active: {shown or 'none'}); "
+    here = cwd_campaign_keys(artifact_root, cwd, rows) if cwd is not None and rows is not None else []
+    return ((f"this folder's streams: {', '.join(here)}; " if here else "")
+            + f"name the work stream with --campaign-key <existing|new> (active: {shown or 'none'}); "
             "--unassigned keeps the work in the root's degraded _unassigned container")
 
 
@@ -10108,6 +10141,13 @@ def main():
             a.campaign_key=_session_campaign_key(artifact_root)
             if a.campaign_key:
                 print(f"campaign_key_default={a.campaign_key} source=this-session-latest-route",file=sys.stderr)
+            else:
+                # A session's first compose joins this folder's one active stream; with several, the
+                # refusal names them first.
+                here=cwd_campaign_keys(artifact_root,cwd)
+                if len(here)==1:
+                    a.campaign_key=here[0]
+                    print(f"campaign_key_default={a.campaign_key} source=this-folder-only-active-stream",file=sys.stderr)
         elif a.campaign_key is not None:
             a.campaign_key,given=compose_resolve_campaign_key(artifact_root,a.campaign_key)
             if given is not None:
