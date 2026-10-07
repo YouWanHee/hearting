@@ -205,5 +205,51 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     self.assertLessEqual(sum(render._dw(t) for t, _ in framed[0]), width)
 
 
+    def test_declared_progress_stays_on_the_resource_row_in_every_view(self):
+        self.attach()
+        progress = {"completed": 12, "total": 50, "unit": "epoch", "age_s": 120}
+        for process in (False, True):
+            render.set_process_view(process)
+            for layout, width in (("wide", 168), ("narrow", 80), ("stack", 60)):
+                with self.subTest(process=process, width=width):
+                    self.resource.progress = None
+                    baseline = render._build_lines([], [self.owner], "both", width < 80, 0,
+                        layout=layout, term_width=width, resources=[self.resource], governor=None)
+                    self.resource.progress = progress
+                    actual = render._build_lines([], [self.owner], "both", width < 80, 0,
+                        layout=layout, term_width=width, resources=[self.resource], governor=None)
+                    self.assertEqual(len(actual), len(baseline))
+                    line = next(line for line in actual if line and "resource eval-run" in flatten([line]))
+                    self.assertIn("2m ago", flatten([line]))
+                    self.assertIn("working  6h 50m", flatten([line]))
+                    if width >= 80:
+                        self.assertIn("12/50 epoch", flatten([line]))
+                    self.assertLessEqual(sum(render._dw(t) for t, _ in line), width)
+                    self.assertEqual(flatten(actual).count("2m ago"), 1)
+
+    def test_counter_without_total_and_old_age_do_not_change_resource_state(self):
+        self.attach()
+        self.resource.progress = {"completed": 12, "unit": "item", "age_s": 9900}
+        text = flatten(render._resource_child_rows(self.owner, term_width=168))
+        self.assertIn("12 item · 2h 45m ago", text)
+        self.assertEqual(self.resource.liveness, "working")
+        self.assertEqual(self.owner.resource_wait["state"], "resource-parked")
+        self.resource.progress = None
+        self.assertNotIn("ago", flatten(render._resource_child_rows(self.owner, term_width=168)))
+
+    def test_long_counter_unit_keeps_age_and_row_width(self):
+        self.attach(resources=[replace(self.resource, node="very-long-resource-node-" * 8)])
+        self.owner.resource_children[0].progress = {"completed": 1234567890,
+            "total": 1234567890, "unit": "한글" * 20, "age_s": 120}
+        for width in (60, 80, 168):
+            with self.subTest(width=width):
+                rows = render._resource_child_rows(self.owner, term_width=width, in_card=True)
+                self.assertEqual(len(rows), 1)
+                self.assertIn("2m ago", flatten(rows))
+                self.assertIn("working  6h 50m", flatten(rows))
+                self.assertLessEqual(sum(render._dw(t) for t, _ in rows[0]),
+                                     render._dispatch_box_width(width) - 1)
+
+
 if __name__ == "__main__":
     unittest.main()

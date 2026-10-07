@@ -4262,6 +4262,29 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
                         summary_ts=getattr(job, "summary_ts", None))
 
 
+def _resource_progress_tail(child, room=None):
+    """Format only the shared reader's normalized counters, on the existing row."""
+    progress = getattr(child, "progress", None)
+    if not isinstance(progress, dict):
+        return ""
+    try:
+        count = str(progress["completed"])
+        if "total" in progress:
+            count += "/" + str(progress["total"])
+        count += " " + progress["unit"]
+        age_s = progress["age_s"]
+        age = fmt_min(int(age_s / 60)) if age_s >= 60 else "%ds" % int(age_s)
+        suffix = " · %s ago" % age.strip()
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ""
+    if room is not None:
+        count_room = room - _dw(suffix)
+        if count_room < 1:
+            return ""
+        count = _clip_w(count, count_room)
+    return count + suffix
+
+
 def _resource_child_rows(job, term_width=None, depth=1, in_card=False):
     """Observed resource children, never log-parsed progress or model dispatch rows."""
     rows = []
@@ -4274,6 +4297,16 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False):
         glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
         node = child.route_node or child.node or child.run_id
         tail = "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min))
+        # Keep the existing liveness/elapsed and at least a short node label;
+        # narrow widths clip the counter text before its update age, never wrap.
+        progress_room = (width - _dw(indent + glyph + " resource " + tail)
+                         - min(12, _dw(str(node))) - 2) if width else None
+        progress = _resource_progress_tail(child, progress_room)
+        if not progress and width and getattr(child, "progress", None):
+            progress = _resource_progress_tail(
+                child, width - _dw(indent + glyph + " resource " + tail) - 3)
+        if progress:
+            tail += "  " + progress
         budget = max(1, width - _dw(indent + glyph + " resource " + tail)) if width else 44
         rows.append([(indent, None), (glyph, key), (" resource ", "dim"),
                      (_clip_w(str(node), budget), "name_dim"), (tail, "dim")])
