@@ -45,9 +45,29 @@ class ProbeCommandAndSessionEvidenceTest(unittest.TestCase):
         self.assertNotRegex(text, r"[\x00-\x1f\x7f]")
 
         long = ns["command_text"]([("가" * 200).encode()])
-        self.assertLessEqual(sum(2 if ord(char) > 127 else 1 for char in long), 160)
+        self.assertLessEqual(sum(2 if ord(char) > 127 else 1 for char in long), 4096)
         argv = ns["command_text"]([str(index).encode() for index in range(80)])
         self.assertNotIn(" 32 ", " " + argv + " ")
+
+    def test_long_interpreter_and_script_survive_collection_then_render_by_filename(self):
+        ns = _probe_namespace()
+        prefix = "/home/nas/user/Uihyeop/NN_Zoo/TF-Rehancer_artifacts/envs/private_unity_" + "x" * 96
+        script = prefix + "/scripts/private_unity_train.py"
+        words = [prefix + "/bin/python", script, "--epochs", "100", "--config", "/cfg/final.yaml"]
+        raw = b"\0".join(word.encode() for word in words) + b"\0"
+        self.assertLess(len(raw), 4096)
+        ns["proc_stat"] = mock.Mock(return_value={"ppid": 1, "start": 44})
+        ns["same_euid"] = mock.Mock(return_value=True)
+        with mock.patch.object(ns["Path"], "open", return_value=io.BytesIO(raw)):
+            command = ns["process_command"](7, 44, "python")
+        self.assertIn(script, command)
+        self.assertTrue(command.endswith("--epochs 100 --config /cfg/final.yaml"))
+        for width in (60, 100, 168):
+            rows = render._gpu_process_rows({"processes": [{"pid": 7, "command": command}]}, "", width)
+            shown = render._plain(rows[0])
+            self.assertIn("private_unity_train.py", shown)
+            self.assertIn("final.yaml", shown)
+            self.assertLessEqual(render._dw(shown), width)
 
     def test_command_read_is_same_euid_pid_start_safe_and_fail_soft(self):
         ns = _probe_namespace()
