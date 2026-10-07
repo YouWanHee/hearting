@@ -2202,25 +2202,19 @@ def enrich(sess, tick=None):
         # `[xx]` badge is minted from the thread id. Deterministic, so nothing is stored.
         from fleet.session_handle import minted_tag
         sess.session_tag = minted_tag(sess.session_id)
-        native_title = _displayable_title(_thread_titles(home).get(sess.session_id))
         sidecar_title = _displayable_title(
-            titles.fresh_title(sess.session_id, harness="codex")
+            titles.last_title(sess.session_id, harness="codex")
         )
-        sess.title = sidecar_title or native_title or sess.title
-        # F-99a ① Codex runtime_name = latest thread_name (Q-2: automatic titles land
-        # in the same field, so a user-set name is honestly indistinguishable — always
-        # treated as ①). Falls to the ② hearting session-name registry only when Codex
-        # has never named the thread.
-        runtime_name = _thread_runtime_names(home).get(sess.session_id)
-        if isinstance(runtime_name, str) and runtime_name.strip():
-            sess.runtime_name = runtime_name.strip()
-        else:
-            try:
-                from fleet.session_handle import resolve_display_inputs
-                sess.runtime_name = resolve_display_inputs(
-                    "codex", sess.session_id).get("runtime_name")
-            except Exception:
-                pass
+        sess.title = sidecar_title
+        # Codex thread_name also carries automatic first-message titles and has
+        # no user/derived marker. Only the explicit Hearting name registry can
+        # override a Fleet subject; automatic native titles must not mask it.
+        try:
+            from fleet.session_handle import resolve_display_inputs
+            sess.runtime_name = resolve_display_inputs(
+                "codex", sess.session_id).get("runtime_name")
+        except Exception:
+            sess.runtime_name = None
         sess.summary, sess.summary_ts = titles.fresh_summary_with_ts(
             sess.session_id, harness="codex",
             after_offset=_latest_user_message_offset(path),
@@ -2240,7 +2234,7 @@ def enrich(sess, tick=None):
         attempt_sid = titles.attempt_sid(getattr(sess, "attempt_id", None))
         if attempt_sid:
             if not sess.title:
-                sess.title = titles.fresh_title(attempt_sid, harness="codex")
+                sess.title = titles.last_title(attempt_sid, harness="codex")
             if not sess.summary:
                 sess.summary, sess.summary_ts = titles.fresh_summary_with_ts(
                     attempt_sid, harness="codex")

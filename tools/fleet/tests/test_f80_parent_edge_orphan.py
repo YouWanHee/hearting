@@ -463,7 +463,7 @@ class RenderConsumesLedgerTest(unittest.TestCase):
         # Happy-path regression: the ledger must not get in the way of the ordinary
         # visible-parent nesting path.
         parent = Session(harness="claude", pid=1, cwd="/work/live", session_id="sid-p",
-                         slug="live-parent", liveness="working")
+                         slug="live-parent", title="live-parent", liveness="working")
         job = DispatchJob(key="code", slug="live-child", cwd="/work/live",
                           parent_sid="sid-p", is_child=True, harness="claude",
                           liveness="working")
@@ -510,13 +510,14 @@ class L3EnvSidRecoveryTest(unittest.TestCase):
 
     def test_tap_hit_wins_over_env_recovery(self):
         from fleet.collectors import claude
-        # title set so the unrelated provenance() best-effort lookup (also read_environ-based,
-        # gated on "no title yet") does not confound the assertion below — this test's only
+        # Successful Fleet title so the unrelated provenance() best-effort lookup
+        # (also read_environ-based, gated on "no title yet") does not confound this test's only
         # subject is whether L3's OWN read_environ call for CLAUDE_CODE_SESSION_ID fires.
         sess = Session(harness="claude", pid=424243, cwd="/work/worker", session_id=None,
                        proc_start="777", title="already-titled")
         with mock.patch.object(claude, "read_registry", return_value=None), \
              mock.patch.object(claude, "_tap_sid_by_pid", return_value="sid-from-tap"), \
+             mock.patch("fleet.titles.last_title", return_value="already-titled"), \
              mock.patch.object(claude.procscan, "read_environ") as mock_env:
             claude.enrich(sess)
         self.assertEqual(sess.session_id, "sid-from-tap")

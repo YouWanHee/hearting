@@ -36,6 +36,7 @@ import routing_config
 import report_bundle_config
 import memory_sync_config
 import compute_hosts_config
+import fleet_config
 import user_config
 import host_probes
 import node_runtime
@@ -395,6 +396,8 @@ def cmd_install(args):
                 "detail": bundle_config["status"],
             })
         inventory = compute_hosts_config.ensure(dry_run=args.dry_run)
+        fleet_preferences = fleet_config.ensure(dry_run=args.dry_run)
+        lines.append("fleet-config: " + fleet_preferences["status"] + " " + fleet_preferences["path"])
         lines.append("compute-hosts-config: " + inventory["status"] + " " + inventory["path"])
         checks.append({
             "id": "compute-hosts-config.inventory",
@@ -511,6 +514,7 @@ def cmd_verify(args):
     if not bundle_config["ok"]:
         ok = False
     for surface_id, check_id in (("compute-hosts", "compute-hosts-config.inventory"),
+                                 ("fleet", "fleet-config.language"),
                                  ("memory-sync", "memory-sync-config.policy")):
         row = user_config.status([surface_id])[0]
         all_checks.append({
@@ -1286,6 +1290,10 @@ def cmd_runtime(args):
             )
             for report in reports:
                 report["report_bundle_config"] = bundle_config
+            fleet_preferences = fleet_config.ensure()
+            lines.append("fleet-config: " + fleet_preferences["status"] + " " + fleet_preferences["path"])
+            for report in reports:
+                report["fleet_config"] = fleet_preferences
     except runtime_activation.ActivationError as exc:
         rollback_errors = []
         for snapshot in reversed(snapshots):

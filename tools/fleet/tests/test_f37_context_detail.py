@@ -156,7 +156,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                                  LEAD + EMPTY * BASE + "   —")
 
     def test_hot_context_stays_visible_without_integrated_alert(self):
-        session = self._session(slug="hot", ctx_pct=85)
+        session = self._session(slug="hot", title="hot", ctx_pct=85)
         visible = text(render._build_lines([session], [], "fleet", False, 0,
                                            layout="wide", term_width=168))
         self.assertNotIn("⚠ context", visible)

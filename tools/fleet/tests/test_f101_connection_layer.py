@@ -419,12 +419,14 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):
+            # Fixed successful subjects keep this connection-layer golden
+            # independent of title generation/failure fallback policy.
             beta = Session(harness="codex", pid=1, cwd="/x/beta", slug="beta",
-                           session_id="b1", liveness="working", elapsed_min=7)
+                           session_id="b1", title="beta", liveness="working", elapsed_min=7)
             alpha = Session(harness="claude", pid=2, cwd="/x/alpha", slug="alpha",
-                            session_id="a1", liveness="idle", elapsed_min=5)
+                            session_id="a1", title="alpha", liveness="idle", elapsed_min=5)
             gamma = Session(harness="opencode", pid=3, cwd="/x/gamma", slug="gamma",
-                            session_id="g1", liveness="done", elapsed_min=9)
+                            session_id="g1", title="gamma", liveness="done", elapsed_min=9)
             lines = render._build_lines([beta, alpha, gamma], [], "fleet", False, 0,
                                         layout="wide", term_width=width)
         return "\n".join(_lines_text(lines))

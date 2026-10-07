@@ -247,9 +247,9 @@ class TagChipReplacesCompanionTest(unittest.TestCase):
         self.assertIn("[fb]", txt)
 
     def test_display_name_precedence_is_unchanged_by_the_chip(self):
-        """The chip is additive: the F-99 name chain still decides the name zone."""
+        """The chip remains visible when no Fleet title has succeeded yet."""
         self.assertEqual(render._session_name(self._derived()), "a real title")
-        self.assertEqual(render._session_name(self._derived(title=None)), "hearting-fb")
+        self.assertEqual(render._session_name(self._derived(title=None)), "")
         self.assertEqual(render._session_name(self._derived(runtime_name="mine")), "mine")
 
     def test_session_serializes_the_new_fields(self):

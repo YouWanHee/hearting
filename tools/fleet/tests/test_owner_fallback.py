@@ -68,6 +68,7 @@ class OwnerFallbackTest(unittest.TestCase):
         work = self._route_projection()
         parent = self._session("sid-parent", "parent", work)
         unrelated = self._session("sid-unrelated", "unrelated", work)
+        parent.title, unrelated.title = "parent", "unrelated"
         recovered = self._stage(parent.session_id, work=work)
 
         rendered = self._render([parent, unrelated], [recovered])
@@ -125,6 +126,7 @@ class OwnerFallbackTest(unittest.TestCase):
     def test_child_summary_count_and_process_full_dag_are_preserved(self):
         work = self._route_projection("rt-preserve")
         parent = self._session("sid-parent", "parent", work)
+        parent.title = "parent"
         stage = self._stage(parent.session_id, work=work)
         group = self._render([parent], [stage])
         self.assertIn("parent", group)

@@ -267,7 +267,7 @@ class Session:
     # --- enrichment (None = harness doesn't expose it → render '—') ---
     session_id: Optional[str] = None
     slug: Optional[str] = None
-    title: Optional[str] = None        # harness session title (ai-title/DB title) — render name zone only, slug fallback when None
+    title: Optional[str] = None        # last successful Fleet subject title; native titles are not fallbacks
     model: Optional[str] = None
     effort: Optional[str] = None
     # The runtime DID report an effort token, but it was the uninformative

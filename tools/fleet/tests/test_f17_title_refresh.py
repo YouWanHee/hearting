@@ -244,27 +244,27 @@ class PriorityTest(_ConfigHomeMixin, unittest.TestCase):
         claude.enrich(sess)
         self.assertEqual(sess.title, "Sidecar Title")
 
-    def test_priority_sidecar_stale_falls_to_ai_title(self):
+    def test_priority_stale_success_is_retained(self):
         home = os.environ["CLAUDE_CONFIG_DIR"]
         self._make_transcript(home, "/proj/b", "sidB", "AI Title Fallback")
         titles.write("sidB", "Stale Sidecar", now=time.time() - 25 * 3600)
         sess = self._sess("/proj/b", "sidB")
         claude.enrich(sess)
-        self.assertEqual(sess.title, "AI Title Fallback")
+        self.assertEqual(sess.title, "Stale Sidecar")
 
-    def test_priority_no_sidecar_uses_ai_title(self):
+    def test_priority_no_sidecar_leaves_title_blank(self):
         home = os.environ["CLAUDE_CONFIG_DIR"]
         self._make_transcript(home, "/proj/c", "sidC", "Only AI Title")
         sess = self._sess("/proj/c", "sidC")
         claude.enrich(sess)
-        self.assertEqual(sess.title, "Only AI Title")
+        self.assertIsNone(sess.title)
 
     def test_priority_all_absent_title_none_slug_fallback(self):
         sess = self._sess("/proj/d-empty", "sidD")
         claude.enrich(sess)
         self.assertIsNone(sess.title)
 
-    def test_sidecar_malformed_falls_through(self):
+    def test_sidecar_malformed_leaves_title_blank(self):
         home = os.environ["CLAUDE_CONFIG_DIR"]
         self._make_transcript(home, "/proj/e", "sidE", "Fallback After Bad Sidecar")
         p = titles.sidecar_path("sidE")
@@ -273,7 +273,7 @@ class PriorityTest(_ConfigHomeMixin, unittest.TestCase):
             f.write("{broken")
         sess = self._sess("/proj/e", "sidE")
         claude.enrich(sess)
-        self.assertEqual(sess.title, "Fallback After Bad Sidecar")
+        self.assertIsNone(sess.title)
 
     def test_slug_never_overwritten(self):
         home = os.environ["CLAUDE_CONFIG_DIR"]

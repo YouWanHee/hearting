@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import claude_settings_config
 import compute_hosts_config
+import fleet_config
 import memory_sync_config
 import paths
 import report_bundle_config
@@ -45,6 +46,13 @@ def _models_conf(runtime):
 
 
 SURFACES = (
+    {
+        "id": "fleet",
+        "title": "Fleet title language",
+        "seeded_by": "harness install (auto language, once)",
+        "when_absent": "title uses NOW's operator-language selection",
+        "validate": fleet_config.validate,
+    },
     {
         "id": "compute-hosts",
         "title": "compute-host inventory",

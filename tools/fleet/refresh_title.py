@@ -3,7 +3,7 @@
 
 The worker reads a Claude, Codex, or OpenCode transcript tail, normalizes visible
 user/assistant
-text, asks a no-tools low-cost model for a short English title, validates it, and
+text, asks a no-tools low-cost model for a short operator-language title, validates it, and
 writes fleet-owned neutral state. The default provider preserves the existing
 ``claude -p --model haiku --disallowedTools ...`` security contract.
 
@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback is fail-closed belo
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-from fleet import titles  # noqa: E402
+from fleet import config, titles  # noqa: E402
 _UTILITIES = Path(__file__).resolve().parents[2] / "utilities"
 if str(_UTILITIES) not in sys.path:
     sys.path.insert(0, str(_UTILITIES))
@@ -52,7 +52,9 @@ ANCHOR_TEXT_CAP = 2000
 TITLE_MAXLEN = 40
 TITLE_MAX_WORDS = 6
 SUMMARY_MAXLEN = 120
-MAX_SCAN = 1 << 20
+# Tool-heavy native transcripts can put the most recent dialogue beyond 1 MiB.
+# Expand only an empty window; model input remains capped at TEXT_CAP.
+MAX_SCAN = 4 << 20
 WORKER_TIMEOUT = 60
 DEBOUNCE_SEC = 600
 WORKING_DEBOUNCE_SEC = 120
@@ -112,8 +114,10 @@ You have no tools; do not attempt shell commands, file operations, or network re
 === END CONVERSATION ===
 
 Output exactly two lines:
-TITLE: the dominant CURRENT topic in the recent CONVERSATION, at task/cycle altitude — English,
-3-6 words, never more than 40 characters. Use TASK CONTEXT and PRIOR TITLE only as reference.
+TITLE: the dominant CURRENT topic in the recent CONVERSATION, at task/cycle altitude, in {title_lang}.
+In English use 3-6 words, never more than 40 characters. For Korean, Japanese or Chinese,
+use a compact subject phrase of at most 20 characters; do not pad it to an English word count.
+Use TASK CONTEXT and PRIOR TITLE only as reference.
 Name the concrete body of work currently discussed, not what it happens to be doing at this moment and not a generic
 category. Never describe status or progress: words such as awaiting, waiting,
 pending, running, idle, blocked, preparing, starting, resuming, monitoring, or "in
@@ -157,6 +161,14 @@ def _now_lang():
     return _LANG_WORDS.get(code, "")
 
 
+def _title_lang():
+    language = config.title_language()
+    if language.lower() == "auto":
+        language = _now_lang() or "the conversation's own language"
+    aliases = {"en": "English", "한국어": "Korean", "日本語": "Japanese", "中文": "Chinese"}
+    return aliases.get(language.lower(), _LANG_WORDS.get(language.lower(), language))
+
+
 def _prior_title_block(prior_title):
     """The prior-title stanza, or ``""`` when there is nothing to carry forward.
 
@@ -172,9 +184,10 @@ def _prior_title_block(prior_title):
     return PRIOR_TITLE_TEMPLATE.format(prior_title=line)
 
 
-def _prompt(delta, prior_title=None, anchor=""):
+def _prompt(delta, prior_title=None, anchor="", title_lang=None):
     return PROMPT_TEMPLATE.format(
         delta=delta, anchor=anchor, now_lang=_now_lang() or "the conversation's own language",
+        title_lang=title_lang or _title_lang(),
         prior_title_block=_prior_title_block(prior_title))
 
 _TITLE_LINE_RE = re.compile(r"^\s*TITLE\s*:\s*(.*)$", re.IGNORECASE)
@@ -299,7 +312,7 @@ def _origin_text(raw, harness="claude"):
     fallback = ""
     codex_user = ""
     saw_role = False
-    for line in raw[:ANCHOR_SCAN_CAP].splitlines():
+    for line in raw[:MAX_SCAN].splitlines():
         if not line.strip():
             continue
         try:
@@ -338,9 +351,14 @@ def read_origin(transcript, harness="claude"):
             size = handle.tell()
             if size <= ANCHOR_SCAN_CAP:
                 return head_context
-            handle.seek(max(0, size - ANCHOR_SCAN_CAP))
-            tail = handle.read(ANCHOR_SCAN_CAP).decode("utf-8", "replace")
-            return _origin_text(tail, harness) or head_context
+            window = ANCHOR_SCAN_CAP
+            while True:
+                handle.seek(max(0, size - window))
+                tail = handle.read(min(window, size)).decode("utf-8", "replace")
+                context = _origin_text(tail, harness)
+                if context or window >= min(MAX_SCAN, size):
+                    return context or head_context
+                window = min(window * 4, MAX_SCAN, size)
     except OSError:
         return ""
 
@@ -590,8 +608,8 @@ def read_opencode_delta(db_path, session_id, last_cursor=0, table=None, connecti
         return "", int(last_cursor or 0), table
 
 
-def validate_title(raw):
-    """Validate provider stdout as one short, mostly-ASCII title.
+def validate_title(raw, language="English"):
+    """Validate a short subject title under the configured language's limits.
 
     Prefers a labeled ``TITLE:`` line (the current two-line contract); falls back to
     the raw text's first non-blank line when no label is present, so an older/custom
@@ -610,13 +628,24 @@ def validate_title(raw):
         return None
     line = line.strip('"“”\'`').rstrip(".。").strip()
     line = "".join(ch for ch in line if ch.isprintable())
-    if len(line) > TITLE_MAXLEN:
-        line = line[:TITLE_MAXLEN].rstrip()
+    cjk = language.lower() in ("korean", "japanese", "chinese") or (
+        language == "the conversation's own language"
+        and bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]", line)))
+    limit = 20 if cjk else TITLE_MAXLEN
+    if len(line) > limit:
+        line = line[:limit].rstrip()
     if not line:
         return None
     ascii_ratio = sum(1 for ch in line if ord(ch) < 128) / len(line)
-    if (ascii_ratio < 0.8 or len(line.split()) < 3
+    english = language.lower() == "english" or (
+        language == "the conversation's own language" and ascii_ratio >= 0.8)
+    scripts = {"korean": r"[\uac00-\ud7a3]", "japanese": r"[\u3040-\u30ff\u3400-\u9fff]",
+               "chinese": r"[\u3400-\u9fff]"}
+    script = scripts.get(language.lower())
+    if ((english and (ascii_ratio < 0.8 or len(line.split()) < 3))
+            or (script and not re.search(script, line))
             or len(line.split()) > TITLE_MAX_WORDS or _META_RE.match(line)
+            or re.match(r"^(제목 없음|알 수 없|죄송|오류|대기\s*중|진행\s*중|실행\s*중|준비\s*중|작업\s*중)", line)
             or _STATUS_TITLE_RE.match(line)):
         return None
     return line
@@ -1743,11 +1772,12 @@ def main(argv=None):
             return 0
 
         provider_box = {}
+        title_lang = _title_lang()
         output = run_worker(
-            _prompt(delta, prior_title=previous_title, anchor=anchor),
+            _prompt(delta, prior_title=previous_title, anchor=anchor, title_lang=title_lang),
             capacity_held=True, label=args.sid, provider_box=provider_box,
         )
-        title = validate_title(output)
+        title = validate_title(output, language=title_lang)
         if title and title.lower() == "untitled":
             title = None
         summary = validate_summary(_labeled_line(output, _NOW_LINE_RE))
