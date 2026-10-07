@@ -389,6 +389,112 @@ class TestSupervisorAdvance(WorkflowFixture):
             arm_path.write_text(json.dumps(armed))
         return route, path, jobs, registry, output
 
+    def _late_resource_artifacts_fixture(self):
+        import dispatch_resource_wait as OWNER_RESOURCE
+        route, path, jobs, registry, output = self._resume_fixture(ordinary=True)
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        row["parent_attempt_id"] = "att-parent"
+        registry.write_text(json.dumps({"runs": {"fixture-run": row}}))
+        ledger = SUP.ledger_for(route, jobs)
+        arm_path = ledger.root / "armed/full-run.json"
+        armed = json.loads(arm_path.read_text())
+        armed["resource_binding"] = OWNER_RESOURCE.resource_body_digest(row)
+        arm_path.write_text(json.dumps(armed))
+        producer = output / "run.json"
+        original = producer.read_bytes()
+        producer.unlink()
+        self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halt-missing-artifact")
+        return route, path, jobs, registry, ledger, producer, original
+
+    def _settle_resource_owner(self, route, path, jobs, *, passed=True):
+        import dispatch_terminal_commit as terminal
+        from types import SimpleNamespace
+        request = terminal.TerminalCommitRequest(path, "att-parent", jobs, self.base)
+        gates = {node: {"passed": passed} for node in WS.route_terminal_nodes(route)}
+        with mock.patch.object(terminal, "_completion_request", return_value=request), \
+                mock.patch.object(terminal.dispatch_contract, "attempt_process_quiescence",
+                                  return_value=SimpleNamespace(state="quiescent")), \
+                mock.patch.object(terminal, "_route_module", return_value=SimpleNamespace(
+                    terminal_gate_observation=lambda *a, **kw: gates)), \
+                mock.patch.object(terminal, "settle_terminal_commit",
+                                  return_value=terminal.TerminalCommitResult("completed")) as commit, \
+                mock.patch.object(SUP, "_start_successor") as launch:
+            result = terminal.settle_owner_completion(jobs, "done", {"attempt_id": "att-parent"})
+        self.assertEqual(launch.call_count, 0)
+        return result, commit.call_count
+
+    def test_owner_settlement_resolves_late_resource_output_without_rerun(self):
+        route, path, jobs, registry, ledger, producer, original = self._late_resource_artifacts_fixture()
+        failure_journal = ledger.journal_path.read_bytes()
+        registry_bytes = registry.read_bytes()
+        producer.write_bytes(original)
+        result, commits = self._settle_resource_owner(route, path, jobs)
+        self.assertEqual(result.result, "completed", result)
+        self.assertEqual(commits, 1)
+        self.assertEqual(ledger.state()["workflow_state"], "COMPLETE")
+        self.assertEqual(ledger.state()["nodes"]["full-run"]["state"], "STAGE_SUCCEEDED")
+        self.assertTrue(ledger.journal_path.read_bytes().startswith(failure_journal))
+        self.assertEqual(registry.read_bytes(), registry_bytes)
+        self.assertEqual(producer.read_bytes(), original)
+        self.assertEqual(ledger.claims(), {})
+        journal = ledger.journal_path.read_bytes()
+        self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "completed")
+        self.assertEqual(ledger.journal_path.read_bytes(), journal)
+
+    def test_owner_settlement_preserves_unresolved_resource_artifact_failure(self):
+        route, path, jobs, registry, ledger, producer, original = self._late_resource_artifacts_fixture()
+        journal = ledger.journal_path.read_bytes()
+        result, commits = self._settle_resource_owner(route, path, jobs)
+        self.assertEqual(result.result, "recoverable")
+        self.assertEqual(commits, 0)
+        self.assertEqual(ledger.journal_path.read_bytes(), journal)
+        producer.write_bytes(original)
+        self.assertEqual(self._settle_resource_owner(route, path, jobs, passed=False)[0].result, "needs-owner")
+        self.assertEqual(ledger.journal_path.read_bytes(), journal)
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        Path(row["sentinel"]).write_text("7")
+        self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "recoverable")
+        self.assertEqual(ledger.journal_path.read_bytes(), journal)
+
+    def test_owner_settlement_retries_interrupted_resource_artifact_resolution(self):
+        for interrupted_state in ("READY", "RUNNING", "STAGE_SUCCEEDED"):
+            with self.subTest(interrupted_state=interrupted_state), \
+                    tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(self, "base", Path(directory)):
+                route, path, jobs, registry, ledger, producer, original = self._late_resource_artifacts_fixture()
+                failure_journal = ledger.journal_path.read_bytes()
+                producer.write_bytes(original)
+                record = WS.WorkflowLedger.record
+                def interrupted_record(instance, node, state, **kwargs):
+                    result = record(instance, node, state, **kwargs)
+                    if node == "full-run" and state == interrupted_state:
+                        raise OSError("fixture interruption after durable append")
+                    return result
+                with mock.patch.object(WS.WorkflowLedger, "record", interrupted_record):
+                    self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "recoverable")
+                self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "completed")
+                self.assertEqual(ledger.state()["workflow_state"], "COMPLETE")
+                self.assertTrue(ledger.journal_path.read_bytes().startswith(failure_journal))
+                self.assertEqual(ledger.claims(), {})
+
+    def test_owner_settlement_preserves_changed_resource_and_other_failures(self):
+        route, path, jobs, registry, ledger, producer, original = self._late_resource_artifacts_fixture()
+        producer.write_bytes(original)
+        original_registry = registry.read_bytes()
+        journal = ledger.journal_path.read_bytes()
+        row = json.loads(original_registry)["runs"]["fixture-run"]
+        row["parent_attempt_id"] = "att-other"
+        registry.write_text(json.dumps({"runs": {"fixture-run": row}}))
+        self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, "recoverable")
+        self.assertEqual(ledger.journal_path.read_bytes(), journal)
+        registry.write_bytes(original_registry)
+        ledger.record("run-verify", "FAILED_TERMINAL", evidence={"reason": "actual-verification-failure"})
+        result, commits = self._settle_resource_owner(route, path, jobs)
+        self.assertEqual(result.result, "recoverable")
+        self.assertEqual(commits, 0)
+        self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
+        self.assertEqual(ledger.state()["nodes"]["run-verify"]["state"], "FAILED_TERMINAL")
+
     def test_owner_resource_correction_is_checked_under_input_lock_before_once_external_claim(self):
         import contextlib
         import dispatch_owner_input as INPUT
