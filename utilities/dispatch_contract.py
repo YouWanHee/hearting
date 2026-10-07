@@ -3042,8 +3042,33 @@ def _process_group_from_scan(scan: ProcessTableScan, pgid: int) -> ProcessGroupO
     return ProcessGroupObservation("empty", ordered)
 
 
+def _forked_across_uid_boundary(entry: Path, tail) -> bool:
+    """Whether this process was forked by a live parent that runs under another real UID.
+
+    Such a parent is outside every attempt by the other-UID rule below, and while it lives the
+    child's environment came from it, not from an attempt (an orphan is reparented to its
+    reaper instead, so init is never this parent). The parent must be older than the child,
+    which rules out a reused parent number. A `sudo` parent keeps the caller's real UID, so
+    an attempt's own sudo child is not excluded. Example: the non-dumpable `sshd: <user>@notty`
+    session process under root's `sshd [priv]` (a VS Code Remote-SSH connection). `tail` is the
+    child's own `/proc/<pid>/stat` fields after the command name, already read."""
+    try:
+        ppid, start = int(tail[1]), int(tail[19])
+        if ppid <= 1:
+            return False
+        parent = entry.parent / str(ppid)
+        parent_raw = (parent / "stat").read_text(encoding="utf-8")
+        parent_start = int(parent_raw[parent_raw.rfind(")") + 2:].split()[19])
+        status = (parent / "status").read_text(encoding="utf-8")
+        real_uid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("Uid:")))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return False
+    return real_uid != os.getuid() and parent_start <= start
+
+
 def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
-    """Only another UID or an adjacent stable birth observation may exclude denial."""
+    """Only another UID, a fork across a UID boundary, or an adjacent stable birth observation
+    may exclude denial."""
     try:
         if entry.stat().st_uid != os.getuid():
             return "", ""
@@ -3053,12 +3078,15 @@ def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
         return "", f"procfs-environ:{entry.name}:uid-unobservable"
     try:
         raw = (entry / "stat").read_text(encoding="utf-8")
-        current = raw[raw.rfind(")") + 2:].split()[19]
+        tail = raw[raw.rfind(")") + 2:].split()
+        current = tail[19]
         stable = start if start.isdigit() and current == start else ""
     except FileNotFoundError:
         return "", ""
     except (OSError, IndexError, ValueError):
-        stable = ""
+        stable, tail = "", None
+    if tail is not None and _forked_across_uid_boundary(entry, tail):
+        return "", ""
     return stable, f"procfs-environ:{entry.name}:same-uid-unobservable"
 
 
@@ -3100,7 +3128,8 @@ def attempt_tagged_descendants(
     Emptiness is evidence only from the namespace that recorded the identities;
     from anywhere else the tagged processes may simply be invisible, so that
     case is ``unverifiable`` rather than a false death. Only a verified different
-    UID, or an adjacent stable birth earlier than this exact local child, excludes
+    UID, a fork by a live parent under another real UID (`_forked_across_uid_boundary`),
+    or an adjacent stable birth earlier than this exact local child, excludes
     a denied environment. Readable positive tags always win. ``host_complete`` is used only once the
     recorded namespaces are extinct (`attempt_process_quiescence`): then a
     complete walk by a host-like observer, which sees every namespace, is the
