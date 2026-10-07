@@ -9419,9 +9419,9 @@ def prepare_isolated_worktree(cwd, slug):
     default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
     _git(top, "fetch", "-q", "origin", default)
     base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
-    # Work in progress in the checkout (uncommitted changes, or commits the base lacks) is what the
+    # Work in progress in the checkout (uncommitted or new files, or commits the base lacks) is what the
     # work may build on; a worktree from the base would leave it behind, so the cwd stays as asked.
-    if (_git(top, "status", "--porcelain", "--untracked-files=no") != ""
+    if (_git(top, "status", "--porcelain") != ""
             or _git(top, "merge-base", "--is-ancestor", "HEAD", base) is None):
         return {"state": "skipped", "reason": "primary-has-local-work"}
     if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
@@ -9433,12 +9433,63 @@ def prepare_isolated_worktree(cwd, slug):
     return {"state": "created", "path": str(path), "cwd": inside(path), "branch": slug, "base": base}
 
 
+ROUTE_ID_FORM = re.compile(r"rt-[0-9a-f]{16}")
+
+
+def resolve_route_argument(value, jobs=None):
+    """`--route` as given: a route file, or a route ID (`rt-<16 hex>`, the form `resume_command`
+    prints) looked up as the canonical record under the cwd's artifact root, then under
+    `AGENT_ARTIFACT_ROOT`, then by the file the jobs registry or a route-chain ledger names for it
+    (this session's, then the newest ledgers of every session). An ID that names no route file is
+    refused (`route-id-unresolved:<id>`)."""
+    text = str(value)
+    if not ROUTE_ID_FORM.fullmatch(text) or Path(text).is_file():
+        return Path(text)
+    roots = [os.environ.get("AGENT_ARTIFACT_ROOT")]
+    try:
+        roots.insert(0, _compose_artifact_root(os.getcwd()))
+    except ValueError:
+        pass
+    named = [canonical_route_path(root, text) for root in roots if root]
+    try:
+        for line in Path(jobs or _compose_default_jobs()).read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            if len(fields) == 6:
+                meta = parse_registry_metadata(fields[5])
+                for key in ("owner_route", "route"):
+                    if meta.get(f"{key}_id") == text and meta.get(f"{key}_file"):
+                        named.append(meta[f"{key}_file"])
+    except OSError:
+        pass
+    rc = _route_chain_module()
+    if rc is not None:
+        # This session's ledger first, then the newest ledgers of every session (any event).
+        own = rc.writer_identity()
+        ledgers = [own] if own else []
+        for harness in rc.HARNESSES:
+            try:
+                directory = Path(rc.state_root()) / harness
+                ledgers += [(harness, path.stem) for path in sorted(
+                    directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:rc.ANCHOR_SCAN_FILES]]
+            except OSError:
+                continue
+        for anchor in ledgers:
+            named += [line["route_file"] for line in rc.read_tail(*anchor) if line.get("route_id") == text]
+            if any(Path(path).is_file() for path in named):
+                break
+    for path in named:
+        if Path(path).is_file():
+            return Path(path)
+    raise ValueError(f"route-id-unresolved:{text} (pass the route file, or run from the route's checkout)")
+
+
 def caller_open_route(cwd):
     """`(route_file | None, source, rows)`: the open route a bare `start` continues.
 
     This session's own newest open route first (its route-chain ledger, which every
     compose and start writes); otherwise the one open route sealed for this cwd under
-    the cwd's artifact root, or, with none there, for a worktree of the cwd's repository. `rows` are the open routes that were looked at, each with
+    the cwd's artifact root, or, with none there, for the worktree compose made for it in the cwd's
+    repository (`<repo>-wt/<route slug>`). `rows` are the open routes that were looked at, each with
     its `resume_command`, so a caller that finds none or several sees what is there."""
     from parent_next_directive import resume_command
     rc = _route_chain_module()
@@ -9452,27 +9503,35 @@ def caller_open_route(cwd):
     except ValueError:
         return None, "none", []
     here = os.path.realpath(cwd)
-    repository = lambda path: _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
     rows, same_repository = [], []
     for row in route_status(artifact_root):
         if row["closed"] or row.get("read_only"):
             continue
         try:
-            sealed_cwd = json.loads(Path(row["route_file"]).read_text(encoding="utf-8")).get("cwd")
+            sealed = json.loads(Path(row["route_file"]).read_text(encoding="utf-8"))
+            sealed_cwd = sealed.get("cwd")
         except (OSError, ValueError):
             continue
         if not isinstance(sealed_cwd, str):
             continue
         found = {"route_id": row["route_id"], "capability": row["capability"], "route_file": row["route_file"],
-                 "cwd": sealed_cwd, "resume_command": resume_command(row["route_file"], agent_home=ROOT)}
+                 "cwd": sealed_cwd, "slug": sealed.get("slug"),
+                 "resume_command": resume_command(row["route_file"], agent_home=ROOT)}
         if os.path.realpath(sealed_cwd) == here:
             rows.append(found)
         else:
             same_repository.append(found)
     if not rows and same_repository:
-        # A route compose moved into the repository's own worktree (`prepare_isolated_worktree`).
-        mine = repository(here)
-        rows = [row for row in same_repository if mine and os.path.isdir(row["cwd"]) and repository(row["cwd"]) == mine]
+        # A route compose moved into this repository's worktree for it (`prepare_isolated_worktree`:
+        # `<repo>-wt/<route slug>`), not any route sealed elsewhere in the repository.
+        top = _git(here, "rev-parse", "--show-toplevel")
+        def moved(row):
+            if not top or not row.get("slug"):
+                return False
+            home = os.path.realpath(Path(top).parent / f"{Path(top).name}-wt" / row["slug"])
+            sealed = os.path.realpath(row["cwd"])
+            return sealed == home or sealed.startswith(home + os.sep)
+        rows = [row for row in same_repository if moved(row)]
     if len(rows) == 1:
         return rows[0]["route_file"], "cwd", rows
     return None, "ambiguous" if rows else "none", rows
@@ -10178,6 +10237,7 @@ def main():
                 return 2
             a.route=Path(found)
             print(f"route_default={found} source={source}",file=sys.stderr)
+        a.route=resolve_route_argument(a.route,a.jobs)
         route=verify_route(json.loads(a.route.read_text()))
         jobs=Path(a.jobs or _compose_default_jobs())
         pin_change=_change_owner_pin(route,jobs,a.pin) if a.pin else None

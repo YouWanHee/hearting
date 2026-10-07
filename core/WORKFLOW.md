@@ -717,9 +717,13 @@ python3 utilities/capability-route.py status [--artifact-root <dir>] --open-only
 ```
 
 `status` defaults the artifact root from the cwd, and each open row carries its
-`resume_command`. A `start` without `--route` continues this session's newest
+`resume_command`. That command names a canonical route by its ID
+(`start --route rt-<16 hex>`); `start` finds the record under the cwd's artifact
+root, `AGENT_ARTIFACT_ROOT`, the jobs registry or a session's route-chain ledger,
+and still takes a route file. A `start` without `--route` continues this session's newest
 open route (its route-chain ledger), or else the one open route sealed for the
-cwd (or, with none there, for a worktree of its repository); with none or several
+cwd (or, with none there, for the worktree compose made for it, `<repo>-wt/<slug>`);
+with none or several
 it lists them and starts nothing.
 
 `close` may preserve `terminal_gate_proven=false`; later exact completion on the

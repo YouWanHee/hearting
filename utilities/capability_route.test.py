@@ -7585,6 +7585,9 @@ class ComposeRouteTest(TestRoute):
    (Path(tmp)/"repo-wt"/"taken").mkdir()
    self.assertEqual(R.prepare_isolated_worktree(primary,"taken")["reason"],"path-occupied")
    self.assertEqual(R.prepare_isolated_worktree(Path(tmp),"x")["reason"],"not-primary-checkout")
+   (primary/"new.txt").write_text("new\n")                     # a new file not yet added is work in progress too
+   self.assertEqual(R.prepare_isolated_worktree(primary,"z")["reason"],"primary-has-local-work")
+   (primary/"new.txt").unlink()
    # work in progress stays where it is: an uncommitted change, or a commit the base lacks
    (primary/"a.txt").write_text("changed\n")
    self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
@@ -7594,7 +7597,9 @@ class ComposeRouteTest(TestRoute):
    # the route compose moved into that worktree is found from the primary checkout after /clear
    routes=Path(tmp)/"reports"; R.canonical_routes_dir(routes).mkdir(parents=True)
    path=R.canonical_routes_dir(routes)/("rt-"+"f"*16+".json")
-   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(wt),"artifact_root":str(routes)}),encoding="utf-8")
+   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(wt),"slug":"fix-x","artifact_root":str(routes)}),encoding="utf-8")
+   other=R.canonical_routes_dir(routes)/("rt-"+"e"*16+".json")     # another route in a worktree it was not made for
+   other.write_text(json.dumps({"route_id":"rt-"+"e"*16,"nodes":[],"cwd":str(wt),"slug":"elsewhere","artifact_root":str(routes)}),encoding="utf-8")
    with mock.patch.object(R,"_route_chain_module",return_value=None), \
         mock.patch.object(R,"_compose_artifact_root",return_value=str(routes)):
     self.assertEqual(R.caller_open_route(primary)[:2],(str(path),"cwd"))
@@ -7604,6 +7609,34 @@ class ComposeRouteTest(TestRoute):
   self.assertTrue(R._isolates_worktree({"artifact_root":real,"nodes":[plan,source]}))
   self.assertFalse(R._isolates_worktree({"artifact_root":real,"nodes":[plan]}))
   self.assertFalse(R._isolates_worktree({"artifact_root":tempfile.gettempdir()+"/x","nodes":[source]}))
+ def test_a_route_id_finds_its_record_from_the_checkout_the_registry_or_a_ledger(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   def record(root,name):
+    path=R.canonical_route_path(root,"rt-"+name*16); path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_text("{}",encoding="utf-8"); return path
+   here,env,owned,chained=(Path(tmp)/n for n in ("here","env","owned","chained"))
+   jobs=Path(tmp)/"jobs.log"
+   in_cwd,in_env,in_jobs,in_ledger=record(here,"a"),record(env,"b"),record(owned,"c"),record(chained,"e")
+   jobs.write_text("now\topen\t1\tp\tt\tworker_type=owner,owner_route_id=rt-"+"c"*16+",owner_route_file="+str(in_jobs)+"\n")
+   from types import SimpleNamespace
+   in_other=record(Path(tmp)/"other-session","9")
+   state=Path(tmp)/"state"; (state/"claude").mkdir(parents=True)
+   (state/"claude"/"s.jsonl").touch(); (state/"claude"/"other.jsonl").touch()
+   tails={"s":[{"route_id":"rt-"+"e"*16,"route_file":str(in_ledger)}],
+          "other":[{"route_id":"rt-"+"9"*16,"route_file":str(in_other)}]}
+   chain=SimpleNamespace(HARNESSES=("claude",),ANCHOR_SCAN_FILES=64,state_root=lambda: str(state),
+                         writer_identity=lambda: ("claude","s"),read_tail=lambda h,sid: tails.get(sid,[]))
+   with mock.patch.object(R,"_compose_artifact_root",return_value=str(here)), \
+        mock.patch.object(R,"_route_chain_module",return_value=chain), \
+        mock.patch.dict(os.environ,{"AGENT_ARTIFACT_ROOT":str(env)}):
+    resolve=lambda value: R.resolve_route_argument(value,jobs)
+    self.assertEqual(resolve(str(in_ledger)),in_ledger)                   # a file stays a file
+    self.assertEqual(resolve("rt-"+"a"*16),in_cwd)
+    self.assertEqual(resolve("rt-"+"b"*16),in_env)
+    self.assertEqual(resolve("rt-"+"c"*16),in_jobs)
+    self.assertEqual(resolve("rt-"+"e"*16),in_ledger)
+    self.assertEqual(resolve("rt-"+"9"*16),in_other)                    # another session's ledger, from any cwd
+    with self.assertRaisesRegex(ValueError,"route-id-unresolved:rt-"+"f"*16): resolve("rt-"+"f"*16)
  def test_a_bare_start_finds_this_sessions_open_route_else_the_one_open_route_of_the_cwd(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp)/"reports"; routes=R.canonical_routes_dir(root); routes.mkdir(parents=True)
@@ -7624,7 +7657,7 @@ class ComposeRouteTest(TestRoute):
     only=route("d",here)
     found,source,rows=R.caller_open_route(here)
     self.assertEqual((found,source),(only,"cwd"))
-    self.assertIn(f"start --route {only}",rows[0]["resume_command"])
+    self.assertIn("start --route rt-"+"d"*16,rows[0]["resume_command"])      # the short form, by ID
     route("e",here)
     found,source,rows=R.caller_open_route(here)
     self.assertEqual((found,source,len(rows)),(None,"ambiguous",2))

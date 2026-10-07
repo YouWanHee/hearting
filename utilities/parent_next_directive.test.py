@@ -333,6 +333,11 @@ class PrintedCommandHomeTest(unittest.TestCase):
                                                       "correct", "--attempt-id", "att-1"])
             self.assertIn(f"correct --jobs {other} --attempt-id att-1",
                           pnd.correction_command("att-1", other, agent_home=self.old))
+        # A canonical route record is named by its ID; any other route file by its path.
+        canonical = Path(self._tmp.name) / ".agent_reports" / ".runtime" / "routes" / ("rt-" + "a" * 16 + ".json")
+        with unittest.mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(state)}):
+            self.assertEqual(pnd.resume_command(canonical, default, agent_home=self.old).split()[-2:],
+                             ["--route", "rt-" + "a" * 16])
         # A bare start reads AGENT_DISPATCH_JOBS first: a different one keeps --jobs named.
         with unittest.mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(state),
                                                    "AGENT_DISPATCH_JOBS": str(other)}):
