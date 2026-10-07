@@ -698,6 +698,68 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertNotIn("original peer body", original.decode())
         self.assertNotEqual(self.pending()[1], ref) # A later intentional message is new.
 
+    def test_herdr_claim_is_atomic_and_receiver_ack_clears_it(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = peer_message.prepare_peer_message("deferred", self.sender, recipient, defer=True)
+        ready = threading.Barrier(2)
+        winners = []
+        def claim():
+            ready.wait(timeout=3)
+            try:
+                winners.append(peer_message.claim_pending_herdr(ref, recipient))
+            except BlockingIOError:
+                winners.append(None)
+        workers = [threading.Thread(target=claim) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(sum(row is not None for row in winners), 1)
+        row = peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "unverified")
+        self.assertEqual(row["text"], text)
+        self.assertIsNotNone(row["rpc_claim"])
+        self.assertIsNone(peer_message.claim_pending_herdr(ref, recipient))
+        self.assertEqual(peer_message.receive_peer_message(text, recipient), 0)
+        received = peer_message._read_pending(ref)
+        self.assertEqual(received["state"], "received")
+        self.assertIsNone(received["rpc_claim"])
+        self.assertEqual(received["receipt"], "exact-peer-ref")
+        self.assertIsNone(peer_message.claim_pending_herdr(ref, recipient))
+
+    def test_herdr_claim_rejects_a_different_recipient(self):
+        _text, ref = self.pending()
+        self.assertIsNone(peer_message.claim_pending_herdr(ref, dict(self.recipient, session_id="other")))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+
+    def test_unsent_claim_can_retry_but_receiver_ack_is_never_undone(self):
+        text, ref = self.pending()
+        first = peer_message.claim_pending_herdr(ref, self.recipient)
+        self.assertTrue(peer_message.release_unsent_herdr_claim(first))
+        second = peer_message.claim_pending_herdr(ref, self.recipient)
+        self.assertIsNotNone(second)
+        self.assertFalse(peer_message.release_unsent_herdr_claim(first))
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        self.assertFalse(peer_message.release_unsent_herdr_claim(second))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+
+    def test_claude_paste_wrapper_keeps_exact_ref_and_body(self):
+        recipient = dict(self.recipient, harness="claude")
+        for index, closing in enumerate(('</pasted_content>', '</pasted_content id="fe20">')):
+            with self.subTest(closing=closing):
+                text, ref = peer_message.prepare_peer_message(
+                    "긴 원문 " * 60 + str(index), self.sender, recipient, defer=True)
+                wrapped = '<pasted_content id="fe20">\n' + text + '\n' + closing
+                peer_message.receive_peer_message(wrapped.replace("긴 원문", "변경", 1), recipient)
+                self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+                peer_message.receive_peer_message(wrapped, dict(recipient, session_id="other"))
+                self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+                peer_message.receive_peer_message("앞에 다른 본문\n" + wrapped, recipient)
+                self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+                self.assertEqual(peer_message.receive_peer_message(wrapped, recipient), 0)
+                self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+
     def test_foreign_sid_or_changed_body_never_ack_pending(self):
         text, ref = self.pending()
         for actual, body in ((dict(self.recipient, session_id="fork"), text),

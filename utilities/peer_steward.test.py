@@ -2282,7 +2282,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         # flush leaves it to the normal path: exactly one send, same ref.
         sent.assert_called_once()
         text = sent.call_args.args[1]
-        self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "pending")
+        self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "received",
+                         "the observed retry closes the row even without a receiver hook")
         peer_steward.peer_message.receive_peer_message(text, {"harness": "claude", "session_id": "recipient"})
         self.assertEqual(peer_steward.peer_message._read_pending(refs[0])["state"], "received")
 
@@ -2380,8 +2381,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertTrue(all("shared body" in argv[4] for argv in prompts))
 
     def test_flush_delivers_a_stranded_row_then_skips_it_once_acked(self):
-        """A later receivable prompt resends deferred rows first; the
-        receiver hook's ack stops any resend. No row is ever marked here."""
+        """A later receivable prompt resends deferred rows first and closes
+        the observed row itself, even when no receiver hook runs."""
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
@@ -2401,8 +2402,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                           if c.args[0][:3] == ["herdr", "agent", "prompt"]]
         self.assertTrue(any("stranded body" in text for text in sent_texts),
                         "the stranded row text must go out before the new send")
-        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "pending",
-                         "no hook ack arrived, so nothing may be marked")
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received",
+                         "the observed send must close the row, not wait for a hook")
         stranded = next(text for text in sent_texts if "stranded body" in text)
         peer_steward.peer_message.receive_peer_message(
             stranded, {"harness": "claude", "session_id": "sid-child"})
@@ -2417,6 +2418,84 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                            for c in [c.args[0]] if c[:3] == ["herdr", "agent", "prompt"]]
         self.assertFalse(any("stranded body" in text for text in sent_texts2),
                          "an acked row must never be resent")
+
+    def _deferred_claude_row(self, body):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        text, ref = peer_steward.peer_message.prepare_peer_message(
+            body, {"harness": "claude", "session_id": "sid-steward", "name": "sender"},
+            {"harness": "claude", "session_id": "sid-child", "name": "child"}, defer=True)
+        return text, ref
+
+    def test_busy_redelivery_observes_pasted_queue_without_hook_ack(self):
+        text, ref = self._deferred_claude_row("긴 지연 원문 " * 50)
+        transcript = Path(os.environ["HOME"]) / ".claude/projects/-fixture/sid-child.jsonl"
+        transcript.parent.mkdir(parents=True)
+        fake = self._verify_run("working", pane_text="❯ ")
+        def send(argv, **kw):
+            if argv[:3] == ["herdr", "agent", "prompt"]:
+                self.assertEqual(argv[4], text)
+                transcript.write_text(json.dumps({
+                    "type": "queue-operation", "operation": "enqueue",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "sessionId": "sid-child",
+                    "content": '<pasted_content id="fe20">\n' + text + '\n</pasted_content id="fe20">',
+                }, ensure_ascii=False) + "\n")
+            return fake(argv, **kw)
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=send), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 1)
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+
+    def test_redelivery_claim_blocks_reentrant_flush(self):
+        text, ref = self._deferred_claude_row("one deferred row")
+        fake = self._verify_run("idle", pane_text="❯ ")
+        def send(argv, **kw):
+            if argv[:3] == ["herdr", "agent", "prompt"]:
+                self.assertEqual(argv[4], text)
+                self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "unverified")
+                self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 0)
+            return fake(argv, **kw)
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=send) as calls, \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 1)
+        prompts = [call.args[0] for call in calls.call_args_list if call.args[0][:3] == ["herdr", "agent", "prompt"]]
+        self.assertEqual(len(prompts), 1)
+
+    def test_ambiguous_redelivery_is_preserved_but_not_submitted_twice(self):
+        text, ref = self._deferred_claude_row("unobserved row")
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", pane_text="❯ ")) as calls, \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 0)
+            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 0)
+        row = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "unverified")
+        self.assertEqual(row["text"], text)
+        prompts = [call.args[0] for call in calls.call_args_list if call.args[0][:3] == ["herdr", "agent", "prompt"]]
+        self.assertEqual(len(prompts), 1)
+        wrapped = '<pasted_content id="fe20">\n' + text + '\n</pasted_content id="fe20">'
+        peer_steward.peer_message.receive_peer_message(wrapped, {"harness": "claude", "session_id": "sid-child"})
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+
+    def test_form_opening_after_delay_banner_keeps_unsent_body_pending(self):
+        text, ref = self._deferred_claude_row("body not submitted")
+        row = peer_steward.peer_message._read_pending(ref)
+        with peer_steward.peer_message.pending_lock(ref):
+            peer_steward.peer_message._save_pending(dict(row, created=row["created"] - 7200))
+        with mock.patch.object(peer_steward, "_agent_state", side_effect=[("idle", "w1:pX"), ("blocked", "w1:pX")]), \
+             mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "sid-child", "child")), \
+             mock.patch.object(peer_steward, "_bottom_form_tokens", return_value=False), \
+             mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as send, \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 0)
+        self.assertEqual(send.call_count, 1)
+        self.assertTrue(send.call_args.args[1].startswith("[지연 전달"))
+        row = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["text"], text)
+        self.assertIsNone(row["rpc_claim"])
 
     def test_late_flush_sends_delay_banner_before_row_text(self):
         """A row stranded over an hour goes out intact preceded by a delay
