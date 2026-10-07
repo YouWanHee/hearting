@@ -1241,7 +1241,8 @@ JSON object per line, schema `peer_message_v1`: `schema_version=1`, a 16-hex `me
 `to{harness,session_id|name}`, `kind`, `summary` (hard-truncated to 200 chars, never the
 full message), `body_sha256` (sha256 of the complete body, never itself stored),
 `delivery{surface,status,receipt}`, `refs[]`. No field carries the message body.
-Only a form-blocked, undelivered transfer retains its bounded body in the private
+An undelivered transfer withheld for a form, a user draft or an unreadable input
+box retains its bounded body in the private
 runtime `peer-messages/pending/` directory (0700, payload/lock files 0600).
 It is bound to the immutable transfer ref, actual sender/recipient and digest,
 not a public ledger field. Receipt removes the private body and retains the ref
@@ -1306,7 +1307,9 @@ prints `prompted=true` only after the submission was observed, and every other v
 `failed` (exit 1), `queued` (exit 3, our text still sits in the target's input), `unverified`
 (exit 5, nothing could be observed) — never `true` from herdr's exit code alone. Before any send the
 visible pane is scanned for a selection/permission form (AskUserQuestion, permission prompt) in
-every state. A `blocked` target or an open form receives no keyboard input. Its
+every state. A `blocked` target, an open form, a user draft or an unreadable input
+box receives no keyboard input. Claude/OpenCode input is read again immediately
+before submission; Codex's existing native queue branch does not type into the box. Its
 undelivered message is retained as a bounded private runtime payload tied to the
 existing immutable transfer ref, sender, exact recipient session and body digest;
 the public ledger continues to store only digest/summary. A still-pending retry
@@ -1314,8 +1317,11 @@ of that same sender/recipient/body reuses the ref. A fork, changed SID or differ
 body has a separate transfer. Queue acceptance is `queued`, ambiguous transport is
 `unverified`, and neither is delivery or consumption. Only exact native history
 or the existing receiver's observation of the bound ref acknowledges receipt.
-Normal receiver callbacks may retry supported transports without typing into a
-form or changing its answer; callback stdout/system context alone is not an ack.
+Normal idle/receive callbacks and the next steward prompt retry unsent rows only
+when the input box is readable and empty, preserving the exact recipient and claim.
+Session-tidy's unsent continue stays in its existing booking until that same idle
+callback, and is cancelled by newer user input or a changed card as before.
+Callback stdout/system context alone is not an ack.
 An unavailable transport or callback without an actual ack keeps the payload
 pending and reports that limitation, without a watcher, forced key or new gate
 (text typed into an open form would be lost and the Enter would answer the form). A target that is not working is sent with `herdr agent prompt --wait --until working`
@@ -1325,7 +1331,9 @@ pending and reports that limitation, without a watcher, forced key or new gate
 then the prompt box — but only when `herdr agent explain` actually read it
 (`region=prompt_box_body`; a working Claude pane is explained by its terminal title and an
 OpenCode pane by `rule: none`, neither is a box read → `verify=prompt-box-unavailable`,
-`unverified`); our own first line still in a read box after one `Enter` retry is `queued`.
+`unverified`); our own first line still in a read box is `queued`. Verification
+never retries Enter: that could submit a user's newer draft. Already accepted or
+ambiguous submissions are not resent.
 A dim `❯ …` line in an *empty* box is Claude Code's prompt suggestion, not unsubmitted text;
 the target transcript settles it. `--no-verify`
 keeps the legacy exit-code report; `--wait-idle-ms N` defers a send to a working/blocked target.

@@ -18,6 +18,7 @@ its bounded-foreground semantics unchanged.
 """
 import argparse
 import calendar
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -2660,6 +2661,21 @@ def _prompt_form_open(target, state_before):
     return _bottom_form_tokens(target)
 
 
+def _prompt_input_reason(target, harness, state):
+    """Withhold keyboard input when a form, draft or unreadable box is present."""
+    if _prompt_form_open(target, state):
+        return "target-form-open"
+    if harness not in {"claude", "opencode"}:
+        return None                 # Codex's existing queue path is unchanged.
+    lines = _read_screen(target)
+    if lines is None:
+        return "target-draft-unknown"
+    draft = _draft_state(harness, lines)
+    if harness == "opencode" and draft == "unknown" and _opencode_home(lines):
+        draft = "empty"              # The native blank home layout is also readable.
+    return None if draft == "empty" else "target-draft" if draft == "nonempty" else "target-draft-unknown"
+
+
 _FLUSH_MAX_ROWS = 4
 _FLUSH_ROW_TIMEOUT_S = 12
 _FLUSH_STUCK_HOURS = 1.0
@@ -2749,8 +2765,9 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
                     and (row.get("from") or {}).get("session_id") == skip[2]:
                 continue
             state, _pane = _agent_state(target)
-            if _prompt_form_open(target, state):
-                print("pending-flush-stopped target=%s reason=form-open" % target, file=sys.stderr)
+            reason = _prompt_input_reason(target, t_harness, state)
+            if reason:
+                print("pending-flush-stopped target=%s reason=%s" % (target, reason), file=sys.stderr)
                 break
             current_harness, current_sid, _name = _resolve_target(target)
             if (current_harness, current_sid) != (t_harness, t_sid):
@@ -2760,6 +2777,10 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
                 continue
             text = row["text"]
             banner = _flush_delay_banner(ref, row.get("created"))
+            reason = _prompt_input_reason(target, t_harness, state)
+            if reason:
+                peer_message.release_unsent_herdr_claim(row, receipt=reason)
+                break
             if banner:
                 banner_rc, _banner_payload = _herdr_prompt(
                     target, banner, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
@@ -2767,8 +2788,9 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
                     peer_message.release_unsent_herdr_claim(row)
                     continue
                 state, _pane = _agent_state(target)
-                if _prompt_form_open(target, state):
-                    peer_message.release_unsent_herdr_claim(row)
+                reason = _prompt_input_reason(target, t_harness, state)
+                if reason:
+                    peer_message.release_unsent_herdr_claim(row, receipt=reason)
                     break
             sent_at = time.time()
             rc, payload = _herdr_prompt(target, text, wait=state != "working",
@@ -2800,19 +2822,38 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
     return flushed, stuck
 
 
-def _send_enter(target):
-    try:
-        subprocess.run(["herdr", "agent", "send-keys", target, "Enter"],
-                       capture_output=True, text=True, timeout=_herdr_get_timeout())
-    except (OSError, subprocess.SubprocessError):
-        pass
+def receiver_idle(recipient, pane, *, peer=True):
+    """One existing receiver callback on its exact pane/session; no wait or watcher."""
+    import session_tidy as st
+    import session_tidy_clear as clear
+    harness, sid = recipient["harness"], recipient["session_id"]
+    seat = st.resolve_seat(harness, sid=sid)
+    req = clear.read_reservation(seat.key)
+    booked = (req and req.get("harness") == harness
+              and (req.get("seat") or {}).get("pane") == pane
+              and req.get("status") == "cleared"
+              and (req.get("continued") or {}).get("state") == "pending"
+              and (harness != "claude" or req.get("new_session") == sid))
+    rows = peer_message.pending_messages(recipient) if peer else []
+    if not booked and not any(r.get("state") == "pending" for r in rows):
+        return
+    current_harness, current_sid, _name = _resolve_target(pane)
+    state, _pane = _agent_state(pane)
+    if (current_harness, current_sid) != (harness, sid) or state not in {"idle", "done"}:
+        return
+    with contextlib.redirect_stdout(sys.stderr):
+        if rows:
+            _flush_pending_for_target(pane, harness, sid, state)
+        if booked:
+            # Booking/card/new-user-input checks still own this ordinary retry.
+            clear._continue(seat.key, req["nonce"], clear._run_continue)
 
 
 def _verify_after_send(target, first, t_harness, t_sid, sent_at):
     """(outcome, verify, reason) once herdr itself could not prove the submission.
 
     Order: the target transcript (exact, Claude only) → a *read* prompt box
-    (`region=prompt_box_body`; residue → one Enter retry → re-check) → nothing
+    (`region=prompt_box_body`; residue stays queued, no Enter retry) → nothing
     observed is `unverified`, never `true`."""
     if _transcript_arrival(t_harness, t_sid, first, sent_at):
         return "true", "transcript-arrival", None
@@ -2821,16 +2862,7 @@ def _verify_after_send(target, first, t_harness, t_sid, sent_at):
         return "unverified", "prompt-box-unavailable", "submission-not-observed"
     if not _prompt_box_residue(evidence, first):
         return "true", "prompt-box-clear", None
-    _send_enter(target)
-    _settle(target)
-    if _transcript_arrival(t_harness, t_sid, first, sent_at):
-        return "true", "transcript-arrival", None
-    evidence, readable = _prompt_box_evidence(target)
-    if not readable:
-        return "unverified", "prompt-box-unavailable", "submission-not-observed"
-    if _prompt_box_residue(evidence, first):
-        return "queued", "prompt-box", "prompt-box-residue"
-    return "true", "prompt-box-clear", None
+    return "queued", "prompt-box", "prompt-box-residue"
 
 
 def cmd_prompt(args):
@@ -2851,7 +2883,7 @@ def cmd_prompt(args):
       through to `_verify_after_send`.
     * target already working (a state change proves nothing): after a bounded
       herdr wait, `_verify_after_send` -- the target transcript first, then a
-      prompt box that was actually read; residue after one Enter retry is
+      prompt box that was actually read; residue without any Enter retry is
       `prompted=queued` (exit 3); nothing observed is `prompted=unverified`
       (exit 5), ledger `unknown`.
 
@@ -2884,7 +2916,8 @@ def cmd_prompt(args):
         _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
         state_before, target_pane = _agent_state(args.target)
     flushed = 0
-    if state_before != "blocked" and not _prompt_form_open(args.target, state_before):
+    input_reason = _prompt_input_reason(args.target, t_harness, state_before)
+    if not input_reason:
         # Deferred rows go first: a target receivable now takes what an
         # earlier form-open verdict stranded (2026-10-07). Never raises and
         # never re-reads state here: the send path below verifies on its own.
@@ -2894,13 +2927,12 @@ def cmd_prompt(args):
             args.target, t_harness, t_sid, state_before,
             skip=(hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest(),
                   from_harness, from_sid))
-    form_open = _prompt_form_open(args.target, state_before)
     if not args.no_trailer:
         try:
             text, transfer_ref = peer_message.prepare_peer_message(
                 body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
                 {"harness": t_harness, "session_id": t_sid, "name": _t_name},
-                defer=form_open, refs=args.ref)
+                defer=bool(input_reason), refs=args.ref, receipt=input_reason or "target-form-open")
         except (OSError, ValueError):
             print("prompted=unverified reason=peer-pending-or-transfer-unavailable")
             return 5
@@ -2923,12 +2955,29 @@ def cmd_prompt(args):
         return 5
     surface = "herdr"
     claimed = None
-    if pending and t_harness != "codex" and not form_open:
+    if pending and t_harness != "codex" and not input_reason:
         try:
             claimed = peer_message.claim_pending_herdr(
                 transfer_ref, {"harness": t_harness, "session_id": t_sid})
         except (OSError, ValueError):
             claimed = None
+    if t_harness in {"claude", "opencode"} and not input_reason:
+        # Preparation/claim may take time: the final read belongs after them.
+        input_reason = _prompt_input_reason(args.target, t_harness, state_before)
+        if input_reason:
+            if claimed is not None:
+                peer_message.release_unsent_herdr_claim(claimed, receipt=input_reason)
+                claimed = None
+            if not args.no_trailer and pending is None:
+                try:
+                    text, transfer_ref = peer_message.prepare_peer_message(
+                        body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
+                        {"harness": t_harness, "session_id": t_sid, "name": _t_name},
+                        defer=True, refs=args.ref, receipt=input_reason)
+                    pending = peer_message._read_pending(transfer_ref)
+                except (OSError, ValueError):
+                    print("prompted=unverified reason=peer-pending-unavailable")
+                    return 5
     if pending and t_harness == "codex":
         surface = "codex-queue"
         try:
@@ -2938,11 +2987,11 @@ def cmd_prompt(args):
         outcome = "true" if result["status"] == "received" else (
             "queued" if result["status"] == "queued" else "unverified")
         verify, reason = "native-queue-" + result["status"], result["reason"]
-    elif form_open:
+    elif input_reason:
         outcome = ("unverified" if pending and pending["state"] == "unverified" else
                    "queued" if pending else "failed")
         verify = "private-pending" if pending else "none"
-        reason = pending["receipt"] if pending and pending["state"] == "unverified" else "target-form-open"
+        reason = pending["receipt"] if pending and pending["state"] == "unverified" else input_reason
     elif pending and claimed is None:
         outcome, verify, reason = "unverified", "private-pending", "peer-delivery-already-submitted"
     elif args.no_verify:
@@ -3013,8 +3062,8 @@ def cmd_prompt(args):
 # --- clear: the one typed command that starts a fresh conversation (session-tidy auto-clear) ---
 
 _CLEAR_COMMAND = {"claude": "/clear", "codex": "/clear", "opencode": "/new"}
-_CLEAR_EXIT = {"true": 0, "skipped": 3, "failed": 1, "unverified": 5}
-_CLEAR_LEDGER_STATUS = {"true": "sent", "failed": "failed", "skipped": "unknown", "unverified": "unknown"}
+_CLEAR_EXIT = {"true": 0, "skipped": 3, "queued": 3, "failed": 1, "unverified": 5}
+_CLEAR_LEDGER_STATUS = {"true": "sent", "failed": "failed", "skipped": "unknown", "queued": "unknown", "unverified": "unknown"}
 _CLEAR_OBSERVE_ROUNDS = 8             # bounded waits between looks at the pane after the send (OpenCode repaints its home in ~5 s)
 _CLEAR_OBSERVE_SETTLE_MS = 1500
 _ANSI_TOKEN = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|(.)", re.S)
@@ -3511,6 +3560,9 @@ def _continue_look(target, req):
         flat = "".join("".join(_plain(c) for c in lines).split()).lower()
         if any(token in flat for token in _FORM_TOKENS):
             return "form-open"
+        draft = _draft_state(harness, lines)
+        if draft == "nonempty":
+            return "draft"
         return None if _opencode_home(lines) else "target-changed"
     if harness == "codex" and new not in _codex_footer_threads(lines) \
             and agent.get("session_id") != new and _process_session(pane, harness) != new:
@@ -3545,12 +3597,13 @@ def cmd_continue(args):
     * it is idle or done, the card is on its way to it, no form is open and the input box is empty.
 
     A new session that is still settling (not idle yet, Claude's start hook not through) gets a few
-    bounded looks. The last look is followed by the `pending -> sending` claim under the seat lock
-    (`claim_continue`) and the single `herdr agent prompt --wait --until working`; nothing is ever
-    re-sent and no Enter is retried. `continued=true` needs the state flip, the seat's prompt count
+    bounded looks. After the `pending -> sending` claim under the seat lock (`claim_continue`),
+    one final look releases an unsent claim if a draft has appeared. An unsent draft/form stays
+    pending for the existing idle callback. The single `herdr agent prompt --wait --until working`
+    is never re-sent and no Enter is retried. `continued=true` needs the state flip, the seat's prompt count
     moving (the new session's prompt hook) or, for Claude, the text in the new transcript; anything
     else is `unverified`. A keystroke landing between the last look and the send cannot be ruled out
-    (herdr has no conditional send), as for `clear`. Exit 0 true / 3 skipped / 1 failed /
+    (herdr has no conditional send), as for `clear`. Exit 0 true / 3 queued or skipped / 1 failed /
     5 unverified. One ledger row (`kind=notice`, `action=continue` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
@@ -3595,17 +3648,25 @@ def cmd_continue(args):
             _run_herdr_wait(target, until, _CONTINUE_SETTLE_MS)
     if reason == "card-pending":
         reason = "card-not-delivered"
+    def withheld(reason):
+        return (reason in {"draft", "draft-unknown", "screen-unknown", "form-open"}
+                or reason.startswith("not-idle-"))
+
     if reason:
-        return finish(_look_outcome(reason), reason)
+        return finish("queued" if withheld(reason) else _look_outcome(reason), reason)
     req, why = clear.validate_continue(args.request, args.nonce)
     if req is None:
         return finish("skipped", why)
     reason = _continue_look(target, req)            # the look immediately before the one send
     if reason:
-        return finish(_look_outcome(reason), reason)
+        return finish("queued" if withheld(reason) else _look_outcome(reason), reason)
     req, why = clear.claim_continue(args.request, args.nonce)
     if req is None:
         return finish("skipped", why)
+    reason = _continue_look(target, req)            # the claim must not hide a newer draft
+    if reason:
+        clear.release_unsent_continue(req)
+        return finish("queued" if withheld(reason) else _look_outcome(reason), reason)
     st, seat = _booked_seat(req)
     seq_before = int(req.get("prompt_seq", 0) or 0)
     sent_at = time.time()

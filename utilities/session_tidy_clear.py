@@ -373,6 +373,20 @@ def claim_continue(path, nonce: Optional[str] = None):
     return req, ""
 
 
+def release_unsent_continue(claim):
+    """Return only this unsent claim to the same booking's pending state."""
+    key = claim["seat"]["key"]
+    with st.seat_lock(key):
+        req = read_reservation(key)
+        if (not req or req.get("nonce") != claim.get("nonce")
+                or req.get("continued") != claim.get("continued")
+                or (req.get("continued") or {}).get("state") != "sending"):
+            return False
+        req["continued"] = {**req["continued"], "state": "pending"}
+        _write_reservation(req)
+        return True
+
+
 # ---------------------------------------------------------------------------
 # The detached helper
 # ---------------------------------------------------------------------------
@@ -491,6 +505,12 @@ def _finish_continue(seat_key: str, nonce: str, outcome: str, reason: str = "") 
         if not req or req.get("nonce") != nonce or req.get("status") != "cleared" \
                 or held.get("state") not in ("pending", "sending"):
             return False
+        if outcome == "queued":
+            if held.get("state") != "pending":
+                return False    # A newer callback's sending claim is never rewound.
+            req["continued"] = {**held, "state": "pending", "reason": reason}
+            _write_reservation(req)
+            return True
         req["continued"] = {**held, "state": "sent" if outcome == "true" else outcome, "reason": reason,
                             "finished": st.now_epoch()}
         _write_reservation(req)

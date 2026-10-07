@@ -310,7 +310,7 @@ def pending_messages(recipient):
     return rows
 
 
-def prepare_peer_message(body, sender, recipient, *, defer=False, refs=()):
+def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), receipt="target-form-open"):
     """A retry reuses a pending intent; ordinary sends need no preparation lock."""
     endpoints_verified = _valid_transfer_endpoint(sender) and _valid_transfer_endpoint(recipient)
     body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
@@ -346,7 +346,7 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=()):
             "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "source_sha256": body_hash, "refs": list(refs), "created": time.time(),
             "state": "pending" if endpoints_verified else "unverified", "text": text,
-            "receipt": "target-form-open" if endpoints_verified else "peer-endpoint-unverified"})
+            "receipt": receipt if endpoints_verified else "peer-endpoint-unverified"})
         return text, ref
 
 
@@ -371,14 +371,14 @@ def claim_pending_herdr(ref, recipient):
         return dict(row, rpc_claim=claim)
 
 
-def release_unsent_herdr_claim(row):
+def release_unsent_herdr_claim(row, *, receipt="target-form-open"):
     """Release this exact claim only when its caller has not submitted the message."""
     with pending_lock(row["ref"]):
         current = _read_pending(row["ref"])
         if (not current or current["state"] != "unverified"
                 or current.get("rpc_claim") != row.get("rpc_claim")):
             return False
-        _save_pending(dict(current, state="pending", rpc_claim=None, receipt="target-form-open"))
+        _save_pending(dict(current, state="pending", rpc_claim=None, receipt=receipt))
         return True
 
 
@@ -568,13 +568,39 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
 
 
 def cmd_receive(args):
-    return receive_peer_message(sys.stdin.read(),
-        {"harness": args.to_harness, "session_id": args.to_session_id}, args.from_project)
+    recipient = {"harness": args.to_harness, "session_id": args.to_session_id}
+    rc = receive_peer_message(sys.stdin.read(), recipient, args.from_project)
+    retry_receiver_idle(recipient)
+    return rc
+
+
+def retry_receiver_idle(recipient, *, peer=True):
+    """Use an existing native callback; never add a watcher or trust an inherited pane."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane or recipient.get("harness") not in {"claude", "opencode"}:
+        return
+    try:
+        tools = str(Path(__file__).resolve().parent.parent / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet.herdr_projection import may_report
+        if not may_report(recipient["harness"], recipient.get("session_id")):
+            return
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_peer_idle_steward", Path(__file__).with_name("peer-steward.py"))
+        steward = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(steward)
+        steward.receiver_idle(recipient, pane, peer=peer)
+    except Exception:
+        pass
 
 
 def cmd_pending(args):
     recipient = {"harness": args.to_harness, "session_id": args.to_session_id}
     if not args.claim and not args.queued:
+        # OpenCode's existing idle/receive pull retries its unsent tidy booking.
+        # Its native peer transport still owns the returned message rows.
+        retry_receiver_idle(recipient, peer=False)
         print(json.dumps(pending_messages(recipient)[:5], ensure_ascii=False))
         return 0
     with pending_lock(args.claim or args.queued):
