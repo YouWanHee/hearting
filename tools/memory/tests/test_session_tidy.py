@@ -1978,6 +1978,74 @@ class SeatHandoverTest(TidyCase):
         self.assertIsNone(self.retire("sid-A", "codex", "sid-B", "claude"))
         self.assertIsNone(self.retire("sid-A", "codex", "sid-A", "codex"))
 
+    def test_retire_hands_open_route_after_terminal_receipt_is_acked(self):
+        import dispatch_pending_delivery as pending
+        path = self.cwd / ".agent_reports" / ".runtime" / "routes" / "rt-1.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"route_id": "rt-1", "route_hash": "sha256:aa"}))
+        meta = self.row("att-done", status="done", route_file=str(path))
+        record_path = pending.record_path(self.jobs.parent, "sid-A", "delivery-finished")
+        record_path.parent.mkdir(parents=True)
+        record_path.write_text(json.dumps({"attempt_ids": ["att-done"], "state": "acked"}))
+        before = (self.jobs.read_bytes(), path.read_bytes(), record_path.read_bytes())
+        row = self.retire("sid-A", "claude", "sid-B", "codex")
+        self.assertIsNotNone(row)
+        self.assertEqual([b["attempt"] for b in row["bindings"]], ["att-done"])
+        self.assertEqual(self.effective(meta), "sid-B")
+        self.assertEqual((self.jobs.read_bytes(), path.read_bytes(), record_path.read_bytes()), before)
+        self.assertIsNone(self.retire("sid-A", "claude", "sid-C", "opencode", pane="test:pane-c"))
+        self.assertEqual(self.retire("sid-A", "claude", "sid-B", "codex"), row)
+
+    def test_clear_hands_open_route_without_a_pending_completion_record(self):
+        path = self.cwd / "rt-1.json"
+        path.write_text(json.dumps({"route_id": "rt-1", "route_hash": "sha256:aa"}))
+        meta = self.row("att-done", status="done", route_file=str(path))
+        self.assertEqual(self.snapshot(now=st.now_epoch() - 5), 1)
+        self.start("sid-B")
+        self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_done_closed_or_unverifiable_route_is_not_handed_over(self):
+        path = self.cwd / "rt-1.json"
+        meta = self.row("att-done", status="done", route_file=str(path))
+        for raw in (None, "not-json", json.dumps({"route_id": "rt-other", "route_hash": "sha256:aa"}),
+                    json.dumps({"route_id": "rt-1", "route_hash": "sha256:other"})):
+            with self.subTest(raw=raw):
+                if raw is not None:
+                    path.write_text(raw)
+                self.assertIsNone(self.retire("sid-A", "claude", "sid-B", "codex"))
+                self.assertEqual(self.effective(meta), "sid-A")
+        path.write_text(json.dumps({"route_id": "rt-1", "route_hash": "sha256:aa"}))
+        path.with_suffix(".outcome.json").write_text(json.dumps({"terminal_gate_proven": False}))
+        self.assertIsNone(self.retire("sid-A", "claude", "sid-B", "codex"))
+
+    def test_finished_node_less_owner_keeps_its_verified_route_until_close(self):
+        import owner_route_binding as owner
+        with self.iso.patched_environ():
+            route = owner.ROUTE.compile_route(
+                "autopilot-code", "dev", "quick", ROOT, self.cwd / ".agent_reports",
+                predicates=[], tracking="tracked", tracked_gate_evidence={
+                    "spec_read": {"satisfied": True, "source": "canonical-prd-sha256"},
+                    "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                    "artifact_guard": {"satisfied": True, "source": "conductor-prechecked"}},
+                registered_headless_evidence={"candidates": [{"harness": "claude", "transport": "headless",
+                    "surface": "registered-headless", "status": "supported", "probe_source": "fixture-probe",
+                    "probe_time": "2026-10-07T00:00:00Z"}]})
+        path = self.cwd / "route.json"
+        path.write_text(json.dumps(route))
+        meta = self.row("att-owner-done", status="done", node="", route=route["route_id"],
+                        digest=route["route_hash"], route_file=str(path))
+        for key in ("route_id", "route_hash", "route_file"):
+            meta["owner_" + key] = meta.pop(key)
+        self.jobs.write_text("2026-10-01T00:00:00Z\tdone\t/w\t/w\tslug\t" +
+                             ",".join(f"{k}={v}" for k, v in meta.items()) + "\n")
+        before = self.jobs.read_bytes()
+        row = self.retire("sid-A", "claude", "sid-B", "codex")
+        self.assertIsNotNone(row)
+        self.assertEqual(self.effective(meta), "sid-B")
+        self.assertEqual(self.jobs.read_bytes(), before)
+        path.with_suffix(".outcome.json").write_text("{}")
+        self.assertIsNone(self.retire("sid-B", "codex", "sid-C", "opencode", pane="test:pane-c"))
+
     def test_a_broken_state_answers_the_registered_parent(self):
         meta = self.row("att-1")
         with mock.patch.object(self.handover, "_all_snapshots", side_effect=OSError("boom")):
