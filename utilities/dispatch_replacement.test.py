@@ -1693,6 +1693,38 @@ class ReplacementTest(unittest.TestCase):
         same_release=dict(old,resolved={'model':'m3','permission_mode':'default'})
         with self.assertRaises(D.DispatchContractError):R._check_tuple(same_release,old)
 
+    def test_a_release_root_spelled_through_its_pointer_is_the_same_permission(self):
+        # TF rt-34ca7756: the owner's rules named releases/v3.13.0, the correcting session's
+        # replacement named the `current` pointer to it, and the same work was refused.
+        share=self.root/'share'
+        for version in ('v1','v2'):
+            (share/'releases'/version/'core').mkdir(parents=True)
+            (share/'releases'/version/'core'/'CORE.md').write_text('core')
+        (share/'current').symlink_to(share/'releases'/'v1')
+        def launch(root,home,*extra):
+            rules=[f'Bash(python3 {root}/utilities/capability-route.py *)',f'Edit(//{self.root}/wt/**)',*extra]
+            return {'harness':'claude','jobs':str(self.jobs),'worktree':str(self.root/'wt'),'launch_home':str(home),
+                    'resolved':{'model':'m1'},'applied_permissions':{'launch_lifecycle':'detached',
+                    'claude':{'mode':'bypass','allowed_tools':rules}}}
+        v1,v2=share/'releases'/'v1',share/'releases'/'v2'
+        sealed=launch(v1,v1)
+        import route_authority
+        self.assertTrue(route_authority.same_sealed_work(sealed,launch(share/'current',v1)))
+        with mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+            R._check_tuple(launch(share/'current',v1),sealed)
+            # BC r2: sealed through the pointer at v1; the pointer and the replacement are at v2 now.
+            (share/'current').unlink();(share/'current').symlink_to(v2)
+            R._check_tuple(launch(v2,v2),launch(share/'current',v1))
+            R._check_tuple(launch(share/'current',v2),launch(share/'current',v1))
+            for changed in (launch(share/'current',v1,'Bash(git push *)'),
+                            {**launch(share/'current',v1),'applied_permissions':{'claude':{'mode':'bypass',
+                             'allowed_tools':[f'Bash(python3 {v1}/utilities/capability-route.py *)',
+                                              f'Edit(//{self.root}/other/**)']}}}):
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    R._check_tuple(changed,sealed)
+                self.assertEqual((caught.exception.reason,caught.exception.detail),
+                                 ('replacement-input-tuple-mismatch','applied_permissions'))
+
 
 class FrameTopCapacityTest(unittest.TestCase):
     """D2: a frame leg at the `top` the frame rule assigned is replaced once, at `deep`, when it stops
