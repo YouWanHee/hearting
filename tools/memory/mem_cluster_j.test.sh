@@ -380,13 +380,13 @@ grep -q '\[WARN\] dump-freshness' /tmp/doctor_dump.out \
   || bad "doctor dump-freshness 미검출: $(cat /tmp/doctor_dump.out)"
 raw_delete viol_dump >/dev/null
 
-# ⑨ worker health — 활성 project 인데 저널에 distiller/curator 무소식
+# ⑨ worker health 폐기 — distiller/curator 자동 워커는 D-78 로 폐기. 수동 기록만 있는 활성 프로젝트는 경고하지 않는다
 : > "$MEM_WRITE_EVENTS"
 seed viol_worker working project thread "$PKEY" 1 "$TODAY" "worker-health body"
 python3 "$MEM" doctor >/tmp/doctor_worker.out
-grep -q '\[WARN\] worker-health' /tmp/doctor_worker.out \
-  && ok "doctor: 활성 프로젝트 + 저널 무소식 → worker-health WARN" \
-  || bad "doctor worker-health 미검출: $(cat /tmp/doctor_worker.out)"
+grep -q 'worker-health' /tmp/doctor_worker.out \
+  && bad "doctor 가 폐기된 워커를 아직 점검: $(cat /tmp/doctor_worker.out)" \
+  || ok "doctor: 활성 프로젝트 + 저널 무소식 → worker-health 경고 없음 (D-78)"
 
 # ⑩ 저널 경로 격리 — MEM_STORE override + MEM_WRITE_EVENTS 미설정 → 저널은 그 store 옆으로
 # (fixture DB 테스트가 실 XDG 저널을 오염시키지 않는 계약 — 2026-07-11 실유출 회귀 고정)
