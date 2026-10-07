@@ -1353,7 +1353,7 @@ _RETIRE_ACTIONS = {"codex": (("send-keys", "ctrl+d"),),
                    "opencode": (("send-keys", "ctrl+d"),)}
 _RETIRE_SECONDS = 5
 # OpenCode can remain foreground while it finishes its normal exit summary.
-_OPENCODE_RETIRE_SECONDS = 30
+_OPENCODE_RETIRE_SECONDS = 60
 
 
 def _retire_process_record(pid):
