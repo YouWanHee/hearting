@@ -1331,6 +1331,17 @@ def cmd_runtime(args):
     if launcher_snapshot is not None:
         codex_launcher.discard_snapshot(launcher_snapshot)
 
+    if args.runtime_command in {"activate", "refresh"}:
+        # A first install has no memory store, and mem refuses to create one at a
+        # derived path: create it here, after the activation committed. Best
+        # effort, so it can neither fail nor roll back the activation; importing
+        # a dump stays with `install`.
+        try:
+            mem_result = bootstrap.restore_memory(import_dump=False)
+        except Exception as exc:
+            mem_result = {"action": "failed", "detail": str(exc)}
+        lines.append(f"bootstrap: mem-store -> {mem_result['action']} ({mem_result['detail']})")
+
     return _runtime_emit_shape(args.runtime_command, reports, exit_code, lines)
 
 

@@ -3587,6 +3587,11 @@ def _scheduler_environment() -> dict[str, str]:
     ):
         if os.environ.get(name):
             values[name] = str(_env_path(name, Path("/unused")))
+    # A named memory store: a scheduled update has to see it too, or activation would
+    # take the machine for a first install and create an empty default store.
+    store = Path(os.environ.get("MEM_STORE") or ".").expanduser()
+    if store.is_absolute():
+        values["MEM_STORE"] = str(store)
     return values
 
 
