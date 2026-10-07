@@ -81,6 +81,7 @@ class F63VisibilityTest(unittest.TestCase):
                                                               resolved_model="claude-opus-5-5")), "Opus 5.5")
         self.assertEqual(render._job_display_model(DispatchJob(key="code", model="opus")), "Opus")
         self.assertEqual(render._dispatch_display_model("claude-haiku-4-5-20251001"), "Haiku 4.5")
+        self.assertEqual(render._dispatch_display_model("claude-sonnet-5-5"), "Sonnet 5.5")
         self.assertEqual(render._dispatch_display_model("glm-5.2"), "glm-5.2")
 
     def test_idle_session_exec_child_is_promoted_in_status_detail_only(self):

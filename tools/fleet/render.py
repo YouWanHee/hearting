@@ -6164,7 +6164,7 @@ def live_harnesses(sessions):
 
 
 def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
-                       usage_snapshots=None):
+                       usage_snapshots=None, term_width=None):
     """Build account usage rows independently of the main line builder.
 
     F-51c: `api_disabled` (user opted out via FLEET_DISABLE=usage-api / --no-usage-api) is
@@ -6211,6 +6211,7 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
         return []
     hs = [h for h in ("claude", "codex", "opencode") if h in rl or h in live]
     rows = []
+    now = now if now is not None else time.time()
     for idx, h in enumerate(hs):
         hn = _USAGE_BADGE_TEXT.get(h) or _BADGE_TEXT.get(h, h)
         row = [("  usage " if idx == 0 else "        ", "head"),
@@ -6225,36 +6226,66 @@ def _usage_header_rows(sessions, layout="wide", now=None, api_disabled=False,
             else:
                 row.append(("no usage api — opencode-go key not found" if h == "opencode"
                             else "no usage api — plan quota is console-only", "dim"))
-            rows.append(row)
+            rows.append((row, None))
             continue
         r5, r7, rms, _mt, rrs, rwins, freshness, err = rl[h]
         if err == "auth":
             # 401/403 from the provider: the key is present but rejected (rotated,
             # expired, wrong scope). Say so instead of a silently blank gauge.
             row.append(("usage api — key rejected (401/403)", "dim"))
-            rows.append(row)
+            rows.append((row, None))
             continue
         rs5, rs7 = (rrs or (None, None))[0], (rrs or (None, None))[1]
-        gauges = ([(str(lbl) + " ", pct, reset) for lbl, pct, reset in rwins]
-                  if rwins else [("5h ", r5, rs5), ("7d ", r7, rs7)])
-        gauges += [(lbl + " ", v, None) for lbl, v in (rms or [])]
-        for gi, (lbl, value, reset) in enumerate(gauges):
-            row.append(("   ", None) if gi else ("", None))
-            row.append((lbl, "dim")); row.append(("[", "dim"))
+        gauges = (list(rwins) if rwins else
+                  [("5h", r5, rs5), ("week", r7, rs7)])
+        if not rwins and h == "codex" and r5 is None:
+            gauges = gauges[1:]
+        gauges += [(lbl, v, None) for lbl, v in (rms or [])]
+        cells = [[], [], []]
+        for lbl, value, reset in gauges:
+            lbl = str(lbl).strip()
+            lbl = {"7d": "week", "wk": "week", "mo": "month"}.get(lbl, lbl)
+            slot = 0 if lbl == "5h" else 1 if lbl == "week" else 2
+            cell = cells[slot]
+            if cell:
+                cell.append(("   ", None))
+            cell.append((lbl + " ", "dim")); cell.append(("[", "dim"))
             if value is None:
-                row += [("·" * _GAUGE_W, "dim"), ("   —", "dim")]
+                cell += [("·" * _GAUGE_W, "dim"), ("   —", "dim")]
             else:
                 gauge = _gauge_segs(value, _GAUGE_W)
                 if freshness == "stale":
                     empty_cells = _GAUGE_W - _dw(gauge[0][0])
                     gauge[1] = ("·" * empty_cells, "dim")
-                row += [(text, _flat_level(key)) for text, key in gauge]
-                row.append((" %3d%%" % value, _flat_level(_pct_key(value))))
-            row.append(("]", "dim"))
-            if reset and reset > (now if now is not None else time.time()):
-                row.append((" ↻ " + fmt_min(int((reset - (now if now is not None else time.time())) / 60)), "dim"))
-        rows.append(row)
-    return rows
+                cell += [(text, _flat_level(key)) for text, key in gauge]
+                cell.append((" %3d%%" % value, _flat_level(_pct_key(value))))
+            cell.append(("]", "dim"))
+            if reset and reset > now:
+                cell.append((" ↻ " + fmt_min(int((reset - now) / 60)), "dim"))
+        rows.append((row, cells))
+    # User 2026-10-07: align 5h | week | other across accounts, including empty
+    # slots. Reset text shares each column's measured width; meters keep their shape.
+    widths = [_GAUGE_W + 10, _GAUGE_W + 12, 0]
+    for _row, cells in rows:
+        if cells is not None:
+            for slot, cell in enumerate(cells):
+                widths[slot] = max(widths[slot], sum(_dw(t) for t, _k in cell))
+    out = []
+    for row, cells in rows:
+        if cells is not None:
+            last = max((slot for slot, cell in enumerate(cells) if cell), default=-1)
+            for slot in range(last + 1):
+                cell = cells[slot]
+                row += cell
+                if slot < last:
+                    used = sum(_dw(t) for t, _k in cell)
+                    row.append((" " * (widths[slot] - used + 3), None))
+        # Only quota columns use the viewport fit; source-absence/error messages
+        # keep their existing plain output (F-101 ledger-absent goldens).
+        if cells is not None and term_width is not None:
+            row = _clip_segs(row, term_width)[0]
+        out.append(row)
+    return out
 
 
 def _shown_group_sessions(group_sessions):
@@ -6808,7 +6839,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # rest (detached/stale/dead/child-jobs/worktrees) only show up in the legend when at least
     # one row used them.
     lines.extend(_usage_header_rows(sessions, layout=layout, api_disabled=_API_DISABLED,
-                                    usage_snapshots=usage_snapshots))
+                                    usage_snapshots=usage_snapshots, term_width=term_width))
     # fleet pulse — htop's "Tasks: N, M running" analogue: whole-board census + live spend Σ
     # Show the row by default; counts skip app-server companions. Extracted into _pulse_segs
     # (F-30, v10) so the process view (§5.1) shares this EXACT row instead of a second copy.

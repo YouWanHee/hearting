@@ -1376,11 +1376,14 @@ def _parse_claude_stream_tail(path):
             session_ids.add(sid)
         row_type = payload.get("type")
         message = payload.get("message")
+        if row_type == "system" and payload.get("subtype") == "init":
+            if isinstance(payload.get("model"), str) and payload["model"].startswith("claude-"):
+                latest_model = payload["model"]
         if row_type == "assistant" and isinstance(message, dict):
             usage = message.get("usage")
             if isinstance(usage, dict):
                 latest_usage = usage
-            if isinstance(message.get("model"), str):
+            if isinstance(message.get("model"), str) and message["model"].startswith("claude-"):
                 latest_model = message["model"]
             content = message.get("content")
             if isinstance(content, list):
@@ -1423,6 +1426,7 @@ def _parse_claude_stream_tail(path):
     parsed = {
         "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
         "ambiguity": ambiguity,
+        "model": latest_model,
         "active_context_tokens": active,
         "context_window_tokens": window,
         "session_input_tokens": _counter(cumulative.get("input_tokens")),
@@ -1471,6 +1475,11 @@ def _enrich_claude_stream_session(job, fast_first=False):
             return
         parsed = resolved
         telemetry_path = transcript
+    # User 2026-10-07: owner/worker aliases must show the actual logged version,
+    # through render's existing model formatter, never a guessed alias mapping.
+    model = parsed.get("model")
+    if isinstance(model, str) and model.startswith("claude-"):
+        job.resolved_model = model
     job._dispatch_context_owned = True
     active_context_tokens = parsed.get("active_context_tokens")
     context_window_tokens = parsed.get("context_window_tokens")
