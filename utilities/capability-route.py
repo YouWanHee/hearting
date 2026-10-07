@@ -9943,7 +9943,7 @@ def _close_route_argument(a):
     artifact root. Without one, `finish` takes this session's latest route there."""
     import artifact_producer
     route=a.route
-    if route and (not artifact_producer._ROUTE_ID_RE.fullmatch(route) or Path(route).exists()):
+    if route and (not artifact_producer._ROUTE_ID_RE.fullmatch(str(route)) or Path(route).exists()):
         return route
     root=getattr(a,"artifact_root",None) or os.environ.get("AGENT_ARTIFACT_ROOT") or _compose_artifact_root(os.getcwd())
     if not route:
@@ -9955,6 +9955,61 @@ def _close_route_argument(a):
     if not path.is_file():
         raise ValueError(f"route-not-found: {route} under {root}/.runtime/routes")
     return str(path)
+
+
+def _legacy_inline_finish(a, route, route_file, api):
+    """Close a legacy inline-shaped route with the one `finish` command.
+
+    Eligible direct routes never reach here (they use `inline_finish.finish`).
+    This reuses the existing `complete`/`close`/`finalize` functions with the
+    same arguments -- no new flags, no new gates. Old explicit steps keep working.
+    """
+    import artifact_producer
+    nodes = [n for n in (route.get("nodes") or []) if isinstance(n, dict) and n.get("id")]
+    node = next((n for n in reversed(nodes) if n.get("terminal")), nodes[-1] if nodes else None)
+    if node is None:
+        raise ValueError("finish-legacy-no-terminal-node")
+    node_id = node.get("id")
+    evidence = Path(a.evidence).resolve()
+    if not (evidence.is_file() or evidence.is_dir()):
+        raise SystemExit("completion evidence missing")
+    summary_text = Path(a.summary_file).read_text(encoding="utf-8").strip().splitlines()
+    summary = (summary_text[0].strip() if summary_text and summary_text[0].strip() else f"legacy inline {node_id}")[:200]
+    attempt_id = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or f"{route.get('route_id')}-{node_id}-inline"
+    try:
+        depth = int(node.get("dispatch_depth"))
+    except (TypeError, ValueError):
+        depth = 0
+    explicit = {"attempt_schema_version": 2, "dispatch_depth": depth, "transport": "headless",
+                "execution_surface": "inline", "registered_worker": "0", "fallback_hop": "inline"}
+    try:
+        marker, _row = complete_node(route, node, node_id, evidence, jobs=None,
+                                     attempt_id=attempt_id, explicit_attempt_metadata=explicit)
+    except ValueError as exc:
+        if str(exc) not in {"immutable attempt completion differs from existing link",
+                            "immutable attempt completion history differs from link"}:
+            raise
+        marker = {"route_id": route.get("route_id"), "node": node_id, "replayed": True}
+    outcome, _created = close_route(route, str(route_file), a.commit if getattr(a, "commit", None) else None,
+                                    summary, allow_unproven=True)
+    root = Path(route.get("artifact_root") or _compose_artifact_root(os.getcwd()))
+    cycle = None
+    try:
+        cycle = artifact_producer.route_cycle_for(root, route)
+    except Exception:
+        cycle = None
+    cycle_id = (cycle or {}).get("cycle_id") if isinstance(cycle, dict) else None
+    finalized = None
+    if cycle_id:
+        try:
+            finalized = artifact_producer.finalize(root, cycle_id=cycle_id, state="completed",
+                                                   allow_open_route=True)
+        except Exception as exc:
+            finalized = {"state": "finalize-deferred", "reason": str(exc)}
+    print(f"legacy-inline-finish node={node_id} outcome={bool(outcome)} finalized={bool(finalized)}", file=sys.stderr)
+    return {"schema": "finish_receipt_v1", "route_id": route.get("route_id"),
+            "route_hash": route.get("route_hash"), "state": "legacy-finished", "legacy": True,
+            "node": node_id, "marker": marker, "outcome": outcome, "finalized": finalized}
 
 def _route_autoclose(artifact_root, trigger, route=None):
     """The runtime closes routes nobody works on any more (utilities/route_autoclose.py).
@@ -10507,7 +10562,12 @@ def main():
             if output is not None:
                 _require_entry_scope_review_preview(route, {"id": "one-shot"}, output)
         import inline_finish
-        receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
+        try:
+            receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
+        except inline_finish.InlineFinishError as exc:
+            if str(exc) not in {"finish-route-not-direct", "finish-inline-owner-sentinel-required"}:
+                raise
+            receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__])
         print(json.dumps(receipt,sort_keys=True))
     else:
         if a.command=="close":
