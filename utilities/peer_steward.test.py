@@ -2358,6 +2358,27 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                        if c.args[0][:3] == ["herdr", "agent", "prompt"]]
         self.assertEqual(len(prompts), 1)
 
+    def test_other_sender_same_body_sends_twice(self):
+        """A same-body row from another sender is flushed AND sent anew: the
+        normal path mints a separate row, so skipping by content alone would
+        strand the old row."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        peer_steward.peer_message.prepare_peer_message(
+            "shared body",
+            {"harness": "claude", "session_id": "sid-other", "name": "other"},
+            {"harness": "claude", "session_id": "sid-child", "name": "child"},
+            defer=True, refs=[])
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._verify_run("idle", pane_text="❯ ")) as run_mock, \
+             mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "shared body"]), 0)
+            prompts = [c.args[0] for c in run_mock.call_args_list
+                       if c.args[0][:3] == ["herdr", "agent", "prompt"]]
+        self.assertEqual(len(prompts), 2)
+        self.assertTrue(all("shared body" in argv[4] for argv in prompts))
+
     def test_flush_delivers_a_stranded_row_then_skips_it_once_acked(self):
         """A later receivable prompt resends deferred rows first; the
         receiver hook's ack stops any resend. No row is ever marked here."""

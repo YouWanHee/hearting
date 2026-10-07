@@ -2654,21 +2654,24 @@ def _flush_delay_banner(ref, created):
             % (sent_at, max(1, round(age_h)), str(ref or "")[:8]))
 
 
-def _flush_pending_for_target(target, t_harness, t_sid, entry_wait, skip_hash=None):
+def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
     """Deliver this recipient's deferred rows before a new send.
 
     Returns (flushed, stuck): flushed counts rows the receiver's hook marked
     received after our resend; stuck lists (age_hours, from_name, ref) rows
     still pending older than _FLUSH_STUCK_HOURS so their senders learn on
-    their next prompt. Only `pending` rows without a live delivery claim go
-    out -- `queued` rows were accepted somewhere already, `unverified` rows
-    are ambiguous, and claimed rows may be moving on another path already
-    (native queue, plugin pull); none of those is retried. Rows carrying the
-    same content as this send (`skip_hash`) are left to the normal path,
-    which reuses their row for its single send -- otherwise the content
-    would arrive twice. Codex targets keep their native-queue path only. A
-    row is never marked received here, never deleted, and no key goes out
-    once a form shows (conservative whole-buffer check per row).
+    their next prompt. `skip` is (source_sha256, from_harness, from_sid) of
+    this send: a row from the same sender with the same content is left to
+    the normal path, which reuses its row for its single send -- otherwise
+    the content would arrive twice. A same-body row from another sender goes
+    out: the normal path mints it a separate row. Only `pending` rows
+    without a live delivery claim go out -- `queued` rows were accepted
+    somewhere already, `unverified` rows are ambiguous, and claimed rows may
+    be moving on another path already (native queue, plugin pull); none of
+    those is retried. Codex targets keep their native-queue path only. A row
+    is never marked received here, never deleted, and every check -- entry
+    and per row -- uses the same state-gated form judgment as a send, so a
+    transcript quote can delay but never strand a row.
     Rows older than _FLUSH_STUCK_HOURS go out intact preceded by a delay
     banner prompt (the seal pins the row text, so the banner is separate).
     Never raises; failures print to stderr and leave rows for a later prompt.
@@ -2700,15 +2703,18 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_wait, skip_hash=No
     flushed = 0
     if t_harness == "codex":
         return flushed, stuck
+    entry_wait = entry_state in ("idle", "done")
     rows.sort(key=lambda row: row.get("created") or 0)
     for row in rows[:_FLUSH_MAX_ROWS]:
         ref = row.get("ref")
         try:
             if row.get("rpc_claim"):
                 continue
-            if skip_hash and row.get("source_sha256") == skip_hash:
+            if skip and row.get("source_sha256") == skip[0] \
+                    and (row.get("from") or {}).get("harness") == skip[1] \
+                    and (row.get("from") or {}).get("session_id") == skip[2]:
                 continue
-            if _form_open(target):
+            if _prompt_form_open(target, entry_state):
                 print("pending-flush-stopped target=%s reason=form-open" % target, file=sys.stderr)
                 break
             text = row.get("text")
@@ -2834,15 +2840,16 @@ def cmd_prompt(args):
         _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
         state_before, target_pane = _agent_state(args.target)
     flushed = 0
-    if state_before != "blocked" and not _form_open(args.target):
+    if state_before != "blocked" and not _prompt_form_open(args.target, state_before):
         # Deferred rows go first: a target receivable now takes what an
         # earlier form-open verdict stranded (2026-10-07). Never raises and
         # never re-reads state here: the send path below verifies on its own.
-        # Rows carrying this send's content are skipped: the normal path
-        # reuses their row for its single send below.
+        # The skip carries this send's identity so a same-sender same-body
+        # row is left to the normal path's single send.
         flushed, _stuck = _flush_pending_for_target(
-            args.target, t_harness, t_sid, state_before in ("idle", "done"),
-            skip_hash=hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest())
+            args.target, t_harness, t_sid, state_before,
+            skip=(hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest(),
+                  from_harness, from_sid))
     form_open = _prompt_form_open(args.target, state_before)
     if not args.no_trailer:
         try:
