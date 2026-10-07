@@ -1062,6 +1062,9 @@ Started from an interactive session, `run` records that session and its latest
 route in `meta.json` and starts a detached completion watch: when the run's exit
 code appears, the session gets one notice through its harness carrier
 (`session_notice`), with the exit code and the `compute-hosts tail` command.
+Started by a registered owner or worker inside a route, the notice goes to the
+session that started that route's owner (its parent in the jobs registry),
+naming the launching attempt.
 
 ### §5.14. Peer-Session Steering (steward role)
 

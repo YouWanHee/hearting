@@ -1399,8 +1399,10 @@ class CompletionWatchTest(unittest.TestCase):
         spawn = lambda argv, **kw: spawned.append(argv)
         self.assertTrue(module._spawn_completion_watch(self.run_dir, self.meta, environ={}, spawn=spawn))
         self.assertEqual(spawned[0][2:], ["watch-run", str(self.run_dir)])
-        self.assertFalse(module._spawn_completion_watch(self.run_dir, self.meta,
-                                                        environ={"AGENT_DISPATCH_DEPTH": "1"}, spawn=spawn))
+        empty = self.root / "jobs.log"
+        empty.write_text("")
+        self.assertFalse(module._spawn_completion_watch(self.run_dir, self.meta, spawn=spawn, environ={
+            "AGENT_DISPATCH_DEPTH": "1", "AGENT_DISPATCH_JOBS": str(empty)}))      # no owner row: nobody to tell
         no_session = {**self.meta, "provenance": {"session": None}}
         self.assertFalse(module._spawn_completion_watch(self.run_dir, no_session, environ={}, spawn=spawn))
         self.assertEqual(len(spawned), 1)
@@ -1427,6 +1429,31 @@ class CompletionWatchTest(unittest.TestCase):
         text = sweep.delivery_context([(state / "dispatch", claimed)])
         self.assertIn("run here-1 on here ended with exit 3; read it with: compute-hosts tail here-1", text)
         self.assertEqual(claimed[0]["route_id"], "rt-0123456789abcdef")
+
+    def test_a_run_a_worker_starts_in_a_route_tells_the_routes_parent_session(self):
+        module = load_module()
+        jobs = self.root / "jobs.log"
+        jobs.write_text("now\tdone\t1\tparent\towner\tworker_type=owner,owner_route_id=rt-0123456789abcdef,"
+                        "parent_harness=claude,parent_sid=sid-parent\n")
+        meta = {**self.meta, "provenance": {**self.meta["provenance"], "attempt_id": "att-worker-1",
+                                           "session": {"harness": "claude", "id": "sid-worker"}}}
+        spawned = []
+        self.assertTrue(module._spawn_completion_watch(self.run_dir, meta, spawn=lambda argv, **kw: spawned.append(argv),
+                                                       environ={"AGENT_DISPATCH_DEPTH": "2", "AGENT_DISPATCH_JOBS": str(jobs)}))
+        recorded = json.loads((self.run_dir / "meta.json").read_text())
+        self.assertEqual(recorded["provenance"]["notify"], {"harness": "claude", "id": "sid-parent"})
+        (self.run_dir / "exit_code").write_text("0\n")
+        state = self.root / "state"
+        with mock.patch.dict(os.environ, {"HARNESS_STATE_ROOT": str(state)}):
+            os.environ.pop("AGENT_DISPATCH_JOBS", None)
+            module.cmd_watch_run(SimpleNamespace(run_dir=str(self.run_dir)), sleep=lambda s: None, now=lambda: 0.0)
+            sys.path.insert(0, str(Path(module.__file__).resolve().parent))
+            import dispatch_session_sweep as sweep
+            mine, _ = sweep.sweep_deliver(state / "dispatch", "claude-parent-runtime", "sid-worker")
+            parents, _ = sweep.sweep_deliver(state / "dispatch", "claude-parent-runtime", "sid-parent")
+        self.assertEqual((len(mine), len(parents)), (0, 1))          # the parent, not the worker's own session
+        self.assertIn("started by attempt att-worker-1 in route rt-0123456789abcdef",
+                      sweep.delivery_context([(state / "dispatch", parents)]))
 
     def test_a_removed_run_ends_the_watch_quietly(self):
         module = load_module()
