@@ -7566,6 +7566,87 @@ class ComposeRouteTest(TestRoute):
    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(root,root,"auto")
    self.assertEqual(R.compose_spec_read(root,root,"read spec/prd.md v3")["source"],"read spec/prd.md v3")
    self.assertTrue(R.compose_spec_read(R.ROOT,R.ROOT,None)["satisfied"])
+ def test_source_changing_work_gets_its_own_worktree_from_the_latest_base(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   git=lambda cwd,*args: subprocess.run(["git","-C",str(cwd),*args],check=True,capture_output=True,text=True).stdout.strip()
+   origin=Path(tmp)/"origin.git"; primary=Path(tmp)/"repo"
+   git(tmp,"init","-q","--bare","-b","main",str(origin)); git(tmp,"clone","-q",str(origin),str(primary))
+   commit=lambda *args: git(primary,"-c","user.name=t","-c","user.email=t@t","commit","-q",*args)
+   (primary/"a.txt").write_text("a\n"); git(primary,"add","a.txt"); commit("-m","base"); git(primary,"push","-q","origin","main")
+   (primary/"pkg").mkdir()
+   made=R.prepare_isolated_worktree(primary/"pkg","fix-x")
+   wt=Path(tmp)/"repo-wt"/"fix-x"
+   self.assertEqual((made["state"],made["path"],made["branch"],made["base"]),("created",str(wt),"fix-x","origin/main"))
+   self.assertEqual(made["cwd"],str(wt))                   # an untracked subdirectory is not in the new tree
+   self.assertEqual(git(wt,"rev-parse","HEAD"),git(primary,"rev-parse","origin/main"))
+   again=R.prepare_isolated_worktree(primary,"fix-x")         # the same work reuses its worktree
+   self.assertEqual((again["state"],again["path"],again["branch"]),("reused",str(wt),"fix-x"))
+   self.assertEqual(R.prepare_isolated_worktree(wt,"other")["reason"],"not-primary-checkout")
+   (Path(tmp)/"repo-wt"/"taken").mkdir()
+   self.assertEqual(R.prepare_isolated_worktree(primary,"taken")["reason"],"path-occupied")
+   self.assertEqual(R.prepare_isolated_worktree(Path(tmp),"x")["reason"],"not-primary-checkout")
+   # work in progress stays where it is: an uncommitted change, or a commit the base lacks
+   (primary/"a.txt").write_text("changed\n")
+   self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
+   git(primary,"switch","-q","-c","feature-x"); (primary/"b.txt").write_text("b\n"); git(primary,"add","b.txt","a.txt"); commit("-m","wip")
+   self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
+   self.assertFalse((Path(tmp)/"repo-wt"/"y").exists())
+   # the route compose moved into that worktree is found from the primary checkout after /clear
+   routes=Path(tmp)/"reports"; R.canonical_routes_dir(routes).mkdir(parents=True)
+   path=R.canonical_routes_dir(routes)/("rt-"+"f"*16+".json")
+   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(wt),"artifact_root":str(routes)}),encoding="utf-8")
+   with mock.patch.object(R,"_route_chain_module",return_value=None), \
+        mock.patch.object(R,"_compose_artifact_root",return_value=str(routes)):
+    self.assertEqual(R.caller_open_route(primary)[:2],(str(path),"cwd"))
+ def test_only_source_changing_routes_with_a_real_artifact_root_are_isolated(self):
+  source={"id":"execute","write_scope":["source/**"]}; plan={"id":"plan","write_scope":["artifacts/plans/**"]}
+  real=str(Path.home()/"project"/".agent_reports")
+  self.assertTrue(R._isolates_worktree({"artifact_root":real,"nodes":[plan,source]}))
+  self.assertFalse(R._isolates_worktree({"artifact_root":real,"nodes":[plan]}))
+  self.assertFalse(R._isolates_worktree({"artifact_root":tempfile.gettempdir()+"/x","nodes":[source]}))
+ def test_a_bare_start_finds_this_sessions_open_route_else_the_one_open_route_of_the_cwd(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)/"reports"; routes=R.canonical_routes_dir(root); routes.mkdir(parents=True)
+   here=Path(tmp)/"wt"; other=Path(tmp)/"other"; here.mkdir(); other.mkdir()
+   def route(name,cwd,closed=False):
+    path=routes/f"rt-{name*16}.json"
+    path.write_text(json.dumps({"route_id":f"rt-{name*16}","nodes":[],"cwd":str(cwd),"artifact_root":str(root)}),encoding="utf-8")
+    if closed: R.outcome_path(path).write_text("{}",encoding="utf-8")
+    return str(path)
+   mine_old,mine_new,mine_closed=route("a",other),route("b",other),route("c",other,closed=True)
+   ledger=[{"route_file":mine_old},{"route_file":mine_new},{"route_file":mine_closed}]
+   chain=mock.Mock(writer_identity=lambda: ("claude","sess"),read_tail=lambda harness,sid: ledger)
+   with mock.patch.object(R,"_route_chain_module",return_value=chain), \
+        mock.patch.object(R,"_compose_artifact_root",return_value=str(root)):
+    self.assertEqual(R.caller_open_route(here)[:2],(mine_new,"this-session"))   # newest open, closed skipped
+    ledger.clear()                                                               # a new session: no ledger
+    self.assertEqual(R.caller_open_route(here)[:2],(None,"none"))
+    only=route("d",here)
+    found,source,rows=R.caller_open_route(here)
+    self.assertEqual((found,source),(only,"cwd"))
+    self.assertIn(f"start --route {only}",rows[0]["resume_command"])
+    route("e",here)
+    found,source,rows=R.caller_open_route(here)
+    self.assertEqual((found,source,len(rows)),(None,"ambiguous",2))
+ def test_spec_read_auto_accepts_this_sessions_recorded_read_of_the_unchanged_spec(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   repo=Path(tmp)/"repo"; reports=repo/".agent_reports"; home=Path(tmp)/"home"
+   (reports/"spec").mkdir(parents=True); home.mkdir(); prd=reports/"spec"/"prd.md"; prd.write_text("# prd\n",encoding="utf-8")
+   read=lambda session: subprocess.run(["sh",str(R.ROOT/"hooks"/"spec-read-marker.sh"),"--file",str(prd),"--session",session,
+                                        "--agent-home",str(home)],check=True,capture_output=True,text=True)
+   with mock.patch.object(R,"resolve_agent_home",return_value=str(home)), \
+        mock.patch.object(R.ROUTE_AUTHORITY,"default_parent_session_id",return_value="sess-a"):
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+    read("sess-b")                                    # another session's read is not this one's
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+    read("sess-a")
+    got=R.compose_spec_read(repo,reports,"auto")
+    self.assertEqual(got,{"satisfied":True,"source":R.SPEC_READ_MARKER_PREFIX+str(prd)})
+    os.utime(prd,(prd.stat().st_atime,prd.stat().st_mtime+5))   # the spec changed after the read
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+   with mock.patch.object(R.ROUTE_AUTHORITY,"default_parent_session_id",side_effect=D.DispatchContractError("caller-harness-ambiguous")):
+    with self.assertRaisesRegex(ValueError,"compose-spec-read-required"): R.compose_spec_read(repo,reports,"auto")
+    self.assertTrue(R.compose_spec_read(Path(tmp)/"none",Path(tmp)/"none","auto")["satisfied"])   # no spec: identity never asked
  def test_spec_read_auto_notes_the_shared_spec_layout_without_refusing(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp); ref=root/"shared"/"spec"/"ref_abc"

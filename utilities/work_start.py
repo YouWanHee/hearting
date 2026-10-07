@@ -1041,10 +1041,11 @@ def _first_leg(route, path, jobs, result, root, record, output, record_path, dec
         binding = RP.read_route_plan(f"{record_path}#0", root)
         readiness = {}
 
-        def probe():
-            if "value" not in readiness:
-                readiness["value"] = module.proposal_readiness(route, jobs)
-            return readiness["value"]
+        def probe(cwd=None):
+            key = cwd or route["cwd"]
+            if key not in readiness:
+                readiness[key] = module.proposal_readiness({**route, "cwd": key}, jobs)
+            return readiness[key]
         leg = {key: compose[key] for key in ("capability", "mode", "shape", "graph", "intensity")}
         try:
             leg_route = module.compile_first_leg(
@@ -1751,10 +1752,11 @@ def _plan_leg(route, jobs, index):
         prompt = Path(context["prompt_file"])
         readiness = {}
 
-        def probe():
-            if "value" not in readiness:
-                readiness["value"] = module.proposal_readiness(route, jobs)
-            return readiness["value"]
+        def probe(cwd=None):
+            key = cwd or route["cwd"]
+            if key not in readiness:
+                readiness[key] = module.proposal_readiness({**route, "cwd": key}, jobs)
+            return readiness[key]
         leg_route = module.compile_first_leg(
             binding["leg"], frame_route=route, frame_cycle_id=cycle["cycle_id"], context=context,
             binding=binding, index=index, readiness=probe,

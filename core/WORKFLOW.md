@@ -359,11 +359,16 @@ stages are not mandatory. The sealed result shows the realized stages and omitte
 defaults before execution. Input/output, explicit human gates, and terminal proof
 remain binding contracts for the selected work.
 `compile` remains the low-level explicit interface. Callers need not switch to it
-to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd, artifact root
+to obtain a complete recipe. `compose` fills omitted flags from the checkout: cwd (for a
+non-direct `--start` whose stages change source from a primary checkout, the worktree
+`<repo>-wt/<slug>` on branch `<slug>` from the latest base, created or reused, unless the
+checkout holds work the base lacks; a framed
+decision's first such leg does the same under the frame's slug), artifact root
 (`utilities/artifact-root.sh`), tracking and workflow mode by shape, a
 default drift verdict, the spec-read gate (it refuses with
 `compose-spec-read-required` when a `spec/prd.md` exists under the cwd or the
-artifact root and the caller has not named what was read; the latest `prd.md` of
+artifact root and neither this session's read hook recorded reading it unchanged
+nor the caller named what was read; the latest `prd.md` of
 a `shared/spec/<ref>/` revision only adds one `[경로]` card line with its path), and both
 eligibility probes (`dispatch-readiness`). The result is sealed, verified,
 bound, and guarded exactly like a recipe route: `selection.route_origin`
@@ -705,8 +710,14 @@ completion and close steps; use their recorded route and producer evidence:
 
 ```text
 python3 utilities/capability-route.py close --route <route.json> [--commit <sha>] [--summary <line>]
-python3 utilities/capability-route.py status --artifact-root <dir> --open-only
+python3 utilities/capability-route.py status [--artifact-root <dir>] --open-only
 ```
+
+`status` defaults the artifact root from the cwd, and each open row carries its
+`resume_command`. A `start` without `--route` continues this session's newest
+open route (its route-chain ledger), or else the one open route sealed for the
+cwd (or, with none there, for a worktree of its repository); with none or several
+it lists them and starts nothing.
 
 `close` may preserve `terminal_gate_proven=false`; later exact completion on the
 same route is consumed by complete/finish/close/finalize (artifact-path-contract

@@ -3278,8 +3278,9 @@ DEFAULT_ARTIFACT_GUARD = "compose-prechecked"
 
 def compose_spec_read(cwd, artifact_root, explicit):
     """`auto` is honest, not permissive: with no spec candidate it records the
-    absence; with a `spec/prd.md` present it refuses and names the file the
-    caller must read and assert (`--spec-read <source>`). The spec-read gate is
+    absence; with a `spec/prd.md` present it is satisfied when this session's read
+    hook recorded reading that file unchanged, and otherwise refuses and names the
+    file the caller must read (or assert with `--spec-read <source>`). The spec-read gate is
     a real invariant (WORKFLOW §7.0); compose only removes the boilerplate case.
     A shared-spec `prd.md` never blocks compose: the record says which file is
     there to read and `compose_card` passes that path on as one line."""
@@ -3292,11 +3293,45 @@ def compose_spec_read(cwd, artifact_root, explicit):
             if candidate.is_file():
                 present.append(str(candidate))
         shared.extend(_compose_shared_spec_prds(root))
+    unread = sorted(set(present) - set(_spec_reads_recorded(present, artifact_root) if present else ()))
+    if unread:
+        raise ValueError("compose-spec-read-required:" + ",".join(unread))
     if present:
-        raise ValueError("compose-spec-read-required:" + ",".join(sorted(set(present))))
+        return {"satisfied": True, "source": SPEC_READ_MARKER_PREFIX + ",".join(sorted(set(present)))}
     if shared:
         return {"satisfied": True, "source": SPEC_READ_SHARED_PREFIX + ",".join(sorted(set(shared)))}
     return {"satisfied": True, "source": "compose-auto: no spec/prd.md under cwd or artifact root"}
+
+
+SPEC_READ_MARKER_PREFIX = "spec-read-marker: "
+
+
+def _spec_reads_recorded(paths, artifact_root):
+    """The `paths` this session has read unchanged, as the read hook recorded them
+    (`hooks/spec-read-marker.sh`: `<agent home>/.spec-grounding/<session>__<root key>`
+    holding the file's mtime at the read). Only a root-level `spec/prd.md` of the
+    artifact root has such a key; anything unreadable counts as not read."""
+    try:
+        session = ROUTE_AUTHORITY.default_parent_session_id()
+    except ValueError:                      # an ambiguous caller has no reads of its own
+        return []
+    if not session:
+        return []
+    root = Path(artifact_root)
+    key = str(root.parent).replace("/", "_").replace(" ", "_")
+    marker = Path(resolve_agent_home()) / ".spec-grounding" / f"{session}__{key}"
+    try:
+        recorded = int(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return []
+    read = []
+    for path in paths:
+        try:
+            if Path(path) == root / "spec" / "prd.md" and int(Path(path).stat().st_mtime) == recorded:
+                read.append(path)
+        except OSError:
+            continue
+    return read
 
 
 def _compose_spec_read_notice(route):
@@ -3892,6 +3927,13 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
         work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
     route = compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
                            parent_harness=owner or "claude")
+    if leg["shape"] != "direct" and _isolates_worktree(route):
+        # Every leg of one decision shares the frame's worktree, prepared by the first leg that changes source.
+        worktree = prepare_isolated_worktree(frame_route["cwd"], frame_route.get("slug"))
+        if worktree.get("cwd"):
+            route = compose_route(**{**kwargs, "cwd": worktree["cwd"]},
+                                  **_leg_evidence(leg, lambda: readiness(worktree["cwd"])),
+                                  work_request=work_request, route_plan=binding, parent_harness=owner or "claude")
     scope = route_plan_execution_scope(binding)
     if scope in ("complete", "report"):
         route = _bind_entry_execution_scope(route, scope)
@@ -9333,6 +9375,109 @@ def stages_block(registry, recipe):
             "frame_brief_inputs":TOPO.frame_brief_inputs(registry,capability)}
 
 
+def _isolates_worktree(route):
+    """Whether this route gets its own worktree: it changes source, and its artifact root is a real
+    one (a temporary root is a fixture's, as for the route-chain ledger, which never touches the
+    checkout around it)."""
+    real_root = os.path.realpath(str(route.get("artifact_root") or ""))
+    real_tmp = os.path.realpath(tempfile.gettempdir())
+    return (real_root != real_tmp and not real_root.startswith(real_tmp + os.sep)
+            and any(_node_mutates_worktree(node) for node in route.get("nodes") or []))
+
+
+def _git(cwd, *args):
+    try:
+        result = subprocess.run(["git", "-C", str(cwd), *args], text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def prepare_isolated_worktree(cwd, slug):
+    """The isolated worktree a source-changing route runs in, when `cwd` is a primary checkout.
+
+    `<repo>-wt/<slug>` (OPERATIONS §5.9 naming) on a new branch `<slug>` from the latest
+    `origin/<default>`, or the existing worktree at that path, reused as it is. Returns
+    `{state: created|reused, path, cwd, branch, base}`, or `{state: skipped, reason}` when the
+    caller's cwd stays the route cwd (not a primary checkout, local work the base lacks, or the path
+    or branch is taken).
+    Nothing here refuses: a skipped preparation leaves the work where it was asked to run."""
+    if OWNER_WRITE_ADVISORY.git_topology(cwd) != "primary":
+        return {"state": "skipped", "reason": "not-primary-checkout"}
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if not top or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(slug or "")):
+        return {"state": "skipped", "reason": "no-checkout-or-slug"}
+    relative = os.path.relpath(os.path.realpath(cwd), os.path.realpath(top))
+    path = Path(top).parent / f"{Path(top).name}-wt" / slug
+    inside = lambda root: str(Path(root) / relative) if relative != "." and (Path(root) / relative).is_dir() else str(root)
+    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if path.exists():
+        branch = _git(path, "symbolic-ref", "-q", "--short", "HEAD")
+        if branch and common and _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir") == common:
+            return {"state": "reused", "path": str(path), "cwd": inside(path), "branch": branch, "base": None}
+        return {"state": "skipped", "reason": "path-occupied", "path": str(path)}
+    default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
+    _git(top, "fetch", "-q", "origin", default)
+    base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
+    # Work in progress in the checkout (uncommitted changes, or commits the base lacks) is what the
+    # work may build on; a worktree from the base would leave it behind, so the cwd stays as asked.
+    if (_git(top, "status", "--porcelain", "--untracked-files=no") != ""
+            or _git(top, "merge-base", "--is-ancestor", "HEAD", base) is None):
+        return {"state": "skipped", "reason": "primary-has-local-work"}
+    if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
+        made = _git(top, "worktree", "add", str(path), slug)
+    else:
+        made = _git(top, "worktree", "add", "-b", slug, str(path), base)
+    if made is None:
+        return {"state": "skipped", "reason": "worktree-add-failed", "path": str(path)}
+    return {"state": "created", "path": str(path), "cwd": inside(path), "branch": slug, "base": base}
+
+
+def caller_open_route(cwd):
+    """`(route_file | None, source, rows)`: the open route a bare `start` continues.
+
+    This session's own newest open route first (its route-chain ledger, which every
+    compose and start writes); otherwise the one open route sealed for this cwd under
+    the cwd's artifact root, or, with none there, for a worktree of the cwd's repository. `rows` are the open routes that were looked at, each with
+    its `resume_command`, so a caller that finds none or several sees what is there."""
+    from parent_next_directive import resume_command
+    rc = _route_chain_module()
+    anchor = rc.writer_identity() if rc is not None else None
+    for line in reversed(rc.read_tail(*anchor) if anchor else []):
+        path = Path(line["route_file"])
+        if path.is_file() and not outcome_path(path).is_file():
+            return str(path), "this-session", []
+    try:
+        artifact_root = _compose_artifact_root(cwd)
+    except ValueError:
+        return None, "none", []
+    here = os.path.realpath(cwd)
+    repository = lambda path: _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    rows, same_repository = [], []
+    for row in route_status(artifact_root):
+        if row["closed"] or row.get("read_only"):
+            continue
+        try:
+            sealed_cwd = json.loads(Path(row["route_file"]).read_text(encoding="utf-8")).get("cwd")
+        except (OSError, ValueError):
+            continue
+        if not isinstance(sealed_cwd, str):
+            continue
+        found = {"route_id": row["route_id"], "capability": row["capability"], "route_file": row["route_file"],
+                 "cwd": sealed_cwd, "resume_command": resume_command(row["route_file"], agent_home=ROOT)}
+        if os.path.realpath(sealed_cwd) == here:
+            rows.append(found)
+        else:
+            same_repository.append(found)
+    if not rows and same_repository:
+        # A route compose moved into the repository's own worktree (`prepare_isolated_worktree`).
+        mine = repository(here)
+        rows = [row for row in same_repository if mine and os.path.isdir(row["cwd"]) and repository(row["cwd"]) == mine]
+    if len(rows) == 1:
+        return rows[0]["route_file"], "cwd", rows
+    return None, "ambiguous" if rows else "none", rows
+
+
 def _compose_artifact_root(cwd):
     script=ROOT/"utilities"/"artifact-root.sh"
     result=subprocess.run(["sh",str(script),str(cwd)],text=True,capture_output=True,check=False)
@@ -9771,7 +9916,8 @@ def main():
             if option.dest in advanced:
                 option.help = argparse.SUPPRESS
     start=sub.add_parser("start",help="continue one sealed work request; existing attempts are reused")
-    start.add_argument("--route",required=True,type=Path)
+    start.add_argument("--route",type=Path,default=None,
+                       help="default: this session's newest open route, else the one open route of this cwd")
     start.add_argument("--jobs",type=Path,default=None)
     start.add_argument("--wait",action="store_true",help="the receipt's bounded wait for a parent without an automatic carrier")
     start.add_argument("--interview",type=Path,help="semantic frame question; runtime owns its registration and cycle fields")
@@ -9854,7 +10000,7 @@ def main():
     cl.add_argument("--allow-unproven",action="store_true",
                      help="accepted for compatibility; close always records terminal_gate_proven=false with a "
                           "terminal-gate-unproven warning when the terminal node has not completed")
-    st=sub.add_parser("status"); st.add_argument("--artifact-root",required=True)
+    st=sub.add_parser("status"); st.add_argument("--artifact-root",default=None,help="default: utilities/artifact-root.sh for cwd")
     st.add_argument("--open-only",action="store_true",help="list only routes with no recorded outcome")
     sg=sub.add_parser("stages",help="list a capability's (or every capability's) stage ids, in recipe order, for --graph")
     sg.add_argument("--capability",default=None,help="default: every capability")
@@ -9927,7 +10073,7 @@ def main():
             pins={**_inherited_selection_pins(route_plan_binding,artifact_root),**pins}
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
-        route=compose_route(
+        compose_args=dict(
             capability=a.capability if shape=="framed" else (a.capability or COMPOSE_DEFAULT_CAPABILITY),
             capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
@@ -9947,6 +10093,17 @@ def main():
             selection_pins=pins or None,route_plan=route_plan_binding,
             execution_scope=a.execution_scope,
         )
+        route=compose_route(**compose_args)
+        worktree=None
+        if (a.start and a.cwd is None and a.dispatch_evidence is None and shape!="direct"
+                and _isolates_worktree(route)):
+            # Work that changes source runs in its own worktree, not in the shared primary checkout.
+            worktree=prepare_isolated_worktree(cwd,a.slug)
+            print("worktree_prepared="+worktree["state"]+"".join(
+                f" {key}={worktree[key]}" for key in ("path","branch","base","reason") if worktree.get(key)),file=sys.stderr)
+            if worktree.get("cwd"):
+                DISPATCH_DEFAULTS_WARNINGS.clear()
+                route=compose_route(**{**compose_args,"cwd":worktree["cwd"]})
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan
@@ -9977,6 +10134,8 @@ def main():
             started=start_work(route,path,jobs)
             if access_change is not None:
                 started={**started,"access_change":access_change}
+            if worktree is not None and worktree.get("cwd"):
+                started={**started,"worktree":worktree}
             print(json.dumps(started,ensure_ascii=False),flush=True)
         # Bookkeeping runs after the work has started: the start does not depend on it (the sweep
         # never closes this route, and a cycle it seals is never the one this route begins or continues).
@@ -10008,6 +10167,17 @@ def main():
         return 0
     if a.command=="start":
         from work_start import start_work
+        if a.route is None:
+            found,source,rows=caller_open_route(os.getcwd())
+            if found is None:
+                print(json.dumps({"state":"no-open-route" if source=="none" else "open-route-ambiguous",
+                                  "cwd":os.getcwd(),"open_routes":rows,
+                                  "next_step":("Run the resume_command of the route to continue."
+                                               if rows else "No open route belongs to this session or cwd.")},
+                                 ensure_ascii=False))
+                return 2
+            a.route=Path(found)
+            print(f"route_default={found} source={source}",file=sys.stderr)
         route=verify_route(json.loads(a.route.read_text()))
         jobs=Path(a.jobs or _compose_default_jobs())
         pin_change=_change_owner_pin(route,jobs,a.pin) if a.pin else None
@@ -10177,8 +10347,12 @@ def main():
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
-        rows=route_status(a.artifact_root)
+        rows=route_status(a.artifact_root or _compose_artifact_root(os.getcwd()))
         if a.open_only: rows=[row for row in rows if not row["closed"]]
+        from parent_next_directive import resume_command
+        for row in rows:
+            if not row["closed"] and not row.get("read_only"):
+                row["resume_command"]=resume_command(row["route_file"],agent_home=ROOT)
         print(json.dumps(rows,sort_keys=True,indent=2))
     elif a.command=="finish":
         a.route=Path(_close_route_argument(a))
