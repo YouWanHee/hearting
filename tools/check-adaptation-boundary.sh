@@ -3463,6 +3463,8 @@ check_codex_mode_map() {
       fail_msg "Codex mode map must report the portable source for $rel"
     fi
   done
+  # One pair per run, reused by every iteration above; nothing else removes it.
+  rm -f "${TMPDIR:-/tmp}/codex-mode-map.$$.out" "${TMPDIR:-/tmp}/codex-mode-map.$$.err"
 }
 
 check_opencode_capability_map() {
