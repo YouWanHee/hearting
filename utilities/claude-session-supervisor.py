@@ -39,6 +39,7 @@ from dispatch_completion_join import (
     receipt_with_stage_advance,
     remove_supervisor_state,
     runtime_wait_requested,
+    settle_runtime_wait_children,
     start_retry_prompt,
     validate_delivery_timing,
     write_supervisor_state,
@@ -1384,6 +1385,27 @@ def main(argv: list[str] | None = None) -> int:
                     "ordinal": 1,
                     **delivery_timing,
                 })
+            wait_requested = runtime_wait_requested(result.get("result"))
+            if unstarted or (wait_requested and not new_attempts):
+                rows, settled = settle_runtime_wait_children(
+                    Path(args.jobs), args.parent_attempt_id, delivered, join_interval=args.join_interval,
+                    route_id=args.route_id, route_hash=args.route_hash)
+                current = {row.attempt_id: row for row in rows}
+                new_attempts = set(current).difference(delivered)
+                partition = partition_runtime_wait_children(
+                    Path(args.jobs), args.parent_attempt_id,
+                    [current[attempt] for attempt in new_attempts], new_attempts,
+                )
+                unstarted = set(partition.unstarted)
+                park_attempts = set(partition.joinable)
+                if settled:
+                    emit(
+                        {
+                            "type": "dispatch.supervisor.launch-settled",
+                            "parent_attempt_id": args.parent_attempt_id,
+                            "attempt_count": len(new_attempts),
+                        }
+                    )
             # A resource never makes an unstarted model leg joinable. Collect
             # actual model children first, and preserve their refusal semantics.
             if not park_attempts and not unstarted and not partition.chain_pending:
@@ -1403,15 +1425,15 @@ def main(argv: list[str] | None = None) -> int:
                     next_prompt = resource_prompt
                     resume = True
                     continue
-            empty_wait = (not current and runtime_wait_requested(result.get("result"))) or (
-                runtime_wait_requested(result.get("result")) and not partition.joinable
+            empty_wait = (not new_attempts and wait_requested) or (
+                wait_requested and not partition.joinable
                 and not partition.chain_pending and bool(partition.refusal_settled)
             )
             # A refusal-settled-only round has nothing to park. Fold those
             # exact rows into the current aggregate bookkeeping when the owner
             # did not request another wait; a requested wait still follows the
             # existing empty-wait correction path.
-            if not runtime_wait_requested(result.get("result")) and not park_attempts:
+            if not wait_requested and not park_attempts:
                 delivered.update(partition.refusal_settled)
             # Collect work already admitted to the shared join before asking
             # for another launch. A pending sibling cannot preempt that duty
