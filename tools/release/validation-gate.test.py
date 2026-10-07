@@ -207,14 +207,14 @@ class ChecksWorkflowContractTest(unittest.TestCase):
         self.assertIn("--verify-shards", aggregate)
         self.assertIn("actions/download-artifact@", aggregate)
 
-    def test_four_shards_run_in_parallel_within_the_old_time_budget(self):
+    def test_eight_shards_run_in_parallel_within_the_old_time_budget(self):
         shard = job_block(self.checks, "full-suite-shard")
         self.assertIn("    needs: adaptation-boundary\n", shard)
         self.assertIn("    if: needs.adaptation-boundary.outputs.full_tests == 'true'\n", shard)
         self.assertIn("      fail-fast: false\n", shard)
-        self.assertIn("        shard: [1, 2, 3, 4]\n", shard)
+        self.assertIn("        shard: [1, 2, 3, 4, 5, 6, 7, 8]\n", shard)
         self.assertIn("    timeout-minutes: 40\n", shard)
-        for option in ("--shard ${{ matrix.shard }}/4", "--suite-list", "--retries 1", "--xpass-nonfatal",
+        for option in ("--shard ${{ matrix.shard }}/8", "--suite-list", "--retries 1", "--xpass-nonfatal",
                        "--strict-leak-sweep", "--diagnostics-dir", "--seed-baseline"):
             self.assertIn(option, shard)
         self.assertIn("sudo timeout 300 apt-get", shard)  # tracing fixtures are needed by each shard
@@ -223,7 +223,7 @@ class ChecksWorkflowContractTest(unittest.TestCase):
         shard = job_block(self.checks, "full-suite-shard")
         upload = shard.split("- name: Upload shard report", 1)[1]
         self.assertIn("if: always()", upload)
-        self.assertIn("name: run-tests-report-shard-${{ matrix.shard }}-of-4", upload)
+        self.assertIn("name: run-tests-report-shard-${{ matrix.shard }}-of-8", upload)
         self.assertIn("overwrite: true", upload)
         marker = job_block(self.checks, "validated-tree-marker")
         self.assertIn("name: validated-tree-${{ steps.tree.outputs.tree }}", marker)
