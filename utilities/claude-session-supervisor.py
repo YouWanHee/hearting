@@ -1534,7 +1534,7 @@ def main(argv: list[str] | None = None) -> int:
                 delivered.update(drive.traversed)
                 delivered.update(drive.closed)
                 delivered.update(partition.refusal_settled)
-                chain_notice = subsession_advance.chain_delivery_notice(drive, joined_rows)
+                chain_notice = subsession_advance.chain_delivery_notice(drive, joined_rows, Path(args.jobs))
                 # A-4 (F-2): the aggregate owner-resume delivery this round is
                 # about to receive, recorded exactly once regardless of how
                 # many internal advances the loop above just performed.
