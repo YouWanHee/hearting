@@ -30,7 +30,9 @@ adapter.
 - `AGENT_HOME` is the installed harness root. Resolve the canonical artifact root with `utilities/artifact-root.sh`; linked worktrees write the primary checkout's `.agent_reports/`, and legacy `.claude_reports/` is only a fallback.
 - `preflight.sh` is a shorthand, not a PATH command: it resolves to `<AGENT_HOME>/adapters/opencode/bin/preflight.sh` and no shim is installed at the harness root. Run it by that absolute path — for example `AGENT_HOME="$AGENT_HOME" bash "$AGENT_HOME/adapters/opencode/bin/preflight.sh" capability-info <capability>` — and read every `preflight.sh <command>` below as that path. Export `AGENT_HOME` to the installed root for release behavior, or to a checkout/worktree to use that tree as the active runtime.
 - Portable model roles stay vendor-neutral in shared artifacts; never use vendor model names as portable semantics.
+<!-- BEGIN generated from core/fragments/bootstrap-compute-hosts.md by tools/sync-bootstrap-dispatch.py; edit the source -->
 - Before GPU or long training work, run `compute-hosts probe`; other servers are reached through `compute-hosts` and its inventory (`~/.config/hearting/compute-hosts.yaml`), not bare `ssh <name>`.
+<!-- END generated from core/fragments/bootstrap-compute-hosts.md -->
 - Capabilities come from `capabilities/`. OpenCode-native generated Skills, commands, agents, and plugins live under `adapters/opencode/` and project through `opencode_setting/opencode-skills`, `opencode_setting/opencode-commands`, `opencode_setting/opencode-agents`, and `opencode_setting/opencode-plugins`.
 - Validate native discovery with `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`; Claude compatibility autoload must not mask missing OpenCode output.
 - Run `preflight.sh capability-info <capability>` and `preflight.sh mode-info <family/mode>`; obey named `tool_contract`, `tool_contract_check`, `runtime_surface`, and `fallback`.
@@ -168,10 +170,11 @@ non-terminal stage declares `inline-next`, `supervised`, `human-gate`, or
 `monitor`; a detached resource run must be `supervised` and can never be
 terminal. Route compile and launch refuse a graph that breaks this.
 
-Do not end a turn while a stage has no registered continuation: arm
-`utilities/workflow-supervisor.py`, dispatch the next stage, or record the human
-gate in the same turn, and otherwise say plainly that automatic follow-up is
-impossible and name the checked fallback. OpenCode's registered standard+
+<!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
+Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run.
+<!-- END generated from core/fragments/bootstrap-continuation.md -->
+
+OpenCode's registered standard+
 dispatch-depth-2 continuations use the shared external supervisor rather than a
 runtime bridge. `OPERATIONS §5.12` owns the mechanics.
 

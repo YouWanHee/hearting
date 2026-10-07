@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Project the shared dispatch paragraphs into the three adapter bootstraps.
+"""Project the shared bootstrap paragraphs into the three adapter bootstraps.
 
-`core/fragments/bootstrap-dispatch.md` is the one source. Each bootstrap holds
-it, byte for byte, between the BEGIN/END markers below; everything outside the
-markers stays adapter-owned. `--check` reports a stale copy without writing.
+Each `core/fragments/bootstrap-*.md` file is the one source for its block.
+Each bootstrap holds it, byte for byte, between its BEGIN/END markers;
+everything outside the markers stays adapter-owned. `--check` reports
+a stale copy without writing.
 """
 
 from __future__ import annotations
@@ -13,31 +14,42 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = "core/fragments/bootstrap-dispatch.md"
 TARGETS = ("adapters/claude/CLAUDE.md", "adapters/codex/AGENTS.md", "adapters/opencode/AGENTS.md")
-BEGIN = f"<!-- BEGIN generated from {SOURCE} by tools/sync-bootstrap-dispatch.py; edit the source -->"
-END = f"<!-- END generated from {SOURCE} -->"
+BLOCKS = (
+    ("core/fragments/bootstrap-compute-hosts.md", "tools/sync-bootstrap-dispatch.py"),
+    ("core/fragments/bootstrap-dispatch.md", "tools/sync-bootstrap-dispatch.py"),
+    ("core/fragments/bootstrap-continuation.md", "tools/sync-bootstrap-dispatch.py"),
+)
 
 
-def render(text: str, body: str, target: str) -> str:
-    if text.count(BEGIN) != 1 or text.count(END) != 1 or text.index(BEGIN) > text.index(END):
-        raise ValueError(f"{target}: needs exactly one generated-block marker pair")
-    head, rest = text.split(BEGIN, 1)
-    _old, tail = rest.split(END, 1)
-    return f"{head}{BEGIN}\n{body.rstrip()}\n{END}{tail}"
+def _markers(source: str, tool: str) -> tuple[str, str]:
+    begin = f"<!-- BEGIN generated from {source} by {tool}; edit the source -->"
+    end = f"<!-- END generated from {source} -->"
+    return begin, end
+
+
+def render(text: str, body: str, target: str, begin: str, end: str) -> str:
+    if text.count(begin) != 1 or text.count(end) != 1 or text.index(begin) > text.index(end):
+        raise ValueError(f"{target}: needs exactly one generated-block marker pair for {begin[:60]}...")
+    head, rest = text.split(begin, 1)
+    _old, tail = rest.split(end, 1)
+    return f"{head}{begin}\n{body.rstrip()}\n{end}{tail}"
 
 
 def main(argv: list[str] | None = None, root: Path = ROOT) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="verify without writing")
     args = parser.parse_args(argv)
-    body = (root / SOURCE).read_text(encoding="utf-8")
+    bodies = [(src, tool, (root / src).read_text(encoding="utf-8")) for src, tool in BLOCKS]
     stale = []
     for target in TARGETS:
         path = root / target
         text = path.read_text(encoding="utf-8")
         try:
-            wanted = render(text, body, target)
+            wanted = text
+            for src, tool, body in bodies:
+                begin, end = _markers(src, tool)
+                wanted = render(wanted, body, target, begin, end)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -47,9 +59,9 @@ def main(argv: list[str] | None = None, root: Path = ROOT) -> int:
         if not args.check:
             path.write_text(wanted, encoding="utf-8")
     if args.check and stale:
-        print("stale bootstrap dispatch block: " + ", ".join(stale), file=sys.stderr)
+        print("stale bootstrap blocks: " + ", ".join(stale), file=sys.stderr)
         return 1
-    print(f"bootstrap dispatch block {'checked' if args.check else 'generated'} in {len(TARGETS)} bootstraps")
+    print(f"bootstrap blocks {'checked' if args.check else 'generated'} in {len(TARGETS)} bootstraps ({len(BLOCKS)} blocks each)")
     return 0
 
 

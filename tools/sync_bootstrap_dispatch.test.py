@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The three bootstraps carry the one shared dispatch source, byte for byte."""
+"""The three bootstraps carry the shared bootstrap sources, byte for byte."""
 import importlib.util
 import unittest
 from pathlib import Path
@@ -12,19 +12,23 @@ SPEC.loader.exec_module(S)
 
 class BootstrapDispatchTest(unittest.TestCase):
     def test_every_bootstrap_block_is_the_source(self):
-        body = (ROOT / S.SOURCE).read_text(encoding="utf-8").rstrip()
-        for target in S.TARGETS:
-            with self.subTest(target=target):
-                text = (ROOT / target).read_text(encoding="utf-8")
-                block = text.split(S.BEGIN, 1)[1].split(S.END, 1)[0].strip("\n")
-                self.assertEqual(block, body)
+        for src, tool in S.BLOCKS:
+            with self.subTest(block=src):
+                body = (ROOT / src).read_text(encoding="utf-8").rstrip()
+                begin, end = S._markers(src, tool)
+                for target in S.TARGETS:
+                    with self.subTest(target=target):
+                        text = (ROOT / target).read_text(encoding="utf-8")
+                        block = text.split(begin, 1)[1].split(end, 1)[0].strip("\n")
+                        self.assertEqual(block, body)
 
     def test_a_bootstrap_without_one_marker_pair_is_refused(self):
-        for text in ("no markers", f"{S.BEGIN}\n{S.BEGIN}\n{S.END}", f"{S.END}\n{S.BEGIN}"):
+        begin, end = S._markers(*S.BLOCKS[0])
+        for text in ("no markers", f"{begin}\n{begin}\n{end}", f"{end}\n{begin}"):
             with self.subTest(text=text[:20]), self.assertRaises(ValueError):
-                S.render(text, "body", "fixture")
-        self.assertEqual(S.render(f"a\n{S.BEGIN}\nold\n{S.END}\nb", "new\n", "fixture"),
-                         f"a\n{S.BEGIN}\nnew\n{S.END}\nb")
+                S.render(text, "body", "fixture", begin, end)
+        self.assertEqual(S.render(f"a\n{begin}\nold\n{end}\nb", "new\n", "fixture", begin, end),
+                         f"a\n{begin}\nnew\n{end}\nb")
 
 
 if __name__ == "__main__":
