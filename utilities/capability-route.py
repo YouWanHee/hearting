@@ -10090,7 +10090,9 @@ def main():
     v=sub.add_parser("verify"); v.add_argument("--route",required=True); v.add_argument("--cwd")
     v.add_argument("--launch-phase",choices=("dry-run","register","start"))
     n=sub.add_parser("node"); n.add_argument("--route",required=True); n.add_argument("--node",required=True)
-    d=sub.add_parser("complete"); d.add_argument("--route",required=True); d.add_argument("--node",required=True); d.add_argument("--evidence",required=True); d.add_argument("--output")
+    d=sub.add_parser("complete"); d.add_argument("--route",required=False,default=None); d.add_argument("--node",required=True); d.add_argument("--evidence",required=False,default=None); d.add_argument("--output")
+    d.add_argument("--inline",action="store_true",help="owner runs a declared stage itself: derive route/attempt axes, keep the long form working")
+    d.add_argument("--reason",help="one line naming what was done inline (stored with a synthesized evidence file when --evidence is omitted)")
     d.add_argument("--jobs",help="canonical registry path for a registered attempt "
                                  "(default AGENT_DISPATCH_JOBS once an attempt is named)")
     d.add_argument("--attempt-id",help="exact current attempt, or an official continuation's blocking source review "
@@ -10512,6 +10514,16 @@ def main():
     else:
         if a.command=="close":
             a.route=_close_route_argument(a)
+        if a.command=="complete" and getattr(a, "inline", False) and not getattr(a, "route", None):
+            try:
+                from owner_route_binding import default_owner_route_file
+                a.route = default_owner_route_file()
+            except Exception as exc:
+                raise ValueError(str(exc)) from exc
+        if a.command=="complete" and not getattr(a, "inline", False):
+            if not getattr(a, "route", None) or not getattr(a, "evidence", None):
+                print("capability-route: complete requires --route and --evidence (omit only with --inline)", file=sys.stderr)
+                raise SystemExit(2)
         route=verify_route(
             json.loads(Path(a.route).read_text()), getattr(a,"cwd",None),
             allow_stale_registry=a.command=="close",
@@ -10596,6 +10608,54 @@ def main():
             if not node: raise SystemExit("unknown route node")
             if a.command=="node": print(json.dumps(node,sort_keys=True))
             else:
+                if getattr(a, "inline", False):
+                    if a.dispatch_depth is None:
+                        try:
+                            a.dispatch_depth = int(node.get("dispatch_depth"))
+                        except (TypeError, ValueError):
+                            pass
+                    if a.transport is None:
+                        a.transport = "headless"
+                    if a.execution_surface is None:
+                        a.execution_surface = "inline"
+                    if a.registered_worker is None:
+                        a.registered_worker = "0"
+                    if a.fallback_hop is None:
+                        a.fallback_hop = "inline"
+                    if not a.attempt_id:
+                        owner_attempt = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or ""
+                        if owner_attempt:
+                            a.attempt_id = f"{owner_attempt}-{a.node}-inline"
+                    if not getattr(a, "evidence", None) and getattr(a, "reason", None):
+                        try:
+                            import artifact_producer as _ap
+                            import hashlib as _hl
+                            artifact_root = Path(route.get("artifact_root") or "")
+                            record = _ap.route_cycle_for(artifact_root, route)
+                            if record is None:
+                                raise ValueError("inline-evidence-no-bound-cycle: pass --evidence with a cycle-local file")
+                            out_dir = _ap.cycle_dir(artifact_root, record["campaign_id"],
+                                                    record["cycle_id"], record) / "artifacts"
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            reason_text = f"# inline {a.node}\n\n{str(a.reason).strip()}\n"
+                            digest = _hl.sha1(str(a.reason).strip().encode("utf-8")).hexdigest()[:8]
+                            synth_path = out_dir / f"{route.get('route_id')}.{a.node}.{digest}.inline.md"
+                            if synth_path.is_file():
+                                if synth_path.read_text(encoding="utf-8") != reason_text:
+                                    raise ValueError("inline-evidence-path-collision: retry with --evidence")
+                                a._synthesized_evidence = None
+                            else:
+                                synth_path.write_text(reason_text, encoding="utf-8")
+                                a._synthesized_evidence = str(synth_path)
+                            a.evidence = str(synth_path)
+                        except (OSError, ValueError, KeyError) as exc:
+                            if isinstance(exc, ValueError) and str(exc).startswith(("inline-evidence-",)):
+                                raise
+                            raise ValueError(f"inline-evidence-unwritable:{exc}") from exc
+                    if getattr(a, "reason", None):
+                        print(f"inline-reason={a.reason}", file=sys.stderr)
+                if not getattr(a, "evidence", None):
+                    raise SystemExit("completion evidence missing")
                 evidence=Path(a.evidence).resolve()
                 # A completion artifact is one file or one directory of them; the
                 # envelope inspector accepts both and `evidence_digest` names both.
@@ -10662,13 +10722,22 @@ def main():
                         route,node,a.node,evidence,a.subsession_manifest,jobs,
                     )
                 else:
-                    marker,row=complete_node(
-                        route,node,a.node,evidence,
-                        jobs=jobs,
-                        attempt_id=attempt_id,
-                        explicit_attempt_metadata=explicit_attempt_metadata,
-                        review_claim=review_claim,
-                    )
+                    try:
+                        marker,row=complete_node(
+                            route,node,a.node,evidence,
+                            jobs=jobs,
+                            attempt_id=attempt_id,
+                            explicit_attempt_metadata=explicit_attempt_metadata,
+                            review_claim=review_claim,
+                        )
+                    except Exception:
+                        synth = getattr(a, "_synthesized_evidence", None)
+                        if synth:
+                            try:
+                                Path(synth).unlink()
+                            except OSError:
+                                pass
+                        raise
                 if a.output: atomic_write(a.output, marker)
                 print(json.dumps(marker,sort_keys=True))
                 if row: print(json.dumps(row,sort_keys=True))
