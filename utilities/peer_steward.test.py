@@ -2441,7 +2441,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                     "content": '<pasted_content id="fe20">\n' + text + '\n</pasted_content id="fe20">',
                 }, ensure_ascii=False) + "\n")
             return fake(argv, **kw)
-        with mock.patch.object(peer_steward.subprocess, "run", side_effect=send), \
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=send), \
              mock.patch("builtins.print"):
             self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 1)
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
@@ -2455,7 +2456,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                 self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "unverified")
                 self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 0)
             return fake(argv, **kw)
-        with mock.patch.object(peer_steward.subprocess, "run", side_effect=send) as calls, \
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=send) as calls, \
              mock.patch("builtins.print"):
             self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 1)
         prompts = [call.args[0] for call in calls.call_args_list if call.args[0][:3] == ["herdr", "agent", "prompt"]]
@@ -2463,7 +2465,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def test_ambiguous_redelivery_is_preserved_but_not_submitted_twice(self):
         text, ref = self._deferred_claude_row("unobserved row")
-        with mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", pane_text="❯ ")) as calls, \
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._verify_run("working", pane_text="❯ ")) as calls, \
              mock.patch("builtins.print"):
             self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 0)
             self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "working")[0], 0)
