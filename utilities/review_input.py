@@ -76,6 +76,17 @@ def _file(path):
     return {"path": str(resolved), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def sealed_plan_input(route, node):
+    """The plan a review reads when its route has no plan node: the `plan.md` input compose sealed
+    for the node from an earlier cycle (`input_sources`, a path under the route's artifact root).
+    None when the node carries no such source."""
+    sources = node.get("input_sources") if isinstance(node.get("input_sources"), dict) else {}
+    source = next((sources[name] for name in sources if Path(name).name == "plan.md"), None)
+    if not isinstance(source, dict) or not isinstance(source.get("path"), str) or not source["path"]:
+        return None
+    return _file(Path(route.get("artifact_root") or "") / source["path"])
+
+
 def drop_inapplicable(node, reviewed_evidence):
     """`--reviewed-evidence` binds what a plan or spec review examines; on any other node it binds
     nothing, so the optional value is dropped with a printed note instead of refusing the launch."""
@@ -123,6 +134,9 @@ def resolve_input(route, node, jobs, reviewed_evidence=None, *, retry_of=None,
         if explicit is None:
             if is_spec_review_node(node):
                 return None
+            sealed = sealed_plan_input(route, node)
+            if sealed is not None:
+                return sealed
             raise DC.DispatchContractError("reviewed-evidence-required", str(node.get("id")))
         return explicit
     producer = next(n for n in route["nodes"] if n.get("id") == "plan")
