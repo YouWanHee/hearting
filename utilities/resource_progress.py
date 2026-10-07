@@ -1,7 +1,11 @@
-"""Optional, bounded training-progress reads for exact registered processes.
+"""Optional, bounded resource progress; counters never decide process lifecycle.
 
 This observes existing producer metadata. It never imports a producer, scans a
-run tree, writes a registry, or changes the registered process lifecycle.
+run tree, writes a registry, or changes the registered process lifecycle. Lab
+workloads may opt in with ``write_progress(12, "epoch", total=50)``: the runner
+supplies the path/run/node in AGENT_RESOURCE_PROGRESS_FILE/RUN_ID/NODE. With no
+progress environment, the writer does nothing. Readers use only the declared
+file, not logs; a missing or invalid observation stays unavailable.
 """
 from __future__ import annotations
 
@@ -13,10 +17,107 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 
 
 MAX_BYTES = 65536
 MAX_ARMS = 32
+
+
+def environment(run):
+    """Bind the payload to its own row, replacing any inherited resource context."""
+    return {
+        "AGENT_RESOURCE_PROGRESS_FILE": str(run.get("progress_file") or ""),
+        "AGENT_RESOURCE_RUN_ID": str(run.get("run_id") or ""),
+        "AGENT_RESOURCE_NODE": str(run.get("node") or ""),
+    }
+
+
+def _valid_progress(value, run_id, node):
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1
+            or not isinstance(run_id, str) or not run_id or not isinstance(node, str) or not node
+            or value.get("run_id") != run_id or value.get("node") != node
+            or not _count(value.get("completed"))):
+        return False
+    updated = value.get("updated_at")
+    if (not isinstance(updated, (int, float)) or isinstance(updated, bool)
+            or not math.isfinite(updated) or updated < 0):
+        return False
+    for name, maximum in (("unit", 40), ("detail", 240)):
+        if name == "detail" and name not in value:
+            continue
+        text = value.get(name)
+        if (not isinstance(text, str) or not text.strip() or len(text) > maximum
+                or any(ord(char) < 32 or ord(char) == 127 or char in "\x85\u2028\u2029" for char in text)):
+            return False
+    return "total" not in value or (_count(value["total"]) and value["completed"] <= value["total"])
+
+
+def write_progress(completed, unit, *, total=None, detail=None):
+    """Atomically publish schema v1 {run_id,node,updated_at,completed,unit,…}.
+
+    Counts are non-negative integers (booleans are not counts); optional total
+    bounds completed. Text is short and single-line. The optional observation
+    is best effort: no environment, invalid input or an I/O failure returns
+    False, without interrupting the workload. Exit/sentinel still own success.
+    """
+    raw_path = os.environ.get("AGENT_RESOURCE_PROGRESS_FILE", "")
+    run_id = os.environ.get("AGENT_RESOURCE_RUN_ID", "")
+    node = os.environ.get("AGENT_RESOURCE_NODE", "")
+    path = Path(raw_path)
+    value = {"schema_version": 1, "run_id": run_id, "node": node,
+             "updated_at": time.time(), "completed": completed, "unit": unit}
+    if total is not None:
+        value["total"] = total
+    if detail is not None:
+        value["detail"] = detail
+    if not raw_path or not path.is_absolute() or not _valid_progress(value, run_id, node):
+        return False
+    name = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(value, output, ensure_ascii=False, allow_nan=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    finally:
+        if name is not None:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+
+
+def read_progress(run, now):
+    """One declared regular file, at most MAX_BYTES, exact run/node; fail soft.
+
+    updated_at is a Unix timestamp; age_s is observation age, not a liveness or
+    completion verdict. Old but valid counters remain visible with their age.
+    """
+    try:
+        raw_path = run.get("progress_file")
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.is_absolute():
+            return None
+        raw, _mtime = _read(path, Path(path.anchor))
+        value = _json(raw)
+        if not _valid_progress(value, run.get("run_id"), run.get("node")):
+            return None
+        keys = ("schema_version", "run_id", "node", "updated_at", "completed", "unit", "total", "detail")
+        return {**{key: value[key] for key in keys if key in value},
+                "age_s": max(0.0, float(now) - value["updated_at"])}
+    except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+        return None
 
 
 def _signature(info):

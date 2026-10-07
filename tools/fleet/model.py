@@ -613,6 +613,8 @@ class ResourceJob:
     source_git_state: Optional[str] = None
     started_at: Optional[float] = None
     training_progress: Optional[dict] = None
+    progress_file: Optional[str] = None
+    progress: Optional[dict] = None  # declared workload counters; never a state verdict
     # Display-only remote production candidates (no liveness verdict); joined
     # to non-self compute hosts by host-qualified identity, never consumed as
     # local proof. Emitted by the registry scanner, hence a pinned field.
