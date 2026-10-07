@@ -190,13 +190,14 @@ def sealed_pin_harness(route, *, worker_type: str | None) -> str | None:
     return (pin.get("harness") or None) if isinstance(pin, dict) else None
 
 
-# A sealed route never changes; its parent may later move the owner pin to another harness
-# (`capability-route.py start --route <file> --pin owner=<harness>`). Each change is one
-# append-only row beside the route: the new pin, the pin it replaced, who changed it and
-# when, what the runtime knew about where the instruction came from, and the checked
-# launch tuples the runtime probed for the new owner harness at that moment. Launch
-# decisions read the sealed route through `route_in_force`, after its hash is verified.
-PIN_CHANGE_TARGETS = ("owner",)
+# A sealed route never changes; its parent may later move one of its pins
+# (`capability-route.py start --route <file> --pin owner|frame|worker=<harness>[:<model>[@<effort>]]`).
+# Each change is one append-only row beside the route: the new pin, the pin it replaced, who
+# changed it and when, what the runtime knew about where the instruction came from, and the
+# checked launch tuples the runtime probed for the new pin at that moment. Launch decisions
+# read the sealed route through `route_in_force`, after its hash is verified; an attempt that
+# already launched keeps what it launched with.
+PIN_CHANGE_TARGETS = ("owner", "frame", "worker")
 PIN_CHANGE_SCHEMA = 1
 
 
@@ -243,7 +244,7 @@ def _tuple_key(row: dict) -> tuple:
 
 def route_in_force(route):
     """The sealed route with its recorded pin changes applied: the pin in force, and the
-    checked tuples probed for the new owner harness added to the route's dispatch evidence,
+    checked tuples probed for each new pin added to the route's dispatch evidence,
     each depth-2 node's same/cross-harness hops and the registered-headless candidates.
 
     The sealed route is returned unchanged when nothing was recorded; otherwise a copy is
@@ -279,12 +280,17 @@ def route_in_force(route):
     return view
 
 
+def changed_pin_harness(route, target: str) -> str | None:
+    """The harness the route's parent last moved `target` to, or None when it never moved it."""
+    changes = [row for row in pin_changes(route) if row.get("target") == target]
+    return changes[-1]["pin"]["harness"] if changes else None
+
+
 def moved_owner_harness(route, launched_harness: str | None) -> str | None:
     """The owner harness the route's parent moved to after an owner launched on
     `launched_harness`, or None. Only a recorded change moves a replacement; a sealed pin the
     original launch did not follow (a usage-limit fallback) keeps today's same-harness replay."""
-    changes = [row for row in pin_changes(route) if row.get("target") == "owner"]
-    harness = changes[-1]["pin"]["harness"] if changes else None
+    harness = changed_pin_harness(route, "owner")
     return harness if harness and harness != launched_harness else None
 
 

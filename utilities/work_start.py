@@ -1516,7 +1516,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     frames = ([] if existing_owner in rows and not (interview or answers) else
               [n for n in route["nodes"] if n.get("worker_type") == "frame" and n.get("dispatch_depth") == 1])
     if frames:
-        candidates = (route.get("registered_headless_candidates") or []) if route["effective_intensity"] == "quick" else (route.get("dispatch_evidence") or {}).get("tuples", [])
+        in_force = route_authority.route_in_force(route)   # with the parent's later pin changes
+        candidates = (in_force.get("registered_headless_candidates") or []) if route["effective_intensity"] == "quick" else (in_force.get("dispatch_evidence") or {}).get("tuples", [])
         key = "harness" if route["effective_intensity"] == "quick" else "child_harness"
         harnesses = list(dict.fromkeys(c[key] for c in candidates if c.get("status") == "supported" and c.get(key)))
         if not harnesses:
@@ -1526,7 +1527,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         # passed on; with no pin the frame keeps the automatic selection. A
         # pinned tool the route's evidence does not support is not forced: the
         # legs fall back to automatic selection and the result says so.
-        pins = route.get("selection_pins") or {}
+        pins = in_force.get("selection_pins") or {}
         frame_pin = ((pins.get("frame") or pins.get("owner") or {}).get("harness"))
         if frame_pin and frame_pin not in harnesses:
             result["frame_explicit_harness"] = f"unavailable:{frame_pin}"
@@ -1860,7 +1861,7 @@ def _compose_again(route) -> str:
         argv += ["--intensity", route["effective_intensity"]]
     elif shape == "framed" and len(RP.frame_legs(route)) == 2:
         argv += ["--intensity", "strong"]           # both frame legs again
-    for token in RP.pin_tokens(route.get("selection_pins")):
+    for token in RP.pin_tokens(route_authority.route_in_force(route).get("selection_pins")):
         argv += ["--pin", token]
     if route.get("route_plan") is not None:
         sealed = route["route_plan"]
