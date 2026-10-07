@@ -733,6 +733,17 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(peer_message.claim_pending_herdr(ref, dict(self.recipient, session_id="other")))
         self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
 
+    def test_unsent_claim_can_retry_but_receiver_ack_is_never_undone(self):
+        text, ref = self.pending()
+        first = peer_message.claim_pending_herdr(ref, self.recipient)
+        self.assertTrue(peer_message.release_unsent_herdr_claim(first))
+        second = peer_message.claim_pending_herdr(ref, self.recipient)
+        self.assertIsNotNone(second)
+        self.assertFalse(peer_message.release_unsent_herdr_claim(first))
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        self.assertFalse(peer_message.release_unsent_herdr_claim(second))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+
     def test_claude_paste_wrapper_keeps_exact_ref_and_body(self):
         recipient = dict(self.recipient, harness="claude")
         for index, closing in enumerate(('</pasted_content>', '</pasted_content id="fe20">')):

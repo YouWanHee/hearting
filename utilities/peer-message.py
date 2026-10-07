@@ -368,7 +368,18 @@ def claim_pending_herdr(ref, recipient):
         claim = {"token": secrets.token_hex(16), "pid": os.getpid(),
                  "start": process_start_ticks(os.getpid())}
         _save_pending(dict(row, state="unverified", receipt="herdr-delivery-inflight", rpc_claim=claim))
-        return row
+        return dict(row, rpc_claim=claim)
+
+
+def release_unsent_herdr_claim(row):
+    """Release this exact claim only when its caller has not submitted the message."""
+    with pending_lock(row["ref"]):
+        current = _read_pending(row["ref"])
+        if (not current or current["state"] != "unverified"
+                or current.get("rpc_claim") != row.get("rpc_claim")):
+            return False
+        _save_pending(dict(current, state="pending", rpc_claim=None, receipt="target-form-open"))
+        return True
 
 
 def deliver_pending_codex(ref, *, timeout=1.0):

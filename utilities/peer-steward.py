@@ -2730,10 +2730,15 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
             text = row["text"]
             banner = _flush_delay_banner(ref, row.get("created"))
             if banner:
-                _herdr_prompt(target, banner, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+                banner_rc, _banner_payload = _herdr_prompt(
+                    target, banner, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+                if banner_rc != 0:
+                    peer_message.release_unsent_herdr_claim(row)
+                    continue
                 state, _pane = _agent_state(target)
                 if _prompt_form_open(target, state):
-                    continue
+                    peer_message.release_unsent_herdr_claim(row)
+                    break
             sent_at = time.time()
             rc, payload = _herdr_prompt(target, text, wait=state != "working",
                                         timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)

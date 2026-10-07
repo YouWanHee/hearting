@@ -2476,6 +2476,24 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         peer_steward.peer_message.receive_peer_message(wrapped, {"harness": "claude", "session_id": "sid-child"})
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
 
+    def test_form_opening_after_delay_banner_keeps_unsent_body_pending(self):
+        text, ref = self._deferred_claude_row("body not submitted")
+        row = peer_steward.peer_message._read_pending(ref)
+        with peer_steward.peer_message.pending_lock(ref):
+            peer_steward.peer_message._save_pending(dict(row, created=row["created"] - 7200))
+        with mock.patch.object(peer_steward, "_agent_state", side_effect=[("idle", "w1:pX"), ("blocked", "w1:pX")]), \
+             mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "sid-child", "child")), \
+             mock.patch.object(peer_steward, "_bottom_form_tokens", return_value=False), \
+             mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as send, \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 0)
+        self.assertEqual(send.call_count, 1)
+        self.assertTrue(send.call_args.args[1].startswith("[지연 전달"))
+        row = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["text"], text)
+        self.assertIsNone(row["rpc_claim"])
+
     def test_late_flush_sends_delay_banner_before_row_text(self):
         """A row stranded over an hour goes out intact preceded by a delay
         banner prompt, so the recipient sees its age first."""
