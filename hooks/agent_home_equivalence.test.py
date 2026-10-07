@@ -31,6 +31,11 @@ class AgentHomeEquivalenceTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name) / "home"
         self.home.mkdir()
+        # The one unvalidated fallback both chains converge on when nothing is
+        # marked: the managed-release default path. ~/.claude is Claude Code's
+        # config dir, not a harness root, since managed releases replaced the
+        # ~/.claude-as-AGENT_HOME layout (2026-08-25).
+        self.default = self.home / ".local" / "share" / "hearting" / "current"
 
     def _resolve_both(self, env: dict) -> tuple[str, str]:
         full_env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
@@ -67,11 +72,10 @@ class AgentHomeEquivalenceTest(unittest.TestCase):
         # already validated every candidate, including AGENT_HOME.
         target = self.home / "unmarked"
         target.mkdir()
-        dot_claude = self.home / ".claude"
-        _mark(dot_claude)
+        _mark(self.home / ".claude")  # a marked ~/.claude is no candidate either
         shell, python = self._resolve_both({"AGENT_HOME": str(target)})
         self.assertEqual(shell, python)
-        self.assertEqual(shell, str(dot_claude))
+        self.assertEqual(shell, str(self.default))
 
     def test_claude_home_used_when_agent_home_absent(self) -> None:
         target = self.home / "claude-home"
@@ -105,21 +109,30 @@ class AgentHomeEquivalenceTest(unittest.TestCase):
         self.assertEqual(shell, python)
         self.assertEqual(shell, str(agent_setting))
 
-    def test_dot_claude_fallback_when_nothing_else_marked(self) -> None:
-        dot_claude = self.home / ".claude"
-        _mark(dot_claude)
+    def test_a_marked_dot_claude_is_not_a_harness_root(self) -> None:
+        # Before 2026-08-25 ~/.claude was the last candidate; now a marked one
+        # is skipped by both chains and the unvalidated default is returned.
+        _mark(self.home / ".claude")
         shell, python = self._resolve_both({})
         self.assertEqual(shell, python)
-        self.assertEqual(shell, str(dot_claude))
+        self.assertEqual(shell, str(self.default))
 
     def test_bare_environment_with_no_marked_candidate_still_agrees(self) -> None:
         """Review F-4: the previously missing matrix cell. When NO candidate
-        carries core/CORE.md the shell chain returns $HOME/.claude
-        unvalidated; the python chain used to return _MODULE_ROOT here, so the
-        two resolvers disagreed exactly where nothing else could catch it."""
+        carries core/CORE.md the shell chain returns the managed-release
+        default path unvalidated; the python chain used to return _MODULE_ROOT
+        here, so the two resolvers disagreed exactly where nothing else could
+        catch it."""
         shell, python = self._resolve_both({})
         self.assertEqual(shell, python)
-        self.assertEqual(shell, str(self.home / ".claude"))
+        self.assertEqual(shell, str(self.default))
+
+    def test_bare_environment_honours_xdg_data_home_in_the_fallback(self) -> None:
+        xdg = self.home / "data"
+        xdg.mkdir()
+        shell, python = self._resolve_both({"XDG_DATA_HOME": str(xdg)})
+        self.assertEqual(shell, python)
+        self.assertEqual(shell, str(xdg / "hearting" / "current"))
 
 
 if __name__ == "__main__":
