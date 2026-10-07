@@ -614,7 +614,7 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         self.assertEqual(render._gpu_model_key("NVIDIA GeForce GTX TITAN X"), "gpu_legacy")
         previous = dict(render._COLOR)
         self.addCleanup(lambda: (render._COLOR.clear(), render._COLOR.update(previous)))
-        for colors, expected in ((256, 166), (8, render.curses.COLOR_YELLOW)):
+        for colors, expected in ((256, 137), (8, render.curses.COLOR_YELLOW)):
             with self.subTest(colors=colors), mock.patch.object(render.curses, "start_color"), \
                  mock.patch.object(render.curses, "use_default_colors"), \
                  mock.patch.object(render.curses, "can_change_color", return_value=False), \
@@ -625,7 +625,7 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                 self.assertIn(mock.call(9, expected, -1), pair.call_args_list)
                 self.assertNotEqual(render._COLOR["gpu_legacy_active"], render._COLOR["tag_steward"])
                 text = render._snapshot_line([("GTX TITAN X", "gpu_legacy")], colored=True, colors=colors)
-                self.assertIn("\033[38;5;166m" if colors == 256 else "\033[33m", text)
+                self.assertIn("\033[38;5;137m" if colors == 256 else "\033[33m", text)
 
     def test_gpu_family_colors_bind_to_initialized_palette_pairs(self):
         previous = dict(render._COLOR)

@@ -60,7 +60,7 @@ _A_REVERSE = getattr(curses, "A_REVERSE", 0)
 # cyan/magenta/blue, but the stock primaries are replaced with softer midtones.
 # Eight-color terminals keep their native colors as a checked fallback.
 _MUTED_256 = {
-    "orange": 166,
+    "orange": 137,
     "soft": 253,       # #dadada — focal text, below pure white
     "green": 150,     # #afd787 — richer sage
     "yellow": 186,    # #d7d787 — warm beige
@@ -7467,7 +7467,7 @@ def _snapshot_line(segs, colored=False, colors=256):
             style = "\033[1;38;5;0;48;5;219m" if colors >= 256 else "\033[1;30;47m"
             piece = style + piece + "\033[0m"
         elif key in {"gpu_legacy", "gpu_legacy_active"}:
-            style = "\033[38;5;166m" if colors >= 256 else "\033[33m"
+            style = "\033[38;5;137m" if colors >= 256 else "\033[33m"
             piece = style + piece + "\033[0m"
         out.append(piece)
     return "".join(out)

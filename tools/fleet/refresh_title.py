@@ -114,7 +114,7 @@ You have no tools; do not attempt shell commands, file operations, or network re
 Output exactly two lines:
 TITLE: the dominant CURRENT topic in the recent CONVERSATION, at task/cycle altitude — English,
 3-6 words, never more than 40 characters. Use TASK CONTEXT and PRIOR TITLE only as reference.
-Name the concrete body of work currently discussed, not a generic
+Name the concrete body of work currently discussed, not what it happens to be doing at this moment and not a generic
 category. Never describe status or progress: words such as awaiting, waiting,
 pending, running, idle, blocked, preparing, starting, resuming, monitoring, or "in
 progress" must not appear in the title — that is the NOW line's job.
@@ -1414,15 +1414,20 @@ def _provider_source():
 
 
 def _minor_peer_delta(delta):
-    """Only a tiny, complete peer envelope; ordinary short user turns still refresh."""
+    """A bounded sequence of complete one-line peer notes, without other dialogue."""
     text = delta.strip()
-    if len(text) > 256:
+    if len(text) > 2048:
         return False
-    match = re.fullmatch(r"(.*?)\n+\(peer-from:[^\n]+;\s*ref=[0-9a-f]{8,64}\)", text, re.S)
-    if not match:
+    trailers = list(re.finditer(r"\n+\(peer-from:[^\n]+;\s*ref=[0-9a-f]{8,64}\)", text))
+    if not 1 <= len(trailers) <= 8:
         return False
-    body = match.group(1).strip()
-    return bool(body) and len(body) <= 80 and len(body.splitlines()) <= 2 and "(peer-from:" not in body
+    cursor = 0
+    for trailer in trailers:
+        body = text[cursor:trailer.start()].strip()
+        if not body or len(body) > 80 or len(body.splitlines()) != 1 or "(peer-from:" in body:
+            return False
+        cursor = trailer.end()
+    return not text[cursor:].strip()
 
 
 def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,

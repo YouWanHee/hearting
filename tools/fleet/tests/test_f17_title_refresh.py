@@ -511,11 +511,17 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
         ts = time.time() - 10 * rt.DEBOUNCE_SEC
         titles.write("peer-only", "GPU Work", now=ts, offset=offset,
                      summary="Inspecting GPU rows", summary_ts=ts)
-        with open(self.transcript, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"message": "ACK\n\n(peer-from: codex [81] ; ref=0123456789abcdef)"}) + "\n")
-        result, probes, spawns = self._spawn_counting_probes("peer-only")
-        self.assertFalse(result)
-        self.assertEqual((probes, spawns), ([], []))
+        messages = []
+        for body, ref in (("ACK", "0123456789abcdef"), ("Received", "fedcba9876543210")):
+            message = body + "\n\n(peer-from: codex [81] ; ref=" + ref + ")"
+            messages.append(message)
+            with open(self.transcript, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"message": message}) + "\n")
+            result, probes, spawns = self._spawn_counting_probes("peer-only")
+            self.assertFalse(result)
+            self.assertEqual((probes, spawns), ([], []))
+        self.assertFalse(rt._minor_peer_delta(messages[0] + "\nShort assistant update\n" + messages[1]))
+        self.assertFalse(rt._minor_peer_delta("Short user request\n" + messages[0]))
         with open(self.transcript, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"message": "Fix the badge color"}) + "\n")
         result, probes, spawns = self._spawn_counting_probes("peer-only")
