@@ -987,6 +987,8 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
     records = _open_cycles(root, memory, scope=cycle_scope)
     cycles = _cycles_by_route(records)
     members = _campaign_members(root, records, campaign_id, deadline=deadline)
+    import artifact_cross_root_move
+    historical_routes = artifact_cross_root_move.historical_route_ids(root)
     files = sorted(_open_route_files(root, api), key=_mtime)
     evidence = []
 
@@ -1001,6 +1003,9 @@ def _pass(summary, root: Path, api, memory: _Memory, *, trigger, campaign_id, no
             summary["deferred"] += len(files) - index
             break
         route_id = path.stem
+        if route_id in historical_routes:
+            kept("relocated-history")
+            continue
         remembered = memory.failed_routes.get(route_id)
         if remembered and remembered.get("signature") == _signature(path):
             kept("close-failed-before")

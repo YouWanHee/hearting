@@ -52,6 +52,9 @@ actually discovers.
 ### Requirements
 
 - Python 3.10+
+- PyYAML for that Python (e.g. `python3 -m pip install --user pyyaml`):
+  framed routes read their frame proposals with it, and `hearting verify`
+  checks it
 - `curl` or `wget`
 - The CLI for each runtime you want to activate
 

@@ -1,0 +1,1 @@
+../../../hooks/design-postwrite.test.sh

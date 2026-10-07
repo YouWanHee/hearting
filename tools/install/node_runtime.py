@@ -194,8 +194,12 @@ def _expose(install_dir: Path, root: Path) -> list:
     return skipped
 
 
-def ensure_node() -> dict:
-    """Reuse a compatible node, else install a verified LTS. Never raises."""
+def ensure_node(dry_run: bool = False) -> dict:
+    """Reuse a compatible node, else install a verified LTS. Never raises.
+
+    A dry run stops before the network and the filesystem: it only reports
+    whether an install would happen and where it would put the launchers.
+    """
     try:
         if os.environ.get("HARNESS_NO_NODE_INSTALL") == "1":
             return _result("ok", "node ensure skipped (HARNESS_NO_NODE_INSTALL=1)")
@@ -211,6 +215,13 @@ def ensure_node() -> dict:
                 f"no compatible node and no managed build for "
                 f"{platform.system()}/{platform.machine()}; install Node >= "
                 "%d.%d.%d manually" % MIN_NODE,
+            )
+        if dry_run:
+            return _result(
+                "would-install",
+                "no node >= %d.%d.%d on PATH; " % MIN_NODE
+                + f"would install the latest LTS into {_node_root()} and "
+                f"expose {'/'.join(EXPOSED)} in {_bin_dir()}",
             )
         version = _latest_lts()
         root = _node_root()

@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import resource_progress as progress
 
@@ -455,6 +456,103 @@ class RemoteCandidatesTest(unittest.TestCase):
         found = self.collect_remote({"arms": [first, second]})
         self.assertEqual([(item["host"], item["pid"]) for item in found],
                          [("cnn", 42), ("moving4", 42)])
+
+
+class DeclaredResourceProgressTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.path = self.root / "logs" / "eval.log.progress.json"
+        self.run = {"run_id": "eval-1", "node": "eval-run", "progress_file": str(self.path)}
+        self.env = progress.environment(self.run)
+
+    def write(self, completed=12, total=50, unit="epoch", detail=None):
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(progress.time, "time", return_value=100.0):
+            return progress.write_progress(completed, unit, total=total, detail=detail)
+
+    def test_atomic_roundtrip_and_old_update_age(self):
+        self.assertTrue(self.write(detail="validation"))
+        value = progress.read_progress(self.run, 220.0)
+        self.assertEqual((value["run_id"], value["node"], value["completed"], value["total"], value["unit"]),
+                         ("eval-1", "eval-run", 12, 50, "epoch"))
+        self.assertEqual((value["updated_at"], value["age_s"], value["detail"]), (100.0, 120.0, "validation"))
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+        self.assertTrue(self.write(13, total=None))
+        self.assertNotIn("total", progress.read_progress(self.run, 10000.0))
+        self.assertEqual(progress.read_progress(self.run, 10000.0)["age_s"], 9900.0)
+
+    def test_absent_partial_and_broken_json_are_only_unavailable(self):
+        self.assertIsNone(progress.read_progress(self.run, 220))
+        self.path.parent.mkdir()
+        for raw in (b"", b"{", b'{"completed": 12,', b"not json", b"[]", b"\xff",
+                    b'{"nested":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}"):
+            with self.subTest(raw=raw):
+                self.path.write_bytes(raw)
+                self.assertIsNone(progress.read_progress(self.run, 220))
+
+    def test_wrong_run_or_node_is_not_attributed(self):
+        self.assertTrue(self.write())
+        for wrong in ({**self.run, "run_id": "other"}, {**self.run, "node": "full-run"}):
+            self.assertIsNone(progress.read_progress(wrong, 220))
+
+    def test_invalid_numbers_or_multiline_text_are_unavailable(self):
+        self.assertTrue(self.write())
+        valid = json.loads(self.path.read_text())
+        for key, bad in (("completed", True), ("completed", -1), ("completed", 1.5),
+                         ("completed", 2**63), ("total", 1), ("total", False),
+                         ("updated_at", float("nan")), ("updated_at", float("inf")),
+                         ("updated_at", -1), ("unit", "epoch\nnext"), ("unit", "epoch\u2028next"),
+                         ("detail", "x" * 241), ("schema_version", True)):
+            with self.subTest(key=key, bad=bad):
+                self.path.write_text(json.dumps({**valid, key: bad}))
+                self.assertIsNone(progress.read_progress(self.run, 220))
+
+    def test_declared_file_only_bounded_and_regular(self):
+        self.assertTrue(self.write())
+        with mock.patch.object(progress, "_read", wraps=progress._read) as reader:
+            self.assertIsNotNone(progress.read_progress(self.run, 220))
+            reader.assert_called_once_with(self.path, Path(self.path.anchor))
+        self.path.write_bytes(b" " * (progress.MAX_BYTES + 1))
+        self.assertIsNone(progress.read_progress(self.run, 220))
+        self.path.unlink()
+        os.mkfifo(self.path)
+        self.assertIsNone(progress.read_progress(self.run, 220))
+        self.path.unlink()
+        target = self.root / "other.json"
+        target.write_text("{}")
+        self.path.symlink_to(target)
+        self.assertIsNone(progress.read_progress(self.run, 220))
+
+    def test_missing_environment_and_failed_replace_do_not_interrupt_workload(self):
+        with mock.patch.dict(os.environ, {key: "" for key in self.env}):
+            self.assertFalse(progress.write_progress(1, "item"))
+        self.assertFalse(self.path.parent.exists())
+        self.assertTrue(self.write())
+        before = self.path.read_bytes()
+        with mock.patch.object(progress.os, "replace", side_effect=OSError("unwritable")):
+            self.assertFalse(self.write(13))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+        self.assertFalse(self.write(-1))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_progress_never_changes_liveness_or_completion(self):
+        import resource_run_registry as registry
+        identity = {"pid": 99999999, "starttime": "1", "command_hash": "a" * 64}
+        run = {**self.run, **identity, "process_group": identity["pid"], "status": "running"}
+        self.assertTrue(self.write(50))  # a complete counter is not a successful exit
+        with mock.patch.object(progress, "collect", return_value=None), \
+             mock.patch.object(progress, "remote_candidates", return_value=[]):
+            observed = registry.normalize_run("eval-1", run, self.root / "runs.json",
+                                             identity_reader=lambda _pid: identity, now=10000)
+        self.assertEqual((observed["liveness"], observed["registry_status"], observed["exit_code"]),
+                         ("working", "running", None))
+        self.assertEqual(observed["progress"]["age_s"], 9900)
+        self.path.write_text("{")
+        exited = registry.normalize_run("eval-1", {**run, "status": "succeeded", "exit_code": 0},
+                                        self.root / "runs.json", identity_reader=lambda _pid: None, now=10000)
+        self.assertEqual((exited["progress"], exited["liveness"], exited["exit_code"]), (None, "exited", 0))
 
 
 if __name__ == "__main__":

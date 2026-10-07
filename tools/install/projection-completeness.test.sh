@@ -201,6 +201,7 @@ assert {item["id"] for item in row["checks"]} == {
     "report-bundle-config.root",
     "compute-hosts-config.inventory",
     "memory-sync-config.policy",
+    "host.pyyaml",
     "bootstrap.launcher.compute-hosts",
 }, row
 PY

@@ -408,6 +408,8 @@ def cycle_dir(root: Path, campaign_id: str, cycle_id: str,
     root = Path(root)
     if record is None:
         record = read_cycle_record(root, cycle_id)
+    if record and (record.get("relocation") or {}).get("artifact_root"):
+        raise ProducerError("cycle-relocated", str(record["relocation"]))
     campaign_record = read_campaign(root, campaign_id)
 
     def owner_campaign_candidates() -> Iterator[Path]:
@@ -6902,7 +6904,8 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                     f"manifest digest mismatch for {cycle_id}; manual inspection required"
                 )
     for record in list_cycle_records(root):
-        if record.get("state") != "open" or record.get("deleted_at"):
+        if (record.get("state") != "open" or record.get("deleted_at")
+                or (record.get("relocation") or {}).get("artifact_root")):
             continue
         try:
             directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
@@ -8507,7 +8510,9 @@ def _publish_document_locked(root: Path, record: Mapping[str, Any], directory: P
         index, refreshed, idempotency_key=cycle_id, manifest_digest=new_digest,
         repository_id=identity.repository_id if identity else None,
         replaces_manifest_digest=digest if isinstance(row, dict) else None,
-        known_parent_cycle_ids=artifact_admission._producer_cycle_ids(root))
+        known_parent_cycle_ids=(set(artifact_admission._producer_cycle_ids(root)) |
+            ({record["parent_cycle_id"]} if record.get("parent_cycle_id") and
+             (record.get("relocation") or {}).get("external_parent_root") else set())))
     if not index_report.ok:
         raise ProducerError("index-rejected", ";".join(v.code for v in index_report.violations))
     base_record = dict(record_after if record_after is not None else record)
@@ -8723,6 +8728,9 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
     if manifest is not None:
         raw, document = manifest
         refreshed = _next_document(document, artifact_identity.IdAllocator())
+        if (record.get("relocation") or {}).get("original_root"):
+            import artifact_cross_root_move
+            refreshed = artifact_cross_root_move.relocate_document(root, refreshed, record["relocation"])
         campaign_row = dict(refreshed.get("campaign") or {})
         campaign_row.update(campaign_id=new_campaign_id, goal=str(target.get("goal", "")),
                             title=str(target.get("title", "")),
@@ -8770,8 +8778,10 @@ def _retarget_index_paths(root: Path, old_prefix: str, new_prefix: str) -> None:
         artifact_admission._write_index(root, replace(index, cycles=cycles))
 
 
-def cycle_move(root: Path, cycle_id: str, *, campaign: Optional[str] = None, parent: Optional[str] = None,
-               no_parent: bool = False, reason: Optional[str] = None, now: Optional[float] = None) -> Dict[str, Any]:
+def cycle_move(root: Path, cycle_id: Optional[str] = None, *, campaign: Optional[str] = None, parent: Optional[str] = None,
+               no_parent: bool = False, reason: Optional[str] = None, now: Optional[float] = None,
+               target_artifact_root: Optional[Path] = None, source_campaign: Optional[str] = None,
+               attach_logs: Sequence[str] = (), dry_run: bool = False) -> Dict[str, Any]:
     """D-126: move a cycle to another campaign and/or change its parent.
 
     The cycle keeps its ID.  The folder moves under the target campaign (a name taken there gets
@@ -8780,6 +8790,12 @@ def cycle_move(root: Path, cycle_id: str, *, campaign: Optional[str] = None, par
     target that is closed is opened again, as a `begin` would; one that is set aside takes the cycle
     without changing its own state.  Open cycles move too (they have no manifest to write)."""
     root = Path(root).resolve()
+    target_root = Path(target_artifact_root).resolve() if target_artifact_root else root
+    if target_root != root or source_campaign is not None or attach_logs or dry_run:
+        import artifact_cross_root_move as cross_move
+        return cross_move.move(root, target_root, cycle_id=cycle_id, source_campaign=source_campaign,
+                               campaign=campaign, attach_logs=attach_logs, dry_run=dry_run,
+                               parent=parent, no_parent=no_parent, reason=reason, now=now)
     if parent is not None and no_parent:
         raise ProducerError("request-invalid", "--parent and --no-parent cannot be combined")
     if campaign is None and parent is None and not no_parent:
@@ -9425,7 +9441,7 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
         gone_cycles: List[str] = []
         for cycle_id in changes["cycle_gone"]:
             record = read_cycle_record(root, cycle_id)
-            if record is None or record.get("deleted_at"):
+            if record is None or record.get("deleted_at") or (record.get("relocation") or {}).get("artifact_root"):
                 continue
             where = _last_known_path(root, record, published.get(cycle_id, ""))
             _tombstone_cycle_locked(root, record, where=where, command="reconcile", stamp=stamp,
@@ -9896,9 +9912,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if command in {"campaign-close", "campaign-reopen"}:
             p.add_argument("--reason")
 
-    p = sub.add_parser("cycle-move", help="move a cycle to another campaign and/or change its parent (keeps its ID)")
+    p = sub.add_parser("cycle-move", help="move cycles, merge campaigns or attach logs (keeps IDs)")
     p.add_argument("--artifact-root", required=True)
-    p.add_argument("--cycle", required=True)
+    selector = p.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--cycle")
+    selector.add_argument("--source-campaign")
+    p.add_argument("--target-artifact-root")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--attach-logs", action="append", default=[])
     p.add_argument("--campaign", help="target campaign: its ID or its key")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--parent", help="the cycle this one follows")
@@ -10069,9 +10090,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _print(result)
             return BLOCKED if str(result.get("status", "")).startswith("refused") else OK
         elif args.command == "campaign-status":
-            _route_autoclose(root, "campaign-status")
-            reconcile_root(root)
-            result = artifact_campaign.status(root, args.campaign)
+            import artifact_cross_root_move as cross_move
+            try:
+                historical_path, historical = cross_move._campaign(root, args.campaign)
+            except ProducerError:
+                historical = {}
+            if historical.get("relocation"):
+                result = {"status": historical["state"], "state": historical["state"],
+                          "campaign_id": historical["campaign_id"], "canonical": historical["relocation"]}
+            else:
+                _route_autoclose(root, "campaign-status")
+                reconcile_root(root)
+                result = artifact_campaign.status(root, args.campaign)
         elif args.command == "campaign-close":
             _route_autoclose(root, "campaign-close", campaign=args.campaign)
             reconcile_root(root)
@@ -10082,7 +10112,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = artifact_campaign.recover(root, args.campaign)
         elif args.command == "cycle-move":
             result = cycle_move(root, args.cycle, campaign=args.campaign, parent=args.parent,
-                                no_parent=args.no_parent, reason=args.reason)
+                                no_parent=args.no_parent, reason=args.reason, target_artifact_root=args.target_artifact_root,
+                                source_campaign=args.source_campaign, attach_logs=args.attach_logs, dry_run=args.dry_run)
         elif args.command == "cycle-mark":
             result = cycle_mark(
                 root, args.cycle, discard=args.discard,

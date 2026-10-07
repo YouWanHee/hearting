@@ -681,5 +681,34 @@ class OpenRefusalDetailTest(unittest.TestCase):
         self.assertEqual(detail.count("route_state=open"), 10)
 
 
+class SupersededCampaignTest(CampaignTest):
+    # Reuse the real closed-cycle setup without rerunning the inherited cases.
+    def test_terminal_merge_replay_keeps_original_event_bytes(self):
+        self._close()
+        C.reopen(self.root, self.path, reason="more work")
+        prior = {path: path.read_bytes() for path in (self.path.parent / C.EVENTS_DIR).glob("*.json")}
+        target_id = "camp_" + "f" * 32
+        lock = P.artifact_admission._acquire_lock(self.root, 1)
+        try:
+            event = C.supersede_locked(self.root, self.path, operation_id="move-test",
+                                      target_root=Path(self._tmp.name) / "target", target_campaign=target_id)
+            replay = C.supersede_locked(self.root, self.path, operation_id="move-test",
+                                       target_root=Path(self._tmp.name) / "target", target_campaign=target_id)
+        finally:
+            P.artifact_admission._release_lock(self.root, lock)
+        self.assertEqual(event, replay)
+        self.assertEqual(C.campaign_state(self.root, self.path).state, "superseded")
+        for path, raw in prior.items():
+            self.assertEqual(path.read_bytes(), raw)
+        with self.assertRaises(C.CampaignError):
+            C.reopen(self.root, self.path, reason="cannot revive")
+
+
+# Only the new test owns this class; the original CampaignTest runs above.
+for _name in dir(CampaignTest):
+    if _name.startswith("test_"):
+        setattr(SupersededCampaignTest, _name, None)
+
+
 if __name__ == "__main__":
     unittest.main()

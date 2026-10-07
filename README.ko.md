@@ -55,6 +55,8 @@ Hearting은 지원되는 코딩 에이전트 런타임에서 조사, 계획, 구
 ### 요구 사항
 
 - Python 3.10 이상
+- 그 Python용 PyYAML (예: `python3 -m pip install --user pyyaml`): framed
+  경로가 frame 제안을 읽을 때 쓰며, `hearting verify`가 확인합니다
 - `curl` 또는 `wget`
 - 활성화하려는 각 런타임의 CLI
 

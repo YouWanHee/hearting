@@ -918,6 +918,11 @@ class FramedStartTest(FramedBase):
         patch = mock.patch.object(W, "_route_cli", side_effect=self.in_process_cli)
         patch.start()
         self.addCleanup(patch.stop)
+        # These briefs carry no proposal block, so whether this host has PyYAML is controlled too;
+        # the PyYAML test below stops this patch and runs against the real probe.
+        self.pyyaml = mock.patch.object(RP, "yaml_available", return_value=True)
+        self.pyyaml.start()
+        self.addCleanup(self.pyyaml.stop)
 
     def owner_gate(self, *args, **kw):
         if not self.released:
@@ -975,6 +980,42 @@ class FramedStartTest(FramedBase):
         self.assertEqual(len({c[c.index("--attempt-id") + 1] for c in self.calls}), 2)
         self.start()
         self.assertEqual(len(self.calls), 2)  # both rows exist: a repeat launches nothing
+
+    def test_without_pyyaml_the_start_launches_no_frame_leg_and_names_the_fix(self):
+        self.pyyaml.stop()
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            result = self.start()
+        self.assertEqual((result["state"], result["reason"], result["required_action"]),
+                         ("needs-attention", "yaml-unavailable", "install-pyyaml"), result)
+        self.assertEqual((self.calls, result["launches"]), ([], []))   # no frame leg, so nothing spent
+        self.assertIn("-m pip install --user pyyaml", result["next_step"])
+        self.assertIn("non-framed shape", result["next_step"])
+        self.assertFalse(R.outcome_path(self.path).exists())           # open: resume_command continues it
+        with mock.patch.object(RP, "yaml_available", return_value=True):
+            self.assertEqual(self.start()["state"], "preparing")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_existing_owner_without_pyyaml_skips_frame_processing(self):
+        self.pyyaml.stop()
+        owner = "att-existing-owner"
+        metadata = {"attempt_id": owner, "parent_sid": "parent", "worker_type": "owner",
+                    "launch_started": "1", "route_id": self.route["route_id"],
+                    "route_hash": self.route["route_hash"]}
+        self.jobs.write_text("now\topen\t12\tparent\ttask\t"
+                             + ",".join(k + "=" + v for k, v in metadata.items()) + "\n")
+        registered = self.jobs.read_bytes()
+        receipt = {"state": "running", "owner_attempt_id": owner}
+        # The real registry identity and frame selection run; only downstream
+        # settlement is controlled, as its lifecycle has separate coverage.
+        with mock.patch.dict(sys.modules, {"yaml": None}), \
+                mock.patch.object(W, "_framed_settle", return_value=receipt) as settle, \
+                mock.patch.object(W, "frame_interview_step", side_effect=AssertionError("new frame processing")):
+            result = self.start()
+        self.assertEqual((result["state"], result["owner_attempt_id"]), ("running", owner))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.jobs.read_bytes(), registered)
+        settle.assert_called_once()
+        self.assertEqual(settle.call_args.args[:3], (self.route, self.path, self.jobs))
 
     def test_the_joined_frames_reach_the_interview_and_the_proceed_answer_ends_the_route(self):
         self.start()

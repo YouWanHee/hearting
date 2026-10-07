@@ -379,8 +379,11 @@ def _launch_root_identity(kind, path, *, resolver_identity=None):
             # never by installer dirty-content hashes. On 2026-09-27 home-os
             # had >100k untracked runtime files under a tracked directory;
             # hashing them here exhausted the pre-claim fence's 60s budget.
-            # Code roots retain their complete release identity, including when
-            # a development checkout is also the grounding cwd.
+            # A cwd without HEAD has no lineage to compare and reads
+            # "unversioned", like its source pin: hashing it instead read a
+            # whole home folder on every start and resume. Code roots retain
+            # their complete release identity, including when a development
+            # checkout or a release tree (RELEASE_VERSION) is the grounding cwd.
             if kind == "grounding_cwd" and str(resolved) not in _LAUNCH_SOURCE_REVISION_CACHE:
                 try:
                     head=subprocess.run(
@@ -392,8 +395,10 @@ def _launch_root_identity(kind, path, *, resolver_identity=None):
                     raise ValueError("grounding-cwd-revision-unverifiable") from exc
                 if head.returncode == 0 and _GIT_SHA.fullmatch(head.stdout.strip()):
                     release_id=head.stdout.strip()
-                else:
+                elif (resolved/"RELEASE_VERSION").is_file():
                     release_id=_launch_source_revision(resolved)
+                else:
+                    release_id="unversioned"
             else:
                 release_id=_launch_source_revision(resolved)
             content_digest=_launch_content_digest(resolved)
