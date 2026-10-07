@@ -113,6 +113,19 @@ def slice_files_sha256(values: list[str]) -> str:
 GAP_RETRY_PURPOSE = "gap-retry"
 
 
+def _worker_adapter(manifest: dict[str, Any]) -> str | None:
+    """The worker harness the route's parent moved the worker pin to (`start --pin worker=`),
+    or None when it never moved it: a session derived after that change launches there, one
+    derived before keeps its source session's adapter."""
+    try:
+        import route_authority
+        route = json.loads(Path(manifest["route_file"]).read_text(encoding="utf-8"))
+        harness = route_authority.changed_pin_harness(route, "worker")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return harness if harness in ADAPTERS else None
+
+
 def derive_gap_retry_manifest(
     manifest: dict[str, Any], failed_subsession_ids
 ) -> dict[str, Any]:
@@ -148,13 +161,14 @@ def derive_gap_retry_manifest(
     if unknown:
         raise StageSessionError("gap-retry-unknown-slice:" + ",".join(sorted(unknown)))
     parent = manifest["_manifest_sha256"]
+    moved = _worker_adapter(manifest)
     sessions = []
     for offset, session_id in enumerate(wanted, 1):
         source = by_id[session_id]
         derived = {
             "subsession_id": f"ss-gap-{parent[:16]}-{offset}",
             "attempt_id": f"att-gap-{parent[:16]}-{offset}",
-            "adapter": source["adapter"],
+            "adapter": moved or source["adapter"],
             "slug": f"gap-{parent[:8]}-{offset}",
             "phase_brief": source["phase_brief"],
             # The whole point of the derivation: the retry's fence is exactly
@@ -211,10 +225,12 @@ def derive_continuation_manifest(
     if not wanted:
         raise StageSessionError("continuation-requires-an-unfinished-session")
     parent = manifest["_manifest_sha256"]
+    moved = _worker_adapter(manifest)
     sessions = []
     for offset, index in enumerate(wanted, 1):
         source = by_index[index]
         derived = {key: source[key] for key in ("adapter", "fixed_files", "narrow_verify", "expected_round_trips")}
+        derived["adapter"] = moved or derived["adapter"]
         derived.update({
             "subsession_id": f"ss-cont-{parent[:16]}-{offset}",
             "attempt_id": f"att-cont-{parent[:16]}-{offset}",

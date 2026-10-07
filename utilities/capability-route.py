@@ -3443,44 +3443,85 @@ def _turn_peer_source(harness, session, cwd):
         return "unattributed"
 
 
-def _change_owner_pin(route, jobs, values):
-    """`start --pin owner=<harness>`: the route's parent moves the owner pin of a sealed route.
+def _pin_change_probe(route, jobs, target, harness, caller):
+    """`(tuples, candidates)` a pin moved to `harness` launches with, probed by the runtime now.
 
-    The runtime probes the checked launch tuples for the new owner harness now and records
-    them with the change (`route_authority.record_pin_change`); every launch decision reads
-    the route through `route_authority.route_in_force`. Frame and worker pins stay sealed."""
+    owner: from the new owner harness to the route's children. worker: from the owner
+    harness in force to the new worker harness. frame: from this depth-0 session to the new
+    frame harness. A quick route (one owner, its registered-headless candidates) is probed for
+    candidates instead; it starts no stage, so a worker change there needs nothing probed.
+    Nothing supported for the new pin is refused before anything is recorded."""
+    import route_authority as RA
+    view = RA.route_in_force(route)
+    quick = route.get("effective_intensity") == "quick" or route.get("registered_headless_candidates") is not None
+    rows = [row for row in (view.get("dispatch_evidence") or {}).get("tuples") or [] if isinstance(row, dict)]
+    if quick and target == "worker":
+        return [], []
+    if target == "owner" or quick:
+        children = sorted({row.get("child_harness") for row in rows if row.get("child_harness")}) \
+            or list(_compose_default_children())
+        probe = _compose_readiness(route["cwd"], jobs, harness, children, gpu_route=route)
+        tuples = [] if quick else [row for row in probe.get("tuples") or [] if row.get("parent_harness") == harness]
+        candidates = [row for row in probe.get("candidates") or [] if row.get("harness") == harness] if quick else []
+        ready = (any(row.get("status") == "supported" for row in candidates) if quick else
+                 any(row.get("status") == "supported" and row.get("launch_authority") == "conductor" for row in tuples))
+    else:
+        if target == "worker":
+            owner = ((view.get("selection_pins") or {}).get("owner") or {}).get("harness")
+            parents = [owner] if owner else sorted({row.get("parent_harness") for row in rows
+                                                    if row.get("launch_authority") == "conductor"
+                                                    and row.get("parent_harness")})
+        else:
+            parents = [caller] if caller else sorted({row.get("parent_harness") for row in rows
+                                                      if row.get("parent_harness")})
+        tuples, candidates = [], []
+        for parent in parents:
+            probe = _compose_readiness(route["cwd"], jobs, parent, [harness], gpu_route=route)
+            tuples += [row for row in probe.get("tuples") or []
+                       if row.get("parent_harness") == parent and row.get("child_harness") == harness]
+        ready = any(row.get("status") == "supported"
+                    and (target == "frame" or row.get("launch_authority") == "conductor") for row in tuples)
+    if not ready:
+        raise ValueError(f"start-pin-{target}-unready:{harness} (the runtime probed no supported launch "
+                         f"for that {target} harness in this worktree; the {target} pin is unchanged)")
+    return tuples, candidates
+
+
+def _change_pins(route, jobs, values):
+    """`start --pin owner|frame|worker=<harness>[:<model>[@<effort>]]`: the route's parent moves
+    pins of a sealed route.
+
+    Each pin's checked launch tuples are probed now (`_pin_change_probe`), all of them before
+    anything is recorded, and each change is one row beside the route
+    (`route_authority.record_pin_change`); every launch decision reads the route through
+    `route_authority.route_in_force`, so the next launch of that target uses the new pin and an
+    attempt that already launched keeps what it launched with."""
     import route_authority as RA
     from work_start import _rows
-    pins = _parse_selection_pins(values)
-    other = sorted(set(pins) - set(RA.PIN_CHANGE_TARGETS))
-    if other:
-        raise ValueError(f"start-pin-target-unsupported:{other[0]} (a sealed route changes only its owner pin; "
-                         "frame and worker pins stay as compose sealed them)")
-    pins, warnings = _filter_top_pins(pins)
-    pin = pins["owner"]
+    pins, warnings = _filter_top_pins(_parse_selection_pins(values))
     harness, session = RA.caller_identity()
     owners = [meta for _status, meta in _rows(jobs).values()
               if meta.get("worker_type") == "owner"
               and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")}]
     if owners and not RA.owns(owners[-1], session, jobs):
-        raise ValueError("start-pin-parent-only: only this route's parent session moves its owner pin")
-    quick = route.get("effective_intensity") == "quick" or route.get("registered_headless_candidates") is not None
-    children = sorted({row.get("child_harness") for row in (route.get("dispatch_evidence") or {}).get("tuples") or []
-                       if isinstance(row, dict) and row.get("child_harness")}) or list(_compose_default_children())
-    probe = _compose_readiness(route["cwd"], jobs, pin["harness"], children, gpu_route=route)
-    tuples = [] if quick else [row for row in probe.get("tuples") or [] if row.get("parent_harness") == pin["harness"]]
-    candidates = [row for row in probe.get("candidates") or [] if row.get("harness") == pin["harness"]] if quick else []
-    ready = (any(row.get("status") == "supported" for row in candidates) if quick else
-             any(row.get("status") == "supported" and row.get("launch_authority") == "conductor" for row in tuples))
-    if not ready:
-        raise ValueError(f"start-pin-owner-unready:{pin['harness']} (the runtime probed no supported launch "
-                         "from that owner harness in this worktree; the owner pin is unchanged)")
-    row = RA.record_pin_change(route, target="owner", pin=pin, by={"harness": harness, "session_id": session},
-                               source=_turn_peer_source(harness, session, route.get("cwd")),
-                               tuples=tuples, candidates=candidates)
-    current = (RA.route_in_force(route).get("selection_pins") or {}).get("owner")
-    return {"changed": row is not None, "owner": current, "previous": (row or {}).get("previous"),
-            "source": (row or {}).get("source"), "warnings": warnings}
+        raise ValueError("start-pin-parent-only: only this route's parent session moves its pins")
+    targets = [target for target in RA.PIN_CHANGE_TARGETS if target in pins]
+    probed = {target: _pin_change_probe(route, jobs, target, pins[target]["harness"], harness)
+              for target in targets}
+    source = _turn_peer_source(harness, session, route.get("cwd"))
+    result = {"changed": False, "warnings": warnings, "changes": {}}
+    for target in targets:
+        tuples, candidates = probed[target]
+        row = RA.record_pin_change(route, target=target, pin=pins[target],
+                                   by={"harness": harness, "session_id": session},
+                                   source=source, tuples=tuples, candidates=candidates)
+        current = (RA.route_in_force(route).get("selection_pins") or {}).get(target)
+        result["changes"][target] = {"changed": row is not None, "pin": current,
+                                     "previous": (row or {}).get("previous")}
+        result.update({target: current, "previous": (row or {}).get("previous"),
+                       "source": (row or {}).get("source"),
+                       "changed": result["changed"] or row is not None})
+    return result
 
 
 def _record_access_change(route, jobs):
@@ -9982,9 +10023,9 @@ def main():
     start.add_argument("--interview",type=Path,help="semantic frame question; runtime owns its registration and cycle fields")
     start.add_argument("--answers",type=Path,help="actual native answers; runtime records intent and releases the gate")
     start.add_argument("--decision",choices=("proceed","revise","stop"),default="proceed")
-    start.add_argument("--pin",action="append",default=[],metavar="owner=HARNESS[:MODEL[@EFFORT]]",
-                       help="the route's parent moves its owner pin; the sealed route stays, the change is recorded "
-                            "beside it and applies from the next owner launch (frame and worker pins stay sealed)")
+    start.add_argument("--pin",action="append",default=[],metavar="TARGET=HARNESS[:MODEL[@EFFORT]]",
+                       help="the route's parent moves an owner, frame or worker pin; the sealed route stays, the "
+                            "change is recorded beside it and applies from that target's next launch")
     finish=sub.add_parser("finish",help="finish one current-session direct route and seal its exact producer cycle")
     finish.add_argument("--route",help="route file or route id (rt-...); defaults to this session's latest route here")
     finish.add_argument("--evidence",required=True,type=Path)
@@ -10240,7 +10281,7 @@ def main():
         a.route=resolve_route_argument(a.route,a.jobs)
         route=verify_route(json.loads(a.route.read_text()))
         jobs=Path(a.jobs or _compose_default_jobs())
-        pin_change=_change_owner_pin(route,jobs,a.pin) if a.pin else None
+        pin_change=_change_pins(route,jobs,a.pin) if a.pin else None
         access_change=_record_access_change(route,jobs)
         _record_route_chain(route, str(Path(a.route).resolve()), "start")
         result=start_work(route,a.route,jobs,wait=a.wait,interview=a.interview,answers=a.answers,decision=a.decision)

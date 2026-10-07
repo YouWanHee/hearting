@@ -266,7 +266,7 @@ def _frame_rule_top(jobs, meta):
         return False
     if (route.get('explicit_profiles') or {}).get(meta['route_node']):
         return False
-    pins = route.get('selection_pins') or {}
+    pins = route_authority.route_in_force(route).get('selection_pins') or {}
     pin = pins.get('frame') or pins.get('owner') or {}
     return not (pin.get('model') or pin.get('effort'))
 

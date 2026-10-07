@@ -221,7 +221,7 @@ class OwnerPinChangeTest(unittest.TestCase):
              mock.patch.object(RA, "caller_identity", return_value=caller), \
              mock.patch.object(work_start, "_rows", return_value=rows), \
              mock.patch.object(router, "_compose_readiness", return_value=probe) as readiness:
-            result = router._change_owner_pin(self.route, Path(self.temp.name) / "jobs.log", values)
+            result = router._change_pins(self.route, Path(self.temp.name) / "jobs.log", values)
         return result, readiness
 
     def test_start_pin_probes_the_new_owner_and_records_the_change(self):
@@ -241,7 +241,8 @@ class OwnerPinChangeTest(unittest.TestCase):
     def test_start_pin_refuses_what_it_cannot_do_and_records_nothing(self):
         for values, kwargs, reason in (
                 (["owner=claude"], {"caller": ("claude", "another-sid")}, "start-pin-parent-only"),
-                (["worker=claude"], {}, "start-pin-target-unsupported:worker"),
+                (["worker=opencode"], {"probed": [_tuple("codex", "opencode", status="unsupported")]},
+                 "start-pin-worker-unready:opencode"),
                 (["owner=claude"], {"probed": [_tuple("claude", "codex", status="unsupported")]}, "start-pin-owner-unready:claude")):
             with self.subTest(reason=reason), self.assertRaises(ValueError) as refused:
                 self.start_pin(values, **kwargs)
@@ -265,15 +266,78 @@ class OwnerPinChangeTest(unittest.TestCase):
             self.assertEqual(router._turn_peer_source("codex", "codex-sid", "/w"), "peer:hearting-4d·0123456789abcdef0123456789abcdef")
             self.assertEqual(router._turn_peer_source("codex", "other-sid", "/w"), "unattributed")
 
-    def test_only_the_owner_target_changes_and_other_routes_rows_are_ignored(self):
+    def test_only_pin_targets_change_and_other_routes_rows_are_ignored(self):
         with self.assertRaises(ValueError):
-            RA.record_pin_change(self.route, target="worker", pin={"harness": "claude"}, by={}, source="x",
+            RA.record_pin_change(self.route, target="unit", pin={"harness": "claude"}, by={}, source="x",
                                  tuples=[], candidates=[])
         path = RA.pin_changes_path(self.route)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"schema": 1, "route_id": self.route["route_id"], "route_hash": "sha256:other",
                                     "target": "owner", "pin": {"harness": "claude"}}) + "\nnot json\n")
         self.assertIs(RA.route_in_force(self.route), self.route)
+
+
+class WorkerPinChangeTest(unittest.TestCase):
+    """The BC route rt-96bab699 after its owner moved to Claude: the parent now moves the worker
+    pin to a stronger Codex model for the remaining checks; the owner pin and the sealed route stay."""
+
+    change = OwnerPinChangeTest.change
+    isolated_env = OwnerPinChangeTest.isolated_env
+    start_pin = OwnerPinChangeTest.start_pin
+
+    def setUp(self):
+        OwnerPinChangeTest.setUp(self)
+        self.change()                                            # the owner already moved to claude
+        self.route_file = Path(self.temp.name) / "route.json"
+        self.route_file.write_text(json.dumps(self.route))
+        self.probed = [_tuple("claude", "codex", sandbox="bypass")]
+
+    def test_the_parent_moves_the_worker_model_and_the_next_stage_launch_uses_it(self):
+        import model_profile
+        before = model_profile.route_selection_pin(self.route_file, worker_type="stage", adapter="codex")
+        self.assertEqual(before, {"status": "harness-only"})
+        result, readiness = self.start_pin(["worker=codex:gpt-6.1-sol@high"], caller=("claude", "claude-sid"),
+                                           owner_parent="claude-sid")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["worker"], {"harness": "codex", "model": "gpt-6.1-sol", "effort": "high"})
+        self.assertEqual((readiness.call_args.args[2], readiness.call_args.args[3]), ("claude", ["codex"]))
+        rows = RA.pin_changes(self.route)
+        self.assertEqual([row["target"] for row in rows], ["owner", "worker"])
+        self.assertEqual(rows[-1]["previous"], {"harness": "codex", "model": None, "effort": None})
+        self.assertEqual(model_profile.route_selection_pin(self.route_file, worker_type="stage", adapter="codex"),
+                         {"status": "applied", "model": "gpt-6.1-sol", "effort": "high"})
+        self.assertEqual(model_profile.route_selection_pin(self.route_file, worker_type="review", adapter="codex"),
+                         {"status": "applied", "model": "gpt-6.1-sol", "effort": "high"})
+        self.assertEqual(RA.sealed_pin_harness(self.route, worker_type="owner"), "claude")   # owner unchanged
+        self.assertEqual(self.route, json.loads(self.route_file.read_text()))               # sealed route unchanged
+        again, _ = self.start_pin(["worker=codex:gpt-6.1-sol@high"], caller=("claude", "claude-sid"),
+                                  owner_parent="claude-sid")
+        self.assertFalse(again["changed"])
+
+    def test_composing_the_work_again_carries_the_pins_in_force(self):
+        import shlex
+        import work_start
+        self.start_pin(["worker=codex:gpt-6.1-sol@high"], caller=("claude", "claude-sid"), owner_parent="claude-sid")
+        argv = shlex.split(work_start._compose_again({**self.route, "capability": "autopilot-code", "slug": "s"}))
+        pins = [argv[i + 1] for i, word in enumerate(argv) if word == "--pin"]
+        self.assertIn("owner=claude", pins)
+        self.assertIn("worker=codex:gpt-6.1-sol@high", pins)
+
+    def test_a_frame_pin_is_probed_from_this_session(self):
+        result, readiness = self.start_pin(["frame=claude"], caller=("claude", "claude-sid"),
+                                           owner_parent="claude-sid",
+                                           probed=[_tuple("claude", "claude", sandbox="bypass")])
+        self.assertEqual((readiness.call_args.args[2], readiness.call_args.args[3]), ("claude", ["claude"]))
+        self.assertEqual(result["frame"]["harness"], "claude")
+        self.assertEqual(RA.changed_pin_harness(self.route, "frame"), "claude")
+
+    def test_a_derived_continuation_launches_on_the_moved_worker_harness(self):
+        import stage_session_contract as SSC
+        manifest = {"route_file": str(self.route_file)}
+        self.assertIsNone(SSC._worker_adapter(manifest))         # never moved: the source adapter stays
+        self.start_pin(["worker=claude"], caller=("claude", "claude-sid"), owner_parent="claude-sid",
+                       probed=[_tuple("claude", "claude", sandbox="bypass")])
+        self.assertEqual(SSC._worker_adapter(manifest), "claude")
 
 
 class Case3TestRoundTest(unittest.TestCase):
