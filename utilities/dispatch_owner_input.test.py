@@ -573,6 +573,8 @@ class OwnerFinishCorrectionRegressionTest(OwnerInputTest):
         self.assertEqual(result.get('owner_phase'), 'unknown')
         self.assertEqual(result.get('delivery_timing'), 'phase-unavailable')
         self.assertIn('timing is unknown', result.get('delivery_notice', '').lower())
+        self.assertIn('may wait for the next owner turn', result.get('delivery_notice', '').lower())
+        self.assertNotIn('are delayed', result.get('delivery_notice', '').lower())
         self.assertNotIn('private correction text', json.dumps(result))
 
     def test_codex_active_turn_with_exact_running_phase_reports_active_turn(self):
@@ -585,6 +587,9 @@ class OwnerFinishCorrectionRegressionTest(OwnerInputTest):
             result = I.inspect(self.jobs, self.attempt)
         self.assertEqual(result.get('owner_phase'), 'running-turn')
         self.assertEqual(result.get('delivery_timing'), 'active-turn')
+        notice = result.get('delivery_notice', '').lower()
+        self.assertIn("goes into the owner's running turn", notice)
+        self.assertNotIn('are delayed', notice)
 
     def test_queued_claude_and_opencode_remain_next_owner_turn(self):
         for transport in ('claude-next-turn', 'opencode-next-turn'):
