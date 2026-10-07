@@ -92,13 +92,16 @@ def _resolver_return_values(source_path: Path) -> set[str]:
               and node.value.func.attr == "resolve_parent_completion_delivery"):
             # Follow the actual imported shared resolver; retain fail-closed
             # handling for unknown calls or newly introduced return forms.
+            # Since PR #303 a wrapper delegates to dispatch_wrapper_common,
+            # whose own resolver follows through to dispatch_parent_completion;
+            # recursion re-runs this same check on either module.
             alias = node.value.func.value.id
             imports = {item.asname or item.name: item.name
                        for statement in tree.body if isinstance(statement, ast.Import)
                        for item in statement.names}
-            assert imports.get(alias) == "dispatch_parent_completion", source_path
-            values.update(_resolver_return_values(
-                ROOT / "utilities" / "dispatch_parent_completion.py"))
+            module_name = imports.get(alias)
+            assert module_name in ("dispatch_parent_completion", "dispatch_wrapper_common"), source_path
+            values.update(_resolver_return_values(ROOT / "utilities" / f"{module_name}.py"))
         elif (isinstance(node.value, ast.Subscript)
               and isinstance(node.value.slice, ast.Constant)
               and node.value.slice.value == "carrier"):
