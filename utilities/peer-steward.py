@@ -1534,21 +1534,46 @@ def cmd_retire(args):
 def _retire_background_dialog_lines(lines):
     """Detect Claude's exit-time background-work confirm; return its task lines or None.
 
-    The dialog reads "Background work is running … 1. Exit and stop tasks /
-    2. Move to background and exit / 3. Stay". Anything else with a form
-    footer is not this dialog and stays `agent-still-running`.
+    Only the live selection UI at the bottom of the screen counts: consecutive
+    option lines 1/2/3 plus a confirm/cancel footer in the same trailing
+    block. Quoted dialog text up in the conversation history never counts --
+    no keys are sent unless the window is certainly showing this dialog now.
     """
     if not lines:
         return None
-    texts = [_plain(cells) for cells in lines]
-    flat = "".join("".join(texts).split()).lower()
-    if "backgroundworkisrunning" not in flat:
+    texts = [_plain(cells).strip() for cells in lines]
+    tail = texts[-14:]
+    flat_tail = "".join("".join(tail).split()).lower()
+    if "entertoconfirm" not in flat_tail and "entertoselect" not in flat_tail:
         return None
-    if "exitandstoptasks" not in flat and "movetobackground" not in flat:
+    if "esctocancel" not in flat_tail and "esccancel" not in flat_tail:
         return None
-    tasks = [text.strip() for text in texts
-             if text.strip() and "background work is running" not in text
-             and not text.strip().startswith(("1.", "2.", "3.", "❯", "Enter", "Esc"))]
+    opts = []
+    for text in tail:
+        low = "".join(text.split()).lower()
+        if low.startswith("1.exitandstoptasks") or low.startswith("1:exitandstoptasks"):
+            opts.append(1)
+        elif low.startswith("2.movetobackground") or low.startswith("2:movetobackground"):
+            opts.append(2)
+        elif low.startswith("3.stay") or low.startswith("3:stay"):
+            opts.append(3)
+    if opts != [1, 2, 3]:
+        joined = " ".join(opts)
+        if not ("1" in joined and "2" in joined and "3" in joined):
+            return None
+        idx = [i for i, text in enumerate(tail)
+               if "".join(text.split()).lower()[:2] in ("1.", "1:", "2.", "2:", "3.", "3:")]
+        if len(idx) < 3 or idx != sorted(idx) or max(idx) - min(idx) > 5:
+            return None
+    head = " ".join(texts[:max(0, len(texts) - len(tail))])
+    if "backgroundworkisrunning" not in "".join(head.split()).lower():
+        title = " ".join(tail)
+        if "backgroundworkisrunning" not in "".join(title.split()).lower():
+            return None
+    tasks = [text for text in tail
+             if text and "background work is running" not in text.lower()
+             and not text.strip()[:2] in ("1.", "2.", "3.", "❯ ")
+             and not text.lower().startswith(("enter", "esc"))]
     seen, unique = set(), []
     for task in tasks:
         if task not in seen:
@@ -1561,20 +1586,24 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
                                       own_sid, own_harness):
     """Finish one normal retire path through Claude's background-work confirm.
 
-    A handed-over retire owns the predecessor's work, so the default picks
-    1 (exit and stop tasks) and leaves the stopped lines in the receipt.
-    When the choice is ambiguous the dialog is closed with a typed 3 (Stay)
-    and the reason is returned; the pane is left usable, never stuck open.
+    Running work is protected: the default picks 2 (move to background and
+    exit) and leaves the backgrounded lines in the receipt so a successor or
+    the supervisor can stop them later. 1 (exit and stop tasks) is never
+    used. When the window is ambiguous the dialog is closed with a typed 3
+    (Stay) and the reason is returned; the pane is left usable, never stuck
+    open. No keys go out unless the live selection UI is certain.
     """
     lines = _read_screen(target)
     tasks = _retire_background_dialog_lines(lines)
     if tasks is None:
         return finish("agent-still-running")
-    stopped = " stopped-background=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
+    moved = " backgrounded=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
     if _retire_foreground(pane, harness) != identity:
         return finish("foreground-changed")
+    if _retire_background_dialog_lines(_read_screen(target)) is None:
+        return finish("agent-still-running")
     try:
-        subprocess.run(["herdr", "pane", "send-text", pane, "1"],
+        subprocess.run(["herdr", "pane", "send-text", pane, "2"],
                        capture_output=True, text=True, timeout=5)
         subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
                        capture_output=True, text=True, timeout=5)
@@ -1592,7 +1621,7 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
             if not _close_pane(pane):
                 return finish("pane-close-failed", handover=handover)
             return finish("normal-exit", True, handover=handover,
-                          detail=(f"background-stopped:{stopped.strip()}") if stopped else None)
+                          detail=(f"backgrounded:{moved.strip()}") if moved else None)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
     try:
         subprocess.run(["herdr", "pane", "send-text", pane, "3"],
@@ -1601,7 +1630,7 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return finish("agent-still-running")
-    return finish("retire-declined-background-work" + (stopped or ""))
+    return finish("retire-declined-background-work" + (moved or ""))
 
 
 # ---------------------------------------------------------------------------
