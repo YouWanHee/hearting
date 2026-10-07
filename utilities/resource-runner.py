@@ -3,6 +3,7 @@
 import argparse, contextlib, fcntl, hashlib, json, os, re, select, signal, subprocess, sys, time
 from pathlib import Path
 import resource_resume as RESOURCE_RESUME
+from resource_progress import environment as progress_environment
 from resource_run_registry import (
     classify_identity,
     is_alive,
@@ -213,6 +214,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         wait_read, release = os.pipe()
         launch_argv = ["/bin/sh", "-c", 'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
                        + SENTINEL_SCRIPT, "resource-runner", *(controller.command if controller else placeholder["command"])]
+        environment.update(progress_environment(placeholder))
         environment.update(AGENT_RESOURCE_SENTINEL=str(sentinel), AGENT_RESOURCE_LAUNCH_FD=str(wait_read))
         try:
             with open(log, "ab", buffering=0) as output:
@@ -365,7 +367,7 @@ def main(argv=None, *, controller=None):
         sentinel=Path(str(log)+".exit")
         placeholder={"run_id":args.run_id,"cwd":str(cwd),"log":str(log),"command":command,
                      **provenance,"route":args.route,"node":args.node,"status":"launching",
-                     "sentinel":str(sentinel),
+                     "sentinel":str(sentinel),"progress_file":str(log)+".progress.json",
                      "parent_attempt_id":args.parent_attempt_id,
                      "workflow_state":"READY","started_at":time.time()}
         owner_wait = None
@@ -399,7 +401,7 @@ def main(argv=None, *, controller=None):
         with contextlib.suppress(OSError):
             Path(str(sentinel)+".partial").unlink()
         launch_argv=["/bin/sh","-c",SENTINEL_SCRIPT,"resource-runner",*command]
-        environment={**os.environ,"AGENT_RESOURCE_SENTINEL":str(sentinel)}
+        environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel)}
         out=open(log,"ab",buffering=0)
         try:
             proc=subprocess.Popen(launch_argv,cwd=cwd,env=environment,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
@@ -417,7 +419,7 @@ def main(argv=None, *, controller=None):
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             fail("could not establish process identity")
         run={**ident,"run_id":args.run_id,"process_group":os.getpgid(proc.pid),"cwd":str(cwd),"log":str(log),"command":command,
-             "launch_argv":launch_argv,"sentinel":str(sentinel),
+             "launch_argv":launch_argv,"sentinel":str(sentinel),"progress_file":placeholder["progress_file"],
              "parent_attempt_id":args.parent_attempt_id,**provenance,
              "route":args.route,"node":args.node,"status":"running","workflow_state":"RUNNING",
              "started_at":placeholder["started_at"]}

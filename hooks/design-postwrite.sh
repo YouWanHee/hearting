@@ -29,4 +29,18 @@ EOF
   esac
 fi
 
-exec node "$AGENT_HOME/tools/design-mcp/console-check.mjs" --hook
+# Hook mode. Almost every Write/Edit is not design HTML, so settle that in the shell:
+# node is started only when the payload names an .htm/.html path (a superset of the
+# checker's own filter, which still makes the exact call). A missing or unusable node
+# is the same infra failure the checker swallows, so only its exit 2 (console errors)
+# is surfaced; `--file` stays loud.
+payload="$(cat)"
+case "$payload" in
+  *.[hH][tT][mM]*) ;;
+  *) exit 0 ;;
+esac
+command -v node >/dev/null 2>&1 || exit 0
+out="$(printf '%s' "$payload" | node "$AGENT_HOME/tools/design-mcp/console-check.mjs" --hook 2>&1)"
+[ "$?" = "2" ] || exit 0
+printf '%s\n' "$out" >&2
+exit 2

@@ -241,7 +241,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--cycle-dir")
     p = sub.add_parser("resolve", help="resolve a legacy root-relative path")
     p.add_argument("--artifact-root", required=True)
-    p.add_argument("--path", required=True)
+    address = p.add_mutually_exclusive_group(required=True)
+    address.add_argument("--path")
+    address.add_argument("--cycle")
+    address.add_argument("--campaign")
     p = sub.add_parser("hold", help="nonterminal resplit (D-77-a) or relayout (A-17.8) journal hold, if any")
     p.add_argument("--artifact-root", required=True)
     args = parser.parse_args(argv)
@@ -264,7 +267,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _emit({"hold": hold})
         return HOLD_EXIT
     else:
-        _emit(resolve_path(root, args.path))
+        if args.path is not None:
+            _emit(resolve_path(root, args.path))
+        else:
+            import artifact_locator
+            _emit(artifact_locator.resolve_historical(root, args.cycle or args.campaign))
     return 0
 
 

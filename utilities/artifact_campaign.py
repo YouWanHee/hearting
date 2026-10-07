@@ -103,7 +103,8 @@ DETACHED_STATES = frozenset({"abandoned", "no-lineage"})
 def is_member_record(record):
     # A deleted cycle (§45 D-126) keeps its record but is no longer a member of anything.
     return (isinstance(record, dict) and record.get("state") not in DETACHED_STATES
-            and not record.get("deleted_at"))
+            and not record.get("deleted_at")
+            and not (record.get("relocation") or {}).get("artifact_root"))
 
 
 def campaign_records(root, campaign_id):
@@ -305,6 +306,16 @@ def _read_stream(root, path, record, start_sequence, stream_id):
                     raise CampaignError("campaign-event-invalid", {"path": str(entry), "field": "payload.reason"})
             if set(payload) != expected:
                 raise CampaignError("campaign-event-invalid", {"path": str(entry), "field": "payload"})
+        elif event_type == "campaign.superseded":
+            if (set(payload) != {"contract", "operation_id", "canonical", "previous_state"}
+                    or not isinstance(payload.get("operation_id"), str)
+                    or payload.get("previous_state") not in {"active", "satisfied"}
+                    or not isinstance(payload.get("canonical"), dict)
+                    or set(payload["canonical"]) != {"artifact_root", "campaign_id"}
+                    or not Path(payload["canonical"].get("artifact_root", "")).is_absolute()
+                    or not identity.is_well_formed(payload["canonical"].get("campaign_id"), "campaign")
+                    or event.get("actor", {}).get("kind") != "producer"):
+                raise CampaignError("campaign-event-invalid", {"path": str(entry), "field": "payload"})
         else:
             raise CampaignError("campaign-event-invalid", {"path": str(entry), "field": "event_type"})
         rows.append((sequence, "stream", event))
@@ -346,7 +357,7 @@ def campaign_state(root, path, record=None):
         if state not in {"active", "abandoned", "superseded"}:
             raise CampaignError("campaign-state-invalid", state)
     else:
-        if record.get("state") in {"abandoned", "superseded"}:
+        if record.get("state") == "abandoned" or (record.get("state") == "superseded" and folded.state != "superseded"):
             raise CampaignError("campaign-projection-conflict", path)
         satisfaction_ids = {event.get("event_id") for _, _, event in rows
                             if event.get("event_type") == "campaign.satisfied"}
@@ -624,6 +635,7 @@ def status(root, selection):
                 "message": "같은 key/ID/parent로 begin하면 자동으로 다시 열린다"}
     if folded.state in {"abandoned", "superseded"}:
         return {"status": folded.state, "state": folded.state, "campaign_id": record["campaign_id"],
+                "canonical": record.get("relocation"),
                 "satisfied": False, "closable": False,
                 "close_refusal": {"reason": "campaign-not-active"}, "events": event_rows}
     try:
@@ -880,3 +892,42 @@ def recover(root, selection):
         return _recover_locked(root, path)
     finally:
         admission._release_lock(root, lock)
+
+
+def supersede_locked(root, path, *, operation_id, target_root, target_campaign):
+    """Append the terminal merge transition under the existing admission lock.
+
+    Replay uses the published operation identity, even if projection was interrupted.
+    """
+    import artifact_producer as producer
+    state = campaign_state(root, path)
+    for _, _, event in state.events:
+        if event["event_type"] == "campaign.superseded":
+            if event["payload"]["operation_id"] != operation_id:
+                raise CampaignError("campaign-not-active", path)
+            _materialize(root, path)
+            _supersede_history(root, path, event)
+            return event
+    actor, _ = _agent_actor()
+    event = _new_event(root, path, state, "campaign.superseded",
+                       {"kind": "producer", "id": actor},
+                       {"contract": CONTRACT, "operation_id": operation_id, "previous_state": state.state,
+                        "canonical": {"artifact_root": str(target_root), "campaign_id": target_campaign}},
+                       {"schema_version": 1, "algorithm_version": CONTRACT, "source_root": str(root),
+                        "operation_id": operation_id, "source_digest": digest({"operation_id": operation_id})})
+    _publish_event(root, path, event)
+    _materialize(root, path)
+    _supersede_history(root, path, event)
+    return event
+
+
+def _supersede_history(root, path, event):
+    import artifact_producer as producer
+    line = producer._command_line(command="cycle-move", stamp=event["event_id"], target_type="campaign",
+        target_id=event["target_id"], target_path=str(path.parent.relative_to(root)), operation="update", field="state",
+        before={"value": event["payload"]["previous_state"]}, after={"value": "superseded"},
+        reason="cross-root campaign merge", now=datetime.fromisoformat(event["recorded_at"].replace("Z", "+00:00")).timestamp(), by="rule")
+    # The automatic projection is a rule; the initiating actor stays in the
+    # stream event. Its recorder row stays byte-stable across caller changes.
+    line["actor"] = {"by": "rule", "session": None, "harness": None, "route": None, "attempt": None}
+    producer._campaign_lines_locked(root, event["target_id"], [line])

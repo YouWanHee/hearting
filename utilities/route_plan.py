@@ -14,6 +14,7 @@ builds, renders, reads and checks, and none of its functions write a file.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -236,6 +237,11 @@ def _proposal_blocks(section: str) -> list:
             continue
         buffer.append(line)
     return blocks
+
+
+def yaml_available() -> bool:
+    """Whether this Python can read a proposal block at all: `_load_yaml` needs PyYAML."""
+    return importlib.util.find_spec("yaml") is not None
 
 
 def _load_yaml(text: str):

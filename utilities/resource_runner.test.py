@@ -32,6 +32,38 @@ assert spec and spec.loader
 spec.loader.exec_module(R)
 
 
+class TestProgressLaunch(unittest.TestCase):
+    def test_main_assigns_one_path_and_replaces_inherited_run_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry, log = root / "runs.json", root / "eval.log"
+            route = root / "route.json"
+            route.write_text(json.dumps({"capability": "autopilot-lab", "artifact_root": str(root),
+                "nodes": [{"id": "eval-run", "kind": "resource-runner", "resource_transport": "detached-process"}]}))
+            payload = (f"import sys, time; sys.path.insert(0, {str(ROOT / 'utilities')!r}); "
+                       "from resource_progress import write_progress; assert write_progress(1, 'item'); time.sleep(.2)")
+            children = []
+            real_popen = subprocess.Popen
+            def spawn(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                children.append(child)
+                return child
+            with mock.patch.object(R.subprocess, "run"), mock.patch.object(R, "register_registry"), \
+                 mock.patch.object(R.subprocess, "Popen", side_effect=spawn), mock.patch("sys.stdout"), \
+                 mock.patch.dict(os.environ, {"AGENT_RESOURCE_PROGRESS_FILE": str(root / "foreign.json"),
+                                             "AGENT_RESOURCE_RUN_ID": "foreign", "AGENT_RESOURCE_NODE": "other"}):
+                R.main(["--registry", str(registry), "start", "--run-id", "auto", "--cwd", str(root),
+                        "--log", str(log), "--route", str(route), "--node", "eval-run",
+                        "--smoke-attestation", str(root / "smoke.json"), "--", sys.executable, "-c", payload])
+                children[0].wait(timeout=5)
+            row = json.loads(registry.read_text())["runs"]["auto"]
+            self.assertEqual(row["progress_file"], str(log) + ".progress.json")
+            counter = json.loads(Path(row["progress_file"]).read_text())
+            self.assertEqual((counter["run_id"], counter["node"], counter["completed"]), ("auto", "eval-run", 1))
+            self.assertFalse((root / "foreign.json").exists())
+            self.assertEqual(R.read_sentinel(row["sentinel"]), 0)
+
+
 class TestRunner(unittest.TestCase):
     def test_verified_publication_cas_preserves_changed_or_missing_reservation(self):
         expected = {"run_id":"resume", "status":"launching", "command":["approved"], "token":"one"}
@@ -75,9 +107,10 @@ class TestRunner(unittest.TestCase):
         route_file = self.base / "owner-route.json"
         args = SimpleNamespace(jobs=str(jobs), run_id="owner-run", node="full-run")
         placeholder = {"run_id":"owner-run", "cwd":str(self.repo), "log":str(self.log),
-            "command":[sys.executable,"-c",f"from pathlib import Path; Path({str(self.launch)!r}).write_text('once')"],
+            "command":[sys.executable,"-c",f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r}); from resource_progress import write_progress; assert write_progress(12, 'epoch', total=50); from pathlib import Path; Path({str(self.launch)!r}).write_text('once')"],
             "route":str(route_file), "node":"full-run", "status":"launching", "sentinel":str(self.log)+".exit",
-            "parent_attempt_id":"att-parent", "owner_wait":{"session_id":"same-native"}}
+            "parent_attempt_id":"att-parent", "progress_file":str(self.log)+".progress.json",
+            "owner_wait":{"session_id":"same-native"}}
         real_popen = subprocess.Popen
         watch = mock.Mock(pid=os.getpid())
         watch.poll.return_value = None
@@ -108,6 +141,9 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(row["resource_policy"],"supervised-owner")
         self.assertEqual(row["owner_wait"],placeholder["owner_wait"])
         self.assertEqual(R.read_sentinel(row["sentinel"]),0)
+        progress = json.loads(Path(row["progress_file"]).read_text())
+        self.assertEqual((progress["run_id"], progress["node"], progress["completed"], progress["total"]),
+                         ("owner-run", "full-run", 12, 50))
 
     def test_codex_tool_intent_has_no_process_until_controller_admission_once(self):
         import artifact_producer

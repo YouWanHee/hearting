@@ -131,6 +131,12 @@ callback, and the session ended with no follow-up mechanism registered. See
 For `eval`, `eval-run` is likewise a supervised detached run whose termination
 advances `metrics`, and `sync` is the terminal node.
 
+Workload progress is optional. The resource runner supplies
+`AGENT_RESOURCE_PROGRESS_FILE`, `AGENT_RESOURCE_RUN_ID`, and `AGENT_RESOURCE_NODE`.
+Lab scripts may call `resource_progress.write_progress(completed, "epoch", total=50)`
+from the shared `utilities/` helper to atomically publish a short counter; a missing
+or invalid observation never interrupts the workload or changes exit/sentinel completion.
+
 ### Parts (SD-165)
 
 For an already verified run's same-code/config resume, epoch extension or repeat,

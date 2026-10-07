@@ -84,7 +84,7 @@ python3 <agent-home>/tools/memory/mem.py <command>
 | `lifecycle [--apply]` | Apply working expiry and expose durable duplicate/capacity candidates. Pending delivery records remain protected. |
 | `stats` | Print a grouped store snapshot. |
 | `log [--limit 20] [--action] [--tier] [--actor] [--json]` | Read the bounded write-event timeline (D-38), complementing the `stats` snapshot. |
-| `doctor` | Run bounded read-only local and v2 protocol checks covering integrity, schema/index invariants, pending/capacity/graveyard/dump consistency, outbox/peer/migration state, and worker health. Exit 0 is clean, 1 is WARN, and 2 is FAIL. |
+| `doctor` | Run bounded read-only local and v2 protocol checks covering integrity, schema/index invariants, pending/capacity/graveyard/dump consistency, and outbox/peer/migration state. Exit 0 is clean, 1 is WARN, and 2 is FAIL. |
 | `inject [--hook]` | Build bounded SessionStart context from working, durable, and profile records. Defaults to 2,000 characters and 15 bullets; `--hook` emits `additionalContext` JSON and reads the SessionStart hook JSON on stdin without waiting for it: `source` `compact` or `clear` empties that session's candidate history. |
 | `sync [--json]` | Explicit full maintenance (nothing runs it at session end): lifecycle maintenance, index rebuild, and the compatibility projection. Does not absorb built-in file memory (D-79). With remote sync explicitly enabled, finalize/render/fetch/validate/integrate/fold/export/push/fresh-confirm immutable operations. `--json` emits the versioned status and phase outcomes described below. |
 | `conflicts` | List bounded unresolved conflict identities without adopting a provisional body. |

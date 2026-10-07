@@ -1352,6 +1352,8 @@ _RETIRE_ACTIONS = {"codex": (("send-keys", "ctrl+d"),),
                    "claude": (("send-text", "/exit"), ("send-keys", "enter")),
                    "opencode": (("send-keys", "ctrl+d"),)}
 _RETIRE_SECONDS = 5
+# OpenCode can remain foreground while it finishes its normal exit summary.
+_OPENCODE_RETIRE_SECONDS = 60
 
 
 def _retire_process_record(pid):
@@ -1510,7 +1512,8 @@ def cmd_retire(args):
                 return finish("exit-send-failed")
     except (OSError, subprocess.SubprocessError):
         return finish("exit-send-unknown")
-    deadline = time.monotonic() + _RETIRE_SECONDS
+    wait_seconds = _OPENCODE_RETIRE_SECONDS if harness == "opencode" else _RETIRE_SECONDS
+    deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         info = _retire_pane_info(pane, timeout=max(.1, deadline - time.monotonic()))
         if info is None:

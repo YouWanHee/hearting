@@ -148,7 +148,6 @@ _WRITE_EVENT_CWD_UNSET = object()
 # Doctor thresholds mirror the cleanup-candidate defaults.
 DOCTOR_DURABLE_SOFT_CEILING = 80
 DOCTOR_WORKING_BLOAT_CEILING = 150
-DOCTOR_WORKER_STALE_DAYS = 7
 
 
 def artifact_root(cwd: Path) -> Path:
@@ -5791,41 +5790,6 @@ def doctor(json_output=False):
                           f"DB max(updated)={db_max} > dump max(updated)={dump_max}; sync required")
         else:
             _doctor_check(results, "dump-freshness", "OK", f"dump max(updated)={dump_max}")
-
-    # Worker health from latest per-project distill and curate journal activity.
-    events = _read_write_events()
-    con = _doctor_connection()
-    try:
-        cwd_by_id = {r[0]: r[1] for r in con.execute(
-            "SELECT id, cwd_origin FROM records WHERE scope='project'").fetchall()}
-        active_projects = {r[0] for r in con.execute(
-            "SELECT DISTINCT cwd_origin FROM records WHERE tier='working' AND scope='project' "
-            "AND last_accessed IS NOT NULL AND last_accessed>=?",
-            ((datetime.date.today() - datetime.timedelta(days=DOCTOR_WORKER_STALE_DAYS))
-             .isoformat(),)).fetchall()}
-    finally:
-        con.close()
-    last_worker_ts = {}
-    for e in events:
-        if e.get("actor") not in ("distiller", "curator"):
-            continue
-        cwd = cwd_by_id.get(e.get("id"))
-        if not cwd:
-            continue
-        ts = e.get("ts") or ""
-        if ts and (cwd not in last_worker_ts or ts > last_worker_ts[cwd]):
-            last_worker_ts[cwd] = ts
-    stale_deadline_ts = (datetime.datetime.now() -
-                        datetime.timedelta(days=DOCTOR_WORKER_STALE_DAYS)).isoformat()
-    silent = sorted(
-        p for p in active_projects
-        if p not in last_worker_ts or last_worker_ts[p] < stale_deadline_ts)
-    if not silent:
-        _doctor_check(results, "worker-health", "OK",
-                      f"{len(active_projects)} active projects; none silent")
-    else:
-        _doctor_check(results, "worker-health", "WARN",
-                      f"{len(silent)} silent-death candidates: " + ",".join(silent[:10]))
 
     sync_level = int(sync_snapshot.get("exit_code", 2))
     _doctor_check(

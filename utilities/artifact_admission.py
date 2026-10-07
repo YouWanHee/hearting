@@ -16,6 +16,7 @@ events. `.runtime/artifact-admission/v1/root-identity.json` is the only value
 here that cannot be rebuilt from published manifests.
 """
 
+from contextlib import contextmanager, ExitStack
 import errno
 import fcntl
 import json
@@ -270,8 +271,16 @@ def _acquire_lock(root: Path, timeout: float, now: Optional[float] = None) -> in
                     # acquisition is refused here, typed and immediately,
                     # rather than blocking on `flock` until the admission
                     # timeout turns a contract violation into a "busy" report.
-                    dispatch_lock_order.enter("producer-admission")
-                    _held_roots().add(str(Path(root).resolve()))
+                    batch = getattr(_HELD_ROOTS_STATE, "batch", ())
+                    canonical_root = str(Path(root).resolve())
+                    if batch and _held_roots():
+                        # One sorted multi-root critical section, with one rank.
+                        remaining = [item for item in batch if item not in _held_roots()]
+                        if not remaining or canonical_root != remaining[0]:
+                            raise dispatch_lock_order.LockOrderError("lock-reentry-forbidden", canonical_root)
+                    else:
+                        dispatch_lock_order.enter("producer-admission")
+                    _held_roots().add(canonical_root)
                     result_fd, fd = fd, -1  # ownership transferred to caller
                     return result_fd
         finally:
@@ -292,7 +301,8 @@ def _acquire_lock(root: Path, timeout: float, now: Optional[float] = None) -> in
 
 def _release_lock(root: Path, fd: int) -> None:
     _held_roots().discard(str(Path(root).resolve()))
-    dispatch_lock_order.leave("producer-admission")
+    if not _held_roots():
+        dispatch_lock_order.leave("producer-admission")
     # Unlink before unlocking, while exclusivity still holds; a waiter that
     # locked the old inode fails its path/inode verification and retries.
     # Unlink only when the path still names this holder's inode, so a release
@@ -313,6 +323,28 @@ def _release_lock(root: Path, fd: int) -> None:
         os.close(fd)
     except OSError:
         pass
+
+
+@contextmanager
+def lock_roots(roots, *, now=None):
+    """One admission critical section over distinct roots in realpath order.
+
+    Ordinary lock reentry remains forbidden. The batch owns the whole rank
+    until its last root is released, including an interrupted acquisition.
+    """
+    if _held_roots() or getattr(_HELD_ROOTS_STATE, "batch", ()):
+        raise dispatch_lock_order.LockOrderError("lock-reentry-forbidden", "producer-admission")
+    ordered = tuple(sorted({str(Path(root).resolve()) for root in roots}))
+    _HELD_ROOTS_STATE.batch = ordered
+    try:
+        with ExitStack() as locks:
+            for item in ordered:
+                root = Path(item)
+                fd = _acquire_lock(root, LOCK_TIMEOUT_DEFAULT, now=now)
+                locks.callback(_release_lock, root, fd)
+            yield
+    finally:
+        _HELD_ROOTS_STATE.batch = ()
 
 
 def force_release_lock(root: Path) -> None:
