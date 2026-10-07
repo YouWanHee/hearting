@@ -113,6 +113,57 @@ class WrapperCommonTest(unittest.TestCase):
                 C.write_reset_cache(Path(tmp), "claude", "usage-limit", "12:00")  # no raise
 
 
+class CloseJobRowTest(unittest.TestCase):
+    def row(self, status="open", slug="slug", worktree="/wt", pipe="attempt_schema_version=2"):
+        return f"2026-10-07T00:00:00Z\t{status}\t/repo\t{worktree}\t{slug}\t{pipe}\n"
+
+    def test_the_slug_path_flips_the_open_row_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.write_text(self.row(), encoding="utf-8")
+            from unittest import mock
+            materialize = mock.Mock()
+            self.assertTrue(C.close_job_row(jobs, "slug", "/wt", "limit", "", materialize=materialize))
+            line = jobs.read_text(encoding="utf-8")
+            self.assertIn("\tdone\t", line)
+            self.assertIn("note=dead-limit", line)
+            materialize.assert_not_called()
+            self.assertFalse(C.close_job_row(jobs, "slug", "/wt", "limit", "", materialize=materialize))
+
+    def test_capacity_and_reset_ride_the_same_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.write_text(self.row(), encoding="utf-8")
+            from unittest import mock
+            self.assertTrue(C.close_job_row(jobs, "slug", "/wt", "capacity", "3pm", materialize=mock.Mock()))
+            line = jobs.read_text(encoding="utf-8")
+            self.assertIn("failure_class=capacity,detected_by=anchored-early-exit", line)
+            self.assertIn("reset=3pm", line)
+
+    def test_every_wrapper_injects_its_own_materialize_at_call_time(self):
+        # foreground_terminal_outcome patches the wrapper's
+        # materialize_after_terminal_close in place; the delegation must look
+        # it up when called, not when imported.
+        import ast
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            jobs.write_text(self.row(), encoding="utf-8")
+            for harness in ("claude", "codex", "opencode"):
+                wrapper = load(harness)
+                tree = ast.parse((ROOT / "adapters" / harness / "bin" / "dispatch-headless.py")
+                                 .read_text(encoding="utf-8"))
+                delegation = next(n for n in tree.body
+                                  if isinstance(n, ast.FunctionDef) and n.name == "close_job_row")
+                with self.subTest(harness=harness):
+                    self.assertIn("WRAPPER_COMMON.close_job_row", ast.unparse(delegation))
+                    self.assertIn("materialize=materialize_after_terminal_close", ast.unparse(delegation))
+                    with mock.patch.object(wrapper, "materialize_after_terminal_close") as delivery, \
+                         mock.patch.object(C, "close_attempt_row", return_value=True):
+                        self.assertTrue(wrapper.close_job_row(jobs, "s", "/w", "limit", "", "att-1"))
+                    delivery.assert_called_once_with(jobs, "att-1")
+
+
 class RegistrationFenceTest(unittest.TestCase):
     def test_every_wrapper_registers_behind_the_terminal_claim_fence(self):
         import ast
