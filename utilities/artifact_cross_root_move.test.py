@@ -31,6 +31,9 @@ def snapshot(root):
 class CrossRootMoveTest(F.ProducerTestBase):
     def setUp(self):
         super().setUp()
+        transfer = mock.patch.object(X, "_same_device", return_value=False)
+        transfer.start()
+        self.addCleanup(transfer.stop)
         self.source = self.root
         self.activate()
         self.target = Path(self._tmp.name) / "target"
@@ -513,6 +516,65 @@ class CorrectionMoveTest(CrossRootMoveTest):
         self.assertEqual(self.move()["operation_id"], out["operation_id"])
 
 
+
+
+class RenameMoveTest(CorrectionMoveTest):
+    def setUp(self):
+        super().setUp()
+        transfer = mock.patch.object(X, "_same_device", return_value=True)
+        transfer.start()
+        self.addCleanup(transfer.stop)
+
+    def test_rename_preview_merge_no_payload_hash_or_copy(self):
+        folder, logs, args = self.logs(nested=True)
+        payload = Path(self.src["cycle_dir"]) / "artifacts" / "data.bin"
+        payload.write_bytes(b"same-device-content")
+        inode = payload.stat().st_ino
+        with mock.patch.object(X, "tree", side_effect=AssertionError("payload hash")), mock.patch.object(X.shutil, "copytree", side_effect=AssertionError("copy")):
+            preview = self.move(dry_run=True, attach_logs=args)
+            self.assertTrue(payload.exists())
+            self.assertEqual(preview["cycles"][0]["transfer"], "rename")
+            out = self.move(attach_logs=args)
+        landed = self.target / out["cycles"][0]["target"]
+        self.assertEqual((landed / "artifacts/data.bin").stat().st_ino, inode)
+        self.assertEqual((landed / "artifacts/data.bin").read_bytes(), b"same-device-content")
+        self.assertFalse(Path(self.src["cycle_dir"]).exists())
+        self.assertEqual(out["cycle_ids"], preview["cycle_ids"])
+        self.assertEqual(Reader.resolve_path(self.source, str(folder.relative_to(self.source)))["absolute"], str(self.target / out["attachments"][0]["target"]))
+
+    def test_rename_lost_response_replays_cycle_and_attachment(self):
+        for attachment in [False, True]:
+            cycle = self.make(self.source, "rename-loss-" + str(attachment), closed=True)
+            args = self.logs("rename-loss-" + str(attachment), True, cycle)[2] if attachment else []
+            def run():
+                return P.cycle_move(self.source, cycle["cycle_id"], target_artifact_root=self.target, campaign=self.dst["campaign_id"], attach_logs=args)
+            count = 0
+            def fault(phase):
+                nonlocal count
+                if phase == "rename":
+                    count += 1
+                    if count == (2 if attachment else 1):
+                        raise RuntimeError("rename response lost")
+            with mock.patch.object(X, "_fault", side_effect=fault), self.assertRaises(RuntimeError):
+                run()
+            self.assertFalse(Path(cycle["cycle_dir"]).exists())
+            out = run()
+            self.assertEqual(out["status"], "moved")
+            self.assertEqual(run()["operation_id"], out["operation_id"])
+
+    def test_rename_foreign_destination_preserves_both_payloads(self):
+        original = X._rename_tree
+        foreign = []
+        def race(source, target, item, **kwargs):
+            target.mkdir(parents=True)
+            path = target / "foreign.txt"
+            path.write_bytes(b"foreign")
+            foreign.append(path)
+            return original(source, target, item, **kwargs)
+        with mock.patch.object(X, "_rename_tree", side_effect=race), self.assertRaises(P.ProducerError):
+            self.move()
+        self.assertTrue(Path(self.src["cycle_dir"]).exists())
+        self.assertEqual(foreign[0].read_bytes(), b"foreign")
 
 if __name__ == "__main__":
     unittest.main()

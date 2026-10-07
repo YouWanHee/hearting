@@ -463,6 +463,8 @@ history with no live work transfers no parent or successor execution authority.
 Source routes and outcomes retain their original bytes and remain historical.
 A new current manifest names the target root and campaign while preserving
 origin-qualified route rows and every earlier manifest snapshot.
+Same-filesystem moves use atomic rename and file-list/size inventories;
+cross-device moves use durable copies and byte digests.
 
 ## 4. Workflow Invariants
 

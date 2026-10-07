@@ -98,6 +98,31 @@ def tree(path):
     return rows
 
 
+def _same_device(source, target):
+    return source.stat().st_dev == target.stat().st_dev
+
+
+def listing(path):
+    """Rename inventory: names, kinds and sizes, without reading payload bytes."""
+    rows, identities = {}, {}
+    def visit(node, rel, info):
+        identities[rel] = [info.st_dev, info.st_ino, info.st_mode]
+        if stat.S_ISLNK(info.st_mode):
+            rows[rel] = {"kind": "symlink", "target": os.readlink(node)}
+        elif stat.S_ISREG(info.st_mode):
+            rows[rel] = {"kind": "file", "bytes": info.st_size}
+        elif stat.S_ISDIR(info.st_mode):
+            rows[rel] = {"kind": "directory"}
+            with os.scandir(node) as entries:
+                for entry in sorted(entries, key=lambda e: e.name):
+                    visit(Path(entry.path), str(Path(rel) / entry.name) if rel else entry.name,
+                          entry.stat(follow_symlinks=False))
+        else:
+            _error("special payload: " + str(node))
+    visit(Path(path), "", Path(path).lstat())
+    return rows, identities
+
+
 def _durable(directory):
     for base, dirs, files in os.walk(directory, followlinks=False):
         for name in files:
@@ -155,12 +180,17 @@ def _supports(root, records, campaign_path, route_ids):
         if any(token in rel or token.encode() in raw for token in ids):
             selected[rel] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
     # Campaign controls are original history, including workflow groups and events.
-    for path in sorted(campaign_path.parent.rglob("*")):
-        if path.is_file() and not path.is_symlink() and not any(
-                (campaign_path.parent / row["locator"]) in path.parents for row in records):
-            rel = path.relative_to(root).as_posix()
-            raw = path.read_bytes()
-            selected[rel] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    excluded = {campaign_path.parent / row["locator"] for row in records}
+    for base, dirs, files in os.walk(campaign_path.parent, followlinks=False):
+        # These payload subtrees were already excluded from support history;
+        # prune before walking them rather than statting every excluded file.
+        dirs[:] = sorted(name for name in dirs if Path(base) / name not in excluded)
+        for name in sorted(files):
+            path = Path(base) / name
+            if path.is_file() and not path.is_symlink():
+                rel = path.relative_to(root).as_posix()
+                raw = path.read_bytes()
+                selected[rel] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
     return selected
 
 
@@ -206,6 +236,7 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
     target_path, target_row = _campaign(target, campaign or source_row["key"])
     if target_row.get("state") != "active":
         _error("target campaign must be active")
+    transfer = "rename" if _same_device(source, target) else "copy"
     cycles, records, used = [], [], set()
     for cid in ids:
         record_path = P.cycle_record_path(source, cid)
@@ -227,8 +258,13 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
             suffix += 1
         used.add(name)
         destination = _safe(target, target_path.parent / name)
+        inventory, identities = listing(directory) if transfer == "rename" else (tree(directory), _identities(directory))
         cycles.append({"cycle_id": cid, "record": record, "source": str(directory.relative_to(source)),
-                       "target": str(destination.relative_to(target)), "inventory": tree(directory), "source_identities": _identities(directory), "state": "planned"})
+                       "target": str(destination.relative_to(target)), "inventory": inventory,
+                       "source_identities": identities, "transfer": transfer, "state": "planned",
+                       "original_binding": (directory / locator.CYCLE_BINDING).read_bytes().hex(),
+                       "original_manifest": (directory / "manifest.json").read_bytes().hex()
+                           if (directory / "manifest.json").is_file() else None})
         records.append(record)
     attach = []
     used_names = set()
@@ -255,8 +291,9 @@ def _plan(source, target, *, operation_id, cycle_id, source_campaign, campaign, 
         while str(dest) in used_names or os.path.lexists(dest) or os.path.lexists(source / item["source"] / dest.relative_to(target / item["target"])):
             dest = dest.parent / (name + "-" + str(index)); index += 1
         used_names.add(str(dest))
+        inventory, identities = listing(logs) if transfer == "rename" else (tree(logs), _identities(logs))
         attach.append({"source": str(directory), "logs_source": str(logs), "target": str(dest.relative_to(target)), "cycle_id": cid,
-                       "inventory": tree(logs), "source_identities": _identities(logs), "state": "planned"})
+                       "inventory": inventory, "source_identities": identities, "transfer": transfer, "state": "planned"})
     journal = {"schema": "artifact-cross-root-move/v1", "operation_id": operation_id, "state": "planned",
                "source_root": str(source), "target_root": str(target), "source_campaign": source_row["campaign_id"],
                "target_campaign": target_row["campaign_id"], "source_campaign_path": str(source_path.relative_to(source)),
@@ -356,6 +393,57 @@ def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_ra
                 _error("destination appeared during publication: " + str(target))
             raise OSError(code, os.strerror(code), str(target))
         P._fsync_dir(target.parent)
+    _fault("publish")
+
+
+def _rename_tree(source, target, item, *, binding=None, manifest_raw=None, prepare=None, roots=(), admit=None):
+    """No-replace rename; exact inode ownership reconciles a lost rename response."""
+    if not os.path.lexists(target):
+        inventory, identities = listing(source)
+        if inventory != item["inventory"] or identities != item["source_identities"]:
+            _error("source changed before rename: " + str(source))
+        with admission.lock_roots(roots):
+            if admit:
+                admit()
+            info = source.lstat()
+            if [info.st_dev, info.st_ino, info.st_mode] != item["source_identities"][""]:
+                _error("source replaced before rename: " + str(source))
+            P._ensure_dir(target.parent)
+            libc = ctypes.CDLL(None, use_errno=True)
+            rename = libc.renameat2
+            rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1):
+                code = ctypes.get_errno()
+                if code == errno.EEXIST:
+                    _error("destination appeared before rename: " + str(target))
+                raise OSError(code, os.strerror(code), str(target))
+            P._fsync_dir(source.parent)
+            P._fsync_dir(target.parent)
+        _fault("rename")
+    landed, identities = listing(target)
+    if identities.get("") != item["source_identities"][""]:
+        _error("foreign rename destination: " + str(target))
+    expected = dict(item["inventory"])
+    for name, raw in ((locator.CYCLE_BINDING, binding), ("manifest.json", manifest_raw)):
+        if raw is None:
+            continue
+        original = item.get("original_binding" if name == locator.CYCLE_BINDING else "original_manifest")
+        path = target / name
+        if not path.is_file() or path.is_symlink() or path.read_bytes() not in (bytes.fromhex(original) if original else None, raw):
+            _error("renamed control changed: " + str(path))
+        landed.pop(name, None)
+        expected.pop(name, None)
+        identities.pop(name, None)
+    original_identities = {name: value for name, value in item["source_identities"].items()
+                           if name in identities}
+    if landed != expected or identities != original_identities:
+        _error("renamed payload changed: " + str(target))
+    with admission.lock_roots(roots):
+        if binding is not None:
+            P._write_atomic(target / locator.CYCLE_BINDING, binding)
+        if prepare:
+            prepare(target)
     _fault("publish")
 
 
@@ -495,19 +583,26 @@ def _verify_landed(target, journal, item):
     directory = _safe(target, target / item["target"])
     if not os.path.lexists(directory):
         _error("target payload missing; source retained: " + item["target"])
-    landed = tree(directory)
+    renamed = item.get("transfer") == "rename"
+    landed = listing(directory)[0] if renamed else tree(directory)
     if "logs_source" in item:
         if landed != item["inventory"]:
             _error("target logs changed; source retained: " + item["target"])
         return
     expected_inventory = dict(item["inventory"])
+    def file_row(raw):
+        row = {"kind": "file", "bytes": len(raw)}
+        if not renamed:
+            row["sha256"] = hashlib.sha256(raw).hexdigest()
+        return row
     binding = locator.cycle_binding_bytes(journal["target_campaign"], item["cycle_id"],
                                            started_on=item["record"].get("started_on"))
-    expected_inventory[locator.CYCLE_BINDING] = {"kind": "file", "bytes": len(binding),
-                                                "sha256": hashlib.sha256(binding).hexdigest()}
+    expected_inventory[locator.CYCLE_BINDING] = file_row(binding)
+    if (directory / locator.CYCLE_BINDING).read_bytes() != binding:
+        _error("target binding changed; data retained: " + item["cycle_id"])
     if item.get("prepared_manifest"):
         raw = P.artifact_manifest.canonical_bytes(item["prepared_manifest"])
-        expected_inventory["manifest.json"] = {"kind": "file", "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        expected_inventory["manifest.json"] = file_row(raw)
         snapshot = _safe(target, P.artifact_lifecycle.manifest_snapshot_path(target, item["cycle_id"],
                                                   item["prepared_manifest"]["manifest_revision_id"]))
         if not snapshot.is_file() or snapshot.is_symlink() or snapshot.read_bytes() != raw:
@@ -533,7 +628,8 @@ def _receipt(journal):
             "historical_routes": journal["historical_routes"], "support_route_ids": journal["route_ids"],
             "support_inventory": journal["support_inventory"],
             "registry_support": journal["registry_support"],
-            "cycles": [{key: item[key] for key in ("cycle_id", "source", "target")} for item in journal["cycles"]],
+            "cycles": [dict({key: item[key] for key in ("cycle_id", "source", "target")},
+                            transfer=item.get("transfer", "copy")) for item in journal["cycles"]],
             "attachments": journal["attachments"]}
 
 
@@ -644,17 +740,26 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
                     P._publish_document_locked(target, P.read_cycle_record(target, item["cycle_id"]), stage,
                         original[0], original[1], prepared, [], now=now, moved_fields=("campaign_id",),
                         cycle_path=item["target"], index=index)
-                _publish_tree(source / item["source"], target / item["target"], staging / item["cycle_id"], item["inventory"],
-                    binding=locator.cycle_binding_bytes(journal["target_campaign"], item["cycle_id"],
-                                                       started_on=item["record"].get("started_on")),
-                    manifest_raw=raw, prepare=prepare, roots=[source, target])
+                binding = locator.cycle_binding_bytes(journal["target_campaign"], item["cycle_id"],
+                                                       started_on=item["record"].get("started_on"))
+                if item.get("transfer") == "rename":
+                    _rename_tree(source / item["source"], target / item["target"], item,
+                        binding=binding, manifest_raw=raw, prepare=prepare, roots=[source, target],
+                        admit=lambda: _decision(source, journal))
+                else:
+                    _publish_tree(source / item["source"], target / item["target"], staging / item["cycle_id"], item["inventory"],
+                        binding=binding, manifest_raw=raw, prepare=prepare, roots=[source, target])
                 item["state"] = "published"; _save(source, journal)
         for index, item in enumerate(journal["attachments"]):
             if item["state"] == "planned":
                 _safe(source, Path(item["logs_source"]))
                 _safe(target, target / item["target"])
                 _safe(target, staging / ("logs-" + str(index)))
-                _publish_tree(Path(item["logs_source"]), target / item["target"], staging / ("logs-" + str(index)), item["inventory"], roots=[source, target])
+                if item.get("transfer") == "rename":
+                    _rename_tree(Path(item["logs_source"]), target / item["target"], item,
+                        roots=[source, target], admit=lambda: _decision(source, journal))
+                else:
+                    _publish_tree(Path(item["logs_source"]), target / item["target"], staging / ("logs-" + str(index)), item["inventory"], roots=[source, target])
                 item["state"] = "published"; _save(source, journal)
         _decision(source, journal)
         with admission.lock_roots([source, target], now=now):
@@ -683,10 +788,12 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
         _decision(source, journal)
         for item in journal["cycles"]:
             _verify_landed(target, journal, item)
-            _source_survivors(source / item["source"], item)
+            if item.get("transfer") != "rename":
+                _source_survivors(source / item["source"], item)
         for item in journal["attachments"]:
             _verify_landed(target, journal, item)
-            _source_survivors(Path(item["logs_source"]), item)
+            if item.get("transfer") != "rename":
+                _source_survivors(Path(item["logs_source"]), item)
         _verify_controls(target, journal)
         for item in journal["cycles"]:
             cid = item["cycle_id"]
@@ -698,7 +805,10 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
                 P._write_cycle_record(source, record, exclusive=False)
                 _pointer(old, new, op)
                 P._edit_campaign_members(source, source_campaign_path.parent, cid, joining=False)
-                _cleanup(source, target, journal, old, item)
+                if item.get("transfer") == "rename":
+                    item["state"] = "cleaned"; _save(source, journal)
+                else:
+                    _cleanup(source, target, journal, old, item)
             _fault("source-cleanup")
         for item in journal["attachments"]:
             old, new = Path(item["source"]), target / item["target"]
@@ -707,7 +817,10 @@ def move(source, target, *, cycle_id, source_campaign, campaign, attach_logs=(),
             with admission.lock_roots([source], now=now):
                 _pointer(logs, new, op)
                 _pointer(old, new, op)
-                _cleanup(source, target, journal, logs, item)
+                if item.get("transfer") == "rename":
+                    item["state"] = "cleaned"; _save(source, journal)
+                else:
+                    _cleanup(source, target, journal, logs, item)
         with admission.lock_roots([source, target], now=now):
             P._retire_rows(source, [item["cycle_id"] for item in journal["cycles"]])
             locator.update_indexes(source, [journal["source_campaign"]])
