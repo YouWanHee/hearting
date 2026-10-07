@@ -517,6 +517,19 @@ class AdapterV11Test(unittest.TestCase):
      capture_output=True,text=True,check=False)
    kept=check(child["AGENT_HOME"])
    self.assertEqual(kept.returncode,0,kept.stdout+kept.stderr)
+   # An owner of the new release in the same worktree gets its own home and never re-links
+   # this one; liveness reads the sessions of both, and of the older worktree-only home.
+   with mock.patch.dict(os.environ,env,clear=True):
+    other=wrapper.nested_codex_home_path(worktree,jobs,later)
+    legacy=wrapper.nested_codex_home_path(worktree,jobs)
+   self.assertNotEqual(other,args.nested_codex_home)
+   self.assertEqual({other.parent,legacy.parent},{args.nested_codex_home.parent})
+   spec=importlib.util.spec_from_file_location("codex_liveness_switch",ROOT/"adapters/codex/bin/dispatch-liveness.py")
+   live=importlib.util.module_from_spec(spec); spec.loader.exec_module(live)
+   other.mkdir(parents=True)
+   with mock.patch.dict(os.environ,env,clear=True):
+    stores=live.sessions_dirs_for("transport=headless","s",ROOT,root/"default",str(worktree),jobs=jobs)
+   self.assertTrue({args.nested_codex_home/"sessions",other/"sessions",legacy/"sessions"} <= set(stores),stores)
    moved=check(str(pointer))                              # what the child used to get
    self.assertNotEqual(moved.returncode,0,moved.stdout)
    self.assertIn("check=hearting:failed",moved.stdout)
@@ -553,7 +566,7 @@ class AdapterV11Test(unittest.TestCase):
    env={"PATH":os.environ.get("PATH",""),"HOME":str(home),"AGENT_HOME":str(ROOT),
         "CODEX_HOME":str(source),"AGENT_DISPATCH_JOBS":str(jobs),"PYTHONDONTWRITEBYTECODE":"1"}
    with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(Path,"stat",mapped_stat):
-    predicted=wrapper.nested_codex_home_path(worktree,jobs)
+    predicted=wrapper.nested_codex_home_path(worktree,jobs,ROOT)
     chosen=wrapper.prepare_nested_codex_home(worktree,source,jobs=jobs)
     self.assertEqual(chosen,predicted)
     self.assertEqual(wrapper.prepare_nested_codex_home(worktree,source,jobs=jobs),chosen)
@@ -660,7 +673,7 @@ class AdapterV11Test(unittest.TestCase):
     out=io.StringIO()
     with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(Path,"stat",mapped_stat), \
          mock.patch.object(wrapper,"codex_app_server_available",return_value=supervised),contextlib.redirect_stdout(out):
-     expected=wrapper.nested_codex_home_path(repo,jobs)
+     expected=wrapper.nested_codex_home_path(repo,jobs,ROOT)
      code=wrapper.main(argv)
     self.assertEqual(code,0,out.getvalue())
     fields=dict(line.split("=",1) for line in out.getvalue().splitlines() if "=" in line)

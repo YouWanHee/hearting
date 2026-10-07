@@ -614,7 +614,7 @@ A single-session mutation stage whose sealed route declares `commit_expected: tr
 
 Commit-expected Codex owners and stages receive only the per-worktree Git metadata directory and common `objects`, `refs`, and `logs`; common `config` and `hooks` remain read-only. Modern Codex protects resolved Git metadata even when legacy `--add-dir` / `writableRoots` list it (measured with codex-cli 0.160.0). When the native named-permissions surface is available, the adapter projects those existing exact grants into an invocation-local profile extending `:workspace`, without overriding it again through legacy thread/turn sandbox fields. Older runtimes retain the legacy grant projection; profile discovery never adds a launch refusal or requires user configuration. Actual sandbox execution, rather than argv, establishes commit support.
 
-Nested Codex homes live under the canonical registry's state directory (`homes/codex/<worktree-hash>`), outside the source checkout. Existing auth/config are linked read-only; new launches never create a source-local `.dispatch/codex-home` link. Legacy links remain readable for liveness without being recreated.
+Nested Codex homes live under the canonical registry's state directory (`homes/codex/<worktree-hash>.<release-hash>`, one per worktree and release so owners of two releases in one worktree never re-link each other's home), outside the source checkout. Existing auth/config are linked read-only; new launches never create a source-local `.dispatch/codex-home` link. Legacy links remain readable for liveness without being recreated.
 
 ### 8.11. Completion marker bound to the exact attempt row under SD-70
 
