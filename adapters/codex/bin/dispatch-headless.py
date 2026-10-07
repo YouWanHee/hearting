@@ -361,12 +361,15 @@ def _bind_runtime_parent(args: argparse.Namespace) -> None:
 
 
 def resolve_parent_completion_delivery(args: argparse.Namespace) -> str:
-    return parent_completion.resolve_parent_completion_delivery(
-        args, probe=probe_managed_codex_parent)
+    return WRAPPER_COMMON.resolve_parent_completion_delivery(
+        args, probe=probe_managed_codex_parent,
+    )
 
 
 def bind_parent_completion_delivery(args: argparse.Namespace) -> None:
-    args.parent_completion_delivery = resolve_parent_completion_delivery(args)
+    return WRAPPER_COMMON.bind_parent_completion_delivery(
+        args, probe=probe_managed_codex_parent,
+    )
 
 
 def validate_interactive_parent_launch(args: argparse.Namespace) -> None:
@@ -374,8 +377,10 @@ def validate_interactive_parent_launch(args: argparse.Namespace) -> None:
 
 
 def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path) -> None:
-    parent_completion.launch_parent_completion_sidecar(
-        args, jobs, launch=launch_codex_queue_completion_sidecar, annotate=annotate_attempt_row)
+    return WRAPPER_COMMON.launch_parent_completion_sidecar(
+        args, jobs, launch=launch_codex_queue_completion_sidecar,
+        annotate=annotate_attempt_row,
+    )
 
 
 # One copy, shared by the three wrappers (`route_authority`); the name stays for readers.

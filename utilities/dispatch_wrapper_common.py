@@ -768,3 +768,17 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate) -> int:
         reason, code, fields = refusal
         return fail(reason, code, **fields)
     return 0
+
+
+def resolve_parent_completion_delivery(args: argparse.Namespace, *, probe) -> str:
+    """The delivery this launch's parent will use; the wrapper passes its own
+    `probe_managed_codex_parent`, looked up in its module at call time."""
+    return parent_completion.resolve_parent_completion_delivery(args, probe=probe)
+
+
+def bind_parent_completion_delivery(args: argparse.Namespace, *, probe) -> None:
+    args.parent_completion_delivery = resolve_parent_completion_delivery(args, probe=probe)
+
+
+def launch_parent_completion_sidecar(args: argparse.Namespace, jobs: Path, *, launch, annotate) -> None:
+    parent_completion.launch_parent_completion_sidecar(args, jobs, launch=launch, annotate=annotate)
