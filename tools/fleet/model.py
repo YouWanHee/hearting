@@ -575,6 +575,9 @@ class DispatchJob:
     cap_grounding: Optional[dict] = None   # {capability, mode?, intensity?} for an inline entry
                                             # session (capability-grounding marker); None otherwise.
     association_ambiguity: Optional[str] = None
+    # Exact resource ownership is independent of cwd, slug, and model activity.
+    resource_children: list = field(default_factory=list)
+    resource_wait: Optional[dict] = None  # display-only current parked activity; summary is preserved
     _context_evidence: Optional[ContextEvidence] = field(default=None, repr=False, compare=False)
     _dispatch_context_owned: bool = field(default=False, repr=False, compare=False)
     _refresh_source: Optional[dict] = field(default=None, repr=False, compare=False)

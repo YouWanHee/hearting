@@ -4262,6 +4262,24 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
                         summary_ts=getattr(job, "summary_ts", None))
 
 
+def _resource_child_rows(job, term_width=None, depth=1, in_card=False):
+    """Observed resource children, never log-parsed progress or model dispatch rows."""
+    rows = []
+    shown_depth = min(depth, 1) if in_card else depth
+    indent = _SUBAGENT_IND + "  " * max(0, shown_depth)
+    width = (_dispatch_box_width(term_width) - 1 if in_card else term_width) if term_width else None
+    for child in getattr(job, "resource_children", ()):
+        if not _SHOW_ALL and child.liveness != "working":
+            continue
+        glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
+        node = child.route_node or child.node or child.run_id
+        tail = "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min))
+        budget = max(1, width - _dw(indent + glyph + " resource " + tail)) if width else 44
+        rows.append([(indent, None), (glyph, key), (" resource ", "dim"),
+                     (_clip_w(str(node), budget), "name_dim"), (tail, "dim")])
+    return rows
+
+
 # F-100b (user 2026-09-03) — the context row's lead cell is the WHERE word, not the state
 # word. F-55's `working`/`idle` word duplicated the harness row's glyph (same state, same
 # color, one line apart), so it is retired; the L1 glyph is the one status indicator. The
@@ -4387,6 +4405,9 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     context = getattr(entity, "context", None)
     pct = getattr(context, "used_pct", None) if context is not None else getattr(entity, "ctx_pct", None)
     now_text = getattr(entity, "summary", None)
+    resource_wait = getattr(entity, "resource_wait", None)
+    if resource_wait:
+        now_text = "%s · resource-parked" % ",".join(resource_wait["nodes"])
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
     indent = " " * max(0, int(indent_width))
@@ -4429,8 +4450,12 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             # F-63: same reserved-width age tag as the dispatch subtitle row — the
             # tag survives clipping; only when the zone cannot hold tag + any text
             # does it drop and the bare NOW clip behaves exactly as before.
-            tag = _summary_age_tag(getattr(entity, "summary_ts", None))
+            tag = None if resource_wait else _summary_age_tag(getattr(entity, "summary_ts", None))
             text_room = now_room - _dw(sep)
+            if resource_wait and text_room < _dw(now_text):
+                # The declared node already rides the breadcrumb and child row.
+                # Preserve the complete current wait state before repeating that node.
+                now_text = resource_wait["state"]
             tag_w = (_dw(tag) + 1) if tag else 0
             if tag and text_room > tag_w:
                 clipped = _clip_w(str(now_text), text_room - tag_w)
@@ -5565,7 +5590,7 @@ def _subagents_for_job(session_by_identity, job):
     return getattr(session, "subagents", None) if session is not None else None
 
 
-def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
+def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, resource_owners=()):
     """One F-30 card. Returns (out_lines, meta) — meta = {"card_key", "fold_line" (index into
     out_lines of the header row), "job_rows": [(index_into_out_lines, DispatchJob), ...]}. The
     caller (`_build_process_lines`) owns translating these to ABSOLUTE line indices for
@@ -5618,6 +5643,13 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
         out.append([("    ", None)] + l2_line)
 
     job_rows = []
+    # A parked owner has no live model stage job. Keep its exact resource edge
+    # visible in process view too, anchored to the owner rather than the route title.
+    for owner in resource_owners:
+        out.append(_route_job_row(owner, max_width=term_width))
+        job_rows.append((len(out) - 1, owner))
+        out.extend(_dispatch_summary_detail_row(owner, term_width=term_width))
+        out.extend(_resource_child_rows(owner, term_width=term_width))
     # route._record_view already preserves sealed record order within each
     # topological level; never sort opaque node ids here.
     active_nodes = [n for n in nodes if n["state"] == "active" and n.get("job") is not None]
@@ -5639,6 +5671,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None):
                          if session else [])
         if resources:
             out.extend(_gpu_resource_strip(resources, term_width=term_width))
+        out.extend(_resource_child_rows(job, term_width=term_width))
 
     if _SHOW_ALL:
         # prd.md:310 — completion gates stay behind the `a` toggle, never on the base screen.
@@ -5734,6 +5767,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
                      if session else [])
     if resources:
         out.extend(_gpu_resource_strip(resources, term_width=term_width))
+    out.extend(_resource_child_rows(job, term_width=term_width))
     return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
 
 
@@ -5838,7 +5872,13 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         first = False
         base = len(lines)
         card_lines, meta = _route_card(
-            view, session_by_identity, term_width, now, gpu_resources=gpu_resources)
+            view, session_by_identity, term_width, now, gpu_resources=gpu_resources,
+            resource_owners=[j for j in jobs
+                             if getattr(getattr(j, "work_projection", None), "route_id", None)
+                             == view.get("route_id")
+                             and getattr(j, "worker_type", None) == "owner"
+                             and any(r.liveness == "working" or _SHOW_ALL
+                                     for r in getattr(j, "resource_children", ()))])
         lines.extend(card_lines)
         _FOLDABLE.append({"line": base + meta["fold_line"], "card_key": meta["card_key"],
                           "folded": meta["folded"]})
@@ -6373,7 +6413,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         try:
             from .projection import attach_projections
             attach_projections(sessions, jobs, node_evidence=_node_evidence, now=time.time(),
-                               degradations=_degradations)
+                               degradations=_degradations, resources=resources)
         except Exception:
             pass
     # A completed route can have no live entity at all.  Keep an ephemeral projection
@@ -6767,7 +6807,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             if depth == 1 or detached_root:
                 unit_working = (job.liveness == "working"
                                 or any(s2.liveness == "working"
-                                       for s2 in job_children.get(job.slug, [])))
+                                       for s2 in job_children.get(job.slug, []))
+                                or any(r.liveness == "working"
+                                       for r in getattr(job, "resource_children", ())))
             # F-27: a job row is a target only with an exact pid to verify (prd.md:253).
             if job.pid:
                 _SELECTABLE.append(_select_entry_job(job, len(lines)))
@@ -6829,6 +6871,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             # NOW line, its own sub-agent strip). Descendants start here, so this index
             # is where the header divider goes once the frame is drawn.
             header_end = len(lines)
+            resource_rows = _resource_child_rows(
+                job, term_width=term_width, depth=depth, in_card=in_card)
+            lines.extend(resource_rows)
             # The map contains depth-2 workers keyed by their depth-1 owner's
             # slug. A worker can reuse that slug (or another owner's), so looking
             # it up from a leaf would revisit itself or a sibling tree forever.
@@ -6907,7 +6952,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 # route_label`, which drew a divider for a childless multi-node route
                 # too). Inserted/appended AFTER framing so neither rail row is itself
                 # passed through `_frame_dispatch_line` (frame members, not content rows).
-                has_children = bool(job_children.get(job.slug))
+                has_children = bool(job_children.get(job.slug) or resource_rows)
                 if has_children:
                     divider_label = (route_label or []) + campaign_segs if campaign_segs else route_label
                     lines.insert(header_end,

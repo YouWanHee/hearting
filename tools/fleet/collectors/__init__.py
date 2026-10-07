@@ -519,6 +519,18 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
+    # Resources remain a separate source/count, but their exact parent edge feeds
+    # the common projection before any group/process/JSON consumer sees the snapshot.
+    resource_jobs = []
+    try:
+        from . import resource_runs
+        resource_jobs = resource_runs.collect()
+    except Exception:
+        pass
+    collect_all.last_resource_jobs = resource_jobs
+    collect_all.last_resource_malformed = getattr(
+        resource_runs.collect, "last_malformed", 0) if "resource_runs" in locals() else 0
+
     # v16: all surfaces receive one projection after evidence collection and association.
     try:
         from ..projection import attach_projections
@@ -529,25 +541,14 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         attach_projections(sessions, jobs, artifact_root=os.environ.get("AGENT_ARTIFACT_ROOT"),
                            now=_time.time(),
                            node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
-                           degradations=getattr(dispatch.collect, "last_degradations", None))
+                           degradations=getattr(dispatch.collect, "last_degradations", None),
+                           resources=resource_jobs)
     except Exception:
         # Projection failure is fail-closed at the row boundary, never a reason to drop data.
         from ..model import WorkProjection
         for entity in sessions + jobs:
             if getattr(entity, "work_projection", None) is None:
                 entity.work_projection = WorkProjection(source="none", ambiguity="projection-error")
-
-    # F-59: resource/lab jobs are a separate source and never enter dispatch
-    # association, projections, or jobs.log counts.
-    resource_jobs = []
-    try:
-        from . import resource_runs
-        resource_jobs = resource_runs.collect()
-    except Exception:
-        resource_jobs = []
-    collect_all.last_resource_jobs = resource_jobs
-    collect_all.last_resource_malformed = getattr(
-        resource_runs.collect, "last_malformed", 0) if "resource_runs" in locals() else 0
 
     # F-98: read-only peer-message ledger projection. Additive and fail-soft — a missing
     # or unreadable ledger must leave every Session field at its default so the rendered
