@@ -1534,46 +1534,45 @@ def cmd_retire(args):
 def _retire_background_dialog_lines(lines):
     """Detect Claude's exit-time background-work confirm; return its task lines or None.
 
-    Only the live selection UI at the bottom of the screen counts: consecutive
-    option lines 1/2/3 plus a confirm/cancel footer in the same trailing
-    block. Quoted dialog text up in the conversation history never counts --
-    no keys are sent unless the window is certainly showing this dialog now.
+    Only the live selection UI at the very bottom of the screen counts: the
+    trailing non-empty lines must be the title, the three consecutive option
+    lines, then the confirm/cancel footer, with nothing below. A selected
+    option carries a leading cursor (`❯ 1. …`). Quoted dialog text up in the
+    conversation history -- or an answer quoting it above fresh content --
+    never counts. No keys are sent unless the window is certainly showing
+    this dialog now.
     """
     if not lines:
         return None
     texts = [_plain(cells).strip() for cells in lines]
-    tail = texts[-14:]
-    flat_tail = "".join("".join(tail).split()).lower()
-    if "entertoconfirm" not in flat_tail and "entertoselect" not in flat_tail:
+    nonempty = [text for text in texts if text]
+    while nonempty and nonempty[-1] in ("❯", "›", ">"):
+        nonempty.pop()
+    if len(nonempty) < 5:
         return None
-    if "esctocancel" not in flat_tail and "esccancel" not in flat_tail:
+    foot = "".join(nonempty[-1].split()).lower()
+    if ("entertoconfirm" not in foot and "entertoselect" not in foot) or \
+            ("esctocancel" not in foot and "esccancel" not in foot):
         return None
-    opts = []
-    for text in tail:
-        low = "".join(text.split()).lower()
-        if low.startswith("1.exitandstoptasks") or low.startswith("1:exitandstoptasks"):
-            opts.append(1)
-        elif low.startswith("2.movetobackground") or low.startswith("2:movetobackground"):
-            opts.append(2)
-        elif low.startswith("3.stay") or low.startswith("3:stay"):
-            opts.append(3)
-    if opts != [1, 2, 3]:
-        joined = " ".join(opts)
-        if not ("1" in joined and "2" in joined and "3" in joined):
-            return None
-        idx = [i for i, text in enumerate(tail)
-               if "".join(text.split()).lower()[:2] in ("1.", "1:", "2.", "2:", "3.", "3:")]
-        if len(idx) < 3 or idx != sorted(idx) or max(idx) - min(idx) > 5:
-            return None
-    head = " ".join(texts[:max(0, len(texts) - len(tail))])
-    if "backgroundworkisrunning" not in "".join(head.split()).lower():
-        title = " ".join(tail)
-        if "backgroundworkisrunning" not in "".join(title.split()).lower():
-            return None
-    tasks = [text for text in tail
-             if text and "background work is running" not in text.lower()
-             and not text.strip()[:2] in ("1.", "2.", "3.", "❯ ")
-             and not text.lower().startswith(("enter", "esc"))]
+
+    def _opt_number(text):
+        stripped = text.lstrip("❯›* ").strip()
+        low = "".join(stripped.split()).lower()
+        for number, prefixes in ((1, ("1.exitandstoptasks", "1:exitandstoptasks")),
+                                 (2, ("2.movetobackground", "2:movetobackground")),
+                                 (3, ("3.stay", "3:stay"))):
+            if any(low.startswith(prefix) for prefix in prefixes):
+                return number
+        return None
+
+    options = nonempty[-4:-1]
+    if [_opt_number(text) for text in options] != [1, 2, 3]:
+        return None
+    title_window = " ".join(nonempty[-8:-3])
+    if "backgroundworkisrunning" not in "".join(title_window.split()).lower():
+        return None
+    tasks = [text for text in nonempty[-8:-4]
+             if "background work is running" not in text.lower()]
     seen, unique = set(), []
     for task in tasks:
         if task not in seen:
