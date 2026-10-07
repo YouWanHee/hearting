@@ -684,3 +684,22 @@ def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str,
             # Lock-free readers (join, owner input) must never see a truncated registry.
             _atomic_registry_replace(jobs, "".join(lines).splitlines())
         return changed
+
+
+def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity, *,
+                         harness: str, summary_launcher):
+    """Attach the summary owner; the wrapper passes its harness name and its own
+    `launch_summary_owner`, looked up in its module at call time so tests that
+    patch the wrapper's name keep working."""
+    review = args.review_output_binding
+    return summary_launcher(
+        attempt_id=args.attempt_id,
+        harness=harness,
+        transcript=log_path,
+        prompt_path=prompt_path,
+        target_pid=int(identity["pid"]),
+        target_start=identity["pid_start"],
+        review_artifact_root=review["artifact_root"] if review else None,
+        review_cycle_id=review["cycle_id"] if review else None,
+        review_lease_nonce=args.review_governed_lease_nonce if review else None,
+    )
