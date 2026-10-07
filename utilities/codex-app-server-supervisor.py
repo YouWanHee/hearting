@@ -41,8 +41,8 @@ from dispatch_completion_join import (
     receipt_with_stage_advance,
     remove_supervisor_state,
     runtime_wait_requested,
+    settle_runtime_wait_children,
     start_retry_prompt,
-    unstarted_child_attempts,
     validate_delivery_timing,
     write_supervisor_state,
     begin_supervisor_turn,
@@ -386,33 +386,6 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
         }
     )
     return observed
-
-
-def settle_runtime_wait_children(
-    args: argparse.Namespace, delivered: set[str]
-) -> tuple[list[Any], bool]:
-    """Reread the exact registry through the register-to-start publication race.
-
-    Atomic reservation can become visible just before the fenced wrapper appends
-    ``launch_started=1``. Treating that single snapshot as register-only wakes
-    the model and invites a duplicate start. This bounded, lock-free settle
-    window accepts only the existing durable launch fence and otherwise leaves
-    the normal correction path unchanged.
-    """
-
-    timeout = min(max(args.join_interval * 5.0, 0.2), 5.0)
-    interval = min(max(args.join_interval / 10.0, 0.01), 0.1)
-    deadline = time.monotonic() + timeout
-    while True:
-        rows = current_children(Path(args.jobs), args.parent_attempt_id,
-                                route_id=args.route_id, route_hash=args.route_hash)
-        new_rows = [row for row in rows if row.attempt_id not in delivered]
-        if new_rows and not unstarted_child_attempts(new_rows):
-            return rows, True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return rows, False
-        time.sleep(min(interval, remaining))
 
 
 def completion_prompt(
@@ -1076,8 +1049,10 @@ def main(argv: list[str] | None = None) -> int:
                     **delivery_timing,
                 })
             wait_requested = runtime_wait_requested(final_text)
-            if wait_requested and (not new_attempts or unstarted):
-                rows, settled = settle_runtime_wait_children(args, delivered)
+            if unstarted or (wait_requested and not new_attempts):
+                rows, settled = settle_runtime_wait_children(
+                    Path(args.jobs), args.parent_attempt_id, delivered, join_interval=args.join_interval,
+                    route_id=args.route_id, route_hash=args.route_hash)
                 current = {row.attempt_id: row for row in rows}
                 new_attempts = set(current).difference(delivered)
                 partition = partition_runtime_wait_children(
