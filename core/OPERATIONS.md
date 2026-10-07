@@ -625,6 +625,12 @@ PASS and carries a supervision notice with exact transaction recovery. Carrier m
 queue and sidecar, human-gate-in-flight wakes, receipt schema, refusal classes,
 and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
 
+A replay that verifies the exact closed outcome, finalized cycle, sealed owner
+handoff and quiescent children reports completed work. A missing or stale progress
+ledger does not overturn those settled facts. Parent delivery facts remain
+information beside the completion; unfinished settlement or publication still
+reports its own obligation.
+
 ### §5.10b. Frame — Launch, Join, Interview
 
 For code/design/draft/refine/spec at quick+, `compose --start` (and a later

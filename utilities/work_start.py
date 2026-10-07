@@ -1444,6 +1444,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         if owner and owner not in rows:
             raise ValueError("closed-route-owner-missing")
         publication = None
+        delivery = []
         for aid, (status, meta) in rows.items():
             if meta.get("workflow_completion") == "runtime-v1" and (
                     aid == owner or route["route_id"] in {meta.get("route_id"), meta.get("owner_route_id")}):
@@ -1461,6 +1462,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     return {**result, "state": "needs-attention", "reason": "workflow-completion-pending",
                             "required_action": "inspect-recovery", "outcome": closed,
                             **({"shared_publication": publication} if publication is not None else {})}
+                if completion.state == "complete" and meta.get("parent_completion_reason"):
+                    delivery.append({"attempt_id": aid,
+                                     "carrier": meta.get("parent_completion_delivery"),
+                                     "reason": meta["parent_completion_reason"]})
                 if route.get("capability") == "autopilot-spec" and completion.state == "complete" and publication is None:
                     from dispatch_terminal_commit import completed_owner_publication
                     publication = completed_owner_publication(jobs, status, meta)
@@ -1484,6 +1489,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                                      "The same normal completion retry keeps the original source/base; no model restarts."}
         return _with_next_leg(route, {**result, "state": "completed", "required_action": "advance-completed",
                                       "outcome": closed,
+                                      **({"completion_delivery": delivery} if delivery else {}),
                                       **({"shared_publication": publication} if publication is not None else {})})
     if RESOURCE_RESUME.route_selected(route):
         resource = RESOURCE_RESUME.observation(route, jobs)
