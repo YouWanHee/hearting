@@ -171,7 +171,7 @@ non-terminal stage declares `inline-next`, `supervised`, `human-gate`, or
 terminal. Route compile and launch refuse a graph that breaks this.
 
 <!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run.
+Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed via `utilities/workflow-supervisor.py arm|poll|watch|status|complete`, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run. Report state from PID identity, sentinel/exit evidence, log modification time, and declared artifacts, never from a registry status word alone.
 <!-- END generated from core/fragments/bootstrap-continuation.md -->
 
 OpenCode's registered standard+

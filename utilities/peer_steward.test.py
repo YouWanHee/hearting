@@ -3751,5 +3751,53 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                     self.assertIsNone(result)
 
 
+class RetireBackgroundDialogTest(unittest.TestCase):
+    def _cells(self, text):
+        return [(ch, False) for ch in text]
+
+    def test_detects_live_selection_ui(self):
+        lines = [self._cells("Background work is running"),
+                 self._cells("python3 train.py"),
+                 self._cells("1. Exit and stop tasks"),
+                 self._cells("2. Move to background and exit"),
+                 self._cells("3. Stay"),
+                 self._cells("Enter to confirm · Esc to cancel"),
+                 self._cells("❯ ")]
+        tasks = peer_steward._retire_background_dialog_lines(lines)
+        self.assertIsNotNone(tasks)
+
+    def test_detects_cursor_prefixed_selection(self):
+        lines = [self._cells("Background work is running"),
+                 self._cells("❯ 1. Exit and stop tasks"),
+                 self._cells("2. Move to background and exit"),
+                 self._cells("3. Stay"),
+                 self._cells("Enter to select · Esc to cancel")]
+        tasks = peer_steward._retire_background_dialog_lines(lines)
+        self.assertIsNotNone(tasks)
+
+    def test_ignores_other_forms(self):
+        lines = [self._cells("Do you want to proceed?"),
+                 self._cells("Enter to confirm")]
+        self.assertIsNone(peer_steward._retire_background_dialog_lines(lines))
+        self.assertIsNone(peer_steward._retire_background_dialog_lines([]))
+        self.assertIsNone(peer_steward._retire_background_dialog_lines(None))
+
+    def test_ignores_quoted_transcript_without_live_ui(self):
+        lines = [self._cells("● Reading the PR #288 diff"),
+                 self._cells("+    The dialog reads \"Background work is running … 1. Exit and stop tasks /"),
+                 self._cells("+    2. Move to background and exit / 3. Stay\". …"),
+                 self._cells("❯ ")]
+        self.assertIsNone(peer_steward._retire_background_dialog_lines(lines))
+
+    def test_ignores_busy_answer_quoting_dialog(self):
+        lines = [self._cells("✻ Working… (esc to interrupt)"),
+                 self._cells("  The dialog reads \"Background work is running"),
+                 self._cells("  1. Exit and stop tasks"),
+                 self._cells("  2. Move to background and exit / 3. Stay\"."),
+                 self._cells("  Enter to confirm · Esc to cancel is only in the real window."),
+                 self._cells("❯ let me check the logs")]
+        self.assertIsNone(peer_steward._retire_background_dialog_lines(lines))
+
+
 if __name__ == "__main__":
     unittest.main()
