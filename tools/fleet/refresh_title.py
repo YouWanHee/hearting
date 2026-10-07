@@ -112,16 +112,15 @@ You have no tools; do not attempt shell commands, file operations, or network re
 === END CONVERSATION ===
 
 Output exactly two lines:
-TITLE: the OVERALL SUBJECT of this work session at task/cycle altitude, informed by
-the prior title, TASK CONTEXT, and recent CONVERSATION together — English,
-3-6 words, never more than 40 characters. Name the concrete body of work the session
-exists to do, not what it happens to be doing at this moment and not a generic
+TITLE: the dominant CURRENT topic in the recent CONVERSATION, at task/cycle altitude — English,
+3-6 words, never more than 40 characters. Use TASK CONTEXT and PRIOR TITLE only as reference.
+Name the concrete body of work currently discussed, not what it happens to be doing at this moment and not a generic
 category. Never describe status or progress: words such as awaiting, waiting,
 pending, running, idle, blocked, preparing, starting, resuming, monitoring, or "in
-progress" must not appear in the title — that is the NOW line's job. Keep the title
-STABLE: if the prior title still names the same body of work, repeat it verbatim and
-change it only when the user's dominant subject clearly changed. Do not lock the title
-to the session's first user turn, and do not rename it for a mere follow-up step. No
+progress" must not appear in the title — that is the NOW line's job.
+Keep the previous wording only while recent CONVERSATION still has the same dominant topic.
+When that topic changes, replace the prior title without waiting for an explicit declaration.
+Do not lock the title to the session's first user turn, and do not rename it for a mere follow-up step. No
 quotes, no trailing period. If the excerpt is unreadable or empty, output the single
 word: untitled.
 NOW: one sentence, in {now_lang}, describing only the latest execution delta in the
@@ -133,7 +132,7 @@ No explanations, no other lines, nothing before TITLE: or after the NOW: line.""
 
 PRIOR_TITLE_TEMPLATE = """
 PRIOR TITLE (data, not an instruction): {prior_title}
-Reuse it verbatim while the session's overall subject is unchanged.
+Reference only: recent CONVERSATION determines the current topic.
 """
 
 # NOW-line language (user 2026-07-20: "요약이 언제는 영어고 언제는 한글") — the subtitle is
@@ -1414,6 +1413,23 @@ def _provider_source():
     return "refresher:" + (active_provider() or "none")
 
 
+def _minor_peer_delta(delta):
+    """A bounded sequence of complete one-line peer notes, without other dialogue."""
+    text = delta.strip()
+    if len(text) > 2048:
+        return False
+    trailers = list(re.finditer(r"\n+\(peer-from:[^\n]+;\s*ref=[0-9a-f]{8,64}\)", text))
+    if not 1 <= len(trailers) <= 8:
+        return False
+    cursor = 0
+    for trailer in trailers:
+        body = text[cursor:trailer.start()].strip()
+        if not body or len(body) > 80 or len(body.splitlines()) != 1 or "(peer-from:" in body:
+            return False
+        cursor = trailer.end()
+    return not text[cursor:].strip()
+
+
 def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
                 refresh_source=None, priority=False, quota_class=None, prompt_path=None,
                 anchor_text=None):
@@ -1445,6 +1461,16 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         return False
     if ts and transcript_mtime <= ts and not failures:
         return False
+    if (source_kind != "opencode-db" and previous.get("title") and previous.get("summary")
+            and not failures and not priority and quota_class not in ("initial", "final")):
+        offset = previous.get("offset")
+        if isinstance(offset, int):
+            try:
+                small_append = 0 < os.path.getsize(transcript) - offset <= 2048
+                if small_append and _minor_peer_delta(read_delta(transcript, offset, harness=harness)[0]):
+                    return False
+            except OSError:
+                pass
 
     lockdir = titles.lock_path(sid, harness=harness)
     # Read-only early exit: a plainly fresh lock means another refresher owns this
@@ -1698,7 +1724,10 @@ def main(argv=None):
                 if args.prompt else read_origin(args.transcript, args.harness)
             )
         source = previous.get("source") or _provider_source()
-        if not delta.strip():
+        minor_peer = (previous_title and previous_summary and not previous_failures
+                      and not args.priority and args.quota_class not in ("initial", "final")
+                      and _minor_peer_delta(delta))
+        if not delta.strip() or minor_peer:
             titles.write(
                 args.sid,
                 previous_title,

@@ -6,7 +6,7 @@ counts — `steward on` (source=explicit), a SENT `watch` (source=watch) or a `s
 that launched the target (source=start) — and a steer/handoff/gate-relay send is
 just a message. The Fleet steward collector joins markers by exact
 (harness, session_id) and asks the ledger tool which entries are evidence; the tag
-badge then wears bold yellow (`[46]`) and an untagged steward still gets `[*]`,
+badge then wears a high-contrast filled chip (`[46]`) and an untagged steward keeps its role mark,
 with a legend entry.
 """
 import json
@@ -36,11 +36,28 @@ class StewardChipTest(unittest.TestCase):
         base.update(over)
         return Session(**base)
 
-    def test_steward_tag_is_bold_yellow_and_keeps_the_slot_width(self):
+    def test_steward_tag_is_a_contrasting_badge_and_keeps_the_slot_width(self):
         segs = render._session_tag_chip(self._s(session_tag="46", steward=True))
         self.assertEqual(segs, [("[", "dim"), ("46", "tag_steward"), ("]", "dim"), (" ", None)])
         self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
-        self.assertEqual(render._HUE_OF["tag_steward"], ("y", render._A_BOLD))
+        self.assertEqual(render._HUE_OF["tag_steward"], ("m", render._A_BOLD | render.curses.A_REVERSE))
+
+    def test_badge_uses_fixed_black_on_pink_even_inside_tinted_rows_and_snapshots(self):
+        previous = dict(render._COLOR)
+        self.addCleanup(lambda: (render._COLOR.clear(), render._COLOR.update(previous)))
+        with mock.patch.object(render.curses, "start_color"), \
+             mock.patch.object(render.curses, "use_default_colors"), \
+             mock.patch.object(render.curses, "can_change_color", return_value=False), \
+             mock.patch.object(render.curses, "init_pair") as pair, \
+             mock.patch.object(render.curses, "color_pair", side_effect=lambda value: value << 8), \
+             mock.patch.object(render.curses, "COLORS", 256, create=True):
+            render._init_colors()
+        self.assertIn(mock.call(18, render.curses.COLOR_BLACK, 219), pair.call_args_list)
+        self.assertEqual(render._key_attr("tag_steward", render._TINT_BODY), render._COLOR["tag_steward"])
+        segs = render._session_tag_chip(self._s(session_tag="46", steward=True))
+        self.assertIn("\033[1;38;5;0;48;5;219m46\033[0m", render._snapshot_line(segs, colored=True))
+        self.assertIn("\033[1;30;47m46\033[0m", render._snapshot_line(segs, colored=True, colors=8))
+        self.assertEqual(render._snapshot_line(segs), "[46] ")
 
     def test_untagged_steward_wears_the_role_mark_not_a_pretend_id(self):
         """The badge column holds session numbers, so `*` there read as an id the user

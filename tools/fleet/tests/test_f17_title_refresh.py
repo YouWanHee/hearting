@@ -506,6 +506,46 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
         self.assertEqual(probes, [])
         self.assertEqual(spawns, [])
 
+    def test_tiny_peer_only_append_skips_probe_but_short_new_user_work_refreshes(self):
+        offset = os.path.getsize(self.transcript)
+        ts = time.time() - 10 * rt.DEBOUNCE_SEC
+        titles.write("peer-only", "GPU Work", now=ts, offset=offset,
+                     summary="Inspecting GPU rows", summary_ts=ts)
+        messages = []
+        for body, ref in (("ACK", "0123456789abcdef"), ("Received", "fedcba9876543210")):
+            message = body + "\n\n(peer-from: codex [81] ; ref=" + ref + ")"
+            messages.append(message)
+            with open(self.transcript, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"message": message}) + "\n")
+            result, probes, spawns = self._spawn_counting_probes("peer-only")
+            self.assertFalse(result)
+            self.assertEqual((probes, spawns), ([], []))
+        self.assertFalse(rt._minor_peer_delta(messages[0] + "\nShort assistant update\n" + messages[1]))
+        self.assertFalse(rt._minor_peer_delta("Short user request\n" + messages[0]))
+        with open(self.transcript, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": "Fix the badge color"}) + "\n")
+        result, probes, spawns = self._spawn_counting_probes("peer-only")
+        self.assertTrue(result)
+        self.assertEqual((len(probes), len(spawns)), (1, 1))
+
+    def test_periodic_worker_skips_two_tiny_peer_updates_but_refreshes_new_work(self):
+        offset = os.path.getsize(self.transcript)
+        titles.write("peer-worker", "GPU Work", now=time.time(), offset=offset,
+                     source="refresher:codex", summary="Inspecting GPU rows", summary_ts=100)
+        with mock.patch.object(rt, "run_worker", return_value="TITLE: Badge Contrast\nNOW: Fixing badge colors") as worker:
+            for body in ("ACK", "Received"):
+                with open(self.transcript, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"message": body + "\n\n(peer-from: codex [81] ; ref=0123456789abcdef)"}) + "\n")
+                self.assertEqual(rt.main(["--harness", "claude", "--sid", "peer-worker",
+                                          "--transcript", self.transcript]), 0)
+            self.assertEqual(worker.call_count, 0)
+            self.assertEqual(titles.read("peer-worker")["summary_ts"], 100)
+            with open(self.transcript, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"message": "Fix the badge color"}) + "\n")
+            self.assertEqual(rt.main(["--harness", "claude", "--sid", "peer-worker",
+                                      "--transcript", self.transcript]), 0)
+            self.assertEqual(worker.call_count, 1)
+
     def test_stale_session_still_probes_and_spawns_once(self):
         result, probes, spawns = self._spawn_counting_probes("fresh-start")
         self.assertTrue(result)
@@ -1357,6 +1397,16 @@ class ValidatorHardeningTest(unittest.TestCase):
     def test_codex_prompt_does_not_lock_title_to_first_user_turn(self):
         normalized = " ".join(rt.PROMPT_TEMPLATE.split())
         self.assertIn("Do not lock the title to the session's first user turn", normalized)
+
+    def test_current_conversation_topic_overrides_prior_title_without_changing_now_contract(self):
+        prompt = rt._prompt("Now fix GPU inheritance", prior_title="Fleet Token Cleanup Policy",
+                            anchor="Older cleanup work")
+        self.assertIn("dominant CURRENT topic in the recent CONVERSATION", prompt)
+        self.assertIn("Use TASK CONTEXT and PRIOR TITLE only as reference", prompt)
+        self.assertIn("replace the prior title without waiting for an explicit declaration", prompt)
+        self.assertNotIn("repeat it verbatim", prompt)
+        self.assertIn("NOW: one sentence", prompt)
+        self.assertEqual(rt.DEBOUNCE_SEC, 600)
 
     def test_codex_origin_reads_recent_user_turn_from_bounded_tail(self):
         def row(role, text):
