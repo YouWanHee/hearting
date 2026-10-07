@@ -323,6 +323,8 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
     elapsed_min = max(0, int((float(end) - started_at) / 60)) if started_at and end else None
     training_progress = None
     remote_training = []
+    from resource_progress import read_progress
+    progress = read_progress({**run, "run_id": str(run_id)}, now)
     if liveness == "working":
         from resource_progress import collect as collect_progress, remote_candidates
         training_progress = collect_progress(run, registry, now)
@@ -346,6 +348,7 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "source_commit": run.get("source_commit"), "source_dirty": run.get("source_dirty"),
         "source_git_state": run.get("source_git_state"), "started_at": started_at,
         "training_progress": training_progress,
+        "progress_file": run.get("progress_file"), "progress": progress,
         "remote_training": remote_training,
         # Tracked-workflow projection (OPERATIONS §5.12): a resource row must expose why
         # it ended and who owns it, not just whether a PID is still there.
