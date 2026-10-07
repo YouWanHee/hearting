@@ -173,12 +173,19 @@ class DispatchV44ProjectionTest(unittest.TestCase):
             self.assertEqual(set(row), identity_fields)
 
         observed = {}
+        shared = ROOT / "utilities" / "dispatch_wrapper_common.py"
         for harness, path in WRAPPERS.items():
-            validate_strings = _strings(path, "validate_route_record")
+            # validate_route_record's body is shared in dispatch_wrapper_common
+            # (PR #299); read the wrapper's delegation plus the shared body.
+            validate_strings = (
+                _strings(path, "validate_route_record")
+                | _strings(shared, "validate_route_record")
+            )
             main_strings = _strings(path, "main")
-            zero_fields = _keyword_names(path, "validate_route_record") & {
-                "registered", "started", "child_spawned"
-            }
+            zero_fields = (
+                _keyword_names(path, "validate_route_record")
+                | _keyword_names(shared, "validate_route_record")
+            ) & {"registered", "started", "child_spawned"}
             observed[harness] = {
                 "validation_flags": validate_strings & {"--launch-phase"},
                 "fence_flags": main_strings & {"--route-file", "--launch-phase"},

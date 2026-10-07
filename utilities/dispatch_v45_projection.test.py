@@ -62,21 +62,28 @@ def _function(path: Path, name: str) -> ast.AST:
 
 
 def _required_field_tuple(path: Path) -> tuple[str, ...]:
-    """The `required = (...)` literal inside `validate_route_record`."""
+    """The `required = (...)` literal inside `validate_route_record`.
 
-    scope = _function(path, "validate_route_record")
-    for node in ast.walk(scope):
-        if (
-            isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Tuple)
-            and any(isinstance(target, ast.Name) and target.id == "required" for target in node.targets)
-        ):
-            return tuple(
-                element.value
-                for element in node.value.elts
-                if isinstance(element, ast.Constant) and isinstance(element.value, str)
-            )
-    raise AssertionError(f"no literal `required` tuple found in {path}")
+    Since PR #299 the body is shared in dispatch_wrapper_common, reached
+    through each wrapper's delegation; read whichever module owns it."""
+
+    for source in (path, ROOT / "utilities" / "dispatch_wrapper_common.py"):
+        try:
+            scope = _function(source, "validate_route_record")
+        except StopIteration:
+            continue
+        for node in ast.walk(scope):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Tuple)
+                and any(isinstance(target, ast.Name) and target.id == "required" for target in node.targets)
+            ):
+                return tuple(
+                    element.value
+                    for element in node.value.elts
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str)
+                )
+    raise AssertionError(f"no literal `required` tuple found in {path} or dispatch_wrapper_common.py")
 
 
 class DispatchV45ProjectionTest(unittest.TestCase):
