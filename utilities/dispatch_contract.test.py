@@ -5471,11 +5471,16 @@ class SealedLaunchHomeRowFieldTest(unittest.TestCase):
     def test_every_wrapper_seals_launch_home_through_the_shared_leaf(self):
         # Guards against a future edit silently swapping the shared leaf call
         # for a raw args.agent_home interpolation in just one wrapper.
+        # append_job is shared in dispatch_wrapper_common: the leaf lives
+        # there now, reached through each wrapper's append_job delegation.
+        module_root = module_root_for_adapters()
+        common = (module_root.parent / "utilities" / "dispatch_wrapper_common.py").read_text()
+        self.assertIn("sealed_launch_home(args.agent_home)", common)
         for harness in ("claude", "codex", "opencode"):
-            source = (module_root_for_adapters() / harness / "bin" / "dispatch-headless.py").read_text()
+            source = (module_root / harness / "bin" / "dispatch-headless.py").read_text()
             with self.subTest(harness=harness):
-                self.assertIn(
-                    "f\",launch_home={sealed_launch_home(args.agent_home)}\"", source)
+                self.assertIn("WRAPPER_COMMON.append_job", source)
+                self.assertNotIn("launch_home={args.agent_home}", source)
 
 
 def module_root_for_adapters():
