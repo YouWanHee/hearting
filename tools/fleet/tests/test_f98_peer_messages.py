@@ -314,11 +314,17 @@ class RenderByteIdenticalTest(unittest.TestCase):
         text = "".join(t for t, _k in segs)
         self.assertNotIn("✉", text)
 
-    def test_badge_present_with_activity(self):
-        s = Session(harness="claude", pid=1, session_id="sid-a", peer_sent_1h=3, peer_recv_1h=2)
-        segs = render._session_row(s, narrow=False)
-        text = "".join(t for t, _k in segs)
-        self.assertIn("✉ 3/2", text)
+    def test_title_count_is_absent_with_activity_but_peer_relations_remain(self):
+        s = Session(harness="claude", pid=1, session_id="sid-a", peer_sent_1h=3, peer_recv_1h=2,
+                    peer_last_sent={"to_harness": "codex", "to_session_id": "sid-b",
+                                    "to_name": "peer-b", "kind": "steer", "age_min": 1})
+        for segs in [render._session_row(s, narrow=False),
+                     *render._session_row_2line(s, term_width=120),
+                     *render._session_row_stack(s, term_width=60)]:
+            self.assertNotIn("✉ 3/2", "".join(t for t, _k in segs))
+        relation = render._peer_link_strip(sent=s.peer_last_sent, term_width=120)
+        self.assertIn("✉", "\n".join("".join(t for t, _k in row) for row in relation))
+        self.assertEqual((s.peer_sent_1h, s.peer_recv_1h), (3, 2))
 
     def test_sessions_json_has_no_summary_field(self):
         s = Session(harness="claude", pid=1, session_id="sid-a",

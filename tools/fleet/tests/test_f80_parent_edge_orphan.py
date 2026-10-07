@@ -134,6 +134,56 @@ class L2CollectorIntegrationTest(unittest.TestCase):
     def tearDown(self):
         model.reset_parent_edge_tracker()
 
+    def test_seat_handover_uses_shared_effective_parent_without_rewriting_registry_fields(self):
+        from pathlib import Path
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import dispatch_seat_handover as handover
+
+        registry = "/fixture/jobs.log"
+        metadata = {"parent_sid": "old-parent", "parent_harness": "claude",
+                    "dispatch_depth": "1", "worker_type": "owner", "attempt_id": "att-owner",
+                    "owner_route_id": "rt-exact", "owner_route_hash": "sha256:" + "a" * 64}
+        binding = handover.binding_of(registry, metadata)
+        snapshot = {"seat": {"kind": "pane", "key": "fixture", "pane": "w1:new"},
+                    "bindings": [binding]}
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                model.reset_parent_edge_tracker()
+                successor = Session(harness=harness, pid=91, cwd="/new-project",
+                                    session_id="new-parent", title="successor", liveness="working")
+                predecessor = Session(harness="claude", pid=90, cwd="/old-project",
+                                      session_id="old-parent", liveness="dead")
+                job = DispatchJob(key="lab", slug="inherited-owner", harness="claude",
+                                  cwd=successor.cwd, parent_sid="old-parent", parent_cwd="/old-project",
+                                  is_child=True, liveness="working", worker_type="owner", depth=1)
+                job._registry_path = registry
+                job._registry_metadata = dict(metadata)
+                relation = {"from": "old-parent", "sid": "new-parent", "harness": harness,
+                            "ts": 1, "bindings": [binding]}
+                with mock.patch.object(handover, "_all_snapshots", return_value=[snapshot]), \
+                     mock.patch.object(handover, "handover_rows", return_value=[relation]):
+                    fleet_collectors._mark_dispatch_child_sessions([successor], [job])
+                    self.assertFalse(successor.is_child)
+                    fleet_collectors.resolve_parent_edges([predecessor, successor], [job])
+                    self.assertEqual(job._parent_edge_sid, "new-parent")
+                    self.assertFalse(job._parent_edge_promoted_orphan)
+                    grouped = render._classify_group_jobs("project", [job], [successor])
+                    self.assertEqual(grouped["children"], {"new-parent": [job]})
+                    self.assertEqual(grouped["orphans"], [])
+                    text = _text(render._build_lines([successor], [job], "both", False, 0,
+                                                    term_width=168, governor=None))
+                    self.assertNotIn("(orphan)", text)
+                self.assertEqual(job.parent_sid, "old-parent")
+                self.assertEqual(job._registry_metadata, metadata)
+                foreign = {**binding, "hash": "sha256:" + "b" * 64}
+                with mock.patch.object(handover, "_all_snapshots", return_value=[{**snapshot, "bindings": [foreign]}]), \
+                     mock.patch.object(handover, "handover_rows", return_value=[relation]):
+                    fleet_collectors.resolve_parent_edges([predecessor, successor], [job])
+                    self.assertIsNone(job._parent_edge_sid)
+                    self.assertTrue(job._parent_edge_promoted_orphan)
+
     def test_stale_app_server_and_absent_parent_all_grace_identically(self):
         # F-80 L2c: three different reasons a parent is "not visible" (stale filter,
         # app_server filter, complete collection absence) must all extend grace the same

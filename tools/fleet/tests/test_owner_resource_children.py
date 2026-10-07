@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fleet import fleet, projection, render, route
-from fleet.model import DispatchJob, ResourceJob
+from fleet.model import DispatchJob, ResourceJob, Session
 
 
 def flatten(lines):
@@ -203,6 +203,85 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                         row, render._dispatch_box_width(width), "mid", "frm_idle") for row in rows]
                     self.assertIn("working  6h 50m", flatten(framed))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in framed[0]), width)
+
+    def test_stage_divider_and_closing_rail_never_repeat_campaign_title(self):
+        self.owner.campaign_label = "asr-coresiden-title"
+        self.owner.parent_sid = "visible-parent"
+        self.owner.is_child = True
+        parent = Session(harness="claude", pid=91, cwd=self.owner.cwd,
+                         session_id="visible-parent", title="parent", liveness="working")
+        for resources in ([self.resource], []):
+            self.attach(resources=resources)
+            sequence = [("eval-smoke", "done"), ("eval-run", "active"), ("report", "pending")]
+            with mock.patch.object(render, "_projection_route_seq", return_value=sequence):
+                lines = render._build_lines([parent], [self.owner], "both", False, 0, term_width=168,
+                                            resources=resources, governor=None)
+            rails = [flatten([line]) for line in lines if line and
+                     any(glyph in flatten([line]) for glyph in ("├", "╰"))]
+            self.assertTrue(any("eval-smoke" in line for line in rails), flatten(lines))
+            self.assertFalse(any("asr-coresiden-title" in line for line in rails))
+        self.assertEqual(self.owner.campaign_label, "asr-coresiden-title")
+
+    def test_gpu_resource_metadata_and_progress_share_one_line_and_cpu_stays_separate(self):
+        self.resource.elapsed_min = 203
+        self.resource.process_group = 41
+        self.resource.progress = {"completed": 12, "total": 50, "unit": "epoch", "age_s": 120}
+        cpu = replace(self.resource, run_id="cpu-run", node="eval-smoke", pid=77,
+                      starttime="777", process_group=77)
+        self.attach(resources=[self.resource, cpu])
+        process = {"pid": 41, "proc_start": 123, "pgid": 41, "used_memory_mib": 6144,
+                   "command": "python train.py", "cwd": "/unrelated"}
+        snapshot = {"configured": True, "hosts": [{"host": "moving4", "self": True,
+            "reachable": True, "gpus": [{"index": index, "name": "NVIDIA RTX 6000 Ada",
+                                         "processes": [dict(process)]} for index in (0, 1)]}]}
+        before = copy.deepcopy(snapshot)
+        render.set_compute_hosts(snapshot)
+        self.addCleanup(render.set_compute_hosts, None)
+        for process_view in (False, True):
+            render.set_process_view(process_view)
+            for width in (60, 80, 168):
+                lines = render._build_lines([], [self.owner], "both", width < 80, 0,
+                    layout=render._layout_mode(width), term_width=width,
+                    resources=[self.resource, cpu], governor=None)
+                gpu = [line for line in lines if line and "● GPU" in flatten([line])]
+                self.assertEqual(len(gpu), 1)
+                text = flatten(gpu)
+                self.assertEqual(text.count("eval-run 3h 23m"), 1)
+                self.assertNotIn("working", text)
+                if width >= 80:
+                    self.assertIn("2m ago", text)
+                if width >= 168:
+                    self.assertIn("12/50 epoch", text)
+                    self.assertIn("GPU moving4:0", text)
+                    self.assertIn("GPU moving4:1", text)
+                self.assertNotIn("resource eval-run", flatten(lines))
+                self.assertEqual(flatten(lines).count("resource eval-smoke"), 1)
+                self.assertLessEqual(sum(render._dw(t) for t, _ in gpu[0]), width)
+        self.assertEqual(snapshot, before)
+        self.resource.liveness = "stale"
+        rows, cpu_rows = render._owner_gpu_resource_rows(self.owner, {}, {}, 168)
+        self.assertIn("eval-run stale 3h 23m", flatten(rows))
+        self.assertNotIn("resource eval-run", flatten(cpu_rows))
+
+    def test_remote_registered_run_matches_gpu_but_cwd_and_reused_pid_do_not(self):
+        self.attach()
+        snapshot = {"configured": True, "hosts": [{"host": "cnn", "self": False,
+            "reachable": True, "gpus": [{"index": 0, "name": "NVIDIA A100", "processes": [{
+                "pid": 900, "proc_start": 999, "pgid": 900, "cwd": self.owner.cwd,
+                "owner": {"kind": "run", "id": self.resource.run_id}, "used_memory_mib": 12000,
+            }]}]}]}
+        render.set_compute_hosts(snapshot)
+        self.addCleanup(render.set_compute_hosts, None)
+        lines = render._build_lines([], [self.owner], "both", False, 0, term_width=168,
+                                    resources=[self.resource], governor=None)
+        self.assertEqual(sum("● GPU" in flatten([line]) for line in lines if line), 1)
+        self.assertIn("GPU cnn:0", flatten(lines))
+        snapshot["hosts"][0]["gpus"][0]["processes"][0]["owner"] = None
+        self.assertEqual(render._resource_gpu_resources(self.resource, snapshot), [])
+        snapshot["hosts"][0]["self"] = True
+        item = snapshot["hosts"][0]["gpus"][0]["processes"][0]
+        item.update(pid=self.resource.pid, proc_start=456, pgid=900)
+        self.assertEqual(render._resource_gpu_resources(self.resource, snapshot), [])
 
 
     def test_declared_progress_stays_on_the_resource_row_in_every_view(self):

@@ -60,6 +60,7 @@ _A_REVERSE = getattr(curses, "A_REVERSE", 0)
 # cyan/magenta/blue, but the stock primaries are replaced with softer midtones.
 # Eight-color terminals keep their native colors as a checked fallback.
 _MUTED_256 = {
+    "orange": 166,
     "soft": 253,       # #dadada — focal text, below pure white
     "green": 150,     # #afd787 — richer sage
     "yellow": 186,    # #d7d787 — warm beige
@@ -181,9 +182,8 @@ _HUE_OF = {
     # white as `herdr_on` (user 2026-09-03: white, so it separates from the harness hue).
     "tag": ("w", 0), "tag_dim": ("d", _A_D),
     # F-100c: a STEWARD session (depth −1: `steward on`, or it watched/started a session) wears
-    # its tag in bold yellow — the one status hue not already claimed by a liveness
-    # state on the identity column (user 2026-09-03: "id에 노란색이나 눈에 띄는 색").
-    "tag_steward": ("y", _A_B),
+    # a filled badge rather than another foreground hue on the identity column.
+    "tag_steward": ("m", _A_B | getattr(curses, "A_REVERSE", 0)),
     # Badge text, NOT the glyph: plain yellow, distinct from the dim g_unused glyph so the
     # ●>○>◌ ink-weight gradient still reads.
     "g_unused_b": ("y", 0),
@@ -212,12 +212,12 @@ _HUE_OF = {
     "gpu_rtx5090": ("g", _A_D),
     "gpu_blackwell": ("g", _A_D), "gpu_hopper": ("m", _A_D),
     "gpu_ada": ("c", _A_D), "gpu_ampere": ("l", _A_D),
-    "gpu_turing": ("y", _A_D), "gpu_other": ("d", _A_D),
+    "gpu_turing": ("y", _A_D), "gpu_legacy": ("o", _A_D), "gpu_other": ("d", _A_D),
     "gpu_rtx6000_active": ("l", 0), "gpu_rtx4090_active": ("c", 0),
     "gpu_rtx5090_active": ("g", 0),
     "gpu_blackwell_active": ("g", 0), "gpu_hopper_active": ("m", 0),
     "gpu_ada_active": ("c", 0), "gpu_ampere_active": ("l", 0),
-    "gpu_turing_active": ("y", 0), "gpu_other_active": ("d", 0),
+    "gpu_turing_active": ("y", 0), "gpu_legacy_active": ("o", 0), "gpu_other_active": ("d", 0),
     # stage palette indices 0-4 = blue·cyan·green·yellow·magenta (see _stage_raw)
     "stg0_on": ("l", _A_B), "stg1_on": ("c", _A_B), "stg2_on": ("g", _A_B),
     "stg3_on": ("y", _A_B), "stg4_on": ("m", _A_B),
@@ -276,6 +276,8 @@ NAME_KEYS = frozenset(list(_NAME_KEY.values()) + list(_NAME_KEY_DIM.values())
 
 def _key_attr(key, tint=None):
     """Attr for a color_key, composed with the row's tint background when active (spec §5.3)."""
+    if key == "tag_steward":
+        return _COLOR.get(key, _A_BOLD | getattr(curses, "A_REVERSE", 0))
     if tint is None or not _TINT_OK:
         return _COLOR.get(key, 0)
     hue, attr = _HUE_OF.get(key, ("d", 0))
@@ -311,6 +313,7 @@ def _init_colors():
         "green": curses.COLOR_GREEN, "yellow": curses.COLOR_YELLOW, "red": curses.COLOR_RED,
         "h_claude": curses.COLOR_CYAN, "h_codex": curses.COLOR_MAGENTA, "h_opencode": curses.COLOR_BLUE,
         "soft": curses.COLOR_WHITE, "vanilla": curses.COLOR_YELLOW,
+        "orange": curses.COLOR_YELLOW,
     }
     palette_name = {
         "h_claude": "cyan", "h_codex": "magenta", "h_opencode": "blue",
@@ -388,7 +391,7 @@ def _init_colors():
     for fam, hue_name in {
         "rtx6000": "h_opencode", "rtx4090": "h_claude", "rtx5090": "green",
         "blackwell": "green", "hopper": "h_codex", "ada": "h_claude",
-        "ampere": "h_opencode", "turing": "yellow",
+        "ampere": "h_opencode", "turing": "yellow", "legacy": "orange",
     }.items():
         hue = _COLOR.get(hue_name, 0)
         _COLOR["gpu_" + fam] = hue | curses.A_DIM
@@ -405,7 +408,13 @@ def _init_colors():
     # F-100a/b badges: soft white, plain weight — no fill, no bold.
     _COLOR["tag"] = _COLOR.get("soft", 0)
     _COLOR["tag_dim"] = curses.A_DIM
-    _COLOR["tag_steward"] = _COLOR.get("yellow", 0) | curses.A_BOLD
+    try:
+        # Pair 18 is a fixed-contrast badge, independent of light/dark default bg.
+        badge_bg = 219 if curses.COLORS >= 256 else curses.COLOR_WHITE
+        curses.init_pair(18, curses.COLOR_BLACK, badge_bg)
+        _COLOR["tag_steward"] = curses.color_pair(18) | curses.A_BOLD
+    except Exception:
+        _COLOR["tag_steward"] = curses.A_REVERSE | curses.A_BOLD
     _COLOR["herdr_on"] = _COLOR.get("soft", 0)
     _COLOR["grp"] = _COLOR.get("soft", 0) | curses.A_BOLD  # group card title
     _COLOR["grp_live"] = _COLOR.get("green", 0)
@@ -499,6 +508,7 @@ def _init_colors():
                     "r": _palette_fg("red", curses.COLOR_RED),
                     "c": _palette_fg("cyan", curses.COLOR_CYAN),
                     "m": _palette_fg("magenta", curses.COLOR_MAGENTA),
+                    "o": _palette_fg("orange", curses.COLOR_YELLOW),
                     "l": _palette_fg("blue", curses.COLOR_BLUE)}
             n_pair = 20
             for tch, lvl in _TINT_LVL.items():
@@ -2026,13 +2036,6 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     session_width = avail + _BRANCH_SUFFIX_W
     if used < session_width:
         segs.append((" " * (session_width - used), None))
-
-    # F-98: peer-message badge. Zero segments when neither count is nonzero — this IS the
-    # byte-identical guard for a board with no ledger activity (G2).
-    _peer_sent = getattr(s, "peer_sent_1h", 0)
-    _peer_recv = getattr(s, "peer_recv_1h", 0)
-    if _peer_sent or _peer_recv:
-        segs.append((" ✉ %d/%d" % (_peer_sent, _peer_recv), "dim"))
 
     segs.append((" " * _WIDE_STAGE_GAP, None))
     if show_projection_stage:
@@ -4285,13 +4288,15 @@ def _resource_progress_tail(child, room=None):
     return count + suffix
 
 
-def _resource_child_rows(job, term_width=None, depth=1, in_card=False):
+def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_children=()):
     """Observed resource children, never log-parsed progress or model dispatch rows."""
     rows = []
     shown_depth = min(depth, 1) if in_card else depth
     indent = _SUBAGENT_IND + "  " * max(0, shown_depth)
     width = (_dispatch_box_width(term_width) - 1 if in_card else term_width) if term_width else None
     for child in getattr(job, "resource_children", ()):
+        if any(child is linked for linked in gpu_children):
+            continue
         if not _SHOW_ALL and child.liveness != "working":
             continue
         glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
@@ -4311,6 +4316,88 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False):
         rows.append([(indent, None), (glyph, key), (" resource ", "dim"),
                      (_clip_w(str(node), budget), "name_dim"), (tail, "dim")])
     return rows
+
+
+def _resource_gpu_suffix(children, room=None):
+    """Resource identity once at the GPU line end; working is already implicit."""
+    unique = {child.run_id: child for child in children}
+    parts = []
+    for child in unique.values():
+        node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+        state = "" if child.liveness == "working" else " " + _gpu_safe_text(child.liveness)
+        parts.append([child, node + state + " " + fmt_min(child.elapsed_min)])
+    base = "".join(" · " + text for _child, text in parts)
+    extra = max(0, room - _dw(base)) if room is not None else None
+    out = ""
+    for child, text in parts:
+        progress = _resource_progress_tail(child, max(0, extra - 3) if extra is not None else None)
+        if progress:
+            text += " · " + progress
+            if extra is not None:
+                extra -= _dw(" · " + progress)
+        out += " · " + text
+    return _clip_w(out, room) if room is not None else out
+
+
+def _resource_gpu_resources(child, snapshot):
+    """Reuse registered PID/start/group marks or the exact host-qualified run id."""
+    if not isinstance(snapshot, dict):
+        return []
+    exact, groups = _compute_hosts._registered_run_marks([child])
+    exact = {(pid, start) for pid, start in exact if start.isdigit()}
+    if type(child.pid) is int and child.pid > 0 and str(child.starttime).isdigit():
+        exact.add((child.pid, str(child.starttime)))
+    resources = []
+    for host in snapshot.get("hosts") or ():
+        if not isinstance(host, dict) or host.get("reachable") is not True:
+            continue
+        for gpu in host.get("gpus") or ():
+            if not isinstance(gpu, dict) or type(gpu.get("index")) is not int:
+                continue
+            matched = []
+            for process in gpu.get("processes") or ():
+                if not isinstance(process, dict):
+                    continue
+                owner = process.get("owner")
+                local = host.get("self") is True and (
+                    (process.get("pid"), str(process.get("proc_start"))) in exact
+                    or process.get("pgid") in groups)
+                run = isinstance(owner, dict) and owner.get("kind") == "run" and owner.get("id") == child.run_id
+                if local or run:
+                    matched.append(process)
+            if matched:
+                used = [process.get("used_memory_mib") for process in matched
+                        if type(process.get("used_memory_mib")) is int]
+                resources.append({"host": _gpu_safe_text(host.get("host") or "?"),
+                    "index": gpu["index"], "model": _gpu_safe_text(gpu.get("name")).replace("NVIDIA ", ""),
+                    "process_count": len(matched), "processes": [],
+                    "_process_keys": [(host.get("host") or "?", process.get("pid"),
+                                       str(process.get("proc_start"))) for process in matched],
+                    "has_memory": bool(used), "used_memory_mib": sum(max(0, value) for value in used)})
+    return resources
+
+
+def _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width=None,
+                             depth=0, in_card=False):
+    """One GPU line plus existing CPU-only resource rows for this exact owner."""
+    resources = _gpu_resources_for_session(job, gpu_resources or {})
+    if not resources:
+        session = _session_for_job(session_by_identity, job)
+        resources = _gpu_resources_for_session(session, gpu_resources or {}) if session else []
+    combined = {(resource["host"], resource["index"]): resource for resource in resources}
+    snapshot, _age = _fresh_compute_hosts()
+    linked = []
+    for child in getattr(job, "resource_children", ()):
+        matched = _resource_gpu_resources(child, snapshot)
+        if matched:
+            linked.append(child)
+            for resource in matched:
+                combined.setdefault((resource["host"], resource["index"]), resource)
+    gpu_rows = _gpu_resource_strip([combined[key] for key in sorted(combined)],
+        term_width=term_width, depth=depth, in_card=in_card, resource_children=linked)
+    cpu_rows = _resource_child_rows(job, term_width=term_width, depth=depth,
+                                  in_card=in_card, gpu_children=linked)
+    return gpu_rows, cpu_rows
 
 
 # F-100b (user 2026-09-03) — the context row's lead cell is the WHERE word, not the state
@@ -4684,6 +4771,7 @@ _GPU_MODEL_PATTERNS = (
     ("ada", re.compile(r"\b(?:l4|l40|l40s)\b|ada|\brtx\s*40\d{2}\b")),
     ("ampere", re.compile(r"\b(?:a10|a30|a40|a100|a6000)\b|ampere|\brtx\s*30\d{2}\b")),
     ("turing", re.compile(r"\b(?:t4|rtx\s*20\d{2}|titan\s+rtx)\b|turing")),
+    ("legacy", re.compile(r"\bgtx\s+(?:9|10)\d{2}\b|\btitan\s+xp?\b|\b(?:p100|p40|m40|k80|maxwell|pascal)\b")),
 )
 
 
@@ -4906,12 +4994,18 @@ def _gpu_resources_for_session(session, resource_index):
     return [resources[key] for key in sorted(resources)]
 
 
-def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
+def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, resource_children=()):
     """One compact GPU line; optional telemetry and names yield before identities."""
     if not resources:
         return []
     indent = _conn_indent(depth, in_card)
     width = max(20, int(term_width or 200)) - 1
+    if in_card and term_width:
+        width = _dispatch_box_width(term_width) - 1
+    bare_gpu_width = _dw(indent + "● GPU %s:%s" % (resources[0]["host"], resources[0]["index"]))
+    if len(resources) > 1:
+        bare_gpu_width += _dw(" · +%d GPU" % (len(resources) - 1))
+    resource_suffix = _resource_gpu_suffix(resource_children, max(0, width - bare_gpu_width))
 
     labels = {}
     for resource in resources:
@@ -4958,6 +5052,8 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False):
                 segs += [(" · ", "dim"), (resource["owner_label"], "lvl_y")]
         if remaining:
             segs += [(" · +%d GPU" % remaining, "dim")]
+        if resource_suffix:
+            segs.append((resource_suffix, "dim"))
         return segs
 
     for model, memory, elapsed, tag in ((True, True, True, True),
@@ -5747,7 +5843,8 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
         out.append(_route_job_row(owner, max_width=term_width))
         job_rows.append((len(out) - 1, owner))
         out.extend(_dispatch_summary_detail_row(owner, term_width=term_width))
-        out.extend(_resource_child_rows(owner, term_width=term_width))
+        gpu_rows, cpu_rows = _owner_gpu_resource_rows(owner, session_by_identity, gpu_resources, term_width)
+        out.extend(gpu_rows + cpu_rows)
     # route._record_view already preserves sealed record order within each
     # topological level; never sort opaque node ids here.
     active_nodes = [n for n in nodes if n["state"] == "active" and n.get("job") is not None]
@@ -5762,14 +5859,8 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
                 if sa.active or _SHOW_ALL]
         if subs:
             out.extend(_subagent_strip(subs))
-        resources = _gpu_resources_for_session(job, gpu_resources or {})
-        if not resources:
-            session = _session_for_job(session_by_identity, job)
-            resources = (_gpu_resources_for_session(session, gpu_resources or {})
-                         if session else [])
-        if resources:
-            out.extend(_gpu_resource_strip(resources, term_width=term_width))
-        out.extend(_resource_child_rows(job, term_width=term_width))
+        gpu_rows, cpu_rows = _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width)
+        out.extend(gpu_rows + cpu_rows)
 
     if _SHOW_ALL:
         # prd.md:310 — completion gates stay behind the `a` toggle, never on the base screen.
@@ -5858,14 +5949,8 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
             if sa.active or _SHOW_ALL]
     if subs:
         out.extend(_subagent_strip(subs))
-    resources = _gpu_resources_for_session(job, gpu_resources or {})
-    if not resources:
-        session = _session_for_job(session_by_identity, job)
-        resources = (_gpu_resources_for_session(session, gpu_resources or {})
-                     if session else [])
-    if resources:
-        out.extend(_gpu_resource_strip(resources, term_width=term_width))
-    out.extend(_resource_child_rows(job, term_width=term_width))
+    gpu_rows, cpu_rows = _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width)
+    out.extend(gpu_rows + cpu_rows)
     return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
 
 
@@ -6489,7 +6574,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # Existing collector verdicts (including grace) never advance a second tick.
     from .collectors import resolve_parent_edges
     resolve_parent_edges(sessions, [j for j in jobs
-                                   if getattr(j, "parent_managed_dir", None)
+                                   if (getattr(j, "parent_managed_dir", None)
+                                       or getattr(j, "_registry_metadata", None))
                                    and not hasattr(j, "_parent_edge_promoted_orphan")])
     # Direct hermetic callers from pre-v16 tests may construct rows without running the
     # collector boundary.  Use the same shared resolver as the snapshot path; never call
@@ -6643,12 +6729,21 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     gpu_work = {}
     if show_jobs:
         strip_keys = set()
+        resource_processes = set()
+        snapshot, age_s = _fresh_compute_hosts()
         for gname, g in groups.items():
             strip_keys |= _group_drawn_strip_keys(
                 gname, g, show_sessions, show_jobs, gpu_resources, session_by_identity)
-        snapshot, age_s = _fresh_compute_hosts()
+            shown = _shown_group_sessions(g["sessions"]) if show_sessions else []
+            classified = _classify_group_jobs(gname, _emitted_group_jobs(g, show_sessions, show_jobs), shown)
+            for job in _drawn_group_jobs(classified, shown):
+                for child in getattr(job, "resource_children", ()):
+                    for resource in _resource_gpu_resources(child, snapshot):
+                        resource_processes.update(resource["_process_keys"])
         for entry in _compute_hosts.unregistered_gpu(
                 snapshot, resources or (), strip_keys, age_s or 0.0):
+            if (entry["host"], entry["pid"], str(entry.get("proc_start"))) in resource_processes:
+                continue
             gpu_work.setdefault(entry["project"], []).append(entry)
     for gk, entries in gpu_work.items():
         groups.setdefault(gk, {"sessions": [], "jobs": []})["gpu"] = entries
@@ -6955,20 +7050,13 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 lines.extend(_subagent_strip(
                     shown_job_subs, depth=depth, in_card=in_card,
                     term_width=term_width))
-            job_resources = _gpu_resources_for_session(job, gpu_resources)
-            if not job_resources:
-                job_session = _session_for_job(session_by_identity, job)
-                job_resources = (_gpu_resources_for_session(job_session, gpu_resources)
-                                 if job_session else [])
-            if job_resources:
-                lines.extend(_gpu_resource_strip(
-                    job_resources, term_width=term_width, depth=depth, in_card=in_card))
+            gpu_rows, resource_rows = _owner_gpu_resource_rows(
+                job, session_by_identity, gpu_resources, term_width, depth=depth, in_card=in_card)
+            lines.extend(gpu_rows)
             # Everything emitted above belongs to the owner itself (identity row, its
             # NOW line, its own sub-agent strip). Descendants start here, so this index
             # is where the header divider goes once the frame is drawn.
             header_end = len(lines)
-            resource_rows = _resource_child_rows(
-                job, term_width=term_width, depth=depth, in_card=in_card)
             lines.extend(resource_rows)
             # The map contains depth-2 workers keyed by their depth-1 owner's
             # slug. A worker can reuse that slug (or another owner's), so looking
@@ -7021,20 +7109,11 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 # so the rail stays bare rather than printing `one-shot` twice on one card
                 # (the F-37 single-render contract). Computed BEFORE the insertion check
                 # below so a childless-but-labeled card still gets its divider.
-                campaign_label = getattr(job, "campaign_label", None)
-                campaign_segs = [(" · " + campaign_label, "dim")] if campaign_label else []
-                campaign_w = sum(_dw(t) for t, _k in campaign_segs)
                 route_label = None
                 if route_seq and len(route_seq) > 1:
-                    # F-97c: the campaign label rides the SAME divider budget as the route
-                    # breadcrumb, deducted first, so the divider's total width never grows —
-                    # breadcrumb legibility always wins when the budget cannot carry both.
-                    label_budget = bottom_label_budget(box_width) - campaign_w
-                    if label_budget < bottom_label_budget(box_width) // 2:
-                        campaign_segs = []  # no room to spare — drop the label, keep the route
                     route_label = _route_stage_segs(
                         route_seq, unit_working or job.liveness == "working",
-                        max(1, label_budget))
+                        max(1, bottom_label_budget(box_width)))
                 # D4/F-81: a divider only makes sense when this card actually HAS raw
                 # children — it separates the owner's own rows from its descendants'.
                 # `has_children` is the raw job_children lookup, not whether any of them
@@ -7050,10 +7129,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 # passed through `_frame_dispatch_line` (frame members, not content rows).
                 has_children = bool(job_children.get(job.slug) or resource_rows)
                 if has_children:
-                    divider_label = (route_label or []) + campaign_segs if campaign_segs else route_label
                     lines.insert(header_end,
                                  _dispatch_box_divider(box_width, rail_key, run_key=run_key,
-                                                       label_segs=divider_label))
+                                                       label_segs=route_label))
                     lines.append(_dispatch_box_bottom(box_width, rail_key, run_key=run_key,
                                                       label_segs=None))
                 else:
@@ -7379,6 +7457,22 @@ def _collect_governor():
         return None
 
 
+def _snapshot_line(segs, colored=False, colors=256):
+    if not colored or segs is None:
+        return _plain(segs)
+    out = []
+    for text, key in segs:
+        piece = _plain([(text, key)])
+        if key == "tag_steward":
+            style = "\033[1;38;5;0;48;5;219m" if colors >= 256 else "\033[1;30;47m"
+            piece = style + piece + "\033[0m"
+        elif key in {"gpu_legacy", "gpu_legacy_active"}:
+            style = "\033[38;5;166m" if colors >= 256 else "\033[33m"
+            piece = style + piece + "\033[0m"
+        out.append(piece)
+    return "".join(out)
+
+
 def render_once(collect_all, hfilter, section):
     global _GIT_TELEMETRY
     sessions, jobs = collect_all(harness_filter=hfilter)
@@ -7402,7 +7496,16 @@ def render_once(collect_all, hfilter, section):
                              governor=governor_snapshot)
     finally:
         _GIT_TELEMETRY = previous_git_telemetry
-    out = "\n".join(_plain(l) for l in lines) + "\n"
+    colored = bool(getattr(sys.stdout, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
+    colored = colored and os.environ.get("TERM") != "dumb"
+    colors = 8
+    if colored:
+        try:
+            curses.setupterm()
+            colors = curses.tigetnum("colors")
+        except Exception:
+            colors = 256 if "256color" in os.environ.get("TERM", "") else 8
+    out = "\n".join(_snapshot_line(l, colored=colored, colors=colors) for l in lines) + "\n"
     # Write UTF-8 bytes directly so the snapshot's box/braille glyphs survive a
     # non-UTF-8 console codepage (e.g. Windows cp949), which would otherwise raise
     # UnicodeEncodeError. Falls back to text stdout when buffer is unavailable.

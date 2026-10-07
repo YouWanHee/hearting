@@ -17,6 +17,25 @@ def _same_path(a, b):
     return a == b or os.path.realpath(a) == os.path.realpath(b)
 
 
+def _effective_job_parent(job):
+    """Display parent from the shared handover interpreter; never rewrite the row."""
+    registered = getattr(job, "parent_sid", None)
+    metadata, registry = getattr(job, "_registry_metadata", None), getattr(job, "_registry_path", None)
+    if not isinstance(metadata, dict) or not registry:
+        return registered, ""
+    try:
+        import sys
+        from pathlib import Path
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        from dispatch_seat_handover import effective_parent, effective_parent_harness
+        return (effective_parent(metadata, jobs=registry) or registered,
+                effective_parent_harness(metadata, jobs=registry))
+    except ImportError:
+        return registered, ""
+
+
 def _mark_dispatch_child_sessions(sessions, jobs):
     """Hide runtime session rows that are already represented by dispatch jobs.
 
@@ -69,7 +88,8 @@ def _mark_dispatch_child_sessions(sessions, jobs):
             # as "not the parent."
             if getattr(j, 'parent_sid', None) and not getattr(s, 'session_id', None):
                 continue
-            if j.parent_sid and s.session_id and j.parent_sid == s.session_id:
+            parent_sid, _parent_harness = _effective_job_parent(j)
+            if parent_sid and s.session_id and parent_sid == s.session_id:
                 continue
             if getattr(j, 'parent_cwd', None) and _same_path(s.cwd, j.parent_cwd):
                 continue
@@ -99,7 +119,10 @@ def resolve_parent_edges(sessions, jobs):
         parent_sid = getattr(j, "parent_sid", None)
         if not (getattr(j, "is_child", False) and parent_sid):
             continue
+        parent_sid, parent_harness = _effective_job_parent(j)
         candidates = sessions_by_sid.get(parent_sid, [])
+        if parent_harness:
+            candidates = [s for s in candidates if s.harness == parent_harness]
         visible = [s for s in candidates if model.session_parent_visible(s)
                    and not getattr(s, "is_child", False)]
         parent_session = (visible[0] if len(visible) == 1 else
