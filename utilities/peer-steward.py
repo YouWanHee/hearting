@@ -1448,11 +1448,17 @@ def cmd_retire(args):
     target = args.target
     ident = {"harness": "-", "session_id": "-", "name": target, "pane": "-"}
 
-    def finish(reason, retired=False, handover=None):
+    def finish(reason, retired=False, handover=None, detail=None):
         tail = f" handover={handover}" if handover else ""
+        summary = f"[retire] {target} {reason}{tail}"
+        receipt = reason
+        if detail:
+            summary += f" {detail}"
+            receipt += f" {detail}"
+            print(detail, file=sys.stderr)
         _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
                 to_session_id=ident["session_id"], to_pane=ident["pane"],
-                summary_text=f"[retire] {target} {reason}{tail}", receipt=reason,
+                summary_text=summary, receipt=receipt,
                 status="sent" if retired else "failed")
         print(f"retired={str(retired).lower()} reason={reason} agent={ident['harness']} "
               f"name={ident['name']} pane={ident['pane']}{tail}")
@@ -1518,7 +1524,112 @@ def cmd_retire(args):
                 return finish("pane-close-failed", handover=handover)
             return finish("normal-exit", True, handover=handover)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    if harness == "claude":
+        return _retire_claude_background_confirm(
+            target, pane, harness, ident, identity, finish,
+            own_sid, own_harness)
     return finish("agent-still-running")
+
+
+def _retire_background_dialog_lines(lines):
+    """Detect Claude's exit-time background-work confirm; return its task lines or None.
+
+    Only the live selection UI at the very bottom of the screen counts: the
+    trailing non-empty lines must be the title, the three consecutive option
+    lines, then the confirm/cancel footer, with nothing below. A selected
+    option carries a leading cursor (`❯ 1. …`). Quoted dialog text up in the
+    conversation history -- or an answer quoting it above fresh content --
+    never counts. No keys are sent unless the window is certainly showing
+    this dialog now.
+    """
+    if not lines:
+        return None
+    texts = [_plain(cells).strip() for cells in lines]
+    nonempty = [text for text in texts if text]
+    while nonempty and nonempty[-1] in ("❯", "›", ">"):
+        nonempty.pop()
+    if len(nonempty) < 5:
+        return None
+    foot = "".join(nonempty[-1].split()).lower()
+    if ("entertoconfirm" not in foot and "entertoselect" not in foot) or \
+            ("esctocancel" not in foot and "esccancel" not in foot):
+        return None
+
+    def _opt_number(text):
+        stripped = text.lstrip("❯›* ").strip()
+        low = "".join(stripped.split()).lower()
+        for number, prefixes in ((1, ("1.exitandstoptasks", "1:exitandstoptasks")),
+                                 (2, ("2.movetobackground", "2:movetobackground")),
+                                 (3, ("3.stay", "3:stay"))):
+            if any(low.startswith(prefix) for prefix in prefixes):
+                return number
+        return None
+
+    options = nonempty[-4:-1]
+    if [_opt_number(text) for text in options] != [1, 2, 3]:
+        return None
+    title_window = " ".join(nonempty[-8:-3])
+    if "backgroundworkisrunning" not in "".join(title_window.split()).lower():
+        return None
+    tasks = [text for text in nonempty[-8:-4]
+             if "background work is running" not in text.lower()]
+    seen, unique = set(), []
+    for task in tasks:
+        if task not in seen:
+            seen.add(task)
+            unique.append(task)
+    return unique[:5]
+
+
+def _retire_claude_background_confirm(target, pane, harness, ident, identity, finish,
+                                      own_sid, own_harness):
+    """Finish one normal retire path through Claude's background-work confirm.
+
+    Running work is protected: the default picks 2 (move to background and
+    exit) and leaves the backgrounded lines in the receipt so a successor or
+    the supervisor can stop them later. 1 (exit and stop tasks) is never
+    used. When the window is ambiguous the dialog is closed with a typed 3
+    (Stay) and the reason is returned; the pane is left usable, never stuck
+    open. No keys go out unless the live selection UI is certain.
+    """
+    lines = _read_screen(target)
+    tasks = _retire_background_dialog_lines(lines)
+    if tasks is None:
+        return finish("agent-still-running")
+    moved = " backgrounded=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
+    if _retire_foreground(pane, harness) != identity:
+        return finish("foreground-changed")
+    if _retire_background_dialog_lines(_read_screen(target)) is None:
+        return finish("agent-still-running")
+    try:
+        subprocess.run(["herdr", "pane", "send-text", pane, "2"],
+                       capture_output=True, text=True, timeout=5)
+        subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
+                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return finish("exit-send-failed")
+    deadline = time.monotonic() + _RETIRE_SECONDS
+    while time.monotonic() < deadline:
+        info = _retire_pane_info(pane, timeout=max(.1, deadline - time.monotonic()))
+        if info is None:
+            return finish("shell-return-unverified")
+        if _retire_shell_returned(info, identity):
+            if not _retire_shell_returned(_retire_pane_info(pane), identity):
+                return finish("shell-changed")
+            handover = _seat_handover(ident, own_sid, own_harness)
+            if not _close_pane(pane):
+                return finish("pane-close-failed", handover=handover)
+            return finish("normal-exit", True, handover=handover,
+                          detail=(f"backgrounded:{moved.strip()}") if moved else None)
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    try:
+        subprocess.run(["herdr", "pane", "send-text", pane, "3"],
+                       capture_output=True, text=True, timeout=5)
+        subprocess.run(["herdr", "pane", "send-keys", pane, "enter"],
+                       capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return finish("agent-still-running")
+    return finish("retire-declined-background-work" + (moved or ""))
 
 
 # ---------------------------------------------------------------------------
