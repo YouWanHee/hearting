@@ -277,6 +277,37 @@ class ValidateRouteRecordTest(unittest.TestCase):
                     self.assertIs(completion.call_args.kwargs["gate"], marker)
 
 
+class ParentCompletionTest(unittest.TestCase):
+    def test_every_wrapper_injects_its_parent_hooks_at_call_time(self):
+        # dispatch_parent_completion.test and the sd45 suites patch the
+        # wrapper's probe/launch/annotate names; the delegations must look
+        # them up when called, not when imported.
+        from unittest import mock
+        import dispatch_parent_completion as parent_completion
+        for harness in ("claude", "codex", "opencode"):
+            wrapper = load(harness)
+            with self.subTest(harness=harness):
+                args = argparse.Namespace()
+                with mock.patch.object(wrapper, "probe_managed_codex_parent") as probe, \
+                     mock.patch.object(parent_completion, "resolve_parent_completion_delivery",
+                                       return_value="poll-fallback") as resolve:
+                    self.assertEqual(wrapper.resolve_parent_completion_delivery(args), "poll-fallback")
+                    self.assertIs(resolve.call_args.kwargs["probe"], probe)
+                bound = argparse.Namespace()
+                with mock.patch.object(wrapper, "probe_managed_codex_parent") as probe, \
+                     mock.patch.object(parent_completion, "resolve_parent_completion_delivery",
+                                       return_value="codex-native-queue") as resolve:
+                    wrapper.bind_parent_completion_delivery(bound)
+                    self.assertEqual(bound.parent_completion_delivery, "codex-native-queue")
+                    self.assertIs(resolve.call_args.kwargs["probe"], probe)
+                with mock.patch.object(wrapper, "launch_codex_queue_completion_sidecar") as launch, \
+                     mock.patch.object(wrapper, "annotate_attempt_row") as annotate, \
+                     mock.patch.object(parent_completion, "launch_parent_completion_sidecar") as sidecar:
+                    wrapper.launch_parent_completion_sidecar(args, Path("/tmp/jobs"))
+                    self.assertIs(sidecar.call_args.kwargs["launch"], launch)
+                    self.assertIs(sidecar.call_args.kwargs["annotate"], annotate)
+
+
 class RegistrationFenceTest(unittest.TestCase):
     def test_every_wrapper_registers_behind_the_terminal_claim_fence(self):
         import ast
