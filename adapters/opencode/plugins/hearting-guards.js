@@ -51,6 +51,53 @@ const turnContextBySession = new Map()
 //     candidate probe) and the kept text is re-emitted on every model call of
 //     that turn, so a tool-loop continuation never consumes a second card.
 const cardBySession = new Map()
+// One threshold notice per native session, retained for the triggering turn so
+// an auxiliary title call cannot consume the answering model's system context.
+const contextAlertBySession = new Map()
+
+async function contextAlert(ctx, sid, output) {
+  if (!sid || isWorkerSession() || process.env.MEM_DISTILL === "1"
+      || ["owner", "worker", "auxiliary", "reviewer"].includes((process.env.AGENT_SESSION_ROLE || "").toLowerCase())
+      || ["compaction", "title", "summary"].includes(output?.message?.agent)
+      || (output?.parts?.length && output.parts.every((part) => part.synthetic || part.ignored))) return ""
+  const client = ctx.client
+  if (typeof client?.session?.get !== "function" || typeof client?.session?.messages !== "function") return ""
+  const controller = new AbortController()
+  let timer
+  try {
+    return await Promise.race([(async () => {
+      const options = { throwOnError: true, signal: controller.signal }
+      const session = sdkResponseData(await client.session.get({ path: { id: sid }, ...options }))
+      if (session?.id !== sid || session.parentID) return ""
+      const rows = sdkResponseData(await client.session.messages({ path: { id: sid },
+        query: { limit: 16 }, ...options }))
+      if (controller.signal.aborted || !Array.isArray(rows)) return ""
+      const latest = rows.map((row) => row?.info)
+        .filter((info) => info?.sessionID === sid && info.role === "assistant" && !info.summary)
+        .sort((a, b) => (b.time?.created || 0) - (a.time?.created || 0)
+          || String(b.id || "").localeCompare(String(a.id || "")))[0]
+      if (!latest?.tokens) return ""
+      const result = spawnSync("python3", [path.join(root, "utilities", "context_alert.py")], {
+        input: JSON.stringify({ session_id: sid, tokens: latest.tokens }),
+        encoding: "utf8", timeout: 1000,
+      })
+      return result.status === 0 ? (result.stdout || "").trim() : ""
+    })(), new Promise((resolve) => {
+      timer = setTimeout(() => { controller.abort(); resolve("") }, 500)
+    })])
+  } catch { return "" } finally { clearTimeout(timer) }
+}
+
+function showContextAlert(ctx, text) {
+  if (!text || typeof ctx.client?.tui?.showToast !== "function") return
+  // Official OpenCode SDK UI channel, not a Claude hook object or a new prompt.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 500)
+  try {
+    Promise.resolve(ctx.client.tui.showToast({ body: { message: text, variant: "warning", duration: 10000 },
+      signal: controller.signal })).catch(() => {}).finally(() => clearTimeout(timer))
+  } catch { clearTimeout(timer) }
+}
 
 function baseDir(ctx) {
   return ctx.worktree || ctx.directory || process.cwd()
@@ -1081,6 +1128,7 @@ export const AgentHarnessGuards = async (ctx) => {
         localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
         cardBySession.delete(sid)
+        contextAlertBySession.delete(sid)
         paneProjectionRetryAt.delete(sid)
         invalidatePaneOrigin(sid)
       }
@@ -1106,6 +1154,12 @@ export const AgentHarnessGuards = async (ctx) => {
       }
     }
     if (turn) turnBySession.set(sid, turn)
+    const alertTurn = turn || prompt
+    if (eventSid && contextAlertBySession.get(sid)?.turn !== alertTurn) {
+      const text = await contextAlert(ctx, eventSid, output)
+      contextAlertBySession.set(sid, { turn: alertTurn, text })
+      showContextAlert(ctx, text)
+    }
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
       cardBySession.set(sid, { turn: cardTurn, text: collectCard("prompt", eventSid, baseDir(ctx)) })
@@ -1134,6 +1188,7 @@ export const AgentHarnessGuards = async (ctx) => {
     }
     appendContext(output, localEvidenceBySession.get(sid))
     appendContext(output, cardBySession.get(sid)?.text)
+    appendContext(output, contextAlertBySession.get(sid)?.text)
 
     const prompt = promptBySession.get(sid) || ""
     const turn = turnBySession.get(sid) || ""
