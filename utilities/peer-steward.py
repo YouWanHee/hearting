@@ -1006,29 +1006,38 @@ def _wait_for_created_shell(pane, cwd, original_shell, deadline):
     return "beside-shell-readiness-timeout", original_shell
 
 
-def _failed_start_cleanup(pane, original_shell, original_screen):
+def _failed_start_cleanup_observation(pane, original_shell, original_screen):
+    if (_pane_has_agent(pane) is not None
+            or _proc_start_ticks(original_shell[0]) != original_shell[1]):
+        return "retained"
+    info = _retire_pane_info(pane)
+    if info is None or info["shell_pid"] != original_shell[0]:
+        return "retained"
+    if _start_shell_identity(pane) == original_shell:
+        if _start_pane_screen(pane) != original_screen:
+            return "retained"
+        if (_start_shell_identity(pane) != original_shell
+                or _pane_has_agent(pane) is not None
+                or _start_pane_screen(pane) != original_screen):
+            return "retained"
+        return "closed" if _close_pane(pane) else "close-failed"
+    return None
+
+
+def _failed_start_cleanup(pane, original_shell, original_screen, deadline=None):
     # Never close a caller-provided pane, a replaced shell or a late-starting
     # agent. The fresh split is the only pane owned by this failed invocation.
     if original_shell is None or original_screen is None:
         return "retained"
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 5 if deadline is None else deadline
     while time.monotonic() < deadline:
-        if (_pane_has_agent(pane) is not None
-                or _proc_start_ticks(original_shell[0]) != original_shell[1]):
-            return "retained"
-        info = _retire_pane_info(pane)
-        if info is None or info["shell_pid"] != original_shell[0]:
-            return "retained"
-        if _start_shell_identity(pane) == original_shell:
-            if _start_pane_screen(pane) != original_screen:
-                return "retained"
-            if (_start_shell_identity(pane) != original_shell
-                    or _pane_has_agent(pane) is not None
-                    or _start_pane_screen(pane) != original_screen):
-                return "retained"
-            return "closed" if _close_pane(pane) else "close-failed"
+        result = _failed_start_cleanup_observation(pane, original_shell, original_screen)
+        if result is not None:
+            return result
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
-    return "retained"
+    # If late-start observation spent the shared wait budget, still perform the
+    # ordinary last cleanup observation, without another wait or a new deadline.
+    return _failed_start_cleanup_observation(pane, original_shell, original_screen) or "retained"
 
 
 def _opencode_tui_scoped_config():
@@ -1136,6 +1145,60 @@ def _seat_handover(ident, own_sid, own_harness):
     return str(len(row["bindings"])) if row else "none"
 
 
+def _observed_start_agent(args, deadline=None, wait=False):
+    """Settle an existing/late start from this pane; never launch or type again."""
+    deadline = time.monotonic() + 5 if deadline is None else deadline
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            proc = subprocess.run(_herdr_argv("agent", "get", args.pane),
+                                  capture_output=True, text=True,
+                                  timeout=max(.01, min(_herdr_get_timeout(), remaining)))
+            payload = json.loads(proc.stdout or "")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            payload = None
+        result = payload.get("result") if isinstance(payload, dict) else None
+        agent = result.get("agent") if isinstance(result, dict) else None
+        if isinstance(agent, dict) and proc.returncode == 0 and not payload.get("error"):
+            if agent.get("pane_id") != args.pane or agent.get("agent") != args.kind:
+                return None
+            cwd = os.path.realpath(os.path.expanduser(args.cwd)) if args.cwd else None
+            if cwd and os.path.realpath(str(agent.get("cwd") or "")) != cwd:
+                return None
+            name = agent.get("name")
+            if name and name != args.name:
+                return None
+            if not name:
+                # Metadata API only: no Enter, bootstrap, or prompt input in a live agent.
+                try:
+                    renamed = subprocess.run(_herdr_argv("agent", "rename", args.pane, args.name),
+                                             capture_output=True, text=True,
+                                             timeout=max(.01, min(5, deadline - time.monotonic())))
+                    answer = json.loads(renamed.stdout or "")
+                    if renamed.returncode or not isinstance(answer, dict) or answer.get("error"):
+                        return None
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    return None
+                # Re-read after naming; conflicting name/kind/cwd stays unclaimed.
+                continue
+            return agent
+        if not wait or deadline - time.monotonic() <= .05:
+            break
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    return None
+
+
+def _mark_started(args, sid, mode):
+    _record(to_harness=args.kind, to_name=args.name, kind="steer",
+            summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
+            to_session_id=sid)
+    from_sid, from_harness = _current_session_identity()
+    peer_message.mark_steward(
+        from_harness, from_sid,
+        {"harness": args.kind, "session_id": sid, "name": args.name, "pane": args.pane},
+        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start")
+
+
 def cmd_start(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
@@ -1164,13 +1227,32 @@ def cmd_start(args):
         if flag:
             cwd_flag = [flag, pane_cwd]
 
+    if args.pane:
+        # The normal retained-pane reuse command may arrive after the runtime did.
+        # Observe first so a retry never bootstraps or starts over that live agent.
+        existing = _observed_start_agent(args, deadline=time.monotonic() + .5)
+        if existing is not None:
+            sid = peer_message.usable_session_id((existing.get("agent_session") or {}).get("value"))
+            mode = args.permission_mode or _default_permission_mode()
+            _mark_started(args, sid, mode)
+            trust_wait = _native_trust_reason(args.kind, _read_screen(args.pane))
+            print(f"started=true agent={args.kind} name={args.name} pane={args.pane} "
+                  f"permission_mode={mode} session_id={sid or '-'} managed=- "
+                  "start_verify=observed-pane" + (f" cwd={pane_cwd}" if pane_cwd else "")
+                  + (f" ready=false reason={trust_wait}" if trust_wait else ""))
+            return 0
+
     created_shell = created_screen = created_deadline = None
     created_pane = False
+    failure_deadline = None
 
     def cleanup():
         if not created_pane:
             return ""
-        result = _failed_start_cleanup(args.pane, created_shell, created_screen)
+        result = (_failed_start_cleanup(args.pane, created_shell, created_screen)
+                  if failure_deadline is None else
+                  _failed_start_cleanup(args.pane, created_shell, created_screen,
+                                        deadline=failure_deadline))
         note = f" pane_cleanup={result}"
         if result in {"retained", "close-failed"}:
             retry = ["hearting", "run", "peer-steward", "start", args.name,
@@ -1294,8 +1376,8 @@ def cmd_start(args):
             return 1
         return _unavailable("herdr-invocation-failed")
 
-    # F-100c: herdr answers `agent_started` with the agent block; a Claude/Codex id is
-    # usually present already, OpenCode's never is (measured) — record what we got.
+    # herdr answers `agent_started` with the agent block; any harness can initially
+    # omit its SID. Record it when available, otherwise keep the named pane join.
     # `started` needs exit 0 AND no error body (review round 1, #9): a herdr that exits
     # 0 with `{"error": …}` launched nobody.
     started_sid = None
@@ -1312,10 +1394,20 @@ def cmd_start(args):
                 agent_block = (payload.get("result") or {}).get("agent")
                 break
         if isinstance(agent_block, dict):
-            started_sid = (agent_block.get("agent_session") or {}).get("value") or None
+            started_sid = peer_message.usable_session_id((agent_block.get("agent_session") or {}).get("value"))
     except Exception:
         agent_block = None
     started = proc.returncode == 0 and not payload_error
+    start_verify = None
+    code = payload_error.get("code") if isinstance(payload_error, dict) else None
+    if not started and code in {"timeout", "agent_pane_busy", "pane_busy"}:
+        failure_deadline = time.monotonic() + 5
+        observed = _observed_start_agent(args, deadline=failure_deadline, wait=True)
+        if observed is not None:
+            agent_block = observed
+            started_sid = peer_message.usable_session_id((observed.get("agent_session") or {}).get("value"))
+            started = True
+            start_verify = "observed-pane"
     # herdr can report an error body with exit 0 (e.g. agent_name_taken).
     # Preserve its bounded machine-readable code instead of silently discarding
     # the only explanation of a refused start. A non-JSON native stderr becomes
@@ -1345,22 +1437,14 @@ def cmd_start(args):
             # projection needs the process start time.
             if not _write_bound_registry(tui_pid, bound_sid, tui_cwd, args.name):
                 session_bind = "bound-unregistered"
-    _record(
-        to_harness=args.kind, to_name=args.name, kind="steer",
-        summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
-        to_session_id=started_sid,
-    )
-    # Launching a session is steward-role evidence (source=start); the `[start]` steer
-    # row above is only the message and raises nothing by itself. Marked only from an
-    # error-free payload that carries the agent block — a refused start, an error body
-    # or an unparsable answer launched nothing we can point at.
+    # A successful agent block or this pane's observed matching runtime proves the
+    # start. An unresolved refusal or unparsable answer grants no role marker.
     if started and isinstance(agent_block, dict):
-        from_sid, from_harness = _current_session_identity()
-        peer_message.mark_steward(
-            from_harness, from_sid,
-            {"harness": args.kind, "session_id": started_sid, "name": args.name},
-            "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
-        )
+        _mark_started(args, started_sid, mode)
+    else:
+        _record(to_harness=args.kind, to_name=args.name, kind="steer",
+                summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
+                to_session_id=started_sid)
     # `session_id=-` is the launch-time signal that nothing proved which session this is
     # (no ledger endpoint, no board badge, nothing to steer by name); `session_bind=` says
     # why for a Codex start (timeout | ambiguous | no-process | unavailable), `bound` when
@@ -1390,6 +1474,7 @@ def cmd_start(args):
         + (f" cwd={pane_cwd}" if pane_cwd else "")
         + cleanup_note
         + (f" tui_scoped={tui_scoped}" if tui_scoped else "")
+        + (f" start_verify={start_verify}" if start_verify else "")
     )
     return 0
 

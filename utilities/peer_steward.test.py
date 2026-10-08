@@ -3977,7 +3977,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_failed_start_cleanup") as cleanup, mock.patch("builtins.print") as printed:
             peer_steward.main(["start", "old", "--kind", "claude", "--pane", "w1:pOld"])
             self.assertIn("reason=herdr-stderr-error-duplicate-name", printed.call_args[0][0])
-            cleanup.assert_not_called(); self.assertEqual(run.call_count, 1)
+            cleanup.assert_not_called(); self.assertEqual(run.call_count, 2)  # one observation, one start
             readiness.assert_not_called()
         code = peer_steward._start_stderr_code("Error: " + "long\tvalue\x00" * 100 + "\n")
         self.assertLessEqual(len(code.encode()), 80)
@@ -4449,6 +4449,120 @@ class RetireBackgroundDialogTest(unittest.TestCase):
                  self._cells("  Enter to confirm · Esc to cancel is only in the real window."),
                  self._cells("❯ let me check the logs")]
         self.assertIsNone(peer_steward._retire_background_dialog_lines(lines))
+
+
+class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
+    def invoke(self, kind, world):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for name, value in (("_herdr_missing", False), ("_ensure_pane_ingress", None),
+                                ("_export_opencode_tui_scoped", "missing"),
+                                ("_read_screen", None), ("_pane_is_managed", False),
+                                ("_codex_embedded_args", []),
+                                ("_current_session_identity", ("parent-sid", "claude"))):
+                stack.enter_context(mock.patch.object(peer_steward, name, return_value=value))
+            stack.enter_context(mock.patch.object(peer_steward.subprocess, "run", side_effect=world))
+            stack.enter_context(mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: world.clock))
+            stack.enter_context(mock.patch.object(peer_steward.time, "sleep", side_effect=world.sleep))
+            output = stack.enter_context(mock.patch("builtins.print"))
+            rc = peer_steward.main(["start", "requested", "--kind", kind, "--pane", "w1:pM",
+                                    "--cwd", str(self.tmp_root)])
+        return rc, output.call_args[0][0]
+
+    def world(self, kind, *, existing=False, error="timeout", name=None, sid="observed-sid"):
+        owner = self
+
+        class World:
+            clock = 0.0
+            launched = existing
+            calls = None
+
+            def __init__(self):
+                self.calls = []
+                self.name = name
+                self.kind = kind
+                self.sid = sid
+                self.cwd = str(owner.tmp_root)
+                self.ready_after = .1
+
+            def sleep(self, value):
+                self.clock += value
+
+            def __call__(self, argv, **kwargs):
+                self.calls.append(argv)
+                if argv[:3] == ["herdr", "agent", "get"]:
+                    if not self.launched or (not existing and self.clock < self.ready_after):
+                        return _herdr_json({"error": {"code": "agent_not_found"}})
+                    return _herdr_json({"result": {"agent": {
+                        "agent": self.kind, "pane_id": "w1:pM", "name": self.name,
+                        "cwd": self.cwd, "agent_session": {"value": self.sid}, "agent_status": "idle"}}})
+                if argv[:3] == ["herdr", "agent", "start"]:
+                    self.launched = True
+                    return _herdr_json({"error": {"code": error}})
+                if argv[:3] == ["herdr", "agent", "rename"]:
+                    self.name = argv[-1]
+                    return _herdr_json({"result": {"type": "ok"}})
+                raise AssertionError(argv)
+
+        return World()
+
+    def test_late_native_timeout_and_busy_settle_once_on_all_harnesses(self):
+        for kind in ("claude", "codex", "opencode"):
+            for error in ("timeout", "agent_pane_busy"):
+                with self.subTest(kind=kind, error=error):
+                    world = self.world(kind, error=error)
+                    rc, line = self.invoke(kind, world)
+                    self.assertEqual(rc, 0)
+                    self.assertIn("started=true", line)
+                    self.assertIn("start_verify=observed-pane", line)
+                    self.assertEqual(sum(a[:3] == ["herdr", "agent", "start"] for a in world.calls), 1)
+                    self.assertEqual(sum(a[:3] == ["herdr", "agent", "rename"] for a in world.calls), 1)
+                    self.assertFalse(any(a[1] == "pane" for a in world.calls))
+                    marker = peer_steward.peer_message.read_steward_markers()[("claude", "parent-sid")]
+                    entry = marker["targets"]["observed-sid"]
+                    self.assertEqual((entry["harness"], entry["pane"], entry["source"]), (kind, "w1:pM", "start"))
+
+    def test_reuse_observes_existing_pane_without_another_launch_or_keyboard_input(self):
+        for kind in ("claude", "codex", "opencode"):
+            with self.subTest(kind=kind):
+                world = self.world(kind, existing=True)
+                rc, line = self.invoke(kind, world)
+                self.assertEqual(rc, 0)
+                self.assertIn("started=true", line)
+                self.assertEqual([a[2] for a in world.calls], ["get", "rename", "get"])
+
+    def test_delayed_sid_completes_only_the_matching_name_and_pane_entry(self):
+        world = self.world("opencode", existing=True, sid="-")
+        _, line = self.invoke("opencode", world)
+        self.assertIn("session_id=-", line)
+        marker = peer_steward.peer_message.read_steward_markers()[("claude", "parent-sid")]
+        self.assertIsNone(marker["targets"]["requested"]["session_id"])
+        world.sid = "ses_observed"
+        self.invoke("opencode", world)
+        marker = peer_steward.peer_message.read_steward_markers()[("claude", "parent-sid")]
+        self.assertEqual(set(marker["targets"]), {"ses_observed"})
+        self.assertEqual(marker["targets"]["ses_observed"]["pane"], "w1:pM")
+
+    def test_foreign_name_kind_or_directory_never_claims_an_existing_agent(self):
+        for change in (dict(name="foreign"), dict(kind="codex"), dict(cwd="/elsewhere")):
+            with self.subTest(change=change):
+                world = self.world("opencode", existing=True, name="requested")
+                for key, value in change.items():
+                    setattr(world, key, value)
+                rc, line = self.invoke("opencode", world)
+                self.assertIn("started=false", line)
+                self.assertFalse(any(a[:3] == ["herdr", "agent", "rename"] for a in world.calls))
+                self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
+
+    def test_a_real_timeout_stays_failed_with_no_marker_and_one_launch(self):
+        world = self.world("opencode")
+        world.ready_after = 100
+        _, line = self.invoke("opencode", world)
+        self.assertIn("started=false", line)
+        self.assertIn("reason=timeout", line)
+        self.assertLessEqual(world.clock, 5)
+        self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
+        self.assertEqual(sum(a[:3] == ["herdr", "agent", "start"] for a in world.calls), 1)
 
 
 if __name__ == "__main__":
