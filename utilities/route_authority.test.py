@@ -80,6 +80,14 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertTrue(RA.lineage_parent_matches(stage, thread_id="x", parent_attempt_id="att-owner"))
         self.assertFalse(RA.lineage_parent_matches(stage, thread_id="x", parent_attempt_id="att-other"))
 
+    def test_replacement_parent_attempt_and_depth2_session_remain_exact(self):
+        stage={**self.OWNER,'dispatch_depth':'2','parent_attempt_id':'att-owner'}
+        self.assertTrue(RA.replacement_parent_matches(stage,stage,None))
+        self.assertFalse(RA.replacement_parent_matches(stage,{**stage,'parent_sid':'other'},None))
+        self.assertFalse(RA.replacement_parent_matches(stage,{**stage,'parent_attempt_id':'other'},None))
+        with mock.patch.object(RA,'owns',return_value=True):
+            self.assertFalse(RA.replacement_parent_matches(stage,{**stage,'parent_sid':'successor'},None))
+
     def test_the_runtime_parent_is_the_calling_session(self):
         env = {"CODEX_THREAD_ID": "codex-sid", "CODEX_DISPATCH_PARENT_CURRENT_FORCE": "1"}
         for honor_force, expected in ((True, "codex-sid"), (False, "synthetic")):

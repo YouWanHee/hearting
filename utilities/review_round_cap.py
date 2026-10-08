@@ -103,6 +103,7 @@ def logical_round_records(rows, *, jobs=None):
     """
     if jobs is None:
         return rows  # No registry binding grants no census-reduction authority.
+    from route_authority import replacement_parent_matches
     by_id = {}
     for fields, meta in rows:
         by_id.setdefault(meta.get('attempt_id'), []).append((fields, meta))
@@ -130,8 +131,9 @@ def logical_round_records(rows, *, jobs=None):
                 or candidate.get('replacement_claim_digest') != digest
                 or candidate.get('replacement_ordinal') != '1'
                 or candidate_fields[2:4] != fields[2:4]
+                or not replacement_parent_matches(source, candidate, jobs, lineage=True)
                 or any(candidate.get(key) != source.get(key) for key in
-                       ('route_node', 'parent_attempt_id', 'parent_sid', 'worker_type', 'dispatch_depth'))):
+                       ('route_node', 'worker_type', 'dispatch_depth'))):
             continue
         # Metadata is reciprocal, but the immutable canonical claim must still
         # agree. Read-only and lock-free: callers may already hold the jobs lock.

@@ -130,6 +130,25 @@ def require_replacement_parent(jobs, rows, meta, *, current_session) -> None:
         raise _contract_error('replacement-parent-identity-unproven')
 
 
+def replacement_parent_matches(source, candidate, jobs, *, lineage=False) -> bool:
+    """Keep the parent attempt exact; a depth-1 session may be its recorded successor."""
+    if candidate.get('parent_attempt_id') != source.get('parent_attempt_id'):
+        return False
+    if candidate.get('parent_sid') == source.get('parent_sid'):
+        return True
+    if source.get('dispatch_depth') != '1':
+        return False
+    if owns(source, candidate.get('parent_sid'), jobs):
+        return True
+    if lineage and candidate.get('dispatch_depth') == '1':
+        # A registered A -> B edge survives a later B -> C handover. Admission
+        # still accepts only the registered parent or the current successor.
+        from dispatch_seat_handover import effective_parent
+        current = effective_parent(source, jobs)
+        return bool(current) and effective_parent(candidate, jobs) == current
+    return False
+
+
 def lineage_parent_matches(metadata, *, thread_id, parent_attempt_id) -> bool:
     """A replacement lineage row belongs to this receipt's parent: the exact
     registered session at depth 1, the exact parent attempt below it."""
