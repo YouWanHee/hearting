@@ -6974,6 +6974,81 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_compose_decisions_replay_input_sources_without_changing_profiles_or_receipt_keys(self):
+  default=self.compose(capability=None,capability_mode=None)
+  self.assertEqual((default["capability"],default["capability_mode"]),("autopilot-code","dev"))
+  lines="\n".join(R.compose_decision_lines(default))
+  self.assertIn("intensity=standard (source=shape-default, 지정 안 됨)",lines)
+  self.assertIn("고정 기본값, 과제 문장 분류 없음",lines)
+  self.assertEqual(lines.count("--intensity strong 검토"),1)
+  R.verify_route(default,R.ROOT)
+  strong=self.compose(intensity="strong")
+  explicit="\n".join(R.compose_decision_lines(strong))
+  self.assertIn("intensity=strong (source=explicit)",explicit)
+  self.assertNotIn("강도 안내",explicit)
+  self.assertEqual([n["model_profile"] for n in default["nodes"]],
+                   [n["model_profile"] for n in strong["nodes"]])
+  legacy=json.loads(json.dumps(default))
+  legacy["selection"]["selection_basis"]=[r for r in legacy["selection"]["selection_basis"]
+                                          if not r["axis"].startswith("compose-")]
+  self.assertIn("source=sealed-route","\n".join(R.compose_decision_lines(legacy)))
+  self.assertNotIn("강도 안내","\n".join(R.compose_decision_lines(legacy)))
+  legacy_display="\n".join(R.compose_decision_lines(legacy))
+  self.assertIn("capability=autopilot-code (source=sealed-route)",legacy_display)
+  self.assertNotIn("source=compose-default",legacy_display)
+  framed=self.compose(capability=None,capability_mode=None,shape="framed",graph=None)
+  framed["selection"]["selection_basis"]=[r for r in framed["selection"]["selection_basis"]
+                                         if not r["axis"].startswith("compose-")]
+  frame_display="\n".join(R.compose_decision_lines(framed))
+  self.assertIn("capability=frame 결정 대기 (source=sealed-route)",frame_display)
+  self.assertNotIn(R.ROUTE_FRAME_CAPABILITY,frame_display)
+  self.assertNotIn("source=compose-default",frame_display)
+  self.assertEqual(set(R.compose_observations(default)),{"confirmation","pre_execution_answers"})
+ def test_compose_decisions_show_real_group_leg_profiles_and_resource_dispatch_count(self):
+  grouped=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
+                       graph="report,independent-verify,publish,sync",
+                       explicit_profiles={"independent-verify":"balanced"})
+  display="\n".join(R.compose_decision_lines(grouped))
+  self.assertIn("independent-verify=balanced+balanced-deep",display)
+  self.assertIn("nodes=5 worker_dispatches=3 owner_dispatches=1 resource(측정)=없음",display)
+  measured=self.compose(capability="autopilot-lab",capability_mode="eval",graph="eval-run,metrics,report")
+  self.assertIn("nodes=3 worker_dispatches=2 owner_dispatches=1 resource(측정)=eval-run",
+                "\n".join(R.compose_decision_lines(measured)))
+  framed=self.compose(capability=None,capability_mode=None,shape="framed",graph=None,intensity="strong")
+  frame_display="\n".join(R.compose_decision_lines(framed))
+  self.assertIn("source=explicit, requested=strong",frame_display)
+  self.assertNotIn("강도 안내",frame_display)
+  self.assertIn("capability=frame 결정 대기",frame_display)
+ def test_compose_start_and_resume_print_decisions_before_launch_once_in_all_harnesses(self):
+  import work_start
+  with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   root=Path(tmp); prompt=root/"task.md"; prompt.write_text("결과 분석·평가·비교")
+   route=self.compose(shape="direct",graph=None,artifact_root=str(root/"artifacts"),
+                      work_request={"text":prompt.read_text(),"owner_harness":None})
+   path=root/"route.json"; path.write_text(json.dumps(route))
+   for harness in ("claude","codex","opencode"):
+    for command in ("compose","start"):
+     out,err=io.StringIO(),io.StringIO()
+     argv=[str(P),command,"--jobs",str(root/"jobs.log")]
+     argv+=(["--start","--prompt-file",str(prompt),"--shape","direct","--parent-harness",harness,
+             "--cwd",str(R.ROOT),"--artifact-root",str(root/"artifacts"),"--unassigned"]
+            if command=="compose" else ["--route",str(path)])
+     receipt={"state":"inline","parent_next":"end-turn","parent_next_command":"untouched"}
+     def start(*args,**kwargs):
+      self.assertIn("intensity=direct",err.getvalue())
+      self.assertIn("nodes=1 worker_dispatches=0 owner_dispatches=0 resource(측정)=없음",err.getvalue())
+      self.assertIn("tiers: inline=current-session(등급 미기록)",err.getvalue())
+      return dict(receipt)
+     with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+          mock.patch.object(work_start,"start_work",side_effect=start), \
+          mock.patch.object(R,"_record_route_chain"),mock.patch.object(R,"_route_autoclose"), \
+          contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+      self.assertEqual(R.main(),0)
+     actual=json.loads(out.getvalue())
+     self.assertEqual({k:actual[k] for k in receipt},receipt)
+     self.assertEqual(set(actual),set(receipt)|{"confirmation","pre_execution_answers"})
+     self.assertEqual(err.getvalue().count("강도 안내"),1)
+     self.assertEqual(err.getvalue().count("규모:"),1)
  def test_verified_resume_graph_keeps_payload_inline_and_verifies_after_exit(self):
   for shape in ("direct", "solo"):
    route=self.compose(capability="autopilot-lab",capability_mode="setup",shape=shape,
@@ -7609,7 +7684,8 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual(sorted(route["selection"]["direct_predicates"]),sorted(ALL))
   self.assertEqual(route["tracked_gate_evidence"]["spec_read"]["source"],"compose-auto: no spec/prd.md under cwd or artifact root")
   # compose fills the predicates itself; the record must not call that caller input.
-  self.assertEqual({row["source"] for row in route["selection"]["selection_basis"]},{"compose-default"})
+  self.assertEqual({row["source"] for row in route["selection"]["selection_basis"]
+                    if row["axis"] == "direct-predicate"},{"compose-default"})
   R.verify_route(route,R.ROOT)
   card=R.compose_card(route); self.assertIn("direct(direct)",card); self.assertIn(route["route_id"],card); self.assertIn("사람 게이트 없음",card)
  def test_solo_shape_is_one_registered_owner(self):
