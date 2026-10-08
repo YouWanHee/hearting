@@ -92,6 +92,7 @@ class ResourceRunFleetTest(unittest.TestCase):
         }]}
         before = json.dumps(snapshot)
         with mock.patch.object(render, "_COMPUTE_HOSTS", snapshot), \
+                mock.patch.object(render, "_ROUTE_FOLD", {render._GPU_FOLD_ALL: False}), \
                 mock.patch.object(render, "_COMPUTE_HOSTS_SET_AT", render.time.monotonic()):
             for process in (False, True):
                 render.set_process_view(process)

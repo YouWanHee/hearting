@@ -262,6 +262,32 @@ def _clear_gpu_session_aliases(harness, sid, pane):
         return []
 
 
+def pane_session_metadata(harness, pane, cwd):
+    """Existing native seat metadata when the pane omits its session ID.
+
+    Read-only display context, not a process identity or a new probe. A foreign
+    repository record cannot identify the pane's current displayed project.
+    """
+    if not pane or harness not in {"claude", "codex", "opencode"}:
+        return None
+    try:
+        import sys
+        from pathlib import Path
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import session_tidy
+        from ..gitinfo import resolve_gitdir
+        seat = session_tidy.Seat("pane", session_tidy._digest("pane", pane), pane, harness)
+        row = session_tidy.latest_session(seat, harness)
+        repository = resolve_gitdir(cwd)[1]
+        if row and repository and resolve_gitdir(row.get("cwd"))[1] == repository:
+            return row
+    except Exception:
+        pass
+    return None
+
+
 def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None):
     """Set ``herdr_attached`` on every eligible depth-0 session. ``agents`` = a
     pre-fetched ``list_agents()`` result (``None`` → probe once here); ``panes``/``pids``
@@ -269,6 +295,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     ``lineage`` = ``pid -> provenance`` callable used only when herdr is absent."""
     for session in sessions:
         session._gpu_session_aliases = []
+        session._herdr_name = None
     if agents is None:
         agents = list_agents()
     if agents is None:
@@ -316,6 +343,13 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
             pane = index[(harness, sid)].get("pane_id")
             matching_panes = {pane} if pane else set()
         if len(matching_panes) == 1:
+            pane = next(iter(matching_panes))
+            names = {agent.get("name") for agent in agents
+                     if isinstance(agent, dict) and agent.get("pane_id") == pane
+                     and agent.get("agent") == harness
+                     and agent.get("name")}
+            if len(names) == 1:
+                s._herdr_name = names.pop()
             aliases = _clear_gpu_session_aliases(harness, sid, next(iter(matching_panes)))
             if aliases:
                 from . import procscan

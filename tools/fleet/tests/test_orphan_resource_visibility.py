@@ -18,6 +18,11 @@ def text(lines):
 
 class OrphanResourceVisibilityTest(unittest.TestCase):
     def setUp(self):
+        # Keep the #406 command/progress formatting checks in the expanded
+        # view; the bundle's own tests cover default command folding.
+        fold = mock.patch.object(render, "_ROUTE_FOLD", {render._GPU_FOLD_ALL: False})
+        fold.start()
+        self.addCleanup(fold.stop)
         self.child = ResourceJob(
             run_id="paired-training", cwd="/work/project", project="project",
             parent_attempt_id="att-ended-owner", node="full-run", liveness="working",

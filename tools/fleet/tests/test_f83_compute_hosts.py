@@ -60,7 +60,7 @@ class ComputeHostCollectorTest(unittest.TestCase):
                 rows = render._compute_host_rows(width)
                 text = "\n".join(render._plain(row) for row in rows)
                 self.assertEqual(len(rows), 2)
-                self.assertIn("COMPUTE RESOURCES  template", text)
+                self.assertIn("compute resources  template", text)
                 self.assertIn("not configured", text)
                 self.assertTrue(all(render._dw(render._plain(row)) <= width for row in rows))
             self.assertIn("compute-hosts.yaml",
@@ -124,6 +124,8 @@ class ComputeHostCollectorTest(unittest.TestCase):
 
 class ComputeHostRenderTest(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(setattr, render, "_ROUTE_FOLD", render._ROUTE_FOLD)
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
         self.addCleanup(setattr, render, "_BLINK_ON", render._BLINK_ON)
         render.set_process_view(False)
         render.set_hearting({"version": "v2.0.0", "install_method": "linked"})
@@ -183,7 +185,7 @@ class ComputeHostRenderTest(unittest.TestCase):
                 rows = render._compute_host_rows(width)
                 self.assertTrue(all(render._dw(render._plain(row)) <= width for row in rows))
                 text = "\n".join(render._plain(row) for row in rows)
-                for value in ("COMPUTE RESOURCES  3/4", "⌂ moving4", "CPU", "0:", "1:",
+                for value in ("compute resources  3/4", "⌂ moving4", "CPU", "0:", "1:",
                               "UTIL", "VRAM", "32/48GB", "1/48GB", "xavier", "down",
                               "cpu", "no gpu"):
                     self.assertIn(value, text)
@@ -394,7 +396,7 @@ class ComputeHostRenderTest(unittest.TestCase):
         render.set_compute_hosts(aligned)
         rows = render._compute_host_rows(120)
 
-        self.assertEqual(rows[0][0], ("  COMPUTE RESOURCES", "section_head"))
+        self.assertEqual(rows[0][0], ("  compute resources", "section_head"))
         gpu_rows = [row for row in rows if "UTIL" in render._plain(row)]
         gpu_lines = [render._plain(row) for row in gpu_rows]
         self.assertEqual(len(gpu_lines), 3)
@@ -429,7 +431,7 @@ class ComputeHostRenderTest(unittest.TestCase):
         lines = render._build_lines([], [], "both", False, 0, term_width=120)
         text = [render._plain(line) for line in lines]
         hearting_at = next(i for i, line in enumerate(text) if "hearting v2.0.0" in line)
-        resource_at = next(i for i, line in enumerate(text) if "COMPUTE RESOURCES" in line)
+        resource_at = next(i for i, line in enumerate(text) if "compute resources" in line)
         pulse_at = next(i for i, line in enumerate(text) if line.startswith("  fleet "))
         dividers = [i for i, line in enumerate(text) if line == "─────"]
         self.assertGreaterEqual(len(dividers), 2)
@@ -441,7 +443,7 @@ class ComputeHostRenderTest(unittest.TestCase):
     def test_process_view_also_separates_resources_from_cards(self):
         lines = render._build_process_lines([], [], {}, 0, None, 120, "wide")
         text = [render._plain(line) for line in lines]
-        resource_at = next(i for i, line in enumerate(text) if "COMPUTE RESOURCES" in line)
+        resource_at = next(i for i, line in enumerate(text) if "compute resources" in line)
         process_at = next(i for i, line in enumerate(text) if "PROCESS VIEW" in line)
         divider_at = next(i for i, line in enumerate(text)
                           if i > resource_at and line == "─────")

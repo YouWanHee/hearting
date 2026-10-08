@@ -189,21 +189,40 @@ def _durable_over(soft_ceiling=DOCTOR_DURABLE_SOFT_CEILING):
         return []
 
 
-def collect(now=None):
+def collect(now=None, *, include_summary=True):
     """Return an additive `memory` dict (fleet.py --json / render.py consume it), or None
     when neither the journal nor the graveyard exists (F-19 not wired up yet — panel omitted).
+
+    ``include_summary=False`` reads only the write journal and returns recent/project
+    events, or None without a journal. The default preserves the aggregate API.
     """
     now = now or datetime.datetime.now()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     events, journal_ok = _read_jsonl_tail(_write_events_path())
+    today_events = [e for e in events if _is_today(e.get("ts"), midnight)]
+    recent = [{key: e.get(key) for key in
+               ("ts", "action", "tier", "type", "actor", "sid", "snippet")}
+              for e in events[-RECENT_LIMIT:][::-1]]
+    by_repo = {}
+    for e in today_events:
+        rk = _repo_key(e)
+        if rk:
+            by_repo.setdefault(rk, []).append({key: e.get(key) for key in
+                ("ts", "action", "tier", "type", "actor", "sid", "snippet")})
+    for rows in by_repo.values():
+        rows.sort(key=lambda e: e.get("ts") or "", reverse=True)
+    # Renderers only consume journal/project events. Keep the default aggregate API
+    # for structured consumers without touching its DB, graveyard or curator in this mode.
+    if not include_summary:
+        return {"journal_available": journal_ok, "recent": recent,
+                "by_repo": by_repo} if journal_ok else None
     graveyard, graveyard_ok = _read_jsonl_tail(_graveyard_path())
     periodic_curate = _periodic_curate(now)
     if not journal_ok and not graveyard_ok and periodic_curate is None:
         return None
 
     if journal_ok:
-        today_events = [e for e in events if _is_today(e.get("ts"), midnight)]
         added_w = sum(1 for e in today_events
                       if e.get("action") in ADDED_ACTIONS and e.get("tier") == "working")
         added_d = sum(1 for e in today_events
@@ -226,29 +245,6 @@ def collect(now=None):
         dt = _parse_ts(last_distill_ts)
         if dt is not None:
             last_distill_min = max(0, int((now - dt).total_seconds() // 60))
-
-    recent = []
-    by_repo = {}
-    if journal_ok:
-        for e in events[-RECENT_LIMIT:][::-1]:
-            recent.append({
-                "ts": e.get("ts"), "action": e.get("action"), "tier": e.get("tier"),
-                "type": e.get("type"), "actor": e.get("actor"), "sid": e.get("sid"),
-                "snippet": e.get("snippet"),
-            })
-        # F-19 repo extension: today's events, grouped by repo when the journal row names
-        # one (see `_repo_key`) — additive, most-recent-first per repo.
-        for e in today_events:
-            rk = _repo_key(e)
-            if not rk:
-                continue
-            by_repo.setdefault(rk, []).append({
-                "ts": e.get("ts"), "action": e.get("action"), "tier": e.get("tier"),
-                "type": e.get("type"), "actor": e.get("actor"), "sid": e.get("sid"),
-                "snippet": e.get("snippet"),
-            })
-        for rk in by_repo:
-            by_repo[rk].sort(key=lambda x: x.get("ts") or "", reverse=True)
 
     durable_over = _durable_over()
     distill_stale = last_distill_min is not None and last_distill_min > DISTILL_STALE_MIN

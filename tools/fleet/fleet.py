@@ -94,7 +94,7 @@ def _collect_memory():
             from fleet.collectors import memory as memcol
         else:
             from .collectors import memory as memcol
-        return memcol.collect()
+        return memcol.collect(include_summary=False)
     except Exception:
         return None
 
