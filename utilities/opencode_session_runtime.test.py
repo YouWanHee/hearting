@@ -390,6 +390,66 @@ for kind, part in [('step_start',{}), ('text',{'text':text}), ('step_finish',{'r
         self.assertEqual(receipt['requests'][0]['state'], 'turn-completed')
         self.assertEqual(receipt['thread_id'], 'ses_actual')
 
+    def test_first_live_turn_can_bind_its_registered_resource_owner(self):
+        f = self.f
+        f.state = f.jobs.parent / 'supervisor-state' / (fixture.PARENT + '.json')
+        f.jobs.write_text(fixture.owner_row(f.lease).replace('harness=claude', 'harness=opencode'))
+        native = f.base / 'native-resource.py'
+        native.write_text("""
+import json, os, sys, time
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+sys.path.insert(0, os.environ['FAKE_UTILITIES'])
+import dispatch_owner_input as INPUT
+import dispatch_resource_wait as RESOURCE
+import dispatch_contract as CONTRACT
+import owner_route_binding as OWNER
+sys.stdin.read()
+session = 'ses_ee3219f52ffe32c72Oe1nJNaxc'
+def event(kind, **values):
+ print(json.dumps(dict(type=kind, sessionID=session, **values)), flush=True)
+event('step_start', part={})
+jobs = Path(os.environ['AGENT_DISPATCH_JOBS'])
+attempt = 'att-parent'
+deadline = time.monotonic() + 3
+while True:
+ current = INPUT.inspect(jobs, attempt)
+ if current['thread_id'] == session:
+  break
+ if time.monotonic() >= deadline:
+  raise AssertionError(('first live turn still has placeholder session', current))
+ time.sleep(.01)
+assert current['supervisor_live'], current
+route_file = Path.cwd() / 'resource-route.json'
+route = dict(route_id='rt-native-resource', route_hash='sha256:native-resource')
+binding = SimpleNamespace(route_file=str(route_file), **route)
+args = SimpleNamespace(jobs=str(jobs), parent_attempt_id=attempt)
+env = dict(os.environ, AGENT_DISPATCH_ATTEMPT_ID=attempt,
+           AGENT_OWNER_ROUTE_FILE=str(route_file),
+           AGENT_DISPATCH_COMPLETION_MODE='supervised')
+with mock.patch.object(OWNER, 'resolve_owner_route_lifecycle', return_value=(binding, 'bound')), \\
+     mock.patch.object(CONTRACT, 'resolve_live_parent_attempt',
+                       return_value=SimpleNamespace(pid=os.getppid(), pid_start='200')):
+ owner = RESOURCE.start_binding(route, route_file, args, env)
+assert owner['session_id'] == session, owner
+Path('resource-owner.json').write_text(json.dumps(owner))
+event('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})
+event('step_finish', part={'reason':'stop'})
+""")
+        command = f.command() + ['--runtime-harness', 'opencode', '--opencode-command',
+                                  shlex.join([sys.executable, str(native)])]
+        result = subprocess.run(command, input='register full-run in this first turn',
+                                text=True, capture_output=True, timeout=15,
+                                env=f.child_env(FAKE_TRACE=str(f.trace),
+                                                AGENT_DISPATCH_JOBS=str(f.jobs),
+                                                AGENT_DISPATCH_COMPLETION_STATE_FILE=str(f.state),
+                                                FAKE_UTILITIES=str(ROOT / 'utilities')))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        owner = json.loads((f.base / 'resource-owner.json').read_text())
+        self.assertEqual(owner['session_id'], 'ses_ee3219f52ffe32c72Oe1nJNaxc')
+        self.assertEqual(owner['parent_attempt_id'], fixture.PARENT)
+
 
 if __name__ == '__main__':
     unittest.main()
