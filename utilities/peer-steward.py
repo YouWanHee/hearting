@@ -1006,34 +1006,38 @@ def _wait_for_created_shell(pane, cwd, original_shell, deadline):
     return "beside-shell-readiness-timeout", original_shell
 
 
+def _failed_start_cleanup_observation(pane, original_shell, original_screen):
+    if (_pane_has_agent(pane) is not None
+            or _proc_start_ticks(original_shell[0]) != original_shell[1]):
+        return "retained"
+    info = _retire_pane_info(pane)
+    if info is None or info["shell_pid"] != original_shell[0]:
+        return "retained"
+    if _start_shell_identity(pane) == original_shell:
+        if _start_pane_screen(pane) != original_screen:
+            return "retained"
+        if (_start_shell_identity(pane) != original_shell
+                or _pane_has_agent(pane) is not None
+                or _start_pane_screen(pane) != original_screen):
+            return "retained"
+        return "closed" if _close_pane(pane) else "close-failed"
+    return None
+
+
 def _failed_start_cleanup(pane, original_shell, original_screen, deadline=None):
     # Never close a caller-provided pane, a replaced shell or a late-starting
     # agent. The fresh split is the only pane owned by this failed invocation.
     if original_shell is None or original_screen is None:
         return "retained"
     deadline = time.monotonic() + 5 if deadline is None else deadline
-    first = True
-    while first or time.monotonic() < deadline:
-        first = False
-        if (_pane_has_agent(pane) is not None
-                or _proc_start_ticks(original_shell[0]) != original_shell[1]):
-            return "retained"
-        info = _retire_pane_info(pane)
-        if info is None or info["shell_pid"] != original_shell[0]:
-            return "retained"
-        if _start_shell_identity(pane) == original_shell:
-            if _start_pane_screen(pane) != original_screen:
-                return "retained"
-            if (_start_shell_identity(pane) != original_shell
-                    or _pane_has_agent(pane) is not None
-                    or _start_pane_screen(pane) != original_screen):
-                return "retained"
-            return "closed" if _close_pane(pane) else "close-failed"
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(.1, remaining))
-    return "retained"
+    while time.monotonic() < deadline:
+        result = _failed_start_cleanup_observation(pane, original_shell, original_screen)
+        if result is not None:
+            return result
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    # If late-start observation spent the shared wait budget, still perform the
+    # ordinary last cleanup observation, without another wait or a new deadline.
+    return _failed_start_cleanup_observation(pane, original_shell, original_screen) or "retained"
 
 
 def _opencode_tui_scoped_config():
