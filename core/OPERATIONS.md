@@ -689,6 +689,16 @@ for a second entry approval. Older sealed quick routes retain their
 
 ### §5.11. Commit and Push Policy for `<agent-home>`
 
+Merge with `hearting run merge-line <PR>`. This shared command queues sessions
+and worktrees for the same GitHub repository under a user-state `flock`, shows
+the waiting position and preceding PR, then updates the branch only if it lacks
+the latest default-branch commit. It waits for that head's CI, rechecks head and
+base immediately before merging, and pins the merge to the checked head. Existing
+successful CI on an up-to-date head is reused. Failure or interruption releases
+the turn; process death releases the OS lock and the next caller discards the
+dead PID/start entry. This is local cooperative merge serialization, with no
+new approval or workflow gate; all three harnesses use the same command.
+
 Release publication uses immutable tags and the tested commit. Repeated or
 out-of-order successful checks are ordinary observations: refresh tags before
 reserving a version, reuse a tag for the same commit, and skip a commit already
