@@ -36,6 +36,10 @@ class ContinuationSupervisionTest(unittest.TestCase):
         self.verify = mock.patch.object(O.ROUTE, "verify_route", side_effect=lambda value, **kw: value)
         self.verify.start()
         self.addCleanup(self.verify.stop)
+        self.proof = mock.patch.object(W, "observed_owner_lifecycle", return_value=(
+            SimpleNamespace(process_state="quiescent"), "recovery", {}))
+        self.proof.start()
+        self.addCleanup(self.proof.stop)
         self.bind()
         O.publish_owner_route_advance(self.jobs, owner_attempt_id=self.owner,
             source=self.source, target=self.target, from_generation=0, to_generation=1)
@@ -102,7 +106,7 @@ class ContinuationSupervisionTest(unittest.TestCase):
                 with mock.patch.object(W, "classify_supervisor_log", return_value=terminal), \
                      mock.patch("dispatch_supervision._pending", side_effect=[True, False]), \
                      mock.patch.object(W.time, "sleep") as pause, \
-                     mock.patch.object(W, "reconcile_supervisor_terminal") as close, \
+                     mock.patch.object(W, "reconcile_supervisor_terminal", return_value="closed") as close, \
                      mock.patch.object(W.subprocess, "run", return_value=SimpleNamespace(
                          returncode=0, stdout=json.dumps(receipt))) as start, \
                      mock.patch.object(W, "_run_registry") as cascade:
@@ -126,9 +130,33 @@ class ContinuationSupervisionTest(unittest.TestCase):
             self.assertIsNone(W.recover_waiting_continuation(self.args))
             start.assert_not_called()
 
+    def test_committed_result_survives_missing_log(self):
+        for note, failure in (("completed-supervisor", "pass"), ("dead-worker-fail", "fail"),
+                              ("dead-worker-blocked", "blocked")):
+            with self.subTest(note=note):
+                self.bind()
+                self.jobs.write_text(self.jobs.read_text().replace("now\topen", "now\tdone", 1).replace(
+                    ",worker_type=owner", ",note=" + note + ",failure_class=" + failure + ",worker_type=owner"))
+                with mock.patch.object(W, "classify_supervisor_log", return_value=SimpleNamespace(failure_class="runtime")), \
+                     mock.patch.object(W.subprocess, "run") as start:
+                    self.assertIsNone(W.recover_waiting_continuation(self.args))
+                    start.assert_not_called()
+
+    def test_unknown_owner_and_terminal_conflict_never_start(self):
+        with mock.patch.object(W, "observed_owner_lifecycle", return_value=(
+                SimpleNamespace(process_state="unverifiable"), "recovery", {})), \
+             mock.patch.object(W.subprocess, "run") as start:
+            self.assertIsNone(W.recover_waiting_continuation(self.args))
+            start.assert_not_called()
+        with mock.patch("dispatch_supervision._pending", return_value=False), \
+             mock.patch.object(W, "reconcile_supervisor_terminal", return_value="terminal-conflict"), \
+             mock.patch("dispatch_supervision.materialize"), mock.patch.object(W.subprocess, "run") as start:
+            self.assertFalse(W.recover_waiting_continuation(self.args))
+            start.assert_not_called()
+
     def test_refused_start_keeps_state_and_parent_notice(self):
         with mock.patch("dispatch_supervision._pending", return_value=False), \
-             mock.patch.object(W, "reconcile_supervisor_terminal"), \
+             mock.patch.object(W, "reconcile_supervisor_terminal", return_value="closed"), \
              mock.patch.object(W.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="")), \
              mock.patch("dispatch_supervision.materialize") as notice:
             self.assertFalse(W.recover_waiting_continuation(self.args))

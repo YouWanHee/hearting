@@ -158,16 +158,23 @@ def recover_waiting_continuation(args) -> bool | None:
     import route_parent_close
     from dispatch_completion_join import current_children
     from dispatch_supervision import _pending, _rows, materialize
+    from dispatch_attempt_policy import readable_result, verdict_pass, terminal_conflict_pending
 
     status, metadata = attempt_record(args.jobs, args.attempt_id)
     if (status not in OPEN | {"done"}
             or metadata.get("worker_type") != "owner"
             or route_parent_close.row_requested(metadata, args.jobs)):
         return None
+    if (readable_result(metadata) or verdict_pass(metadata) or terminal_conflict_pending(metadata)
+            or metadata.get("failure_class") in {"cancelled", "capacity", "auth", "permission"}):
+        return None
     state = read_supervisor_phase_state(
         dispatch_state_root(args.jobs) / "supervisor-state" / f"{args.attempt_id}.json",
         args.attempt_id)
     if state is None or state.phase not in {"parked", "recovery"}:
+        return None
+    observed, _phase, _meta = observed_owner_lifecycle(args)
+    if observed is None or observed.process_state != "quiescent":
         return None
     terminal = classify_supervisor_log(metadata.get("log_file"), metadata.get("harness", "unknown"))
     if terminal.failure_class in {"pass", "fail", "blocked", "cancelled", "capacity", "auth", "permission"}:
@@ -189,14 +196,20 @@ def recover_waiting_continuation(args) -> bool | None:
     _status, current = attempt_record(args.jobs, args.attempt_id)
     if _status not in OPEN | {"done"} or route_parent_close.row_requested(current, args.jobs):
         return None
+    if readable_result(current) or verdict_pass(current) or terminal_conflict_pending(current):
+        return None
     terminal = classify_supervisor_log(current.get("log_file"), current.get("harness", "unknown"))
     if terminal.failure_class in {"pass", "fail", "blocked", "cancelled", "capacity", "auth", "permission"}:
         return None
     # Closing just this extinct owner leaves the settled children intact. The
     # current continuation has no owner yet; ordinary start supplies it.
-    reconcile_supervisor_terminal(Path(args.jobs), args.attempt_id, terminal)
+    outcome = reconcile_supervisor_terminal(Path(args.jobs), args.attempt_id, terminal)
+    if outcome not in {"closed", "already-terminal"}:
+        materialize(Path(args.jobs), {args.attempt_id}, reason="supervisor-exited")
+        return False
+    from parent_next_directive import entrypoint
     result = subprocess.run([
-        sys.executable, str(Path(__file__).with_name("capability-route.py")),
+        sys.executable, entrypoint(args.agent_home, "utilities/capability-route.py"),
         "start", "--route", binding.route_file, "--jobs", str(args.jobs),
     ], text=True, capture_output=True, check=False, timeout=300)
     receipts = []
