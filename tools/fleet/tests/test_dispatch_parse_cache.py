@@ -77,6 +77,34 @@ class ParseCacheTest(unittest.TestCase):
         parse_cache.save(key, {"thread_id": "old"}, str(self.path), sig)
         self.assertIsNone(parse_cache.load(key))
 
+    def test_valid_json_with_damaged_value_reparses_for_every_harness(self):
+        fixtures = (
+            (dispatch._parse_codex_attempt_tail, dispatch._CODEX_ATTEMPT_CACHE,
+             {"type": "thread.started", "thread_id": "thread-a"},
+             ({"activity": {}}, {"token_usage": ["damaged"]}, {"exec_tool": []})),
+            (dispatch._parse_claude_stream_tail, dispatch._CLAUDE_STREAM_CACHE,
+             {"type": "system", "subtype": "init", "session_id": "session-a"},
+             ({"session_id": []}, {"active_context_tokens": {}}, {"ambiguity": True})),
+            (dispatch._parse_opencode_attempt_tail, dispatch._OPENCODE_ATTEMPT_CACHE,
+             {"type": "step_finish", "sessionID": "session-a", "part": {"tokens": {"input": 100}}},
+             ({"active_context_tokens": []}, {"session_id": {}}, {"ambiguity": 123})),
+        )
+        for index, (parse, memory, event, corruptions) in enumerate(fixtures):
+            path = self.root / ("fixture-%d.jsonl" % index)
+            path.write_text(json.dumps(event) + "\n")
+            memory.clear()
+            good = parse(str(path))
+            for corruption in corruptions:
+                # Find the cached record by its valid parser value, then damage only
+                # that value: the source stamp/signature deliberately stays exact.
+                cache = next(p for p in parse_cache._directory().glob("*.json")
+                             if json.loads(p.read_text())["value"] == good)
+                record = json.loads(cache.read_text())
+                record["value"].update(corruption)
+                cache.write_text(json.dumps(record))
+                memory.clear()
+                self.assertEqual(parse(str(path)), good, corruption)
+
 
 class RetentionGoldenTest(unittest.TestCase):
     def test_dropped_owners_never_enrich_and_all_snapshots_match(self):
