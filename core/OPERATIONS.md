@@ -393,6 +393,10 @@ predecessor; a worker's readable `FAIL` or `BLOCKED` is its result, so the next
 launch of that node is new work on capped and uncapped nodes alike. An
 explicit new review round remains a workflow decision. Stage boundaries specify
 inputs and outcomes; they do not themselves imply another process launch.
+Within the admitted review budget, the same owner opens the next parallel
+review round with the existing group start command. Its attempt identities and
+launch-input binding belong to that round; earlier terminal attempts and sealed
+inputs remain intact. The census counts exact attempts regardless of display slugs.
 Conflicting terminal evidence preserves that result and receipt while pausing
 automatic consumption. `dispatch-registry.py resolve-terminal-conflict` previews
 the exact row and prints its `apply_command`, which carries that row's digest
