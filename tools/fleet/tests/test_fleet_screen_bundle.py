@@ -170,7 +170,7 @@ class BundleTest(unittest.TestCase):
         self.assertEqual([s.session_id for s in keeper.reconcile_sessions("bundle", ordered)],
                          [s.session_id for s in ordered])
 
-    def test_under_id_intervals_preserve_session_rows_model_columns_and_box_edges(self):
+    def test_dashed_branches_align_ids_preserve_details_and_box_edges(self):
         sessions = self.hierarchy()
         owner = DispatchJob(key="code", slug="owner", parent_sid="aa", is_child=True,
                             cwd=sessions[0].cwd, depth=1, worker_type="owner", liveness="working")
@@ -178,27 +178,31 @@ class BundleTest(unittest.TestCase):
             rows = text(self.build(sessions, [owner], width))
             ids = {sid: next(i for i, row in enumerate(rows) if "[%s]" % sid in row)
                    for sid in ("aa", "bb", "cc", "dd", "ee", "zz")}
-            # Every MAIN chip keeps its original column and no line overlays an ID.
+            # Every MAIN chip shares its new column; status glyphs stay first.
             for sid, i in ids.items():
-                self.assertEqual(rows[i].index("[%s]" % sid) + 1, render._STEWARD_LINE_COL)
+                self.assertEqual(rows[i].index("[%s]" % sid), 7)
+                self.assertEqual(rows[i][2], render._glyph("working")[0])
                 self.assertNotIn(render._STEWARD_LINE_MARK, rows[i])
+            for sid, mark in (("aa", "⚑ "), ("bb", "⚑ "), ("cc", "╰╌"),
+                              ("dd", "├╌"), ("ee", "╰╌"), ("zz", "  ")):
+                self.assertEqual(rows[ids[sid]][4:6], mark)
             for parent, end in (("aa", "cc"), ("bb", "ee")):
                 for i in range(ids[parent] + 1, ids[end]):
                     if i in ids.values():
                         continue
                     self.assertEqual(rows[i][render._STEWARD_LINE_COL], "┆", rows[i])
-                    self.assertEqual(rows[i][render._STEWARD_LINE_COL + 1:render._RAIL_COL], "  ")
+                    self.assertEqual(rows[i][render._STEWARD_LINE_COL + 1:render._RAIL_COL], "   ")
             self.assertTrue(any("┆" in r and "╭" in r for r in rows))
-            box = [r for r in rows if "╭" in r or "╰" in r]
+            box = [r for r in rows if "╭" in r or "╰" in r[render._RAIL_COL:]]
             self.assertTrue(all(r.index(r[-1]) == render._dispatch_box_width(width, render._layout_mode(width)) - 1
                                 for r in box))
             self.assertNotIn("⚑ →", "\n".join(rows))
             self.assertNotIn("⚑ ←", "\n".join(rows))
-            self.assertIn("⚑", rows[ids["aa"]] if width >= 138 else rows[ids["aa"] + 1])
+            self.assertIn("⚑", rows[ids["aa"]])
         original = render._session_row_2line(session("aa", model="MODEL", effort="medium"))[1]
         joined = render._under_id_connector(original)
         self.assertIn("3h", render._plain(joined))
-        self.assertIn("┆  3h", render._plain(joined))
+        self.assertIn("┆   3h", render._plain(joined))
         self.assertEqual(render._plain(original).index("MODEL"), render._plain(joined).index("MODEL"))
         worker = DispatchJob(key="code-execute", harness="codex", depth=2, worker_type="stage",
                              model="MODEL", effort="medium", liveness="working", elapsed_min=17)
@@ -324,9 +328,9 @@ class BundleTest(unittest.TestCase):
                     if inside and "╭" not in row and "╰" not in row and "├" not in row:
                         self.assertEqual(row[render._RAIL_COL], "│", row)
                         self.assertTrue(row.endswith("│"), row)
-                    if "╰" in row:
+                    if "╰" in row[render._RAIL_COL:]:
                         inside = False
-                    if inside or "╰" in row:
+                    if inside or "╰" in row[render._RAIL_COL:]:
                         self.assertEqual(row[render._STEWARD_LINE_COL], "┆", row)
                 self.assertNotIn("╭│", "\n".join(rows))
                 self.assertNotIn("││", "\n".join(rows))
@@ -341,7 +345,7 @@ class BundleTest(unittest.TestCase):
         start = before.index("━")
         self.assertEqual(before[start:], after[start:])
         self.assertIn(" 82%", after)
-        self.assertIn("┆  herdr", after)
+        self.assertIn("┆   herdr", after)
 
     def test_long_korean_owner_title_cannot_move_routing_anchor(self):
         main = session("aa", model="gpt-6.1-sol", effort="xhigh")
@@ -401,6 +405,55 @@ class BundleTest(unittest.TestCase):
         end = next(i for i, row in enumerate(rows) if "[bb]" in row)
         self.assertEqual(end - start, 2)
         self.assertEqual(rows[start + 1][render._STEWARD_LINE_COL], "┆")
+        self.assertEqual(rows[end][4:6], "╰╌")
+
+    def test_narrow_identity_title_shift_keeps_full_harness_and_detail_anchors(self):
+        for width in (60, 100):
+            for harness in ("claude", "codex", "opencode"):
+                s = session("aa", harness, model="MODEL", effort="high")
+                s.title = "TITLEMARK"
+                rows = render._session_row_stack(s, term_width=width)
+                first, detail = text(rows)
+                self.assertEqual(first.index("TITLEMARK"), 22)
+                self.assertEqual(first.index("[aa]"), 7)
+                label = "claude" if harness == "claude" else harness
+                self.assertIn("[aa] " + label + " ", first)
+                self.assertEqual(detail.index("3h 00m"), 8)
+                self.assertEqual(detail.index("MODEL"), 20)
+                wide = render._plain(render._session_row(s, narrow=False))
+                self.assertEqual(wide.index("TITLEMARK"), render._NAME_COL)
+
+    def test_mixed_harness_branches_offscreen_steward_and_unrelated_session(self):
+        parent = session("aa", "claude", steward=True,
+                         steward_targets=[target("bb", "opencode"), target("cc")],
+                         model="MODEL", effort="high", herdr_attached=True)
+        children = [session("bb", "opencode", model="MODEL", effort="high"),
+                    session("cc", "codex", model="MODEL", effort="high")]
+        lone = session("dd", "opencode", steward=True,
+                       steward_targets=[target("off-screen")], model="MODEL", effort="high")
+        unrelated = session("ee", "claude", model="MODEL", effort="high")
+        jobs = [DispatchJob(key="code", slug="owner", cwd=parent.cwd, parent_sid="aa",
+                            depth=1, worker_type="owner", is_child=True, liveness="working")]
+        for tint in (False, True):
+            render._TINT_OK = tint
+            for width in (60, 100, 168):
+                lines = self.build([unrelated, lone, *children, parent], jobs, width)
+                rows = text(lines)
+                identity = {sid: next(row for row in rows if "[%s]" % sid in row)
+                            for sid in ("aa", "bb", "cc", "dd", "ee")}
+                for sid, mark in (("aa", "⚑ "), ("bb", "├╌"), ("cc", "╰╌"),
+                                  ("dd", "⚑ "), ("ee", "  ")):
+                    self.assertEqual(identity[sid].index("[%s]" % sid), 7)
+                    self.assertEqual(identity[sid][4:6], mark)
+                    self.assertEqual(identity[sid][2], render._glyph("working")[0])
+                self.assertEqual(sum(row.count("⚑") for row in rows), 2)
+                relation_segs = [(t, key) for line in lines if line for t, key in line
+                                 if t in ("┆", "├╌", "╰╌")]
+                self.assertTrue(relation_segs)
+                self.assertTrue(all(key == "relation" for t, key in relation_segs))
+                lone_i = next(i for i, row in enumerate(rows) if "[dd]" in row)
+                self.assertNotIn("┆", rows[lone_i + 1])
+                self.assertTrue(any("┆" in row and "╭" in row for row in rows))
 
     def test_mixed_owner_frame_worker_columns_across_harnesses_and_widths(self):
         main = session("aa", model="MAINMODEL", effort="xhigh", ctx_pct=50,

@@ -274,7 +274,8 @@ class StewardParentStripTest(unittest.TestCase):
                                                layout="wide", term_width=168))
         self.assertFalse(any("⚑ →" in t for t in rows))
         self.assertFalse(any("⚑ ←" in t for t in rows))
-        self.assertTrue(any("│" in t for t in rows))
+        self.assertTrue(any("┆" in t for t in rows))
+        self.assertTrue(any("╰╌ [13]" in t for t in rows))
 
 
 class RelationLineBudgetTest(unittest.TestCase):
@@ -356,7 +357,9 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     the exact capture procedure above; the only diff was that one label line per width.
     Exception on record: 2026-10-08 the approved shared detail inset and aligned
     MAIN/OWNER/FRAME gauge anchor moved the three context tracks from 12 to 20;
-    these four goldens record that intentional layout change."""
+    these four goldens record that intentional layout change.
+    Exception on record: 2026-10-09 every MAIN row reserves the leading relation
+    slot, shifting its ID three cells and shortening only the harness/model field."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):
