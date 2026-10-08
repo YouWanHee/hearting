@@ -14,6 +14,15 @@ from fleet.tests import test_title_consistency
 
 
 class SummaryGovernorRootTest(_ConfigHomeMixin, unittest.TestCase):
+    def test_missing_governor_spec_or_loader_keeps_a_failure_reason(self):
+        for spec in (None, SimpleNamespace(loader=None)):
+            with self.subTest(spec=spec), \
+                 mock.patch.object(rt, "_resolve_commands", return_value=[(["codex"], None, None)]), \
+                 mock.patch.object(rt.importlib.util, "spec_from_file_location", return_value=spec):
+                box = {}
+                self.assertEqual(rt.run_worker("prompt", capacity_held=True, provider_box=box), "")
+                self.assertEqual(box, {"error": "governor-loader-unavailable"})
+
     def test_release_cwd_never_calls_project_governor_root_for_any_provider(self):
         for provider in ("claude", "codex", "opencode"):
             with self.subTest(provider=provider):

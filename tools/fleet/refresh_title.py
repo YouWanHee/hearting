@@ -1428,6 +1428,8 @@ def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, 
             sys.path.insert(0, governor_dir)
         spec = importlib.util.spec_from_file_location("model_worker_governor", governor)
         if spec is None or spec.loader is None:
+            if provider_box is not None:
+                provider_box["error"] = "governor-loader-unavailable"
             return ""
         governor_module = importlib.util.module_from_spec(spec); spec.loader.exec_module(governor_module)
         # Title jobs are cross-project local runtime work. The installed release
