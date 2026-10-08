@@ -2204,7 +2204,10 @@ def resolve_plan_qa_artifact(job):
         roots.extend((root, os.path.join(root, ".agent_reports"),
                       os.path.join(root, ".claude_reports")))
     candidates = set()
-    for root in roots:
+    for root in dict.fromkeys(roots):
+        if not (os.path.isdir(os.path.join(root, "campaigns"))
+                or os.path.isdir(os.path.join(root, "plans"))):
+            continue
         # W7D: cycle plans dirs plus the legacy top-level plans/ read-only fallback.
         matches = (artifact_reader.glob_bucket(Path(root), "plans", "*_%s" % slug)
                    if artifact_reader is not None
@@ -2244,16 +2247,18 @@ _QA_DEFAULT = {
 
 
 def effective_qa(argv_qa, pipe_qa, jcwd, slug, key, capability=None, worker_role=None,
-                 artifact_root=None):
+                 artifact_root=None, lookup_plan=True):
     """Layered qa resolver, first-hit precedence: argv > jobslog(pipe) > plan artifact >
     CONVENTIONS default. Returns (qa, source) — source in argv|jobslog|plan|default|None."""
     if argv_qa:
         return argv_qa, "argv"
     if pipe_qa:
         return pipe_qa, "jobslog"
-    v = resolve_plan_qa_artifact({"cwd": jcwd, "slug": slug, "key": key,
-                                  "artifact_root": artifact_root,
-                                  "capability": capability, "worker_role": worker_role})
+    v = None
+    if lookup_plan:
+        v = resolve_plan_qa_artifact({"cwd": jcwd, "slug": slug, "key": key,
+                                      "artifact_root": artifact_root,
+                                      "capability": capability, "worker_role": worker_role})
     if v:
         return v, "plan"
     v = _QA_DEFAULT.get(key)
@@ -2645,7 +2650,7 @@ def _scan_processes():
             })
             is_child = env.get("AGENT_SESSION_ROLE", "").lower() == "worker" or env.get("CLAUDE_CODE_CHILD_SESSION") == "1" or bool(parent_slug or parent_sid)
             q, qsrc = effective_qa(qa, None, jcwd, slug, key,
-                                   artifact_root=env.get("AGENT_ARTIFACT_ROOT"))
+                                   artifact_root=env.get("AGENT_ARTIFACT_ROOT"), lookup_plan=False)
             jobs.append(DispatchJob(
                 key=key, stage=None, mode=mode,
                 capability_mode=capability_mode, worker_mode=worker_mode,
@@ -2653,6 +2658,7 @@ def _scan_processes():
                 elapsed_min=etime_to_min(etime), slug=slug, cwd=jcwd,
                 parent_sid=parent_sid, parent_slug=parent_slug, is_child=is_child,
                 qa_source=qsrc, source="proc", harness=proc_harness or "claude",
+                artifact_root=env.get("AGENT_ARTIFACT_ROOT"),
                 pid=int(pid_s) if pid_s.isdigit() else None,
                 proc_start=procscan.read_proc_start(pid_s) if pid_s.isdigit() else None,
                 model=_claude_job_model(pid_s, jcwd), depth=depth,
@@ -2899,7 +2905,7 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
         capability = meta.get("capability")
         worker_role = meta.get("worker_role")
         q, qsrc = effective_qa(None, meta.get("qa"), cwd, slug, pname, capability, worker_role,
-                               artifact_root=meta.get("artifact_root"))
+                               artifact_root=meta.get("artifact_root"), lookup_plan=False)
         parent_slug = meta.get("parent") or meta.get("parent_slug") or None
         parent_sid = meta.get("parent_sid") or meta.get("parent_session_id") or None
         parent_cwd = meta.get("parent_cwd") or meta.get("parent_worktree") or None
@@ -3548,7 +3554,7 @@ def _attach_execution_evidence(jobs, session_rows):
             job.exec_child = candidates[0]
 
 
-def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
+def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
     """Return merged [DispatchJob]. harness_filter does not restrict dispatch — the section
     is cross-harness by design (jobs, not sessions).
 
@@ -3745,6 +3751,16 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
         _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
+    # Plan QA is display detail. Resolve it only after dedup/retention and the
+    # single liveness pass, never for old rows the normal board does not draw.
+    for j in jobs:
+        if (j.qa_source in (None, "default") and
+                (j.liveness != "dead" or j.afterglow
+                 or getattr(j, "_dead_terminal_owner", False))):
+            j.qa, j.qa_source = effective_qa(
+                None, None, j.cwd, j.slug, j.key,
+                getattr(j, "capability_owner", None), j.worker_role,
+                artifact_root=j.artifact_root)
     # F-15c(a): a registry-only row (source="jobs") that turns out to be genuinely working
     # re-derives its breadcrumb from the real plan artifacts instead of the raw jobs.log
     # status word ("open"/"running") — otherwise a live job with real progress shows a
@@ -3775,6 +3791,18 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
     except Exception:
         collect.last_pending_delivery = None
     return jobs
+
+
+_ARTIFACT_READ_CACHE = artifact_reader.ReadCache() if artifact_reader is not None else None
+
+
+def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
+    """One inventory observation per root/tick; unchanged records reuse it live."""
+    args = (jobs_path, harness_filter, session_rows, fast_first)
+    if artifact_reader is None:
+        return _collect(*args)
+    with artifact_reader.read_scope(_ARTIFACT_READ_CACHE):
+        return _collect(*args)
 
 
 collect.last_malformed = 0

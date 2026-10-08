@@ -403,7 +403,14 @@ class TestSupervisorAdvance(WorkflowFixture):
         producer = output / "run.json"
         original = producer.read_bytes()
         producer.unlink()
-        self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halt-missing-artifact")
+        waiting = SUP.poll_once(route, ledger)[0]
+        self.assertEqual(waiting["action"], "wait-next-resource")
+        # Historical observers recorded this exact missing-output failure. Keep
+        # exercising settlement of those persisted records after the policy change.
+        evidence = dict(waiting["evidence"])
+        evidence.pop("awaiting_next_resource", None)
+        ledger.record("full-run", "FAILED_RETRYABLE", evidence=evidence, actor="old-watch")
+        ledger.set_workflow_state("FAILED_RETRYABLE", evidence={"node": "full-run"}, actor="old-watch")
         return route, path, jobs, registry, ledger, producer, original
 
     def _settle_resource_owner(self, route, path, jobs, *, passed=True):
@@ -693,15 +700,15 @@ class TestSupervisorAdvance(WorkflowFixture):
                 ledger = SUP.ledger_for(route, jobs)
                 with mock.patch.object(SUP, "_start_successor") as launch:
                     result = SUP.poll_once(route, ledger)
-                    self.assertEqual(result[0]["action"], "halt-missing-artifact")
+                    self.assertEqual(result[0]["action"], "wait-next-resource" if ordinary else "halt-missing-artifact")
                     self.assertEqual(result[0]["evidence"]["artifacts"]["missing"], ["run.json"])
-                    self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halted")
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "wait-next-resource" if ordinary else "halted")
                     self.assertEqual(launch.call_count, 0)
                 self.assertFalse(producer.exists())
                 self.assertFalse(producer.with_suffix(".json.tmp").exists())
                 self.assertFalse((jobs.parent / "completion" / route["route_id"] / f"{node}.json").exists())
                 self.assertEqual(ledger.claims(), {})
-                self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
+                self.assertEqual(ledger.state()["workflow_state"], "RUNNING" if ordinary else "FAILED_RETRYABLE")
                 self.assertEqual(jobs.read_text(), "")
 
     def test_verified_resume_changed_runtime_evidence_preserves_producer_and_refuses_marker(self):
