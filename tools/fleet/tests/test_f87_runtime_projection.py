@@ -254,9 +254,8 @@ class RuntimeProjectionTest(unittest.TestCase):
         self.assertEqual(agent, "[3a] codex ⚑")
         self.assertLess(len(title), 80)
 
-    def test_claude_hook_reports_metadata_and_leaves_the_session_id_to_herdr(self):
-        """`report-agent-session` stays herdr's own integration's job — two sources
-        claiming one pane's agent session would race their `seq` values."""
+    def test_claude_hook_reports_current_session_and_metadata_together(self):
+        """The common publisher repairs native ID continuity and paints its header."""
         with tempfile.TemporaryDirectory() as td:
             root, sid = Path(td), "abcdefgh-claude"
             sidecar = root / "titles/claude" / (sid + ".json")
@@ -265,8 +264,10 @@ class RuntimeProjectionTest(unittest.TestCase):
             result, rows = self.claude_hook(root, sid)
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
-            self.assertEqual([row[1] for row in rows], ["report-metadata"])
-            self.assertEqual(rows[0][4:], ["herdr:claude", "--display-agent", "claude",
+            self.assertEqual([row[1] for row in rows], ["report-agent-session", "report-metadata"])
+            self.assertEqual(rows[0][4:], ["herdr:claude", "--agent", "claude",
+                                         "--agent-session-id", sid])
+            self.assertEqual(rows[1][4:], ["herdr:claude", "--display-agent", "claude",
                                            "--title", "claude Claude pane title"])
 
     def test_claude_hook_skips_a_registered_worker(self):

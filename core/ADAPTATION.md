@@ -170,6 +170,12 @@ native route and bound to the same TUI process lifecycle; it is never estimated
 from a callback session id, an SDK-first root, timing, pane labels, or daemon
 environment.
 
+Pane identity follows native session-start/resume events: publishers carry the
+actual start source with the current ID. Fleet joins predecessor/current IDs from
+that pane's existing same-harness, same-repository seat history for display only;
+another live session keeps its own ID. These aliases grant no report, wake or write
+authority and add no state ledger, user confirmation or caller flag.
+
 OpenCode identity and completion helpers resolve a live harness root at invocation
 time if their import-time release has been removed, using the existing core root
 order. They preserve the exact session and inherited dispatch registry across that

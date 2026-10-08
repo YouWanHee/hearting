@@ -481,6 +481,45 @@ def latest_session(seat: Seat, harness: Optional[str] = None) -> Optional[dict]:
     return max(rows, key=lambda r: r["last_seen"]) if rows else None
 
 
+def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+    """Display IDs observed at this exact pane, bounded to one harness/repository.
+
+    Reuse the seat history; a same-cwd session elsewhere is not an alias. Readers
+    can hold the previous ID while native publication is catching up, so the
+    display join is bidirectional. Execution and notification identities stay exact.
+    """
+    if harness not in HARNESSES or not sid or not pane or not cwd:
+        return []
+    try:
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet.gitinfo import resolve_gitdir
+        repository = resolve_gitdir(cwd)[1]
+        if not repository:
+            return []
+        rows = [row for row in session_summary(_pane_seat_of(pane)).values()
+                if row["harness"] == harness and row.get("cwd")
+                and resolve_gitdir(row["cwd"])[1] == repository]
+        if not any(row["sid"] == sid for row in rows):
+            return []
+        return [row["sid"] for row in sorted(rows, key=lambda r: r["last_seen"], reverse=True)
+                if row["sid"] != sid][:8]
+    except (OSError, ValueError, TypeError, ImportError):
+        return []
+
+
+def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:
+    """The recorded native start source, not a new or inferred lifecycle event."""
+    if harness not in HARNESSES or not sid or not pane:
+        return None
+    for row in reversed(_read_ledger_lines(_pane_seat_of(pane))):
+        if row.get("harness") == harness and row.get("sid") == sid and row.get("event") == "start":
+            source = row.get("source")
+            return source if source in {"startup", "resume", "clear", "compact", "fork"} else None
+    return None
+
+
 def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str = "",
                  transcript: str = "", cwd: str = "", now: Optional[float] = None,
                  bump_epoch: bool = False) -> dict:

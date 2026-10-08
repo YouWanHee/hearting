@@ -288,6 +288,20 @@ def pane_session_metadata(harness, pane, cwd):
     return None
 
 
+def pane_session_aliases(harness, sid, pane, cwd):
+    """Reuse the common seat-history display join, without another pane probe."""
+    try:
+        import sys
+        from pathlib import Path
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import session_tidy
+        return session_tidy.pane_session_aliases(harness, sid, pane, cwd)
+    except Exception:
+        return []
+
+
 def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None):
     """Set ``herdr_attached`` on every eligible depth-0 session. ``agents`` = a
     pre-fetched ``list_agents()`` result (``None`` → probe once here); ``panes``/``pids``
@@ -321,6 +335,36 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         pids = pane_pids(panes, bindings=bindings) if panes is not None else None
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None
+    # A native resume can run inside the still-live foreground runtime. Keep
+    # one pane row instead of letting that detached companion make the same
+    # display alias ambiguous. Independent live processes remain separate.
+    from . import procscan
+    companions = set()
+    for owner in sessions:
+        owner_panes = bindings.get(owner.pid, set())
+        if not _eligible(owner) or len(owner_panes) != 1 or not owner.proc_start:
+            continue
+        pane = next(iter(owner_panes))
+        aliases = pane_session_aliases(owner.harness, owner.session_id, pane, owner.cwd)
+        for other in sessions:
+            agent = index.get((other.harness, other.session_id), {})
+            if (other is owner or not _eligible(other) or other.harness != owner.harness
+                    or not other.detached or other.session_id not in aliases
+                    or agent.get("pane_id") != pane or not other.proc_start
+                    or procscan.read_proc_start(owner.pid) != owner.proc_start
+                    or procscan.read_proc_start(other.pid) != other.proc_start
+                    or not pid_in_panes(other.pid, set(), {owner.pid})):
+                continue
+            companions.add(id(other))
+            owner.session_aliases = list(dict.fromkeys(
+                list(getattr(owner, "session_aliases", None) or []) + [other.session_id]))
+            for field in ("liveness", "mtime", "title", "summary", "summary_ts", "model", "effort",
+                          "ctx_pct", "context", "context_window_tokens", "exec_tool", "work_projection"):
+                value = getattr(other, field, None)
+                if value is not None:
+                    setattr(owner, field, value)
+    if companions:
+        sessions[:] = [s for s in sessions if id(s) not in companions]
     for s in sessions:
         if not _eligible(s):
             continue
@@ -336,8 +380,8 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
             s.herdr_attached = False
         else:
             s.herdr_attached = None
-        # Herdr may still name the pre-/clear id. Its exact foreground PID identifies
-        # the same pane; the native clear receipt identifies the current session there.
+        # Herdr can lag a native resume/clear. Its exact foreground PID (or an
+        # existing session match) identifies the pane; seat history joins its IDs.
         matching_panes = bindings.get(s.pid, set())
         if not matching_panes and sid and (harness, sid) in index:
             pane = index[(harness, sid)].get("pane_id")
@@ -351,8 +395,12 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
             if len(names) == 1:
                 s._herdr_name = names.pop()
             aliases = _clear_gpu_session_aliases(harness, sid, next(iter(matching_panes)))
-            if aliases:
+            pane_aliases = pane_session_aliases(harness, sid, pane, getattr(s, "cwd", None))
+            if aliases or pane_aliases:
                 from . import procscan
                 if getattr(s, "proc_start", None) and procscan.read_proc_start(s.pid) == s.proc_start:
                     live = {(other.harness, other.session_id) for other in sessions}
                     s._gpu_session_aliases = [old for old in aliases if (harness, old) not in live]
+                    s.session_aliases = list(dict.fromkeys(
+                        list(getattr(s, "session_aliases", None) or [])
+                        + [other for other in pane_aliases if (harness, other) not in live]))
