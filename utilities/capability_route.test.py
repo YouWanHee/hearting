@@ -6984,9 +6984,14 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual([n["id"] for n in route["nodes"]],["metrics","diagnose","report","independent-verify"])
   self.assertEqual(R.compose_omission_lines(route),[
    "  strong group independent-verify dropped by --graph: terminal-anchor"])
+  inactive=self.compose(**{**args,"intensity":"standard"})
+  self.assertEqual(R.compose_omission_lines(inactive),[])
+  # Existing omission rows carry no minimum-intensity hint. Registry gaps
+  # must suppress a notice rather than claim an unselected preset was dropped.
   with mock.patch.object(R.TOPO,"load_registry",side_effect=ValueError("historical registry unavailable")):
-   self.assertEqual(len(R.compose_omission_lines(route)),1)
-  self.assertEqual(R.compose_omission_lines(self.compose(**{**args,"intensity":"standard"})),[])
+   self.assertEqual(R.compose_omission_lines(route),[])
+   self.assertEqual(R.compose_omission_lines(inactive),[])
+  self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],expected)
   R.verify_route(route,R.ROOT)
   # Compile the exact pre-notice recipe shape, then verify it with the new
   # composer. Recording a diagnostic must not reinterpret its sealed profiles.

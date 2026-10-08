@@ -4394,8 +4394,10 @@ def compose_omission_lines(route):
             group = next((g for g in source["standard_plus"].get("parallel_groups", [])
                           if g["node"] == node["id"]), None)
         except (OSError, ValueError, KeyError, TypeError):
-            pass  # A historical registry gap cannot block a display notice.
-        if group and ORDER[route["effective_intensity"]] < ORDER[group["min_intensity"]]:
+            pass  # A historical registry gap cannot block compose/start.
+        if group is None:
+            continue  # Older diagnostic rows have no intensity hint; do not guess.
+        if ORDER[route["effective_intensity"]] < ORDER[group["min_intensity"]]:
             continue  # This intensity did not select the declared preset.
         legs = " legs " + ",".join(row["legs"]) if row.get("legs") else ""
         lines.append(f"  {route['effective_intensity']} group {row['id']}{legs} dropped by --graph: {row['reason']}")
