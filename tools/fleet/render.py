@@ -7648,12 +7648,22 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
                   if callable(compute_hosts_refresh) else None)
     try:
         sessions, jobs = collect_all(harness_filter=hfilter)
-    finally:
-        # Drain reads even when session collection fails; a retry must not
-        # leave an earlier observer running against the same cache.
-        governor_snapshot = governor_read.result()
+    except BaseException:
+        # Drain both reads. Preserve the original serial failure priority:
+        # hosts before sessions before governor (normally fail-soft).
+        try:
+            governor_read.result()
+        except BaseException:
+            pass
         if hosts_read is not None:
             set_compute_hosts(hosts_read.result())
+        raise
+    else:
+        try:
+            governor_snapshot = governor_read.result()
+        finally:
+            if hosts_read is not None:
+                set_compute_hosts(hosts_read.result())
     resources = list(getattr(collect_all, "last_resource_jobs", []))
     usage_snapshots = dict(getattr(collect_all, "last_usage_snapshots", {}))
     malformed = _malformed()
@@ -8542,7 +8552,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         try:
             sessions, jobs = collect_all(harness_filter=hfilter,
                                          **({"fast_first": True} if first_snapshot else {}))
-        finally:
+        except BaseException:
+            try:
+                governor_read.result()
+            except BaseException:
+                pass
+            raise
+        else:
             governor_snapshot = governor_read.result()
         # Only the first publication is fast: every later tick (the existing
         # background refresh) runs the full pass, filling the details the

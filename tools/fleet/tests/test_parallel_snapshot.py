@@ -1,5 +1,6 @@
 """Independent reads overlap without publishing an incomplete snapshot."""
 import contextlib
+from concurrent.futures import Future
 import io
 import sys
 import threading
@@ -123,6 +124,78 @@ class ParallelSnapshotTest(unittest.TestCase):
             raise LookupError("read failure")
         with self.assertRaisesRegex(LookupError, "read failure"):
             refresh.background_read(failed).result(timeout=2.0)
+
+    def test_governor_base_exception_waits_for_hosts_before_escaping(self):
+        governor, hosts = Future(), Future()
+        governor.set_exception(SystemExit("governor failure"))
+        host_waiting, finished = threading.Event(), threading.Event()
+        errors = []
+        read_hosts = mock.Mock()
+
+        def host_result():
+            host_waiting.set()
+            return hosts.result(timeout=5.0)
+
+        read_hosts.result.side_effect = host_result
+
+        def run_once():
+            try:
+                render.render_once(lambda **kw: ([], []), None, "both", compute_hosts_refresh=lambda: None)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        with self.quiet_renderer(), \
+             mock.patch.object(render, "background_read", side_effect=[governor, read_hosts]), \
+             mock.patch.object(render, "_build_lines") as build:
+            worker = threading.Thread(target=run_once)
+            worker.start()
+            try:
+                self.assertTrue(host_waiting.wait(2.0))
+                self.assertFalse(finished.is_set())
+            finally:
+                hosts.set_result({"hosts": []})
+                worker.join(5.0)
+            self.assertFalse(worker.is_alive())
+            build.assert_not_called()
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SystemExit)
+        self.assertEqual(render._COMPUTE_HOSTS, {"hosts": []})
+
+    def test_serial_failure_priority_when_all_collectors_fail(self):
+        governor, hosts = Future(), Future()
+        governor.set_exception(SystemExit("governor failure"))
+        hosts.set_exception(ValueError("host failure"))
+        previous = {"hosts": ["previous"]}
+        render.set_compute_hosts(previous)
+
+        def sessions(**kwargs):
+            raise LookupError("session failure")
+
+        with self.quiet_renderer(), \
+             mock.patch.object(render, "background_read", side_effect=[governor, hosts]), \
+             mock.patch.object(render, "_build_lines") as build:
+            with self.assertRaisesRegex(ValueError, "host failure"):
+                render.render_once(sessions, None, "both", compute_hosts_refresh=lambda: None)
+            build.assert_not_called()
+        self.assertEqual(render._COMPUTE_HOSTS, previous)
+
+    def test_session_failure_precedes_governor_base_exception(self):
+        governor, hosts = Future(), Future()
+        governor.set_exception(SystemExit("governor failure"))
+        hosts.set_result({"hosts": []})
+
+        def sessions(**kwargs):
+            raise LookupError("session failure")
+
+        with self.quiet_renderer(), \
+             mock.patch.object(render, "background_read", side_effect=[governor, hosts]), \
+             mock.patch.object(render, "_build_lines") as build:
+            with self.assertRaisesRegex(LookupError, "session failure"):
+                render.render_once(sessions, None, "both", compute_hosts_refresh=lambda: None)
+            build.assert_not_called()
+        self.assertEqual(render._COMPUTE_HOSTS, {"hosts": []})
 
     def test_thread_exhaustion_uses_synchronous_read(self):
         caller = threading.get_ident()
