@@ -50,6 +50,19 @@ class SessionSummaryTriggerTest(unittest.TestCase):
             self.assertEqual(kwargs["debounce"], 0)
             self.assertTrue(kwargs["priority"])
 
+    def test_interactive_periodic_uses_five_minutes_for_every_harness(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "source"
+            source.write_text("{}\n")
+            for harness in ("claude", "codex", "opencode"):
+                with self.subTest(harness=harness), \
+                     mock.patch.object(T, "_opencode_db", return_value=source), \
+                     mock.patch("fleet.refresh_title.maybe_spawn", return_value=True) as spawn:
+                    self.assertTrue(T.trigger(harness, "sid", "periodic", str(source)))
+                    self.assertEqual(spawn.call_args.kwargs["debounce"], 300)
+                    self.assertFalse(spawn.call_args.kwargs["priority"])
+                    self.assertIsNone(spawn.call_args.kwargs["quota_class"])
+
     def test_trigger_forwards_current_user_context_to_refresher(self):
         with tempfile.TemporaryDirectory() as td:
             transcript = Path(td) / "session.jsonl"

@@ -81,7 +81,7 @@ class QuotaTest(unittest.TestCase):
 
     def test_debounce_and_child_debounce_are_the_approved_values(self):
         self.assertEqual(rt.DEBOUNCE_SEC, 600)
-        self.assertEqual(rt.WORKING_DEBOUNCE_SEC, 120)
+        self.assertEqual(rt.WORKING_DEBOUNCE_SEC, 300)
         self.assertEqual(rt.CHILD_DEBOUNCE_SEC, 600)
         self.assertEqual(rt.SUMMARY_RETRY_DELAYS, (30, 60, 120))
         # A dispatched child's periodic title refresh and an ordinary owner's

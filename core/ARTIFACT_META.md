@@ -246,6 +246,17 @@ edit a manifest, or change a route.
 
 ## The one background review
 
+Fleet titles/NOW and this review share one text-only provider call. Each uses
+a short dedicated system instruction, no tools, hooks, MCP or user/project
+bootstrap, and the resolved profile's effort/variant as well as its model.
+Authentication still uses the subscription CLI; provider allocation stays the
+same. Fleet's ordinary working-session refresh interval is five minutes;
+registered summaries retain their existing initial/periodic/final lifecycle.
+In auto language mode, native command metadata is not user intent. A main
+session's observed user language travels in the existing summary-source
+provenance; a worker with no user-language signal uses the latest such main
+observation for its title and NOW. No setting or sidecar field is added.
+
 `artifact_workflow_group_review.py` (the existing job; see
 [WORKFLOW_GROUPS.md](WORKFLOW_GROUPS.md)) decides, with **one model call per campaign per
 sweep**, the workflow groups of new cycles and the title, summary, branches, and kinds of
