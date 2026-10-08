@@ -6974,6 +6974,70 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_terminal_group_notice_preserves_the_graph_and_pre_notice_route_profiles(self):
+  args=dict(capability="autopilot-lab",capability_mode="eval",intensity="strong",
+            graph="metrics:qa/ml-debug,diagnose,report,independent-verify")
+  route=self.compose(**args)
+  expected=[{"id":"independent-verify","reason":"terminal-anchor"}]
+  self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],expected)
+  self.assertEqual(route["parallel_groups"],[])
+  self.assertEqual([n["id"] for n in route["nodes"]],["metrics","diagnose","report","independent-verify"])
+  self.assertEqual(R.compose_omission_lines(route),[
+   "  strong group independent-verify dropped by --graph: terminal-anchor"])
+  inactive=self.compose(**{**args,"intensity":"standard"})
+  self.assertEqual(R.compose_omission_lines(inactive),[])
+  # Existing omission rows carry no minimum-intensity hint. Registry gaps
+  # must suppress a notice rather than claim an unselected preset was dropped.
+  with mock.patch.object(R.TOPO,"load_registry",side_effect=ValueError("historical registry unavailable")):
+   self.assertEqual(R.compose_omission_lines(route),[])
+   self.assertEqual(R.compose_omission_lines(inactive),[])
+  self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],expected)
+  R.verify_route(route,R.ROOT)
+  # Compile the exact pre-notice recipe shape, then verify it with the new
+  # composer. Recording a diagnostic must not reinterpret its sealed profiles.
+  compose=R.compose_subgraph_recipe
+  def pre_notice(*a,**kw):
+   recipe=compose(*a,**kw)
+   recipe["compose"].pop("omitted_parallel_presets")
+   return recipe
+  with mock.patch.object(R,"compose_subgraph_recipe",side_effect=pre_notice):
+   old=self.compose(**args)
+  before=R.canonical(old)
+  self.assertEqual(old["nodes"],route["nodes"])
+  self.assertEqual(old["workflow_contract"],route["workflow_contract"])
+  R.verify_route(old,R.ROOT)
+  self.assertEqual(before,R.canonical(old))
+ def test_omission_notice_is_once_before_start_and_once_in_explain_in_all_harnesses(self):
+  import work_start
+  with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   root=Path(tmp);prompt=root/"task.md";prompt.write_text("Existing metrics judgment")
+   route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
+                      graph="metrics:qa/ml-debug,diagnose,report,independent-verify",artifact_root=str(root/"artifacts"))
+   warning="strong group independent-verify dropped by --graph: terminal-anchor"
+   for harness in ("claude","codex","opencode"):
+    for action in ("explain","start"):
+     out,err=io.StringIO(),io.StringIO()
+     argv=[str(P),"compose","--shape","staged","--intensity","strong","--capability","autopilot-lab",
+           "--capability-mode","eval","--graph","metrics:qa/ml-debug,diagnose,report,independent-verify",
+           "--cwd",str(R.ROOT),"--artifact-root",str(root/"artifacts"),"--unassigned","--parent-harness",harness,
+           "--prompt-file",str(prompt),"--jobs",str(root/"jobs.log"),"--"+action]
+     receipt={"state":"waiting-owner","parent_next":"end-turn"}
+     def start(*a,**kw):
+      self.assertEqual(err.getvalue().count(warning),1)
+      return dict(receipt)
+     with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+          mock.patch.object(work_start,"start_work",side_effect=start) as launch, \
+          mock.patch.object(R,"_record_route_chain"),mock.patch.object(R,"_route_autoclose"), \
+          contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+      self.assertEqual(R.main(),0)
+     self.assertEqual(err.getvalue().count(warning),1)
+     payload=json.loads(out.getvalue())
+     if action=="start":
+      self.assertEqual({k:payload[k] for k in receipt},receipt)
+      self.assertEqual(set(payload),set(receipt)|{"confirmation","pre_execution_answers"})
+      launch.assert_called_once()
+     else:
+      launch.assert_not_called();self.assertEqual(payload["parallel_groups"],[])
  def test_compose_decisions_replay_input_sources_without_changing_profiles_or_receipt_keys(self):
   default=self.compose(capability=None,capability_mode=None)
   self.assertEqual((default["capability"],default["capability_mode"]),("autopilot-code","dev"))
@@ -7579,6 +7643,8 @@ class ComposeRouteTest(TestRoute):
    self.assertEqual(route["parallel_groups"],[])
    self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],
     [{"id":"plan","reason":"review-consumer-not-selected"}])
+   self.assertEqual(R.compose_omission_lines(route),[
+    "  strong group plan dropped by --graph: review-consumer-not-selected"] if intensity=="strong" else [])
    R.verify_route(route,R.ROOT)
  def test_frame_pair_stays_independent_and_gates_the_following_work(self):
   route=self.compose(graph="frame,frame-alternative,plan,test,report")
@@ -7651,6 +7717,8 @@ class ComposeRouteTest(TestRoute):
   self.assertEqual([g["id"] for g in grouped["parallel_groups"]],["plan"])
   self.assertNotIn("impl-review-alternative",[n["id"] for n in grouped["nodes"]])
   self.assertTrue(grouped["nodes"][-1]["terminal"])
+  self.assertEqual(grouped["composed_recipe"]["compose"]["omitted_parallel_presets"],
+                   [{"id":"impl-review","reason":"terminal-anchor"}])
   R.verify_route(grouped,R.ROOT)
   # (2) route-guard-recovery D9: `plan`/`plan-check` are real descendants of
   # `frame` in the base recipe (`plan.depends_on == ["frame",
