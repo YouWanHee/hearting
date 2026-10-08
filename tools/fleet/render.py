@@ -2097,7 +2097,7 @@ _STEWARD_LINE_COL = 4         # start of the MAIN [id] chip
 _OWNER_CARD_INSET = _STEWARD_LINE_COL  # clear the connector column on every box
 
 
-def _dispatch_prefix(j, orphan=False, in_card=False):
+def _dispatch_prefix(j, orphan=False, in_card=False, card_rail_col=None):
     # F-64c (v49, user 2026-08-05 연쇄 "depth=1을 조금 앞당겨서" → "세로선은 좀 더 들여쓰게"
     # → "아주 조금만 더 + depth=2의 들여쓰기를 완화"): dispatch-depth-1 sheds its ↳ arrow and sits at
     # a 4-cell inset — the capsule rail (assembler post-pass at `_RAIL_COL`) is what marks
@@ -2117,6 +2117,8 @@ def _dispatch_prefix(j, orphan=False, in_card=False):
     # sourcing working-memory note carried no requester) and found it noisy. Depth
     # readability improvements, if any, go through explicit user direction.
     depth = max(1, min(3, int(getattr(j, "depth", 1) or 1)))
+    if in_card and not orphan and card_rail_col is not None:
+        return " " * (card_rail_col + 2)
     # A boxed row carries `_CARD_INSET` extra columns so the frame drawn over this
     # prefix lands one cell inside a plain group row. Orphans are never boxed
     # and keep the original 4-cell seat, which is what keeps their `··` mark aligned
@@ -2857,7 +2859,7 @@ def _opts_segs(j, max_width=None):
 def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_last=True,
                   parent_effort=None, stage_override=None, name_width=None, route_seq=None,
                   route_zone=None, in_card=False, unit_working=None,
-                  card_interior=None):
+                  card_interior=None, card_rail_col=None):
     """A dispatch job rendered as a session-ANALOGUE, mirroring the session columns 1:1:
       harness (model · effort)  |  [stage label] session (branch)  |  stage breadcrumb  |  time
     F-33 (v11): model/effort fold into the harness field (no more separate model column).
@@ -2899,7 +2901,7 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
     # the NAME still lands at the shared _NAME_COL — name onward aligns with sessions. DIM =
     # spawned. F-33 (v11): the widened field also carries the job's own model/effort as a
     # parenthetical (SD-F3).
-    prefix = _dispatch_prefix(j, orphan=orphan, in_card=in_card)
+    prefix = _dispatch_prefix(j, orphan=orphan, in_card=in_card, card_rail_col=card_rail_col)
     segs = [("  ", None), (prefix, "dim"), (gch, gkey), (" ", None)]
     segs += _harness_model_cell(j.harness,
                                 None if j.liveness == "dead" else
@@ -3181,11 +3183,11 @@ def _session_row_stack(s, is_parent=False, child_count=0, term_width=None,
 
 
 def _dispatch_row_stack(j, orphan=False, parent_model=None, parent_effort=None, stage_override=None,
-                        route_seq=None, in_card=False, unit_working=None):
+                        route_seq=None, in_card=False, unit_working=None, card_rail_col=None):
     l1, l2 = _dispatch_row_2line(j, orphan=orphan, parent_model=parent_model,
                                  parent_effort=parent_effort, stage_override=stage_override,
                                  route_seq=route_seq, in_card=in_card,
-                                 unit_working=unit_working)
+                                 unit_working=unit_working, card_rail_col=card_rail_col)
     if _route_rides_the_rail(j, route_seq, in_card):
         return [l1, l2]
     gi = _stack_split(l2)
@@ -3193,7 +3195,8 @@ def _dispatch_row_stack(j, orphan=False, parent_model=None, parent_effort=None, 
 
 
 def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, _split=False,
-                        stage_override=None, route_seq=None, in_card=False, unit_working=None):
+                        stage_override=None, route_seq=None, in_card=False, unit_working=None,
+                        card_rail_col=None):
     """F-15a narrow card — L1 = identity ONLY (stage label + slug, no mode/qa tag); L2 =
     elapsed · model · options (relocated from L1) · breadcrumb/micro-status."""
     key = j.key or "?"
@@ -3208,7 +3211,7 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
         gch, gkey = _LIVE_GLYPH["done"], "dim"   # F-46 parity with the wide row
     hn = _BADGE_TEXT.get(j.harness, "—") if j.harness else "—"
 
-    prefix = _dispatch_prefix(j, orphan=orphan, in_card=in_card)
+    prefix = _dispatch_prefix(j, orphan=orphan, in_card=in_card, card_rail_col=card_rail_col)
     label = _dispatch_stage_label(j)
     if label:
         slug_room = max(1, _DISPATCH_NAME_MAX - len(label) - 1)
@@ -4369,7 +4372,7 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
     rows = []
     shown_depth = min(depth, 1) if in_card else depth
     indent = _SUBAGENT_IND + "  " * max(0, shown_depth)
-    width = (_dispatch_box_width(term_width) - 1 if in_card else term_width) if term_width else None
+    width = (_dispatch_box_width(term_width) - 2 if in_card else term_width) if term_width else None
     for child in getattr(job, "resource_children", ()):
         if any(child is linked for linked in gpu_children):
             continue
@@ -7182,6 +7185,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             # the next card — a depth-2 worker floating outside every box (user 2026-08-19).
             owns_card = not orphan and (depth == 1 or detached_root or _is_owner_mode_row(job))
             in_card = in_card or owns_card
+            row_rail_col = (_RAIL_COL if card_rail_col is None else card_rail_col) if in_card else None
             stage_override = _projection_stage_for_dispatch(job)
             route_seq = _projection_route_seq(job)
             if job.liveness == "stale":
@@ -7214,7 +7218,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 lines.extend(_jrow(job, orphan=orphan, parent_model=row_parent_model,
                                    parent_effort=row_parent_effort, stage_override=stage_override,
                                    route_seq=route_seq, in_card=in_card,
-                                   unit_working=unit_working))
+                                    unit_working=unit_working, card_rail_col=row_rail_col))
             else:
                 lines.append(_dispatch_row(job, orphan=orphan, parent_model=row_parent_model,
                                            parent_harness=parent_harness,
@@ -7227,7 +7231,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                                            in_card=in_card, unit_working=unit_working,
                                            # F-83: unframed rows need the same right-edge
                                            # ledger to clamp their open-row breadcrumb zone.
-                                           card_interior=_dispatch_box_width(term_width, layout) - 1))
+                                            card_interior=_dispatch_box_width(term_width, layout) - 1,
+                                            card_rail_col=row_rail_col))
             # F-97b legend gate: _seen_glyphs is local to this call (R3), and
             # _branch_suffix_segs runs inside a helper with no closure over it, so the
             # loc_repo/loc_wt glyph is inferred here from the row it just emitted.
@@ -7336,11 +7341,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                     elif route_seq:
                         route_label = _route_stage_segs(
                             route_seq, unit_working or job.liveness == "working", budget)
-                    elif getattr(job, "afterglow", False) or job.liveness in ("stale", "done"):
+                    elif (getattr(job, "afterglow", False) or job.liveness == "done"
+                          or (job.liveness == "stale" and not unit_working)):
                         route_label = [("done ✓", "dim")]
-                    elif stage_override not in (None, "", "open", "running"):
-                        current = stage_override
-                        route_label = [(_clip_w(current, budget), "stg0_on" if unit_working and _BLINK_ON else "stg0_off")]
+                    elif (getattr(job, "worker_type", None) == "owner"
+                          and (job.intensity or "") != "quick" and not stage_override):
+                        route_label = [("—", "dim")]
                     else:
                         route_label = _dispatch_stage_segs(
                             job, job.key, stage_override, job.slug,

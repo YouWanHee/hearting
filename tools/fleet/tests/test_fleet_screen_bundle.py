@@ -271,7 +271,7 @@ class BundleTest(unittest.TestCase):
         self.assertEqual(collect.call_args_list, [mock.call(include_summary=False)] * 2)
 
     def test_gpu_mouse_map_uses_actual_draw_scroll_offset_in_both_views(self):
-        from .test_f27_mouse import FakeScreen
+        from fleet.tests.test_f27_mouse import FakeScreen
         render._COMPUTE_HOSTS = self.gpu_snapshot()
         for process in (False, True):
             render._PROCESS_VIEW = process
@@ -584,6 +584,84 @@ class SameRepositoryRoleTest(unittest.TestCase):
              mock.patch.object(codex, "_state_db", return_value=None):
             rows = implementation({("opencode", "wanted"): {"targets": {}}}, [])
         self.assertEqual([(row.session_id, row.cwd) for row in rows], [("wanted", str(self.repo))])
+
+    def test_target_only_native_metadata_keeps_role_and_current_metadata_still_wins(self):
+        from fleet.collectors import codex, opencode
+        db = self.repo / "targets.sqlite"
+        with sqlite3.connect(db) as con:
+            con.execute("CREATE TABLE session (id TEXT, directory TEXT)")
+            con.execute("CREATE TABLE threads (id TEXT, cwd TEXT)")
+            for table in ("session", "threads"):
+                con.executemany("INSERT INTO %s VALUES (?,?)" % table,
+                                [("target-only", str(self.worktree)),
+                                 ("unrelated", str(self.repo)), ("communication-only", str(self.repo))])
+        connect = sqlite3.connect
+        for harness in ("codex", "opencode"):
+            with self.subTest(harness=harness):
+                parent = self.row("claude", "parent", self.repo)
+                markers = {("claude", "parent"): {"targets": {
+                    "target": dict(target("target-only", harness), source="watch"),
+                    "message": dict(target("communication-only", harness), source="steer"),
+                }}}
+                rows = [parent]
+                queries = []
+
+                def readonly(*args, **kwargs):
+                    self.assertIn("mode=ro", args[0])
+                    self.assertTrue(kwargs["uri"])
+                    connection = connect(*args, **kwargs)
+                    connection.set_trace_callback(queries.append)
+                    return connection
+
+                with mock.patch.object(steward, "_native_role_sessions", side_effect=self._native_implementation), \
+                     mock.patch.object(steward, "_registry_sessions", return_value=rows), \
+                     mock.patch.object(steward, "_projection_sessions", return_value=rows), \
+                     mock.patch.object(steward, "read_markers", return_value=markers), \
+                     mock.patch.object(opencode, "_db", return_value=str(db)), \
+                     mock.patch.object(codex, "_state_db", return_value=str(db)), \
+                     mock.patch.object(herdr, "_clear_gpu_session_aliases", return_value=[]), \
+                     mock.patch.object(herdr_projection.os, "getcwd", return_value=str(self.repo)), \
+                     mock.patch.object(sqlite3, "connect", side_effect=readonly):
+                    steward.enrich(rows)
+                    self.assertTrue(parent.steward)
+                    self.assertEqual(parent.steward_targets[0]["session_id"], "target-only")
+                    self.assertTrue(herdr_projection.is_steward("claude", "parent"))
+                    self.assertTrue(any("WHERE id='target-only'" in query for query in queries))
+                    self.assertFalse(any("unrelated" in query or "communication-only" in query
+                                         for query in queries))
+                    rows.append(self.row(harness, "target-only", self.foreign))
+                    queries.clear()
+                    steward.enrich(rows)
+                    self.assertFalse(parent.steward)
+                    self.assertFalse(herdr_projection.is_steward("claude", "parent"))
+                    self.assertEqual(queries, [])
+
+    def test_duplicate_name_with_missing_identity_cannot_bind_either_surface(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                parent = self.row(harness, "parent", self.repo)
+                known = self.row("codex", "known", self.worktree)
+                unresolved = self.row("codex", "temporary", self.repo)
+                known._herdr_name = unresolved._herdr_name = "duplicate-name"
+                unresolved.session_id = None
+                rows = [parent, known, unresolved]
+                markers = {(harness, "parent"): {"targets": {"name": {
+                    "harness": "codex", "name": "duplicate-name", "source": "start"}}}}
+                with mock.patch.object(steward, "_registry_sessions", return_value=[]), \
+                     mock.patch.object(steward, "_projection_sessions", return_value=rows), \
+                     mock.patch.object(steward, "read_markers", return_value=markers), \
+                     mock.patch.object(herdr, "_clear_gpu_session_aliases", return_value=[]), \
+                     mock.patch.object(herdr_projection.os, "getcwd", return_value=str(self.repo)):
+                    steward.enrich(rows)
+                    self.assertFalse(parent.steward)
+                    self.assertIsNone(known.steward_parents)
+                    self.assertFalse(herdr_projection.is_steward(harness, "parent"))
+                    # The existing uniquely identified name remains a valid relation.
+                    rows.remove(unresolved)
+                    steward.enrich(rows)
+                    self.assertTrue(parent.steward)
+                    self.assertEqual(known.steward_parents[0]["session_id"], "parent")
+                    self.assertTrue(herdr_projection.is_steward(harness, "parent"))
 
     def test_pane_metadata_reuses_native_seat_and_rejects_foreign_project(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "utilities"))

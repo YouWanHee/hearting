@@ -407,10 +407,9 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                         render._BLINK_ON = old
                     top = next(i for i, line in enumerate(lines)
                                if line and "rail-owner" in "".join(p for p, _k in line))
-                    divider = next(i for i, line in enumerate(lines[top:], top)
-                                   if line and "├" in "".join(p for p, _k in line))
-                    owner_keys = [key for line in lines[top:divider]
-                                  for _part, key in (line or [])]
+                    close = next(line for line in lines[top:]
+                                 if line and "╰" in "".join(p for p, _k in line))
+                    owner_keys = [key for _part, key in close]
                     self.assertIn(expected, owner_keys)
 
     def test_f66_entire_frame_uses_the_owner_rail_color(self):
@@ -440,12 +439,11 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             self.assertFalse(attr & render._A_BOLD, "frame is never bold")
         self.assertTrue(render._HUE_OF["frm_idle"][1] & render._A_DIM)
 
-    def test_card_border_keeps_equal_air_on_both_sides(self):
-        # user 2026-08-14 "테두리를 좌우 한칸씩 여백을 더 넣어서 메인세션의 하위로 보이게
-        # 강조해보자". The user has reported an asymmetric right edge twice, so the
-        # contract is measured, not assumed: the gap from the band's left edge to the
-        # left border must equal the gap from the right border to the band's right edge.
-        self.assertEqual(render._RAIL_COL, 2 + render._CARD_INSET)
+    def test_card_border_clears_connector_and_preserves_right_edge_air(self):
+        # 1008: the left inset now clears the supervisor lane; the right edge
+        # retains its previous gap while the interior alone shrinks.
+        self.assertEqual(render._RAIL_COL, 2 + render._OWNER_CARD_INSET)
+        self.assertGreater(render._RAIL_COL, render._STEWARD_LINE_COL)
         width = 175
         old = render._TINT_OK
         render._TINT_OK = True
@@ -456,7 +454,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # `_addline` shifts a tinted row by _INSET + _PAD_IN, and the band's last
         # paintable screen column is width - _INSET - 1.
         last_raw = width - 2 * render._INSET - render._PAD_IN - 1
-        self.assertEqual(last_raw - (box_width - 1), render._RAIL_COL)
+        self.assertEqual(last_raw - (box_width - 1), render._CARD_EDGE_GAP)
 
     def test_f64c_rail_hue_mirrors_the_breadcrumb_current_token(self):
         # user 2026-08-05 "컬러 안맞는데": the rail must share the exact index the lit
@@ -667,10 +665,10 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # The session's own would-be stage ("exec") never reaches its row.
         self.assertNotIn("exec", session_line)
         # The owner card carries exactly one dim `—` fallback token, not a blank slot.
+        close = next(text for text in texts if "╰" in text)
+        self.assertEqual(close.count(" — "), 1)
         segs = render._dispatch_row(owner, in_card=True, card_interior=100)
-        self.assertIn((" : ", "dim"), segs)
-        dash_idx = segs.index((" : ", "dim")) + 1
-        self.assertEqual(segs[dash_idx], ("—", "dim"))
+        self.assertNotIn((" : ", "dim"), segs)  # state moved off the model/identity line
         self.assertNotIn("execute", owner_line)
 
     def test_exact_owner_card_keeps_its_breadcrumb_with_stage_suppressed_once(self):

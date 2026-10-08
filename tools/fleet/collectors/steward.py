@@ -107,19 +107,32 @@ def _projection_sessions():
 
 
 def _native_role_sessions(markers, rows):
-    """Exact native directory metadata for marker actors absent from the snapshot.
+    """Exact native directory metadata for evidenced actors/targets absent from the snapshot.
 
     An OpenCode pane can omit its SID, and old process registry files can be
-    absent. Read only the named actors from the native metadata tables, never
+    absent. Read only named actors and evidenced targets from the native metadata tables, never
     conversation bodies, process state, or an inferred same-cwd identity.
     """
     from . import codex, opencode
     present = {key for row in rows for key in _session_keys(row)}
+    wanted = set(markers)
+    mod = _peer_message_module()
+    evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
+    for marker in markers.values():
+        try:
+            targets = evidence(marker) if evidence is not None else ()
+        except Exception:
+            continue
+        for target in targets:
+            harness = str(target.get("harness") or "").lower()
+            sid = target.get("session_id")
+            if sid:
+                wanted.add((harness, sid))
     out = []
     for harness, db, table, column in (
             ("codex", codex._state_db(codex._home()), "threads", "cwd"),
             ("opencode", opencode._db(), "session", "directory")):
-        ids = sorted({sid for h, sid in markers if h == harness and sid
+        ids = sorted({sid for h, sid in wanted if h == harness and sid
                       and (h, sid) not in present})
         if not ids or not db:
             continue
@@ -148,7 +161,9 @@ def _role_winners(markers, rows, evidence):
             by_name.setdefault((row.harness, name), []).append(row)
 
     def one(candidates):
-        identities = {(row.harness, row.session_id) for row in candidates if row.session_id}
+        if any(not row.session_id for row in candidates):
+            return None
+        identities = {(row.harness, row.session_id) for row in candidates}
         repositories = {repos[id(row)] for row in candidates}
         if len(identities) != 1 or len(repositories) != 1 or None in repositories:
             return None
@@ -186,7 +201,13 @@ def _role_winners(markers, rows, evidence):
             for child, owners in claims.items()}
 
 
-def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None):
+def _owner_targets(winners, harness, session_id):
+    targets = [claim for claim in winners.values() if claim[1] == (harness, session_id)]
+    return [entry for _rank, _parent, entry, _order in sorted(targets, key=lambda claim: claim[3])]
+
+
+def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None,
+                 _winners=None):
     """One same-repository role lookup for Fleet and herdr, with proven prior ids.
 
     Current snapshot rows override registry history for their exact join keys.
@@ -202,6 +223,8 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
     harness = str(harness or "").lower()
     if not any(markers.get((harness, sid)) for sid in [session_id, *aliases] if sid):
         return []
+    if _winners is not None:
+        return _owner_targets(_winners, harness, session_id)
     rows = _projection_sessions() if sessions is None else list(sessions)
     own_keys = {(harness, sid) for sid in [session_id, *aliases] if sid}
     if cwd is None:
@@ -221,8 +244,7 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
     if sessions is None:
         rows += _native_role_sessions(markers, rows)
     winners = _role_winners(markers, rows, evidence)
-    targets = [claim for claim in winners.values() if claim[1] == (harness, session_id)]
-    return [entry for _rank, _parent, entry, _order in sorted(targets, key=lambda claim: claim[3])]
+    return _owner_targets(winners, harness, session_id)
 
 
 def enrich(sessions, markers=None):
@@ -238,6 +260,11 @@ def enrich(sessions, markers=None):
     context = list(sessions) + [s for s in _registry_sessions()
                                 if not current_keys.intersection(_session_keys(s))]
     context += _native_role_sessions(markers, context)
+    mod = _peer_message_module()
+    evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
+    if evidence is None:
+        return
+    winners = _role_winners(markers, context, evidence)
     # target key → the stewards that named it. Built from the SAME evidence entries the
     # forward projection uses, so "who watches me" can never claim a relation that the
     # steward's own row does not also show.
@@ -246,7 +273,7 @@ def enrich(sessions, markers=None):
         keys = _session_keys(s)
         targets = role_targets(s.harness, s.session_id, markers=markers,
                                aliases=[sid for _harness, sid in keys[1:]],
-                               cwd=getattr(s, "cwd", None), sessions=context)
+                               cwd=getattr(s, "cwd", None), sessions=context, _winners=winners)
         if not targets:
             continue
         s.steward = True

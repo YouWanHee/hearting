@@ -50,6 +50,11 @@ def _session_owner(harness="codex", sid=SESSION_ID):
 
 class UnregisteredGpuTestBase(unittest.TestCase):
     def setUp(self):
+        # These fixtures check command labels and identity compaction in the
+        # expanded view; the bundle tests own the new default-fold contract.
+        fold = mock.patch.object(render, "_ROUTE_FOLD", {render._GPU_FOLD_ALL: False})
+        fold.start()
+        self.addCleanup(fold.stop)
         self.addCleanup(render.set_compute_hosts, None)
         self.addCleanup(setattr, render, "_BLINK_ON", render._BLINK_ON)
 
