@@ -236,6 +236,10 @@ For standard+ code stage dispatch, role and profile are explicit: ordinary frame
 3. Adversarial means thorough plus a selected external adversary, failure-mode, security, or claim-verification pass. `standard + external/Codex` is not the definition.
 4. Code has no fact-checker.
 5. Do not hardcode code-test to thorough or parallel QA on every call; scale final verification from intensity-derived rigor. Registry-v6 `parallel_groups` alone declare an anchor's intensity-specific width, profile, perspective, join, and independence axes. At `strong` or higher, assembly defaults to realizing each eligible declared group on a retained anchor, including reduced `--graph` routes; two-way is the baseline unless the registry widens it. Width stays 2–4, is selective rather than universal, and never applies to `direct`; at `quick` it reaches the bootstrap layer alone — the two frame legs before owner launch — and not quick's work graph, which stays exactly one `one-shot` node.
+   Missing review consumers or auxiliary arbiters are restored from the group's
+   unique safe recipe consumer, with existing gates, scopes, and fan-in; compose
+   reports the addition. Only unsafe or ambiguous completions remain warnings
+   (`WORKFLOW §0.2.1`). Standard/lower and sealed historical graphs keep their shape.
 6. `--no-fact-check` and `--no-style-audit` must not leak to unrelated capabilities.
 7. An external review wrapper is not the reviewer; separate the independent engine from the mechanical orchestrator.
 8. New or strengthened instructions, rules, and hooks preserve why, including the motivating incident and date, inline or in the commit message. Drills are the strongest executable preservation of intent.
