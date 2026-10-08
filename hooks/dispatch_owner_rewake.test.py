@@ -2840,7 +2840,9 @@ class SupervisionWakeRearmTest(unittest.TestCase):
              mock.patch.object(rewake.sys, "stdout", stdout), \
              mock.patch.object(rewake.sys, "stderr", stderr), \
              mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
-             mock.patch.object(rewake, "wait_for_attempt", return_value=(wait_state, "test-readiness")):
+             mock.patch.object(rewake, "wait_for_attempt",
+                               side_effect=wait_state if callable(wait_state) else None,
+                               return_value=(wait_state, "test-readiness")):
             code = rewake.main()
         return code, stderr.getvalue()
 
@@ -2925,6 +2927,58 @@ class SupervisionWakeRearmTest(unittest.TestCase):
         self.assertEqual(record["state"], "sent-ambiguous")
         self.assertIsNone(record["acked_by"])
 
+    def _wake_and_sweep(self):
+        from dispatch_session_sweep import sweep_deliver, ack_delivered
+        self.assertEqual(self._run("gate")[0], 2)
+        self._dead_holder()
+        records, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual(ack_delivered(self.root, "session-1", records, acked_by="parent-prompt"), 1)
+
+    def test_stop_keeps_watching_after_an_attention_turn_with_no_bash(self):
+        self._wake_and_sweep()
+        completion = []
+
+        def finish_during_wait(*args, **kwargs):
+            arm = rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))
+            self.assertEqual((arm["arms"], arm["state"]), (2, "waiting"))
+            completion.append(self._complete_owner())
+            return "ready", "terminal-quiescent"
+
+        stop = {"hook_event_name": "Stop", "session_id": "session-1", "stop_hook_active": True}
+        code, text = self._run(finish_during_wait, stop)
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", text)
+        self.assertEqual(json.loads(completion[0].read_text())["state"], "sent-ambiguous")
+        self.assertEqual(rewake.registry_launch(stop).reason, "ended")
+
+    def test_stop_delivers_a_completion_that_preceded_the_turn_end(self):
+        self._wake_and_sweep()
+        completion = self._complete_owner()
+        stop = {"hook_event_name": "Stop", "session_id": "session-1"}
+        self.assertEqual(self._run("ready", stop)[0], 2)
+        self.assertEqual(json.loads(completion.read_text())["state"], "sent-ambiguous")
+
+    def test_stop_never_first_arms_or_takes_a_foreign_or_live_arm(self):
+        stop = {"hook_event_name": "Stop", "session_id": "session-1"}
+        self.assertIsNone(rewake.registry_launch(stop))  # no ledger yet
+        claim = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)
+        self.assertEqual(rewake.registry_launch(stop).reason, "held-live")
+        self._dead_holder()
+        self.assertIsNone(rewake.registry_launch({**stop, "session_id": "foreign"}))
+        self.assertEqual(rewake._read_arm(claim.path)["arms"], 1)
+        self.assertIsNone(rewake.registry_launch({**stop, "hook_event_name": "SubagentStop"}))
+
+    def test_claude_stop_registers_the_same_async_completion_carrier(self):
+        settings = json.loads((ROOT / "adapters/claude/settings.json").read_text())
+        by_event = {}
+        for event in ("PostToolUse", "Stop"):
+            by_event[event] = [hook for entry in settings["hooks"][event]
+                               for hook in entry["hooks"]
+                               if "dispatch-owner-rewake.py" in hook.get("command", "")]
+        self.assertEqual(len(by_event["Stop"]), 1)
+        self.assertEqual(by_event["Stop"], by_event["PostToolUse"])
+        self.assertTrue(by_event["Stop"][0]["asyncRewake"])
+
 
 class GateCloseRearmTest(GateCarrierTest):
     """SD-129 without command parsing: the wake spent on a gate is re-armed by
@@ -2963,6 +3017,15 @@ class GateCloseRearmTest(GateCarrierTest):
                         self.call()["tool_input"]["command"]):
             with self.subTest(command=command):
                 self.assertNotIsInstance(rewake.registry_launch(self.call(command)), tuple)
+
+    def test_stop_rearms_only_after_the_human_gate_record_closes(self):
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        stop = {"hook_event_name": "Stop", "session_id": "session-gate"}
+        self.assertEqual(rewake.registry_launch(stop).reason, "gate-open")
+        rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+        launch, claim = rewake.registry_launch(stop)
+        self.assertEqual((launch.attempt_id, claim.arms), ("att-gate-owner", 2))
 
     def test_the_first_call_after_the_gate_closes_rearms_the_owner(self):
         delivery_id = self._gate_record(state="sent-ambiguous")

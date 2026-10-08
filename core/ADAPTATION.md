@@ -494,7 +494,11 @@ stamp path in `core/HOOKS.md`.
   returns only its own supervision-notice claims to the existing queue. The
   synchronous prompt sweep on the awakened turn can consume or retire them
   immediately, allowing that turn's next Bash call to re-arm the same attempt
-  for completion. The async emit is not an acknowledgement; a lost wake stays
+  for completion. At the end of a turn, the same async carrier also runs on
+  Claude `Stop` and may re-take only an existing arm bound to that session;
+  it never first-arms a fresh row there. Thus an attention turn with no Bash
+  call still resumes the exact completion wait, while a live holder or an
+  ended arm stays quiet. The async emit is not an acknowledgement; a lost wake stays
   recoverable. Human-gate notices retain their existing speculative lease and
   release semantics, and another carrier's successor claim is preserved.
 - The interactive Claude `asyncRewake` bridge never reads the Bash command

@@ -423,9 +423,13 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | N
     own call or the next one. A row older than the arm window is a first-time
     refusal (the next-prompt sweep owns stale completions); a row whose claim
     lapsed -- its holder died with the session, or its gate wake was spent and
-    the gate has since closed -- is re-armed regardless of age."""
+    the gate has since closed -- is re-armed regardless of age. Stop can
+    re-take only an existing claim, so a tool-free attention turn continues
+    its completion wait without discovering new starts at that boundary."""
 
-    gate = _bash_call(payload)
+    stopping = isinstance(payload, dict) and payload.get("hook_event_name") == "Stop"
+    session = _payload_session(payload) if stopping else None
+    gate = (payload, session) if session else _bash_call(payload)
     if gate is None:
         return None
     payload, session = gate
@@ -442,6 +446,8 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | N
     # may have finished between the release and this call (top review M1).
     for attempt_id, age in _session_owner_rows(jobs, session, statuses=RECEIPT_ROW_STATUSES):
         fresh = attempt_id in open_rows and age <= window
+        if stopping and not arm_path(jobs, attempt_id).exists():
+            continue
         if attempt_id not in open_rows and not arm_path(jobs, attempt_id).exists():
             continue
         claim = claim_arm(jobs, attempt_id, session, fresh=fresh)
