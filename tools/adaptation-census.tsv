@@ -45,6 +45,7 @@ shared-utility-deferred	governor_identity.py
 shared-utility-deferred	hearting_gates.py
 shared-utility-deferred	interactive-main-recovery.py
 shared-utility-deferred	memory-store.sh
+shared-utility-deferred	merge-line.py
 shared-utility-deferred	opencode_session_runtime.py
 shared-utility-deferred	owner_write_advisory.py
 shared-utility-deferred	gpu_execution_sandbox.py
