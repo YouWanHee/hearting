@@ -45,6 +45,23 @@ class ReplacementTest(unittest.TestCase):
 
     def claim(self):return R.claim(self.jobs,'att-source')
 
+    def bind_source_parent(self, *, carrier=False):
+        self.args.dispatch_depth=1
+        self.args.execution_surface='registered-headless';self.args.registered_worker=True
+        R.route_authority.bind_runtime_parent(self.args,environ={'CODEX_THREAD_ID':'parent'})
+        if carrier:self.args.parent_completion_delivery='codex-native-queue'
+        self.meta['parent_harness']='codex'
+        # Replace the original temporary fixture before it has any claim or launch.
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args,'codex','the raw task')))
+        self.write(self.meta)
+
+    def parent_env(self, parent, harness):
+        from harness_capabilities import CARRIER_ENV, parent_completion
+        variable={'claude':'CLAUDE_SESSION_ID','codex':'CODEX_THREAD_ID','opencode':'OPENCODE_SESSION_ID'}[harness]
+        return {variable:parent,'AGENT_DISPATCH_CALLER_HARNESS':harness,
+                CARRIER_ENV:f"{parent_completion(harness)['carrier']}:{parent}"}
+
     def handover(self, successor='successor', harness='claude', **binding_changes):
         import dispatch_seat_handover as H
         import session_tidy as S
@@ -62,6 +79,12 @@ class ReplacementTest(unittest.TestCase):
         replay=R.launch_input(self.jobs,'att-source',source)
         args=SimpleNamespace(**vars(self.args));args.attempt_id=record['replacement_attempt_id']
         args.replacement_input_argv=R._replacement_argv(record,source,replay)
+        if hasattr(args,'parent_session_id'):
+            with mock.patch.dict(os.environ,self.parent_env(parent,harness),clear=True):
+                R.route_authority.bind_runtime_parent(args)
+                if hasattr(args,'parent_completion_delivery'):
+                    from dispatch_parent_completion import resolve_parent_completion_delivery
+                    args.action='start';args.parent_completion_delivery=resolve_parent_completion_delivery(args)
         candidate={**self.meta,'attempt_id':record['replacement_attempt_id'],
                    'automatic_retry_of':'att-source','parent_sid':parent,'parent_harness':harness}
         candidate.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
@@ -70,7 +93,7 @@ class ReplacementTest(unittest.TestCase):
     def test_handover_owner_replacement_registers_and_lineage_reuses_the_same_claim(self):
         import review_round_cap as ROUND
         self.meta.update(worker_type='owner',owner_route_id='rt-test',owner_route_hash='sha256:test')
-        self.write(self.meta)
+        self.bind_source_parent()
         self.handover()
         record=self.claim();candidate=self.replacement_candidate(record)
         before=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
@@ -89,16 +112,59 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual([meta['attempt_id'] for _,meta in projected],[candidate['attempt_id']])
         self.assertEqual(self.claim(),record)
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+        # B's registered edge survives B -> C; B no longer admits a fresh launch.
+        import dispatch_seat_handover as H
+        import session_tidy as S
+        ledger=S._ledger_path(S.Seat('pane','replacement-test-seat','wY:p5'))
+        with ledger.open('a') as handle:
+            handle.write(json.dumps({'event':'handover','from':'successor','sid':'next-successor',
+                                     'harness':'opencode','ts':2,
+                                     'bindings':[H.binding_of(self.jobs,registered[candidate['attempt_id']][1])]})+'\n')
+        self.assertEqual(R.effective_attempts(self.jobs,{'att-source'}),(effective,mapping))
+        projected=ROUND.logical_round_records(list(registered.values()),jobs=self.jobs)
+        self.assertEqual([meta['attempt_id'] for _,meta in projected],[candidate['attempt_id']])
+        self.assertFalse(R.route_authority.replacement_parent_matches(registered['att-source'][1],candidate,self.jobs))
+        self.assertEqual(self.claim(),record)
 
     def test_handover_replacement_admission_is_shared_by_all_parent_harnesses(self):
+        self.bind_source_parent(carrier=True)
         record=self.claim()
         for harness in ('claude','codex','opencode'):
             with self.subTest(harness=harness):
+                (R._directory(self.jobs)/'inputs'/(record['replacement_attempt_id']+'.json')).unlink(missing_ok=True)
                 self.handover(harness=harness)
                 candidate=self.replacement_candidate(record,harness=harness)
-                self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate),record)
+                from harness_capabilities import parent_completion
+                sealed=R.launch_input(self.jobs,candidate['attempt_id'],candidate)
+                self.assertEqual(sealed['resolved']['parent_completion_delivery'],parent_completion(harness)['carrier'])
+                with mock.patch.dict(os.environ,self.parent_env('successor',harness),clear=True):
+                    self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate),record)
+
+    def test_handover_launch_input_changes_only_the_confirmed_parent_values(self):
+        self.bind_source_parent();self.handover()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        path=R._directory(self.jobs)/'inputs'/(candidate['attempt_id']+'.json')
+        original=json.loads(path.read_text())
+        mutations=[('resolved',{key:'foreign'}) for key in
+                   ('parent_session_id','parent_harness','parent_attempt_id','parent_transport','parent_sandbox','sandbox')]
+        mutations += [('argv',R._canonical_argv(R._replace_options(original['argv'],{'--parent-session-id':'foreign'}))),
+                      ('applied_permissions',{'execution_access':{'request_sha256':'foreign'}})]
+        for field,value in mutations:
+            with self.subTest(field=field,value=value):
+                payload=json.loads(json.dumps(original))
+                if field=='resolved':payload[field].update(value)
+                else:payload[field]=value
+                path.write_text(json.dumps(payload))
+                changed={**candidate,'replacement_input_digest':R._digest(payload)}
+                with self.assertRaises(D.DispatchContractError) as refused:
+                    R.admission(self.jobs,self.jobs.read_text().splitlines(),changed)
+                self.assertEqual(refused.exception.reason,
+                                 'replacement-argv-mismatch' if field=='argv' else 'replacement-input-tuple-mismatch')
+        path.write_text(json.dumps(original))
+        self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate),record)
 
     def test_handover_admission_keeps_unrelated_parents_and_other_bindings_strict(self):
+        self.bind_source_parent()
         self.handover()
         record=self.claim();candidate=self.replacement_candidate(record)
         lines=self.jobs.read_text().splitlines()
@@ -112,6 +178,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertFalse(any(fields[1]=='open' for fields,_ in R._rows(lines).values()))
 
     def test_handover_for_a_different_route_node_or_registry_does_not_authorize(self):
+        self.bind_source_parent()
         record=self.claim();candidate=self.replacement_candidate(record)
         for change in ({},{'route':'rt-other'},{'hash':'sha256:other'},{'node':'other'},
                        {'jobs':str(self.root/'foreign-jobs.log')}):

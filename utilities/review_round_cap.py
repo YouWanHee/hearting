@@ -131,7 +131,7 @@ def logical_round_records(rows, *, jobs=None):
                 or candidate.get('replacement_claim_digest') != digest
                 or candidate.get('replacement_ordinal') != '1'
                 or candidate_fields[2:4] != fields[2:4]
-                or not replacement_parent_matches(source, candidate, jobs)
+                or not replacement_parent_matches(source, candidate, jobs, lineage=True)
                 or any(candidate.get(key) != source.get(key) for key in
                        ('route_node', 'worker_type', 'dispatch_depth'))):
             continue

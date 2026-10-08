@@ -660,7 +660,7 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         _, prior = references[0]
         if (prior.get('retry_ordinal') != '1' or not prior.get('recovery_id')
                 or DC._stable_recovery_attempt_id(prior['recovery_id']) != aid
-                or not route_authority.replacement_parent_matches(prior, source, jobs)
+                or not route_authority.replacement_parent_matches(prior, source, jobs, lineage=True)
                 or any(prior.get(key) != source.get(key) for key in
                        ('route_node',
                         'worker_type', 'dispatch_depth'))):
@@ -764,7 +764,7 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         direct = (previous is not None or other in reference_ids or other == aid
                   or prior.get('automatic_retry_of') == aid)
         if prior.get('automatic_retry_of') == aid and (
-                not route_authority.replacement_parent_matches(source, prior, jobs)
+                not route_authority.replacement_parent_matches(source, prior, jobs, lineage=True)
                 or any(prior.get(key) != source.get(key) for key in
                        ('route_id', 'route_hash', 'route_node', 'worker_type', 'dispatch_depth'))):
             raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
@@ -1117,6 +1117,17 @@ def admission(jobs, lines, metadata):
             raise DC.DispatchContractError('replacement-subsession-scope-mismatch')
     _, source, replay = validate_claim_source(jobs, lines, record)
     candidate = launch_input(jobs, metadata['attempt_id'], metadata)
+    parent_values = {}
+    if source.get('dispatch_depth') == '1' and metadata.get('parent_sid') != source.get('parent_sid'):
+        from dispatch_seat_handover import effective_parent_harness
+        parent_values = {'parent_session_id': metadata['parent_sid'],
+                         'parent_harness': effective_parent_harness(source, jobs)}
+        if 'parent_completion_delivery' in (candidate.get('resolved') or {}):
+            from types import SimpleNamespace
+            from dispatch_parent_completion import resolve_parent_completion_delivery
+            parent_args = SimpleNamespace(**{**candidate['resolved'], **parent_values,
+                                            'action': 'start', 'dispatch_depth': 1})
+            parent_values['parent_completion_delivery'] = resolve_parent_completion_delivery(parent_args)
     if source.get('review_input_digest') or metadata.get('review_input_digest'):
         from review_input import read_binding
         original_input = read_binding(jobs, source, verify_current=True)
@@ -1136,10 +1147,10 @@ def admission(jobs, lines, metadata):
             if candidate.get(key) != replay.get(key):
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
     else:
-        _check_tuple(candidate, replay, _transition_of(record), record.get('execution_access'))
+        _check_tuple(candidate, replay, _transition_of(record), record.get('execution_access'), parent_values)
     if candidate.get('task') != expected_task:
         raise DC.DispatchContractError('replacement-task-mismatch')
-    expected_argv = _replacement_argv(record, source, replay)
+    expected_argv = _replacement_argv(record, source, replay, parent_values)
     if not moved and candidate.get('argv') != expected_argv:
         raise DC.DispatchContractError('replacement-argv-mismatch')
     if Path(record['route_file']).with_suffix('.outcome.json').exists():
@@ -1158,7 +1169,7 @@ RUNTIME_DERIVED_KEYS = route_authority.RELEASE_DERIVED_VALUES
 PROFILE_DERIVED_KEYS = frozenset({'model_profile', 'model', 'reasoning', 'resolved_model_settings'})
 
 
-def _check_tuple(candidate, replay, transition=None, access=None):
+def _check_tuple(candidate, replay, transition=None, access=None, parent_values=None):
     """The candidate must match the sealed input; only runtime-derived values may follow a new release,
     and only the profile-derived ones may follow a verified profile transition."""
     for key in route_authority.REPLACEMENT_FIXED_KEYS:
@@ -1168,7 +1179,7 @@ def _check_tuple(candidate, replay, transition=None, access=None):
     drift = candidate.get('launch_home') != replay.get('launch_home')
     old, new = replay.get('resolved') or {}, candidate.get('resolved') or {}
     for key in sorted(set(old) | set(new)):
-        if old.get(key) != new.get(key):
+        if (parent_values or {}).get(key, old.get(key)) != new.get(key):
             if (transition and key in PROFILE_DERIVED_KEYS and old.get('model_profile') == transition['from']
                     and new.get('model_profile') == transition['to']
                     and (key != 'resolved_model_settings'
@@ -1299,8 +1310,11 @@ def _access_in_force(jobs, route):
             'at': change['at'] if change else None}
 
 
-def _replacement_argv(record, source, replay):
+def _replacement_argv(record, source, replay, parent_values=None):
     options = {}
+    for key in ('parent_session_id', 'parent_harness'):
+        if key in (parent_values or {}):
+            options['--'+key.replace('_','-')] = parent_values[key]
     access = record.get('execution_access')
     if access:
         options['--execution-access-file'] = access['request_path']
@@ -1643,7 +1657,7 @@ def effective_attempts(jobs, attempts):
         if (target.get('replacement_claim_digest') != _digest(record)
                 or target.get('replacement_family_id') != family or target.get('automatic_retry_of') != aid
                 or target.get('replacement_original_attempt_id') != aid
-                or not route_authority.replacement_parent_matches(source, target, jobs)
+                or not route_authority.replacement_parent_matches(source, target, jobs, lineage=True)
                 or any(target.get(k) != source.get(k) for k in ('worker_type','dispatch_depth'))):
             raise DC.DispatchContractError('replacement-lineage-unproven',replacement)
         effective.discard(aid); effective.add(replacement)
