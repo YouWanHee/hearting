@@ -56,33 +56,27 @@ def _owner(route_seq=LONG_ROUTE, done=3, total=7):
 
 
 class BottomRailGeometryTest(unittest.TestCase):
-    def test_only_the_current_active_route_label_blinks_without_moving_the_rail(self):
+    def test_shared_manual_phase_pulses_current_route_label_without_moving_the_rail(self):
         seq = [("plan-check(R1)", "done"), ("execute(R2)", "active"),
-               ("parallel-check", "active"), ("test", "pending"), ("report", "pending")]
+               ("parallel-check", "pending"), ("test", "pending"), ("report", "pending")]
         for width in (60, 100, 120, 168):
             with self.subTest(width=width):
-                label = render._route_stage_segs(seq, working=False,
-                                                max_width=render.bottom_label_budget(width))
-                blinking = [(t, k) for t, k in label if k and k.endswith("_blink")]
-                self.assertEqual(len(blinking), 1)
-                self.assertIn("execute", blinking[0][0])
-                colored = render._snapshot_line(label, colored=True)
-                self.assertEqual(colored.count("\033[5m"), 1)
-                plain_keys = [(t, k[:-6] if k and k.endswith("_blink") else k) for t, k in label]
-                rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=label)
-                plain_rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=plain_keys)
-                self.assertEqual(_text(rail), _text(plain_rail))
+                labels = []
+                for phase in (True, False):
+                    with mock.patch.object(render, "_BLINK_ON", phase):
+                        labels.append(render._route_stage_segs(seq, working=True,
+                                      max_width=render.bottom_label_budget(width)))
+                self.assertNotEqual(labels[0], labels[1])
+                self.assertEqual(render._snapshot_line(labels[0]), render._snapshot_line(labels[1]))
+                self.assertNotIn("\033[5m", render._snapshot_line(labels[0], colored=True))
+                rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=labels[0])
+                other_rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=labels[1])
+                self.assertEqual(_text(rail), _text(other_rail))
                 self.assertEqual(_w(rail), width)
 
-    def test_curses_blink_preserves_the_base_color_and_weight_with_or_without_tint(self):
-        label = render._route_stage_segs(LONG_ROUTE, working=True, max_width=100)
-        key = next(k for t, k in label if t == "execute")
-        self.assertTrue(key.endswith("_blink"))
-        base = key[:-6]
-        for tint in (None, "a"):
-            self.assertEqual(render._key_attr(key, tint), render._key_attr(base, tint) | render._A_BLINK)
-        with mock.patch.object(render, "_A_BLINK", 0):
-            self.assertEqual(render._key_attr(key), render._key_attr(base))
+    def test_shared_blink_cycle_has_one_second_on_and_one_second_off(self):
+        self.assertEqual([render._blink_phase(t) for t in (0, 0.5, 0.999, 1, 1.5, 1.999, 2)],
+                         [True, True, True, False, False, False, True])
 
     def test_done_pending_and_blocked_routes_have_no_native_blink(self):
         for seq in ([("execute", "done"), ("test", "pending")],
@@ -332,8 +326,30 @@ class CardIntegrationTest(unittest.TestCase):
                     self.assertTrue(render._route_rides_the_rail(job, seq, in_card=True))
                     for row in rows:
                         self.assertLessEqual(render._dw(row), width)
-                    snapshot = render._snapshot_line(render._route_stage_segs(seq, False, 60), colored=True)
-                    self.assertEqual("\033[5m" in snapshot, state == "active")
+                    phases = []
+                    for phase in (True, False):
+                        with mock.patch.object(render, "_BLINK_ON", phase):
+                            phases.append(render._route_stage_segs(seq, True, 60))
+                    self.assertEqual(phases[0] != phases[1], state == "active")
+                    self.assertNotIn("\033[5m", render._snapshot_line(phases[0], colored=True))
+
+    def test_one_shot_resource_child_leaves_label_on_close_rail_not_divider(self):
+        from fleet.model import ResourceJob, Session
+        job = _owner(route_seq=[("one-shot", "active")], done=0, total=1)
+        job.attempt_id = "att-one-shot-resource"
+        job.parent_sid, job.is_child = "sid-parent", True
+        resource = ResourceJob(run_id="one-shot-run", cwd=job.cwd, node="one-shot",
+                               parent_attempt_id=job.attempt_id, liveness="working")
+        job.resource_children = [resource]
+        session = Session(harness="claude", pid=915, cwd=job.cwd, session_id="sid-parent",
+                          slug="main-parent", liveness="working")
+        for width in (80, 168):
+            lines = render._build_lines([session], [job], "both", False, 0,
+                                        layout=render._layout_mode(width), term_width=width,
+                                        resources=[resource])
+            rows = [_text(line) for line in lines if line]
+            self.assertTrue(any("╰" in row and "one-shot" in row for row in rows))
+            self.assertFalse(any("├" in row and "one-shot" in row for row in rows))
 
     def test_breadcrumb_survives_when_every_descendant_folded_to_done(self):
         # F-81's own regression: an owner whose children are ALL `done` folds them out of

@@ -55,7 +55,6 @@ from .session_handle import session_id_for_derived_name as _session_id_for_deriv
 _A_BOLD = getattr(curses, "A_BOLD", 0)
 _A_DIM = getattr(curses, "A_DIM", 0)
 _A_REVERSE = getattr(curses, "A_REVERSE", 0)
-_A_BLINK = getattr(curses, "A_BLINK", 0)
 
 # Low-chroma xterm-256 palette. Semantic axes stay green/yellow/red and
 # cyan/magenta/blue, but the stock primaries are replaced with softer midtones.
@@ -167,7 +166,7 @@ _HUE_OF = {
     "loc_repo": ("w", 0),
     "qa_quick": ("d", _A_D), "qa_light": ("d", _A_D), "qa_standard": ("d", 0),
     "qa_thorough": ("d", _A_B), "qa_adversarial": ("d", _A_B),
-    "g_work": ("g", _A_B), "g_work_off": ("g", _A_D), "route_current": ("d", 0),
+    "g_work": ("g", _A_B), "g_work_off": ("g", _A_D),
     "g_spin": ("v", 0), "g_spin_dim": ("v", _A_D), "g_idle": ("y", 0),
     "g_stale": ("d", _A_D), "g_dead": ("r", _A_B), "g_unused": ("y", _A_D),
     # F-60: `blocked` is RED, on its own key. It shares a hue with `g_dead` but never a key —
@@ -255,10 +254,6 @@ _HUE_OF = {
     # per-row glyph and can never be confused with a word on the first line.
     "hearting_name": ("v", _A_B),
 }
-_HUE_OF.update({key + "_blink": (hue, attr | _A_BLINK)
-                for key, (hue, attr) in list(_HUE_OF.items())
-                if isinstance(key, str) and (key.startswith("stg")
-                                             or key in ("g_work", "route_current"))})
 
 # F-76b — the NAME zone wears the harness hue, but on its OWN keys rather than reusing
 # `hb_*`/`h_*`. The color is identical; the separate key is what keeps a row's name
@@ -282,8 +277,6 @@ NAME_KEYS = frozenset(list(_NAME_KEY.values()) + list(_NAME_KEY_DIM.values())
 
 def _key_attr(key, tint=None):
     """Attr for a color_key, composed with the row's tint background when active (spec §5.3)."""
-    if isinstance(key, str) and key.endswith("_blink"):
-        return _key_attr(key[:-6], tint) | _A_BLINK
     if tint is None or not _TINT_OK:
         return _COLOR.get(key, 0)
     hue, attr = _HUE_OF.get(key, ("d", 0))
@@ -595,7 +588,11 @@ _COOL_RING = "○"        # Long-inactive directory.
 _COOL_TIME_ICON = "✓"   # Prefix for elapsed time since completion.
 
 
-_BLINK_ON = True     # manual blink phase (toggled ~2 Hz in the live loop) — drives the spinner too
+_BLINK_ON = True     # shared manual blink: one second on, one second off
+
+
+def _blink_phase(now):
+    return int(now) % 2 == 0
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # braille loading spinner — working SESSIONS animate (user 2026-07-03);
                      # the blinking green ● moved up to the directory title
 
@@ -1274,8 +1271,7 @@ def _route_stage_segs(route_seq, working, max_width):
         elif st == "done":
             items.append((i, nid + " ✓", "stg%d_off" % (i % 5)))
         elif st == "active":
-            key = _cur_key(i)
-            items.append((i, nid, key + "_blink" if i == cur_i else key))
+            items.append((i, nid, _cur_key(i)))
         else:
             # pending (and any residual skipped that a caller did not filter) — the name in the
             # dim off-hue, no glyph. Kept glyph-free on purpose: ✓/✕ are the only markers, and a
@@ -3987,8 +3983,9 @@ def _route_chain_node_segs(node, with_knobs, tag_by_key, is_current=False, worki
         return [(label + " ○", "dim")]
     knobs = _route_chain_node_knobs(node, with_knobs)
     if is_current:
-        lit = (("g_work_blink" if working else "route_current_blink")
-               if state == "open" else None)
+        lit = None
+        if state == "open":
+            lit = ("g_work" if _BLINK_ON else "g_work_off") if working else (None if _BLINK_ON else "dim")
         segs = [(label, lit)]
         if knobs:
             segs += [("(", "dim"), (knobs, "dim"), (")", "dim")]
@@ -7567,9 +7564,6 @@ def _snapshot_line(segs, colored=False, colors=256):
         return _plain(segs)
     out = []
     for text, key in segs:
-        blink = isinstance(key, str) and key.endswith("_blink")
-        if blink:
-            key = key[:-6]
         piece = _plain([(text, key)])
         if key == "tag_steward":
             style = "\033[1;38;5;219m" if colors >= 256 else "\033[1;35m"
@@ -7577,8 +7571,6 @@ def _snapshot_line(segs, colored=False, colors=256):
         elif key in {"gpu_legacy", "gpu_legacy_active"}:
             style = "\033[38;5;137m" if colors >= 256 else "\033[33m"
             piece = style + piece + "\033[0m"
-        if blink:
-            piece = "\033[5m" + piece + "\033[0m"
         out.append(piece)
     return "".join(out)
 
@@ -8562,7 +8554,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 if compute_host_update is not None:
                     compute_host_generation, compute_host_snapshot = compute_host_update
                     set_compute_hosts(compute_host_snapshot)
-            _BLINK_ON = (int(now * 2) % 2 == 0)
+            _BLINK_ON = _blink_phase(now)
 
             if ch in (ord("q"), ord("Q")):
                 return 0
