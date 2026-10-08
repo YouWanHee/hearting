@@ -791,10 +791,11 @@ def _proposal_rows(route, jobs, root, record, output):
     module = _route_module()
     readiness = {}
 
-    def probe():
-        if "value" not in readiness:
-            readiness["value"] = module.proposal_readiness(route, jobs)
-        return readiness["value"]
+    def probe(cwd=None):
+        key = cwd or route["cwd"]
+        if key not in readiness:
+            readiness[key] = module.proposal_readiness({**route, "cwd": key}, jobs)
+        return readiness[key]
 
     def compile_leg(leg, index):
         return module.compile_proposal_leg(leg, index, frame_route=route, frame_cycle_id=record["cycle_id"],
@@ -1027,6 +1028,7 @@ def _decide(route, jobs, root, record, output, briefs, intent):
     record_rel = (output / RP.RECORD_RELATIVE).relative_to(root).as_posix()
     compose = {
         "leg": 0, **{key: leg[key] for key in ("capability", "mode", "shape", "graph", "intensity")},
+        **({"cwd": leg["cwd"]} if leg.get("cwd") else {}),
         "route_plan": record_rel + "#0",
         "context": {"cwd": route["cwd"], "artifact_root": str(root), "slug": route.get("slug") or "framed",
                     "campaign_key": route.get("campaign_key"), "parent_cycle": record["cycle_id"],
@@ -1089,7 +1091,7 @@ def _first_leg(route, path, jobs, result, root, record, output, record_path, dec
             if key not in readiness:
                 readiness[key] = module.proposal_readiness({**route, "cwd": key}, jobs)
             return readiness[key]
-        leg = {key: compose[key] for key in ("capability", "mode", "shape", "graph", "intensity")}
+        leg = {**binding["leg"], **{key: compose[key] for key in ("capability", "mode", "shape", "graph", "intensity")}}
         try:
             leg_route = module.compile_first_leg(
                 leg, frame_route=route, frame_cycle_id=record["cycle_id"], context=context, binding=binding,

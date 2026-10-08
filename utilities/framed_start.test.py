@@ -628,6 +628,67 @@ class RuntimeBuiltInterviewTest(StartBase):
 class LegWorktreeTest(StartBase):
     """A source-changing leg runs in its own worktree, prepared from the frame's checkout."""
 
+    def test_an_existing_linked_worktree_is_used_for_validation_launch_and_replay(self):
+        repo = self.root.parent / "source"
+        worktree = self.root.parent / "source-wt" / "chosen folder"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                        "commit", "-q", "--allow-empty", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "chosen", str(worktree)], check=True)
+        dirty = worktree / "uncommitted.py"
+        dirty.write_text("pending source\n", encoding="utf-8")
+        chosen = {**CODE_STAGED, "cwd": str(worktree)}
+        self.set_briefs(chosen, chosen)
+        self.set_interview({"legs": [chosen]})
+        probed = []
+
+        def readiness(frame_route, jobs):
+            probed.append(frame_route["cwd"])
+            return {"tuples": [{**T.nested(parent, child), "checked_worktree": frame_route["cwd"]}
+                               for parent in ("claude", "codex", "opencode")
+                               for child in ("claude", "codex", "opencode")],
+                    "candidates": T.registered_headless()["candidates"]}
+
+        with mock.patch.object(R, "proposal_readiness", side_effect=readiness), \
+                mock.patch.object(R, "prepare_isolated_worktree") as prepare:
+            result = self.settle()
+            replay = self.settle()
+        self.assertTrue(result["owner_started"], result)
+        prepare.assert_not_called()
+        self.assertTrue(probed)
+        self.assertEqual(set(probed), {str(worktree)})
+        (leg_path,) = self.leg_routes()
+        leg = json.loads(leg_path.read_text(encoding="utf-8"))
+        self.assertEqual(leg["cwd"], str(worktree))
+        self.assertEqual(R.verify_route(copy.deepcopy(leg), worktree)["cwd"], str(worktree))
+        self.assertEqual(replay["route_id"], leg["route_id"])
+        self.assertEqual(len(self.leg_calls), 1)
+        command = self.leg_calls[0]
+        self.assertEqual(Path(command[command.index("--route-evidence") + 1]), leg_path)
+        self.assertEqual({row["checked_worktree"] for row in leg["dispatch_evidence"]["tuples"]}, {str(worktree)})
+        self.assertEqual(dirty.read_text(encoding="utf-8"), "pending source\n")
+        self.assertEqual(self.record()["decision"]["proposal"]["legs"][0]["cwd"], str(worktree))
+
+    def test_a_later_leg_uses_its_own_folder_and_relative_paths_use_the_original_frame(self):
+        one, two = self.root.parent / "one", self.root.parent / "two"
+        one.mkdir()
+        two.mkdir()
+        relative = os.path.relpath(two, self.route["cwd"])
+        first, second = {**DIRECT, "cwd": str(one)}, {**DIRECT, "cwd": relative}
+        self.set_briefs([first, second], [first, second])
+        self.set_interview({"legs": [first, second]})
+        self.assertEqual(self.settle()["state"], "inline")
+        (first_path,) = self.leg_routes()
+        first_route = json.loads(first_path.read_text(encoding="utf-8"))
+        cycle = self.finish_leg(first_route, first_path)
+        projected = RP.project_next_leg(first_route, cycle)
+        argv = shlex.split(projected["compose_command"])
+        self.assertEqual(argv[argv.index("--cwd") + 1], str(two))
+        result = W.start_work(first_route, first_path, self.jobs, run=self.fake_run)
+        second_route = json.loads(Path(result["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(second_route["cwd"], str(two))
+        self.assertEqual(second_route["route_plan"]["index"], 1)
+
     def test_the_first_source_changing_leg_is_sealed_in_the_prepared_worktree_with_its_own_probe(self):
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp) / "repo-wt" / "framed"
