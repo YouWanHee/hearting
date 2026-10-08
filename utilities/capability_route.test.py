@@ -7016,6 +7016,40 @@ class ComposeRouteTest(TestRoute):
     self.assertEqual(R._resolve_auxiliary_arbiter(route,group["id"]),("node","owner-close"))
    R.verify_route(route,R.ROOT)
 
+ def test_auto_owner_close_assignment_and_auxiliary_completion(self):
+  import worker_bootstrap as W
+  from types import SimpleNamespace
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   route=self.compose(capability="audit",capability_mode="default",intensity="thorough",
+                      graph="inspect,autopilot-research:retrieval",artifact_root=str(root))
+   path=root/"route.json";path.write_text(json.dumps(route))
+   owner=route["nodes"][-1];group=route["parallel_groups"][0]
+   auxiliary=R._realized_auxiliary_nodes(route,group["id"])
+   self.assertEqual(len(auxiliary),1)
+   for harness in ("claude","codex","opencode"):
+    for via_binding in (False,True):
+     args=SimpleNamespace(worker_type="owner",adapter=harness,route_node=None,
+                          route_file=None if via_binding else str(path),
+                          owner_route_binding=SimpleNamespace(route_file=str(path)) if via_binding else None)
+     prompt=W.assignment_prompt(args,"Analyze the existing results",{})
+     self.assertIn(group["id"],prompt)
+     self.assertIn("exactly 1 entries",prompt)
+     self.assertIn('  - "'+auxiliary[0]["id"]+': <finding and disposition>"',prompt)
+   self.assertEqual(W.owner_close_prompt(SimpleNamespace(worker_type="stage",route_file=str(path))),"")
+   for node in route["nodes"][:-1]:
+    evidence=root/(node["id"]+".md");evidence.write_text("PASS\n")
+    R.complete_node(route,node,node["id"],evidence,attempt_id="att-inline-"+node["id"],
+                    explicit_attempt_metadata=InlineStageCompletionRecipeTest._axes(self))
+   closing=root/"owner-close.md";closing.write_text("All results reconciled\n")
+   with self.assertRaisesRegex(ValueError,"requires auxiliary_findings_considered"):
+    R.complete_node(route,owner,owner["id"],closing)
+   closing.write_text('---\nauxiliary_findings_considered:\n  - "assumption: finding adopted"\n---\nAll results reconciled\n')
+   R.complete_node(route,owner,owner["id"],closing,attempt_id="att-inline-owner-close",
+                   explicit_attempt_metadata=InlineStageCompletionRecipeTest._axes(self,depth=1))
+   self.assertEqual(owner["write_scope"],["owner-close.md"])
+   self.assertTrue(R.terminal_gate_observation(route,jobs=self._fixture_jobs)["owner-close"]["passed"])
+
  def test_auto_owner_close_cannot_finish_before_every_verification_leg(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp)

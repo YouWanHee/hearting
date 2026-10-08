@@ -292,8 +292,10 @@ These advisory points add no prerequisite or required stage:
 
 At `strong` or higher, a subgraph ending in an eligible declared review or map
 group receives an automatic owner closing node. It reads every realized leg's
-result and writes only the route's closing summary; it does not publish, sync,
-or change the preceding artifacts. The group anchor stays non-terminal and
+result and writes only the route's closing summary. When it arbitrates auxiliary
+legs, its assignment names the realized groups and the required
+`auxiliary_findings_considered` frontmatter entries, derived from the sealed route.
+It does not publish, sync, or change the preceding artifacts. The group anchor stays non-terminal and
 the owner holds the terminal completion gate. Compose displays this addition
 alongside omission notices. A pipeline group still needs its declared review
 consumer; an unavailable safe completion remains an omission with a warning.

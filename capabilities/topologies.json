@@ -4205,7 +4205,7 @@
   "completion_gate_contracts": {
     "compose-owner-close": {
       "kind": "custom",
-      "doc": "Side-effect-free owner closure: read every realized predecessor leg's result, reconcile findings, and write the declared closing summary. Existing dependency completion and owner terminal evidence hold the gate; no publication, synchronization, or edits to prior artifacts. WORKFLOW §0.2.1.",
+      "doc": "Side-effect-free owner closure: read every realized predecessor leg's result, reconcile findings, and write the declared closing summary. When arbitrating auxiliary legs, record auxiliary_findings_considered in summary frontmatter with one entry per realized auxiliary leg named by the owner assignment. Existing dependency completion and owner terminal evidence hold the gate; no publication, synchronization, or edits to prior artifacts. WORKFLOW §0.2.1.",
       "auxiliary_arbiter": true
     },
     "apply-hash": {

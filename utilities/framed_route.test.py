@@ -439,8 +439,11 @@ class RegistryRegistrationTest(unittest.TestCase):
                 self.assertEqual(recipe["promotion_signals"].count("gpu"), 1)
                 recipe["promotion_signals"].remove("gpu")
         self.assertEqual(_frozen_digest(recipes), FROZEN_RECIPES_DIGEST)
-        # The frozen digest includes resource-exit; only route-frame rows are projected out.
-        rest = {k: v for k, v in after["completion_gate_contracts"].items() if k not in ("route-frame", "route-decision")}
+        # New gates do not change the frozen per-name contracts or preset recipe digests.
+        self.assertFalse(any(n["completion_gate"] == "compose-owner-close"
+                             for r in after["recipes"] for n in r["standard_plus"]["nodes"]))
+        rest = {k: v for k, v in after["completion_gate_contracts"].items()
+                if k not in ("route-frame", "route-decision", "compose-owner-close")}
         self.assertEqual(_frozen_digest(rest), FROZEN_GATE_CONTRACT_DIGEST)
 
     def test_other_capabilities_keep_their_registry_digest(self):
