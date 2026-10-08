@@ -285,8 +285,10 @@ These advisory points add no prerequisite or required stage:
   `--explicit-profiles` for judgment or verification nodes. Check the selection
   reasons and actual node/leg profiles in the compose output.
 - Use `compose --explain` to check the displayed stage/worker/resource scale.
-  At `strong` or higher, check the realized group legs and omission notices,
-  including `terminal-anchor`; the intensity label alone does not retain a group.
+  At `strong` or higher, default to the eligible declared groups on retained
+  anchors, with two-way as the baseline unless the registry widens it. Check
+  realized legs and omission notices, including `terminal-anchor`; the label
+  alone does not retain a group. Group selection stays registry-only.
 
 **Frame procedure at depth-0 (`framed`).** `start` launches the frame legs
 (separate launches, no owner) and returns `needs-interview` with
