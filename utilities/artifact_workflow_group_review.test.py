@@ -1118,6 +1118,7 @@ class ModelCallTest(unittest.TestCase):
         cascade = mock.Mock(return_value=("reply", 1))
         governor = mock.Mock()
         governor.acquire.return_value = "token"
+        governor.title_start_budget.return_value = 20
         with tempfile.TemporaryDirectory() as state, \
                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": state, "AGENT_DISPATCH_ATTEMPT_ID": "att-x",
                                              "AGENT_ROUTE_ID": "rt-x", "FLEET_TITLE_PROVIDER": "codex",
@@ -1148,12 +1149,14 @@ class ModelCallTest(unittest.TestCase):
         self.assertNotIn("AGENT_ARTIFACT_WORKFLOW_GROUP_ID", env)
         governor.acquire.assert_called_once()
         self.assertEqual(governor.acquire.call_args.args[1], "title")
+        self.assertEqual(governor.acquire.call_args.kwargs["budget"], 20)
         governor.release.assert_called_once()
 
     def test_invoke_model_passes_a_caller_agent_out_tag_and_label(self):
         rt = R._refresh_title()
         governor = mock.Mock()
         governor.acquire.return_value = "token"
+        governor.title_start_budget.return_value = 20
         with tempfile.TemporaryDirectory() as state, \
                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), \
                 mock.patch.object(rt, "selected_providers", return_value=("claude",)), \
@@ -1169,6 +1172,7 @@ class ModelCallTest(unittest.TestCase):
         governor.acquire.assert_called_once()
         self.assertEqual(governor.acquire.call_args.args[1], "title")
         self.assertEqual(governor.acquire.call_args.kwargs["label"], "campaign-title")
+        self.assertEqual(governor.acquire.call_args.kwargs["budget"], 20)
 
     def test_no_provider_or_governor_failure_is_unavailable(self):
         rt = R._refresh_title()

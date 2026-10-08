@@ -1535,7 +1535,7 @@ def _answering_provider(commands, index):
 
 
 def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, label="",
-               provider_box=None):
+               provider_box=None, priority=False):
     """Run the title-provider cascade with no shell; all failures degrade to ``''``.
 
     When `provider_box` (a dict) is given, the answering provider name is
@@ -1590,7 +1590,9 @@ def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, 
         explicit_root = env.get("AGENT_MODEL_GOVERNOR_ROOT")
         governor_root = (Path(explicit_root).expanduser().resolve(strict=False) if explicit_root
                          else stable_state_root(env) / "model-worker-governor")
-        governor_token = governor_module.acquire(governor_root, "title", label=label)
+        governor_token = governor_module.acquire(
+            governor_root, "title", label=label,
+            budget=governor_module.title_start_budget(priority=priority))
         text, index = run_provider_cascade(commands, timeout=timeout, env=env)
         if provider_box is not None:
             provider_box["provider"] = _answering_provider(commands, index)
@@ -1756,6 +1758,10 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         argv += ["--transcript", transcript]
     if prompt_path:
         argv += ["--prompt", prompt_path]
+    if priority:
+        argv.append("--priority")
+    if quota_class in ("initial", "final"):
+        argv += ["--quota-class", quota_class]
     if bounded_anchor:
         argv.append("--anchor-stdin")
     argv += [
@@ -1909,6 +1915,10 @@ def main(argv=None):
         offset = previous.get("offset", 0) if isinstance(previous.get("offset"), int) else 0
         previous_title = previous.get("title", "") if isinstance(previous.get("title"), str) else ""
         previous_summary = previous.get("summary") if isinstance(previous.get("summary"), str) else None
+        # A prior NOW proves this session has already had its first refresh.
+        # Language repair may clear its title on failure; that and a caller's
+        # retry priority must not turn later periodic calls into first starts.
+        first_title_now = not previous_summary
         previous_summary_ts = (
             previous.get("summary_ts", previous.get("ts"))
             if previous_summary else None
@@ -2003,6 +2013,7 @@ def main(argv=None):
             _prompt(delta, prior_title=previous_title, anchor=anchor, title_lang=title_lang,
                     observed_language=observed_language),
             capacity_held=True, label=args.sid, provider_box=provider_box,
+            priority=bool(first_title_now or args.quota_class in ("initial", "final")),
         )
         title = validate_title(output, language=title_lang)
         if title and title.lower() == "untitled":

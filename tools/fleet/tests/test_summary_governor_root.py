@@ -28,6 +28,7 @@ class SummaryGovernorRootTest(_ConfigHomeMixin, unittest.TestCase):
             with self.subTest(provider=provider):
                 governor = SimpleNamespace(
                     default_root=mock.Mock(side_effect=RuntimeError("immutable installed source tree")),
+                    title_start_budget=mock.Mock(return_value=20),
                     acquire=mock.Mock(return_value="token"), release=mock.Mock())
                 spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda _module: None))
                 box = {}
@@ -43,6 +44,7 @@ class SummaryGovernorRootTest(_ConfigHomeMixin, unittest.TestCase):
                     error_box = {}
                     self.assertEqual(rt.run_worker("prompt", capacity_held=True, provider_box=error_box), "")
                 governor.default_root.assert_not_called()
+                self.assertEqual(governor.acquire.call_args.kwargs["budget"], 20)
                 root = governor.acquire.call_args.args[0]
                 self.assertEqual(root, state / "hearting" / "dispatch" / "model-worker-governor")
                 governor.release.assert_called_once_with(root, "token")
@@ -66,6 +68,32 @@ class SummaryGovernorRootTest(_ConfigHomeMixin, unittest.TestCase):
         with mock.patch.object(rt, "run_worker", return_value="TITLE: 제목 복구 확인\nNOW: 회귀 확인 중"):
             rt.main(args)
         self.assertNotIn("summary_error", titles.read("sid-error", "codex"))
+
+    def test_missing_first_now_keeps_priority_on_a_periodic_retry(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                path = test_title_consistency.TitleConsistencyTest._transcript(self, harness)
+                sid = "dispatch-retry-" + harness
+                args = ["--harness", harness, "--sid", sid, "--transcript", str(path),
+                        "--slotdir", str(Path(self._tmp.name) / "slot")]
+
+                def refused(_prompt, **kwargs):
+                    self.assertTrue(kwargs["priority"])
+                    kwargs["provider_box"]["error"] = "_StartBudgetReached: title window full"
+                    return ""
+
+                with mock.patch.object(rt, "run_worker", side_effect=refused):
+                    rt.main(args)
+                failed = titles.read(sid, harness)
+                self.assertFalse(failed.get("summary"))
+                self.assertEqual(failed["offset"], 0)
+                self.assertIn("_StartBudgetReached", failed["summary_error"])
+                # Same scheduler entry, no --priority/--quota-class flags.
+                with mock.patch.object(rt, "run_worker", return_value="TITLE: 제목 한도 복구\nNOW: 첫 요약 확인 중") as worker:
+                    rt.main(args)
+                self.assertTrue(worker.call_args.kwargs["priority"])
+                self.assertEqual(titles.read(sid, harness)["summary"], "첫 요약 확인 중")
+                self.assertNotIn("summary_error", titles.read(sid, harness))
 
     def test_codex_main_owner_worker_keep_exec_and_summary_on_one_detail_row(self):
         for entity in (Session(harness="codex", pid=1, liveness="working"),

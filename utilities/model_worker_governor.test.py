@@ -1233,7 +1233,7 @@ class StartBudgetClassPoolTest(unittest.TestCase):
     def test_each_background_class_has_its_own_pool(self):
         self.assertEqual(
             GOVERNOR.CLASS_START_BUDGETS,
-            {"dispatch": 40, "title": 12, "loop": 4},
+            {"dispatch": 40, "title": 24, "loop": 4},
         )
         with self._uncapped(), tempfile.TemporaryDirectory() as temp_dir:
             for worker_class in ("loop",):
@@ -1248,17 +1248,17 @@ class StartBudgetClassPoolTest(unittest.TestCase):
                 GOVERNOR.release(temp_dir, token)
 
     def test_start_budget_env_per_class_and_legacy_dispatch_env(self):
-        self.assertEqual(GOVERNOR.start_budget("title"), 12)
+        self.assertEqual(GOVERNOR.start_budget("title"), 24)
         with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_START_BUDGET_TITLE": "3"}, clear=False):
             self.assertEqual(GOVERNOR.start_budget("title"), 3)
         with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_START_BUDGET_TITLE": "not-a-number"}, clear=False):
-            self.assertEqual(GOVERNOR.start_budget("title"), 12)
+            self.assertEqual(GOVERNOR.start_budget("title"), 24)
         with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_START_BUDGET_TITLE": "0"}, clear=False):
-            self.assertEqual(GOVERNOR.start_budget("title"), 12)
+            self.assertEqual(GOVERNOR.start_budget("title"), 24)
         # The legacy global env applies to `dispatch` only.
         with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_START_BUDGET": "5"}, clear=False):
             self.assertEqual(GOVERNOR.start_budget("dispatch"), 5)
-            self.assertEqual(GOVERNOR.start_budget("title"), 12)
+            self.assertEqual(GOVERNOR.start_budget("title"), 24)
         # A class-specific env takes precedence over the legacy global one.
         with mock.patch.dict(
             os.environ,
@@ -1267,6 +1267,29 @@ class StartBudgetClassPoolTest(unittest.TestCase):
         ):
             self.assertEqual(GOVERNOR.start_budget("dispatch"), 9)
         self.assertEqual(GOVERNOR.start_budget("title", 2), 2)
+
+    def test_periodic_titles_leave_four_starts_in_the_same_bounded_pool(self):
+        with self._uncapped(), tempfile.TemporaryDirectory() as root:
+            ordinary = GOVERNOR.title_start_budget()
+            self.assertEqual(ordinary, 20)
+            for _ in range(ordinary):
+                token = GOVERNOR.acquire(root, "title", budget=ordinary)
+                GOVERNOR.release(root, token)
+            with self.assertRaises(GOVERNOR._StartBudgetReached):
+                GOVERNOR.acquire(root, "title", budget=ordinary)
+            for _ in range(4):
+                token = GOVERNOR.acquire(root, "title", budget=GOVERNOR.title_start_budget(priority=True))
+                GOVERNOR.release(root, token)
+            with self.assertRaises(GOVERNOR._StartBudgetReached):
+                GOVERNOR.acquire(root, "title", budget=GOVERNOR.title_start_budget(priority=True))
+
+    def test_title_priority_respects_small_user_budgets(self):
+        for budget, ordinary in ((1, 1), (3, 1), (8, 4)):
+            with self.subTest(budget=budget), mock.patch.dict(
+                os.environ, {"AGENT_MODEL_WORKER_START_BUDGET_TITLE": str(budget)}
+            ):
+                self.assertEqual(GOVERNOR.title_start_budget(), ordinary)
+                self.assertEqual(GOVERNOR.title_start_budget(priority=True), budget)
 
     def test_start_records_carry_class_label_pid_and_prune_by_window(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1388,7 +1411,7 @@ class StartBudgetClassPoolTest(unittest.TestCase):
             usage = data["start_usage"]["title"]
             self.assertEqual(usage["used"], 1)
             self.assertEqual(usage["reserved"], 0)
-            self.assertEqual(usage["limit"], 12)
+            self.assertEqual(usage["limit"], 24)
             self.assertIsNotNone(usage["frees_at"])
             self.assertEqual(usage["labels"], ["att-one"])
             self.assertEqual(data["start_usage"]["dispatch"]["used"], 0)
