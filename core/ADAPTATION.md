@@ -511,6 +511,11 @@ stamp path in `core/HOOKS.md`.
   went out; a hook that lost the completion claim leaves them for the sweep.
   A start whose receipt proves `started=1` but whose attempt no hook process
   holds emits one typed `not-armed` notice naming the explicit poll-fallback.
+  Each carrier exit appends a best-effort diagnostic line beside its arm in
+  `<attempt_id>.exits.jsonl`, preserving time, holder/arm identity, wait reason
+  and raw return code, exception or TERM/HUP signal across re-arms. These
+  observations never decide completion or delivery; SIGKILL cannot be recorded
+  by the killed carrier.
 - Managed receipt schema v2 binds the one canonical absolute `job_registry`
   supplied by its completion sidecar. The gateway includes it in the delivery
   digest and names it with `--jobs` in every actionable harvest command, so
