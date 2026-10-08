@@ -2373,6 +2373,21 @@ class DispatchContractTest(unittest.TestCase):
    self.assertEqual(observed,before.decode().splitlines())
    self.assertEqual(jobs.read_bytes(),before)
    self.assertNotIn("launch_claimed=1",jobs.read_text())
+ def test_observed_worker_home_does_not_change_assignment_identity(self):
+  for harness in ('codex','claude','opencode'):
+   with self.subTest(harness=harness), tempfile.TemporaryDirectory() as td:
+    jobs=Path(td)/'jobs.log'; attempt='att-home-observed'
+    row=(f'2026-07-16T00:00:00Z\topen\t/repo\t/wt\tstage\t{CURRENT},'
+         f'harness={harness},model=fixture,attempt_id={attempt}')
+    self.assertTrue(D.claim_attempt_row(jobs,attempt,row,launch=True))
+    D.annotate_attempt_row(jobs,attempt,{'runtime_home':str(Path(td)/'worker-home')})
+    before=jobs.read_bytes()
+    self.assertFalse(D.claim_attempt_row(jobs,attempt,row,launch=True))
+    self.assertEqual(jobs.read_bytes(),before)
+    with self.assertRaises(D.DispatchContractError) as caught:
+     D.claim_attempt_row(jobs,attempt,row.replace('model=fixture','model=different'),launch=True)
+    self.assertEqual(caught.exception.reason,'attempt-identity-conflict')
+    self.assertEqual(jobs.read_bytes(),before)
  def test_existing_attempt_id_rejects_conflicting_immutable_identity_without_mutation(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"; attempt="att-conflict00001"
