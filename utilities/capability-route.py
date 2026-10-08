@@ -3437,8 +3437,11 @@ def _validate_compose_owner_close(registry, recipe, intensity=None):
     meta = recipe.get("compose") or {}
     auto = meta.get("auto_completed_nodes")
     selected = {key.replace(":", "-") for key in meta.get("graph", [])}
-    extra = bool(meta.get("graph")) and any(node["id"] not in selected and not node.get("plan_stage")
-                                            for node in recipe["standard_plus"]["nodes"])
+    # Consumer completion is strong+ only; lower intensities retain the
+    # existing profile-demand validation of an inexact subgraph marker.
+    extra = intensity not in ("direct", "quick", "standard") and bool(meta.get("graph")) and any(
+        node["id"] not in selected and not node.get("plan_stage")
+        for node in recipe["standard_plus"]["nodes"])
     completion_intensity = meta.get("group_completion_intensity")
     nodes = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
     host_omission = any(row["reason"] == "auxiliary-arbiter-not-selected"
