@@ -277,6 +277,9 @@ FALLBACK_HOPS = {
     "inline",
 }
 ATTEMPT_MUTABLE_METADATA = {
+    # Published with the actual child environment after the admission claim.
+    # A duplicate start has not prepared that environment yet.
+    "runtime_home",
     "parent_close_requested", "parent_close_route_id", "parent_close_route_hash",
     "parent_close_stop_resources", "parent_close_settled",
     "resolved_model",
