@@ -680,6 +680,12 @@ def coordinate_chain_advance_from_joined_rows(
 def advance_chain_step(jobs: Path, parent_attempt_id: str, joined: dict) -> ChainAdvanceStep:
     """Classify one joined predecessor without hiding a sealed refusal."""
 
+    import route_parent_close
+    from dispatch_completion_join import current_attempt_row
+    parent = current_attempt_row(jobs, parent_attempt_id)
+    if parent is not None and route_parent_close.row_requested(parent.metadata, jobs):
+        return ChainAdvanceStep("not-chain", reason="cancelled-by-parent")
+
     predecessor = next(
         (row for row in joined.values()
          if (getattr(row, "metadata", {}) or {}).get("session_chain_id")

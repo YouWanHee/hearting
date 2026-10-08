@@ -282,6 +282,10 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     Only a route owner pauses on capacity: a stage worker's limit stays with its owner's
     own fallback, so one row never has two successors.
     """
+    import route_parent_close
+    if (meta.get('parent_close_requested') == '1' or
+            jobs is not None and route_parent_close.row_requested(meta, jobs)):
+        return None
     if jobs is not None and meta.get('note') == 'dead-worker-blocked':
         found = owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if found and found['status'] == 'proceed':

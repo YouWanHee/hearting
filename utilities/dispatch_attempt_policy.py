@@ -129,6 +129,8 @@ def committed_outcome(status: str, metadata: Mapping[str, str]) -> str:
     if status not in TERMINAL_STATES:
         return "unknown"
     note = metadata.get("note", "")
+    if note == "cancelled-by-parent" and metadata.get("failure_class") == "cancelled":
+        return "cancelled"
     if note == REVIEW_BLOCKING_NOTE:
         return "review-blocked"
     if deferred_completion(metadata) == "pending":
@@ -167,6 +169,9 @@ def decide_attempt(
     outcome = committed_outcome(status, metadata)
     if status not in OPEN_STATES | TERMINAL_STATES:
         return AttemptDecision(outcome, "recover", "supervision-controller", "registry-status-invalid")
+    if metadata.get("parent_close_requested") == "1":
+        return AttemptDecision(outcome, "settle-cancellation" if outcome == "cancelled" else "cancel",
+                               "execution-boundary", "cancelled-by-parent")
     if process_state == "live":
         return AttemptDecision(outcome, "wait", "execution-boundary", process_reason or "process-alive")
     if process_state != "quiescent":
@@ -201,6 +206,8 @@ def decide_attempt(
 
 def required_action(status: str, metadata: Mapping[str, str]) -> str:
     """The terminal writer/harvest instruction, before transport formatting."""
+    if committed_outcome(status, metadata) == "cancelled":
+        return "advance-completed"
     if status in OPEN_STATES:
         return "complete-open"
     if terminal_conflict_pending(metadata):

@@ -41,7 +41,7 @@ from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
 from .collectors import compute_hosts as _compute_hosts
-from .refresh import LiveSnapshot, RefreshPump
+from .refresh import LiveSnapshot, RefreshPump, background_read
 from .session_handle import sanitize_title as _sanitize_session_title
 from .session_handle import _cell_width as _session_handle_cell_width
 from .session_handle import clip_cells as _clip_cells
@@ -3487,7 +3487,7 @@ def _visible_group_jobs(jobs, show_sessions, show_jobs):
 
 def _group_activity_rank(g):
     members_live = [s.liveness for s in g["sessions"]] + [j.liveness for j in g["jobs"]]
-    if g.get("gpu"):
+    if g.get("gpu") or g.get("resources"):
         members_live.append("working")
     if "working" in members_live:
         return 0
@@ -4367,13 +4367,14 @@ def _resource_progress_tail(child, room=None):
     return count + suffix
 
 
-def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_children=()):
+def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_children=(),
+                         children=None):
     """Observed resource children, never log-parsed progress or model dispatch rows."""
     rows = []
     shown_depth = min(depth, 1) if in_card else depth
     indent = _SUBAGENT_IND + "  " * max(0, shown_depth)
     width = (_dispatch_box_width(term_width) - 2 if in_card else term_width) if term_width else None
-    for child in getattr(job, "resource_children", ()):
+    for child in (getattr(job, "resource_children", ()) if children is None else children):
         if any(child is linked for linked in gpu_children):
             continue
         if not _SHOW_ALL and child.liveness != "working":
@@ -4418,7 +4419,7 @@ def _resource_gpu_suffix(children, room=None):
     return _clip_w(out, room) if room is not None else out
 
 
-def _resource_gpu_resources(child, snapshot):
+def _resource_gpu_resources(child, snapshot, commands=False, excluded_processes=()):
     """Reuse local PID/start/group marks, exact run id or remote parent attempt."""
     if not isinstance(snapshot, dict):
         return []
@@ -4437,6 +4438,10 @@ def _resource_gpu_resources(child, snapshot):
             for process in gpu.get("processes") or ():
                 if not isinstance(process, dict):
                     continue
+                process_key = (host.get("host") or "?", process.get("pid"),
+                               str(process.get("proc_start")))
+                if process_key in excluded_processes:
+                    continue
                 owner = process.get("owner")
                 local = host.get("self") is True and (
                     (process.get("pid"), str(process.get("proc_start"))) in exact
@@ -4452,7 +4457,12 @@ def _resource_gpu_resources(child, snapshot):
                         if type(process.get("used_memory_mib")) is int]
                 resources.append({"host": _gpu_safe_text(host.get("host") or "?"),
                     "index": gpu["index"], "model": _gpu_safe_text(gpu.get("name")).replace("NVIDIA ", ""),
-                    "process_count": len(matched), "processes": [],
+                    "process_count": len(matched),
+                    "processes": [{"pid": process.get("pid"),
+                        "proc_start": process.get("proc_start"),
+                        "command": _gpu_safe_text(process.get("command")
+                                                   or process.get("process_name") or "process")}
+                        for process in matched] if commands else [],
                     "_process_keys": [(host.get("host") or "?", process.get("pid"),
                                        str(process.get("proc_start"))) for process in matched],
                     "_process_memory": {(host.get("host") or "?", process.get("pid"),
@@ -4486,11 +4496,19 @@ def _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width
                              depth=0, in_card=False):
     """One GPU line plus existing CPU-only resource rows for this exact owner."""
     resources = _job_gpu_resources(job, session_by_identity, gpu_resources)
+    return _gpu_and_resource_rows(getattr(job, "resource_children", ()), resources,
+                                  term_width, depth, in_card)
+
+
+def _gpu_and_resource_rows(children, resources=(), term_width=None, depth=0, in_card=False,
+                           commands=False, excluded_processes=()):
+    """The same observed resource rows under an owner or its project fallback."""
     combined = {(resource["host"], resource["index"]): resource for resource in resources}
     snapshot, _age = _fresh_compute_hosts()
     linked = []
-    for child in getattr(job, "resource_children", ()):
-        matched = _resource_gpu_resources(child, snapshot)
+    for child in children:
+        matched = _resource_gpu_resources(child, snapshot, commands=commands,
+                                         excluded_processes=excluded_processes)
         if matched:
             linked.append(child)
             for resource in matched:
@@ -4500,14 +4518,31 @@ def _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width
                     continue
                 current = combined[key]
                 memory = {**current.get("_process_memory", {}), **resource["_process_memory"]}
+                processes = {(p["pid"], p["proc_start"]): p
+                             for p in list(current.get("processes") or ())
+                             + list(resource.get("processes") or ())}
                 current.update(_process_memory=memory, _process_keys=list(memory),
+                               processes=list(processes.values()),
                                process_count=len(memory), has_memory=any(v is not None for v in memory.values()),
                                used_memory_mib=sum(max(0, v) for v in memory.values() if v is not None))
     gpu_rows = _gpu_resource_strip([combined[key] for key in sorted(combined)],
         term_width=term_width, depth=depth, in_card=in_card, resource_children=linked)
-    cpu_rows = _resource_child_rows(job, term_width=term_width, depth=depth,
-                                  in_card=in_card, gpu_children=linked)
+    cpu_rows = _resource_child_rows(None, term_width=term_width, depth=depth,
+                                  in_card=in_card, gpu_children=linked, children=children)
     return gpu_rows, cpu_rows
+
+
+def _orphan_resource_groups(resources, drawn_jobs):
+    """Working declared children not on screen; cwd only places their project card."""
+    shown = {id(child) for job in drawn_jobs
+             for child in getattr(job, "resource_children", ())}
+    groups = {}
+    for child in resources or ():
+        if child.liveness != "working" or not child.parent_attempt_id or id(child) in shown:
+            continue
+        name = project_of(child.cwd) if child.cwd else child.project
+        groups.setdefault(name, []).append(child)
+    return groups
 
 
 # F-100b (user 2026-09-03) — the context row's lead cell is the WHERE word, not the state
@@ -6202,7 +6237,8 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     for remaining in plugin_by_parent.values():
         plugin_orphans.extend(remaining)
 
-    if not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans:
+    if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
+            and not _orphan_resource_groups(resources, ())):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
         lines.append([("  no active route", "dim")])
         return lines
@@ -6263,6 +6299,17 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
 
     snapshot, _age = _fresh_compute_hosts()
     excluded = _drawn_gpu_processes(drawn_gpu_jobs, session_by_identity, gpu_resources, snapshot)
+    for name, children in sorted(_orphan_resource_groups(resources, drawn_gpu_jobs).items()):
+        if not first:
+            lines.append(None)
+        first = False
+        lines.append([("  ● ", "g_work"), (name + "/", "grp_hot")])
+        gpu_rows, resource_rows = _gpu_and_resource_rows(
+            children, term_width=term_width, commands=True, excluded_processes=excluded)
+        lines.extend(gpu_rows + resource_rows)
+        for child in children:
+            for gpu in _resource_gpu_resources(child, snapshot):
+                excluded.update(gpu["_process_keys"])
     parent_gpu_resources = (_gpu_session_resources(snapshot, excluded)
                             if excluded else gpu_resources)
     # Routeless sessions with active sub-agents — one minimal owner anchor + the same strip,
@@ -6738,11 +6785,12 @@ def _group_emission(g, show_sessions, show_jobs, gpu_resources=None,
     group_sessions = g["sessions"] if show_sessions else []
     group_jobs = _emitted_group_jobs(g, show_sessions, show_jobs)
     gpu = g.get("gpu") or []
-    empty = not group_sessions and not group_jobs and not gpu
+    resources = (g.get("resources") or []) if show_jobs else []
+    empty = not group_sessions and not group_jobs and not gpu and not resources
     if empty:
         return {"group_sessions": group_sessions, "group_jobs": group_jobs,
                 "empty": True, "fold": False, "shown": [], "hidden": 0,
-                "gpu": [], "gpu_strip_keys": set(), "classified": None}
+                "gpu": [], "resources": [], "gpu_strip_keys": set(), "classified": None}
     live_sessions = [s for s in group_sessions
                      if s.liveness not in ("stale", "dead") and not s.app_server]
     must_show_jobs = any(not getattr(j, "afterglow", False) for j in group_jobs)
@@ -6753,11 +6801,12 @@ def _group_emission(g, show_sessions, show_jobs, gpu_resources=None,
     # GPU work is live work: a card holding a GPU row or a drawn session/job GPU
     # strip is never folded away.
     fold = ((not _SHOW_ALL) and (not live_sessions) and (not must_show_jobs)
-            and (not gpu) and (not strip_keys))
+            and (not gpu) and (not resources) and (not strip_keys))
     return {"group_sessions": group_sessions, "group_jobs": group_jobs,
             "empty": False, "fold": fold, "shown": shown,
             "hidden": len(group_sessions) - len(shown),
-            "gpu": gpu, "gpu_strip_keys": strip_keys, "classified": classified}
+            "gpu": gpu, "resources": resources,
+            "gpu_strip_keys": strip_keys, "classified": classified}
 
 
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
@@ -6940,14 +6989,23 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     if show_jobs:
         strip_keys = set()
         resource_processes = set()
+        drawn_jobs = []
         snapshot, age_s = _fresh_compute_hosts()
         for gname, g in groups.items():
             strip_keys |= _group_drawn_strip_keys(
                 gname, g, show_sessions, show_jobs, gpu_resources, session_by_identity)
             shown = _shown_group_sessions(g["sessions"]) if show_sessions else []
             classified = _classify_group_jobs(gname, _emitted_group_jobs(g, show_sessions, show_jobs), shown)
+            drawn_jobs.extend(_drawn_group_jobs(classified, shown))
             resource_processes.update(_drawn_gpu_processes(
                 _drawn_group_jobs(classified, shown), session_by_identity, gpu_resources, snapshot))
+        for name, children in _orphan_resource_groups(resources, drawn_jobs).items():
+            group = groups.setdefault(name, {"sessions": [], "jobs": []})
+            group["resources"] = children
+            group["resource_excluded_processes"] = set(resource_processes)
+            for child in children:
+                for gpu in _resource_gpu_resources(child, snapshot):
+                    resource_processes.update(gpu["_process_keys"])
         for entry in _compute_hosts.unregistered_gpu(
                 snapshot, resources or (), strip_keys, age_s or 0.0):
             if (entry["host"], entry["pid"], str(entry.get("proc_start"))) in resource_processes:
@@ -6972,11 +7030,13 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             if not _SHOW_ALL:
                 group_jobs = [j for j in group_jobs if j.liveness != "dead"]
             group_gpu = g.get("gpu") or []
-            if not group_sessions and not group_jobs and not group_gpu:
+            group_resources = g.get("resources") or []
+            if not group_sessions and not group_jobs and not group_gpu and not group_resources:
                 continue
             live_sessions = [s for s in group_sessions
                              if s.liveness not in ("stale", "dead") and not s.app_server]
             if ((not _SHOW_ALL) and not live_sessions and not group_jobs and not group_gpu
+                    and not group_resources
                     and not _group_drawn_strip_keys(
                         name, g, show_sessions, show_jobs, gpu_resources, session_by_identity)):
                 continue
@@ -7098,12 +7158,13 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         recovered_session_ids = classified["recovered_session_ids"]
 
         gcwd = "" if name in ("loops", _SYSTEM_GROUP) else (group_sessions[0].cwd if group_sessions else
-                (group_jobs[0].cwd if group_jobs else ""))
+                (group_jobs[0].cwd if group_jobs else
+                 (emission["resources"][0].cwd if emission["resources"] else "")))
         # The section title has no indicator glyph; the title itself carries active state.
         # while the group works, plain bold otherwise. Doubles with the active card tint.
         n_work = sum(1 for s in live_sessions if s.liveness == "working") + \
                  sum(1 for j in group_jobs if j.liveness == "working") + \
-                 len(emission["gpu"])
+                 len(emission["gpu"]) + len(emission["resources"])
         # cooling (round-6, user 2026-07-03): no active work, but the newest session transcript
         # A write within the cooling window indicates a directory that just finished.
         # state between hot (green ●) and cold (no glyph): a grey ring + time-since-done, so a
@@ -7530,6 +7591,11 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             _emit_dispatch_tree(gj, orphan=False)
 
         # F-104: live GPU work that no registry run or session GPU strip shows.
+        if emission["resources"]:
+            gpu_rows, resource_rows = _gpu_and_resource_rows(
+                emission["resources"], term_width=term_width, commands=True,
+                excluded_processes=g.get("resource_excluded_processes", ()))
+            lines.extend(gpu_rows + resource_rows)
         lines.extend(_gpu_work_strip(emission["gpu"], term_width))
 
         # F-19 repo rows (사용자 확정 2026-07-16): this card's own today-mem events, below a
@@ -7725,14 +7791,33 @@ def _snapshot_line(segs, colored=False, colors=256):
     return "".join(out)
 
 
-def render_once(collect_all, hfilter, section):
+def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     global _GIT_TELEMETRY
-    sessions, jobs = collect_all(harness_filter=hfilter)
+    governor_read = background_read(_collect_governor)
+    hosts_read = (background_read(compute_hosts_refresh)
+                  if callable(compute_hosts_refresh) else None)
+    try:
+        sessions, jobs = collect_all(harness_filter=hfilter)
+    except BaseException:
+        # Drain both reads. Preserve the original serial failure priority:
+        # hosts before sessions before governor (normally fail-soft).
+        try:
+            governor_read.result()
+        except BaseException:
+            pass
+        if hosts_read is not None:
+            set_compute_hosts(hosts_read.result())
+        raise
+    else:
+        try:
+            governor_snapshot = governor_read.result()
+        finally:
+            if hosts_read is not None:
+                set_compute_hosts(hosts_read.result())
     resources = list(getattr(collect_all, "last_resource_jobs", []))
     usage_snapshots = dict(getattr(collect_all, "last_usage_snapshots", {}))
     malformed = _malformed()
     mem_snapshot = _collect_memory()
-    governor_snapshot = _collect_governor()
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
         import shutil
@@ -8616,8 +8701,18 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
 
     def collect_snapshot():
         nonlocal first_snapshot
-        sessions, jobs = collect_all(harness_filter=hfilter,
-                                     **({"fast_first": True} if first_snapshot else {}))
+        governor_read = background_read(_collect_governor)
+        try:
+            sessions, jobs = collect_all(harness_filter=hfilter,
+                                         **({"fast_first": True} if first_snapshot else {}))
+        except BaseException:
+            try:
+                governor_read.result()
+            except BaseException:
+                pass
+            raise
+        else:
+            governor_snapshot = governor_read.result()
         # Only the first publication is fast: every later tick (the existing
         # background refresh) runs the full pass, filling the details the
         # first snapshot honestly left empty. --once/JSON never sets the flag.
@@ -8638,7 +8733,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             usage_snapshots=dict(getattr(collect_all, "last_usage_snapshots", {})),
             malformed=_malformed(),
             memory=_collect_memory(),
-            governor=_collect_governor(),
+            governor=governor_snapshot,
             hearting=dict(hearting) if isinstance(hearting, dict) else None,
         )
 

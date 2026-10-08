@@ -689,9 +689,51 @@ for a second entry approval. Older sealed quick routes retain their
 
 ### §5.11. Commit and Push Policy for `<agent-home>`
 
+Merge with `hearting run merge-line <PR>`. This shared command queues sessions
+and worktrees for the same GitHub repository under a user-state `flock`, shows
+the waiting position and preceding PR, then updates the branch only if it lacks
+the latest default-branch commit. It waits for that head's CI, rechecks head and
+base immediately before merging, and pins the merge to the checked head. Existing
+successful CI on an up-to-date head is reused. Failure or interruption releases
+the turn; process death releases the OS lock and the next caller discards the
+dead PID/start entry. This is local cooperative merge serialization, with no
+new approval or workflow gate; all three harnesses use the same command.
+
+Release publication uses immutable tags and the tested commit. Repeated or
+out-of-order successful checks are ordinary observations: refresh tags before
+reserving a version, reuse a tag for the same commit, and skip a commit already
+included in a published stable release. A version occupied by another commit
+is replanned from the current version without moving tags or asking the caller
+to repair the release queue. The release policy owns the version rules.
+
 After validating changes to instructions, rules, hooks, preflight, or runtime status surfaces under `<agent-home>`, commit and push them in the same turn without a separate user signal. A work repository's push is separate and remains subject to its deployment gate.
 
 ### §5.12. Continuation Supervisor and Tracked-Workflow Completion
+
+**Parent close.** The existing `capability-route close --route <route>` also
+ends that parent's unfinished current owner, without waiting for another model
+turn. Before signalling, the shared controller records `cancelled-by-parent`
+intent in the existing workflow journal and exact attempt rows. This stops
+launch, replacement, chain advance and gate delivery. A committed normal result
+that precedes the intent keeps its result; a later PASS cannot replace an
+intentional cancellation. The controller revalidates PID/start and owned
+descendants, sends TERM, then KILL after a short grace, observes their end,
+folds never-launched successors, closes the attempts as `failure_class=cancelled`
+and the workflow as CANCELLED, and records the route outcome. Repeated close
+and the existing execution observers resume this same cleanup after interruption.
+Unknown process evidence stays termination-pending; it grants no signal or
+false completion and requires no new caller recovery ritual.
+
+Resource runs are preserved by default, including when they share an agent
+process group. Close returns their exact IDs and states; the existing resource
+supervisor records their results without starting successors on the cancelled
+route. The single optional `--stop-resources` flag uses existing resource/compute
+stop only for runs exactly bound to this route. Other routes and shared GPU
+processes are never targets. Close neither deletes nor moves artifacts, and
+later user deletion of artifacts cannot reopen cancellation or prevent replay.
+There is no artifact protection mechanism, required reason, new command or
+additional approval. Intentional cancellation produces no human gate,
+`inspect-done-failure`, replacement or start recommendation.
 
 `WORKFLOW §0.6` defines the portable state machine and the four continuation
 kinds. This section owns the mechanics, and it applies to every tracked
@@ -712,6 +754,21 @@ metadata, never the payload, its identity, or producer outputs. A recovered watc
 whose owner already ended hands proven resource completion to that owner's
 existing parent carrier; it does not start a new training run. Explicit parent
 close suppresses this continuation and all cancelled successors.
+
+A supervised owner can register sequential resources for one route/node using
+the same `resource-runner start`. Exact replay preserves its run; a new run may
+replace the armed predecessor only after an exact successful exit while that
+stage is still waiting for its declared outputs. The ledger lock serializes
+the binding change, preserves the prior execution evidence, and refuses active
+or failed identities, different owners, completed stages, and parent close.
+All prior bindings protect their log, sentinel and progress paths across registries
+and path aliases. Existing active workflow progress is preserved. The final payload
+release checks parent close under the same ledger lock before publishing identity
+and opening its private launch fence.
+The owner receives intermediate execution success with no successor admission;
+an unacknowledged result remains recoverable from its original binding after the
+next registration, with no lifetime receipt-count ceiling.
+The resource that supplies the declared stage outputs can complete the stage.
 
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
@@ -739,6 +796,9 @@ predecessor's declared output artifacts. Missing, unreadable, or
 namespace-unverifiable evidence is not success. A nonzero exit, a `FAIL`/
 `BLOCKED` verdict, or an absent declared artifact records `FAILED_RETRYABLE` or
 `FAILED_TERMINAL` and starts nothing downstream.
+For a supervised owner resource, successful exit with missing stage outputs
+instead records a wait for the next resource in the existing running stage;
+the output requirement for downstream work is unchanged.
 
 **Exactly-once is claim-based, not schedule-based.** The successor key is
 derived from the sealed `route_hash`, the predecessor node, the predecessor's
@@ -809,6 +869,11 @@ its declared route node; a supervised parked owner shows that node and
 `resource-parked` instead of presenting an old model summary as current work.
 Resource liveness stays independent of the owner's model activity, and a missing
 progress declaration leaves only elapsed time and liveness (2026-10-07 SR eval-run).
+Verified working resources whose exact parent owner is no longer drawn
+remain on their project card in both Fleet views. The row reuses exact GPU
+identity and existing elapsed/progress; absent a fresh GPU match, it shows
+the resource row. Cwd places the card and never implies a session owner.
+Terminal/stale resources drop the fallback without reviving an ended owner.
 A worker card shows its assigned work, not every node in the
 route: a depth-1 frame owns only its exact frame node; the later owner owns the
 execution stages, excluding the separate pre-owner frame pair. Depth alone does
@@ -1282,6 +1347,13 @@ runtime `peer-messages/pending/` directory (0700, payload/lock files 0600).
 It is bound to the immutable transfer ref, actual sender/recipient and digest,
 not a public ledger field. Receipt removes the private body and retains the ref
 for replay deduplication; unknown, stale or ambiguous identities keep their binding.
+An external shell may have no sender session: `unknown`/empty and null sender
+fields mean an unattributed sender, not an invalid message. Its sealed ref/body
+and exact known recipient still govern delivery and receipt. Legacy unsent rows
+held only for that absent sender use the normal pending path; ambiguous sends
+remain unverified. Locked or temporarily unreadable rows stay in place for the
+next ordinary callback. Damaged private rows are moved aside with their bytes intact
+and diagnosed once, so unrelated messages proceed without repeated warnings.
 Late redelivery sends its delay notice and the sealed message in one prompt.
 The notice is transport context: receivers may remove only that recognized
 prefix with the matching transfer ref before checking the unchanged body digest.

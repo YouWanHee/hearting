@@ -302,8 +302,14 @@ legs, its assignment names the realized groups and the required
 `auxiliary_findings_considered` frontmatter entries, derived from the sealed route.
 It does not publish, sync, or change the preceding artifacts. The group anchor stays non-terminal and
 the owner holds the terminal completion gate. Compose displays this addition
-alongside omission notices. A pipeline group still needs its declared review
-consumer; an unavailable safe completion remains an omission with a warning.
+alongside omission notices. If a retained group lacks its review consumer or
+auxiliary arbiter, compose restores the unique, safe downstream node declared
+by that group's recipe, including borrowed-part paths and inputs. It inserts
+the node directly after the anchor and preserves the caller's selected order;
+it adds no publication, synchronization, resource run, or source mutation.
+The assignment identifies any realized auxiliary legs and their existing
+consideration obligation. Compose names every automatic addition. Ambiguous,
+unavailable, or conflicting completions remain omissions with a warning.
 Standard and lower routes and already sealed graphs keep their existing shape.
 
 **Frame procedure at depth-0 (`framed`).** `start` launches the frame legs
@@ -939,6 +945,18 @@ A resource watch lasts while its recorded PID/start/command identity is alive,
 without a fixed elapsed-time ceiling. The existing start/resume can reattach a
 lost or expired watch to the same run without releasing a payload again. Explicit
 parent cancellation still suppresses the preserved resource's successors.
+
+One supervised owner stage may use resources sequentially through the existing
+runner. An exact successful resource exit with stage outputs still absent waits
+for the next resource; it does not fail or complete the stage. The same owner
+receives that execution result and may register the next run after the previous
+identity is gone and its exit sentinel proves success. Historical run records
+remain intact, including their evidence paths and unacknowledged receipts.
+Receipt recovery follows the preserved binding after the next run is registered;
+acknowledgement remains with the returning owner turn, without a lifetime run-count
+ceiling. Stage success and successor admission still require the declared
+outputs; failed, unverifiable, active, or explicitly cancelled resources cannot
+be replaced by another run.
 
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner

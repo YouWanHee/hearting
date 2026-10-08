@@ -85,6 +85,10 @@ def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
 
 
 def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
+    import route_parent_close
+    attempts = [aid for aid in attempts if aid not in rows or not route_parent_close.row_requested(rows[aid][1], jobs)]
+    if not attempts:
+        return False
     if reason == "owner-input-undelivered":
         from dispatch_owner_input import unresolved
         return any(unresolved(jobs, aid) for aid in attempts)
@@ -462,6 +466,12 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
                     receipt = {**receipt, "replacement_attention": attention}
                 return receipt
         except Exception as exc:
+            from dispatch_completion_join import CompletionDeferred
+            if isinstance(exc, CompletionDeferred):
+                # The existing cancellation observer retains this exact batch;
+                # never project cleanup waiting as failure or parent recovery.
+                time.sleep(0.05)
+                continue
             # Observation failure is not worker failure. Keep the exact wait
             # and transfer the diagnostic, without fabricating completion.
             observer_error = str(exc)
