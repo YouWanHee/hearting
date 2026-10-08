@@ -2390,12 +2390,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"round={budget.next_round} max_round={budget.cap}",
                     route_node=capped_node_id,
                 )
+        # Only an unmet group opens a new round. A successful group replay
+        # retains its sealed attempts and spends no fresh capacity.
+        historical_batch_attempts = (frozenset().union(*(
+            admission.prior_attempt_ids for admission in round_admissions.values()
+        )) if any(admission.gate_unmet for admission in round_admissions.values()) else frozenset())
         prior_input = None if partial is not None else prior_batch_input(
             jobs, route, nodes, args.parallel_group,
             os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
-            prior_attempt_ids=frozenset().union(*(
-                admission.prior_attempt_ids for admission in round_admissions.values()
-            )))
+            prior_attempt_ids=historical_batch_attempts)
         if prior_input is not None:
             assignments = prior_batch_assignments(prior_input, route, nodes, parent_identity)
             independence = "persona"
@@ -2541,6 +2544,9 @@ def main(argv: list[str] | None = None) -> int:
             review_round=(round_admissions[node_id].budget.next_round
                           if node_id in round_admissions else 1),
         )
+        if prior_input is not None:
+            attempt_id = next(member["attempt_id"] for member in prior_input["manifest"]["members"]
+                              if member["route_node"] == node_id)
         leg = {
             "node": node_id,
             "adapter": adapter,
@@ -2758,8 +2764,7 @@ def main(argv: list[str] | None = None) -> int:
                 leg_digest=leg_digests[str(leg["attempt_id"])],
                 agent_home=agent_home,
                 replaced_attempt_id=str(partial["failed_source_attempt_id"]) if partial else "",
-                prior_attempt_ids=(round_admissions[leg["node"]].prior_attempt_ids
-                                   if leg["node"] in round_admissions else frozenset()),
+                prior_attempt_ids=historical_batch_attempts,
             )
             if existing is None:
                 pending_legs.append(leg)

@@ -370,6 +370,7 @@ class RoundAdmission:
  planned_revision_nodes: frozenset[str] = frozenset()
  reviewed_input: object = None
  prior_attempt_ids: frozenset[str] = frozenset()
+ gate_unmet: bool = False
 
 
 def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
@@ -491,6 +492,8 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
   ),
   reviewed_input=reviewed_input,
   prior_attempt_ids=frozenset(meta["attempt_id"] for _cols,meta in rows if meta.get("attempt_id")),
+  gate_unmet=REVIEW_ROUND_CAP.gate_unmet(classified_rows,
+      node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test")),
  )
 
 

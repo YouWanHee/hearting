@@ -873,14 +873,8 @@ class DispatchBatchTest(unittest.TestCase):
         # Use the lab's actual review kinds/units and derived alternative id.
         # Only launch/process boundaries are faked; admission, both sealed
         # inputs, attempt matching and the round census run for real.
-        import route_identity
         from dispatch_replacement_batch import _input_path
-        self.route["effective_intensity"] = "strong"
-        for index, node in enumerate(self.route["nodes"]):
-            node.update(id=("independent-verify" if index == 0 else "independent-verify-alternative"),
-                        kind="review-worker", unit="qa/test", parallel_anchor="independent-verify")
-            self.assertTrue(BATCH.DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node))
-        self.route["route_hash"] = route_identity.route_hash(self.route)
+        self._configure_lab_review()
         assignments = self.common_patches()[1]
         for index, leg in enumerate(self.legs()):
             self.write_existing(leg, status="done", note="completed-review-blocking", append=index != 0)
@@ -955,6 +949,21 @@ class DispatchBatchTest(unittest.TestCase):
             self.assertTrue(self.jobs.read_bytes().startswith(original_rows))
             self.assertEqual(source_path.read_bytes(), original_input)
             self.assertEqual(second_path.read_bytes(), second_input)
+
+    def _configure_lab_review(self):
+        import route_identity
+        self.route["effective_intensity"] = "strong"
+        for index, node in enumerate(self.route["nodes"]):
+            node.update(id=("independent-verify" if index == 0 else "independent-verify-alternative"),
+                        kind="review-worker", unit="qa/test", parallel_anchor="independent-verify")
+            self.assertTrue(BATCH.DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node))
+        self.route["route_hash"] = route_identity.route_hash(self.route)
+
+    def test_successful_capped_review_group_replay_reuses_its_attempts(self):
+        self._configure_lab_review()
+        with mock.patch.object(BATCH, "completion_marker_is_current", return_value=True), \
+             mock.patch.object(BATCH, "completion_attempt_readiness", return_value=SimpleNamespace(state="ready")):
+            self._assert_duplicate_batch_state(completed=True)
 
     def test_same_owner_opens_next_review_round_with_changed_prompt(self):
         self._same_owner_next_review_round("closure check after fixes", "codex")
