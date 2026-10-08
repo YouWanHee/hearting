@@ -29,6 +29,22 @@ class SupervisorError(RuntimeError):
     """A session supervisor could not preserve its completion contract."""
 
 
+def refresh_owner_route(args) -> None:
+    """Follow the same owner's adopted continuation before selecting children.
+
+    Launch arguments stay pinned to the original route outside this controller.
+    Using that old tuple here dropped BC's review child after a route advance
+    (2026-10-08), and turned a wait into a terminal contract failure.
+    """
+    from owner_route_binding import resolve_owner_route_lifecycle
+    binding, _status = resolve_owner_route_lifecycle(
+        Path(args.jobs), owner_attempt_id=args.parent_attempt_id)
+    if binding is not None:
+        args.route_file = binding.route_file
+        args.route_id = binding.route_id
+        args.route_hash = binding.route_hash
+
+
 def apply_notice(prompt: str, notice: str) -> str:
     """Attach an SD-116 (b)/(c) budget notice outside any prompt's receipt
     JSON. Used for start-retry prompts that carry no receipt, so
