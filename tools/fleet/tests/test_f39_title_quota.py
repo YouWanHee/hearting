@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -51,6 +52,19 @@ class QuotaTest(unittest.TestCase):
             else:
                 os.environ[key] = value
         self.tmp.cleanup()
+
+    def _run_as_non_group_actor(self):
+        # Budget API cases need no process-group drain. As in the governor's
+        # own API tests, use a real child so unrelated procfs churn cannot
+        # retain already-returned leases and mask the rolling-budget result.
+        if os.getpid() != os.getpgrp():
+            return False
+        result = rt.subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()),
+             type(self).__name__ + "." + self._testMethodName],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return True
 
     def test_limits_and_fake_clock_bound_backlog_then_reopen_window(self):
         self.assertEqual((rt.DEFAULT_CONCURRENCY, rt.MAX_CONCURRENCY), (3, 4))
@@ -236,10 +250,12 @@ class QuotaTest(unittest.TestCase):
         self.assertEqual(records[0]["label"], "dispatch-att-x")
 
     def test_real_governor_reserves_first_now_and_existing_retry_recovers(self):
+        if self._run_as_non_group_actor():
+            return
         now = [1700000000.0]
         answer = "TITLE: 제목 한도 확인\nNOW: 첫 요약 확인 중"
-        # Only the remote provider is stubbed. Both admission layers, sidecar
-        # writing and the missing-summary retry use the real implementation.
+        # Only the remote provider is stubbed. Governor admission, sidecar
+        # writing and retry are real; the caller already holds Fleet capacity.
         with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_START_BUDGET_TITLE": "6",
                                           "FLEET_NOW_LANG": "Korean"}), \
                 mock.patch.object(rt.time, "time", side_effect=lambda: now[0]), \
@@ -273,6 +289,61 @@ class QuotaTest(unittest.TestCase):
             self.assertEqual(recovered["summary"], "첫 요약 확인 중")
             self.assertNotIn("summary_error", recovered)
             self.assertEqual(provider.call_count, 7)
+
+    def test_periodic_retry_and_language_repair_cannot_spend_first_now_reserve(self):
+        if self._run_as_non_group_actor():
+            return
+        now = [1700000000.0]
+        answer = "TITLE: 제목 한도 확인\nNOW: 첫 요약 확인 중"
+        path = Path(self.tmp.name) / "claude.jsonl"
+        path.write_text(json.dumps({"type": "user", "message": {
+            "role": "user", "content": "제목 한도 보호를 확인해 주세요"}}) + "\n")
+        with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_START_BUDGET_TITLE": "6",
+                                          "FLEET_NOW_LANG": "Korean"}), \
+                mock.patch.object(rt.time, "time", side_effect=lambda: now[0]), \
+                mock.patch.object(rt, "run_provider_cascade", return_value=(answer, 0)) as provider:
+            for _ in range(2):
+                self.assertTrue(rt.run_worker("periodic", capacity_held=True))
+            args = ["--harness", "claude", "--sid", "existing-now", "--transcript", str(path)]
+            titles.write("existing-now", "기존 제목", harness="claude", summary="기존 작업 중",
+                         offset=0, now=now[0] - 1000)
+            rt.main(args)  # Real Fleet slot/start admission and governor refusal.
+            failed = titles.read("existing-now", "claude")
+            self.assertIn("_StartBudgetReached", failed["summary_error"])
+            shell = (Path(__file__).resolve().parents[3] / "adapters/claude/statusline.sh").read_text()
+            block = shell[shell.index("          priority_arg="):shell.index("          FLEET_TITLE_REFRESH=1")]
+            result = rt.subprocess.run(
+                ["sh", "-c", block + '\nprintf "%s\\n%s\\n" "$priority_arg" "$quota_arg"'],
+                capture_output=True, text=True, check=True,
+                env=dict(os.environ, scts=str(int(failed["ts"])), sf=str(failed["summary_failures"])))
+            retry_flags = result.stdout.split()
+            self.assertEqual(retry_flags, ["--priority"])
+            now[0] += 31
+            rt.main(args + retry_flags)
+            retried = titles.read("existing-now", "claude")
+            self.assertIn("_StartBudgetReached", retried["summary_error"])
+            self.assertEqual((retried["summary"], retried["offset"]), ("기존 작업 중", 0))
+            titles.write("language-now", "Existing Title", harness="claude", summary="기존 작업 중",
+                         offset=0, now=now[0] - 1000)
+            args[args.index("--sid") + 1] = "language-now"
+            rt.main(args)
+            repaired = titles.read("language-now", "claude")
+            self.assertIn("_StartBudgetReached", repaired["summary_error"])
+            self.assertEqual((repaired["summary"], repaired["offset"]), ("기존 작업 중", 0))
+            self.assertIsNone(titles.last_title("language-now", "claude"))
+            # The language policy drops the invalid title even on failure.
+            # Its next retry must remain ordinary despite that blank title.
+            now[0] += 61
+            rt.main(args + retry_flags)
+            repaired_again = titles.read("language-now", "claude")
+            self.assertIn("_StartBudgetReached", repaired_again["summary_error"])
+            self.assertEqual((repaired_again["summary"], repaired_again["offset"]),
+                             ("기존 작업 중", 0))
+            self.assertEqual(provider.call_count, 2)
+            args[args.index("--sid") + 1] = "dispatch-new-worker"
+            rt.main(args + ["--priority", "--quota-class", "initial"])
+            self.assertEqual(titles.read("dispatch-new-worker", "claude")["summary"], "첫 요약 확인 중")
+            self.assertEqual(provider.call_count, 3)
 
 
 class OpenCodeReadOnlyTest(unittest.TestCase):

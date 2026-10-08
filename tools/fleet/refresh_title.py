@@ -1915,6 +1915,10 @@ def main(argv=None):
         offset = previous.get("offset", 0) if isinstance(previous.get("offset"), int) else 0
         previous_title = previous.get("title", "") if isinstance(previous.get("title"), str) else ""
         previous_summary = previous.get("summary") if isinstance(previous.get("summary"), str) else None
+        # A prior NOW proves this session has already had its first refresh.
+        # Language repair may clear its title on failure; that and a caller's
+        # retry priority must not turn later periodic calls into first starts.
+        first_title_now = not previous_summary
         previous_summary_ts = (
             previous.get("summary_ts", previous.get("ts"))
             if previous_summary else None
@@ -2009,8 +2013,7 @@ def main(argv=None):
             _prompt(delta, prior_title=previous_title, anchor=anchor, title_lang=title_lang,
                     observed_language=observed_language),
             capacity_held=True, label=args.sid, provider_box=provider_box,
-            priority=bool(not previous_title or not previous_summary
-                          or args.priority or args.quota_class in ("initial", "final")),
+            priority=bool(first_title_now or args.quota_class in ("initial", "final")),
         )
         title = validate_title(output, language=title_lang)
         if title and title.lower() == "untitled":
