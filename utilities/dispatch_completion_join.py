@@ -228,13 +228,16 @@ def pending_record_identity(
     route_id = metadata.get("route_id") or ""
     route_node = metadata.get("route_node") or ""
     parent_attempt_id = metadata.get("parent_attempt_id") or ""
-    # A depth-1 review has no owner route. Its exact attempt is its delivery
-    # scope; do not invent an owner binding or conflate cycle and session.
-    if (metadata.get("worker_type") == "review"
+    # A route-free depth-1 review or standalone verification stage has no
+    # owner route. Its exact attempt is the delivery scope, not a route grant.
+    # 2026-10-08: the first-NOW stage completed but no pending record could
+    # be materialized, leaving the native courier retrying an absent ledger.
+    worker_type = metadata.get("worker_type")
+    if (worker_type in {"review", "stage"}
             and metadata.get("dispatch_depth") == "1"
             and not any(metadata.get(key) for key in ROUTE_IDENTITY_METADATA_KEYS)):
         attempt_id = metadata.get("attempt_id", "")
-        return (f"review:{attempt_id}" if attempt_id else "", "_review",
+        return (f"{worker_type}:{attempt_id}" if attempt_id else "", f"_{worker_type}",
                 parent_attempt_id or NO_PARENT_ATTEMPT)
     # A dispatch-depth-1 frame leg is launched by the depth-0 session itself:
     # it carries route_id/route_node like a stage row but has no parent
