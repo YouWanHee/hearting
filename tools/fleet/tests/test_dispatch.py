@@ -1114,7 +1114,7 @@ class RegistrySplitVisibilityTest(unittest.TestCase):
                 "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
                 "execution_surface=registered-headless,registered_worker=1,"
                 "fallback_hop=same-harness-headless,capability=autopilot-code,"
-                "harness=codex,worker_type=owner,launch_started=1,attempt_id=%s\n"
+                "harness=codex,worker_type=owner,launch_started=1,parent_sid=sid-real,attempt_id=%s\n"
                 % (root, attempt),
                 encoding="utf-8",
             )
@@ -1122,7 +1122,8 @@ class RegistrySplitVisibilityTest(unittest.TestCase):
                  mock.patch.object(dispatch, "_candidate_jobs_paths",
                                    return_value=[str(canonical)]):
                 scan.observed_registries = {str(split): {attempt}}
-                jobs = dispatch.collect()
+                jobs = dispatch.collect(session_rows=[Session(harness="claude", pid=1,
+                                                              session_id="sid-real")])
 
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].attempt_id, attempt)
@@ -1140,6 +1141,55 @@ class RegistrySplitVisibilityTest(unittest.TestCase):
                 [], {str(path): {"att-not-present"}}
             )
         self.assertEqual(result, {})
+
+    def test_fixture_parent_and_parentless_rows_are_not_visibility_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs.log"
+            for parent in ("fixture-session", "", "sid-real-extra"):
+                with self.subTest(parent=parent):
+                    path.write_text(
+                        "2026-10-08T00:00:00Z\topen\t/repo\t/wt\tfixture\t"
+                        "attempt_id=att-fixture,parent_sid=%s\n" % parent)
+                    result = dispatch._validated_split_registry_paths(
+                        [], {str(path): {"att-fixture"}},
+                        [Session(harness="opencode", pid=1, session_id="sid-real")])
+                    self.assertEqual(result, {})
+
+    def test_only_exact_observed_attempts_with_current_real_parents_are_shown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = Path(tmp) / "canonical.log"
+            canonical.touch()
+            split = Path(tmp) / "split.log"
+            base = ("2026-10-08T00:00:00Z\topen\t/repo\t/wt\t%s\t"
+                    "attempt_schema_version=2,dispatch_depth=1,harness=codex,"
+                    "worker_type=owner,attempt_id=%s,parent_sid=%s\n")
+            split.write_text(
+                base % ("real", "att-real", "sid-real")
+                + base % ("fixture", "att-fixture", "fixture-session")
+                + base % ("unobserved", "att-unobserved", "sid-real")
+                + base % ("changed", "att-changed", "sid-real")
+                + base % ("changed", "att-changed", "fixture-session"))
+            with mock.patch.object(dispatch, "_scan_processes", return_value=[]) as scan, \
+                 mock.patch.object(dispatch, "_candidate_jobs_paths",
+                                   return_value=[str(canonical)]):
+                scan.observed_registries = {str(split): {"att-real", "att-fixture", "att-changed"}}
+                jobs = dispatch.collect(session_rows=[Session(harness="opencode", pid=1,
+                                                              session_id="sid-real")])
+            self.assertEqual([j.attempt_id for j in jobs], ["att-real"])
+            self.assertEqual(jobs[0].note, "registry-split")
+
+    def test_canonical_jobs_keep_orphans_without_a_visible_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            canonical = Path(tmp) / "jobs.log"
+            canonical.write_text(
+                "2026-10-08T00:00:00Z\topen\t/repo\t/wt\treal-orphan\t"
+                "attempt_schema_version=2,dispatch_depth=1,harness=codex,"
+                "worker_type=owner,attempt_id=att-orphan,parent_sid=missing\n")
+            with mock.patch.object(dispatch, "_scan_processes", return_value=[]), \
+                 mock.patch.object(dispatch, "_candidate_jobs_paths",
+                                   return_value=[str(canonical)]):
+                jobs = dispatch.collect()
+            self.assertEqual([j.attempt_id for j in jobs], ["att-orphan"])
 
 
 class OpenCodeContextTest(unittest.TestCase):

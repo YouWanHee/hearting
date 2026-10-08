@@ -2675,13 +2675,14 @@ def _scan_processes():
 _scan_processes.observed_registries = {}
 
 
-def _validated_split_registry_paths(canonical_paths, observed=None):
+def _validated_split_registry_paths(canonical_paths, observed=None, session_rows=()):
     """Return live process-selected registries outside Fleet's canonical set.
 
     A path is admitted only when the same-user process environment names an exact
-    attempt and that file contains the attempt row.  This is a read-only visibility
-    fallback, not registry authority: jobs from it are marked ``registry-split`` so
-    the launch defect remains visible instead of being normalized away.
+    attempt, that file contains its latest row, and its parent is a session Fleet
+    actually collected. This keeps fixture workers out of the read-only visibility
+    fallback while real launch defects remain marked ``registry-split``. Canonical
+    registry rows do not depend on parent visibility.
     """
 
     observed = (
@@ -2690,6 +2691,7 @@ def _validated_split_registry_paths(canonical_paths, observed=None):
         else observed
     )
     canonical = {os.path.realpath(path) for path in canonical_paths}
+    parent_ids = {s.session_id for s in session_rows if s.session_id}
     result = {}
     for raw_path, attempts in observed.items():
         if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
@@ -2697,18 +2699,21 @@ def _validated_split_registry_paths(canonical_paths, observed=None):
         real = os.path.realpath(raw_path)
         if real in canonical or not os.path.isfile(raw_path):
             continue
-        matched = set()
+        latest = {}
         try:
             with open(raw_path, encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     fields = line.rstrip("\n").split("\t")
                     if len(fields) != 6:
                         continue
-                    attempt = _parse_pipe_meta(fields[5]).get("attempt_id")
+                    meta = _parse_pipe_meta(fields[5])
+                    attempt = meta.get("attempt_id")
                     if attempt in attempts:
-                        matched.add(attempt)
+                        latest[attempt] = meta
         except OSError:
             continue
+        matched = {attempt for attempt, meta in latest.items()
+                   if (meta.get("parent_sid") or meta.get("parent_session_id")) in parent_ids}
         if matched:
             result[raw_path] = matched
     return result
@@ -2730,9 +2735,9 @@ def _iso_elapsed_min(ts):
 
 
 def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
-                   live_attempt_ids=None, canonical_attempts=None,
-                   proc_attempts_by_slug=None, proc_pid_identities=None,
-                   seen_attempts=None):
+                    live_attempt_ids=None, canonical_attempts=None,
+                    proc_attempts_by_slug=None, proc_pid_identities=None,
+                    seen_attempts=None, allowed_attempt_ids=None):
     jobs = []
     malformed = 0
     seen_attempts = set() if seen_attempts is None else seen_attempts
@@ -2758,6 +2763,8 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
             continue
         slug = fields[4]
         row_meta = _parse_pipe_meta(fields[5] or "")
+        if allowed_attempt_ids is not None and row_meta.get("attempt_id") not in allowed_attempt_ids:
+            continue
         # F-97e (2026-09-02): identity is the ATTEMPT, not the slug. An owner and its
         # dispatch-depth-2 children share one jobs.log slug, so slug-keyed latest-wins
         # DESTROYED the open depth-1 owner row before any liveness or render logic ran
@@ -3514,7 +3521,7 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
     output is unchanged."""
     proc_jobs = _scan_processes()
     paths = _candidate_jobs_paths(jobs_path)
-    split_registries = _validated_split_registry_paths(paths)
+    split_registries = _validated_split_registry_paths(paths, session_rows=session_rows)
     paths.extend(split_registries)
     try:
         route_nodes, terminal_attempts = _scan_registry_evidence(paths)
@@ -3544,11 +3551,11 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
             proc_attempts_by_slug=proc_attempts_by_slug,
             proc_pid_identities=proc_pid_identities,
             seen_attempts=seen_attempts,
+            **({"allowed_attempt_ids": split_registries[path]} if path in split_registries else {}),
         )
         if path in split_registries:
             for job in path_jobs:
-                if job.attempt_id in split_registries[path]:
-                    job.note = "registry-split"
+                job.note = "registry-split"
         log_jobs.extend(path_jobs)
         malformed += path_malformed
     # F-71: one attempt = one row. A registry row that reached us for an attempt a
