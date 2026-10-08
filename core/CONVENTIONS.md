@@ -170,6 +170,10 @@ length; difficult-uncertain judgment selects deep at either length. Length alone
 never selects a deep profile. Important explicit deep records additional judgment
 headroom. These are recommendations: an explicit known profile takes precedence
 without requiring a demand document or a justification for overriding the matrix.
+For a parallel group, `--explicit-profiles` wins for the named node/leg only;
+unnamed legs retain their declared profiles. Compose records omitted presets in
+`omitted_parallel_presets` and displays active-intensity omissions before launch,
+including `terminal-anchor`; this notice does not change the terminal/group contract.
 
 The selection records schema/source/resolver_version/demand_digest/resolved_profile/
 judgment_floor/reason. `judgment_floor` retains the historical field name for the recommendation,

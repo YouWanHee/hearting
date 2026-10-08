@@ -3169,7 +3169,10 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
     groups, omitted_groups = [], []
     for group, borrowed in declared_groups:
         anchor = next((n for n in nodes if n["id"] == group["node"]), None)
-        if anchor is None or anchor.get("terminal") is True:
+        if anchor is None:
+            continue
+        if anchor.get("terminal") is True:
+            omitted_groups.append({"id": group["id"], "reason": "terminal-anchor"})
             continue
         consumers = [n for n in nodes if anchor["id"] in n.get("depends_on", [])]
         if anchor["kind"] == "pipeline-stage" and not any(
@@ -3246,8 +3249,19 @@ def _versioned_subgraph(registry, recipe):
             if isinstance(node.get("input_sources"), dict):
                 for name, source in node["input_sources"].items():
                     sealed.setdefault(name, source)
-        return compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None,
-                                       extra_stages=meta.get("extra_stages")) == recipe
+        expected = compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None,
+                                           extra_stages=meta.get("extra_stages"))
+        if expected == recipe:
+            return True
+        # Pre-notice routes already had this identical graph, but did not
+        # record terminal omissions. Preserve their original bytes/profiles.
+        omissions = expected["compose"].get("omitted_parallel_presets", [])
+        remaining = [row for row in omissions if row["reason"] != "terminal-anchor"]
+        if remaining:
+            expected["compose"]["omitted_parallel_presets"] = remaining
+        else:
+            expected["compose"].pop("omitted_parallel_presets", None)
+        return expected == recipe
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         return False
 
@@ -4363,6 +4377,33 @@ def compose_observations(route):
             "pre_execution_answers": [{"question": i, "name": name, "answer": value} for i, (name, value) in enumerate(answers, 1)]}
 
 
+def compose_omission_lines(route):
+    """Existing compose diagnostics only; no stage, profile or gate changes."""
+    recipe = route.get("composed_recipe") or {}
+    omissions = (recipe.get("compose") or {}).get("omitted_parallel_presets", [])
+    if not omissions:
+        return []
+    lines = []
+    for row in omissions:
+        group = None
+        try:
+            registry = TOPO.load_registry()
+            base = TOPO.resolve_recipe(registry, route["capability"], route["capability_mode"])
+            anchor = next((n for n in route["nodes"] if n["id"] == row["id"]), {"id": row["id"]})
+            source, node = TOPO.part_recipe(registry, anchor["part"]) if anchor.get("part") else (base, anchor)
+            group = next((g for g in source["standard_plus"].get("parallel_groups", [])
+                          if g["node"] == node["id"]), None)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # A historical registry gap cannot block compose/start.
+        if group is None:
+            continue  # Older diagnostic rows have no intensity hint; do not guess.
+        if ORDER[route["effective_intensity"]] < ORDER[group["min_intensity"]]:
+            continue  # This intensity did not select the declared preset.
+        legs = " legs " + ",".join(row["legs"]) if row.get("legs") else ""
+        lines.append(f"  {route['effective_intensity']} group {row['id']}{legs} dropped by --graph: {row['reason']}")
+    return lines
+
+
 def compose_decision_lines(route):
     """Read only the sealed selection/nodes; same display for every harness."""
     basis = {row.get("axis"): row for row in
@@ -4401,7 +4442,7 @@ def compose_decision_lines(route):
     resources = [n["id"] for n in nodes if n.get("kind") == "resource-runner"]
     lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
                  f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)")
-    return lines
+    return lines + compose_omission_lines(route)
 
 
 def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False,
