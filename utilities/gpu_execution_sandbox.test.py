@@ -325,7 +325,10 @@ class GpuSandboxTest(unittest.TestCase):
             request = E.load_request(prepared, context=self.context)
             self.assertEqual(request.enforcement_required, "any")
             self.assertEqual(request.writable_roots, (run_root,))
-            grant = E.build_grant(request, runtime="codex-exec", effective_sandbox="danger-full-access", gpu_resource_scope=True)
+            self.assertTrue(request.network_required)
+            self.assertEqual(request.read_roots, ())  # inventory's parent holds the worktree: never grant that tree
+            grant = E.build_grant(request, runtime="codex-exec", effective_sandbox="danger-full-access",
+                                  gpu_resource_scope=True, network_available=True)
             self.assertEqual(grant.file_enforcement, "none")
             self.request(enforcement_required="os-sandbox")
             original = self.request_file.read_bytes()

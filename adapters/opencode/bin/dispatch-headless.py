@@ -534,7 +534,11 @@ def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
     runtime = state_root / "opencode-runtime" / attempt_id
     if not runtime.resolve().is_relative_to(state_root):
         raise DispatchContractError("nested-opencode-runtime-outside-state-root")
-    values = {}
+    # Nested XDG isolation must retain the same user inventory as the typed
+    # worker home which is prepared from this environment afterwards.
+    config_root = Path(env.get("XDG_CONFIG_HOME") or Path(env.get("HOME") or Path.home()) / ".config")
+    inventory = env.get("COMPUTE_HOSTS_CONFIG") or config_root / "hearting/compute-hosts.yaml"
+    values = {"COMPUTE_HOSTS_CONFIG": str(Path(inventory).expanduser().absolute())}
     for kind in ("data", "cache", "state", "config"):
         directory = runtime / kind
         if not directory.resolve().is_relative_to(state_root):
