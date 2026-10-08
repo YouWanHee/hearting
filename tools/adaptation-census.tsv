@@ -24,6 +24,7 @@ shared-utility-deferred	cairn-artifact-read.ts
 shared-utility-deferred	campaign_title_repair.py
 shared-utility-deferred	codex_permission_profile.py
 shared-utility-deferred	compute-hosts
+shared-utility-deferred	context_alert.py
 shared-utility-deferred	dispatch-readiness.py
 shared-utility-deferred	dispatch_attempt_policy.py
 shared-utility-deferred	dispatch_capacity_evidence.py
