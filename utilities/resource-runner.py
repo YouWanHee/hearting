@@ -114,6 +114,38 @@ def controller_argv(registry, row):
     return argv + ["--", *row["command"]]
 
 
+def start_watch(route_file, jobs, cwd, runtime):
+    """Start only the observer, confirming readiness before publishing its identity."""
+    ready_read, ready_write = os.pipe()
+    watch = None
+    try:
+        runtime.mkdir(parents=True, exist_ok=True)
+        with open(runtime / "watch.log", "ab", buffering=0) as output:
+            watch = subprocess.Popen([sys.executable, str(Path(__file__).with_name("workflow-supervisor.py")),
+                "watch", "--route", str(route_file), "--jobs", str(jobs), "--interval", "1",
+                "--ready-fd", str(ready_write)],
+                env={**os.environ, "AGENT_DISPATCH_JOBS": str(jobs)}, cwd=cwd,
+                pass_fds=(ready_write,), stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        os.close(ready_write)
+        ready_write = None
+        if not select.select([ready_read], [], [], 5)[0] or os.read(ready_read, 32) != b"ready\n":
+            raise ValueError("resource-supervisor-start-unconfirmed")
+        supervision = proc_identity(watch.pid)
+        if not supervision or watch.poll() is not None:
+            raise ValueError("resource-supervisor-exited-before-launch")
+        return watch, supervision
+    except Exception:
+        # Only our newly created observer handle is ours to stop.
+        if watch is not None and watch.poll() is None:
+            watch.terminate()
+            watch.wait(timeout=5)
+        raise
+    finally:
+        os.close(ready_read)
+        if ready_write is not None:
+            os.close(ready_write)
+
+
 def start_verified(registry, args, route, route_file, placeholder, *, controller=None):
     """Own the existing watch before releasing an exact, once-only payload."""
     from artifact_producer import prepare_route_artifact_env
@@ -152,6 +184,13 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     with controller.guard() if controller else contextlib.nullcontext():
         created, row = locked_update(registry, reserve)
     if not created:
+        import dispatch_resource_wait as OWNER_RESOURCE
+        sup = OWNER_RESOURCE.supervisor()
+        ledger = sup.ledger_for(route, jobs)
+        armed = sup.read_armed(ledger).get(args.node)
+        if armed:
+            sup.reattach_resource_watch(route, ledger, armed)
+            row = json.loads(Path(registry).read_text())["runs"][args.run_id]
         print(json.dumps({**row, "replayed": True, "payload_spawned": False,
                           "supervisor_alive": RESOURCE_RESUME.supervisor_alive(row.get("supervision"))}))
         return
@@ -186,24 +225,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                               "required_action": "yield-owner-turn", "verification_admitted": False,
                               "workflow_complete": False}))
             return
-        ready_read, ready_write = os.pipe()
-        try:
-            with open(runtime / "watch.log", "ab", buffering=0) as output:
-                watch = subprocess.Popen([sys.executable, supervisor, "watch", "--route", str(route_file),
-                    "--jobs", str(jobs), "--max", "86400", "--interval", "1",
-                    "--ready-fd", str(ready_write)], env=environment, cwd=placeholder["cwd"],
-                    pass_fds=(ready_write,), stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-            os.close(ready_write)
-            ready_write = None
-            if not select.select([ready_read], [], [], 5)[0] or os.read(ready_read, 32) != b"ready\n":
-                raise ValueError("resource-supervisor-start-unconfirmed")
-            supervision = proc_identity(watch.pid)
-            if not supervision or watch.poll() is not None:
-                raise ValueError("resource-supervisor-exited-before-launch")
-        finally:
-            os.close(ready_read)
-            if ready_write is not None:
-                os.close(ready_write)
+        watch, supervision = start_watch(route_file, jobs, placeholder["cwd"], runtime)
         log = Path(placeholder["log"])
         log.parent.mkdir(parents=True, exist_ok=True)
         sentinel = Path(placeholder["sentinel"])
@@ -249,7 +271,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         os.close(release)
         release = None
         print(json.dumps({**row, "replayed": False, "payload_spawned": True,
-                          "supervisor_alive": True, "watch_seconds": 86400,
+                          "supervisor_alive": True, "watch_seconds": None,
                           "verification_admitted": False, "workflow_complete": False}))
     except Exception as error:
         # Closing the private fence cannot run the payload. Do not signal a foreign PID.
