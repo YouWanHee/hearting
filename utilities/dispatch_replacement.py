@@ -178,9 +178,13 @@ def seal_launch_input(args, harness: str, task: str) -> str:
     try:
         _once(path, payload)
     except DC.DispatchContractError as exc:
-        if exc.reason != 'replacement-record-conflict' or not _reseal_allowed(jobs, aid, path, payload):
+        if exc.reason != 'replacement-record-conflict':
             raise
-        _replace_record(path, payload)
+        with _locked(jobs) as lines:
+            if not _reseal_allowed(jobs, aid, path, payload, lines=lines,
+                                   prior=getattr(args, 'automatic_retry_of', None)):
+                raise
+            _replace_record(path, payload)
     return ',replacement_input_digest='+_digest(payload)
 
 
@@ -191,14 +195,27 @@ def seal_launch_input(args, harness: str, task: str) -> str:
 _RESEAL_STABLE_KEYS = route_authority.RESEAL_STABLE_KEYS
 
 
-def _reseal_allowed(jobs, aid, path, payload):
+def _reseal_allowed(jobs, aid, path, payload, *, lines=None, prior=None):
     """A launcher stopped before its claim sealed this input; the next one may reseal it."""
     previous = _read(path)
     stored = json.loads(_bytes(payload))  # compare in the stored form: a tuple reads back as a list
-    if not previous or not route_authority.same_sealed_work(previous, stored):
+    if not previous:
         return False
+    lines = jobs.read_text(encoding='utf-8', errors='replace').splitlines() if lines is None else lines
+    same_work = route_authority.same_sealed_work(previous, stored)
+    if not same_work:
+        reservation = source_reservation(jobs, prior) if prior else None
+        record = _read(_record_path(jobs, reservation['family_id'])) if reservation else None
+        if not record or record.get('replacement_attempt_id') != aid:
+            return False
+        _, source, replay = validate_claim_source(jobs, lines, record)
+        if (source.get('worker_type') != 'owner'
+                or any(previous.get(k) != stored.get(k) for k in _RESEAL_STABLE_KEYS if k not in {'harness', 'argv'})
+                or stored.get('task') != _replacement_task(record, source, replay)
+                or (stored.get('resolved') or {}).get('model_profile') != (replay.get('resolved') or {}).get('model_profile')):
+            return False
     rows = []
-    for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
+    for line in lines:
         fields = line.split('\t')
         if len(fields) == 6:
             meta = DC.parse_registry_metadata(fields[5])
@@ -899,7 +916,7 @@ def claim(jobs: Path, aid: str) -> dict:
         moved = route_authority.moved_owner_harness(route, replay.get('harness')) \
             if meta.get('worker_type') == 'owner' else None
         if moved:
-            # The route's parent moved the owner pin before this claim: the replacement runs there.
+            # Historical observation; the ordinary owner selector reads the pin at launch.
             record['harness'] = moved
         access = _access_in_force(jobs, route) if meta.get('worker_type') == 'owner' else None
         if access:
@@ -1137,21 +1154,30 @@ def admission(jobs, lines, metadata):
                     'attempt_id': source['attempt_id'], 'binding_digest': source['review_input_digest']}):
             raise DC.DispatchContractError('reviewed-evidence-replacement-mismatch')
     expected_task = _replacement_task(record, source, replay)
-    moved = _moved_harness(record, replay)
-    if moved:
-        # The route's parent moved the owner before this claim: the same work on the new harness.
-        # Its command, resolved settings and permission realization are the new harness's own.
-        if candidate.get('harness') != moved:
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'harness')
+    owner = source.get('worker_type') == 'owner'
+    if owner:
+        # Claims bind the work. The ordinary owner launcher resolves the current pin,
+        # allocation and the selected harness's settings at launch, even for an old claim.
+        _, route = _route(jobs, prior, source)
+        from model_profile import sealed_pin_harness
+        pinned = sealed_pin_harness(route_authority.route_in_force(route), worker_type='owner')
+        if pinned and candidate.get('harness') != pinned:
+            raise DC.DispatchContractError('pin-ignored-for-replacement', pinned)
         for key in ('jobs', 'worktree'):
             if candidate.get(key) != replay.get(key):
                 raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
+        if (candidate.get('resolved') or {}).get('model_profile') != (replay.get('resolved') or {}).get('model_profile'):
+            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'model_profile')
+        if record.get('execution_access'):
+            granted = route_authority.granted_permissions(candidate.get('applied_permissions'), candidate.get('launch_home'))
+            if (granted.get('execution_access') or {}).get('request_sha256') != record['execution_access']['request_sha256']:
+                raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'execution_access')
     else:
         _check_tuple(candidate, replay, _transition_of(record), record.get('execution_access'), parent_values)
     if candidate.get('task') != expected_task:
         raise DC.DispatchContractError('replacement-task-mismatch')
     expected_argv = _replacement_argv(record, source, replay, parent_values)
-    if not moved and candidate.get('argv') != expected_argv:
+    if not owner and candidate.get('argv') != expected_argv:
         raise DC.DispatchContractError('replacement-argv-mismatch')
     if Path(record['route_file']).with_suffix('.outcome.json').exists():
         raise DC.DispatchContractError('replacement-route-closed')
@@ -1344,12 +1370,6 @@ def _command(jobs, record, source, replay):
     return [sys.executable,str(root/f'adapters/{replay["harness"]}/bin/dispatch-headless.py'),*argv]
 
 
-def _moved_harness(record, replay):
-    """The harness a claim moved this replacement to, or None when it replays its source's."""
-    harness = record.get('harness')
-    return harness if harness and harness != replay.get('harness') else None
-
-
 def _argv_value(argv, flag):
     for index, arg in enumerate(argv):
         if arg == flag and index + 1 < len(argv):
@@ -1359,10 +1379,10 @@ def _argv_value(argv, flag):
     return None
 
 
-def _moved_owner_command(jobs, record, source, replay):
-    """A replacement owner on the harness its route's parent moved the pin to.
+def _owner_command(jobs, record, source, replay):
+    """Resolve a replacement through the ordinary owner launch, including an old claim.
 
-    The source command belongs to another harness, so it is not replayed: the same work (task,
+    The source command may belong to another harness, so it is not replayed: the same work (task,
     route, worktree, access request, parent session) takes the ordinary owner launch path, which
     builds the new harness's own command from the route in force."""
     task = _replacement_task(record, source, replay)
@@ -1372,7 +1392,7 @@ def _moved_owner_command(jobs, record, source, replay):
     if prompt.is_symlink() or (not _write_once(prompt.parent,prompt,raw) and prompt.read_bytes()!=raw):
         raise DC.DispatchContractError('replacement-task-conflict')
     command = [sys.executable, str(ROOT.resolve()/'utilities/dispatch-owner.py'), '--start',
-               '--adapter', record['harness'], '--route-evidence', record['route_file'],
+               '--route-evidence', record['route_file'],
                '--jobs', str(Path(jobs).resolve()), '--worktree', replay['worktree'],
                '--slug', _argv_value(replay['argv'], '--slug') or record['replacement_attempt_id'],
                '--attempt-id', record['replacement_attempt_id'],
@@ -1396,6 +1416,10 @@ def _capacity_wait(jobs, aid, source, hold=None):
               'harness': source.get('harness') or source.get('owner_harness') or ''}
     if hold is None:
         hold = _capacity_hold(jobs, source)
+        if hold is None and source.get('worker_type') == 'owner':
+            # Preserve reset evidence for a capacity-dead owner before an explicit resume.
+            from dispatch_capacity_evidence import harness_hold
+            hold = harness_hold(jobs, result['harness'], model=source.get('model'))
     if hold:
         result['usage_state'] = hold['label']
         for key in ('headroom', 'usage_gate_used_percent', 'capacity_source'):
@@ -1414,22 +1438,28 @@ def _capacity_reader():
 
 def _capacity_hold(jobs, source, model=None):
     from dispatch_capacity_evidence import harness_hold, usage_states
+    _, route = _route(jobs, source.get('attempt_id'), source)
+    from model_profile import sealed_pin_harness
+    pin = sealed_pin_harness(route_authority.route_in_force(route), worker_type=source.get('worker_type'))
     harness = source.get('harness') or source.get('owner_harness')
+    if source.get('worker_type') == 'owner':
+        # The ordinary selector judges all candidates; the old owner's limit or
+        # soft allocation gate cannot prevent that selection. A named pin waits
+        # only at a real limit, and admission refuses a silently ignored pin.
+        return harness_hold(jobs, pin, model=model) if pin else None
     if not harness:
         return None
     hold = harness_hold(jobs, harness, model=model or source.get('model'))
     if hold:
         return hold
-    _, route = _route(jobs, source.get('attempt_id'), source)
-    from model_profile import sealed_pin_harness
-    if sealed_pin_harness(route, worker_type=source.get('worker_type')) == harness:
+    if pin == harness:
         # A sealed pin moves only for a real usage limit (harness_hold above), as at its
         # first launch and on the stage path; the soft allocation gate does not move it.
         return None
     allocation = route.get('dispatch_allocation') or {}
     if allocation.get('strategy') not in {'balanced', 'capacity-aware'}:
         return None  # legacy routes keep their existing hard-quota contract
-    policy = route.get('owner_harness_policy') if source.get('worker_type') == 'owner' else next(
+    policy = next(
         (node.get('harness_policy') for node in route.get('nodes', [])
          if node.get('id') == source.get('route_node')), None)
     if not isinstance(policy, dict):
@@ -1454,7 +1484,6 @@ def _capacity_hold(jobs, source, model=None):
         affinity_weight=allocation.get('depth_affinity_weight', .5),
         headroom_exponent=allocation.get('usage_headroom_exponent', 1),
         harness_weights=allocation.get('harness_weights'),
-        preference_order=allocation.get('owner_order') if source.get('worker_type') == 'owner' else None,
     )
     if selected == harness:
         return None  # original all-gated recovery, quality bands and relief remain intact
@@ -1558,10 +1587,19 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                     return exhausted_attention(jobs, replacement, replacement_meta)
                 return {'state':'reused','attempt_id':replacement,'record':record}
             if replacement_meta.get('launch_claimed') == '1':
+                if source.get('worker_type') == 'owner':
+                    _, route = _route(jobs, aid, source)
+                    from model_profile import sealed_pin_harness
+                    pinned = sealed_pin_harness(route_authority.route_in_force(route), worker_type='owner')
+                    if pinned and replacement_meta.get('harness') != pinned:
+                        return {'state': 'needs-attention', 'reason': 'pin-ignored-for-replacement',
+                                'attempt_id': replacement, 'harness': replacement_meta.get('harness'),
+                                'source_attempt_id': aid, 'node': source.get('route_node') or '__owner__',
+                                'requested_harness': pinned, 'detail': 'replacement already launched; its execution identity is retained'}
                 return {'state':'running','attempt_id':replacement,'record':record}
         replay = launch_input(jobs,aid,source)
         from dispatch_replacement_batch import command as batch_command
-        command = (_moved_owner_command(jobs, record, source, replay) if _moved_harness(record, replay)
+        command = (_owner_command(jobs, record, source, replay) if source.get('worker_type') == 'owner'
                    else batch_command(jobs, record, source, replay) or _command(jobs,record,source,replay))
         env = dict(os.environ)
         # The old launcher reservation/owner tuple is not a grant for its successor.
@@ -1607,8 +1645,21 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                     'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         if current and current[1].get('launch_claimed') == '1':
             return {'state':'running','attempt_id':replacement,'record':record}
-        output = ''.join(str(getattr(completed, name, '') or '') for name in ('stdout', 'stderr'))
-        return {'state':'needs-attention','reason':'replacement-launch-pending',
+        output = '\n'.join(str(getattr(completed, name, '') or '') for name in ('stdout', 'stderr'))
+        diagnostic = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+        if source.get('worker_type') == 'owner' and diagnostic.get('reason') in {
+                'no-eligible-candidate', 'no-eligible-route-evidence-candidate'}:
+            # Use the ordinary selector's candidates. Only real limits on all of
+            # them mean a pause; auth/unknown/policy failures keep their diagnostic.
+            from dispatch_capacity_evidence import harness_hold
+            candidates = [h for h in diagnostic.get('configured_candidates', '').split(',') if h]
+            holds = [(h, harness_hold(jobs, h)) for h in candidates]
+            if holds and all(hold for _, hold in holds):
+                harness, hold = min(holds, key=lambda item: item[1].get('until_epoch') or float('inf'))
+                return _capacity_wait(jobs, aid, {**source, 'harness': harness}, hold)
+        reason = ('pin-ignored-for-replacement' if diagnostic.get('reason') == 'pin-ignored-for-replacement'
+                  else 'replacement-launch-pending')
+        return {'state':'needs-attention','reason':reason,
                 'attempt_id':replacement,'record':record,'launcher_exit':completed.returncode,
                 'launcher_diagnostic':'\n'.join(output.splitlines()[-20:]),
                 'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
@@ -1625,7 +1676,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             return exhausted_attention(jobs, aid, source, family_record=family_record)
         result = {'state':'needs-attention','reason':reason,'source_attempt_id':aid,
                   'node': source.get('route_node') or '__owner__'}
-        if reason.startswith('replacement-') and getattr(exc,'detail',reason) != reason:
+        if (reason.startswith('replacement-') or reason == 'pin-ignored-for-replacement') and getattr(exc,'detail',reason) != reason:
             result['detail'] = str(exc.detail)[:240]
         elif not isinstance(exc, DC.DispatchContractError):
             result['detail'] = f'{type(exc).__name__}: {exc}'[:240]

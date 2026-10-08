@@ -691,6 +691,33 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn("You are the parent session", result["next_step"])
         self.assertIn("Do not kill", result["next_step"])
 
+    def test_start_with_a_changed_pin_diagnoses_a_live_owner_on_the_old_harness(self):
+        self.start(); self.ready = self.released = True; created = self.start()
+        owner = created['owner_attempt_id']
+        self.jobs.write_text(self.jobs.read_text().replace('attempt_id='+owner,
+            'harness=codex,launch_claimed=1,replacement_original_attempt_id=att-predecessor,attempt_id='+owner))
+        self.route['selection_pins'] = {'owner': {'harness': 'opencode'}}
+        before = self.jobs.read_bytes()
+        result = self.start()
+        self.assertEqual((result['state'], result['reason'], result['requested_harness']),
+                         ('needs-attention', 'pin-ignored-for-replacement', 'opencode'))
+        self.assertEqual(result['owner_attempt_id'], owner)
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_an_ordinary_live_owner_keeps_its_selector_fallback(self):
+        self.start(); self.ready = self.released = True; created = self.start()
+        owner = created['owner_attempt_id']
+        self.jobs.write_text(self.jobs.read_text().replace('attempt_id='+owner, 'harness=codex,launch_claimed=1,attempt_id='+owner))
+        self.route['selection_pins'] = {'owner': {'harness': 'opencode'}}
+        before = self.jobs.read_bytes()
+        with mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}):
+            result = self.start()
+        self.assertEqual(result['state'], 'running', result)
+        self.assertNotEqual(result.get('reason'), 'pin-ignored-for-replacement')
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertEqual(len(self.calls), 3)
+
     def test_owner_exits_during_join_before_the_public_receipt(self):
         self.start(); self.ready = self.released = True; self.start()
         def close_during_join(**kwargs):
@@ -1264,11 +1291,13 @@ class WorkStartTest(unittest.TestCase):
 
     def test_verified_resume_confirmed_exit_enters_existing_once_only_owner_path(self):
         self.route.update(capability="autopilot-lab", capability_mode="setup", effective_intensity="quick",
+            cwd=self.tmp.name, artifact_root=self.tmp.name,
             composed_recipe={"capability":"autopilot-lab","modes":["setup"],
                 "compose":{"graph":["resume-run","run-verify"]},
                 "standard_plus":{"nodes":[{"id":"resume-run"},{"id":"run-verify"}]}},
             nodes=[{"id":"resume-run"},{"id":"one-shot","worker_type":"owner","dispatch_depth":1}])
         with mock.patch.object(W.RESOURCE_RESUME,"observation",return_value={"state":"resource-succeeded"}), \
+             mock.patch.object(W,"prepare_task_request",return_value=None), \
              mock.patch.object(W.RESOURCE_RESUME,"verification_prompt",return_value="\nONLY independent post-run verification"):
             first=self.start()
             again=self.start()

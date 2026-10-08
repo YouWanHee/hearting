@@ -308,8 +308,8 @@ def changed_pin_harness(route, target: str) -> str | None:
 
 def moved_owner_harness(route, launched_harness: str | None) -> str | None:
     """The owner harness the route's parent moved to after an owner launched on
-    `launched_harness`, or None. Only a recorded change moves a replacement; a sealed pin the
-    original launch did not follow (a usage-limit fallback) keeps today's same-harness replay."""
+    `launched_harness`, or None. This is a historical observation; replacement launch
+    selection reads all current pins through `route_in_force`."""
     harness = changed_pin_harness(route, "owner")
     return harness if harness and harness != launched_harness else None
 
@@ -427,9 +427,9 @@ def pinned_launch_harness(route, *, worker_type: str | None, requested: str | No
     return pinned, (requested if requested not in (None, pinned) else None)
 
 
-# A replacement replays its source on the same harness, registry and worktree -- unless the
-# route's parent moved the owner pin before the claim (`moved_owner_harness`): that owner
-# replacement takes the ordinary owner launch on the new harness with the same work.
+# Stage replacements replay the original harness tuple. Owner replacements preserve
+# work and lineage and use the ordinary owner selector with the current pin at launch;
+# a claim's historical harness hint does not override that selection.
 REPLACEMENT_FIXED_KEYS = ("harness", "jobs", "worktree")
 
 
