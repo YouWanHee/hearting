@@ -151,7 +151,7 @@ def read_armed(ledger):
 def resource_continuation_cancelled(route, ledger):
     """The existing journal owns explicit parent close, including preserved runs."""
     return (ledger.state().get("workflow_state") == "CANCELLED" or any(
-        entry.get("evidence", {}).get("parent_close")
+        (entry.get("evidence") or {}).get("parent_close")
         for entry in ledger.journal()))
 
 
@@ -626,6 +626,30 @@ def _checked_resource_row(armed, evidence):
     return row
 
 
+def resource_predecessors(ledger, node):
+    """Resolve active and journal-preserved bindings without dropping old runs."""
+    import dispatch_resource_wait as OWNER_RESOURCE
+    records = [read_armed(ledger).get(node)] + [
+        (entry.get("evidence") or {}).get("previous_resource")
+        for entry in ledger.journal() if entry.get("node") == node]
+    result, seen = [], set()
+    for armed in records:
+        if not armed or armed.get("predecessor_kind") != "resource":
+            continue
+        key = (armed["resource_registry"], armed["predecessor_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        row = json.loads(Path(key[0]).read_text())["runs"][key[1]]
+        if (row.get("route") != armed.get("route_file") or row.get("node") != node
+                or row.get("jobs") != armed.get("jobs")
+                or (row.get("resource_policy") == "supervised-owner" and
+                    OWNER_RESOURCE.resource_body_digest(row) != armed.get("resource_binding"))):
+            raise SupervisorError("resource-history-binding-mismatch")
+        result.append((armed, row))
+    return result
+
+
 def replace_resource_predecessor(route, ledger, prior, record, resource):
     """Called under the ledger lock, with the old run and journal preserved."""
     import dispatch_resource_wait as OWNER_RESOURCE
@@ -645,8 +669,9 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
             or old.get("owner_wait") != resource.get("owner_wait")
             or not missing.get("checked") or not missing.get("missing")
             or stage.get("state") not in {"RUNNING", "FAILED_RETRYABLE"}
-            or state["workflow_state"] not in {"RUNNING", "FAILED_RETRYABLE"}
-            or old.get("log") == resource.get("log") or old.get("sentinel") == resource.get("sentinel")):
+            or state["workflow_state"] not in {"RUNNING", "STAGE_SUCCEEDED", "NEXT_REGISTERED", "NEXT_RUNNING", "FAILED_RETRYABLE"}
+            or any(OWNER_RESOURCE.resource_evidence_paths_conflict(row, resource)
+                   for _, row in resource_predecessors(ledger, prior["node"]))):
         raise SupervisorError("resource-watch-binding-conflict")
     if stage["state"] == "FAILED_RETRYABLE" or state["workflow_state"] == "FAILED_RETRYABLE":
         previous = stage.get("evidence") or {}

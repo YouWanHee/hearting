@@ -1049,12 +1049,12 @@ class SupervisorState:
 
 
 def valid_resource_state(value: object) -> bool:
-    """Separate bounded resource delivery; never manufacture model attempts."""
+    """Separate resource delivery; never manufacture model attempts."""
     if not isinstance(value, dict) or set(value) != {"session_id", "delivered", "outbox"}:
         return False
     delivered = value["delivered"]
     if (not isinstance(value["session_id"], str) or not _safe_identity(value["session_id"])
-            or not isinstance(delivered, list) or len(delivered) > 64
+            or not isinstance(delivered, list)
             or any(not re_fullmatch_digest(key) for key in delivered)
             or len(set(delivered)) != len(delivered)):
         return False

@@ -185,14 +185,16 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                 row.get("resource_policy") != "supervised-owner"
                 or row.get("owner_wait") != owner_wait
                 or not OWNER_RESOURCE.resource_execution_succeeded(row)
-                or row.get("log") == placeholder.get("log")
-                or row.get("sentinel") == placeholder.get("sentinel") for row in matches)):
+                or OWNER_RESOURCE.resource_evidence_paths_conflict(row, placeholder) for row in matches)):
+            raise ValueError("resource-route-body-conflict")
+        if any(OWNER_RESOURCE.resource_evidence_paths_conflict(row, placeholder) for row in history):
             raise ValueError("resource-route-body-conflict")
         data["runs"][args.run_id] = placeholder
         return True, placeholder
     with ledger.lock() if ledger else contextlib.nullcontext():
         if ledger and sup.resource_continuation_cancelled(route, ledger):
             raise ValueError("resource-parent-close-requested")
+        history = [row for _, row in sup.resource_predecessors(ledger, args.node)] if ledger else []
         with controller.guard() if controller else contextlib.nullcontext():
             created, row = locked_update(registry, reserve)
     if not created:
@@ -227,6 +229,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             *continuation, "--successor-cwd", str(placeholder["cwd"]),
             "--successor-log", str(runtime / "verification-start.log")],
             check=True, env=environment, stdout=subprocess.DEVNULL, timeout=30)
+        with ledger.lock():
+            if sup.resource_continuation_cancelled(route, ledger):
+                raise ValueError("resource-parent-close-requested")
         if owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller" and controller is None:
             queued = {**placeholder, "launch_state": "queued"}
             publish_verified_run(registry, args.run_id, placeholder, queued)
@@ -269,10 +274,13 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         if controller is not None:
             row.update(launch_state="started", pid_namespace=controller.identity["pid_namespace"],
                        payload_sandbox=controller.sandbox)
-        with controller.guard() if controller else contextlib.nullcontext():
-            publish_verified_run(registry, args.run_id, placeholder, row)
-            os.write(release, b"start\n")
-            payload_released = True
+        with ledger.lock():
+            if sup.resource_continuation_cancelled(route, ledger):
+                raise ValueError("resource-parent-close-requested")
+            with controller.guard() if controller else contextlib.nullcontext():
+                publish_verified_run(registry, args.run_id, placeholder, row)
+                os.write(release, b"start\n")
+                payload_released = True
         if controller is not None:
             # The outer controller keeps the actual Popen handles so it can
             # reap its children before observing /proc, without PID guessing.

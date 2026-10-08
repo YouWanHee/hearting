@@ -751,7 +751,13 @@ replace the armed predecessor only after an exact successful exit while that
 stage is still waiting for its declared outputs. The ledger lock serializes
 the binding change, preserves the prior execution evidence, and refuses active
 or failed identities, different owners, completed stages, and parent close.
-The owner receives intermediate execution success with no successor admission.
+All prior bindings protect their log, sentinel and progress paths across registries
+and path aliases. Existing active workflow progress is preserved. The final payload
+release checks parent close under the same ledger lock before publishing identity
+and opening its private launch fence.
+The owner receives intermediate execution success with no successor admission;
+an unacknowledged result remains recoverable from its original binding after the
+next registration, with no lifetime receipt-count ceiling.
 The resource that supplies the declared stage outputs can complete the stage.
 
 **Registry selection is workflow-ledger authority.** When a supervisor command

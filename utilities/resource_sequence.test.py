@@ -64,7 +64,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         with contextlib.redirect_stdout(io.StringIO()):
             return SUP.main(argv)
 
-    def launch(self, route, path, jobs, registry, output, body):
+    def launch(self, route, path, jobs, registry, output, body, *, controller=None, close_at=None):
         import artifact_producer
         runner = SUP.runner()
         args = SimpleNamespace(jobs=str(jobs), run_id=body['run_id'], node=body['node'])
@@ -73,9 +73,20 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         def popen(*a, **kw):
             proc = real_popen(*a, **kw)
             payloads.append(proc)
+            if close_at == 'fence':
+                close()
             return proc
+        def close():
+            ledger = SUP.ledger_for(route, jobs)
+            with ledger.lock():
+                ledger.record(body['node'], 'RUNNING', evidence={'parent_close': {'preserve_resource': True}})
         def arm(argv, **kwargs):
-            return subprocess.CompletedProcess(argv, SUP.main(argv[2:]))
+            if close_at == 'reservation':
+                close()
+            result = SUP.main(argv[2:])
+            if close_at == 'arm':
+                close()
+            return subprocess.CompletedProcess(argv, result)
         watch = mock.Mock()
         watch.poll.return_value = None
         with mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
@@ -86,10 +97,184 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 mock.patch.object(runner.subprocess, 'run', side_effect=arm), \
                 mock.patch.object(runner.subprocess, 'Popen', side_effect=popen), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
-            runner.start_verified(registry, args, route, path, dict(body))
+            runner.start_verified(registry, args, route, path, dict(body), controller=controller)
         for proc in payloads:
             self.assertEqual(proc.wait(timeout=5), 0)
         return payloads, json.loads(out.getvalue().splitlines()[-1])
+
+    def receipt_fixture(self, *, queued_controller=False):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        if queued_controller:
+            data = json.loads(registry.read_text())
+            row = data['runs']['fixture-run']
+            row['owner_wait']['launch_scope'] = 'codex-owner-controller'
+            registry.write_text(json.dumps(data))
+            arm_path = ledger.root / 'armed/full-run.json'
+            armed = json.loads(arm_path.read_text())
+            armed['resource_binding'] = WAIT.resource_body_digest(row)
+            arm_path.write_text(json.dumps(armed))
+        SUP.poll_once(route, ledger)
+        args = SimpleNamespace(parent_attempt_id='att-parent', route_id=route['route_id'],
+            route_hash=route['route_hash'], route_file=str(path), jobs=str(jobs))
+        control = SimpleNamespace(thread_id='same-native', pending=lambda: False)
+        state = self.base / 'state.json'
+        WAIT.JOIN.write_supervisor_state(state, 'att-parent', set(), phase='running-turn')
+        def context(*_):
+            armed = SUP.read_armed(ledger)['full-run']
+            row = json.loads(Path(armed['resource_registry']).read_text())['runs'][armed['predecessor_id']]
+            return SUP, route, ledger, [(armed, row)]
+        with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP):
+            prompt = WAIT.wait(args, state, control, set(), lambda _: None, sleep=lambda _: self.fail('extra wait'))
+        return route, path, jobs, registry, output, ledger, args, control, state, context, prompt
+
+    def test_cross_role_and_aliased_evidence_paths_refuse_without_changing_bytes(self):
+        for collision in ('log-sentinel', 'sentinel-log', 'symlink', 'hardlink', 'partial', 'progress'):
+            with self.subTest(collision=collision), self.subfixture():
+                route, path, jobs, registry, output, ledger = self.fixture()
+                SUP.poll_once(route, ledger)
+                body = self.next_body(registry, 'next', output)
+                old = json.loads(registry.read_text())['runs']['fixture-run']
+                if collision == 'log-sentinel':
+                    body['log'] = old['sentinel']
+                elif collision == 'sentinel-log':
+                    body['sentinel'] = old['log']
+                elif collision == 'partial':
+                    body['log'] = old['sentinel'] + '.partial'
+                elif collision == 'progress':
+                    body['progress_file'] = old['sentinel']
+                else:
+                    alias = self.base / 'alias'
+                    if collision == 'symlink':
+                        alias.symlink_to(old['sentinel'])
+                    else:
+                        os.link(old['sentinel'], alias)
+                    body['log'] = str(alias)
+                before = registry.read_bytes(), Path(old['sentinel']).read_bytes(), SUP.read_armed(ledger)
+                with self.assertRaisesRegex(ValueError, 'resource-route-body-conflict'):
+                    self.launch(route, path, jobs, registry, output, body)
+                self.assertEqual((registry.read_bytes(), Path(old['sentinel']).read_bytes(), SUP.read_armed(ledger)), before)
+
+    def test_third_registry_cannot_reuse_first_resource_evidence(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        SUP.poll_once(route, ledger)
+        middle_registry = self.base / 'middle-registry.json'
+        middle_registry.write_text(json.dumps({'runs': {}}))
+        self.launch(route, path, jobs, middle_registry, output, self.next_body(registry, 'middle', output))
+        SUP.poll_once(route, ledger)
+        body = self.next_body(registry, 'last', output)
+        old = json.loads(registry.read_text())['runs']['fixture-run']
+        body['log'] = old['sentinel']
+        last_registry = self.base / 'last-registry.json'
+        last_registry.write_text(json.dumps({'runs': {}}))
+        before = last_registry.read_bytes(), Path(old['sentinel']).read_bytes()
+        with self.assertRaisesRegex(ValueError, 'resource-route-body-conflict'):
+            self.launch(route, path, jobs, last_registry, output, body)
+        self.assertEqual((last_registry.read_bytes(), Path(old['sentinel']).read_bytes()), before)
+        last_registry.write_text(json.dumps({'runs': {body['run_id']: body}}))
+        prior = SUP.read_armed(ledger)
+        with self.assertRaisesRegex(ValueError, 'resource-watch-binding-conflict'):
+            self.arm(path, last_registry, run_id=body['run_id'], extra=('--jobs', str(jobs), '--artifact-base', str(output)))
+        self.assertEqual(SUP.read_armed(ledger), prior)
+
+    def test_unacknowledged_receipt_survives_next_registration_and_queued_intent(self):
+        for other_registry, queued in ((False, False), (True, False), (True, True)):
+            with self.subTest(other_registry=other_registry, queued=queued), self.subfixture():
+                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture(queued_controller=queued)
+                body = self.next_body(registry, 'next', output)
+                target = registry
+                if other_registry:
+                    target = self.base / 'next-registry.json'
+                    target.write_text(json.dumps({'runs': {}}))
+                if queued:
+                    body.update(launch_state='queued', status='launching', launch_request={})
+                    self.assertTrue(WAIT.controller_intent(body))
+                    target.write_text(json.dumps({'runs': {'next': body}}))
+                    self.arm(path, target, run_id='next', extra=('--jobs', str(jobs), '--artifact-base', str(output)))
+                else:
+                    self.launch(route, path, jobs, target, output, body)
+                with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
+                        mock.patch.object(WAIT, 'admit_controller_launch') as admit:
+                    self.assertEqual(WAIT.pending_prompt(state, 'att-parent', args, control), prompt)
+                    self.assertEqual(WAIT.wait(args, state, control, set(), lambda _: None), prompt)
+                    admit.assert_not_called()
+                saved = WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource
+                self.assertEqual(saved['delivered'], [])
+                self.assertTrue(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
+                self.assertFalse(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
+                self.assertIsNone(WAIT.pending_prompt(state, 'att-parent', args, control))
+
+    def test_historical_receipt_rejects_mutated_identity_sentinel_and_session(self):
+        for mutation in ('identity', 'sentinel', 'session'):
+            with self.subTest(mutation=mutation), self.subfixture():
+                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture()
+                self.launch(route, path, jobs, registry, output, self.next_body(registry, 'next', output))
+                data = json.loads(registry.read_text())
+                old = data['runs']['fixture-run']
+                if mutation == 'identity':
+                    old['starttime'] = 'changed'
+                    registry.write_text(json.dumps(data))
+                elif mutation == 'sentinel':
+                    Path(old['sentinel']).write_text('7')
+                else:
+                    control.thread_id = 'foreign-native'
+                with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP):
+                    with self.assertRaisesRegex((ValueError, WAIT.JOIN.JoinContractError), 'binding'):
+                        WAIT.pending_prompt(state, 'att-parent', args, control)
+                self.assertIsNotNone(WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource['outbox'])
+
+    def test_close_between_reservation_arm_and_release_never_runs_payload(self):
+        for controller_mode in (False, True):
+            for close_at in ('reservation', 'arm', 'fence'):
+                with self.subTest(controller=controller_mode, close_at=close_at), self.subfixture():
+                    route, path, jobs, registry, output, ledger = self.fixture()
+                    SUP.poll_once(route, ledger)
+                    body = self.next_body(registry, 'next', output)
+                    effect = self.base / 'payload-effect'
+                    body['command'] = [sys.executable, '-c', 'from pathlib import Path; Path(' + repr(str(effect)) + ').touch()']
+                    controller = None
+                    if controller_mode:
+                        body['launch_state'] = 'queued'
+                        data = json.loads(registry.read_text())
+                        data['runs']['next'] = body
+                        registry.write_text(json.dumps(data))
+                        controller = SimpleNamespace(expected=copy.deepcopy(body), identity={**SUP.RR.proc_identity(os.getpid()),
+                            'pid_namespace': os.readlink('/proc/self/ns/pid')}, command=body['command'],
+                            sandbox='fixture', guard=contextlib.nullcontext)
+                    with self.assertRaisesRegex(ValueError, 'resource-parent-close-requested'):
+                        self.launch(route, path, jobs, registry, output, body, controller=controller, close_at=close_at)
+                    self.assertFalse(effect.exists())
+                    self.assertEqual(ledger.claims(), {})
+                    self.assertEqual(json.loads(registry.read_text())['runs']['next']['status'], 'failed')
+
+    def test_next_registration_preserves_existing_active_workflow_progress(self):
+        for target_state in ('STAGE_SUCCEEDED', 'NEXT_REGISTERED', 'NEXT_RUNNING'):
+            with self.subTest(state=target_state), self.subfixture():
+                route, path, jobs, registry, output, ledger = self.fixture()
+                SUP.poll_once(route, ledger)
+                for step in ('STAGE_SUCCEEDED', 'NEXT_REGISTERED', 'NEXT_RUNNING'):
+                    ledger.set_workflow_state(step)
+                    if step == target_state:
+                        break
+                self.launch(route, path, jobs, registry, output, self.next_body(registry, 'next', output))
+                self.assertEqual(ledger.state()['workflow_state'], target_state)
+                self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'RUNNING')
+
+    def test_65th_receipt_acknowledges_once_without_lifetime_count_limit(self):
+        route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture()
+        saved = WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent')
+        resource = copy.deepcopy(saved.resource)
+        resource['delivered'] = [f'{i:064x}' for i in range(64)]
+        WAIT._write(state, 'att-parent', set(), resource, 'deliverable')
+        receipt_id = resource['outbox']['receipt_id']
+        self.assertTrue(WAIT.acknowledge(state, 'att-parent', receipt_id))
+        self.assertFalse(WAIT.acknowledge(state, 'att-parent', receipt_id))
+        resource = WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource
+        self.assertEqual(len(resource['delivered']), 65)
+        self.assertIsNone(resource['outbox'])
+        with mock.patch.object(WAIT, 'context', side_effect=context):
+            self.assertIsNone(WAIT.wait(args, state, control, set(), lambda _: None, sleep=lambda _: self.fail('already delivered')))
+        for invalid in ([resource['delivered'][0]] * 2, ['invalid-digest']):
+            self.assertFalse(WAIT.JOIN.valid_resource_state({**resource, 'delivered': invalid}))
 
     def test_intermediate_success_waits_without_marker_claim_or_completion(self):
         route, path, jobs, registry, output, ledger = self.fixture()

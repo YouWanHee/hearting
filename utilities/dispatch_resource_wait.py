@@ -98,6 +98,27 @@ def resource_execution_succeeded(row):
             and supervisor().runner().read_sentinel(row.get("sentinel")) == 0)
 
 
+def resource_evidence_paths_conflict(left, right):
+    """Protect prior evidence across path roles, symlinks, and hard links."""
+    def paths(row):
+        values = [row.get(key) for key in ("log", "sentinel", "progress_file") if row.get(key)]
+        return [Path(path).resolve(strict=False) for value in values
+                for path in (value, value + ".partial")]
+    a, b = paths(left), paths(right)
+    if set(a) & set(b):
+        return True
+    def inodes(values):
+        result = set()
+        for path in values:
+            try:
+                stat = path.stat()
+                result.add((stat.st_dev, stat.st_ino))
+            except FileNotFoundError:
+                pass
+        return result
+    return bool(inodes(a) & inodes(b))
+
+
 def controller_intent(row):
     return ((row.get("owner_wait") or {}).get("launch_scope") == "codex-owner-controller"
             and row.get("launch_state") in {"queued", "claimed"}
@@ -257,6 +278,23 @@ def pending_prompt(path, parent, args=None, control=None):
                     "jobs": str(Path(args.jobs).resolve())}
         found = context(args, control)
         row = next((r for _, r in found[3] if resource_key(r) == box["key"]), None) if found else None
+        if row is None and found and found[3] and receipt.get("reason") == "awaiting-next-resource":
+            sup, route, ledger, _ = found
+            for armed, prior in sup.resource_predecessors(ledger, receipt["node"]):
+                owner = prior.get("owner_wait") or {}
+                if (armed.get("route_id") == args.route_id and armed.get("route_hash") == args.route_hash
+                        and armed.get("route_file") == str(Path(args.route_file).resolve())
+                        and armed.get("jobs") == expected["jobs"]
+                        and armed.get("successor_external") is True
+                        and armed.get("successor_command") is None
+                        and prior.get("resource_policy") == "supervised-owner"
+                        and prior.get("parent_attempt_id") == parent
+                        and owner.get("parent_attempt_id") == parent
+                        and owner.get("session_id") == control.thread_id
+                        and resource_key(prior) == box["key"]
+                        and resource_execution_succeeded(prior)):
+                    row = prior
+                    break
         if (any(receipt.get(k) != v for k, v in expected.items()) or row is None
                 or RESUME.row_digest(row) != receipt.get("resource_sha256")):
             raise JOIN.JoinContractError("resource-outbox-binding-changed")

@@ -951,7 +951,10 @@ runner. An exact successful resource exit with stage outputs still absent waits
 for the next resource; it does not fail or complete the stage. The same owner
 receives that execution result and may register the next run after the previous
 identity is gone and its exit sentinel proves success. Historical run records
-remain intact. Stage success and successor admission still require the declared
+remain intact, including their evidence paths and unacknowledged receipts.
+Receipt recovery follows the preserved binding after the next run is registered;
+acknowledgement remains with the returning owner turn, without a lifetime run-count
+ceiling. Stage success and successor admission still require the declared
 outputs; failed, unverifiable, active, or explicitly cancelled resources cannot
 be replaced by another run.
 
