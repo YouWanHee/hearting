@@ -191,6 +191,11 @@ papers uses analyze-project/research as appropriate; new synthesis, failure
 reproduction, or model comparison uses lab/eval; implementing a reusable
 evaluation program uses code. Small experiment-support scripts remain within
 lab's existing implementation stages and do not automatically open a code cycle.
+Existing-result analysis, evaluation, and comparison therefore select
+`autopilot-lab --capability-mode eval` under this same purpose rule. The parent
+chooses the capability: omitting `--capability` in ordinary compose uses the
+fixed `autopilot-code` default, not a classifier of the task text; framed work
+leaves that choice to its frame.
 Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs
 to `audit`. Both may inspect code; purpose, not file type, decides the owner.
@@ -217,6 +222,16 @@ a mode retains its existing deployment/release behavior (`default`).
 
 
 ### 0.2.1. Shape Before Preset (SD-135)
+
+Compose and start show intensity and its source, sealed node profiles, and the
+initial node/worker-dispatch/resource counts before launch. Unspecified intensity
+adds one nonblocking suggestion to consider `strong` for judgment or root-cause
+analysis; intensity does not change model profiles. These observations add no
+approval or required input. New compose records retain the two input sources in
+the existing `selection_basis`; old routes display `sealed-route` when the
+original explicit/default choice was not recorded. Worker estimates count stage
+and frame legs, excluding the separately shown owner and any retries or later
+routes chosen by a frame.
 
 The precedence above decides which capability **owns the artifacts** of a
 request. It does not oblige the session to run that entry's whole recipe.
