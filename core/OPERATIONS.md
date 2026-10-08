@@ -705,6 +705,14 @@ never reimplements continuation. The supervisor is a non-model process: it
 holds no model turn, opens no dispatch depth, and has no launch authority
 beyond the successor its sealed route already declares.
 
+Resource watches follow exact resource identity rather than a 24-hour deadline.
+Start/resume and the parked owner controller reuse a live watch or reattach one
+under the existing resource-registry lock. Recovery changes only supervision
+metadata, never the payload, its identity, or producer outputs. A recovered watch
+whose owner already ended hands proven resource completion to that owner's
+existing parent carrier; it does not start a new training run. Explicit parent
+close suppresses this continuation and all cancelled successors.
+
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
 `<jobs-parent>/workflow/<route-id>` even if the raising and releasing actors
