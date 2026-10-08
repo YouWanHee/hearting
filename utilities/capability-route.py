@@ -2148,7 +2148,8 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
                 node["depends_on"] = list(node["depends_on"]) + [
                     member["id"] for member in members[1:]
                 ]
-                if base.get("kind") != "review-worker":
+                if (base.get("kind") != "review-worker"
+                        or node.get("completion_gate") == "compose-owner-close"):
                     node["inputs"] = list(node.get("inputs", [])) + [
                         output for member in members[1:] for output in member["outputs"]
                     ]
@@ -2864,7 +2865,7 @@ def _unarbitrated_auxiliary_legs(registry, group, anchor, consumers):
 
 
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False,
-                            extra_stages=None):
+                            extra_stages=None, group_intensity=None):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
     The nodes keep their unit, kind, gate, write scope, profile and permissions;
@@ -2872,7 +2873,9 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
     last node becomes the terminal, a human gate a kept node raised is rebound
     to the entry of the node that now follows it (dropped when nothing
     follows), and a parallel group survives only when its anchor is kept and is
-    not the new terminal (G6). Validation stays with `_validate_recipe` --
+    not the new terminal (G6). Strong+ may append a side-effect-free owner close
+    to keep eligible terminal review/map groups. An absent group_intensity
+    replays the historical assembly. Validation stays with `_validate_recipe` --
     this function never re-implements a rule, it only assembles.
 
     SD-165: a graph key is a host stage id, an optional catalog part of the host
@@ -3106,11 +3109,51 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         for original, sealed in zip(info["originals"], node["outputs"]):
             if not TOPO._is_semantic_output(original):
                 produced[original] = sealed
+    declared_groups = [(group, False) for group in base_recipe["standard_plus"].get("parallel_groups") or []]
+    for _, node_id, _, part in rows:
+        if part:  # a borrowed anchor brings its own group, re-keyed to the borrowed node id
+            declared_groups.extend(
+                (dict(json.loads(json.dumps(group)), id=node_id, node=node_id), True)
+                for group in part["recipe"]["standard_plus"].get("parallel_groups") or []
+                if group["node"] == part["stage"])
     if preserve_base_dependencies:
         terminal_ids = {node["id"] for node in nodes
                         if not any(node["id"] in (other.get("depends_on") or []) for other in nodes)}
     else:
         terminal_ids = {nodes[-1]["id"]}
+    auto_completed = []
+    closing_boundaries = set()
+    if group_intensity is not None and ORDER[group_intensity] >= ORDER["strong"]:
+        eligible = {group["node"] for group, _ in declared_groups
+                    if ORDER[group_intensity] >= ORDER[group["min_intensity"]]}
+        anchors = [node for node in nodes if node["id"] in terminal_ids & eligible
+                   and node["kind"] in ("review-worker", "map-worker")]
+        if anchors:
+            closing_boundaries = set(terminal_ids)
+            owner_id, suffix = "owner-close", 1
+            occupied = {node["id"] for node in nodes} | {out for node in nodes for out in node["outputs"]}
+            while owner_id in occupied or owner_id + ".md" in occupied:
+                suffix += 1
+                owner_id = f"owner-close-{suffix}"
+            terminals = [node for node in nodes if node["id"] in terminal_ids]
+            owner = {
+                "id": owner_id, "kind": "capability-owner", "unit": "_kernel/owner",
+                "depends_on": [node["id"] for node in terminals], "role": "deep orchestrator",
+                "inputs": list(dict.fromkeys(item for node in terminals
+                                             for item in node["inputs"] + node["outputs"])),
+                "outputs": [owner_id + ".md"], "write_scope": [owner_id + ".md"],
+                "resource_class": "normal", "completion_gate": "compose-owner-close",
+                "dispatch_depth": 1, "model_profile": registry["owner_profile_by_intensity"]["standard"],
+                "fallback_hops": ["same-harness-headless", "cross-harness-headless", "inline"],
+                "advance_class": "model-required", "model_required_reason": "terminal-report",
+                "commit_expected": False,
+            }
+            nodes.append(owner)
+            source_of[owner_id] = owner
+            terminal_ids = {owner_id}
+            auto_completed.append({"id": owner_id, "reason": "terminal-anchor",
+                                   "anchors": [node["id"] for node in anchors],
+                                   "intensity": group_intensity})
     for terminal in nodes:
         if terminal["id"] not in terminal_ids:
             continue
@@ -3135,7 +3178,9 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
             continue
         base = source_of[node["id"]]
         continuation = base.get("continuation") or {}
-        if continuation.get("kind") == "human-gate":
+        # A closing summary is not the omitted transaction: the old terminal
+        # boundary still drops its approval rather than rebinding it to the close.
+        if continuation.get("kind") == "human-gate" and node["id"] not in closing_boundaries:
             gate = continuation["gate"]
             if gate not in gate_anchor:
                 gates.append(gate)
@@ -3159,13 +3204,6 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
                 and row.get("gate") not in gates):
             bindings.append({"gate": row["gate"], "node": node_id, "position": "entry"})
             gates.append(row["gate"])
-    declared_groups = [(group, False) for group in base_recipe["standard_plus"].get("parallel_groups") or []]
-    for _, node_id, _, part in rows:
-        if part:  # a borrowed anchor brings its own group, re-keyed to the borrowed node id
-            declared_groups.extend(
-                (dict(json.loads(json.dumps(group)), id=node_id, node=node_id), True)
-                for group in part["recipe"]["standard_plus"].get("parallel_groups") or []
-                if group["node"] == part["stage"])
     groups, omitted_groups = [], []
     for group, borrowed in declared_groups:
         anchor = next((n for n in nodes if n["id"] == group["node"]), None)
@@ -3218,7 +3256,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         "completion_gates": sorted({node["completion_gate"] for node in nodes}),
         "human_gates": sorted(set(gates)),
         "human_gate_bindings": bindings,
-        "resume_retry_boundaries": list(ids),
+        "resume_retry_boundaries": list(ids) + [row["id"] for row in auto_completed],
         "compose": {"origin": "compose", "shape": "staged",
                     "graph": [row[0] for row in rows if not (row[3] and row[3].get("plan_stage"))],
                     "unit_overrides": overrides, "base_capability": base_recipe["capability"]},
@@ -3232,6 +3270,10 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         recipe["standard_plus"]["parallel_groups"] = groups
     if omitted_groups:
         recipe["compose"]["omitted_parallel_presets"] = omitted_groups
+    if auto_completed:
+        recipe["compose"]["auto_completed_nodes"] = auto_completed
+        if preserve_base_dependencies:
+            recipe["compose"]["preserve_base_dependencies"] = True
     return recipe
 
 
@@ -3249,8 +3291,11 @@ def _versioned_subgraph(registry, recipe):
             if isinstance(node.get("input_sources"), dict):
                 for name, source in node["input_sources"].items():
                     sealed.setdefault(name, source)
+        auto = meta.get("auto_completed_nodes") or []
         expected = compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None,
-                                           extra_stages=meta.get("extra_stages"))
+                                           extra_stages=meta.get("extra_stages"),
+                                           group_intensity=auto[0]["intensity"] if auto else None,
+                                           preserve_base_dependencies=meta.get("preserve_base_dependencies", False))
         if expected == recipe:
             return True
         # Pre-notice routes already had this identical graph, but did not
@@ -3264,6 +3309,17 @@ def _versioned_subgraph(registry, recipe):
         return expected == recipe
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         return False
+
+
+def _validate_compose_owner_close(registry, recipe, intensity=None):
+    """An automatic close must be the exact registry-derived assembly."""
+    carries = any(node.get("completion_gate") == "compose-owner-close"
+                  for node in recipe["standard_plus"]["nodes"])
+    auto = (recipe.get("compose") or {}).get("auto_completed_nodes")
+    if carries or auto:
+        if (not carries or not auto or not _versioned_subgraph(registry, recipe)
+                or intensity is not None and auto[0]["intensity"] != intensity):
+            raise ValueError("compose-owner-close-differs-from-assembly")
 
 
 def _compose_default_jobs():
@@ -3831,7 +3887,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         extra_stages = route_plan["leg"].get("extra_stages")   # the plan's own stages, from the sealed leg
     selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input,
                                                 preserve_base_dependencies=execution_scope == "report",
-                                                extra_stages=extra_stages)
+                                                extra_stages=extra_stages, group_intensity=requested)
                        if graph_spec is not None else base)
     if execution_scope == "report" and shape == "staged" and graph_spec is not None and profile is None:
         # The narrowed graph is made only from existing recipe/catalog parts. Keep each
@@ -4442,6 +4498,9 @@ def compose_decision_lines(route):
     resources = [n["id"] for n in nodes if n.get("kind") == "resource-runner"]
     lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
                  f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)")
+    for row in ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", []):
+        lines.append(f"  {row['intensity']} group {','.join(row['anchors'])}: "
+                     f"auto-added {row['id']} (terminal-anchor; owner closing summary)")
     return lines + compose_omission_lines(route)
 
 
@@ -4521,6 +4580,8 @@ def compile_composed_route(composed_recipe, capability_mode, requested_intensity
     # SAME validator means gates too: without this, a composed recipe could carry a
     # forged completion gate that no registry contract backs (2026-07-22 verify finding).
     TOPO._validate_gate_contracts(composed_recipe, registry)
+    _validate_compose_owner_close(registry, composed_recipe,
+                                 "standard" if requested_intensity == "auto" else requested_intensity)
     if capability_mode not in composed_recipe.get("modes", []):
         raise ValueError("composed recipe does not declare the requested capability mode")
     return _compile_from_recipe(
@@ -5097,6 +5158,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             composed_recipe, registry,
             registry["owner_profile_by_intensity"]["standard"],
         )
+        _validate_compose_owner_close(registry, composed_recipe, route["effective_intensity"])
         if resume_recipe and not _versioned_subgraph(registry, composed_recipe):
             raise ValueError("resume recipe differs from the declared catalog")
         expected_nodes=(RESOURCE_RESUME.nodes(composed_recipe, registry["owner_profile_by_intensity"]["quick"])
@@ -8109,6 +8171,10 @@ def complete_node(
             raise ValueError(f"{exc.reason}:{exc.detail}") from exc
     # This completion proceeds on its predecessors: keep any gates-off edit of their evidence as history.
     _note_evidence_changes(route,node.get("depends_on",[]) if isinstance(node,dict) else [],jobs=jobs)
+    if node.get("completion_gate") == "compose-owner-close":
+        missing = owner_terminal_prerequisites(route, node, jobs or _compose_default_jobs())
+        if missing:
+            raise ValueError("compose-owner-close-before-join:" + ",".join(sorted(missing)))
     artifact_root=route.get("artifact_root")
     route_id=route.get("route_id")
     pending=None

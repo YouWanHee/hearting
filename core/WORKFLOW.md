@@ -290,6 +290,15 @@ These advisory points add no prerequisite or required stage:
   realized legs and omission notices, including `terminal-anchor`; the label
   alone does not retain a group. Group selection stays registry-only.
 
+At `strong` or higher, a subgraph ending in an eligible declared review or map
+group receives an automatic owner closing node. It reads every realized leg's
+result and writes only the route's closing summary; it does not publish, sync,
+or change the preceding artifacts. The group anchor stays non-terminal and
+the owner holds the terminal completion gate. Compose displays this addition
+alongside omission notices. A pipeline group still needs its declared review
+consumer; an unavailable safe completion remains an omission with a warning.
+Standard and lower routes and already sealed graphs keep their existing shape.
+
 **Frame procedure at depth-0 (`framed`).** `start` launches the frame legs
 (separate launches, no owner) and returns `needs-interview` with
 `route_proposal_review`: each brief's validated proposal or

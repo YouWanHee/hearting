@@ -6974,10 +6974,139 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_auto_owner_close_retains_verification_and_every_leg_input(self):
+  for intensity in ("strong","thorough","adversarial"):
+   route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity=intensity,
+                      graph="metrics:qa/ml-debug,diagnose,report,independent-verify")
+   nodes={n["id"]:n for n in route["nodes"]};owner=nodes["owner-close"]
+   group=route["parallel_groups"][0]
+   self.assertEqual((group["id"],group["width"]),("independent-verify",2))
+   self.assertEqual(owner["depends_on"],group["members"])
+   self.assertEqual((owner["kind"],owner["unit"],owner["dispatch_depth"]),
+                    ("capability-owner","_kernel/owner",1))
+   self.assertEqual(owner["write_scope"],["owner-close.md"])
+   self.assertEqual(owner["terminal_gate"],"compose-owner-close")
+   self.assertEqual(route["workflow_contract"]["terminal_nodes"],["owner-close"])
+   self.assertFalse(set(nodes)&{"publish","sync"})
+   for member in group["members"]:
+    self.assertNotIn("terminal",nodes[member])
+    self.assertEqual(nodes[member]["continuation"],{"kind":"inline-next"})
+    self.assertTrue(set(nodes[member]["outputs"])<=set(owner["inputs"]))
+   self.assertNotIn("omitted_parallel_presets",route["composed_recipe"]["compose"])
+   self.assertTrue(R._versioned_subgraph(R.TOPO.load_registry(),route["composed_recipe"]))
+   R.verify_route(route,R.ROOT)
+  standard=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="standard",
+                        graph="metrics:qa/ml-debug,diagnose,report,independent-verify")
+  self.assertEqual([n["id"] for n in standard["nodes"]],["metrics","diagnose","report","independent-verify"])
+  self.assertNotIn("auto_completed_nodes",standard["composed_recipe"]["compose"])
+  self.assertEqual(standard["parallel_groups"],[])
+  R.verify_route(standard,R.ROOT)
+
+ def test_auto_owner_close_map_arbiter_and_borrowed_scopes(self):
+  for intensity,width in (("strong",2),("thorough",3)):
+   route=self.compose(capability="audit",capability_mode="default",intensity=intensity,
+                      graph="inspect,autopilot-research:retrieval")
+   group=route["parallel_groups"][0];nodes={n["id"]:n for n in route["nodes"]}
+   self.assertEqual(group["width"],width)
+   self.assertEqual(nodes["owner-close"]["depends_on"],group["members"])
+   for member in group["members"]:
+    self.assertTrue(set(nodes[member]["outputs"])<=set(nodes["owner-close"]["inputs"]))
+    self.assertTrue(all("parts/autopilot-research/retrieval/" in p for p in nodes[member]["write_scope"]))
+   if width==3:
+    self.assertEqual(R._resolve_auxiliary_arbiter(route,group["id"]),("node","owner-close"))
+   R.verify_route(route,R.ROOT)
+
+ def test_auto_owner_close_cannot_finish_before_every_verification_leg(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
+                      graph="metrics:qa/ml-debug,diagnose,report,independent-verify",artifact_root=str(root))
+   owner=route["nodes"][-1];closing=root/"owner-close.md";closing.write_text("Both verdicts reconciled\n")
+   with self.assertRaisesRegex(ValueError,"compose-owner-close-before-join"):
+    R.complete_node(route,owner,owner["id"],closing)
+   for node in route["nodes"][:-1]:
+    evidence=root/(node["id"]+".md");evidence.write_text("PASS\n")
+    R.complete_node(route,node,node["id"],evidence,attempt_id="att-inline-"+node["id"],
+                    explicit_attempt_metadata=InlineStageCompletionRecipeTest._axes(self))
+    if node["id"]=="independent-verify":
+     with self.assertRaisesRegex(ValueError,"compose-owner-close-before-join:independent-verify-alternative"):
+      R.complete_node(route,owner,owner["id"],closing)
+   self.assertEqual(R.owner_terminal_prerequisites(route,owner,self._fixture_jobs),{})
+   R.complete_node(route,owner,owner["id"],closing,attempt_id="att-inline-owner-close",
+                   explicit_attempt_metadata=InlineStageCompletionRecipeTest._axes(self,depth=1))
+   self.assertTrue(R.terminal_gate_observation(route,jobs=self._fixture_jobs)["owner-close"]["passed"])
+
+ def test_auto_owner_close_rejects_changed_scope_and_missing_assembly(self):
+  route=self.compose(graph="plan,impl-review",intensity="strong")
+  registry=R.TOPO.load_registry()
+  for change in ("scope","metadata","intensity"):
+   recipe=json.loads(R.canonical(route["composed_recipe"]))
+   if change=="scope":recipe["standard_plus"]["nodes"][-1]["write_scope"].append("source/**")
+   if change=="metadata":recipe["compose"].pop("auto_completed_nodes")
+   if change=="intensity":recipe["compose"]["auto_completed_nodes"][0]["intensity"]="standard"
+   with self.subTest(change=change),self.assertRaisesRegex(ValueError,"compose-owner-close-differs"):
+    R._validate_compose_owner_close(registry,recipe)
+  with self.assertRaisesRegex(ValueError,"compose-owner-close-differs"):
+   R._validate_compose_owner_close(registry,route["composed_recipe"],"standard")
+
+ def test_auto_owner_close_does_not_restore_a_dropped_approval(self):
+  route=self.compose(capability="autopilot-refine",capability_mode="default",
+                     graph="review",intensity="strong")
+  self.assertEqual(route["human_gates"],[])
+  self.assertEqual(route["human_gate_bindings"],[])
+  self.assertEqual(route["nodes"][0]["continuation"],{"kind":"inline-next"})
+  self.assertEqual(route["nodes"][-1]["write_scope"],["owner-close.md"])
+  R.verify_route(route,R.ROOT)
+
+ def test_auto_owner_close_report_scope_keeps_dependency_projection(self):
+  route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
+                     graph="metrics:qa/ml-debug,diagnose,report,independent-verify",execution_scope="report")
+  self.assertTrue(route["composed_recipe"]["compose"]["preserve_base_dependencies"])
+  self.assertTrue(R._versioned_subgraph(R.TOPO.load_registry(),route["composed_recipe"]))
+  self.assertEqual(route["workflow_contract"]["terminal_nodes"],["owner-close"])
+  R.verify_route(route,R.ROOT)
+
+ def test_auto_owner_close_notice_is_once_before_start_and_explain(self):
+  import work_start
+  with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   root=Path(tmp);prompt=root/"task.md";prompt.write_text("Existing metrics judgment")
+   route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
+                      graph="metrics:qa/ml-debug,diagnose,report,independent-verify",artifact_root=str(root/"artifacts"))
+   notice="strong group independent-verify: auto-added owner-close (terminal-anchor; owner closing summary)"
+   for harness in ("claude","codex","opencode"):
+    for action in ("explain","start"):
+     out,err=io.StringIO(),io.StringIO()
+     argv=[str(P),"compose","--shape","staged","--intensity","strong","--capability","autopilot-lab",
+           "--capability-mode","eval","--graph","metrics:qa/ml-debug,diagnose,report,independent-verify",
+           "--cwd",str(R.ROOT),"--artifact-root",str(root/"artifacts"),"--unassigned","--parent-harness",harness,
+           "--prompt-file",str(prompt),"--jobs",str(root/"jobs.log"),"--"+action]
+     receipt={"state":"waiting-owner","parent_next":"end-turn"}
+     def start(*a,**kw):
+      self.assertEqual(err.getvalue().count(notice),1)
+      return dict(receipt)
+     with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+          mock.patch.object(work_start,"start_work",side_effect=start) as launch, \
+          mock.patch.object(R,"_record_route_chain"),mock.patch.object(R,"_route_autoclose"), \
+          contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+      self.assertEqual(R.main(),0)
+     self.assertEqual(err.getvalue().count(notice),1)
+     payload=json.loads(out.getvalue())
+     if action=="start":
+      self.assertEqual({k:payload[k] for k in receipt},receipt)
+      self.assertEqual(set(payload),set(receipt)|{"confirmation","pre_execution_answers"})
+      launch.assert_called_once()
+     else:
+      launch.assert_not_called();self.assertEqual(payload["parallel_groups"][0]["width"],2)
+
  def test_terminal_group_notice_preserves_the_graph_and_pre_notice_route_profiles(self):
   args=dict(capability="autopilot-lab",capability_mode="eval",intensity="strong",
             graph="metrics:qa/ml-debug,diagnose,report,independent-verify")
-  route=self.compose(**args)
+  compose=R.compose_subgraph_recipe
+  def historical(*a,**kw):
+   kw["group_intensity"]=None
+   return compose(*a,**kw)
+  with mock.patch.object(R,"compose_subgraph_recipe",side_effect=historical):
+   route=self.compose(**args)
   expected=[{"id":"independent-verify","reason":"terminal-anchor"}]
   self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],expected)
   self.assertEqual(route["parallel_groups"],[])
@@ -6995,8 +7124,8 @@ class ComposeRouteTest(TestRoute):
   R.verify_route(route,R.ROOT)
   # Compile the exact pre-notice recipe shape, then verify it with the new
   # composer. Recording a diagnostic must not reinterpret its sealed profiles.
-  compose=R.compose_subgraph_recipe
   def pre_notice(*a,**kw):
+   kw["group_intensity"]=None
    recipe=compose(*a,**kw)
    recipe["compose"].pop("omitted_parallel_presets")
    return recipe
@@ -7011,14 +7140,13 @@ class ComposeRouteTest(TestRoute):
   import work_start
   with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
    root=Path(tmp);prompt=root/"task.md";prompt.write_text("Existing metrics judgment")
-   route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",
-                      graph="metrics:qa/ml-debug,diagnose,report,independent-verify",artifact_root=str(root/"artifacts"))
-   warning="strong group independent-verify dropped by --graph: terminal-anchor"
+   route=self.compose(intensity="strong",graph="plan,test,report",artifact_root=str(root/"artifacts"))
+   warning="strong group plan dropped by --graph: review-consumer-not-selected"
    for harness in ("claude","codex","opencode"):
     for action in ("explain","start"):
      out,err=io.StringIO(),io.StringIO()
-     argv=[str(P),"compose","--shape","staged","--intensity","strong","--capability","autopilot-lab",
-           "--capability-mode","eval","--graph","metrics:qa/ml-debug,diagnose,report,independent-verify",
+     argv=[str(P),"compose","--shape","staged","--intensity","strong","--capability","autopilot-code",
+           "--capability-mode","dev","--graph","plan,test,report",
            "--cwd",str(R.ROOT),"--artifact-root",str(root/"artifacts"),"--unassigned","--parent-harness",harness,
            "--prompt-file",str(prompt),"--jobs",str(root/"jobs.log"),"--"+action]
      receipt={"state":"waiting-owner","parent_next":"end-turn"}
@@ -7707,18 +7835,18 @@ class ComposeRouteTest(TestRoute):
   # A review unit can be reused without selecting its preset's producer group.
   review_only=self.compose(capability="autopilot-spec",capability_mode="update",graph="review,prd-transaction",signals=["shared-contract"])
   R.verify_route(review_only,R.ROOT)
- def test_terminal_frame_drops_its_group_and_gate(self):
+ def test_terminal_group_gets_an_owner_close_without_relaxing_g6(self):
   # `frame` is no longer a parallel-group anchor, and it is a dispatch-depth-1
   # node, so a `frame`-only subgraph has no depth-2 evidence consumer and can
   # no longer be composed at all. The two rules this test protects are
   # unchanged and are pinned on the shapes that can still carry them.
-  # (1) G6: a parallel group whose anchor became the terminal is dropped.
+  # (1) G6 stays: the group anchor is non-terminal; the added owner closes.
   grouped=self.compose(graph="plan,impl-review",intensity="strong")
-  self.assertEqual([g["id"] for g in grouped["parallel_groups"]],["plan"])
-  self.assertNotIn("impl-review-alternative",[n["id"] for n in grouped["nodes"]])
+  self.assertEqual([g["id"] for g in grouped["parallel_groups"]],["plan","impl-review"])
+  self.assertIn("impl-review-alternative",[n["id"] for n in grouped["nodes"]])
   self.assertTrue(grouped["nodes"][-1]["terminal"])
-  self.assertEqual(grouped["composed_recipe"]["compose"]["omitted_parallel_presets"],
-                   [{"id":"impl-review","reason":"terminal-anchor"}])
+  self.assertEqual(grouped["nodes"][-1]["id"],"owner-close")
+  self.assertNotIn("omitted_parallel_presets",grouped["composed_recipe"]["compose"])
   R.verify_route(grouped,R.ROOT)
   # (2) route-guard-recovery D9: `plan`/`plan-check` are real descendants of
   # `frame` in the base recipe (`plan.depends_on == ["frame",
