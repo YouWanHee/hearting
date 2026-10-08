@@ -626,7 +626,7 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
         self.assertEqual(seen["child"], (rt.CHILD_DEBOUNCE_SEC, True))
         self.assertEqual(rt.CHILD_DEBOUNCE_SEC, 600)
 
-    def test_working_main_without_summary_uses_priority_lane_and_120s_debounce(self):
+    def test_working_main_without_summary_uses_priority_lane_and_working_debounce(self):
         session = self._session("working-main")
         seen = []
         original = rt.maybe_spawn
@@ -1024,11 +1024,11 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
         """
         captured = self._run_pinned("claude")
         argv = captured["argv"]
-        self.assertIn("--disallowedTools", argv)
-        blocked = argv[argv.index("--disallowedTools") + 1]
-        for tool in rt.DISALLOWED_TOOLS.split():
-            self.assertIn(tool, blocked)
-        self.assertEqual(len(rt.DISALLOWED_TOOLS.split()), 11)
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--disable-slash-commands", argv)
+        self.assertIn("--system-prompt", argv)
+        self.assertIn("--no-session-persistence", argv)
         self.assertEqual(captured["env"]["FLEET_TITLE_REFRESH"], "1")
         self.assertEqual(captured["env"]["AGENT_SESSION_ROLE"], "worker")
 
@@ -1052,8 +1052,8 @@ class SecurityTest(_ConfigHomeMixin, unittest.TestCase):
         definition = workdir / ".opencode" / "agent" / (agent + ".md")
         self.assertTrue(definition.is_file())
         body = definition.read_text(encoding="utf-8")
-        for tool in ("bash", "edit", "write", "read", "webfetch", "task"):
-            self.assertIn("%s: false" % tool, body)
+        self.assertIn('"*": false', body)
+        self.assertIn('"*": deny', body)
 
     def test_no_provider_installed_degrades_to_empty(self):
         import shutil as _shutil
