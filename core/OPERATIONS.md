@@ -166,6 +166,13 @@ an already completed review follows the same recorded-history rule; the first
 completion still requires readable evidence, and gates on retain their live
 evidence check.
 
+A route-free detached review launched by the ordinary governor has no review
+watchdog outcome. Its readable terminal handoff and exact process/group drain
+prove completion through the shared review classifier. Only a review admitted
+through the watchdog requires that watchdog's sealed process outcome; a missing
+watchdog outcome must not be imposed on an ordinary review. Foreground reviews
+retain their sealed exit result, and live or unobservable processes stay pending.
+
 Each SD item below keeps the rule an agent acts on; its full decision record is verbatim in `core/ADAPTATION.md §8`.
 
 Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).

@@ -4009,6 +4009,12 @@ def classify_exact_route_free_review_outcome(
             "dead-foreground-outcome-ineligible", "typed-close"
         )
     detached = row.metadata.get("launch_lifecycle") == "detached"
+    bound_review = any(row.metadata.get(key) for key in (
+        "review_admission", "review_cycle_id", "review_producer_id",
+        "review_output_locator_b64", "review_output_digest",
+        "review_watchdog_budget_digest", "review_readiness_digest",
+        "review_governed_lease_nonce", "review_governed_lease", "review_fence_pid",
+    ))
     if not foreground_review_eligible(
         {**row.metadata, "launch_lifecycle": "foreground-scoped"},
         expected_attempt_id=expected_attempt_id,
@@ -4040,19 +4046,24 @@ def classify_exact_route_free_review_outcome(
                 "terminal-handoff", seal_error.reason,
                 "dead-foreground-outcome-malformed", "typed-close"
             )
-        if detached and quiescence.state == "quiescent":
+        if detached and bound_review and quiescence.state == "quiescent":
             return ExactReviewClassification(
                 "terminal-handoff", "review-process-outcome-missing",
                 "dead-review-process-outcome-missing", "typed-close"
             )
-        return ExactReviewClassification(
-            "active", "foreground-outcome-pending", None, "pending"
-        )
+        if not detached or bound_review:
+            return ExactReviewClassification(
+                "active", "foreground-outcome-pending", None, "pending"
+            )
+        # Ordinary detached reviews use the same governor and exact drain
+        # proof as stage workers. Only --review-output launches a watchdog;
+        # requiring its outcome on an ordinary review invents a worker death
+        # before the readable terminal handoff can be inspected.
     if quiescence.state != "quiescent":
         return ExactReviewClassification(
             "active", f"foreground-process-{quiescence.reason}", None, "pending"
         )
-    if sealed["foreground_process_failure"] != "none":
+    if sealed is not None and sealed["foreground_process_failure"] != "none":
         failure = sealed["foreground_process_failure"]
         return ExactReviewClassification(
             "terminal-handoff", f"foreground-process-{failure}", f"dead-{failure}", "typed-close"
@@ -4098,17 +4109,18 @@ def classify_exact_route_free_review_outcome(
             "terminal-handoff", evidence_reason, "dead-invalid-envelope", "typed-close"
         )
     try:
-        validate_review_output_binding(
-            jobs,
-            attempt_id=row.attempt_id,
-            output_path=artifact,
-            cycle_id=metadata.get("review_cycle_id", ""),
-            producer_id=metadata.get("review_producer_id", ""),
-            capability=metadata.get("capability", ""),
-            unit=metadata.get("unit", ""),
-            worktree=_row_worktree(row),
-            artifact_root=metadata.get("artifact_root", ""),
-        )
+        if bound_review:
+            validate_review_output_binding(
+                jobs,
+                attempt_id=row.attempt_id,
+                output_path=artifact,
+                cycle_id=metadata.get("review_cycle_id", ""),
+                producer_id=metadata.get("review_producer_id", ""),
+                capability=metadata.get("capability", ""),
+                unit=metadata.get("unit", ""),
+                worktree=_row_worktree(row),
+                artifact_root=metadata.get("artifact_root", ""),
+            )
     except (DispatchContractError, OSError) as exc:
         return ExactReviewClassification(
             "terminal-handoff", getattr(exc, "reason", "review-output-binding-invalid"),
