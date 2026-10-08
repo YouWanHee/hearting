@@ -196,6 +196,65 @@ class ArtifactFreedomTest(FX.ProducerTestBase):
         self.assertEqual(len(self.control_events(first, "INDEX.md")), 1)
         self.next_work(first)
 
+    def test_interrupted_first_publication_keeps_its_original_state_after_a_hand_edit(self):
+        route, route_file = self.route(slug="interrupted", campaign_key="freedom")
+        first = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.write_output(first)
+        with self.assertRaises(P.artifact_admission.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=first["cycle_id"], allow_open_route=True, crash_after_manifest=True)
+        path = Path(first["cycle_dir"]) / "manifest.json"
+        document = json.loads(path.read_text())
+        self.assertEqual(document["cycle"]["state"], "active")
+        original_digest = P.artifact_manifest.manifest_digest(document)
+        document["cycle"]["state"] = "completed"
+        path.write_text(json.dumps(document))
+        edited = path.read_bytes()
+        for _ in range(2):
+            P.recover(self.root)
+            record = P.read_cycle_record(self.root, first["cycle_id"])
+            self.assertEqual(record["cycle_state"], "active")
+            self.assertEqual(record["manifest_digest"], original_digest)
+            self.assertEqual(path.read_bytes(), edited)
+        self.next_work(first)
+
+    def test_interrupted_refresh_keeps_pending_edit_history_until_the_recorder_returns(self):
+        first = self.finished()
+        folder = Path(first["cycle_dir"])
+        (folder / "artifacts/plans/cycle/REPORT.md").write_text("updated payload\n")
+        with self.assertRaises(P.artifact_admission.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=first["cycle_id"], crash_after_manifest=True)
+        path = folder / "manifest.json"
+        document = json.loads(path.read_text())
+        document["cycle"]["title"] = "edited while recorder was unavailable"
+        path.write_text(json.dumps(document))
+        with mock.patch.object(P, "_history_module", return_value=None):
+            P.finalize(self.root, cycle_id=first["cycle_id"])
+            pending = P.read_cycle_record(self.root, first["cycle_id"])["history_pending"]
+            self.assertTrue(any(row.get("reason") == "filesystem-change" and
+                                row["target_path"].endswith("manifest.json") for row in pending))
+        for _ in range(2):
+            P.finalize(self.root, cycle_id=first["cycle_id"])
+        self.assertEqual(len(self.control_events(first, "manifest.json")), 1)
+
+    def test_valid_runtime_record_and_locator_edits_are_logged_once_without_own_write_noise(self):
+        first = self.finished()
+        record_path = P.cycle_record_path(self.root, first["cycle_id"])
+        record = json.loads(record_path.read_text())
+        record["title"] = "edited runtime title"
+        record_path.write_text(json.dumps(record))
+        index_json = self.root / "campaigns/INDEX.json"
+        index_json.write_text(json.dumps(json.loads(index_json.read_text()), indent=4) + "\n")
+        index_md = self.root / "campaigns/INDEX.md"
+        index_md.write_text(index_md.read_text() + "\nUser annotation\n")
+        for _ in range(2):
+            P.checkpoint(self.root, cycle_id=first["cycle_id"], trigger="explicit")
+            P.list_campaign_summaries(self.root)
+            P.finalize(self.root, cycle_id=first["cycle_id"])
+        self.assertEqual(len(self.control_events(first, record_path.name)), 1)
+        self.assertEqual(len(self.control_events(first, "INDEX.json")), 1)
+        self.assertEqual(len(self.control_events(first, "INDEX.md")), 1)
+        self.next_work(first)
+
 
 if __name__ == "__main__":
     unittest.main()

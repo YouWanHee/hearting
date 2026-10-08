@@ -769,6 +769,28 @@ def expected_index_bytes(root: Path) -> Tuple[bytes, bytes]:
     return render_indexes(mapping, rows)
 
 
+def index_observation_baselines(root: Path) -> Dict[str, str]:
+    """Last generated contents for history only; absence never gates a reader."""
+    value = _read_json(Path(root) / ".runtime/artifact-locator/index-observation.json")
+    if isinstance(value, dict) and set(value) == {INDEX_JSON, INDEX_MD}:
+        return value
+    import hashlib
+    data = expected_index_bytes(root)
+    return {name: "sha256:" + hashlib.sha256(raw).hexdigest()
+            for name, raw in zip((INDEX_JSON, INDEX_MD), data)}
+
+
+def _remember_generated_indexes(root: Path, json_bytes: bytes, md_bytes: bytes) -> None:
+    import hashlib
+    try:
+        path = Path(root) / ".runtime/artifact-locator/index-observation.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(path, json.dumps({name: "sha256:" + hashlib.sha256(raw).hexdigest()
+                      for name, raw in ((INDEX_JSON, json_bytes), (INDEX_MD, md_bytes))}, sort_keys=True).encode())
+    except OSError:
+        pass  # optional observation state cannot fail an ordinary cache write
+
+
 def _write_index_pair(root: Path, json_bytes: bytes, md_bytes: bytes) -> bool:
     """Atomic two-file replace with rollback. Skips the write (returns False)
     when both files already hold these exact bytes."""
@@ -780,11 +802,13 @@ def _write_index_pair(root: Path, json_bytes: bytes, md_bytes: bytes) -> bool:
     previous_json = _regular_bytes(json_path)
     previous_markdown = _regular_bytes(markdown_path)
     if previous_json == json_bytes and previous_markdown == md_bytes:
+        _remember_generated_indexes(root, json_bytes, md_bytes)
         return False
     base.mkdir(parents=True, exist_ok=True)
     try:
         _atomic_write(json_path, json_bytes)
         _atomic_write(markdown_path, md_bytes)
+        _remember_generated_indexes(root, json_bytes, md_bytes)
     except OSError:
         # Two filenames cannot share one POSIX rename. Roll the first replace
         # back if the second fails; crash residue is detected and healed by

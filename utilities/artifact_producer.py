@@ -695,10 +695,15 @@ def read_cycle_record(root: Path, cycle_id: str) -> Optional[Dict[str, Any]]:
             "locator": where.name, "slug": where.name, "title": where.name, "locator_suffix": ""}
 
 
+def _record_content_digest(record: Mapping[str, Any]) -> str:
+    return _digest(_canonical({key: value for key, value in record.items()
+                               if not key.startswith("control_") and key != "history_pending"}))
+
+
 def _write_cycle_record(root: Path, record: Dict[str, Any], *, exclusive: bool) -> None:
     path = cycle_record_path(root, record["cycle_id"])
     _ensure_dir(path.parent)
-    data = _json_bytes(record)
+    data = _json_bytes(dict(record, control_record_digest=_record_content_digest(record)))
     if exclusive:
         _write_exclusive(path, data, 0o600)
     else:
@@ -5666,7 +5671,8 @@ def _refresh_journal_resume(root: Path, record: Mapping[str, Any], journal: Mapp
         # those bytes alone and abandon this old write intent automatically.
         carried = journal.get("history_pending")
         if isinstance(carried, list):
-            _write_cycle_record(root, _with_pending(record, [entry for entry in carried if isinstance(entry, dict)]),
+            _write_cycle_record(root, _with_pending(record, _merge_pending(record.get("history_pending") or [],
+                                [entry for entry in carried if isinstance(entry, dict)])),
                                 exclusive=False)
             _flush_cycle_pending_locked(root, cycle_id)
         _remove_journal(root, cycle_id)
@@ -5674,7 +5680,8 @@ def _refresh_journal_resume(root: Path, record: Mapping[str, Any], journal: Mapp
     carried = journal.get("history_pending")
     if isinstance(carried, list):
         # History lines the refresh could not hand over before it stopped belong to the record.
-        record = _with_pending(record, [entry for entry in carried if isinstance(entry, dict)])
+        record = _with_pending(record, _merge_pending(record.get("history_pending") or [],
+                               [entry for entry in carried if isinstance(entry, dict)]))
     _commit_sealed(root, record, current, new_digest, now=now, previous_digest=previous_digest)
     return True
 
@@ -6946,13 +6953,30 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                     })
                     continue
                 result["rolled_forward"].append(cycle_id)
-            elif document is None:
+            else:
+                # Publication was prepared from validated bytes. A later edit
+                # or deletion is history, not authority for a different close.
+                original = artifact_lifecycle.find_manifest_snapshot(
+                    root, cycle_id, manifest_digest=journal.get("manifest_digest"))
+                if original is not None:
+                    _raise_if_recovery_fenced(root, cycle_id, now=now)
+                    try:
+                        artifact_locator.prepare_index_update(root, [record["campaign_id"]])
+                        _commit_sealed(root, record, original, journal["manifest_digest"], now=now)
+                    except (artifact_locator.LocatorError, ProducerError) as exc:
+                        if not _is_recoverable_locator_defect(exc) or record["campaign_id"] == target_campaign_id:
+                            raise
+                        result["unresolved"].append({
+                            "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
+                            "code": exc.code, "detail": exc.detail, "phase": "journal",
+                        })
+                        continue
+                    result["rolled_forward"].append(cycle_id)
+                    continue
                 # Crash before the commit point: cycle stays open.
                 _drop_unpublished_snapshot(root, cycle_id, journal)
                 entry.unlink()
                 result["rolled_back"].append(cycle_id)
-            else:
-                _remove_journal(root, cycle_id)
     for record in list_cycle_records(root):
         if (record.get("state") != "open" or record.get("deleted_at")
                 or (record.get("relocation") or {}).get("artifact_root")):
@@ -6969,6 +6993,11 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
             if (directory / "manifest.json").is_file():
                 document = _read_json(directory / "manifest.json")
                 if document is not None:
+                    digest = artifact_manifest.manifest_digest(document)
+                    published = artifact_lifecycle.find_manifest_snapshot(root, record["cycle_id"], manifest_digest=digest)
+                    if published is None:
+                        result["open"].append(record["cycle_id"])
+                        continue
                     _raise_if_recovery_fenced(root, record["cycle_id"], now=now)
                     artifact_locator.prepare_index_update(root, [record["campaign_id"]])
                     _commit_sealed(root, record, document, artifact_manifest.manifest_digest(document), now=now)
@@ -8451,9 +8480,10 @@ def _observe_control_changes(root: Path, cycle_id: str, *, now: Optional[float] 
                                                        started_on=record.get("started_on"))
         paths = [(directory / "manifest.json", record.get("manifest_digest")),
                  (directory / artifact_locator.CYCLE_BINDING, _digest(binding)),
-                 (cycle_record_path(root, cycle_id), "present")]
+                 (cycle_record_path(root, cycle_id), record.get("control_record_digest") or _record_content_digest(record))]
         if locator_cache:
-            paths += [(root / "campaigns" / name, "present") for name in ("INDEX.json", "INDEX.md")]
+            expected = artifact_locator.index_observation_baselines(root)
+            paths += [(root / "campaigns" / name, expected.get(name)) for name in ("INDEX.json", "INDEX.md")]
         prior = dict(record.get("control_observations") or {})
         baselines = dict(record.get("control_baselines") or {})
         stamp = _command_stamp()
@@ -8462,9 +8492,10 @@ def _observe_control_changes(root: Path, cycle_id: str, *, now: Optional[float] 
         for path, expected in paths:
             rel = path.relative_to(root).as_posix()
             if path.parent == root / "campaigns":
-                after = "present" if path.is_file() and not path.is_symlink() else None
+                after = _digest(path.read_bytes()) if path.is_file() and not path.is_symlink() else None
             elif path == cycle_record_path(root, cycle_id):
-                after = "present" if _read_json(path) is not None else None
+                parsed = _read_json(path)
+                after = _record_content_digest(parsed) if parsed is not None else None
             elif path.is_symlink() or not path.is_file():
                 after = None
             elif path.name == "manifest.json":
@@ -8480,7 +8511,7 @@ def _observe_control_changes(root: Path, cycle_id: str, *, now: Optional[float] 
                 continue
             if before == after:
                 continue
-            updates[rel] = "present" if path == cycle_record_path(root, cycle_id) else after
+            updates[rel] = _record_content_digest(record) if path == cycle_record_path(root, cycle_id) else after
             lines.append({"kind": "artifact", "target_type": "artifact", "target_id": cycle_id,
                           "target_path": rel, "operation": "delete" if after is None else "update",
                           "field": "content", "before": {"value": before}, "after": {"value": after},
