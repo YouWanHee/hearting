@@ -985,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
                 server, thread_id=thread_id, prompt=next_prompt, args=args
             )
             pending_notice = ""
+            DECISIONS.refresh_owner_route(args)
             rows = current_children(Path(args.jobs), args.parent_attempt_id,
                                     route_id=args.route_id, route_hash=args.route_hash)
             current = {row.attempt_id: row for row in rows}

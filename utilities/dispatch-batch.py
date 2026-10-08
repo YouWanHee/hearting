@@ -431,12 +431,14 @@ def registry_batch_input(rows: list[dict], route: dict, nodes: list[dict], group
 
 
 def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
-                      parent_attempt: str, prompt: str):
+                      parent_attempt: str, prompt: str, *, prior_attempt_ids=frozenset()):
     """Reuse a previously sealed launch input before applying current ranking.
 
     One exact registered member plus its verified immutable input proves the
     whole original allocation. Final per-row checks still run before launch.
     A pre-SD-157 registry proves the whole original manifest from its N rows.
+    The shared round admission names historical attempts already consumed by
+    this next round; their bindings remain stored but cannot bind its input.
     """
     if not parent_attempt or not jobs.exists():
         return None
@@ -450,6 +452,7 @@ def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
         if (meta.get("route_id") == route["route_id"]
                 and meta.get("batch_group") == group
                 and meta.get("parent_attempt_id") == parent_attempt
+                and meta.get("attempt_id") not in prior_attempt_ids
                 and meta.get("batch_manifest_sha256")):
             candidates.append(meta)
     if not candidates:
@@ -1005,10 +1008,11 @@ def stable_attempt_id(
     route: dict[str, object], node: dict[str, object], slug: str, parent: str,
     parent_attempt_id: str, adapter: str, ordinal: int,
     superseding_recovery_discriminator: str = "",
+    *, review_round: int = 1,
 ) -> str:
     # Display labels are deliberately excluded. One exact parent generation,
-    # route node and selected fallback tuple must always resolve to the same
-    # launch identity even when a caller varies --slug-prefix on a retry.
+    # route node, admitted review round and selected fallback tuple must always
+    # resolve to the same launch identity when a caller varies --slug-prefix.
     del slug, parent
     payload = {
         "route_id": route["route_id"],
@@ -1017,6 +1021,10 @@ def stable_attempt_id(
         "target_harness": adapter,
         "fallback_ordinal": ordinal,
     }
+    if review_round > 1:
+        # The shared admission census owns the generation, not prompt bytes
+        # or display labels. Keep the historic first-round identity unchanged.
+        payload["review_round"] = review_round
     if superseding_recovery_discriminator:
         if not DIGEST.fullmatch(superseding_recovery_discriminator):
             raise BatchError("partial-continuation-replacement-identity-invalid")
@@ -1574,6 +1582,7 @@ def existing_leg_result(
     leg_digest: str,
     agent_home: Path,
     replaced_attempt_id: str = "",
+    prior_attempt_ids: frozenset[str] = frozenset(),
 ) -> dict[str, object] | None:
     """Classify one exact prior attempt before consuming governor capacity.
 
@@ -1608,6 +1617,7 @@ def existing_leg_result(
                     and prior.get("route_node") == leg["node"]
                     and prior.get("parent_attempt_id") == parent_attempt_id
                     and prior.get("batch_group") == parallel_group
+                    and prior.get("attempt_id") not in prior_attempt_ids
                     and prior.get("attempt_id") != replaced_attempt_id):
                 raise BatchError("batch-prior-binding-unproven", str(leg["node"]))
         return None
@@ -2380,9 +2390,15 @@ def main(argv: list[str] | None = None) -> int:
                     f"round={budget.next_round} max_round={budget.cap}",
                     route_node=capped_node_id,
                 )
+        # Only an unmet group opens a new round. A successful group replay
+        # retains its sealed attempts and spends no fresh capacity.
+        historical_batch_attempts = (frozenset().union(*(
+            admission.prior_attempt_ids for admission in round_admissions.values()
+        )) if any(admission.gate_unmet for admission in round_admissions.values()) else frozenset())
         prior_input = None if partial is not None else prior_batch_input(
             jobs, route, nodes, args.parallel_group,
-            os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text)
+            os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
+            prior_attempt_ids=historical_batch_attempts)
         if prior_input is not None:
             assignments = prior_batch_assignments(prior_input, route, nodes, parent_identity)
             independence = "persona"
@@ -2525,7 +2541,12 @@ def main(argv: list[str] | None = None) -> int:
             parent_attempt,
             adapter,
             ordinal,
+            review_round=(round_admissions[node_id].budget.next_round
+                          if node_id in round_admissions else 1),
         )
+        if prior_input is not None:
+            attempt_id = next(member["attempt_id"] for member in prior_input["manifest"]["members"]
+                              if member["route_node"] == node_id)
         leg = {
             "node": node_id,
             "adapter": adapter,
@@ -2743,6 +2764,7 @@ def main(argv: list[str] | None = None) -> int:
                 leg_digest=leg_digests[str(leg["attempt_id"])],
                 agent_home=agent_home,
                 replaced_attempt_id=str(partial["failed_source_attempt_id"]) if partial else "",
+                prior_attempt_ids=historical_batch_attempts,
             )
             if existing is None:
                 pending_legs.append(leg)

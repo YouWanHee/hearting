@@ -379,6 +379,26 @@ def validate_request(value):
     return value
 
 
+def continuation_work_request(route, jobs):
+    """Read the original request for a legacy continuation, without rewriting it.
+
+    New continuations already inherit work_request. BC's older continuation
+    lacked it, so the same normal start could not automatically attach an owner.
+    """
+    current, seen = route, set()
+    while current.get("work_request") is None:
+        source_id, source_hash = current.get("source_route_id"), current.get("source_route_hash")
+        if not source_id or not source_hash or source_id in seen:
+            return validate_request(None)
+        seen.add(source_id)
+        module = _route_module()
+        source_path = module.resolve_route_argument(source_id, jobs)
+        current = module.verify_route(json.loads(Path(source_path).read_text()))
+        if (current.get("route_id"), current.get("route_hash")) != (source_id, source_hash):
+            return validate_request(None)
+    return validate_request(current["work_request"])
+
+
 def group_context_matches_campaign(route, context):
     """Check an explicit context against selection; never infer one from a parent."""
     import artifact_producer as producer
@@ -468,7 +488,8 @@ def _start(route, path, jobs, node, harness, run):
                "--attempt-id", attempt_id(route, node)]
     if node == "owner" or not route.get("artifact_root"):
         # A route with no artifact root has no runtime home for a prompt file; every sealed route has one.
-        task = route["work_request"]["text"]
+        task = (route["work_request"] if "work_request" in route
+                else continuation_work_request(route, jobs))["text"]
         if RESOURCE_RESUME.route_selected(route):
             task += RESOURCE_RESUME.verification_prompt(route, jobs)
         command += ["--prompt-text", task]
@@ -1417,7 +1438,7 @@ def _exited_owner_response(route, result, jobs, aid, **extra):
 def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=None,
              decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
     """Advance preparation once; repeating this call creates no duplicate job."""
-    request = validate_request(route.get("work_request"))
+    request = continuation_work_request(route, jobs)
     path, jobs = Path(path).resolve(), Path(jobs).resolve()
     resume = resume_command(path, jobs, agent_home=ROOT)
     result["resume_command"] = resume

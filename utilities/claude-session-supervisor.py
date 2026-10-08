@@ -1319,6 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
                     return 70
                 emit(result)
                 return process_rc or 3
+            DECISIONS.refresh_owner_route(args)
             rows = current_children(Path(args.jobs), args.parent_attempt_id,
                                     route_id=args.route_id, route_hash=args.route_hash)
             current = {row.attempt_id: row for row in rows}
