@@ -176,6 +176,7 @@ class WorkerHomes(unittest.TestCase):
                                     env=env, profile='code-report')
         home = Path(first['CLAUDE_CONFIG_DIR'])
         before = {p.name: p.read_bytes() for p in home.iterdir() if p.is_file()}
+        bootstrap_inode = (home / 'CLAUDE.md').stat().st_ino
         original = os.replace
         publications = []
         def checked_replace(source, destination):
@@ -190,9 +191,38 @@ class WorkerHomes(unittest.TestCase):
             futures = [pool.submit(prepare_worker_home, ROOT, 'claude', 'stage',
                                    'profile-refresh', env=env, profile='code-report') for _ in range(2)]
             self.assertEqual([f.result(timeout=10) for f in futures], [first, first])
-        self.assertEqual(publications.count('CLAUDE.md'), 2)
+        self.assertEqual(publications.count('CLAUDE.md'), 0)
+        self.assertEqual((home / 'CLAUDE.md').stat().st_ino, bootstrap_inode)
         self.assertEqual(publications.count('settings.json'), 2)
         self.assertEqual(publications.count('worker-home.json'), 2)
+
+    def test_concurrent_profile_bootstrap_publication_is_idempotent(self):
+        builder = worker_runtime_home._builder
+        env = {**self.env, 'CLAUDE_CONFIG_DIR': str(self.source)}
+        original = os.link
+        barrier = threading.Barrier(2)
+        def synchronized(source, destination, *args, **kwargs):
+            if Path(destination).name == 'CLAUDE.md':
+                barrier.wait(timeout=5)
+            return original(source, destination, *args, **kwargs)
+        with patch.object(builder.os, 'link', synchronized), ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(prepare_worker_home, ROOT, 'claude', 'stage',
+                                   'new-profile', env=env, profile='code-report') for _ in range(2)]
+            results = [f.result(timeout=10) for f in futures]
+        self.assertEqual(results[0], results[1])
+        self.assertIn('profiles/code-report.yaml',
+                      (Path(results[0]['CLAUDE_CONFIG_DIR']) / 'CLAUDE.md').read_text())
+
+    def test_profile_preserves_a_foreign_regular_bootstrap(self):
+        home = self.base / 'foreign-home'
+        home.mkdir()
+        bootstrap = home / 'CLAUDE.md'
+        bootstrap.write_text('foreign instructions')
+        with self.assertRaisesRegex(ValueError, 'worker home collision'):
+            prepare_worker_home(ROOT, 'claude', 'stage', 'foreign-profile',
+                                env={**self.env, 'CLAUDE_CONFIG_DIR': str(self.source)},
+                                destination=home, profile='code-report')
+        self.assertEqual(bootstrap.read_text(), 'foreign instructions')
 
     def test_link_refresh_is_atomic_and_foreign_file_is_preserved(self):
         builder = worker_runtime_home._builder

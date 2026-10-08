@@ -229,6 +229,25 @@ def write_worker_text(path, text):
         Path(temporary).unlink(missing_ok=True)
 
 
+def write_profile_bootstrap(path, text):
+    """Publish once; a matching regular bootstrap can be reused, never overwritten."""
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.worker-bootstrap-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(text)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink():
+                # An older preparation may have left the attach-template link.
+                os.replace(temporary, path)
+            elif path.read_text(encoding='utf-8') != text:
+                raise ValueError(f'worker home collision: {path}')
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def link(target, linkpath):
     """Python port of install-runtime-projection.sh's link() primitive.
 
@@ -436,7 +455,7 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         # The declaration's body is specialization; its full skill catalog is
         # not needed because the dispatcher supplies the assigned contract.
         bootstrap = home / filename
-        write_worker_text(bootstrap, assemble_bootstrap(agent_home, profile, harness, worker_type, fragments))
+        write_profile_bootstrap(bootstrap, assemble_bootstrap(agent_home, profile, harness, worker_type, fragments))
     else:
         symlink(agent_home / 'profiles/templates' / f'bootstrap-{harness}.md', home / filename)
     symlink(agent_home, home / 'hearting')
