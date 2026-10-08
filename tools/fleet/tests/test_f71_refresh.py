@@ -197,7 +197,7 @@ class RefreshPumpTest(unittest.TestCase):
         # `_collect_governor()` runs artifact-root.sh: >1s on a loaded runner,
         # so `_loop`'s own `pump.stop(join_timeout=1.0)` raced the join below.
         with mock.patch.object(render, "_init_colors"), \
-             mock.patch.object(render, "_draw"), \
+             mock.patch.object(render, "_draw") as draw, \
              mock.patch.object(render.curses, "curs_set"), \
              mock.patch.object(render, "_malformed", return_value=0), \
              mock.patch.object(render, "_collect_memory", return_value=None), \
@@ -222,6 +222,54 @@ class RefreshPumpTest(unittest.TestCase):
         # every tick and wedge the screen on its empty first frame).
         self.assertTrue(collector_calls)
         self.assertTrue(collector_calls[0])
+        self.assertTrue(draw.call_args_list[0].kwargs["loading"])
+
+    def test_loading_ends_when_a_successful_empty_snapshot_is_adopted(self):
+        self.addCleanup(setattr, render, "_BLINK_ON", render._BLINK_ON)
+        self.addCleanup(setattr, render, "_REFRESH_HEALTH", render._REFRESH_HEALTH)
+        release = threading.Event()
+        adopted = threading.Event()
+        states = []
+
+        def collector(**_kwargs):
+            release.wait(5.0)
+            return [], []
+
+        def draw(*_args, **kwargs):
+            states.append(kwargs["loading"])
+            if not kwargs["loading"]:
+                adopted.set()
+
+        class Screen:
+            def timeout(self, _value):
+                pass
+
+            def getmaxyx(self):
+                return 60, 168
+
+            def getch(self):
+                release.set()
+                return ord("q") if adopted.wait(0.01) else -1
+
+        with mock.patch.object(render, "_init_colors"), \
+             mock.patch.object(render, "_draw", side_effect=draw), \
+             mock.patch.object(render.curses, "curs_set"), \
+             mock.patch.object(render, "_malformed", return_value=0), \
+             mock.patch.object(render, "_collect_memory", return_value=None), \
+             mock.patch.object(render, "_collect_governor", return_value=None), \
+             mock.patch.object(render.gitinfo, "enrich_entities"), \
+             mock.patch.object(render, "_poll_pending_kill"), \
+             mock.patch.object(render, "_handle_base_key", return_value=False), \
+             mock.patch.object(render, "_PROMPT", None), \
+             mock.patch.object(render, "_SELECT_MODE", False):
+            thread = threading.Thread(target=render._loop,
+                                      args=(Screen(), collector, None, "both", 60.0))
+            thread.start()
+            self.assertTrue(adopted.wait(5.0))
+            thread.join(5.0)
+            self.assertFalse(thread.is_alive())
+        self.assertTrue(states[0])
+        self.assertFalse(states[-1])
 
     def test_live_line_build_uses_snapshot_git_and_governor_only(self):
         session = Session(harness="codex", pid=1, cwd="/nas/project", slug="project",
@@ -236,6 +284,44 @@ class RefreshPumpTest(unittest.TestCase):
         visible = "\n".join(render._plain(line) for line in lines)
         self.assertIn("(main ↑2 ↓1)", visible)
         self.assertIn("🚧 3", visible)
+
+
+class FirstSnapshotRenderTest(unittest.TestCase):
+    def test_pending_dispatch_evidence_is_not_projected_before_first_publication(self):
+        from fleet.collectors import dispatch
+        from fleet import projection
+
+        # Dispatch has populated its side channel while the live snapshot is
+        # still in flight. A pending empty frame must not turn this into a
+        # route census or start projecting historical routes on the UI thread.
+        evidence = {"r1": {"execute": {"route_file": "/unused/route.json"}}}
+        with mock.patch.object(dispatch.collect, "last_route_nodes", evidence, create=True), \
+             mock.patch.object(dispatch.collect, "last_degradations", {}, create=True), \
+             mock.patch.object(projection, "attach_projections") as attach, \
+             mock.patch.object(render, "_compute_host_rows", return_value=[]), \
+             mock.patch.object(render, "_usage_header_rows", return_value=[]), \
+             mock.patch.object(render, "_SHOW_ALL", False):
+            for process_view in (False, True):
+                with self.subTest(process_view=process_view), \
+                     mock.patch.object(render, "_PROCESS_VIEW", process_view):
+                    lines = render._build_lines([], [], "both", False, 0,
+                                                term_width=168, governor=None, loading=True)
+                    text = "\n".join(render._plain(line) for line in lines if line)
+                    self.assertIn("loading sessions", text)
+                    self.assertNotIn("0 working", text)
+                    self.assertNotIn("0 idle", text)
+                    self.assertNotIn("no active", text)
+                    attach.assert_not_called()
+
+            # Once a census is published, the existing completed-route fallback
+            # and truthful empty display remain available to snapshot callers.
+            with mock.patch.object(render, "_PROCESS_VIEW", False):
+                lines = render._build_lines([], [], "both", False, 0,
+                                            term_width=168, governor=None)
+                text = "\n".join(render._plain(line) for line in lines if line)
+                self.assertIn("no active sessions or dispatch jobs", text)
+                self.assertIn("0 working", text)
+                attach.assert_called_once()
 
 
 class RefreshPumpRecoveryTest(unittest.TestCase):
