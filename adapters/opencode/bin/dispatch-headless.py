@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
+from worker_runtime_home import prepare_worker_home
 from dispatch_contract import (
     _atomic_registry_replace,
     ensure_terminal_claim_absent,
@@ -1649,6 +1650,9 @@ def main(argv: list[str]) -> int:
             # secondary alive signal independent of the OpenCode SQLite mtime.
             "OPENCODE_DISPATCH_SLUG": args.slug,
         }
+        dispatch_env.update(prepare_worker_home(args.agent_home, 'opencode',
+                                                args.worker_type, args.attempt_id,
+                                                env=dispatch_env))
         if _supervised_owner(args):
             lease = supervisor_lease_path(jobs, args.attempt_id)
             dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))
@@ -1768,9 +1772,9 @@ def main(argv: list[str]) -> int:
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)
             launch_metadata["execution_access_effective_sha256"] = effective_sha256
-        if getattr(args, "nested_runtime_env", None):
-            launch_metadata["opencode_runtime_dir"] = str(
-                Path(args.nested_runtime_env["XDG_DATA_HOME"]).parent)
+        launch_metadata["opencode_runtime_dir"] = str(
+            Path(dispatch_env["XDG_DATA_HOME"]).parent)
+        launch_metadata["runtime_home"] = dispatch_env["OPENCODE_CONFIG_DIR"]
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
         try:
