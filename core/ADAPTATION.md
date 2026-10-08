@@ -335,6 +335,17 @@ prompt carries the carrier taxonomy (dispatch-complexity diagnosis
 
 ### 7.1. Registered owner supervision (SD-14/78/92/113)
 
+Parent close uses the same shared cancellation controller for Claude, Codex
+and OpenCode, whether the owner is in a model turn or parked on children.
+Native turn/session interruption alone is not route closure: exact OS process
+identity and owned-child cleanup are the checked common fallback. Supervisors,
+completion joins and post-exit observers read the existing cancellation intent
+before delivering gates, reconciling results or starting another turn/stage.
+The caller's existing `close` performs termination and closure; resources stay
+live unless its optional `--stop-resources` selects the exactly linked runs.
+An interrupted close is continued by the existing execution observers. No
+adapter adds a cancellation command, reason requirement or approval step.
+
 Owner corrections are accepted independently of delivery. Codex active-turn
 steering is only accepted after a matching turn response; Claude and OpenCode
 next-turn transports deliver on a later owner turn. A parked owner receives a

@@ -277,6 +277,8 @@ FALLBACK_HOPS = {
     "inline",
 }
 ATTEMPT_MUTABLE_METADATA = {
+    "parent_close_requested", "parent_close_route_id", "parent_close_route_hash",
+    "parent_close_stop_resources", "parent_close_settled",
     "resolved_model",
     "launch_claimed",
     "pid",
@@ -5018,6 +5020,9 @@ def spawn_claimed_attempt(
             )
         child_index, child_fields, child_meta = matches[0]
         validate_attempt_metadata(child_meta)
+        import route_parent_close
+        if route_parent_close.row_requested(child_meta, jobs):
+            raise DispatchContractError("cancelled-by-parent")
         if child_fields[1] not in {"open", "running"}:
             raise DispatchContractError("attempt-not-open", attempt_id)
         if child_meta.get("launch_claimed") == "1":
@@ -5339,6 +5344,8 @@ def spawn_claimed_attempt(
                     )
                 fresh_index, fresh_fields, fresh_meta = fresh_matches[0]
                 validate_attempt_metadata(fresh_meta)
+                if route_parent_close.row_requested(fresh_meta, jobs):
+                    raise DispatchContractError("cancelled-by-parent")
                 if (
                     fresh_fields[1] not in {"open", "running"}
                     or fresh_fields[2:5] != child_fields[2:5]
@@ -6822,6 +6829,9 @@ def owner_operation_gates(route: dict) -> list[tuple[dict, str]]:
 
 def owner_operation_fence(route: dict, node: dict, jobs: Path | None = None) -> None:
     """Refuse the owner's own operation until a person released the current preview."""
+    import route_parent_close
+    if route_parent_close.intent(route, jobs):
+        raise DispatchContractError("cancelled-by-parent")
     _human_gate_entry_fence(route, node, jobs, release_proof=True, only=OWNER_OPERATION_GATES)
 
 
@@ -9304,10 +9314,12 @@ def marker_bound_delivery_transaction(
         verdict = _marker_bound_row_verdict(metadata)
         quiescent = observation_current and process_observation.state == "quiescent"
         advanced = False
+        import route_parent_close
         if (
             advance
             and observation_current
             and fields[1] in {"open", "running"}
+            and not route_parent_close.row_requested(metadata, jobs)
             and marker is not None
             and quiescent
             and owned_children == 0
@@ -9623,6 +9635,13 @@ def claim_attempt_row(
         for terminal_route_id in sorted(terminal_route_ids):
             ensure_terminal_claim_absent(jobs, terminal_route_id,
                 terminal_owner)
+            import route_parent_close
+            terminal_hash = (row_metadata.get("owner_route_hash")
+                             if terminal_route_id == row_metadata.get("owner_route_id")
+                             else row_metadata.get("route_hash"))
+            if terminal_hash and route_parent_close.intent(
+                    {"route_id": terminal_route_id, "route_hash": terminal_hash}, jobs):
+                raise DispatchContractError("cancelled-by-parent")
         from dispatch_replacement import replacement_row
         row, automatic_replacement = replacement_row(jobs, lines, row)
         row_fields = row.split("\t")
@@ -9770,7 +9789,8 @@ _SD105_CANCELLED_NOTE = "cancelled-receipt-unavailable"
 
 def _terminal_delivery_receipt(metadata: dict[str, str]) -> dict:
     """The terminal writer and every carrier use this same semantic result."""
-    is_success = committed_outcome("done", metadata) == "succeeded"
+    outcome = committed_outcome("done", metadata)
+    is_success = outcome in {"succeeded", "cancelled"}
     child = {
         "attempt_id": metadata.get("attempt_id", ""),
         "status": "done",
@@ -9781,6 +9801,8 @@ def _terminal_delivery_receipt(metadata: dict[str, str]) -> dict:
     }
     if not is_success:
         child["reason"] = "terminal-failure-or-unclosed"
+    elif outcome == "cancelled":
+        child["reason"] = "cancelled-by-parent"
     receipt = {
         "schema_version": 2,
         "state": "delivered",
@@ -9964,6 +9986,9 @@ def close_attempt_row(
             if metadata.get("attempt_id") != attempt_id:
                 continue
             validate_attempt_metadata(metadata)
+            import route_parent_close
+            if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+                return False
             if metadata.get("teardown_claim"):
                 return False
             fields[1] = "done"
@@ -10163,6 +10188,11 @@ def _commit_attempt_terminal(
             )
         index, fields, metadata = matches[0]
         validate_attempt_metadata(metadata)
+        import route_parent_close
+        if route_parent_close.row_requested(metadata, jobs):
+            # Intent first wins; post-exit PASS/FAIL is a late observation,
+            # not a contradictory terminal result requiring another review.
+            return "already-terminal" if fields[1] not in {"open", "running"} else "cancellation-pending"
         if fields[1] in {"done", "killed", "cancelled"}:
             incoming = evidence or {}
             prior_class = metadata.get("failure_class", "")
@@ -10393,6 +10423,9 @@ def close_attempt_row_if(
             if metadata.get("attempt_id") != attempt_id:
                 continue
             validate_attempt_metadata(metadata)
+            import route_parent_close
+            if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+                return False
             recorded_claim = metadata.get("teardown_claim", "")
             if recorded_claim:
                 if not teardown_claim or recorded_claim != teardown_claim:

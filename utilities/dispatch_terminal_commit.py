@@ -1554,6 +1554,9 @@ def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
     """
     from dispatch_completion_join import exact_attempt_row
     row = exact_attempt_row(Path(jobs), owner_attempt_id)
+    import route_parent_close
+    if route_parent_close.row_requested(row.metadata, jobs):
+        return None
     if row.metadata.get("workflow_completion") != "runtime-v1":
         return None
     if row.status not in {"open", "running"}:
@@ -1576,7 +1579,9 @@ def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
 
 def _completion_request(jobs, status, metadata):
     """The launch contract, not terminal words alone, assigns workflow closure."""
-    if (metadata.get("workflow_completion") != "runtime-v1"
+    import route_parent_close
+    if (route_parent_close.row_requested(metadata, jobs)
+            or metadata.get("workflow_completion") != "runtime-v1"
             or metadata.get("worker_type") != "owner" or metadata.get("dispatch_depth") != "1"
             or status != "done" or not verdict_pass(metadata)):
         return None

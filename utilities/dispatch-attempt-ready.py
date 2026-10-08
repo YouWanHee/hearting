@@ -83,6 +83,10 @@ def classify_selection(jobs: Path, rows, *, settle: bool = False) -> dict[str, o
                 parent_attempt_id=row.attempt_id, advance=False,
             )
             current["status"] = state.status
+            if state.cancellation_requested and not state.cancelled:
+                current.update(readiness="pending", reason="termination-pending", required_action="")
+                children.append(current)
+                continue
             current["required_action"] = JOIN.delivery_required_action(state)
             current["readiness"] = (
                 "ready" if JOIN.delivery_classification(state) == "success"

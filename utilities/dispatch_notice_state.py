@@ -288,6 +288,14 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
             current = True
             continue  # Old route-free completion records remain deliverable.
         status, meta = row
+        import route_parent_close
+        settled = route_parent_close.cancellation_settled(meta, jobs)
+        if settled is False:
+            from dispatch_completion_join import CompletionDeferred
+            raise CompletionDeferred("termination-pending")
+        if settled is True:
+            current = True
+            continue
         if action.startswith("human-gate:"):
             if not _legacy_gate_current(record, jobs, child, meta):
                 return False
@@ -309,12 +317,43 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
 def keep_claim(root, recipient, delivery_id, record, claim_owner, *, jobs=None) -> bool:
     """Retire only proven obsolete notices; unknown evidence stays recoverable."""
     import dispatch_pending_delivery as pending
+    from dispatch_completion_join import CompletionDeferred
+    jobs = Path((record.get("receipt") or {}).get("job_registry") or jobs or Path(root) / "jobs.log")
     try:
-        if notice_is_current(record, jobs=jobs or Path(root) / "jobs.log"):
+        if notice_is_current(record, jobs=jobs):
+            # Only the carrier's in-memory view changes. The stored receipt,
+            # identity/digest, lease and replay remain the original record.
+            receipt = record.get("receipt") or {}
+            if receipt.get("kind") not in {"human-gate", "supervision", "notice"}:
+                from dispatch_supervision import _rows
+                import route_parent_close
+                rows = _rows(jobs)
+                children = []
+                projected = False
+                for child in receipt.get("children", []):
+                    row = rows.get(child.get("attempt_id"))
+                    settled = route_parent_close.cancellation_settled(row[1], jobs) if row else None
+                    if settled is False:
+                        raise CompletionDeferred("termination-pending")
+                    if settled is True:
+                        projected = True
+                        child = dict(child, status="done", readiness="ready", reason="cancelled-by-parent",
+                                     required_action="advance-completed", delivery_classification="success")
+                        child.pop("next_leg", None)
+                    children.append(child)
+                if projected:
+                    record["receipt"] = dict(receipt, children=children,
+                        delivery_classification=("attention" if any(c.get("delivery_classification") == "attention"
+                            for c in children) else "success"))
             return True
         pending.reject_claimed(root, recipient, delivery_id, claim_owner=claim_owner,
                                reason=("supervision-resolved" if record.get("receipt", {}).get("kind") == "supervision"
                                        else "notice-obligation-resolved"))
+    except CompletionDeferred:
+        try:
+            pending.release_claim(root, recipient, delivery_id, claim_owner=claim_owner)
+        except pending.PendingDeliveryError:
+            pass  # A lost claim stays with its existing carrier/lease recovery.
     except (OSError, ValueError, KeyError, pending.PendingDeliveryError):
         pass
     return False

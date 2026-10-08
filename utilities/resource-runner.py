@@ -237,6 +237,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         launch_argv = ["/bin/sh", "-c", 'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
                        + SENTINEL_SCRIPT, "resource-runner", *(controller.command if controller else placeholder["command"])]
         environment.update(progress_environment(placeholder))
+        environment.update(HEARTING_RESOURCE_RUN_ID=args.run_id, HEARTING_RESOURCE_REGISTRY=str(registry.resolve()))
         environment.update(AGENT_RESOURCE_SENTINEL=str(sentinel), AGENT_RESOURCE_LAUNCH_FD=str(wait_read))
         try:
             with open(log, "ab", buffering=0) as output:
@@ -254,7 +255,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             time.sleep(.01)
         if not ident or not RESOURCE_RESUME.supervisor_alive(supervision):
             raise ValueError("resource-launch-identity-unconfirmed")
-        row = {**placeholder, **ident, "process_group": os.getpgid(proc.pid), "launch_argv": launch_argv,
+        row = {**placeholder, **ident, "pid_namespace": os.readlink("/proc/self/ns/pid"), "process_group": os.getpgid(proc.pid), "launch_argv": launch_argv,
                "status": "running", "workflow_state": "RUNNING", "supervision": supervision}
         if controller is not None:
             row.update(launch_state="started", pid_namespace=controller.identity["pid_namespace"],
@@ -423,7 +424,8 @@ def main(argv=None, *, controller=None):
         with contextlib.suppress(OSError):
             Path(str(sentinel)+".partial").unlink()
         launch_argv=["/bin/sh","-c",SENTINEL_SCRIPT,"resource-runner",*command]
-        environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel)}
+        environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel),
+                     "HEARTING_RESOURCE_RUN_ID": args.run_id, "HEARTING_RESOURCE_REGISTRY": str(registry.resolve())}
         out=open(log,"ab",buffering=0)
         try:
             proc=subprocess.Popen(launch_argv,cwd=cwd,env=environment,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
@@ -440,7 +442,7 @@ def main(argv=None, *, controller=None):
             proc.kill()
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             fail("could not establish process identity")
-        run={**ident,"run_id":args.run_id,"process_group":os.getpgid(proc.pid),"cwd":str(cwd),"log":str(log),"command":command,
+        run={**ident,"pid_namespace":os.readlink("/proc/self/ns/pid"),"run_id":args.run_id,"process_group":os.getpgid(proc.pid),"cwd":str(cwd),"log":str(log),"command":command,
              "launch_argv":launch_argv,"sentinel":str(sentinel),"progress_file":placeholder["progress_file"],
              "parent_attempt_id":args.parent_attempt_id,**provenance,
              "route":args.route,"node":args.node,"status":"running","workflow_state":"RUNNING",
