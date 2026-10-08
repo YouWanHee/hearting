@@ -62,9 +62,9 @@ def claude_usage(transcript: object, session_id: str) -> int | None:
                     or row.get("sessionId", session_id) != session_id):
                 continue
             message = row.get("message")
-            if isinstance(message, dict) and "usage" in message:
-                return input_tokens(message["usage"], (
-                    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+            # Missing latest usage is unknown; an older request is not current.
+            return input_tokens(message.get("usage") if isinstance(message, dict) else None, (
+                "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
     except OSError:
         pass
     return None

@@ -89,6 +89,17 @@ class ContextAlertTest(unittest.TestCase):
             values = list(pool.map(lambda _: self.notice(703000), range(16)))
         self.assertEqual(sum(bool(value) for value in values), 1)
 
+    def test_latest_assistant_without_usage_never_reuses_an_older_high_count(self):
+        path = self.transcript(800000)
+        with path.open("a") as handle:
+            handle.write(json.dumps({"type": "assistant", "sessionId": "sid",
+                                    "message": {"content": "usage unavailable"}}) + "\n")
+        self.assertIsNone(alert.claude_usage(str(path), "sid"))
+        with patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(alert.claude_notice({"hook_event_name": "UserPromptSubmit",
+                "session_id": "sid", "transcript_path": str(path)}), "")
+        self.assertFalse((self.state / "hearting/context-alert").exists())
+
     def test_state_failure_is_silent(self):
         self.state.write_text("cannot create directory")
         self.assertEqual(self.notice(703000), "")
