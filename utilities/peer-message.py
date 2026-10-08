@@ -890,6 +890,7 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
         if not isinstance(targets, dict):
             targets = {}
         key = to.get("session_id") or to.get("name") or "-"
+        previous_entries = [targets.get(key)]
         if to.get("session_id") and to.get("name"):
             # A later observed SID completes the launch-time name-only entry.
             for previous_key, entry in list(targets.items()):
@@ -898,9 +899,24 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
                         and entry.get("harness") == to.get("harness")
                         and entry.get("name") == to.get("name")
                         and entry.get("pane") in (None, to.get("pane"))):
+                    previous_entries.append(entry)
                     targets.pop(previous_key)
+        missing = object()
+        start_ts = missing
+        for entry in previous_entries:
+            if isinstance(entry, dict) and entry.get("harness") == to.get("harness"):
+                if "start_ts" in entry:
+                    start_ts = entry["start_ts"]
+                    break
+                if entry.get("source") == "start":
+                    start_ts = entry.get("ts")
+                    break
+        if start_ts is missing and source == "start":
+            start_ts = ts
         targets[key] = {"harness": to.get("harness"), "session_id": to.get("session_id"),
                          "name": to.get("name"), "kind": kind, "ts": ts, "source": source}
+        if start_ts is not missing:
+            targets[key]["start_ts"] = start_ts
         if to.get("pane"):
             targets[key]["pane"] = to["pane"]
         if len(targets) > _STEWARD_TARGETS_MAX:

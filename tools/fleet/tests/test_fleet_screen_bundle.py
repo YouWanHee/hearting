@@ -631,6 +631,48 @@ class SameRepositoryRoleTest(unittest.TestCase):
         self.assertFalse(worker.steward)
         self.assertEqual(worker.steward_parents[0]["session_id"], "parent")
 
+    def test_start_parent_is_remembered_after_it_watches_the_same_known_sid(self):
+        mod = steward._peer_message_module()
+        parent = self.row("claude", "parent", self.repo)
+        worker = self.row("opencode", "worker", self.worktree)
+        with mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(self.repo / "state")}):
+            mod.mark_steward("claude", "parent", target("worker", "opencode"),
+                             "start", "2026-10-09T01:00:00Z", source="start")
+            mod.mark_steward("claude", "parent", target("worker", "opencode"),
+                             "watch", "2026-10-09T02:00:00Z", source="watch")
+            mod.mark_steward("opencode", "worker", target("parent", "claude"),
+                             "watch", "2026-10-09T03:00:00Z", source="watch")
+            markers = mod.read_steward_markers([str(self.repo / "state")])
+        self.assertEqual(markers[("claude", "parent")]["targets"]["worker"]["source"], "watch")
+        self.assertEqual(markers[("claude", "parent")]["targets"]["worker"]["start_ts"],
+                         "2026-10-09T01:00:00Z")
+        with mock.patch.object(steward, "_registry_sessions", return_value=[]):
+            steward.enrich([parent, worker], markers=markers)
+        self.assertTrue(parent.steward)
+        self.assertFalse(worker.steward)
+        self.assertEqual(worker.steward_parents[0]["session_id"], "parent")
+        shown = text(render._build_lines([worker, parent], [], "fleet", False, 0,
+                                        layout="wide", term_width=168))
+        self.assertTrue(any("╰╌ [wo]" in line for line in shown))
+
+    def test_start_origin_survives_explicit_update_and_name_only_sid_completion(self):
+        mod = steward._peer_message_module()
+        with mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(self.repo / "state")}):
+            mod.mark_steward("claude", "parent", {"harness": "opencode", "name": "named",
+                             "pane": "w:p1", "session_id": None},
+                             "start", "2026-10-09T01:00:00Z", source="start")
+            mod.mark_steward("claude", "parent", {"harness": "opencode", "name": "named",
+                             "pane": "w:p1", "session_id": "worker"},
+                             "watch", "2026-10-09T02:00:00Z", source="watch")
+            mod.mark_steward("claude", "parent", {"harness": "opencode", "name": "named",
+                             "pane": "w:p1", "session_id": "worker"},
+                             "explicit", "2026-10-09T03:00:00Z", source="explicit")
+            marker = mod.read_steward_markers([str(self.repo / "state")])[("claude", "parent")]
+        self.assertEqual(set(marker["targets"]), {"worker"})
+        entry = marker["targets"]["worker"]
+        self.assertEqual((entry["source"], entry["ts"], entry["start_ts"]),
+                         ("explicit", "2026-10-09T03:00:00Z", "2026-10-09T01:00:00Z"))
+
     def test_pane_projection_reuses_current_herdr_names_over_stale_native_metadata(self):
         parent = self.row("opencode", "parent", self.repo)
         child = self.row("codex", "child", self.worktree)
