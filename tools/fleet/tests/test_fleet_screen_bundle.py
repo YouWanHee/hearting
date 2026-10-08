@@ -564,6 +564,73 @@ class SameRepositoryRoleTest(unittest.TestCase):
         self.assertEqual(render._steward_hierarchy([child, parent])[0], [parent, child])
         self.assertIsNone(markers[("claude", "parent")]["targets"]["named"]["session_id"])
 
+    def test_worker_watch_of_its_start_parent_keeps_both_surfaces_and_branch(self):
+        for parent_harness in ("claude", "codex", "opencode"):
+            for worker_harness in ("claude", "codex", "opencode"):
+                for named in (False, True):
+                    with self.subTest(parent=parent_harness, worker=worker_harness, named=named):
+                        parent = self.row(parent_harness, "parent", self.repo)
+                        worker = self.row(worker_harness, "worker", self.worktree)
+                        parent.session_aliases = ["old-parent"]
+                        worker.session_aliases = ["old-worker"]
+                        parent._herdr_name, worker._herdr_name = "launcher-name", "worker-name"
+                        parent_sid, worker_sid = ("old-parent", "old-worker") if named else ("parent", "worker")
+                        start = dict(harness=worker_harness, session_id=None if named else worker_sid,
+                                     name="worker-name", source="start", kind="start", ts="2026-10-09T01:00:00Z")
+                        watch = dict(target(parent_sid, parent_harness), source="watch", kind="watch",
+                                     ts="2026-10-09T02:00:00Z")
+                        markers = {(parent_harness, parent_sid): {"targets": {"worker": start}},
+                                   (worker_harness, worker_sid): {"targets": {"parent": watch}}}
+                        before = copy.deepcopy(markers)
+                        rows = [worker, parent]
+                        with mock.patch.object(steward, "_registry_sessions", return_value=[]), \
+                             mock.patch.object(steward, "_projection_sessions", return_value=rows), \
+                             mock.patch.object(steward, "read_markers", return_value=markers), \
+                             mock.patch.object(herdr, "_clear_gpu_session_aliases", side_effect=
+                                               lambda h, sid, pane: ["old-" + sid] if named else []), \
+                             mock.patch.object(herdr_projection.os, "getcwd", return_value=str(self.repo)):
+                            steward.enrich(rows)
+                            self.assertTrue(parent.steward)
+                            self.assertFalse(worker.steward)
+                            self.assertEqual([t["session_id"] for t in parent.steward_targets], ["worker"])
+                            self.assertEqual(worker.steward_parents[0]["session_id"], "parent")
+                            self.assertTrue(herdr_projection.is_steward(parent_harness, "parent"))
+                            self.assertFalse(herdr_projection.is_steward(worker_harness, "worker"))
+                            shown = text(render._build_lines(rows, [], "fleet", False, 0,
+                                                             layout="wide", term_width=168))
+                            self.assertTrue(any("╰╌ [wo]" in line for line in shown))
+                        self.assertEqual(markers, before)  # the real watch remains recorded
+
+    def test_ordinary_watch_and_other_worker_targets_still_grant_the_role(self):
+        parent = self.row("claude", "parent", self.repo)
+        worker = self.row("opencode", "worker", self.worktree)
+        other = self.row("codex", "other", self.repo)
+        markers = {("opencode", "worker"): {"targets": {
+            "parent": dict(target("parent", "claude"), source="watch")}}}
+        with mock.patch.object(steward, "_registry_sessions", return_value=[]):
+            steward.enrich([parent, worker], markers=markers)
+            self.assertTrue(worker.steward)  # no start relation: an ordinary watch
+            markers[("claude", "parent")] = {"targets": {
+                "worker": dict(target("worker", "opencode"), source="start")}}
+            markers[("opencode", "worker")]["targets"]["other"] = dict(target("other"), source="watch")
+            steward.enrich([parent, worker, other], markers=markers)
+        self.assertTrue(worker.steward)
+        self.assertEqual([t["session_id"] for t in worker.steward_targets], ["other"])
+        self.assertEqual(other.steward_parents[0]["session_id"], "worker")
+
+    def test_legacy_watch_kind_follows_the_same_reverse_watch_rule(self):
+        parent = self.row("codex", "parent", self.repo)
+        worker = self.row("claude", "worker", self.worktree)
+        markers = {("codex", "parent"): {"targets": {
+            "worker": dict(target("worker", "claude"), source="start", kind="start")}},
+            ("claude", "worker"): {"targets": {
+                "parent": dict(target("parent"), kind="watch")}}}
+        with mock.patch.object(steward, "_registry_sessions", return_value=[]):
+            steward.enrich([parent, worker], markers=markers)
+        self.assertTrue(parent.steward)
+        self.assertFalse(worker.steward)
+        self.assertEqual(worker.steward_parents[0]["session_id"], "parent")
+
     def test_pane_projection_reuses_current_herdr_names_over_stale_native_metadata(self):
         parent = self.row("opencode", "parent", self.repo)
         child = self.row("codex", "child", self.worktree)

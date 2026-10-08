@@ -170,7 +170,7 @@ def _role_winners(markers, rows, evidence):
             return None
         return next(iter(identities)), next(iter(repositories))
 
-    claims = {}
+    resolved = []
     for parent_key, marker in markers.items():
         parent = one(by_key.get(parent_key, ()))
         if parent is None:
@@ -186,18 +186,28 @@ def _role_winners(markers, rows, evidence):
             child = one(candidates)
             if child is None or child[1] != parent[1]:
                 continue
-            raw_ts = str(target.get("ts") or "")
-            instant = _parse_ts(raw_ts)
-            instant = instant if instant is not None else float("-inf")
-            rank = (instant, *parent[0])
-            owners = claims.setdefault(child[0], {})
-            previous = owners.get(parent[0])
-            first = (instant, raw_ts)
-            order = min(first, previous[3]) if previous else first
-            if previous is None or rank > previous[0]:
-                owners[parent[0]] = (rank, parent[0], dict(target, session_id=child[0][1]), order)
-            else:
-                owners[parent[0]] = (*previous[:3], order)
+            resolved.append((parent[0], child[0], target))
+    starts = {(parent, child) for parent, child, target in resolved
+              if (target.get("source") or target.get("kind")) == "start"}
+    claims = {}
+    for parent, child, target in resolved:
+        # Waiting for the launcher does not turn its worker into a supervisor.
+        # Use canonical, same-repo endpoints so names and resumed IDs agree.
+        if ((target.get("source") or target.get("kind")) == "watch"
+                and (child, parent) in starts):
+            continue
+        raw_ts = str(target.get("ts") or "")
+        instant = _parse_ts(raw_ts)
+        instant = instant if instant is not None else float("-inf")
+        rank = (instant, *parent)
+        owners = claims.setdefault(child, {})
+        previous = owners.get(parent)
+        first = (instant, raw_ts)
+        order = min(first, previous[3]) if previous else first
+        if previous is None or rank > previous[0]:
+            owners[parent] = (rank, parent, dict(target, session_id=child[1]), order)
+        else:
+            owners[parent] = (*previous[:3], order)
     winners = {child: max(owners.values(), key=lambda claim: claim[0])
                for child, owners in claims.items()}
     # Decide peers after the existing handover: only an actor with a winning
