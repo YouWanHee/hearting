@@ -869,6 +869,11 @@ its declared route node; a supervised parked owner shows that node and
 `resource-parked` instead of presenting an old model summary as current work.
 Resource liveness stays independent of the owner's model activity, and a missing
 progress declaration leaves only elapsed time and liveness (2026-10-07 SR eval-run).
+Verified working resources whose exact parent owner is no longer drawn
+remain on their project card in both Fleet views. The row reuses exact GPU
+identity and existing elapsed/progress; absent a fresh GPU match, it shows
+the resource row. Cwd places the card and never implies a session owner.
+Terminal/stale resources drop the fallback without reviving an ended owner.
 A worker card shows its assigned work, not every node in the
 route: a depth-1 frame owns only its exact frame node; the later owner owns the
 execution stages, excluding the separate pre-owner frame pair. Depth alone does
