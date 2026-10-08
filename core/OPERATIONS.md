@@ -1329,6 +1329,11 @@ predecessor's open depth-1 routes pass to the successor, on any harness: it may
 `start` and `correct` them, and their stored completion records reach it
 (`retire ... handover=<n>`). Registry rows, their registered parent and worker
 identities stay as they are; cards and notices are not moved.
+Replacement admission and lineage use that same parent judgment: a depth-1
+replacement may be launched by the registered parent or its ledger-confirmed
+successor. Parent attempt bindings remain exact, as do route, node, depth,
+sub-session and input digests. A changed parent label on a depth-1 node replay
+is accepted only for that same parent; depth-2 parent bindings stay exact.
 An owner's terminal row and an acknowledged completion message do not close its
 route. Its verified open route still passes to the successor until the route's
 outcome is committed; an acknowledged message is never delivered again.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Proof, race and crash falsifiers for automatic replacement (no model calls)."""
 import concurrent.futures
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,8 @@ class ReplacementTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.jobs=self.root/'jobs.log';self.jobs.touch()
+        seat_state=mock.patch('session_tidy.state_root',return_value=self.root/'seat-state')
+        seat_state.start();self.addCleanup(seat_state.stop)
         self.route={'route_id':'rt-test','route_hash':'sha256:test','artifact_root':str(self.root),
                     'cwd':str(self.root),'capability':'autopilot-code','nodes':[]}
         self.path=self.root/'route.json';self.path.write_text(json.dumps(self.route))
@@ -41,6 +44,105 @@ class ReplacementTest(unittest.TestCase):
         with self.jobs.open('a' if append else 'w') as f:f.write(line)
 
     def claim(self):return R.claim(self.jobs,'att-source')
+
+    def handover(self, successor='successor', harness='claude', **binding_changes):
+        import dispatch_seat_handover as H
+        import session_tidy as S
+        seat=S.Seat('pane','replacement-test-seat','wY:p5')
+        binding={**H.binding_of(self.jobs,self.meta),**binding_changes}
+        snapshot={'schema':H.SCHEMA,'seat':{'kind':'pane','key':seat.key,'pane':seat.pane},
+                  'from':{'sid':self.meta['parent_sid']},'bindings':[binding]}
+        S.atomic_write_json(H._snapshot_path(seat.key),snapshot)
+        path=S._ledger_path(seat);path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(json.dumps({'event':'handover','from':self.meta['parent_sid'],
+                                   'sid':successor,'harness':harness,'ts':1,'bindings':[binding]})+'\n')
+
+    def replacement_candidate(self, record, parent='successor', harness='claude'):
+        source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        replay=R.launch_input(self.jobs,'att-source',source)
+        args=SimpleNamespace(**vars(self.args));args.attempt_id=record['replacement_attempt_id']
+        args.replacement_input_argv=R._replacement_argv(record,source,replay)
+        candidate={**self.meta,'attempt_id':record['replacement_attempt_id'],
+                   'automatic_retry_of':'att-source','parent_sid':parent,'parent_harness':harness}
+        candidate.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
+        return candidate
+
+    def test_handover_owner_replacement_registers_and_lineage_reuses_the_same_claim(self):
+        import review_round_cap as ROUND
+        self.meta.update(worker_type='owner',owner_route_id='rt-test',owner_route_hash='sha256:test')
+        self.write(self.meta)
+        self.handover()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        before=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        lines=self.jobs.read_text().splitlines()
+        self.assertEqual(R.admission(self.jobs,lines,candidate),record)
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\treplacement\t'+','.join(k+'='+v for k,v in candidate.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs,candidate['attempt_id'],row,launch=False))
+        self.assertFalse(D.claim_attempt_row(self.jobs,candidate['attempt_id'],row,launch=False))
+        registered=R._rows(self.jobs.read_text().splitlines())
+        self.assertEqual(registered['att-source'][1],before)
+        self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),registered[candidate['attempt_id']][1]),record)
+        effective,mapping=R.effective_attempts(self.jobs,{'att-source'})
+        self.assertEqual(effective,{candidate['attempt_id']})
+        self.assertEqual(mapping[0]['replacement_attempt_id'],record['replacement_attempt_id'])
+        projected=ROUND.logical_round_records(list(registered.values()),jobs=self.jobs)
+        self.assertEqual([meta['attempt_id'] for _,meta in projected],[candidate['attempt_id']])
+        self.assertEqual(self.claim(),record)
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_handover_replacement_admission_is_shared_by_all_parent_harnesses(self):
+        record=self.claim()
+        for harness in ('claude','codex','opencode'):
+            with self.subTest(harness=harness):
+                self.handover(harness=harness)
+                candidate=self.replacement_candidate(record,harness=harness)
+                self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate),record)
+
+    def test_handover_admission_keeps_unrelated_parents_and_other_bindings_strict(self):
+        self.handover()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        lines=self.jobs.read_text().splitlines()
+        for change in ({'parent_sid':'foreign'},{'parent_attempt_id':'foreign-attempt'},
+                       {'route_hash':'sha256:other'},{'route_node':'other'},{'dispatch_depth':'2'},
+                       {'subsession_id':'other'},{'phase_brief_sha256':'other'},
+                       {'fixed_inputs_sha256':'other'},{'narrow_verify_sha256':'other'}):
+            with self.subTest(change=change),self.assertRaises(D.DispatchContractError) as refused:
+                R.admission(self.jobs,lines,{**candidate,**change})
+            self.assertEqual(refused.exception.reason,'replacement-launch-binding-mismatch')
+        self.assertFalse(any(fields[1]=='open' for fields,_ in R._rows(lines).values()))
+
+    def test_handover_for_a_different_route_node_or_registry_does_not_authorize(self):
+        record=self.claim();candidate=self.replacement_candidate(record)
+        for change in ({},{'route':'rt-other'},{'hash':'sha256:other'},{'node':'other'},
+                       {'jobs':str(self.root/'foreign-jobs.log')}):
+            with self.subTest(change=change):
+                if change:self.handover(**change)
+                with self.assertRaises(D.DispatchContractError) as refused:
+                    R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate)
+                self.assertEqual(refused.exception.reason,'replacement-launch-binding-mismatch')
+
+    def test_node_replay_accepts_only_the_recorded_depth1_parent_when_its_label_changes(self):
+        spec=importlib.util.spec_from_file_location('replacement_handover_node',Path(__file__).with_name('dispatch-node.py'))
+        node_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(node_module)
+        self.meta['parent']='old-parent-label';self.write(self.meta)
+        self.handover()
+        record=self.claim()
+        args=SimpleNamespace(adapter_args=['--','--automatic-retry-of','att-source'],
+                             attempt_id=record['replacement_attempt_id'],adapter='codex',parent='new-parent-label')
+        for session in ('parent','successor'):
+            with self.subTest(session=session),mock.patch.object(node_module.ROUTE_AUTHORITY,'default_parent_session_id',return_value=session):
+                self.assertEqual(node_module.replacement_task(args,self.route,{'id':'frame'},self.jobs),'the raw task')
+        with mock.patch.object(node_module.ROUTE_AUTHORITY,'default_parent_session_id',return_value='foreign'):
+            with self.assertRaises(D.DispatchContractError) as refused:
+                node_module.replacement_task(args,self.route,{'id':'frame'},self.jobs)
+            self.assertEqual(refused.exception.reason,'replacement-launch-binding-mismatch')
+        # The same ledger is never authority to change a depth-2 owner's label or attempt.
+        self.meta.update(dispatch_depth='2',parent_attempt_id='att-owner');self.write(self.meta)
+        source={**self.meta}
+        with mock.patch.object(R,'validate_claim_source',return_value=([],source,{'task':'the raw task'})), \
+                mock.patch.object(node_module.ROUTE_AUTHORITY,'default_parent_session_id',return_value='parent'):
+            with self.assertRaises(D.DispatchContractError):
+                node_module.replacement_task(args,self.route,{'id':'frame'},self.jobs)
 
     def test_depth1_replacement_is_authorized_for_the_launching_session_or_its_same_seat_successor(self):
         import work_start

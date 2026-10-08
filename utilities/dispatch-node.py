@@ -706,7 +706,9 @@ def replacement_task(args, route, node, jobs):
       or record['route_hash']!=route['route_hash']
       or source.get('route_node')!=node['id']
       or source.get('harness')!=args.adapter
-      or source.get('parent')!=args.parent):
+      or (source.get('parent')!=args.parent and not (
+          source.get('dispatch_depth')=='1'
+          and ROUTE_AUTHORITY.owns(source,ROUTE_AUTHORITY.default_parent_session_id(),jobs)))):
    raise DispatchContractError('replacement-launch-binding-mismatch')
   return replay['task']
 

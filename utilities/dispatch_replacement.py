@@ -660,8 +660,9 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         _, prior = references[0]
         if (prior.get('retry_ordinal') != '1' or not prior.get('recovery_id')
                 or DC._stable_recovery_attempt_id(prior['recovery_id']) != aid
+                or not route_authority.replacement_parent_matches(prior, source, jobs)
                 or any(prior.get(key) != source.get(key) for key in
-                       ('route_node', 'parent_attempt_id', 'parent_sid',
+                       ('route_node',
                         'worker_type', 'dispatch_depth'))):
             raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
         # The current SD104/106 gap executes on the original source route.
@@ -762,10 +763,10 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         previous = lineage.get(prior_id)
         direct = (previous is not None or other in reference_ids or other == aid
                   or prior.get('automatic_retry_of') == aid)
-        if prior.get('automatic_retry_of') == aid and any(
-                prior.get(key) != source.get(key) for key in
-                ('route_id', 'route_hash', 'route_node', 'parent_attempt_id',
-                 'parent_sid', 'worker_type', 'dispatch_depth')):
+        if prior.get('automatic_retry_of') == aid and (
+                not route_authority.replacement_parent_matches(source, prior, jobs)
+                or any(prior.get(key) != source.get(key) for key in
+                       ('route_id', 'route_hash', 'route_node', 'worker_type', 'dispatch_depth'))):
             raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
         try:
             if previous is not None:
@@ -1103,8 +1104,9 @@ def admission(jobs, lines, metadata):
     route_key = 'owner_route_id' if source.get('owner_route_id') else 'route_id'
     hash_key = 'owner_route_hash' if source.get('owner_route_id') else 'route_hash'
     if (metadata.get(route_key) != record['route_id'] or metadata.get(hash_key) != record['route_hash']
+            or not route_authority.replacement_parent_matches(source, metadata, jobs)
             or any(metadata.get(k) != source.get(k) for k in
-                   ('route_node', 'parent_attempt_id', 'parent_sid', 'worker_type', 'dispatch_depth',
+                   ('route_node', 'worker_type', 'dispatch_depth',
                     'session_chain_id','subsession_id','subsession_index','subsession_count',
                     'subsession_mode','stage_authority','fixed_inputs_sha256',
                     'narrow_verify_sha256','phase_brief_sha256'))):
@@ -1641,7 +1643,8 @@ def effective_attempts(jobs, attempts):
         if (target.get('replacement_claim_digest') != _digest(record)
                 or target.get('replacement_family_id') != family or target.get('automatic_retry_of') != aid
                 or target.get('replacement_original_attempt_id') != aid
-                or any(target.get(k) != source.get(k) for k in ('parent_sid','parent_attempt_id','worker_type','dispatch_depth'))):
+                or not route_authority.replacement_parent_matches(source, target, jobs)
+                or any(target.get(k) != source.get(k) for k in ('worker_type','dispatch_depth'))):
             raise DC.DispatchContractError('replacement-lineage-unproven',replacement)
         effective.discard(aid); effective.add(replacement)
         mapping.append({'original_attempt_id':aid,'replacement_attempt_id':replacement,
