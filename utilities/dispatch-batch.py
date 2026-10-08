@@ -293,6 +293,33 @@ def revalidate_partial_peers(
     return current_rows
 
 
+def partial_source_rows(jobs: Path, partial: dict) -> dict:
+    """Read the exact original census shared by placement and manifest recovery."""
+    attempts = {
+        str(peer["node_id"]): str(peer["terminal_attempt_id"])
+        for peer in partial["realized_peer_set"]
+    }
+    attempts[str(partial["gap_leg_id"])] = str(partial["failed_source_attempt_id"])
+    try:
+        lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise BatchError("batch-registry-unreadable", str(exc)) from exc
+    rows = {}
+    for node_id, attempt_id in attempts.items():
+        exact = []
+        for line in lines:
+            fields = line.split("\t")
+            if len(fields) == 6:
+                metadata = parse_registry_metadata(fields[5])
+                if metadata.get("attempt_id") == attempt_id:
+                    exact.append((fields, metadata))
+        if len(exact) != 1:
+            raise BatchError("partial-continuation-source-row-not-unique",
+                             f"node={node_id}:attempt_id={attempt_id}:rows={len(exact)}")
+        rows[node_id] = exact[0]
+    return rows
+
+
 def partial_source_assignments(
     jobs: Path,
     route: dict[str, object],
@@ -302,33 +329,12 @@ def partial_source_assignments(
 ) -> list[tuple[dict[str, object], str, str, int]]:
     """Recover the original sealed adapter tuple instead of reallocating a retry."""
 
-    attempts = {
-        str(peer["node_id"]): str(peer["terminal_attempt_id"])
-        for peer in partial["realized_peer_set"]
-    }
-    attempts[str(partial["gap_leg_id"])] = str(partial["failed_source_attempt_id"])
     try:
         with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
+            rows = partial_source_rows(jobs, partial)
     except OSError as exc:
         raise BatchError("batch-registry-unreadable", str(exc)) from exc
-    rows: dict[str, tuple[list[str], dict[str, str]]] = {}
-    for node_id, attempt_id in attempts.items():
-        exact = []
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            metadata = parse_registry_metadata(fields[5])
-            if metadata.get("attempt_id") == attempt_id:
-                exact.append((fields, metadata))
-        if len(exact) != 1:
-            raise BatchError(
-                "partial-continuation-source-row-not-unique",
-                f"node={node_id}:attempt_id={attempt_id}:rows={len(exact)}",
-            )
-        rows[node_id] = exact[0]
     assignments = []
     for node in nodes:
         node_id = str(node["id"])
@@ -361,7 +367,7 @@ def partial_source_assignments(
 
 
 def registry_batch_input(rows: list[dict], route: dict, nodes: list[dict], group: str,
-                         parent_attempt: str, prompt: str):
+                         parent_attempt: str, prompt: str | None):
     """Prove a pre-SD-157 whole manifest from all exact original rows.
 
     A missing member cannot be inferred from current capacity or a display
@@ -372,7 +378,8 @@ def registry_batch_input(rows: list[dict], route: dict, nodes: list[dict], group
             or len({row.get("attempt_id") for row in rows}) != len(nodes)):
         raise BatchError("batch-prior-manifest-proof-missing", group)
     members = []
-    assignment = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    assignment = ("sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                  if prompt is not None else rows[0].get("batch_assignment_sha256"))
     try:
         for row in rows:
             validate_attempt_metadata(row)
@@ -428,6 +435,32 @@ def registry_batch_input(rows: list[dict], route: dict, nodes: list[dict], group
                 "options": {"prompt_text": prompt}, "source": "registry-manifest-proof"}
     except (DispatchContractError, ReplicaBatchContractError, KeyError, TypeError, ValueError) as exc:
         raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
+
+
+def partial_batch_input(jobs: Path, route: dict, nodes: list[dict], partial: dict):
+    """Recover historical source bytes independently of the current retry brief."""
+    from dispatch_replacement_batch import _input, _input_path
+    rows = partial_source_rows(jobs, partial)
+    metadata = [rows[node["id"]][1] for node in nodes]
+    digest = str(partial.get("source_batch_manifest_digest", ""))
+    try:
+        if any(row.get("batch_manifest_sha256") != digest for row in metadata):
+            raise BatchError("partial-continuation-source-manifest-drift")
+        # This also proves the complete row census against the current sealed
+        # route, including the original parent, profile, persona and leg hashes.
+        reconstructed = registry_batch_input(
+            metadata, route, nodes, str(partial["source_group_id"]),
+            metadata[0]["batch_parent_attempt_id"], None)
+        input_path = _input_path(jobs, digest)
+        if not input_path.exists() and not input_path.is_symlink():
+            return reconstructed
+        payload = _input(jobs, metadata[0])
+        if (payload.get("route_hash") != route.get("route_hash")
+                or payload["manifest"] != reconstructed["manifest"]):
+            raise BatchError("partial-continuation-source-manifest-drift")
+        return payload
+    except (DispatchContractError, ReplicaBatchContractError, KeyError) as exc:
+        raise BatchError("partial-continuation-source-manifest-invalid", str(exc)) from exc
 
 
 def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
@@ -2405,6 +2438,7 @@ def main(argv: list[str] | None = None) -> int:
             diagnostics = {"allocation_source": "sealed-launch-input", "degradation_cause": "",
                            "sole_gate": "not-applicable"}
         elif partial is not None:
+            partial_input = partial_batch_input(jobs, route, nodes, partial)
             assignments = partial_source_assignments(
                 jobs, route, nodes, partial, parent_identity
             )
@@ -2600,16 +2634,13 @@ def main(argv: list[str] | None = None) -> int:
         for leg in legs:
             leg["attempt_id"] = source_attempts[str(leg["node"])]
         try:
-            source_kwargs = dict(
-                parallel_group=args.parallel_group,
-                route_id=str(route["route_id"]),
-                parent_attempt_id=parent_attempt,
-                required_independence_axes=required_axes,
-                realized_independence_axes=realized_axes,
-                members=manifest_members(legs),
-            )
-            source_manifest, source_manifest_digest, source_leg_digests = source_manifest_for_digest(
-                source_kwargs, str(partial.get("source_batch_manifest_digest", "")))
+            source_manifest, source_manifest_digest, source_leg_digests = verify_manifest(
+                partial_input["manifest"])
+            source_members = {member["route_node"]: member for member in source_manifest["members"]}
+            for leg in legs:
+                # assignment_sha256 identifies the original group input. The
+                # ordinary worker launch still receives the current retry brief.
+                leg["assignment_sha256"] = source_members[leg["node"]]["assignment_sha256"]
         except ReplicaBatchContractError as exc:
             return fail(
                 "partial-continuation-source-manifest-invalid",

@@ -664,6 +664,30 @@ class DispatchBatchTest(unittest.TestCase):
         popen.assert_not_called()
 
     def test_at5_partial_continuation_reuses_peers_and_claims_only_gap(self):
+        self._partial_continuation_launch()
+
+    def test_partial_continuation_uses_sealed_assignment_with_new_gap_brief(self):
+        self._partial_continuation_launch(
+            retry_prompt="Independent research: finish only the failed alternative.\n",
+            sealed=True,
+        )
+
+    def test_partial_continuation_preserves_newline_lost_by_shell_substitution(self):
+        original = BATCH.DEFAULT_PROMPT + "\n"
+        with mock.patch.object(BATCH, "DEFAULT_PROMPT", original):
+            self._partial_continuation_launch(retry_prompt=original.rstrip("\n"), sealed=True)
+
+    def test_partial_continuation_legacy_rows_keep_assignment_with_new_brief(self):
+        self._partial_continuation_launch(retry_prompt="Recover the failed leg only.")
+
+    def test_partial_continuation_new_owner_keeps_source_parent_and_replacement(self):
+        self._partial_continuation_launch(
+            retry_prompt="Continue the authorized gap.", sealed=True,
+            parent_attempt="att-corrected-owner",
+        )
+
+    def _partial_continuation_launch(self, *, retry_prompt=None, sealed=False,
+                                    parent_attempt="att-parent-fixture"):
         source_legs = self.legs()
         _source_manifest, continuation, partial = self.partial_continuation(source_legs)
         peer, gap = source_legs
@@ -671,6 +695,8 @@ class DispatchBatchTest(unittest.TestCase):
         self.write_existing(
             gap, status="done", note="cancelled-receipt-unavailable"
         )
+        if sealed:
+            self.seal_original_input()
         self.jobs.write_text(
             self.jobs.read_text(encoding="utf-8").replace(
                 f"note=cancelled-receipt-unavailable\n",
@@ -681,6 +707,8 @@ class DispatchBatchTest(unittest.TestCase):
         )
         continuation_path = self.base / "continuation.json"
         argv = self.argv() + ["--continuation", str(continuation_path)]
+        if retry_prompt is not None:
+            argv += ["--prompt-text", retry_prompt]
         output = io.StringIO()
         created = []
 
@@ -744,7 +772,7 @@ class DispatchBatchTest(unittest.TestCase):
             ))
             stack.enter_context(mock.patch.dict(os.environ, {
                 "AGENT_DISPATCH_SELF_SLUG": "owner",
-                "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_ATTEMPT_ID": parent_attempt,
                 "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
                 "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
                 "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
@@ -791,6 +819,9 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(popen.call_count, 1)
         self.assertEqual(len(created), 1)
         command = created[0].command
+        self.assertEqual(command[command.index("--prompt-text") + 1],
+                         retry_prompt if retry_prompt is not None else BATCH.DEFAULT_PROMPT)
+        self.assertEqual(command[command.index("--parent-attempt-id") + 1], parent_attempt)
         self.assertEqual(
             command[command.index("--attempt-id") + 1],
             "att-retry-verbatim",
@@ -804,6 +835,43 @@ class DispatchBatchTest(unittest.TestCase):
             receipt["legs"][0]["reason"], "reused-successful-peer"
         )
         self.assertEqual(len(self.jobs.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_partial_source_rejects_tampered_launch_input_and_row_bindings(self):
+        from dispatch_replacement_batch import _input_path
+        legs = self.legs()
+        _manifest, _continuation, partial = self.partial_continuation(legs)
+        self.write_existing(legs[0], status="done", note="completed-marker")
+        self.write_existing(legs[1], status="done", note="dead-worker-blocked")
+        self.seal_original_input()
+        path = _input_path(self.jobs, partial["source_batch_manifest_digest"])
+        original_input = path.read_text()
+        original_rows = self.jobs.read_text()
+        for mutation in ("manifest", "prompt", "leg-digest", "profile", "parent", "duplicate"):
+            with self.subTest(mutation=mutation):
+                path.write_text(original_input)
+                self.jobs.write_text(original_rows)
+                payload = json.loads(original_input)
+                if mutation == "manifest":
+                    payload["manifest"]["members"][0]["assignment_sha256"] = "sha256:" + "f" * 64
+                    path.write_text(json.dumps(payload))
+                elif mutation == "prompt":
+                    payload["options"]["prompt_text"] += "tampered"
+                    path.write_text(json.dumps(payload))
+                else:
+                    rows = original_rows
+                    if mutation == "leg-digest":
+                        rows = rows.replace("batch_leg_sha256=sha256:", "batch_leg_sha256=sha256:f")
+                    elif mutation == "profile":
+                        rows = rows.replace(f"batch_model_profile={legs[0]['model_profile']}",
+                                            "batch_model_profile=mini")
+                    elif mutation == "parent":
+                        rows = rows.replace("batch_parent_attempt_id=att-parent-fixture",
+                                            "batch_parent_attempt_id=att-foreign")
+                    else:
+                        rows += original_rows.splitlines()[0] + "\n"
+                    self.jobs.write_text(rows)
+                with self.assertRaises(BATCH.BatchError):
+                    BATCH.partial_batch_input(self.jobs, self.route, self.route["nodes"], partial)
 
     def test_blocked_recovery_claim_can_never_reuse_retry_attempt(self):
         metadata = {
