@@ -890,8 +890,19 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
         if not isinstance(targets, dict):
             targets = {}
         key = to.get("session_id") or to.get("name") or "-"
+        if to.get("session_id") and to.get("name"):
+            # A later observed SID completes the launch-time name-only entry.
+            for previous_key, entry in list(targets.items()):
+                if (previous_key != key and isinstance(entry, dict)
+                        and not entry.get("session_id")
+                        and entry.get("harness") == to.get("harness")
+                        and entry.get("name") == to.get("name")
+                        and entry.get("pane") in (None, to.get("pane"))):
+                    targets.pop(previous_key)
         targets[key] = {"harness": to.get("harness"), "session_id": to.get("session_id"),
-                        "name": to.get("name"), "kind": kind, "ts": ts, "source": source}
+                         "name": to.get("name"), "kind": kind, "ts": ts, "source": source}
+        if to.get("pane"):
+            targets[key]["pane"] = to["pane"]
         if len(targets) > _STEWARD_TARGETS_MAX:
             oldest = sorted(targets, key=lambda k: targets[k].get("ts") or "")
             for k in oldest[: len(targets) - _STEWARD_TARGETS_MAX]:

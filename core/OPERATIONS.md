@@ -1466,6 +1466,16 @@ their existing columns. Fleet ignores a marker whose entries carry no role sourc
 `peer-message prune-steward-markers [--apply]` lists/removes those, and `peer-steward.py steward off` (or `peer-message release`)
 clears a marker.
 
+`peer-steward start` settles from the requested pane's actual agent when native
+startup reports a timeout or busy pane. A matching harness, requested directory
+and unclaimed or matching name can complete the existing start without another
+launch or keyboard input; an unclaimed name is assigned through herdr's rename
+API. The existing failed-start cleanup window bounds this last observation.
+Success records the pane and any SID already available in the same start marker;
+name-only targets continue to resolve through the common metadata join. A repeated
+observation that learns the SID completes the same name/pane entry, rather than
+leaving an extra anonymous target.
+
 **Prompt submission is verified, never assumed.** `peer-steward.py prompt`
 prints `prompted=true` only after the submission was observed, and every other verdict is typed:
 `failed` (exit 1), `queued` (exit 3, our text still sits in the target's input), `unverified`
