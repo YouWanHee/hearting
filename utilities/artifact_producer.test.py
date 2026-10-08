@@ -1303,7 +1303,7 @@ class FinalizeTest(ProducerTestBase):
         self.assertEqual(again["status"], "already-sealed")
         self.assertEqual(P.status(self.root)["cycle_counts"], {"sealed": 1})
 
-    def test_sealed_replay_requires_matching_index_row(self):
+    def test_general_sealed_replay_keeps_the_past_result_when_an_index_row_is_removed(self):
         self.activate()
         route, route_file, result = self.begin()
         self.write_output(result)
@@ -1317,9 +1317,9 @@ class FinalizeTest(ProducerTestBase):
         ))
         before = (P.read_cycle_record(self.root, result["cycle_id"]),
                   (Path(result["cycle_dir"]) / "manifest.json").read_bytes())
-        with self.assertRaises(P.ProducerError) as ctx:
-            P.finalize(self.root, cycle_id=result["cycle_id"])
-        self.assertEqual(ctx.exception.code, "already-sealed-mismatch")
+        replay = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(replay["cycle_state"], "completed")
+        self.assertNotIn(result["cycle_id"], adm.load_index(self.root).manifests)
         self.assertEqual(before[0], P.read_cycle_record(self.root, result["cycle_id"]))
         self.assertEqual(before[1], (Path(result["cycle_dir"]) / "manifest.json").read_bytes())
 

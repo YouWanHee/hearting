@@ -679,6 +679,10 @@ def read_cycle_record(root: Path, cycle_id: str) -> Optional[Dict[str, Any]]:
     routes = document.get("routes") or []
     if not routes or cycle.get("cycle_id") != cycle_id:
         return None
+    campaign_path = artifact_locator.locate(root, cycle.get("campaign_id"))
+    campaign = _read_json(campaign_path / "campaign.json") if campaign_path is not None else None
+    if campaign is not None and cycle_id not in (campaign.get("cycles") or []):
+        return None  # an explicit removal from membership is not a missing cache
     source = str((document.get("producer") or {}).get("source_revision", "")).split("/")
     if len(source) < 2:
         return None
