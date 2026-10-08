@@ -1545,7 +1545,7 @@ class AnsweringProviderSourceTest(_ConfigHomeMixin, unittest.TestCase):
                                return_value=self._Completed("", 1)):
             self.assertEqual(rt.run_worker("prompt", timeout=30,
                                            provider_box=box), "")
-        self.assertEqual(box, {"provider": None})
+        self.assertEqual(box, {"provider": None, "error": "provider-no-output"})
 
     def test_main_writes_answering_provider_source(self):
         with tempfile.TemporaryDirectory() as tmp:

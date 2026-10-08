@@ -3,7 +3,8 @@
 Canonical state:
   <state-root>/<harness>/<sid>.json
   {"title": str, "ts": float, "source": str, "offset": int, "cursor_kind": str,
-   "summary": str, "summary_ts": float, "summary_failures": int}
+   "summary": str, "summary_ts": float, "summary_failures": int,
+   "summary_error": str}  # optional bounded failure diagnostic
 
 ``summary`` is additive (F-16/F-17 merge): the same haiku call that produces the
 title also returns a live one-sentence status, written alongside it. Absent on
@@ -157,7 +158,7 @@ def fresh_summary_with_ts(sid, harness="claude", now=None,
 
 
 def write(sid, title, source="refresher", offset=0, now=None, harness="claude", summary=None,
-          summary_ts=None, cursor_kind=None, summary_failures=0):
+          summary_ts=None, cursor_kind=None, summary_failures=0, summary_error=None):
     """Atomically write neutral fleet-owned state. ``title=''`` is allowed.
 
     ``summary`` is additive and omitted from the written dict when falsy — old
@@ -181,6 +182,8 @@ def write(sid, title, source="refresher", offset=0, now=None, harness="claude", 
         )
     if isinstance(summary_failures, int) and not isinstance(summary_failures, bool) and summary_failures > 0:
         data["summary_failures"] = summary_failures
+    if isinstance(summary_error, str) and summary_error.strip():
+        data["summary_error"] = "".join(ch for ch in summary_error if ch.isprintable())[:180]
     directory = titles_dir(harness)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
