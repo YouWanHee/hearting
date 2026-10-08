@@ -199,6 +199,13 @@ class OwnerGrantStartTest(unittest.TestCase):
             stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
             stack.enter_context(redirect_stdout(stdout))
             stack.enter_context(redirect_stderr(stderr))
+            # The grant fixture needs a live parent after start returns. Keep
+            # its fake payload detached even when the test runner is sandboxed;
+            # lifecycle selection is covered by dispatch_lifecycle.test.py.
+            stack.enter_context(mock.patch("dispatch_lifecycle.pid_namespace_evidence", return_value={
+                "lifecycle_selector_source": "host-like", "lifecycle_nspid_width": "1",
+                "lifecycle_pid1_class": "system-init",
+            }))
             if hasattr(wrapper, "check_runtime_projection"):
                 stack.enter_context(mock.patch.object(wrapper, "check_runtime_projection", return_value=0))
             if hasattr(wrapper, "prepare_nested_codex_home"):
