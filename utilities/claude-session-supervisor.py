@@ -910,11 +910,19 @@ def run_turn(
     resume: bool,
     stream_session: ClaudeStreamSession | None = None,
     handoff_intent: dict | None = None,
+    owner_input: OwnerInput | None = None,
 ) -> tuple[dict[str, Any], int]:
     if getattr(args, "runtime_harness", "claude") == "opencode":
         from opencode_session_runtime import run_turn as native_turn, OpenCodeTransportError
+        def native_event(value):
+            # The transport has validated and persisted this exact session.
+            # Resource tools can run before native_turn returns, so publish it
+            # to the live owner's input state at the binding event.
+            if owner_input is not None and value.get("type") == "dispatch.supervisor.session":
+                owner_input.bind_initial_thread(value["session_id"])
+            emit(value)
         try:
-            return native_turn(args, prompt, emit=emit, idle_reset=handoff_intent is None)
+            return native_turn(args, prompt, emit=native_event, idle_reset=handoff_intent is None)
         except OpenCodeTransportError as exc:
             raise SupervisorError(str(exc)) from exc
     def submit(transport):
@@ -1236,6 +1244,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             turn_kwargs = ({"handoff_intent": pending_handoff_intent}
                            if pending_handoff_intent is not None else {})
+            if args.runtime_harness == "opencode":
+                turn_kwargs["owner_input"] = control
             if pending_handoff_intent is None:
                 next_prompt = control.prepare(next_prompt)
             result, process_rc = run_turn(
@@ -1246,8 +1256,6 @@ def main(argv: list[str] | None = None) -> int:
                 stream_session=stream_session,
                 **turn_kwargs,
             )
-            if args.runtime_harness == "opencode":
-                control.bind_initial_thread(read_binding(args))
             if process_rc == 0:
                 control.started(str(turn_ordinal))
                 control.completed(str(turn_ordinal))
