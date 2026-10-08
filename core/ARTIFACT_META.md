@@ -252,6 +252,13 @@ bootstrap, and the resolved profile's effort/variant as well as its model.
 Authentication still uses the subscription CLI; provider allocation stays the
 same. Fleet's ordinary working-session refresh interval is five minutes;
 registered summaries retain their existing initial/periodic/final lifecycle.
+The first title/NOW and the existing final refresh retain priority through the
+provider's rolling-start admission. Ordinary refreshes and metadata reviews
+leave up to four starts in that same title-class window for priority calls.
+The default rolling budget is 24 starts per ten minutes; the four-worker
+concurrency cap and user overrides still apply.
+A missing title/NOW keeps that priority on the existing scheduler's retry;
+admission failures remain visible in `summary_error`. No new retry loop is added.
 In auto language mode, native command metadata is not user intent. A main
 session's observed user language travels in the existing summary-source
 provenance; a worker with no user-language signal uses the latest such main

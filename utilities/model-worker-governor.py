@@ -115,7 +115,9 @@ DEFAULT_START_BUDGET = 40
 # dispatch children could starve every new dispatch admission on their own
 # periodic title updates alone. DEFAULT_START_BUDGET stays equal to
 # CLASS_START_BUDGETS["dispatch"] -- it is the same pool under its old name.
-CLASS_START_BUDGETS = {"dispatch": DEFAULT_START_BUDGET, "title": 12, "loop": 4}
+# Text-only title calls retain a bounded rolling pool after their bootstrap
+# reduction; periodic consumers leave four starts for first/final summaries.
+CLASS_START_BUDGETS = {"dispatch": DEFAULT_START_BUDGET, "title": 24, "loop": 4}
 # Eight is the same "recent tail" size `status` already uses for
 # `identity_diagnostics` -- enough for an operator to see the last few
 # starts of a class without the receipt growing unbounded.
@@ -172,6 +174,17 @@ def start_budget(worker_class: str, override: int | None = None) -> int:
         if value >= 1:
             return value
     return CLASS_START_BUDGETS[worker_class]
+
+
+def title_start_budget(*, priority: bool = False) -> int:
+    """Leave up to four starts for first/final summaries in the existing pool.
+
+    A caller's priority never raises the configured class budget or changes
+    concurrency. Tiny user budgets retain at least one ordinary start.
+    """
+    budget = start_budget("title")
+    reserve = min(4, budget - 1)
+    return budget if priority else budget - reserve
 
 BATCH_RESERVATION_KEYS = (
     "reservation_kind",

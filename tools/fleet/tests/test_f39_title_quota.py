@@ -149,6 +149,19 @@ class QuotaTest(unittest.TestCase):
                 quota_class="initial"))
         popen.assert_not_called()
 
+    def test_detached_worker_receives_existing_priority_and_phase(self):
+        for harness, phase in (("claude", "initial"), ("codex", "initial"), ("opencode", "final")):
+            with self.subTest(harness=harness):
+                with mock.patch.object(rt.subprocess, "Popen", return_value=object()) as popen:
+                    self.assertTrue(rt.maybe_spawn(
+                        harness, "forward-" + harness, self.transcript,
+                        priority=True, quota_class=phase))
+                argv = popen.call_args.args[0]
+                self.assertIn("--priority", argv)
+                self.assertEqual(argv[argv.index("--quota-class") + 1], phase)
+                for flag in ("--slotdir", "--lockdir"):
+                    rt._remove_empty_dir(argv[argv.index(flag) + 1])
+
     def test_failed_spawn_releases_session_ticket_for_exact_retry(self):
         now = 2800.0
         for index in range(4):
@@ -221,6 +234,45 @@ class QuotaTest(unittest.TestCase):
         records = [record for record in state["start_records"] if record["class"] == "title"]
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["label"], "dispatch-att-x")
+
+    def test_real_governor_reserves_first_now_and_existing_retry_recovers(self):
+        now = [1700000000.0]
+        answer = "TITLE: 제목 한도 확인\nNOW: 첫 요약 확인 중"
+        # Only the remote provider is stubbed. Both admission layers, sidecar
+        # writing and the missing-summary retry use the real implementation.
+        with mock.patch.dict(os.environ, {"AGENT_MODEL_WORKER_START_BUDGET_TITLE": "6",
+                                          "FLEET_NOW_LANG": "Korean"}), \
+                mock.patch.object(rt.time, "time", side_effect=lambda: now[0]), \
+                mock.patch.object(rt, "run_provider_cascade", return_value=(answer, 0)) as provider:
+            for _ in range(2):
+                self.assertTrue(rt.run_worker("periodic", capacity_held=True))
+            box = {}
+            self.assertFalse(rt.run_worker("periodic", capacity_held=True, provider_box=box))
+            self.assertIn("_StartBudgetReached", box["error"])
+            self.assertEqual(provider.call_count, 2)
+            path = os.path.join(self.tmp.name, "codex.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "제목 첫 요약을 확인해 주세요"}]}}) + "\n")
+            args = ["--harness", "codex", "--sid", "dispatch-first-now",
+                    "--transcript", path, "--slotdir", os.path.join(self.tmp.name, "slot")]
+            rt.main(args)
+            self.assertEqual(titles.read("dispatch-first-now", "codex")["summary"], "첫 요약 확인 중")
+            for _ in range(3):
+                self.assertTrue(rt.run_worker("initial", capacity_held=True, priority=True))
+            args[args.index("--sid") + 1] = "dispatch-window-retry"
+            rt.main(args)
+            blocked = titles.read("dispatch-window-retry", "codex")
+            self.assertIn("_StartBudgetReached", blocked["summary_error"])
+            self.assertEqual(blocked["offset"], 0)
+            self.assertEqual(provider.call_count, 6)
+            now[0] += 601
+            rt.main(args)
+            recovered = titles.read("dispatch-window-retry", "codex")
+            self.assertEqual(recovered["summary"], "첫 요약 확인 중")
+            self.assertNotIn("summary_error", recovered)
+            self.assertEqual(provider.call_count, 7)
 
 
 class OpenCodeReadOnlyTest(unittest.TestCase):
