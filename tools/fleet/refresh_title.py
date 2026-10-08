@@ -1394,6 +1394,8 @@ def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, 
         return ""
     commands = _resolve_commands(prompt, model=model)
     if not commands:
+        if provider_box is not None:
+            provider_box["error"] = "provider-unavailable"
         return ""
     owned_slot = None
     if not capacity_held:
@@ -1428,13 +1430,22 @@ def run_worker(prompt, model=None, timeout=WORKER_TIMEOUT, capacity_held=False, 
         if spec is None or spec.loader is None:
             return ""
         governor_module = importlib.util.module_from_spec(spec); spec.loader.exec_module(governor_module)
-        governor_root = governor_module.default_root()
+        # Title jobs are cross-project local runtime work. The installed release
+        # is often their cwd, so a project artifact-root lookup cannot own their state.
+        from dispatch_contract import stable_state_root
+        explicit_root = env.get("AGENT_MODEL_GOVERNOR_ROOT")
+        governor_root = (Path(explicit_root).expanduser().resolve(strict=False) if explicit_root
+                         else stable_state_root(env) / "model-worker-governor")
         governor_token = governor_module.acquire(governor_root, "title", label=label)
         text, index = run_provider_cascade(commands, timeout=timeout, env=env)
         if provider_box is not None:
             provider_box["provider"] = _answering_provider(commands, index)
+            if not text:
+                provider_box["error"] = "provider-no-output"
         return text
-    except Exception:
+    except Exception as exc:
+        if provider_box is not None:
+            provider_box["error"] = (type(exc).__name__ + ": " + str(exc)).replace("\n", " ")[:180]
         return ""
     finally:
         if governor_token and governor_module:
@@ -1805,6 +1816,7 @@ def main(argv=None):
                 summary_ts=previous_summary_ts,
                 summary_failures=previous_failures,
                 cursor_kind=cursor_kind,
+                summary_error=previous.get("summary_error"),
             )
             titles.sweep()
             return 0
@@ -1835,6 +1847,7 @@ def main(argv=None):
             summary_ts=None if summary else previous_summary_ts,
             summary_failures=summary_failures,
             cursor_kind=cursor_kind,
+            summary_error=provider_box.get("error"),
         )
         titles.sweep()
         return 0
