@@ -196,6 +196,8 @@ class ProbeCommandAndSessionEvidenceTest(unittest.TestCase):
 
 class GpuProcessAndResourceRenderTest(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(setattr, render, "_ROUTE_FOLD", render._ROUTE_FOLD)
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
         self.original_blink = render._BLINK_ON
         self.addCleanup(setattr, render, "_BLINK_ON", self.original_blink)
         self.session = Session(

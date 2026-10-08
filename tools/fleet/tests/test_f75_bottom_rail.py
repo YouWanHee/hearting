@@ -1,22 +1,7 @@
-"""F-75 (geometry) / F-81 (placement) — the depth-1 conductor breadcrumb's right-flush rail
-label geometry, and which rail actually carries it.
+"""OWNER rail geometry and status placement.
 
-User 2026-08-14: "박스를 만들면서 하단 가로줄이 한줄을 잡아먹는데, 거기에 … 우측 정렬 같은걸
-해서 놓는건 어떨까". Before F-75, the whole route rode the owner row, which is also the box's
-TOP edge: at 140 columns a 7-node strong route clipped to `re…`, and at 200 it shoved the frame
-around. F-75 moved it to the close rail (`╰───╯`), right-flushed.
-
-F-81 (user 2026-08-20 "파이프라인은 카드 헤더 밴드가 소유한다") moved the breadcrumb AGAIN, this
-time from the close rail to the header divider (`├───┤`) — the close rail reverted to a bare
-rule (F-75's four-cell stub, width, corner, and grain unchanged). The right-flush placement
-arithmetic itself (`_dispatch_rail_label_layout`) is shared by both rails and is unchanged by
-F-81, which is why `BottomRailGeometryTest` below still calls `_dispatch_box_bottom` directly
-and still pins the geometry it always pinned. Only `CardIntegrationTest`, which renders through
-the real card and checks WHICH rail shows the text, reflects the F-81 move.
-
-This suite pins the parts that silently regress: the flush geometry (every card's label ends on
-the same column), the ledger (a label never overruns the corner), and the two suppressions
-(one-node route, no sealed route).
+Approved 1008 correction: singleton/boot/done and full pipelines all live on the
+close rail. A child divider remains bare. Worker micro-status remains inline.
 """
 import os
 import re
@@ -139,12 +124,11 @@ class RouteShownExactlyOnceTest(unittest.TestCase):
     def test_multi_node_route_leaves_the_owner_slot_to_the_rail(self):
         self.assertTrue(render._route_rides_the_rail(_owner(), LONG_ROUTE, in_card=True))
 
-    def test_one_node_route_stays_on_the_owner_row(self):
-        """The rail suppresses a one-node breadcrumb, so the row must keep it — otherwise
-        the node would appear nowhere at all."""
+    def test_one_node_route_moves_to_the_close_rail(self):
+        """A singleton OWNER route uses the same close rail as a full pipeline."""
         seq = [("execute", "active")]
         job = _owner(route_seq=seq, done=0, total=1)
-        self.assertFalse(render._route_rides_the_rail(job, seq, in_card=True))
+        self.assertTrue(render._route_rides_the_rail(job, seq, in_card=True))
         segs = render._dispatch_stage_segs(job, "code", "execute", "f75-owner",
                                            working=True, route_seq=seq,
                                            route_zone=40, compact_route=True)
@@ -302,14 +286,13 @@ class CardIntegrationTest(unittest.TestCase):
         self.assertTrue(any("(orphan)" in row and "f75-owner" in row for row in rows))
         self.assertFalse([row for row in rows if render._dw(row) > width])
 
-    def test_one_node_route_leaves_the_rail_bare(self):
-        """A one-node route is not a pipeline: its breadcrumb would spell the owner row's
-        own compact token a second time (the F-37 single-render contract)."""
+    def test_one_node_route_labels_the_close_rail(self):
+        """A singleton appears only on the close rail."""
         seq = [("execute", "active")]
         rows = self._render(_owner(route_seq=seq, done=0, total=1))
         rail = [r for r in rows if "╰" in r]
         self.assertTrue(rail)
-        self.assertEqual(set(self._rail_run(rail[0])), {"─"})
+        self.assertIn("execute", rail[0])
 
     def test_one_shot_owner_label_is_once_on_the_close_rail_in_wide_and_narrow(self):
         for width in (80, 168):
@@ -374,8 +357,8 @@ class CardIntegrationTest(unittest.TestCase):
                 rail = [r for r in rows if "╰" in r]
                 self.assertTrue(divider,
                                 "breadcrumb-only card must still draw its header divider")
-                self.assertIn("plan-check ✓", divider[0])
-                self.assertNotIn("plan-check ✓", rail[0])
+                self.assertNotIn("plan-check ✓", divider[0])
+                self.assertIn("plan-check ✓", rail[0])
                 for row in rows:
                     if any(mark in row for mark in ("╭", "│", "├", "╰")):
                         self.assertLessEqual(render._dw(row), width)
@@ -456,19 +439,19 @@ class CardIntegrationTest(unittest.TestCase):
                 rail = [r for r in rows if "╰" in r]
                 self.assertTrue(divider)
                 self.assertEqual(sum(r.count("plan-check ✓") for r in rows), 1)
-                self.assertNotIn("plan-check ✓", rail[0])
+                self.assertIn("plan-check ✓", rail[0])
                 for row in rows:
                     if any(mark in row for mark in ("╭", "│", "├", "╰")):
                         self.assertLessEqual(render._dw(row), width)
 
-    def test_routeless_card_keeps_a_bare_rail(self):
-        """F-3/F-42a: no sealed route means no track — never a fabricated one on the rule."""
+    def test_routeless_card_keeps_its_existing_boot_state_on_the_rail(self):
+        """No sealed route keeps its boot status without fabricating a pipeline."""
         job = DispatchJob(key="code", slug="f75-noroute", cwd="/tmp/f75", harness="claude",
                           depth=1, intensity="quick", liveness="working", stage="open")
         rows = self._render(job)
         rail = [r for r in rows if "╰" in r]
         self.assertTrue(rail)
-        self.assertEqual(set(self._rail_run(rail[0])), {"─"})
+        self.assertIn("quick/exec", rail[0])
 
 
 class FinishedRowNameHueTest(unittest.TestCase):

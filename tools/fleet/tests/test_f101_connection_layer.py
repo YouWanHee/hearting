@@ -36,11 +36,10 @@ def _rec(frm, to, kind, minutes=1, status="sent", harness="claude"):
 
 class StripContractTest(unittest.TestCase):
     def test_all_connection_strips_accept_width(self):
-        for name in ("_subagent_strip", "_gpu_resource_strip", "_peer_link_strip",
-                     "_steward_link_strip"):
+        for name in ("_subagent_strip", "_gpu_resource_strip", "_peer_link_strip"):
             self.assertIn("term_width", signature(getattr(render, name)).parameters)
 
-    def test_peer_and_steward_fail_soft_and_fit(self):
+    def test_peer_fail_soft_and_fit(self):
         peer = render._peer_link_strip(None, {"from_session_id": "sid", "from_name": "a",
                                               "kind": "handoff", "age_min": 2}, term_width=12)
         self.assertLessEqual(sum(render._dw(t) for t, _ in peer[0]), 12)
@@ -49,12 +48,6 @@ class StripContractTest(unittest.TestCase):
         # OffScreenPeerTest): endpoint visibility stopped deciding existence.
         self.assertEqual(render._peer_link_strip(None, {"from_session_id": ""}), [])
         self.assertEqual(render._peer_link_strip(None, None), [])
-        steward = render._steward_link_strip(
-            [{"harness": "claude", "session_id": "s%d" % i} for i in range(20)], None,
-            {("claude", "s%d" % i): "%02x" % i for i in range(20)}, term_width=60)
-        self.assertLessEqual(sum(render._dw(t) for t, _ in steward[0]), 60)
-        self.assertIn("+", "".join(t for t, _ in steward[0]))
-
     def test_icon_says_kind_and_arrow_says_direction(self):
         """User decision 2026-09-09: the glyph carries WHAT, the arrow carries WHICH WAY,
         and neither repeats the other — so no icon may vary between the two directions."""
@@ -64,13 +57,6 @@ class StripContractTest(unittest.TestCase):
             {"to_session_id": "s", "to_name": "peer", "age_min": 1}, None, {})[0])
         self.assertIn("✉ ←", recv)
         self.assertIn("✉ →", sent)
-        watches = _text(render._steward_link_strip(
-            [{"harness": "claude", "session_id": "s"}], None, {("claude", "s"): "b0"})[0])
-        watched = _text(render._steward_link_strip(
-            None, [{"harness": "claude", "session_id": "s", "name": "n"}],
-            {("claude", "s"): "b0"})[0])
-        self.assertIn("⚑ →", watches)
-        self.assertIn("⚑ ← [b0] claude", watched)
 
 
 class PeerEndpointLabelTest(unittest.TestCase):
@@ -163,10 +149,10 @@ class PeerCorrelationTest(unittest.TestCase):
 
 
 class ConnectionLayerInsetOrderTest(unittest.TestCase):
-    """F-101g-(3) — subagent/GPU/peer/steward all share the one inset and all four
-    precede plugin-agent and dispatch-child rows for the same session."""
+    """Subagent/GPU/peer strips share the inset and precede children.
+    Steward relations moved to under-id lines by the approved 1008 correction."""
 
-    def test_four_strips_share_inset_and_precede_children(self):
+    def test_three_strips_share_inset_and_precede_children(self):
         self.addCleanup(render.set_compute_hosts, None)
         render.set_compute_hosts({"hosts": [{"host": "h1", "gpus": [{
             "index": 0, "name": "RTX", "processes": [{
@@ -201,7 +187,6 @@ class ConnectionLayerInsetOrderTest(unittest.TestCase):
         subagent_i = idx(lambda t: render._ICON_SUBAGENT in t and "codex task" not in t)
         gpu_i = idx(lambda t: "GPU h1:0" in t)
         peer_i = idx(lambda t: "←" in t and "peerB" in t)
-        steward_i = idx(lambda t: "[46]" in t and "→" in t)
         # Each strip's leading CONTENT glyph is its own icon, so the shared-inset
         # invariant is measured at the icon, not at the arrow that follows it.
         plugin_i = idx(lambda t: "codex task" in t)
@@ -219,41 +204,14 @@ class ConnectionLayerInsetOrderTest(unittest.TestCase):
             "subagent": content_offset(subagent_i, render._ICON_SUBAGENT),
             "gpu": content_offset(gpu_i, "●"),
             "peer": content_offset(peer_i, render._ICON_PEER),
-            "steward": content_offset(steward_i, render._ICON_STEWARD),
         }
         self.assertEqual(len(set(offsets.values())), 1,
                          "inset offsets differ across strips: %r" % offsets)
         self.assertEqual(next(iter(offsets.values())), render._dw(render._SUBAGENT_IND))
 
-        for label, i in (("subagent", subagent_i), ("gpu", gpu_i), ("peer", peer_i),
-                        ("steward", steward_i)):
+        for label, i in (("subagent", subagent_i), ("gpu", gpu_i), ("peer", peer_i)):
             self.assertLess(i, plugin_i, "%s row must precede the plugin-agent row" % label)
             self.assertLess(i, dispatch_i, "%s row must precede the dispatch-child row" % label)
-
-
-class StewardFoldPlaceholderTest(unittest.TestCase):
-    """F-101g-(5) — steward `+N` folding keeps front tags and drops placeholders,
-    join failures, and untagged children before folding at all."""
-
-    def test_placeholders_and_join_failures_vanish_before_folding(self):
-        targets = [{"harness": "claude", "session_id": "s%d" % i} for i in range(20)]
-        targets.append({"harness": "claude", "session_id": None})          # placeholder
-        targets.append({"harness": "claude", "session_id": "sBadJoin"})    # no ledger tag
-        targets.append({"harness": "unknown", "session_id": "sBadTag"})    # tag resolves to None
-        tag_by_key = {("claude", "s%d" % i): "%02x" % i for i in range(20)}
-        tag_by_key[("unknown", "sBadTag")] = None
-
-        segs = render._steward_link_strip(targets, None, tag_by_key, term_width=60)[0]
-        text = _text(segs)
-        self.assertLessEqual(sum(render._dw(t) for t, _k in segs), 60)
-        self.assertRegex(text, r"^\s*⚑ →( \[[0-9a-f]{2}\])+ \+\d+$")
-        self.assertIn("[00]", text)
-        self.assertIn("[01]", text)
-        shown = len(re.findall(r"\[[0-9a-f]{2}\]", text))
-        rest = int(re.search(r"\+(\d+)", text).group(1))
-        self.assertEqual(shown + rest, 20)
-        self.assertNotIn("sBadJoin", text)
-        self.assertNotIn("None", text)
 
 
 class OffScreenPeerTest(unittest.TestCase):
@@ -314,19 +272,13 @@ class StewardParentStripTest(unittest.TestCase):
                                            "name": "hearting-b0"}])
         rows = _lines_text(render._build_lines([parent, target], [], "fleet", False, 0,
                                                layout="wide", term_width=168))
-        self.assertTrue(any("⚑ → [13]" in t for t in rows))
-        self.assertTrue(any("⚑ ← [b0] claude" in t for t in rows))
+        self.assertFalse(any("⚑ →" in t for t in rows))
+        self.assertFalse(any("⚑ ←" in t for t in rows))
+        self.assertTrue(any("│" in t for t in rows))
 
 
 class RelationLineBudgetTest(unittest.TestCase):
-    """A session spends at most TWO rows on relations, whatever it is doing.
-
-    Before this a session that had sent, received, watched and was watched drew four
-    rows — one per direction. The user measured that on the live board (2026-09-10:
-    "그 감독 줄과 메시지 줄이 따로 있으면 최대 총 4줄까지 있는건데, 그건 좀 과한것 같아.
-    2줄로 줄여 어차피 횡으로 여유 많은데"). Vertical space is the scarce axis on this
-    board; horizontal is not.
-    """
+    """Peer relations use one row; steward relations use under-id lines."""
 
     def _busiest_session(self):
         return Session(
@@ -353,16 +305,14 @@ class RelationLineBudgetTest(unittest.TestCase):
                                       for icon in (render._ICON_PEER, render._ICON_STEWARD)
                                       for direction in ("→", "←"))]
 
-    def test_a_session_with_every_relation_spends_exactly_two_rows(self):
+    def test_a_session_with_every_relation_spends_one_peer_row(self):
         rows = self._relation_rows()
-        self.assertEqual(len(rows), 2, "relation rows: %r" % rows)
+        self.assertEqual(len(rows), 1, "relation rows: %r" % rows)
 
     def test_each_row_carries_both_of_its_directions(self):
-        peer_row, steward_row = self._relation_rows()
+        peer_row, = self._relation_rows()
         self.assertIn("✉ →", peer_row)
         self.assertIn("←", peer_row.split("✉ →", 1)[1])
-        self.assertIn("⚑ →", steward_row)
-        self.assertIn("←", steward_row.split("⚑ →", 1)[1])
 
     def test_the_icon_is_not_repeated_for_the_second_direction(self):
         # The icon says what the relation is — once per row. Repeating it would make the
@@ -390,20 +340,6 @@ class RelationLineBudgetTest(unittest.TestCase):
         self.assertIn("[b0]", text)
         self.assertIn("[c0]", text)
         self.assertNotIn("steer", text)
-
-    def test_the_steward_row_folds_its_watch_list_before_dropping_the_watcher(self):
-        # Who is watching me is one fact; who I watch is a list. The list yields first.
-        targets = [{"harness": "claude", "session_id": "s%d" % i} for i in range(20)]
-        tag_by_key = {("claude", "s%d" % i): "%02x" % i for i in range(20)}
-        tag_by_key[("claude", "sP")] = "b0"
-        parents = [{"harness": "claude", "session_id": "sP", "name": "steward"}]
-        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
-            segs = render._steward_link_strip(targets, parents, tag_by_key, term_width=40)[0]
-        text = _text(segs)
-        self.assertLessEqual(sum(render._dw(t) for t, _k in segs), 40)
-        self.assertIn("← [b0] claude", text)
-        self.assertIn("+", text)
-
 
 class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     """F-101g-(7) — with no connection-layer fields set at all (ledger absent), a

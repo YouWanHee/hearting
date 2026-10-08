@@ -186,11 +186,31 @@ class StewardOrderTest(unittest.TestCase):
 
 
 class StewardCollectorTest(unittest.TestCase):
+    def setUp(self):
+        repository = mock.patch.object(steward, "_repository_key", side_effect=lambda cwd: cwd or None)
+        repository.start()
+        self.addCleanup(repository.stop)
+        registry = mock.patch.object(steward, "_registry_sessions", return_value=[])
+        self.registry = registry.start()
+        self.addCleanup(registry.stop)
+        native = mock.patch.object(steward, "_native_role_sessions", return_value=[])
+        native.start()
+        self.addCleanup(native.stop)
+        projection = mock.patch.object(steward, "_projection_sessions",
+                                       side_effect=lambda: self.registry.return_value)
+        projection.start()
+        self.addCleanup(projection.stop)
+        cwd = mock.patch.object(herdr_projection.os, "getcwd", return_value="/x")
+        cwd.start()
+        self.addCleanup(cwd.stop)
+
     def test_confirmed_clear_keeps_the_same_role_in_fleet_and_herdr(self):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
-                session = Session(harness=harness, pid=1, session_id="new")
+                session = Session(harness=harness, pid=1, session_id="new", cwd="/x")
                 session._gpu_session_aliases = ["old"]
+                self.registry.return_value = [session, Session(harness="codex", pid=2,
+                                               session_id="ended-target", cwd="/x")]
                 markers = {(harness, "old"): {"session_id": "old", "targets": {
                     "ended-target": {"harness": "codex", "session_id": "ended-target",
                                      "kind": "watch", "source": "watch"}}}}
@@ -206,10 +226,12 @@ class StewardCollectorTest(unittest.TestCase):
                     self.assertFalse(herdr_projection.is_steward(harness, "unrelated"))
 
     def test_join_is_exact_on_harness_and_session_id(self):
-        sessions = [Session(harness="claude", pid=1, session_id="sid-a"),
-                    Session(harness="codex", pid=2, session_id="sid-a"),
-                    Session(harness="claude", pid=3, session_id="sid-b"),
-                    Session(harness="claude", pid=4)]
+        sessions = [Session(harness="claude", pid=1, session_id="sid-a", cwd="/x"),
+                    Session(harness="codex", pid=2, session_id="sid-a", cwd="/x"),
+                    Session(harness="claude", pid=3, session_id="sid-b", cwd="/x"),
+                    Session(harness="claude", pid=4, cwd="/x")]
+        self.registry.return_value = [Session(harness="codex", pid=5, session_id="x", cwd="/x"),
+                                      Session(harness="claude", pid=6, session_id="y", cwd="/x")]
         markers = {("claude", "sid-a"): {"session_id": "sid-a", "targets": {
             "x": {"harness": "codex", "session_id": "x", "name": "w", "kind": "start", "ts": "2",
                   "source": "start"},
@@ -225,10 +247,12 @@ class StewardCollectorTest(unittest.TestCase):
         entries are steer/handoff/gate-relay sends — new (source absent, kind=handoff) or
         old (no source at all) — leaves steward=False; a mixed marker keeps only the
         evidence entries in `steward_targets`."""
-        sessions = [Session(harness="claude", pid=1, session_id="worker"),
-                    Session(harness="claude", pid=2, session_id="legacy-steward"),
-                    Session(harness="claude", pid=3, session_id="mixed"),
-                    Session(harness="opencode", pid=4, session_id="empty")]
+        sessions = [Session(harness="claude", pid=1, session_id="worker", cwd="/x"),
+                    Session(harness="claude", pid=2, session_id="legacy-steward", cwd="/x"),
+                    Session(harness="claude", pid=3, session_id="mixed", cwd="/x"),
+                    Session(harness="opencode", pid=4, session_id="empty", cwd="/x")]
+        self.registry.return_value = [Session(harness="codex", pid=5, session_id="c", cwd="/x"),
+                                      Session(harness="claude", pid=6, session_id="s", cwd="/x")]
         markers = {
             ("claude", "worker"): {"session_id": "worker", "targets": {
                 "w1:p15": {"harness": "claude", "session_id": "steward", "name": "hearting-b0",
@@ -249,7 +273,7 @@ class StewardCollectorTest(unittest.TestCase):
         self.assertEqual([s.steward for s in sessions], [False, True, True, False])
         self.assertIsNone(sessions[0].steward_targets)
         self.assertEqual([t["session_id"] for t in sessions[1].steward_targets], ["c"])
-        self.assertEqual([t["session_id"] for t in sessions[2].steward_targets], [None, "s"])
+        self.assertEqual([t["session_id"] for t in sessions[2].steward_targets], ["s"])
         self.assertIsNone(sessions[3].steward_targets)
 
     def test_without_the_ledger_module_nothing_is_claimed(self):
@@ -293,7 +317,9 @@ class StewardCollectorTest(unittest.TestCase):
                                                 "2026-09-06T00:00:00Z", source="watch"))
                 markers = steward.read_markers()
                 self.assertIn(("claude", "sid-a"), markers)
-                sessions = [Session(harness="claude", pid=1, session_id="sid-a")]
+                sessions = [Session(harness="claude", pid=1, session_id="sid-a", cwd="/x")]
+                self.registry.return_value = [Session(harness="codex", pid=2,
+                                                       session_id="sid-c", cwd="/x")]
                 steward.enrich(sessions, markers=markers)
                 self.assertTrue(sessions[0].steward)
                 self.assertEqual(sessions[0].steward_targets[0]["session_id"], "sid-c")
@@ -359,6 +385,17 @@ class StewardReverseIndexTest(unittest.TestCase):
     the watched session had no reverse field at all (measured 2026-09-09) and the board
     could not answer "who is watching me". The reverse index is derived from the same
     evidence entries, never from a second marker."""
+
+    def setUp(self):
+        repository = mock.patch.object(steward, "_repository_key", side_effect=lambda cwd: cwd or None)
+        repository.start()
+        self.addCleanup(repository.stop)
+        registry = mock.patch.object(steward, "_registry_sessions", return_value=[])
+        registry.start()
+        self.addCleanup(registry.stop)
+        native = mock.patch.object(steward, "_native_role_sessions", return_value=[])
+        native.start()
+        self.addCleanup(native.stop)
 
     def _enrich(self, sessions, marker_targets):
         markers = {("claude", "sidP"): {"session_id": "sidP", "targets": marker_targets}}
