@@ -3340,10 +3340,13 @@ def _governor_segs(snapshot=_IO_UNSET):
     return [("  ⚙ ", "dim"), ("governor %d/%d" % (active, cap), "dim")]
 
 
-def _pulse_segs(sessions, jobs):
+def _pulse_segs(sessions, jobs, loading=False):
     """`  fleet ⠙ N working   ● N idle ...` — whole-board census. Extracted (F-30, v10) so both
     the group view and the process view (§5.1) render the EXACT same row — one source, shared
     by the header helper contract §5.2 asks for, instead of two independently-drifting copies."""
+    if loading:
+        spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
+        return [("  fleet ", "head"), (spin, "g_spin"), (" loading sessions…", "dim")]
     _real = [s for s in sessions if not s.app_server and not getattr(s, "mem_worker", False)]
     n_wk = sum(1 for s in _real if s.liveness == "working")
     n_id = sum(1 for s in _real if s.liveness == "idle")
@@ -6154,7 +6157,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
 
 
 def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, term_width, layout,
-                         node_evidence=None, governor=_IO_UNSET, resources=None):
+                         node_evidence=None, governor=_IO_UNSET, resources=None, loading=False):
     """F-30 (prd.md:304-310) — the process view: one card per ACTIVE route (pipeline-centric
     regrouping) instead of the group view's per-project regrouping. Returns the SAME flat
     segment-line contract as `_build_lines` ([[(text,key),...]|None]) — `_draw`/`render_once`/
@@ -6168,7 +6171,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     for record lookup, and needs the identical fix for the SAME reason."""
     global _FOLDABLE
     _FOLDABLE = []
-    lines = [_pulse_segs(sessions, jobs)]
+    lines = [_pulse_segs(sessions, jobs, loading=loading)]
     _governor = _governor_segs(governor)
     if _governor is not None:
         lines.append(_governor)
@@ -6240,7 +6243,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
             and not _orphan_resource_groups(resources, ())):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
-        lines.append([("  no active route", "dim")])
+        lines.append([("  loading sessions…" if loading else "  no active route", "dim")])
         return lines
 
     seen_keys = set()
@@ -6811,7 +6814,7 @@ def _group_emission(g, show_sessions, show_jobs, gpu_resources=None,
 
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
                  term_width=None, live_order=None, resources=None, usage_snapshots=None,
-                 governor=_IO_UNSET):
+                 governor=_IO_UNSET, loading=False):
     """Return a flat list of segment-lines for the whole screen (None = blank line).
 
     Side effect: refreshes the module-level `_SELECTABLE` stash (F-27) — see its definition.
@@ -6840,8 +6843,13 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     _degradations = {}
     try:
         from .collectors import dispatch as _dispatch
-        _node_evidence = getattr(_dispatch.collect, "last_route_nodes", None) or {}
-        _degradations = getattr(_dispatch.collect, "last_degradations", None) or {}
+        # The first live frame has no published session snapshot yet. Dispatch
+        # can already be filling these side channels in its worker; treating
+        # them as a completed empty census projects every historical route on
+        # the curses thread and stalls adoption of the real first snapshot.
+        if not loading:
+            _node_evidence = getattr(_dispatch.collect, "last_route_nodes", None) or {}
+            _degradations = getattr(_dispatch.collect, "last_degradations", None) or {}
     except Exception:
         _node_evidence = {}
         _degradations = {}
@@ -6913,7 +6921,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # the same way route resolution itself needed it for defect 1.
         process_lines = _build_process_lines(
             sessions, display_jobs, _route_views_by_id, malformed, memory,
-            term_width, layout, node_evidence=_node_evidence, governor=governor, resources=resources)
+            term_width, layout, node_evidence=_node_evidence, governor=governor,
+            resources=resources, loading=loading)
         top_rows = _top_rows(term_width, narrow)
         for entry in _FOLDABLE + _SELECTABLE:
             entry["line"] += len(top_rows)
@@ -7084,7 +7093,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # fleet pulse — htop's "Tasks: N, M running" analogue: whole-board census + live spend Σ
     # Show the row by default; counts skip app-server companions. Extracted into _pulse_segs
     # (F-30, v10) so the process view (§5.1) shares this EXACT row instead of a second copy.
-    lines.append(_pulse_segs(sessions, display_jobs))  # Aggregate cost rollup intentionally removed.
+    lines.append(_pulse_segs(sessions, display_jobs, loading=loading))
     _governor = _governor_segs(governor)       # F-28c — snapshot-owned in the live loop
     if _governor is not None:                  # counts (I8); None = source absent or quiet.
         lines.append(_governor)
@@ -7642,7 +7651,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                       (names[:90] + ("…" if len(names) > 90 else ""), "dim")])
 
     if not order:
-        lines.append([("  (no active sessions or dispatch jobs)", "dim")])
+        lines.append([("  loading sessions…" if loading else
+                       "  (no active sessions or dispatch jobs)", "dim")])
 
     if malformed:
         lines.append(None)
@@ -8561,7 +8571,7 @@ def reset_scroll():
 
 
 def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=None,
-          resources=None, usage_snapshots=None, governor=None):
+          resources=None, usage_snapshots=None, governor=None, loading=False):
     global _OFFSET, _TOGGLE_ROWS, _CLICK_ROWS, _FOLD_ROWS, _PROMPT_HITS, _CURSOR_ID
     # reset before any early-return so a stale map never survives a click (§4.1 pattern) —
     # _PROMPT_HITS in particular must never carry the PRIOR stage's coordinates into this
@@ -8577,7 +8587,7 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     lines = _build_lines(sessions, jobs, section, narrow, malformed, layout=_layout_mode(w),
                          memory=memory, term_width=w, live_order=live_order,
                          resources=resources, usage_snapshots=usage_snapshots,
-                         governor=governor)
+                         governor=governor, loading=loading)
     body_h = max(1, h - 1)   # reserve 1 footer row
 
     # F-27: the cursor tracks a ROW, so the viewport follows it (not the reverse). Done before
@@ -8737,8 +8747,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             hearting=dict(hearting) if isinstance(hearting, dict) else None,
         )
 
-    # The TUI is useful immediately: draw an empty last-good frame, then atomically
-    # adopt the first complete snapshot. No collector ever runs on this thread.
+    # Draw a loading frame until the first complete snapshot is adopted. Empty
+    # sessions here are unobserved, not a successful census with zero sessions.
     snapshot = LiveSnapshot(hearting=dict(_HEARTING) if isinstance(_HEARTING, dict) else None)
     generation = 0
     pump = RefreshPump(collect_snapshot, interval)
@@ -8769,7 +8779,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     stdscr.timeout(200)                     # getch blocks ≤200ms → responsive keys
     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
           live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-          governor=governor_snapshot)
+          governor=governor_snapshot, loading=(generation == 0))
     try:
         while True:
             # Wake at the next 0.1s spinner frame while staying key-responsive. Collection
@@ -8824,13 +8834,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _handle_prompt_key(ch)
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                      governor=governor_snapshot)
+                      governor=governor_snapshot, loading=(generation == 0))
                 continue
             if _SELECT_MODE:
                 if _handle_select_key(ch):
                     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                           live_order=live_order, resources=resources,
-                          usage_snapshots=usage_snapshots, governor=governor_snapshot)
+                          usage_snapshots=usage_snapshots, governor=governor_snapshot,
+                          loading=(generation == 0))
                     continue
             elif ch in (ord("s"), ord("S"), ord("x"), ord("X")):
                 # Enter selection mode. `x` doubles as the enter shortcut so the "press x to kill"
@@ -8839,7 +8850,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _set_action("no selectable rows")
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                      governor=governor_snapshot)
+                      governor=governor_snapshot, loading=(generation == 0))
                 continue
 
             # --- base mode: scroll keys UNCHANGED (F-27 regression budget = 0) ---
@@ -8860,7 +8871,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             # Redraw every wake for the spinner/blink; curses doupdate emits only changed cells.
             _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                   live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                  governor=governor_snapshot)
+                  governor=governor_snapshot, loading=(generation == 0))
     finally:
         pump.stop(join_timeout=1.0)
         if compute_host_pump is not None:
