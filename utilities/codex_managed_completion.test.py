@@ -740,6 +740,42 @@ class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
 
 
 class NativeQueueDeliveryTest(unittest.TestCase):
+    def test_standalone_stage_close_creates_the_real_ledger_then_queue_delivery_acks_it(self):
+        # Exercise the real close, materializer, session-row lookup and ledger;
+        # stub only the native queue transport, never the delivery record.
+        module = load_completion_module()
+        import dispatch_contract as contract
+        import dispatch_completion_join as join
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "jobs.log"
+            attempt = "att-standalone-first-now"
+            jobs.write_text(
+                "t\topen\t/repo\t/wt\tfirst-now\t"
+                "attempt_schema_version=2,dispatch_depth=1,transport=headless,"
+                "execution_surface=registered-headless,registered_worker=1,"
+                "fallback_hop=same-harness-headless,worker_type=stage,unit=qa/test,"
+                "launch_claimed=1,launch_outcome=never-launched,"
+                "parent_completion_delivery=codex-native-queue,"
+                f"attempt_id={attempt},parent_sid={SESSION},harness=codex\n")
+            self.assertTrue(contract.close_attempt_row(jobs, attempt, "dead-exact-pid"))
+            record_path = join.materialize_after_terminal_close(jobs, attempt)
+            self.assertIsNotNone(record_path)
+            args = SimpleNamespace(queue_socket=Path("/tmp/app-server.sock"),
+                                   thread_id=SESSION, jobs=jobs, timeout=1.0,
+                                   delivery_retry_interval=0.01)
+            receipt = json.loads(record_path.read_text())["receipt"]
+            with mock.patch.object(module.codex_queue_delivery, "_rpc", return_value={
+                    "thread": {"id": SESSION, "cwd": "/repo"}}), \
+                 mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
+                                   return_value={"status": "consumed"}) as send:
+                result = module.deliver_to_native_queue(args, receipt, {attempt})
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(json.loads(record_path.read_text())["state"], "acked")
+            send.assert_called_once()
+            self.assertEqual(send.call_args.kwargs["thread_id"], SESSION)
+            self.assertIn(attempt, send.call_args.kwargs["message"])
+
     def test_queue_acceptance_uses_exact_id_and_restarts_only_while_pending(self) -> None:
         from types import SimpleNamespace
 
