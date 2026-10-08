@@ -41,7 +41,7 @@ from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo
 from .collectors import compute_hosts as _compute_hosts
-from .refresh import LiveSnapshot, RefreshPump
+from .refresh import LiveSnapshot, RefreshPump, background_read
 from .session_handle import sanitize_title as _sanitize_session_title
 from .session_handle import _cell_width as _session_handle_cell_width
 from .session_handle import clip_cells as _clip_cells
@@ -7641,14 +7641,33 @@ def _snapshot_line(segs, colored=False, colors=256):
     return "".join(out)
 
 
-def render_once(collect_all, hfilter, section):
+def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     global _GIT_TELEMETRY
-    sessions, jobs = collect_all(harness_filter=hfilter)
+    governor_read = background_read(_collect_governor)
+    hosts_read = (background_read(compute_hosts_refresh)
+                  if callable(compute_hosts_refresh) else None)
+    try:
+        sessions, jobs = collect_all(harness_filter=hfilter)
+    except BaseException:
+        # Drain both reads. Preserve the original serial failure priority:
+        # hosts before sessions before governor (normally fail-soft).
+        try:
+            governor_read.result()
+        except BaseException:
+            pass
+        if hosts_read is not None:
+            set_compute_hosts(hosts_read.result())
+        raise
+    else:
+        try:
+            governor_snapshot = governor_read.result()
+        finally:
+            if hosts_read is not None:
+                set_compute_hosts(hosts_read.result())
     resources = list(getattr(collect_all, "last_resource_jobs", []))
     usage_snapshots = dict(getattr(collect_all, "last_usage_snapshots", {}))
     malformed = _malformed()
     mem_snapshot = _collect_memory()
-    governor_snapshot = _collect_governor()
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
         import shutil
@@ -8529,8 +8548,18 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
 
     def collect_snapshot():
         nonlocal first_snapshot
-        sessions, jobs = collect_all(harness_filter=hfilter,
-                                     **({"fast_first": True} if first_snapshot else {}))
+        governor_read = background_read(_collect_governor)
+        try:
+            sessions, jobs = collect_all(harness_filter=hfilter,
+                                         **({"fast_first": True} if first_snapshot else {}))
+        except BaseException:
+            try:
+                governor_read.result()
+            except BaseException:
+                pass
+            raise
+        else:
+            governor_snapshot = governor_read.result()
         # Only the first publication is fast: every later tick (the existing
         # background refresh) runs the full pass, filling the details the
         # first snapshot honestly left empty. --once/JSON never sets the flag.
@@ -8551,7 +8580,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             usage_snapshots=dict(getattr(collect_all, "last_usage_snapshots", {})),
             malformed=_malformed(),
             memory=_collect_memory(),
-            governor=_collect_governor(),
+            governor=governor_snapshot,
             hearting=dict(hearting) if isinstance(hearting, dict) else None,
         )
 

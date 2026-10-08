@@ -326,8 +326,8 @@ def main(argv=None):
     if view:
         render.set_process_view(view == "process")
     if args.once:
-        render.set_compute_hosts(compute_hosts.collect())
-        return render.render_once(projected_collector, hfilter, args.section)
+        return render.render_once(projected_collector, hfilter, args.section,
+                                  compute_hosts_refresh=compute_hosts.collect)
     render.reset_scroll()   # fresh launch starts scrolled to top (belt-and-suspenders)
 
     base_collector = projected_collector

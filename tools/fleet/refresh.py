@@ -6,9 +6,34 @@ one follow-up run, and publishes only complete successful results.
 """
 
 from dataclasses import dataclass, field
+from concurrent.futures import Future
 import os
 import threading
 import time
+
+
+def background_read(producer):
+    """Overlap one independent read; the caller still owns result publication.
+
+    Daemon lifetime matches RefreshPump: a stalled read must not keep a closed
+    TUI alive. Each snapshot awaits its read before another tick can start.
+    Thread exhaustion falls back to the existing synchronous observation.
+    """
+    result = Future()
+
+    def collect():
+        if not result.set_running_or_notify_cancel():
+            return
+        try:
+            result.set_result(producer())
+        except BaseException as exc:
+            result.set_exception(exc)
+
+    try:
+        threading.Thread(target=collect, daemon=True, name="fleet-read").start()
+    except (RuntimeError, OSError):
+        collect()
+    return result
 
 
 @dataclass
