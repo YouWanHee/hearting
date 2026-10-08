@@ -1096,6 +1096,8 @@ network need in their normal execution-access request. Execution/validation
 children remain inside the parent's grant; non-execution nodes get no new
 automatic network request. The effective record reports this logical network
 grant separately from OS enforcement. An explicit network request still wins.
+An answered BLOCKED GPU lab owner prepares these same defaults for its
+replacement, retaining completed stages and the old request as history.
 The launcher is shared across runtimes, repairs only an exact owned link, preserves
 foreign collisions, and is removed only by a full uninstall. That file
 is byte-identical on every host: which entry is the local machine is discovered
