@@ -1733,6 +1733,15 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "it starts the owner again."}
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
     result["correction_command"] = correction_command(aid, jobs, agent_home=ROOT)
+    if status in {"open", "running"} and metadata.get("launch_claimed") == "1":
+        from model_profile import sealed_pin_harness
+        pinned = sealed_pin_harness(route_authority.route_in_force(route), worker_type="owner")
+        if pinned and metadata.get("harness") and metadata.get("harness") != pinned:
+            return {**result, "state": "needs-attention", "reason": "pin-ignored-for-replacement",
+                    "harness": metadata.get("harness"), "requested_harness": pinned,
+                    "next_step": "The pin is recorded for the next launch. This owner already launched on "
+                        "another harness and keeps its execution identity. Send a correction for a graceful "
+                        "handoff; do not kill its resource work."}
     if status == "done":
         gate_response = _owner_gate_response(route, path, jobs, aid, metadata, result)
         if gate_response is not None:

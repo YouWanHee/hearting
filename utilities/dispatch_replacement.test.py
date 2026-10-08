@@ -678,7 +678,7 @@ class ReplacementTest(unittest.TestCase):
              mock.patch.object(capacity,'capacity_report',return_value=report), \
              mock.patch.object(capacity,'gate_release_epoch',return_value=None):
             with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None):
-                for source in (owner,stage):
+                for source in (stage,):
                     hold=R._capacity_hold(self.jobs,source)
                     self.assertEqual((hold['label'],hold['until_epoch'],hold['usage_gate_used_percent']),
                                      ('allocation-usage-gate',None,85))
@@ -687,7 +687,7 @@ class ReplacementTest(unittest.TestCase):
                 for source in (owner,stage):                 # the pin starts despite the soft gate
                     self.assertIsNone(R._capacity_hold(self.jobs,source))
                 self.route['selection_pins']={'owner':{'harness':'claude'}}
-                self.assertEqual(R._capacity_hold(self.jobs,owner)['label'],'allocation-usage-gate')
+                self.assertIsNone(R._capacity_hold(self.jobs,owner))  # the ordinary selector honours the Claude pin
             self.route['selection_pins']={'owner':{'harness':'codex'},'worker':{'harness':'codex'}}
             with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=limited):
                 for source in (owner,stage):                 # a real usage limit still holds the pin
@@ -695,9 +695,10 @@ class ReplacementTest(unittest.TestCase):
             del self.route['selection_pins']
             with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
                  mock.patch.object(capacity,'gate_release_epoch',return_value=4102444800) as release:
-                self.assertEqual(R._capacity_hold(self.jobs,owner)['until_epoch'],4102444800)
+                self.assertIsNone(R._capacity_hold(self.jobs,owner))
+                self.assertEqual(R._capacity_hold(self.jobs,stage)['until_epoch'],4102444800)
                 release.assert_called_with('codex','live',usage_gate_used_percent=85)
-                self.assertEqual(R._capacity_wait(self.jobs,'att-source',owner)['retry_at'],'2100-01-01T00:00:00Z')
+                self.assertEqual(R._capacity_wait(self.jobs,'att-source',stage)['retry_at'],'2100-01-01T00:00:00Z')
 
     def test_an_io_failure_keeps_its_cause(self):
         with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):
@@ -1348,6 +1349,7 @@ class ReplacementTest(unittest.TestCase):
 
     def test_capacity_wait_writes_nothing(self):
         self._capacity_owner()
+        self.route['selection_pins'] = {'owner': {'harness': 'codex'}}
         def files():return sorted(str(p.relative_to(R._directory(self.jobs))) for p in R._directory(self.jobs).rglob('*') if p.is_file())
         before=(files(),self.jobs.read_bytes())
         result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
@@ -1585,10 +1587,11 @@ class ReplacementTest(unittest.TestCase):
         return RA.record_pin_change(self.route, target='owner', pin={'harness': harness}, by={'harness': 'codex',
                                     'session_id': 'parent'}, source='unattributed', tuples=[], candidates=[])
 
-    def _moved_successor(self, record, command, harness='claude'):
+    def _moved_successor(self, record, command, harness='claude', write=True):
         """The new harness's wrapper seals the forwarded owner command and registers the replacement."""
         aid = record['replacement_attempt_id']
         args = SimpleNamespace(**vars(self.args)); args.attempt_id = aid
+        args.automatic_retry_of = record['original_attempt_id']
         args.replacement_input_argv = command[3:]
         meta = {k: v for k, v in self.meta.items() if k not in ('note', 'failure_class', 'launch_outcome',
                                                                 'replacement_input_digest')}
@@ -1597,7 +1600,8 @@ class ReplacementTest(unittest.TestCase):
                     replacement_original_attempt_id='att-source', replacement_ordinal='1',
                     replacement_claim_digest=R._digest(record))
         meta.update(D.parse_registry_metadata(R.seal_launch_input(args, harness, 'the raw task')))
-        self.write(meta, 'open', append=True)
+        if write:
+            self.write(meta, 'open', append=True)
         return meta
 
     def test_a_parent_moved_owner_pin_continues_the_answered_owner_on_the_new_harness(self):
@@ -1610,7 +1614,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(record['harness'], 'claude')
         (command,) = commands
         self.assertTrue(command[1].endswith('utilities/dispatch-owner.py'))
-        self.assertEqual(command[command.index('--adapter') + 1], 'claude')
+        self.assertNotIn('--adapter', command)  # ordinary selector reads the current route pin
         self.assertEqual(command[command.index('--attempt-id') + 1], record['replacement_attempt_id'])
         self.assertEqual(command[command.index('--automatic-retry-of') + 1], 'att-source')
         self.assertEqual(Path(command[command.index('--prompt-file') + 1]).read_text(), 'the raw task')
@@ -1629,7 +1633,7 @@ class ReplacementTest(unittest.TestCase):
             with self.assertRaises(D.DispatchContractError) as refused:
                 R.admission(self.jobs, lines, wrong)
         self.assertEqual((refused.exception.reason, refused.exception.detail),
-                         ('replacement-input-tuple-mismatch', 'harness'))
+                         ('pin-ignored-for-replacement', 'claude'))
 
     def test_a_replacement_owner_runs_with_the_access_request_its_parent_handed_over(self):
         # BC rt-839dbd48: the parent handed a new request and answered; the replacement replayed the first one.
@@ -1700,14 +1704,106 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(json.loads(Path(access['request_path']).read_text())['read_roots'],
                          [str(data), str(self.root / 'more')])
 
-    def test_a_pin_moved_after_the_claim_leaves_that_replacement_on_its_harness(self):
+    def test_a_pin_moved_after_the_claim_controls_the_next_owner_launch(self):
         self._blocked_owner()
         self._answer()
         record = self.claim()
         self.assertNotIn('harness', record)
         self._move_owner()
         result, commands = self._launch()
-        self.assertTrue(commands[0][1].endswith('adapters/codex/bin/dispatch-headless.py'))
+        self.assertTrue(commands[0][1].endswith('utilities/dispatch-owner.py'))
+        self.assertEqual(result['record'], record)  # lineage remains immutable
+        moved = self._moved_successor(record, commands[0])
+        self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), moved), record)
+        self.assertIn('approved: start the full run', R.recovery_instructions(SimpleNamespace(
+            automatic_retry_of='att-source', worker_type='owner', jobs_path=self.jobs,
+            attempt_id=record['replacement_attempt_id'])))
+
+    def test_an_unstarted_registered_owner_can_follow_a_later_pin(self):
+        self._blocked_owner(); self._answer()
+        record = self.claim()
+        _, commands = self._launch()
+        old = self._moved_successor(record, commands[0], harness='codex')
+        self._move_owner('opencode')
+        _, commands = self._launch()
+        candidate = self._moved_successor(record, commands[0], harness='opencode', write=False)
+        row = 'now\topen\t'+str(self.root)+'\t'+str(self.root)+'\ttask\t'+','.join(k+'='+v for k,v in candidate.items())
+        self.assertFalse(D.claim_attempt_row(self.jobs, candidate['attempt_id'], row, launch=False))
+        current = R._rows(self.jobs.read_text().splitlines())[candidate['attempt_id']][1]
+        self.assertEqual((current['harness'], current['launch_claimed']), ('opencode', '0'))
+        self.assertEqual(current['replacement_claim_digest'], old['replacement_claim_digest'])
+
+    def test_a_started_replacement_with_a_conflicting_pin_returns_a_diagnostic(self):
+        self._blocked_owner(); self._answer()
+        record = self.claim()
+        old = self._successor(record, self.meta | {'worker_type': 'owner'}, status='open')
+        self._move_owner('opencode')
+        result, commands = self._launch()
+        self.assertEqual(commands, [])
+        self.assertEqual((result['state'], result['reason'], result['requested_harness']),
+                         ('needs-attention', 'pin-ignored-for-replacement', 'opencode'))
+        self.assertEqual(R._rows(self.jobs.read_text().splitlines())[old['attempt_id']][1]['harness'], 'codex')
+        self.assertEqual(R.validate_attention(self.jobs, [result])[0]['reason'], 'pin-ignored-for-replacement')
+
+    def test_only_real_limits_on_every_selector_candidate_become_a_capacity_pause(self):
+        self._blocked_owner(); self._answer()
+        limited = {'label': 'limited', 'until_epoch': 4102444800}
+        diagnostic = 'reason=no-eligible-route-evidence-candidate\nconfigured_candidates=claude,codex,opencode\n'
+        for holds, expected in ((dict.fromkeys(('claude', 'codex', 'opencode'), limited), 'replacement-capacity-wait'),
+                                ({'claude': limited, 'codex': None, 'opencode': limited}, 'replacement-launch-pending')):
+            with self.subTest(expected=expected), mock.patch('dispatch_capacity_evidence.harness_hold',
+                    side_effect=lambda jobs, harness, **kw: holds[harness]):
+                result = R.advance(self.jobs, 'att-source', authority_check=lambda *_: True, resume_capacity=True,
+                                   run=lambda *a, **k: SimpleNamespace(returncode=65, stdout=diagnostic, stderr=''))
+            self.assertEqual(result['reason'], expected)
+        # A pin rejected by the actual launch seam retains its explicit diagnostic.
+        result = R.advance(self.jobs, 'att-source', authority_check=lambda *_: True, resume_capacity=True,
+                           run=lambda *a, **k: SimpleNamespace(returncode=64, stdout='reason=pin-ignored-for-replacement\n', stderr=''))
+        self.assertEqual(result['reason'], 'pin-ignored-for-replacement')
+
+    def test_a_registered_owner_cannot_reseal_after_launch_started(self):
+        self._blocked_owner(); self._answer()
+        record = self.claim()
+        _, commands = self._launch()
+        self._moved_successor(record, commands[0], harness='codex')
+        self.jobs.write_text(self.jobs.read_text().replace('launch_claimed=0', 'launch_claimed=1'))
+        self._move_owner('opencode')
+        before = (R._directory(self.jobs)/'inputs'/(record['replacement_attempt_id']+'.json')).read_bytes()
+        with self.assertRaises(D.DispatchContractError):
+            self._moved_successor(record, commands[0], harness='opencode', write=False)
+        self.assertEqual((R._directory(self.jobs)/'inputs'/(record['replacement_attempt_id']+'.json')).read_bytes(), before)
+
+    def test_the_replacement_command_uses_the_real_owner_selector(self):
+        spec = importlib.util.spec_from_file_location('replacement_owner_selector_test', Path(__file__).with_name('dispatch_owner.test.py'))
+        suite = importlib.util.module_from_spec(spec); spec.loader.exec_module(suite)
+        self._blocked_owner(); self._answer()
+        record = self.claim()  # the original Codex claim already exists
+        helper = suite.RouteOwnerPinTest()
+        for pin, scores, usage, expected in (
+                ('claude', {'claude': 1, 'codex': 80, 'opencode': 80}, None, 'claude'),
+                ('opencode', {'claude': 1, 'codex': 80, 'opencode': 1}, None, 'opencode'),
+                ('codex', {'claude': 80, 'codex': 1, 'opencode': 80}, None, 'codex'),
+                (None, {'claude': 80, 'codex': 1, 'opencode': 80}, None, 'claude'),
+                (None, {'claude': 80, 'codex': 80, 'opencode': 80}, {'claude': 'limited', 'codex': 'limited', 'opencode': 'limited'}, None)):
+            with self.subTest(pin=pin, expected=expected):
+                path = helper._route(pin=pin, sealed=('claude', 'codex', 'opencode'))
+                self.addCleanup(lambda p=path: __import__('shutil').rmtree(p.parent))
+                route = json.loads(path.read_text()); route['cwd'] = str(self.root)
+                path.write_text(json.dumps(route))
+                command = R._owner_command(self.jobs, {**record, 'route_file': str(path)},
+                                          self.meta | {'worker_type': 'owner'}, R.launch_input(self.jobs, 'att-source', self.meta))
+                extra = command[3:]
+                del extra[extra.index('--route-evidence'):extra.index('--route-evidence')+2]
+                with mock.patch.object(suite.OWNER._capacity, 'capacity_report',
+                                       return_value={'scores': scores, 'sources': dict.fromkeys(scores, 'fixture')}):
+                    selected = helper._launch(path, None, usage=usage, scores=scores, extra=extra)
+                self.assertEqual(selected.wrapper, expected, selected.out)
+                if expected:
+                    launched = selected.calls[0]
+                    self.assertEqual(launched[launched.index('--model-profile')+1], 'deep')
+                    self.assertEqual(launched[launched.index('--automatic-retry-of')+1], 'att-source')
+                else:
+                    self.assertIn('no-eligible-route-evidence-candidate', selected.out)
 
     def test_gpu_lab_correction_prepares_compute_defaults_instead_of_replaying_old_access(self):
         import execution_access as EA
@@ -1733,13 +1829,13 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(argv[argv.index('--execution-access-file') + 1], access['request_path'])
         self.assertNotIn(str(old), argv)
 
-    def test_without_a_recorded_change_the_owner_replays_on_its_own_harness(self):
+    def test_a_sealed_pin_also_controls_the_replacement_launch(self):
         self._blocked_owner()
         self._answer()
         self.route['selection_pins'] = {'owner': {'harness': 'claude'}}   # sealed, never followed by the launch
         result, commands = self._launch()
         self.assertNotIn('harness', result['record'])
-        self.assertTrue(commands[0][1].endswith('adapters/codex/bin/dispatch-headless.py'))
+        self.assertTrue(commands[0][1].endswith('utilities/dispatch-owner.py'))
 
     def test_an_answer_queued_just_before_the_owner_ended_blocked_continues_it(self):
         import dispatch_owner_input as I

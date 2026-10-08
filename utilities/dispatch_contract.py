@@ -9588,11 +9588,17 @@ from route_authority import RELAUNCH_STABLE_KEYS as _RELAUNCH_STABLE_KEYS  # noq
 
 
 def _never_launched_same_work(fields, metadata, row_fields, row_metadata) -> bool:
+    # replacement_row already admitted this candidate against its source and
+    # current pin. Its unstarted owner row may follow the selector to another
+    # harness; every work/lineage axis still matches and started rows never move.
+    keys = _RELAUNCH_STABLE_KEYS
+    if metadata.get('worker_type') == 'owner' and metadata.get('replacement_original_attempt_id'):
+        keys = tuple(key for key in keys if key != 'harness')
     return (fields[1] == "open" and metadata.get("launch_claimed") == "0"
             and metadata.get("launch_started") != "1" and not metadata.get("pid")
             and fields[2:5] == row_fields[2:5]
             and all(metadata.get(key, "") == row_metadata.get(key, "")
-                    for key in _RELAUNCH_STABLE_KEYS))
+                    for key in keys))
 
 
 def claim_attempt_row(

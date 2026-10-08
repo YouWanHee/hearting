@@ -1861,7 +1861,7 @@ class DispatchContractTest(unittest.TestCase):
           "attempt_id":marker["attempt_id"],"note":"completed-marker"}
     if row_hash is not None:meta["route_hash"]=row_hash
     lines=[attempt_row(meta,status="done")]
-    with mock.patch.object(D,"attempt_process_quiescence",
+    with mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}), mock.patch.object(D,"attempt_process_quiescence",
                            return_value=D.ProcessQuiescence("quiescent","fixture")) as probe:
      actual=D.completion_attempt_readiness(route,node,marker,Path("unused"),registry_lines=lines)
      self.assertEqual(actual.state,state)
