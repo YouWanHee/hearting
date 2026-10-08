@@ -958,7 +958,8 @@ def _invoke_model(prompt: str, *, agent: Tuple[str, str] = ("workflow-group-revi
             return "", None
         governor = _load_governor(home)
         governor_root = governor.default_root()
-        token = governor.acquire(governor_root, "title", label=label)
+        token = governor.acquire(governor_root, "title", label=label,
+                                 budget=governor.title_start_budget())
         try:
             env = _child_env()
             env["AGENT_SESSION_ROLE"] = "worker"
