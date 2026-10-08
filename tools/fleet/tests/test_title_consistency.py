@@ -103,6 +103,12 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
         ]
         raw = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
         self.assertEqual(rt._origin_text(raw, "claude", latest=True), "제목을 한국어로 맞춰줘")
+        codex = [{"type":"response_item", "payload":{"type":"message", "role":"user",
+                  "content":[{"type":"input_text", "text":text}]}}
+                 for text in ("제목을 한국어로 맞춰줘", "AGENT_HARNESS_COMPLETION_V1\n{}")]
+        self.assertEqual(rt._origin_text("\n".join(json.dumps(row, ensure_ascii=False)
+                                                 for row in codex), "codex", latest=True),
+                         "제목을 한국어로 맞춰줘")
 
     def test_main_observation_survives_failed_refresh_and_current_language_wins(self):
         path = self._transcript("claude")

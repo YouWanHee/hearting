@@ -155,7 +155,10 @@ _USER_LANGUAGE_SOURCE = re.compile(r"\|user-language=([A-Za-z]+)@([0-9.]+)$")
 
 
 def _user_text(text):
-    return "" if not isinstance(text, str) or _CLAUDE_COMMAND_META.match(text) else text
+    if (not isinstance(text, str) or _CLAUDE_COMMAND_META.match(text)
+            or text.lstrip().startswith("AGENT_HARNESS_COMPLETION_V1\n")):
+        return ""
+    return text
 
 
 def _observed_main_language():
@@ -386,6 +389,8 @@ def _origin_text(raw, harness="claude", latest=False):
         saw_role = saw_role or exposed
         values = parser(data)
         joined = "\n".join(v for v in values if isinstance(v, str))
+        if role == "user":
+            joined = _user_text(joined)
         if role == "user" and harness == "codex" and _codex_bootstrap_user_text(joined):
             continue
         text = _bounded_data_text(joined, ANCHOR_TEXT_CAP)
