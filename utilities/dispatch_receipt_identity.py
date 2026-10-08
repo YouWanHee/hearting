@@ -28,10 +28,12 @@ COMPLETION_ACTIONS = frozenset({"complete-open", "inspect-done-failure", "advanc
 # revised-unrecorded` now (an evidence sha mismatch usually means `revise`
 # can record it, not that anything is broken).
 COMPLETION_REASONS = frozenset({"registry-closed", "registry-closed-marker", "terminal-observed",
+                                "cancelled-by-parent",
                                 "row-advanced", "terminal-failure-or-unclosed",
                                 "closure-blocked:completion-attempt-not-current",
                                 "closure-blocked:completion-evidence-revised-unrecorded"})
 JOIN_REASONS = COMPLETION_REASONS | {"process-alive", "process-unverifiable",
+                                     "termination-pending",
                                      "terminal-commit-pending", "workflow-completion-pending"}
 
 

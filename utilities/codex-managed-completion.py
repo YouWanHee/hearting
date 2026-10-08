@@ -32,7 +32,7 @@ from dispatch_completion_join import (  # noqa: E402
     current_children,
     current_session_children,
     delivery_timing_fields,
-    receipt_with_delivery_observability,
+    wait_for_delivery_projection,
     receipt_with_stage_advance,
     validate_delivery_timing,
     completion_followup_text,
@@ -542,7 +542,7 @@ def normalize_receipt(
         ],
     }
     try:
-        normalized = receipt_with_delivery_observability(
+        normalized = wait_for_delivery_projection(
             normalized,
             jobs=jobs,
             timing=timing,

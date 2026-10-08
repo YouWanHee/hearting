@@ -1370,6 +1370,14 @@ def reconcile(rows, args):
     decisions = []
     for row in selected:
         meta = row["meta"]
+        import route_parent_close
+        if route_parent_close.row_requested(meta, args.jobs):
+            result = route_parent_close.recover_attempt(args.jobs, meta) if args.apply else None
+            decisions.append({"attempt_id": meta["attempt_id"], "slug": row["slug"],
+                              "category": "parent-close", "reason": "cancelled-by-parent",
+                              "closed": bool(result and result.get("state") == "cancelled"),
+                              "cleanup": result})
+            continue
         exact_owner_scope = (exact_selection and not only_exact_dead
                              and not any((args.session, args.route, args.node, args.job,
                                           getattr(args, "all", False)))
@@ -2771,6 +2779,11 @@ def _release_cascade_claim(jobs, child_attempt, token):
 def cascade_orphan_children(owner, route_id, args):
     """Bounded teardown of exact direct children for one dead owner attempt."""
 
+    import route_parent_close
+    if route_parent_close.row_requested(owner["meta"], args.jobs):
+        if getattr(args, "apply", True):
+            route_parent_close.recover_attempt(args.jobs, owner["meta"])
+        return []
     owner_attempt = owner["meta"].get("attempt_id")
     rows = read_rows(args.jobs)
     children = [

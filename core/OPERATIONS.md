@@ -700,6 +700,31 @@ After validating changes to instructions, rules, hooks, preflight, or runtime st
 
 ### §5.12. Continuation Supervisor and Tracked-Workflow Completion
 
+**Parent close.** The existing `capability-route close --route <route>` also
+ends that parent's unfinished current owner, without waiting for another model
+turn. Before signalling, the shared controller records `cancelled-by-parent`
+intent in the existing workflow journal and exact attempt rows. This stops
+launch, replacement, chain advance and gate delivery. A committed normal result
+that precedes the intent keeps its result; a later PASS cannot replace an
+intentional cancellation. The controller revalidates PID/start and owned
+descendants, sends TERM, then KILL after a short grace, observes their end,
+folds never-launched successors, closes the attempts as `failure_class=cancelled`
+and the workflow as CANCELLED, and records the route outcome. Repeated close
+and the existing execution observers resume this same cleanup after interruption.
+Unknown process evidence stays termination-pending; it grants no signal or
+false completion and requires no new caller recovery ritual.
+
+Resource runs are preserved by default, including when they share an agent
+process group. Close returns their exact IDs and states; the existing resource
+supervisor records their results without starting successors on the cancelled
+route. The single optional `--stop-resources` flag uses existing resource/compute
+stop only for runs exactly bound to this route. Other routes and shared GPU
+processes are never targets. Close neither deletes nor moves artifacts, and
+later user deletion of artifacts cannot reopen cancellation or prevent replay.
+There is no artifact protection mechanism, required reason, new command or
+additional approval. Intentional cancellation produces no human gate,
+`inspect-done-failure`, replacement or start recommendation.
+
 `WORKFLOW §0.6` defines the portable state machine and the four continuation
 kinds. This section owns the mechanics, and it applies to every tracked
 workflow — lab, code, ship, spec/research, CI and check cycles, external-state

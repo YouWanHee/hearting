@@ -28,6 +28,9 @@ def supervisor():
 
 def start_binding(route, route_file, args, environ):
     """Use the normal registered owner identity, never labels or a guessed SID."""
+    import route_parent_close
+    if route_parent_close.intent(route, args.jobs or environ.get("AGENT_DISPATCH_JOBS")):
+        raise ValueError("cancelled-by-parent")
     import owner_route_binding as OWNER
     from dispatch_contract import resolve_live_parent_attempt
     from dispatch_owner_input import inspect, PLACEHOLDER_THREAD
@@ -183,6 +186,9 @@ def admit_controller_launch(args, control, armed, row, delivered=()):
     def guard():
         with INPUT._locked(args.jobs, args.parent_attempt_id) as (_, value):
             parent, target = INPUT._target(args.jobs, args.parent_attempt_id)
+            import route_parent_close
+            if route_parent_close.row_requested(parent.metadata, args.jobs):
+                raise runner.LaunchDeferred("cancelled-by-parent")
             live = proc_identity(owner["owner_pid"])
             if (value is None or value.get("target") != target or
                     value.get("thread_id") != control.thread_id or parent.status not in {"open", "running"}

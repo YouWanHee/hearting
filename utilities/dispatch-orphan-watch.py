@@ -192,7 +192,15 @@ def reconcile_exact_exit(args) -> int:
 
 def watch(args) -> int:
     while True:
-        status = attempt_status(args.jobs, args.attempt_id)
+        status, metadata = attempt_record(args.jobs, args.attempt_id)
+        import route_parent_close
+        if route_parent_close.row_requested(metadata, args.jobs):
+            result = route_parent_close.recover_attempt(args.jobs, metadata)
+            if result and result.get("state") == "cancelled":
+                _remove_supervisor_state(args)
+                return 0
+            time.sleep(args.interval)
+            continue
         if status not in OPEN:
             # A terminal registry word can precede owner teardown (notably
             # Fleet kill). Keep the supervisor state and wait for the exact
@@ -239,7 +247,15 @@ def main(argv=None) -> int:
     args.pid_observer_ns = process_namespace_identity() or ""
     while True:
         try:
-            return watch(args)
+            result = watch(args)
+            _status, metadata = attempt_record(args.jobs, args.attempt_id)
+            import route_parent_close
+            if route_parent_close.row_requested(metadata, args.jobs):
+                closing = route_parent_close.recover_attempt(args.jobs, metadata)
+                if not closing or closing.get("state") != "cancelled":
+                    time.sleep(args.interval)
+                    continue
+            return result
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             print(f"orphan-recovery-retained attempt_id={args.attempt_id} reason={exc}", file=sys.stderr, flush=True)
             time.sleep(max(args.interval, 30.0))

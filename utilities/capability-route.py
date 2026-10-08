@@ -6341,6 +6341,9 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
                 terminal_commit_id=None, expected_owner_attempt_id=None,
                 expected_producer_binding_digest=None, inline_finish_id=None,
                 expected_summary_digest=None, inline_commit=None, autoclose=None):
+    import route_parent_close
+    if route_parent_close.intent(route, jobs):
+        raise ValueError("cancelled-by-parent")
     try:
         import inline_finish
         pending=inline_finish.pending_state(Path(route["artifact_root"]),route["route_id"])
@@ -9121,6 +9124,9 @@ def _complete_node_locked(
                 )
             raise ValueError(f"row-close-failed:{exc.reason}") from exc
         with _exclusive_lock(Path(f"{jobs_path}.lock")) as jobs_lock:
+            import route_parent_close
+            if route_parent_close.intent(route, jobs_path):
+                raise ValueError("cancelled-by-parent")
             # Existing jobs lock is the sole terminal-claim serialization point.
             ensure_terminal_claim_absent(jobs_path, route["route_id"], attempt_id)
             lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
@@ -10557,6 +10563,8 @@ def main():
                     help="for a route id: default AGENT_ARTIFACT_ROOT, else utilities/artifact-root.sh for the current directory")
     cl.add_argument("--commit",help="result commit; defaults to HEAD in the route cwd")
     cl.add_argument("--summary",help="one line naming what the route produced")
+    cl.add_argument("--stop-resources", action="store_true",
+                    help="also stop resource runs exactly linked to this route; default preserves them")
     cl.add_argument("--allow-unproven",action="store_true",
                      help="accepted for compatibility; close always records terminal_gate_proven=false with a "
                           "terminal-gate-unproven warning when the terminal node has not completed")
@@ -11020,7 +11028,15 @@ def main():
         elif a.command=="close":
             # An unproven terminal gate is recorded and warned about below, never refused:
             # the refusal was bypassed almost every time it fired.
-            outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=True)
+            import route_parent_close
+            outcome=route_parent_close.close(route, a.route, stop_resources=a.stop_resources,
+                                            summary=a.summary, commit=a.commit)
+            if outcome is None:
+                outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=True)
+            else:
+                created=True
+                print(json.dumps(outcome,sort_keys=True))
+                return
             print(json.dumps(outcome,sort_keys=True))
             if not created: print("capability-route: route already closed",file=sys.stderr)
             if outcome.get("review_independence_degraded"):
