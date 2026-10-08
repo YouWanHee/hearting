@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -55,6 +56,41 @@ def _owner(route_seq=LONG_ROUTE, done=3, total=7):
 
 
 class BottomRailGeometryTest(unittest.TestCase):
+    def test_only_the_current_active_route_label_blinks_without_moving_the_rail(self):
+        seq = [("plan-check(R1)", "done"), ("execute(R2)", "active"),
+               ("parallel-check", "active"), ("test", "pending"), ("report", "pending")]
+        for width in (60, 100, 120, 168):
+            with self.subTest(width=width):
+                label = render._route_stage_segs(seq, working=False,
+                                                max_width=render.bottom_label_budget(width))
+                blinking = [(t, k) for t, k in label if k and k.endswith("_blink")]
+                self.assertEqual(len(blinking), 1)
+                self.assertIn("execute", blinking[0][0])
+                colored = render._snapshot_line(label, colored=True)
+                self.assertEqual(colored.count("\033[5m"), 1)
+                plain_keys = [(t, k[:-6] if k and k.endswith("_blink") else k) for t, k in label]
+                rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=label)
+                plain_rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=plain_keys)
+                self.assertEqual(_text(rail), _text(plain_rail))
+                self.assertEqual(_w(rail), width)
+
+    def test_curses_blink_preserves_the_base_color_and_weight_with_or_without_tint(self):
+        label = render._route_stage_segs(LONG_ROUTE, working=True, max_width=100)
+        key = next(k for t, k in label if t == "execute")
+        self.assertTrue(key.endswith("_blink"))
+        base = key[:-6]
+        for tint in (None, "a"):
+            self.assertEqual(render._key_attr(key, tint), render._key_attr(base, tint) | render._A_BLINK)
+        with mock.patch.object(render, "_A_BLINK", 0):
+            self.assertEqual(render._key_attr(key), render._key_attr(base))
+
+    def test_done_pending_and_blocked_routes_have_no_native_blink(self):
+        for seq in ([("execute", "done"), ("test", "pending")],
+                    [("execute", "done"), ("test", "done")],
+                    [("execute", "attention"), ("test", "pending")]):
+            segs = render._route_stage_segs(seq, working=True, max_width=100)
+            self.assertNotIn("\033[5m", render._snapshot_line(segs, colored=True))
+
 
     def test_label_is_right_flushed_with_a_fixed_tail(self):
         """The user chose right flush over centering: the label's END lands on the same

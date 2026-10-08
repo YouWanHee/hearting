@@ -55,6 +55,7 @@ from .session_handle import session_id_for_derived_name as _session_id_for_deriv
 _A_BOLD = getattr(curses, "A_BOLD", 0)
 _A_DIM = getattr(curses, "A_DIM", 0)
 _A_REVERSE = getattr(curses, "A_REVERSE", 0)
+_A_BLINK = getattr(curses, "A_BLINK", 0)
 
 # Low-chroma xterm-256 palette. Semantic axes stay green/yellow/red and
 # cyan/magenta/blue, but the stock primaries are replaced with softer midtones.
@@ -254,6 +255,9 @@ _HUE_OF = {
     # per-row glyph and can never be confused with a word on the first line.
     "hearting_name": ("v", _A_B),
 }
+_HUE_OF.update({key + "_blink": (hue, attr | _A_BLINK)
+                for key, (hue, attr) in list(_HUE_OF.items())
+                if isinstance(key, str) and key.startswith("stg")})
 
 # F-76b — the NAME zone wears the harness hue, but on its OWN keys rather than reusing
 # `hb_*`/`h_*`. The color is identical; the separate key is what keeps a row's name
@@ -277,6 +281,8 @@ NAME_KEYS = frozenset(list(_NAME_KEY.values()) + list(_NAME_KEY_DIM.values())
 
 def _key_attr(key, tint=None):
     """Attr for a color_key, composed with the row's tint background when active (spec §5.3)."""
+    if isinstance(key, str) and key.endswith("_blink"):
+        return _key_attr(key[:-6], tint) | _A_BLINK
     if tint is None or not _TINT_OK:
         return _COLOR.get(key, 0)
     hue, attr = _HUE_OF.get(key, ("d", 0))
@@ -1267,7 +1273,8 @@ def _route_stage_segs(route_seq, working, max_width):
         elif st == "done":
             items.append((i, nid + " ✓", "stg%d_off" % (i % 5)))
         elif st == "active":
-            items.append((i, nid, _cur_key(i)))
+            key = _cur_key(i)
+            items.append((i, nid, key + "_blink" if i == cur_i else key))
         else:
             # pending (and any residual skipped that a caller did not filter) — the name in the
             # dim off-hue, no glyph. Kept glyph-free on purpose: ✓/✕ are the only markers, and a
@@ -7553,6 +7560,9 @@ def _snapshot_line(segs, colored=False, colors=256):
         return _plain(segs)
     out = []
     for text, key in segs:
+        blink = isinstance(key, str) and key.endswith("_blink")
+        if blink:
+            key = key[:-6]
         piece = _plain([(text, key)])
         if key == "tag_steward":
             style = "\033[1;38;5;219m" if colors >= 256 else "\033[1;35m"
@@ -7560,6 +7570,8 @@ def _snapshot_line(segs, colored=False, colors=256):
         elif key in {"gpu_legacy", "gpu_legacy_active"}:
             style = "\033[38;5;137m" if colors >= 256 else "\033[33m"
             piece = style + piece + "\033[0m"
+        if blink:
+            piece = "\033[5m" + piece + "\033[0m"
         out.append(piece)
     return "".join(out)
 
