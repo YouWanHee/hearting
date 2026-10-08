@@ -7338,12 +7338,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                             route_seq, unit_working or job.liveness == "working", budget)
                     elif getattr(job, "afterglow", False) or job.liveness in ("stale", "done"):
                         route_label = [("done ✓", "dim")]
-                    elif (stage_override or job.stage) not in (None, "", "open", "running"):
-                        current = stage_override or job.stage
+                    elif stage_override not in (None, "", "open", "running"):
+                        current = stage_override
                         route_label = [(_clip_w(current, budget), "stg0_on" if unit_working and _BLINK_ON else "stg0_off")]
                     else:
                         route_label = _dispatch_stage_segs(
-                            job, job.key, stage_override or job.stage, job.slug,
+                            job, job.key, stage_override, job.slug,
                             working=bool(unit_working), route_zone=budget)
                     if getattr(job, "row_terminal_mismatch", False) and not residue:
                         warning = " ⚠alive"
