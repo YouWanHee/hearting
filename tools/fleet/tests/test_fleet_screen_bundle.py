@@ -181,17 +181,14 @@ class BundleTest(unittest.TestCase):
             # Every MAIN chip keeps its original column and no line overlays an ID.
             for sid, i in ids.items():
                 self.assertEqual(rows[i].index("[%s]" % sid) + 1, render._STEWARD_LINE_COL)
-                self.assertNotIn("│", rows[i])
+                self.assertNotIn(render._STEWARD_LINE_MARK, rows[i])
             for parent, end in (("aa", "cc"), ("bb", "ee")):
                 for i in range(ids[parent] + 1, ids[end]):
                     if i in ids.values():
                         continue
-                    below = i - 1 in ids.values()
-                    above = i + 1 in ids.values()
-                    mark = "│" if below == above else "╷" if below else "╵"
-                    self.assertEqual(rows[i][render._STEWARD_LINE_COL], mark, rows[i])
+                    self.assertEqual(rows[i][render._STEWARD_LINE_COL], "┆", rows[i])
                     self.assertEqual(rows[i][render._STEWARD_LINE_COL + 1:render._RAIL_COL], "  ")
-            self.assertTrue(any("│" in r and "╭" in r for r in rows))
+            self.assertTrue(any("┆" in r and "╭" in r for r in rows))
             box = [r for r in rows if "╭" in r or "╰" in r]
             self.assertTrue(all(r.index(r[-1]) == render._dispatch_box_width(width, render._layout_mode(width)) - 1
                                 for r in box))
@@ -201,14 +198,14 @@ class BundleTest(unittest.TestCase):
         original = render._session_row_2line(session("aa", model="MODEL", effort="medium"))[1]
         joined = render._under_id_connector(original)
         self.assertIn("3h", render._plain(joined))
-        self.assertIn("│  3h", render._plain(joined))
+        self.assertIn("┆  3h", render._plain(joined))
         self.assertEqual(render._plain(original).index("MODEL"), render._plain(joined).index("MODEL"))
         worker = DispatchJob(key="code-execute", harness="codex", depth=2, worker_type="stage",
                              model="MODEL", effort="medium", liveness="working", elapsed_min=17)
         l2 = render._dispatch_row_2line(worker, in_card=True)[1]
         framed = render._frame_dispatch_line(l2, 100, "mid", "frm_idle")
         connected = render._plain(render._under_id_connector(framed))
-        self.assertEqual(connected[render._STEWARD_LINE_COL], "│")
+        self.assertEqual(connected[render._STEWARD_LINE_COL], "┆")
         self.assertEqual(connected[render._RAIL_COL], "│")
         self.assertIn("17m", connected)
         self.assertEqual(connected.index("MODEL"), render._plain(l2).index("MODEL"))
@@ -330,7 +327,7 @@ class BundleTest(unittest.TestCase):
                     if "╰" in row:
                         inside = False
                     if inside or "╰" in row:
-                        self.assertIn(row[render._STEWARD_LINE_COL], "│╷╵", row)
+                        self.assertEqual(row[render._STEWARD_LINE_COL], "┆", row)
                 self.assertNotIn("╭│", "\n".join(rows))
                 self.assertNotIn("││", "\n".join(rows))
                 self.assertTrue(any("9m" in row and row[render._RAIL_COL] == "│"
@@ -344,7 +341,7 @@ class BundleTest(unittest.TestCase):
         start = before.index("━")
         self.assertEqual(before[start:], after[start:])
         self.assertIn(" 82%", after)
-        self.assertIn("│  herdr", after)
+        self.assertIn("┆  herdr", after)
 
     def test_long_korean_owner_title_cannot_move_routing_anchor(self):
         main = session("aa", model="gpt-6.1-sol", effort="xhigh")
@@ -390,20 +387,20 @@ class BundleTest(unittest.TestCase):
             where = [row for row in rows if "herdr" in row and "NOWTEXT" in row]
             self.assertEqual([row.index("herdr") for row in where], [render._SESSION_DETAIL_COL] * 2)
             self.assertEqual([row.index("NOWTEXT") for row in where], [render._NAME_COL] * 2)
-            self.assertEqual(where[0][render._STEWARD_LINE_COL], "│" if width == 168 else "╵")
+            self.assertEqual(where[0][render._STEWARD_LINE_COL], "┆")
             self.assertEqual(where[1][render._STEWARD_LINE_COL], " ")
             if width != 168:
                 elapsed = [row for row in rows if "3h 00m" in row and "MODEL" in row]
                 self.assertEqual([row.index("3h 00m") for row in elapsed], [render._SESSION_DETAIL_COL] * 2)
                 self.assertEqual([row.index("MODEL") for row in elapsed], [4 + render._HW] * 2)
 
-    def test_single_row_between_identities_has_a_full_line(self):
+    def test_single_row_between_identities_uses_the_same_dashed_mark(self):
         parent = session("aa", steward=True, steward_targets=[target("bb")])
         rows = text(self.build([parent, session("bb")], width=168))
         start = next(i for i, row in enumerate(rows) if "[aa]" in row)
         end = next(i for i, row in enumerate(rows) if "[bb]" in row)
         self.assertEqual(end - start, 2)
-        self.assertEqual(rows[start + 1][render._STEWARD_LINE_COL], "│")
+        self.assertEqual(rows[start + 1][render._STEWARD_LINE_COL], "┆")
 
     def test_mixed_owner_frame_worker_columns_across_harnesses_and_widths(self):
         main = session("aa", model="MAINMODEL", effort="xhigh", ctx_pct=50,

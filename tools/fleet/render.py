@@ -3576,7 +3576,12 @@ def _steward_hierarchy(rows):
     return ordered, edges
 
 
-def _under_id_connector(segs, mark="│"):
+# Dashed so a supervisor line never reads as an owner box border; the dashes
+# already leave a gap beside each ID, so every row uses the same mark.
+_STEWARD_LINE_MARK = "┆"
+
+
+def _under_id_connector(segs, mark=_STEWARD_LINE_MARK):
     """Paint only the reserved cell; detail layout never depends on a relation."""
     return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, "dim")
 
@@ -7525,10 +7530,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                     connector_rows.update(range(session_starts[parent] + 1, stop))
         for idx in sorted(connector_rows - session_identity_rows):
             if lines[idx]:
-                below_id = idx - 1 in session_identity_rows
-                above_id = idx + 1 in session_identity_rows
-                mark = "│" if below_id == above_id else "╷" if below_id else "╵"
-                lines[idx] = _under_id_connector(lines[idx], mark)
+                lines[idx] = _under_id_connector(lines[idx])
         if group_sessions and hidden:
             lines.append([("     +%d stale/companion hidden" % hidden, "dim")])
 

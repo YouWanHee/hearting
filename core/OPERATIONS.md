@@ -1443,8 +1443,8 @@ evidence wins, with a stable identity tie-break. Sessions with their own winning
 targets form separate supervisor groups; supervisor-to-supervisor relations
 remain communication (`✉`). This shared projection is a display handover, not a
 refusal or marker rewrite. Supervisor groups share one connector column under
-the first character inside `[id]`, with `╷`/`╵` half-line ends between identities
-(`│` for a one-row gap). All session detail text and box left edges clear that
+the first character inside `[id]`, drawn as a dashed `┆` on every row so it
+never reads as a box border. All session detail text and box left edges clear that
 column by two spaces, even without a connector; model, routing, NOW and box
 right-edge anchors stay fixed. Depth-1 frame cards use the owner model/gauge,
 routing and close-rail status layout on every harness; worker layouts retain
