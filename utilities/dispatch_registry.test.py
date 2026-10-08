@@ -2288,8 +2288,8 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   names=sorted(path.name for path in unrelated.parent.iterdir())
   self.assertEqual(names,["unrelated-acked.json"])
 
- def test_seal_survives_a_live_tagged_process_that_outlived_the_worker(self):
-  """The exact shape that made the receipt unissuable: a leaked tagged process."""
+ def test_output_seal_survives_cleanup_of_terminal_tagged_leftover(self):
+  """Reconcile drains an ordinary leftover without changing the output seal."""
   child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
                          env={**os.environ,"AGENT_DISPATCH_ATTEMPT_ID":self.attempt})
   try:
@@ -2303,23 +2303,30 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
    self.assertEqual(
     observed_attempt_liveness("done",sealed,terminal_receipt_gate=True).state,
     "alive")
-   before=self.jobs.read_bytes()
-   recovery=self.invoke("reconcile","--attempt",self.attempt,"--apply")
-   self.assertEqual(recovery.returncode,0,recovery.stdout+recovery.stderr)
-   self.assertEqual(json.loads(recovery.stdout)["decisions"][0]["category"],"terminal-cleanup-pending")
-   self.assertEqual(self.jobs.read_bytes(),before)
-   # Without the seal the same live tag still vetoes quiescence -- and now
-   # reports the descendant as live process evidence instead of merely
-   # withholding terminal progression, matching every other populated-scan
-   # case in the precedence ladder.
+   # The output seal alone still cannot turn a live process into quiescence.
    unsealed={key:value for key,value in sealed.items()
              if not key.startswith("artifact_proof_")
              and key!="post_exit_receipt_substitute"}
    self.assertEqual(
     attempt_process_quiescence(unsealed,terminal_receipt=True).state,
     "live")
+   before=self.jobs.read_bytes()
+   dry=self.invoke("reconcile","--attempt",self.attempt)
+   self.assertEqual(dry.returncode,0,dry.stdout+dry.stderr)
+   self.assertEqual(self.jobs.read_bytes(),before)
+   self.assertIsNone(child.poll())
+   recovery=self.invoke("reconcile","--attempt",self.attempt,"--apply")
+   self.assertEqual(recovery.returncode,0,recovery.stdout+recovery.stderr)
+   self.assertEqual(json.loads(recovery.stdout)["decisions"][0]["category"],"terminal-settled")
+   child.wait(timeout=5)
+   settled=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
+   self.assertEqual({key:settled[key] for key in sealed},sealed)
+   self.assertEqual(observed_attempt_liveness("done",settled,terminal_receipt_gate=True).state,"terminal")
+   self.assertNotIn("cancellation_quiescence_receipt",settled)
   finally:
-   child.terminate();child.wait(timeout=5)
+   if child.poll() is None:
+    child.terminate()
+   child.wait(timeout=5)
 
  def test_refuses_when_the_artifact_no_longer_matches_the_heartbeat(self):
   self.write_row()

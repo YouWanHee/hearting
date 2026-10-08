@@ -538,7 +538,6 @@ def reap_terminal_descendants(jobs, fields, *, grace=0.3, kill_wait=0.5):
              "route_hash": meta.get("owner_route_hash") or meta.get("route_hash", "")}
     path = Path(meta.get("owner_route_file") or meta.get("route_file") or fields[3])
     resources = known_resources(route, path, jobs, {meta["attempt_id"]})
-    protected = _protected(resources)
     deadline, sent = time.monotonic() + grace + kill_wait, set()
     while True:
         current = _rows(jobs).get(meta["attempt_id"])
@@ -552,9 +551,15 @@ def reap_terminal_descendants(jobs, fields, *, grace=0.3, kill_wait=0.5):
         tagged = DC.attempt_tagged_descendants(meta)
         if tagged.state != "populated":
             return
+        # Reuse the complete parent-close decision, including uncertain
+        # resource namespaces and branches born during this drain pass.
+        agents, observed = _agent_processes(meta, resources)
+        if not observed:
+            return
+        owned = set(agents)
         targets = []
         for pid, start, state in tagged.members:
-            if (state == "Z" or pid == identity.pid or (pid, start) in protected
+            if (state == "Z" or pid == identity.pid or (pid, start) not in owned
                     or not start.isdigit() or int(start) < int(identity.expected_start)):
                 continue
             try:

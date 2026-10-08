@@ -899,6 +899,67 @@ class DerivedAccessTest(unittest.TestCase):
         self.assertEqual(request["read_roots"], [])
         self.assertNotIn("derivation", binding)
 
+    def test_gpu_compute_defaults_upgrade_old_requests_and_reach_each_harness(self):
+        inventory = self.home / '.config/hearting/compute-hosts.yaml'
+        inventory.parent.mkdir(parents=True)
+        run_root = self.root / 'compute-runs'
+        inventory.write_text(f'schema_version: 1\nrun_root: {run_root}\nhosts:\n  fixture:\n    ssh_host: example.invalid\n')
+        route = self.route(self.task(), capability='autopilot-lab')
+        old = prepare_task_request(route, self.jobs)
+        old_bytes = old.read_bytes()
+        # This is the already prepared BC-style route, upgraded at normal start.
+        route['nodes'] = [{'id': 'full-run', 'kind': 'resource-runner'}]
+        prepared = prepare_task_request(route, self.jobs)
+        request, binding = self.prepared(prepared)
+        self.assertNotEqual(old, prepared)
+        self.assertEqual(old.read_bytes(), old_bytes)
+        self.assertEqual(binding['derivation'], self.prepared(old)[1]['derivation'])
+        self.assertIn(str(inventory.parent), request['read_roots'])
+        self.assertTrue(request['network']['required'])
+        self.assertFalse(run_root.exists())
+        self.assertEqual(prepared, prepare_task_request(route, self.jobs))
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=self.root / 'install')
+        loaded = load_request(prepared, context=context)
+        for runtime, sandbox in [('opencode', 'adapter-default'), ('claude-cli', 'adapter-default'),
+                                 ('codex-exec', 'danger-full-access')]:
+            grant = build_grant(loaded, runtime=runtime, network_available=True,
+                                effective_sandbox=sandbox, gpu_resource_scope=True)
+            effective, digest = publish_effective_grant(
+                jobs=self.jobs, attempt_id='att-' + runtime, route_id=route['route_id'],
+                route_hash=route['route_hash'], runtime=runtime, sandbox=sandbox, grant=grant,
+                default_writable_roots=(self.worktree, self.artifact), network_allowed=False)
+            record = json.loads(effective.read_text())
+            self.assertTrue(record['network_allowed'])
+            self.assertEqual(record['network_enforcement'], 'none')
+            self.jobs.write_text('now\topen\tfixture\tfixture\tparent\t'
+                                 f'attempt_id=att-{runtime},route_id={route["route_id"]},'
+                                 f'route_hash={route["route_hash"]},runtime_sandbox={sandbox},'
+                                 f'execution_access_effective_file={effective},execution_access_effective_sha256={digest}\n')
+            parent = load_parent_effective_grant(
+                jobs=self.jobs, parent_attempt_id='att-' + runtime, context=context)
+            assert_within_parent(loaded, parent, is_child=True)
+        non_execution = EA.bind_request(str(prepared), environ={}, context=context, is_child=False,
+                                     parent=None, runtime='opencode', compute_execution_scope=False)
+        self.assertEqual(non_execution.network, 'not-requested')
+        self.assertNotIn(inventory.parent, non_execution.read_roots)
+        child = prepare_task_request(route, self.jobs, node='handoff')
+        self.assertFalse(self.prepared(child)[0]['network']['required'])
+        self.assertNotIn(str(inventory.parent), self.prepared(child)[0]['read_roots'])
+
+    def test_gpu_defaults_keep_explicit_network_choice(self):
+        inventory = self.home / '.config/hearting/compute-hosts.yaml'
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text(f'schema_version: 1\nrun_root: {self.root}/runs\nhosts:\n  fixture:\n    ssh_host: local\n')
+        manual = self.root / 'offline.json'
+        manual.write_text(json.dumps({'schema_version': 1, 'writable_roots': [], 'read_roots': [],
+                                      'network': {'required': False, 'reason': '', 'hosts': []}}))
+        route = self.route('GPU run', capability='autopilot-lab')
+        route['nodes'] = [{'id': 'full-run', 'kind': 'resource-runner'}]
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_EXECUTION_ACCESS_FILE': str(manual)}):
+            prepared = prepare_task_request(route, self.jobs)
+        self.assertFalse(self.prepared(prepared)[0]['network']['required'])
+
     def test_a_node_keeps_what_it_derived_at_its_first_preparation(self):
         (self.other / "out").rmdir()
         first = prepare_task_request(self.route(self.task()), self.jobs)
