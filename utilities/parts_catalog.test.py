@@ -283,10 +283,11 @@ class HistoricalGpuExceptionTest(unittest.TestCase):
         self.assertEqual(card, self.OLD_CARD + "\n" + GPU_EVAL_ADVISORY)
         for old, new in (("danger-full-access", "workspace-write"),
                 ("gpu-lab-resource", "caller-cli"), ("gpu-lab-resource", "forced-env"),
-                ("resource eval-run", "resource full-run"),
+                ("노드 eval-run", "노드 full-run"),
                 ("OS enforcement 없음", "OS enforcement enforced"),
                 ("논리 경계입니다", "OS 경계입니다")):
             changed = card.replace(old, new)
+            self.assertNotEqual(changed, card, (old, new))
             with self.subTest(old=old, new=new), self.assertRaises(AssertionError):
                 _historical_gpu_card(self.route(), changed, self)
         with self.assertRaises(AssertionError):
