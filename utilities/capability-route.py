@@ -3706,6 +3706,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     decided, so it compiles without the recipe's frame pair too; `framed` is where a frame runs.
     """
     import route_plan as RP
+    given_intensity, given_capability = intensity, capability
+    if capability is None and shape != "framed":
+        capability = COMPOSE_DEFAULT_CAPABILITY
     sealed_plan = RP.sealed_form(route_plan) if route_plan is not None else None
     frameless = frameless or route_plan is not None or shape in DECIDED_SHAPES
     if execution_scope is None and route_plan is not None:
@@ -3876,6 +3879,15 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             **common)
     if unassigned:
         route["campaign_unassigned"] = True
+    # Observational provenance in the existing basis list, shared by compose
+    # and later start; it never changes stage/profile selection or approvals.
+    route["selection"]["selection_basis"].extend([
+        {"axis": "compose-intensity", "signal": given_intensity or SHAPE_INTENSITY[shape],
+         "source": "explicit" if given_intensity is not None else "shape-default"},
+        {"axis": "compose-capability", "signal": given_capability or route["capability"],
+         "source": "frame-shape" if shape == "framed" else
+                   "explicit" if given_capability is not None else "compose-default"},
+    ])
     if work_request is not None:
         from work_start import capture_request_context
         if routing_hints:
@@ -3889,9 +3901,9 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             request = dict(route.get("work_request") or {})
             request["text"] = request.get("text", "").rstrip() + f"\n\nExecution scope: {execution_scope}\n"
             route["work_request"] = request
-    if unassigned or work_request is not None or selection_pins or execution_scope is not None:
-        route["route_hash"] = route_hash(route)
-        route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
+    # The compose input provenance also participates in the route seal.
+    route["route_hash"] = route_hash(route)
+    route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
 
 
@@ -4351,8 +4363,49 @@ def compose_observations(route):
             "pre_execution_answers": [{"question": i, "name": name, "answer": value} for i, (name, value) in enumerate(answers, 1)]}
 
 
+def compose_decision_lines(route):
+    """Read only the sealed selection/nodes; same display for every harness."""
+    basis = {row.get("axis"): row for row in
+             (route.get("selection") or {}).get("selection_basis", [])}
+    intensity = basis.get("compose-intensity", {})
+    source = intensity.get("source", "sealed-route")
+    requested = intensity.get("signal", route.get("requested_intensity"))
+    detail = ", 지정 안 됨" if source == "shape-default" else ""
+    if requested and requested != route["effective_intensity"]:
+        detail += f", requested={requested}"
+    lines = [f"  intensity={route['effective_intensity']} (source={source}{detail})"]
+    if source == "shape-default":
+        lines.append("  강도 안내: 판정·원인 분석이면 --intensity strong 검토")
+    shape = (route.get("selection") or {}).get("shape") or shape_for_intensity(route["effective_intensity"])
+    capability = basis.get("compose-capability", {})
+    if capability.get("source") == "compose-default":
+        lines.append(f"  capability={route['capability']} (source=compose-default, --capability 지정 안 됨; "
+                     "고정 기본값, 과제 문장 분류 없음; 결과 분석·평가·비교는 autopilot-lab/eval 검토)")
+    elif capability.get("source") == "frame-shape":
+        lines.append("  capability=frame 결정 대기 (source=frame-shape)")
+    elif not capability:
+        label = "frame 결정 대기" if shape == "framed" else route["capability"]
+        lines.append(f"  capability={label} (source=sealed-route)")
+    profiles = {}
+    nodes = route.get("nodes", [])
+    for node in nodes:
+        if _no_model_node(node):
+            continue
+        anchor = node.get("parallel_anchor") or node["id"]
+        profile = ("current-session(등급 미기록)" if node.get("execution_surface") == "inline"
+                   else node.get("model_profile") or "unknown")
+        profiles.setdefault(anchor, []).append(profile)
+    lines.append("  tiers: " + (" ".join(f"{node}={'+'.join(values)}" for node, values in profiles.items()) or "없음"))
+    workers = sum(n.get("dispatch_depth") == 2 or _frame_node(n) for n in nodes)
+    owners = int(shape != "framed" and route["effective_intensity"] != "direct")
+    resources = [n["id"] for n in nodes if n.get("kind") == "resource-runner"]
+    lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
+                 f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)")
+    return lines
+
+
 def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, route_plan_unreadable=False,
-                 campaign_selection=None):
+                 campaign_selection=None, include_decisions=True):
     """One-line `[경로]` notice the acting session pastes instead of a card."""
     shape = route.get("selection", {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     ids = [node["id"] for node in route["nodes"]]
@@ -4367,6 +4420,8 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
                                  else compose_campaign_selection(route))
     )
     observed = compose_observations(route)
+    if include_decisions:
+        card += "\n" + "\n".join(compose_decision_lines(route))
     card += f"\n  확인 방식 {observed['confirmation']['method']} · 출처 {observed['confirmation']['origin']}"
     for answer in observed["pre_execution_answers"]:
         card += f"\n  {answer['question']}. {answer['name']}: {answer['answer']}"
@@ -10343,7 +10398,7 @@ def main():
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         compose_args=dict(
-            capability=a.capability if shape=="framed" else (a.capability or COMPOSE_DEFAULT_CAPABILITY),
+            capability=a.capability,
             capability_mode=a.capability_mode,shape=shape,graph=a.graph,
             slug=a.slug,cwd=cwd,artifact_root=artifact_root,intensity=a.intensity,signals=a.signal,
             campaign_key=a.campaign_key,parent_cycle_id=a.parent_cycle,unassigned=a.unassigned,
@@ -10401,6 +10456,7 @@ def main():
             from work_start import start_work
             jobs=Path(a.jobs or _compose_default_jobs())
             access_change=_record_access_change(route,jobs)
+            print("\n".join(compose_decision_lines(route)), file=sys.stderr, flush=True)
             started=start_work(route,path,jobs)
             if access_change is not None:
                 started={**started,"access_change":access_change}
@@ -10412,7 +10468,7 @@ def main():
         _route_autoclose(artifact_root,"compose",route)
         print(compose_card(route, _plan_for_card, _plan_source_for_card, owner_harness=owner_pin,
                            route_plan_unreadable=route_plan_unreadable,
-                           campaign_selection=_campaign_for_card),file=sys.stderr)
+                           campaign_selection=_campaign_for_card, include_decisions=not a.start),file=sys.stderr)
         return 0
     if a.command=="correct":
         from dispatch_owner_input import submit, inspect, InputError
@@ -10454,6 +10510,7 @@ def main():
         pin_change=_change_pins(route,jobs,a.pin) if a.pin else None
         access_change=_record_access_change(route,jobs)
         _record_route_chain(route, str(Path(a.route).resolve()), "start")
+        print("\n".join(compose_decision_lines(route)), file=sys.stderr, flush=True)
         result=start_work(route,a.route,jobs,wait=a.wait,interview=a.interview,answers=a.answers,decision=a.decision)
         if pin_change is not None:
             result={**result,"pin_change":pin_change}

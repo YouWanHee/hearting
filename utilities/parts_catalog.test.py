@@ -139,6 +139,12 @@ def _historical_setup_projection(recipe, case):
 
 def _historical_gpu_card(route, card, case):
     lines = card.splitlines()
+    # Later routing observations are not part of the pre-catalog graph. Drop
+    # only this route's exact display, leaving graph/gate bytes pinned below.
+    if "selection" in route:
+        for notice in R.compose_decision_lines(route):
+            case.assertEqual(lines.count(notice), 1)
+            lines.remove(notice)
     typed_gpu_nodes = [n["id"] for n in route["nodes"] if n.get("resource_class") == "gpu"]
     if route["capability"] == "autopilot-lab" and typed_gpu_nodes:
         case.assertEqual(typed_gpu_nodes, ["eval-run"])
