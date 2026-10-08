@@ -119,11 +119,24 @@ class RouteChainCellTest(unittest.TestCase):
         keyed = [(t, k) for t, k in working if t.strip()]
         self.assertEqual(keyed[0], ("code(std)", "dim"))
         self.assertEqual(keyed[1], (" ✓", "dim"))
-        self.assertIn(("lab", "g_work"), keyed)
-        self.assertIn((" ●", "g_work"), keyed)
+        self.assertIn(("lab", "g_work_blink"), keyed)
+        self.assertIn((" ●", "g_work_blink"), keyed)
         self.assertIn(("std", "dim"), keyed)            # the current node's knobs stay dim
         idle = render._route_chain_bodies(chain, working=False)[0]
-        self.assertIn(("lab", None), idle)               # plain, not dim, while idle
+        self.assertIn(("lab", "route_current_blink"), idle)  # base remains plain while idle
+
+    def test_current_open_item_blinks_while_idle_and_working_but_closed_or_planned_does_not(self):
+        for working in (False, True):
+            node = {"label": "code", "state": "open"}
+            segs = render._route_chain_node_segs(node, False, {}, is_current=True, working=working)
+            self.assertEqual(render._snapshot_line(segs), "code ●")
+            self.assertEqual(render._snapshot_line(segs, colored=True).count("\033[5m"), 2)
+            past = render._route_chain_node_segs(node, False, {}, is_current=False, working=working)
+            self.assertNotIn("\033[5m", render._snapshot_line(past, colored=True))
+        for state in ("done", "planned", "failed"):
+            segs = render._route_chain_node_segs({"label": "code", "state": state}, False, {},
+                                                is_current=True, working=True)
+            self.assertNotIn("\033[5m", render._snapshot_line(segs, colored=True))
 
     def test_failed_past_node_keeps_its_red_glyph(self):
         nodes = [_node("code", "failed"), _node("lab", "open")]

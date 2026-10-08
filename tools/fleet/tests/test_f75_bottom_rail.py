@@ -148,13 +148,13 @@ class RouteShownExactlyOnceTest(unittest.TestCase):
     def test_one_node_route_stays_on_the_owner_row(self):
         """The rail suppresses a one-node breadcrumb, so the row must keep it — otherwise
         the node would appear nowhere at all."""
-        seq = [("one-shot", "active")]
+        seq = [("execute", "active")]
         job = _owner(route_seq=seq, done=0, total=1)
         self.assertFalse(render._route_rides_the_rail(job, seq, in_card=True))
-        segs = render._dispatch_stage_segs(job, "code", "one-shot", "f75-owner",
+        segs = render._dispatch_stage_segs(job, "code", "execute", "f75-owner",
                                            working=True, route_seq=seq,
                                            route_zone=40, compact_route=True)
-        self.assertEqual(_text(segs), "one-shot 0/1")
+        self.assertEqual(_text(segs), "execute 0/1")
 
     def test_unframed_owner_keeps_its_route_on_the_row(self):
         self.assertFalse(render._route_rides_the_rail(_owner(), LONG_ROUTE, in_card=False))
@@ -311,11 +311,29 @@ class CardIntegrationTest(unittest.TestCase):
     def test_one_node_route_leaves_the_rail_bare(self):
         """A one-node route is not a pipeline: its breadcrumb would spell the owner row's
         own compact token a second time (the F-37 single-render contract)."""
-        seq = [("one-shot", "active")]
+        seq = [("execute", "active")]
         rows = self._render(_owner(route_seq=seq, done=0, total=1))
         rail = [r for r in rows if "╰" in r]
         self.assertTrue(rail)
         self.assertEqual(set(self._rail_run(rail[0])), {"─"})
+
+    def test_one_shot_owner_label_is_once_on_the_close_rail_in_wide_and_narrow(self):
+        for width in (80, 168):
+            for state in ("active", "done"):
+                with self.subTest(width=width, state=state):
+                    seq = [("one-shot", state)]
+                    job = _owner(route_seq=seq, done=int(state == "done"), total=1)
+                    rows = self._render(job, width=width, layout=render._layout_mode(width))
+                    label = "one-shot" + (" ✓" if state == "done" else "")
+                    rails = [r for r in rows if "╰" in r]
+                    self.assertTrue(rails)
+                    self.assertIn(label, rails[0])
+                    self.assertEqual(sum(r.count("one-shot") for r in rows), 1)
+                    self.assertTrue(render._route_rides_the_rail(job, seq, in_card=True))
+                    for row in rows:
+                        self.assertLessEqual(render._dw(row), width)
+                    snapshot = render._snapshot_line(render._route_stage_segs(seq, False, 60), colored=True)
+                    self.assertEqual("\033[5m" in snapshot, state == "active")
 
     def test_breadcrumb_survives_when_every_descendant_folded_to_done(self):
         # F-81's own regression: an owner whose children are ALL `done` folds them out of

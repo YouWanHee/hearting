@@ -167,7 +167,7 @@ _HUE_OF = {
     "loc_repo": ("w", 0),
     "qa_quick": ("d", _A_D), "qa_light": ("d", _A_D), "qa_standard": ("d", 0),
     "qa_thorough": ("d", _A_B), "qa_adversarial": ("d", _A_B),
-    "g_work": ("g", _A_B), "g_work_off": ("g", _A_D),
+    "g_work": ("g", _A_B), "g_work_off": ("g", _A_D), "route_current": ("d", 0),
     "g_spin": ("v", 0), "g_spin_dim": ("v", _A_D), "g_idle": ("y", 0),
     "g_stale": ("d", _A_D), "g_dead": ("r", _A_B), "g_unused": ("y", _A_D),
     # F-60: `blocked` is RED, on its own key. It shares a hue with `g_dead` but never a key —
@@ -257,7 +257,8 @@ _HUE_OF = {
 }
 _HUE_OF.update({key + "_blink": (hue, attr | _A_BLINK)
                 for key, (hue, attr) in list(_HUE_OF.items())
-                if isinstance(key, str) and key.startswith("stg")})
+                if isinstance(key, str) and (key.startswith("stg")
+                                             or key in ("g_work", "route_current"))})
 
 # F-76b — the NAME zone wears the harness hue, but on its OWN keys rather than reusing
 # `hb_*`/`h_*`. The color is identical; the separate key is what keeps a row's name
@@ -1396,6 +1397,10 @@ _ROUTE_STATE_MARK = {"failed": ("✕", "lvl_r"), "degraded": ("◐", "lvl_y"),
                      "done": ("✓", None)}
 
 
+def _one_shot_route(route_seq):
+    return bool(route_seq and len(route_seq) == 1 and route_seq[0][0] == "one-shot")
+
+
 def _route_rides_the_rail(j, route_seq, in_card):
     """Does this row's pipeline live on the card's close rail instead of the row itself?
 
@@ -1406,13 +1411,14 @@ def _route_rides_the_rail(j, route_seq, in_card):
 
     The single judge for both halves, so the row and the rail can never both show the route
     or both hide it. Two carve-outs:
-    - A ONE-node route stays on the row: the rail suppresses it (its breadcrumb would spell
-      the owner's own token twice), so the row is the only place left.
+    - A ONE-node route stays on the row, except the named one-shot owner: its node
+      belongs on the close rail just like a staged owner's pipeline.
     - dispatch-depth-2 rows are untouched. Their slot never held the conductor breadcrumb —
       it holds their OWN micro-status (`running` / their stage), which the rail does not
       carry and which no other cell on the card repeats."""
     depth = max(1, int(getattr(j, "depth", 1) or 1))
-    return bool(in_card and depth == 1 and route_seq and len(route_seq) > 1)
+    return bool(in_card and depth == 1 and route_seq
+                and (len(route_seq) > 1 or _one_shot_route(route_seq)))
 
 
 def _route_compact_segs(j, route_seq, working, max_width=None):
@@ -3981,7 +3987,8 @@ def _route_chain_node_segs(node, with_knobs, tag_by_key, is_current=False, worki
         return [(label + " ○", "dim")]
     knobs = _route_chain_node_knobs(node, with_knobs)
     if is_current:
-        lit = "g_work" if (working and state == "open") else None
+        lit = (("g_work_blink" if working else "route_current_blink")
+               if state == "open" else None)
         segs = [(label, lit)]
         if knobs:
             segs += [("(", "dim"), (knobs, "dim"), (")", "dim")]
@@ -7202,13 +7209,13 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 # `_drop_past_stages` (SD-F2 order: past first, current last) instead of
                 # clipping at the corner. Only a sealed route qualifies — a legacy/pre-boot
                 # row keeps its short token on the owner line and leaves the rule bare,
-                # never a fabricated track (F-3/F-42a). A ONE-node route is not a pipeline:
-                # its breadcrumb is the owner row's own compact token spelled identically,
-                # so the rail stays bare rather than printing `one-shot` twice on one card
-                # (the F-37 single-render contract). Computed BEFORE the insertion check
+                # never a fabricated track (F-3/F-42a). The named one-shot route also
+                # uses the close rail; other singleton routes keep their row slot.
+                # Computed BEFORE the insertion check
                 # below so a childless-but-labeled card still gets its divider.
                 route_label = None
-                if route_seq and len(route_seq) > 1:
+                one_shot = _one_shot_route(route_seq)
+                if _route_rides_the_rail(job, route_seq, in_card=True):
                     route_label = _route_stage_segs(
                         route_seq, unit_working or job.liveness == "working",
                         max(1, bottom_label_budget(box_width)))
@@ -7229,9 +7236,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 if has_children:
                     lines.insert(header_end,
                                  _dispatch_box_divider(box_width, rail_key, run_key=run_key,
-                                                       label_segs=route_label))
+                                                        label_segs=None if one_shot else route_label))
                     lines.append(_dispatch_box_bottom(box_width, rail_key, run_key=run_key,
-                                                      label_segs=None))
+                                                       label_segs=route_label if one_shot else None))
                 else:
                     lines.append(_dispatch_box_bottom(box_width, rail_key, run_key=run_key,
                                                       label_segs=route_label))
