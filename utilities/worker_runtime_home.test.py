@@ -2,6 +2,8 @@
 import json
 import importlib.util
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -114,6 +116,23 @@ class WorkerHomes(unittest.TestCase):
         self.assertEqual((home / 'plugins').resolve(), (self.source / 'plugins').resolve())
         self.assertEqual(env['OPENCODE_DISABLE_CLAUDE_CODE_PROMPT'], '1')
 
+    def test_opencode_all_worker_types_override_snapshot_without_changing_user_config(self):
+        config = {'snapshot': True, 'permission': {'bash': {'secret *': 'deny'}}}
+        source = self.source / 'opencode.json'
+        source.write_text(json.dumps(config))
+        self.env.update(OPENCODE_CONFIG_DIR=str(self.source),
+                        OPENCODE_CONFIG_CONTENT=json.dumps({'snapshot': True, 'model': 'test/model'}))
+        before = source.read_bytes()
+        for typ in ('owner', 'stage', 'review', 'support', 'frame'):
+            env = prepare_worker_home(ROOT, 'opencode', typ, 'snapshot-' + typ, env=self.env)
+            actual = json.loads((Path(env['OPENCODE_CONFIG_DIR']) / 'opencode.json').read_text())
+            self.assertFalse(actual['snapshot'])
+            inline = json.loads(env['OPENCODE_CONFIG_CONTENT'])
+            self.assertFalse(inline['snapshot'])
+            self.assertEqual(inline['model'], 'test/model')
+            self.assertEqual(actual['permission']['bash'], config['permission']['bash'])
+        self.assertEqual(source.read_bytes(), before)
+
     def test_profile_specialization_uses_same_guard_preserving_home(self):
         (self.source / 'settings.json').write_text('{"permissions":{"deny":["Read(secret)"]}}')
         self.env['CLAUDE_CONFIG_DIR'] = str(self.source)
@@ -121,6 +140,38 @@ class WorkerHomes(unittest.TestCase):
         home = Path(env['CLAUDE_CONFIG_DIR'])
         self.assertIn('profiles/code-report.yaml', (home / 'CLAUDE.md').read_text())
         self.assertEqual(json.loads((home / 'settings.json').read_text())['permissions']['deny'], ['Read(secret)'])
+
+    def test_opencode_isolation_keeps_the_user_inventory_through_descendants(self):
+        config = self.base / 'user-config'
+        inventory = config / 'hearting/compute-hosts.yaml'
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text(f'schema_version: 1\nrun_root: {self.base}/runs\nhosts:\n  fixture:\n    ssh_host: local\n')
+        before = inventory.read_bytes()
+        env = {**self.env, 'HOME': str(self.source), 'XDG_CONFIG_HOME': str(config)}
+        owner = prepare_worker_home(ROOT, 'opencode', 'owner', 'lab-owner', env=env)
+        self.assertNotEqual(owner['XDG_CONFIG_HOME'], str(config))
+        self.assertEqual(owner['COMPUTE_HOSTS_CONFIG'], str(inventory))
+        child = prepare_worker_home(ROOT, 'opencode', 'review', 'lab-child', env={**env, **owner})
+        for values in (owner, child):
+            # Run the real inventory loader in the actual masked environment,
+            # rather than only checking a projected environment string.
+            result = subprocess.run([sys.executable, '-c',
+                                     'import importlib.util; '
+                                     f's=importlib.util.spec_from_file_location("compute", {str(ROOT / "utilities/compute-hosts.py")!r}); '
+                                     'm=importlib.util.module_from_spec(s); s.loader.exec_module(m); '
+                                     'print(m.config_path()); print(m.load_config()["run_root"])'],
+                                    env={**os.environ, **env, **values},
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(str(inventory), result.stdout)
+            self.assertFalse((Path(values['XDG_CONFIG_HOME']) / 'hearting').exists())
+        self.assertEqual(inventory.read_bytes(), before)
+
+    def test_opencode_preserves_an_explicit_inventory_location(self):
+        inventory = self.base / 'operator/inventory.yaml'
+        values = prepare_worker_home(ROOT, 'opencode', 'owner', 'explicit-inventory',
+                                     env={**self.env, 'COMPUTE_HOSTS_CONFIG': str(inventory)})
+        self.assertEqual(values['COMPUTE_HOSTS_CONFIG'], str(inventory))
 
     def test_codex_without_optional_user_hook_file_still_builds_minimal_home(self):
         minimal = self.base / 'minimal-source'

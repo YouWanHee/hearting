@@ -8,7 +8,7 @@ Server ``--writable-root``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import hashlib
 import importlib.util
@@ -30,6 +30,8 @@ MAX_TEXT_LENGTH = 500
 MAX_JSON_DEPTH = 64
 MAX_TASK_TARGET_SCRIPT_BYTES = 1024 * 1024
 MAX_DERIVATION_SKIPPED = 48
+COMPUTE_NETWORK_REASON = "Compute-hosts SSH for GPU lab execution"
+COMPUTE_INVENTORY_REASON = "User compute-hosts inventory for GPU lab execution"
 
 _TOP_LEVEL_FIELDS = frozenset(
     {
@@ -786,6 +788,16 @@ def prepare_task_request(
     explicit = explicit if given is None else given
     targets = None if lab_owner and explicit is not None else resolve_task_targets(route)
     run_root = _lab_run_root(route, node)
+    # The same typed execution scope as the GPU sandbox selector, without
+    # applying any Codex-specific caller overrides to another harness.
+    from gpu_execution_sandbox import select as gpu_selection
+    compute_scope = lab_owner and run_root is not None and gpu_selection(route, environ={})["gpu_scope"]
+    inventory_root = None
+    if compute_scope:
+        inventory = os.environ.get("COMPUTE_HOSTS_CONFIG") or (
+            Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+            / "hearting/compute-hosts.yaml")
+        inventory_root = Path(inventory).expanduser().absolute().parent
     if given is not None and run_root is None:
         return given
     if targets is None and run_root is None and (
@@ -806,19 +818,32 @@ def prepare_task_request(
         directory = directory / "nodes" / node
     request_path_value = directory / "request.json"
     binding_path = directory / "binding.json"
+    previous_binding = _prepared_binding(binding_path)
+    if compute_scope:
+        # Old prepared requests remain history. A normal start/correction on
+        # an upgraded release prepares these runtime defaults alongside them,
+        # retaining the task roots already derived by the original owner.
+        directory = directory / "compute"
+        request_path_value = directory / "request.json"
+        binding_path = directory / "binding.json"
     context = AccessContext.build(
         worktree=str(route.get("cwd") or ""),
         artifact_root=str(route.get("artifact_root") or ""),
         dispatch_state_root=state_root,
         agent_home=Path(__file__).resolve().parents[1],
     )
+    if inventory_root is not None and _broad_root(inventory_root, context):
+        # An explicitly placed inventory may sit beside the worktree or at a
+        # broad root. Keep the utility's exact file input without granting its
+        # surrounding tree or adding a new refusal to an otherwise valid run.
+        inventory_root = None
     supplied = load_request(explicit, context=context) if run_root is not None and explicit is not None else None
     named = list(targets.writable_roots if targets else ())
     if run_root is not None:
         named.append(run_root)
     if supplied is not None:
         named.extend(supplied.writable_roots)
-    prior = _prepared_binding(binding_path)
+    prior = _prepared_binding(binding_path) or previous_binding
     if explicit is not None:
         derived = None
     elif prior is not None:
@@ -834,6 +859,9 @@ def prepare_task_request(
         if supplied is not None:
             justification.update(dict(supplied.justification))
         read = [str(path) for path in supplied.read_roots] if supplied else []
+        if inventory_root is not None:
+            read.append(str(inventory_root))
+            justification[str(inventory_root)] = COMPUTE_INVENTORY_REASON
         if derived is not None:
             roots = [str(path) for path in _unique_paths((*named, *derived.writable_roots))]
             read = [str(path) for path in _unique_paths((*map(Path, read), *derived.read_roots))]
@@ -844,8 +872,9 @@ def prepare_task_request(
             "writable_roots": roots,
             "read_roots": read,
             "network": {
-                "required": supplied.network_required if supplied else False,
-                "reason": supplied.network_reason if supplied else "",
+                "required": supplied.network_required if supplied else bool(compute_scope),
+                "reason": supplied.network_reason if supplied else (
+                    COMPUTE_NETWORK_REASON if compute_scope else ""),
                 "hosts": list(supplied.network_hosts) if supplied else [],
             },
             "enforcement_required": supplied.enforcement_required if supplied else "any",
@@ -1578,6 +1607,7 @@ def bind_request(
     effective_sandbox: str = "workspace-write",
     gpu_resource_scope: bool = False,
     inherit_parent_sandbox: bool = False,
+    compute_execution_scope: bool | None = None,
 ) -> ExecutionAccessGrant | None:
     """Resolve, validate, constrain, and grade an explicit request.
 
@@ -1589,6 +1619,14 @@ def bind_request(
     if source is None:
         return None
     request = load_request(source, context=context)
+    if compute_execution_scope is False and request.network_reason == COMPUTE_NETWORK_REASON:
+        # A non-execution child may inherit the owner's input file, but not its
+        # automatic compute defaults. Explicit operator requests retain their
+        # existing behavior; this is only the runtime's own default request.
+        inventory_roots = {Path(root) for root, reason in request.justification
+                           if reason == COMPUTE_INVENTORY_REASON}
+        request = replace(request, network_required=False, network_reason="", network_hosts=(),
+                          read_roots=tuple(root for root in request.read_roots if root not in inventory_roots))
     assert_within_parent(request, parent, is_child=is_child)
     if inherit_parent_sandbox and (not is_child or parent is None):
         raise ExecutionAccessError("execution-access-exceeds-parent:parent-grant-unknown")
@@ -1643,7 +1681,7 @@ def publish_effective_grant(
         "request_sha256": grant.request_sha256 if grant else None,
         "writable_roots": writable,
         "read_roots": read,
-        "network_allowed": bool(network_allowed),
+        "network_allowed": bool(network_allowed or (grant is not None and grant.network == "granted-unenforced")),
         "file_enforcement": grant.file_enforcement if grant else (
             ("os-sandbox" if sandbox == "workspace-write" else "none") if _os_sandboxed(runtime)
             else "tool-permission" if runtime in _RUNTIMES else "none"

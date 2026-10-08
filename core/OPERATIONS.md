@@ -971,6 +971,12 @@ join retains every owned attempt, including `done` rows, until the exact process
 group and tagged descendants are settled. `dispatch-reconcile --attempt <id>
 --apply` uses the same bounded cleanup proof authority on terminal rows; it
 preserves the result, marker, and delivery receipt and grants no retry credit.
+After the recorded leader has exited, the existing post-exit watcher and applied
+cleanup terminate its exact attempt-tagged leftovers with TERM, then bounded
+KILL. They revalidate the row, namespace and PID birth before signalling, and
+preserve resource/compute runs and their branches under the same protection as
+parent close. A live leader or unknown identity remains pending. This applies
+equally to all three harnesses and requires no caller input.
 An exact authenticated portable cleanup receipt remains settled when a later
 same-namespace tag scan cannot read an unrelated process and the current owned
 group is empty; any visible live leader, group member or tagged
@@ -1082,7 +1088,17 @@ The static half — addresses, ports, environment roots, and the shared run root
 other cross-runtime policy files; install seeds it once as a commented template
 and neither install nor update ever rewrites it. `harness config status` shows
 its state next to the other user-owned config surfaces. The
-launcher is shared across runtimes, repairs only an exact owned link, preserves
+worker runtime preserves that exact inventory location through the existing
+`COMPUTE_HOSTS_CONFIG` environment value before isolating its XDG directories;
+it neither copies the inventory nor exposes the user's whole config home.
+GPU lab owners include the inventory directory as a read-only root and SSH
+network need in their normal execution-access request. Execution/validation
+children remain inside the parent's grant; non-execution nodes get no new
+automatic network request. The effective record reports this logical network
+grant separately from OS enforcement. An explicit network request still wins.
+An answered BLOCKED GPU lab owner prepares these same defaults for its
+replacement, retaining completed stages and the old request as history.
+The launcher is shared across runtimes, repairs only an exact owned link, preserves
 foreign collisions, and is removed only by a full uninstall. That file
 is byte-identical on every host: which entry is the local machine is discovered
 by matching its declared `hostname`, not written down, so promoting a different

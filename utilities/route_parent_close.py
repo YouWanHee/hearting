@@ -516,6 +516,78 @@ def _signal(pid, start, signum):
         pass
 
 
+def reap_terminal_descendants(jobs, fields, *, grace=0.3, kill_wait=0.5):
+    """Drain exact post-exit leftovers, retaining the parent-close resource policy.
+
+    This is shared by the post-exit watcher and terminal reconcile. A result
+    alone cannot stop a live leader, and a tag never grants group-wide signals.
+    """
+    from codex_dispatch_terminal import terminal_envelope_observed
+
+    meta = DC.parse_registry_metadata(fields[5])
+    if not DC.attempt_scan_namespace_authority(meta):
+        return
+    identities = DC.authoritative_process_identities(meta)
+    if not identities:
+        return
+    identity = identities[0]
+    visible, birth, state = DC.process_observation(identity.pid)
+    if visible == "inaccessible" or (visible == "present" and birth == identity.expected_start and state != "Z"):
+        return
+    route = {"route_id": meta.get("owner_route_id") or meta.get("route_id") or meta["attempt_id"],
+             "route_hash": meta.get("owner_route_hash") or meta.get("route_hash", "")}
+    path = Path(meta.get("owner_route_file") or meta.get("route_file") or fields[3])
+    resources = known_resources(route, path, jobs, {meta["attempt_id"]})
+    deadline, sent = time.monotonic() + grace + kill_wait, set()
+    while True:
+        current = _rows(jobs).get(meta["attempt_id"])
+        if current is None or current[0] != fields:
+            return  # A successor/result writer changed the selected row.
+        if fields[1] not in {"done", "killed", "cancelled"} and not terminal_envelope_observed(meta.get("log_file")):
+            return
+        visible, birth, state = DC.process_observation(identity.pid)
+        if visible == "inaccessible" or (visible == "present" and birth == identity.expected_start and state != "Z"):
+            return
+        tagged = DC.attempt_tagged_descendants(meta)
+        if tagged.state != "populated":
+            return
+        # Reuse the complete parent-close decision, including uncertain
+        # resource namespaces and branches born during this drain pass.
+        agents, observed = _agent_processes(meta, resources)
+        if not observed:
+            return
+        owned = set(agents)
+        targets = []
+        for pid, start, state in tagged.members:
+            if (state == "Z" or pid == identity.pid or (pid, start) not in owned
+                    or not start.isdigit() or int(start) < int(identity.expected_start)):
+                continue
+            try:
+                env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return
+            if f"{DC.ATTEMPT_DESCENDANT_ENV}={meta['attempt_id']}".encode() not in env:
+                continue
+            # Resource tags protect also a reparented/re-setsid branch whose
+            # registry or observer namespace is temporarily unavailable.
+            if any(item.startswith((b"HEARTING_RESOURCE_RUN_ID=", b"HEARTING_RESOURCE_REGISTRY=",
+                                    b"HEARTING_COMPUTE_RUN_ID=")) for item in env):
+                continue
+            targets.append((pid, start))
+        if not targets:
+            return
+        escalated = time.monotonic() >= deadline - kill_wait
+        for pid, start in targets:
+            if escalated or (pid, start) not in sent:
+                _signal(pid, start, signal.SIGKILL if escalated else signal.SIGTERM)
+                sent.add((pid, start))
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.05)
+
+
 def _saved_branches(value, ledger):
     branches = {rid: {tuple(pair) for pair in pairs}
                 for rid, pairs in value.get("resource_branches", {}).items()}

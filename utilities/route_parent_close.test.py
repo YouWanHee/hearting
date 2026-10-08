@@ -254,6 +254,65 @@ class ParentCloseTest(unittest.TestCase):
         self.assertEqual(self.close()["state"], "cancelled")
         self.assertIsNotNone(resource.poll())
 
+    def test_terminal_reaper_preserves_resource_with_unknown_namespace(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner, status="done")
+        resource = self.process("att-owner")
+        registry, run = self.resource(resource)
+        run["pid_namespace"] = "pid:[foreign-namespace]"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": run}}))
+        owner.terminate(); owner.wait(timeout=2)
+        fields, meta = CLOSE._rows(self.jobs)[self.aid("att-owner")]
+        resources = CLOSE.known_resources(self.route, self.path, self.jobs, {self.aid("att-owner")})
+        self.assertEqual(CLOSE._agent_processes(meta, resources), ([], False))
+        CLOSE.reap_terminal_descendants(self.jobs, fields)
+        self.assertIsNone(resource.poll())
+        cleanup = DC.resolve_attempt_cleanup(self.jobs, self.aid("att-owner"), apply=True)
+        self.assertFalse(cleanup["settled"])
+        self.assertIsNone(resource.poll())
+
+    def test_terminal_reaper_refreshes_resource_branches_during_grace(self):
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner, status="done")
+        leftover = self.process("att-owner", ignore_term=True)
+        gate, pidfile = self.base / "fork-now", self.base / "payload.pid"
+        script = ("import os,subprocess,time\n"
+            "print('ready',flush=True)\n"
+            f"while not os.path.exists({str(gate)!r}): time.sleep(0.005)\n"
+            "child=subprocess.Popen(['sleep','300'],start_new_session=True)\n"
+            f"open({str(pidfile)!r},'w').write(str(child.pid))\n"
+            "time.sleep(300)\n")
+        resource = self.process("att-owner", script=script)
+        self.resource(resource)
+        owner.terminate(); owner.wait(timeout=2)
+        fields, _ = CLOSE._rows(self.jobs)[self.aid("att-owner")]
+        original = CLOSE._protected
+        payload = None
+
+        def publish_branch_after_first_scan(resources):
+            nonlocal payload
+            protected = original(resources)
+            if payload is None:
+                gate.touch()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if pidfile.exists() and pidfile.read_text().isdigit():
+                        payload = int(pidfile.read_text())
+                        break
+                    time.sleep(0.005)
+                self.assertIsNotNone(payload)
+                birth = DC.process_start_ticks(payload)
+                self.addCleanup(CLOSE._signal, payload, birth, signal.SIGKILL)
+            return protected
+
+        with mock.patch.object(CLOSE, "_protected", side_effect=publish_branch_after_first_scan):
+            CLOSE.reap_terminal_descendants(self.jobs, fields)
+        observation = DC.process_observation(payload)
+        self.assertEqual(observation[0], "present")
+        self.assertNotEqual(observation[2], "Z")
+        self.assertIsNone(resource.poll())
+        self.assertIsNotNone(leftover.poll())
+
     def test_escaped_payload_is_durable_after_root_exit_and_observer_restart(self):
         owner = self.process("att-owner"); self.row("att-owner", process=owner)
         pidfile = self.base / "escaped.pid"

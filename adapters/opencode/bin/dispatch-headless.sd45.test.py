@@ -27,7 +27,10 @@ class NestedRuntimeTest(unittest.TestCase):
             projected = Path(values["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
             self.assertTrue(projected.is_symlink())
             self.assertEqual(projected.resolve(), config_file)
-            for path in values.values():
+            self.assertEqual(values['COMPUTE_HOSTS_CONFIG'], str(root / 'user-config/hearting/compute-hosts.yaml'))
+            for key, path in values.items():
+                if key == 'COMPUTE_HOSTS_CONFIG':
+                    continue
                 self.assertTrue(Path(path).is_relative_to(state_root))
                 self.assertEqual(Path(path).stat().st_mode & 0o777, 0o700)
             link = Path(values["XDG_DATA_HOME"]) / "opencode" / "auth.json"

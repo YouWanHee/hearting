@@ -195,7 +195,7 @@ class DispatchReapWatchTest(unittest.TestCase):
             )
             self.assertFalse((base / "degradations").exists())
 
-    def _tagged_residue_worker(self, attempt, residue_seconds="30"):
+    def _tagged_residue_worker(self, attempt, residue_seconds="30", *, resource=False, ignore_term=False):
         """Spawn a worker that leaves one tagged, re-setsid'd survivor behind."""
 
         script = (
@@ -204,9 +204,16 @@ class DispatchReapWatchTest(unittest.TestCase):
             "subprocess.Popen(['sleep',sys.argv[2]],env=env,start_new_session=True)\n"
             "time.sleep(0.04)\n"
         )
+        if ignore_term:
+            payload = "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('ready',flush=True);time.sleep(30)"
+            script = ("import os,subprocess,sys\n"
+                      f"p=subprocess.Popen([sys.executable,'-c',{payload!r}],env=os.environ,start_new_session=True,stdout=subprocess.PIPE)\n"
+                      "assert p.stdout.readline()==b'ready\\n'\n"
+                      "p.stdout.close()\n")
         worker = subprocess.Popen(
             [sys.executable, "-c", script, attempt, residue_seconds],
-            env=dict(os.environ, AGENT_DISPATCH_ATTEMPT_ID=attempt),
+            env=dict(os.environ, AGENT_DISPATCH_ATTEMPT_ID=attempt,
+                     **({'HEARTING_RESOURCE_RUN_ID': 'preserved-training'} if resource else {})),
             start_new_session=True,
         )
         identity = D.process_launch_identity(worker.pid)
@@ -223,7 +230,7 @@ class DispatchReapWatchTest(unittest.TestCase):
         self.addCleanup(reap_residue)
         return identity
 
-    def test_sd_open_47_tagged_residue_after_terminal_evidence_is_sealed_not_waited_forever(self):
+    def test_terminal_tagged_residue_is_reaped_and_cleanup_settles(self):
         """H7 (rt-8561efa2 / att-e72e08e0): a worker-spawned background process
         that inherited the attempt tag outlived the worker. The sidecar rescanned
         /proc every 0.2 s for 95 minutes and the row could never drain."""
@@ -232,7 +239,7 @@ class DispatchReapWatchTest(unittest.TestCase):
             base = Path(td)
             jobs = base / "jobs.log"
             attempt = "att-tagged-residue-terminal"
-            identity = self._tagged_residue_worker(attempt)
+            identity = self._tagged_residue_worker(attempt, ignore_term=True)
             metadata = ",".join(
                 f"{key}={value}"
                 for key, value in {
@@ -265,29 +272,15 @@ class DispatchReapWatchTest(unittest.TestCase):
             row = jobs.read_text(encoding="utf-8")
             meta = D.parse_registry_metadata(row.strip().split("\t")[5])
             self.assertEqual(meta["launch_outcome"], "governed-process-group-drained")
-            self.assertEqual(
-                meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF
-            )
-            self.assertEqual(meta["attempt_descendant_residue_basis"], "registry-terminal")
-            self.assertEqual(meta["attempt_descendant_residue_count"], "1")
-            residue_pids = {
-                int(item.split(":")[0]) for item in meta["attempt_descendant_residue"].split(";")
-            }
-            self.assertTrue(residue_pids)
+            self.assertEqual(meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_PROOF)
             live = D.attempt_tagged_descendants(meta)
-            self.assertEqual(live.state, "populated", "residue must still be alive")
-            self.assertTrue(residue_pids.issuperset({pid for pid, _s, _st in live.members}))
-            # The residue observation preserves output diagnostics, but the
-            # runtime still owns these live descendants after watcher exit.
-            self.assertTrue(D.tagged_residue_receipt(meta))
-            self.assertEqual(D.post_exit_receipt_reason(meta), "")
+            self.assertEqual(live.state, "empty", "terminal residue must be gone")
+            self.assertFalse(D.tagged_residue_receipt(meta))
+            self.assertEqual(D.post_exit_receipt_reason(meta), "governed-process-group-drained")
             verdict = D.attempt_process_quiescence(meta, terminal_receipt=True)
-            self.assertEqual(verdict.state, "live", verdict.reason)
-            self.assertEqual(D.attempt_process_quiescence(meta).state, "live")
-            observed = D.observed_attempt_liveness("done", meta)
-            self.assertEqual(observed.state, "alive")
+            self.assertEqual(verdict.state, "quiescent", verdict.reason)
             before=jobs.read_bytes()
-            self.assertFalse(D.resolve_attempt_cleanup(jobs,attempt,apply=True)["settled"])
+            self.assertTrue(D.resolve_attempt_cleanup(jobs,attempt,apply=True)["settled"])
             self.assertEqual(jobs.read_bytes(),before)
 
     def _open_residue_row(self, base, attempt, residue_seconds):
@@ -297,7 +290,8 @@ class DispatchReapWatchTest(unittest.TestCase):
         jobs = base / "jobs.log"
         log = base / f"{attempt}.claude.jsonl"
         log.write_text('{"type":"result","subtype":"success"}\n', encoding="utf-8")
-        identity = self._tagged_residue_worker(attempt, residue_seconds)
+        # Legacy residue recovery remains necessary for preserved resources.
+        identity = self._tagged_residue_worker(attempt, residue_seconds, resource=True)
         metadata = ",".join(
             f"{key}={value}"
             for key, value in {
@@ -333,6 +327,50 @@ class DispatchReapWatchTest(unittest.TestCase):
         return D.parse_registry_metadata(
             jobs.read_text(encoding="utf-8").strip().split("\t")[5]
         )
+
+    def test_applied_terminal_cleanup_reaps_old_residue_preserves_result_and_other_attempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / 'jobs.log'
+            attempt = 'att-snapshot-cleanup'
+            identity = self._tagged_residue_worker(attempt)
+            other = self._tagged_residue_worker('att-unrelated-cleanup')
+            metadata = ','.join(f'{key}={value}' for key, value in {
+                **identity, 'attempt_id': attempt, 'launch_lifecycle': 'detached',
+                'pid_scope': 'namespace-local', 'note': 'completed-supervisor',
+                'failure_class': 'pass',
+            }.items())
+            jobs.write_text(f'2026-10-09T00:00:00Z\tdone\t/repo\t/wt\tworker\t{CURRENT},{metadata}\n')
+            before = jobs.read_bytes()
+            self.assertEqual(D.resolve_attempt_cleanup(jobs, attempt)['reason'], 'attempt-descendant-live')
+            self.assertEqual(jobs.read_bytes(), before)
+            self.assertTrue(D.resolve_attempt_cleanup(jobs, attempt, apply=True)['settled'])
+            self.assertEqual(D.attempt_tagged_descendants(self._row_metadata(jobs)).state, 'empty')
+            self.assertEqual(D.attempt_tagged_descendants({'attempt_id': 'att-unrelated-cleanup', **other}).state, 'populated')
+            self.assertEqual(self._row_metadata(jobs)['failure_class'], 'pass')
+            self.assertEqual(self._row_metadata(jobs)['note'], 'completed-supervisor')
+
+    def test_terminal_cleanup_never_signals_live_leader_or_foreign_namespace(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / 'jobs.log'
+            proc = subprocess.Popen(['sleep', '30'], start_new_session=True,
+                                    env=dict(os.environ, AGENT_DISPATCH_ATTEMPT_ID='att-live-owner'))
+            self.addCleanup(lambda: (proc.kill(), proc.wait()) if proc.poll() is None else None)
+            identity = D.process_launch_identity(proc.pid)
+            metadata = ','.join(f'{key}={value}' for key, value in {
+                **identity, 'attempt_id': 'att-live-owner', 'launch_lifecycle': 'detached',
+                'pid_scope': 'namespace-local',
+            }.items())
+            fields = ['2026-10-09T00:00:00Z', 'done', '/repo', '/wt', 'worker', f'{CURRENT},{metadata}']
+            jobs.write_text('\t'.join(fields) + '\n')
+            import route_parent_close as CLOSE
+            with mock.patch.object(CLOSE, '_signal') as send:
+                CLOSE.reap_terminal_descendants(jobs, fields)
+                send.assert_not_called()
+                with mock.patch.object(D, 'attempt_scan_namespace_authority', return_value=False):
+                    CLOSE.reap_terminal_descendants(jobs, fields)
+                send.assert_not_called()
+            self.assertIsNone(proc.poll())
 
     def test_residue_that_later_exits_is_released_by_the_runtime_not_left_draining(self):
         """stale-residue-1002 (BC [32], att-execute-e2584831102a-c3): the
@@ -411,7 +449,7 @@ class DispatchReapWatchTest(unittest.TestCase):
             self.assertEqual(jobs.read_bytes(), before)
             self.assertEqual(list(D.residue_live_pids(meta)), expected)
 
-    def test_sd_open_47_residue_inside_the_governed_group_is_sealed_too(self):
+    def test_terminal_residue_inside_the_governed_group_is_reaped(self):
         """review finding 11: `nohup cmd &` without setsid keeps the governed
         pgid; when every live group member carries the tag it is residue."""
         with tempfile.TemporaryDirectory() as td:
@@ -464,8 +502,8 @@ class DispatchReapWatchTest(unittest.TestCase):
             )
             self.assertEqual(watcher.wait(timeout=10), 0)
             meta = D.parse_registry_metadata(jobs.read_text(encoding="utf-8").strip().split("\t")[5])
-            self.assertEqual(meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_RESIDUE_PROOF)
-            self.assertTrue(D.tagged_residue_receipt(meta))
+            self.assertEqual(meta["attempt_descendant_proof"], D.ATTEMPT_DESCENDANT_PROOF)
+            self.assertFalse(D.tagged_residue_receipt(meta))
 
     def test_sd_open_47_tagged_residue_without_terminal_evidence_keeps_the_veto(self):
         with tempfile.TemporaryDirectory() as td:
