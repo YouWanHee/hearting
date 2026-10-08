@@ -425,7 +425,7 @@ class SpecPhaseSequenceTest(unittest.TestCase):
                     self.assertIn(expected, text)
             # active phase carries a lit (non-dim) color key so it stands out / blinks.
             active_keys = [k for t, k in segs if t == "dev"]
-            self.assertTrue(any(k and k.startswith("stg") and k.endswith("_on")
+            self.assertTrue(any(k and k.startswith("stg") and k.removesuffix("_blink").endswith("_on")
                                 for k in active_keys))
 
     def test_mode_parsing_flow_and_block_forms(self):
