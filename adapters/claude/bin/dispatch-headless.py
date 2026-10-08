@@ -27,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
+from worker_runtime_home import prepare_worker_home, claude_worker_arguments
 from dispatch_contract import (
     _atomic_registry_replace,
     workflow_completion_receipt,  # noqa: E402
@@ -1136,6 +1137,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         "--output-format", "stream-json", "--verbose",
         "--no-session-persistence",
     ]
+    cmd += claude_worker_arguments(getattr(args, "worker_runtime_env", None))
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
     if getattr(args, "execution_access_grant", None) is not None:
@@ -1639,7 +1641,7 @@ def main(argv: list[str]) -> int:
     )
     log_path = log_dir / log_name
     args.log_path = log_path
-    command = shell_command(args, prompt_path, log_path)
+    command = None if action == 'start' else shell_command(args, prompt_path, log_path)
 
     if action in ("register", "start"):
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1649,14 +1651,6 @@ def main(argv: list[str]) -> int:
         # Gate-first, then create -> register -> launch: a --check failure
         # must not leave an instance home behind (no leak on gate failure).
         rc = build_home_gate(agent_home, args.profile, ["--check"], "profile-check-failed")
-        if rc != 0:
-            return rc
-        rc = build_home_gate(
-            agent_home,
-            args.profile,
-            ["--instance", args.slug, "--home-root", str(home_root)],
-            "profile-build-failed",
-        )
         if rc != 0:
             return rc
 
@@ -1818,8 +1812,11 @@ def main(argv: list[str]) -> int:
             env["AGENT_DISPATCH_UNIT"] = args.unit
         else:
             env.pop("AGENT_DISPATCH_UNIT", None)
-        if args.profile:
-            env["CLAUDE_CONFIG_DIR"] = str(instance_dir)
+        args.worker_runtime_env = prepare_worker_home(args.agent_home, 'claude', args.worker_type,
+                                                       args.attempt_id, env=env, profile=args.profile)
+        env.update(args.worker_runtime_env)
+        instance_dir = Path(env["CLAUDE_CONFIG_DIR"])
+        command = shell_command(args, prompt_path, log_path)
         if args.resolved_completion_delivery == "session-resume-supervised":
             env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(
                 completion_state_path(args)
@@ -1916,6 +1913,7 @@ def main(argv: list[str]) -> int:
         launch_metadata = {
             **args.launch_lifecycle_resolution.metadata(),
             "runtime_sandbox": "adapter-default",
+            "runtime_home": env["CLAUDE_CONFIG_DIR"],
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("claude", env))
@@ -2296,6 +2294,8 @@ def main(argv: list[str]) -> int:
     print(f"prompt_source={prompt_source}")
     print(f"prompt_file={prompt_path}")
     print(f"log_file={log_path}")
+    if command is None:
+        command = shell_command(args, prompt_path, log_path)
     print(f"command={command}")
     return (
         75
