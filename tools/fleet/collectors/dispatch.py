@@ -61,6 +61,7 @@ from .. import model
 from ..model import ContextEvidence, DispatchJob, etime_to_min, project_of
 from ..token_budget import parse_codex_token_count, telemetry_from_explicit
 from . import procscan
+from . import parse_cache
 
 _AUTOPILOT = re.compile(r"/autopilot-([a-z-]+)")
 _LOOPS = re.compile(r"loops/(oncall|note|study|drill|runtime-watch)")
@@ -1121,9 +1122,9 @@ _CLAUDE_STREAM_TAIL_BYTES = 512 * 1024
 _CLAUDE_SUPERVISOR_HEAD_BYTES = 64 * 1024
 _CLAUDE_SUBAGENT_SCAN_BYTES = 8 * 1024 * 1024
 _CLAUDE_DISPATCH_CONTEXT_WINDOW_DEFAULT = 1_000_000
-_CLAUDE_STREAM_CACHE = {}       # path -> (mtime_ns, size, parsed)
-_CODEX_ATTEMPT_CACHE = {}       # path -> (mtime_ns, size, parsed)
-_OPENCODE_ATTEMPT_CACHE = {}    # path -> (mtime_ns, size, parsed)
+_CLAUDE_STREAM_CACHE = {}       # path -> ((mtime_ns, size, dev, ino), parsed)
+_CODEX_ATTEMPT_CACHE = {}       # path -> ((mtime_ns, size, dev, ino), parsed)
+_OPENCODE_ATTEMPT_CACHE = {}    # path -> ((mtime_ns, size, dev, ino), parsed)
 # Every registry attempt is re-observed each tick, so the FIFO bound must exceed the
 # attempt count; a smaller bound evicts each entry before its next hit.
 _ATTEMPT_PARSE_CACHE_LIMIT = 4096
@@ -1344,10 +1345,18 @@ def _parse_claude_stream_tail(path):
         st = os.stat(path)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size)
+    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _CLAUDE_STREAM_CACHE.get(path)
-    if cached and cached[:2] == cache_key:
-        return cached[2]
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    disk_key = parse_cache.key("claude-attempt", path, cache_key,
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES))
+    parsed = parse_cache.load(disk_key)
+    if isinstance(parsed, dict):
+        _CLAUDE_STREAM_CACHE[path] = (cache_key, parsed)
+        if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+            _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
+        return parsed
     start = max(0, st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
     try:
         with open(path, "rb") as stream:
@@ -1434,7 +1443,8 @@ def _parse_claude_stream_tail(path):
         "session_output_tokens": _counter(cumulative.get("output_tokens")),
         "exec_tool": next(reversed(open_tools.values())) if open_tools else None,
     }
-    _CLAUDE_STREAM_CACHE[path] = (cache_key[0], cache_key[1], parsed)
+    _CLAUDE_STREAM_CACHE[path] = (cache_key, parsed)
+    parse_cache.save(disk_key, parsed, path, cache_key)
     if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
     return parsed
@@ -1569,10 +1579,18 @@ def _parse_codex_attempt_tail(path):
         st = os.stat(path)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size)
+    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _CODEX_ATTEMPT_CACHE.get(path)
-    if cached and cached[:2] == cache_key:
-        return cached[2]
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    disk_key = parse_cache.key("codex-attempt", path, cache_key,
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES))
+    parsed = parse_cache.load(disk_key)
+    if isinstance(parsed, dict):
+        _CODEX_ATTEMPT_CACHE[path] = (cache_key, parsed)
+        if len(_CODEX_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+            _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
+        return parsed
     head_bytes = _CLAUDE_SUPERVISOR_HEAD_BYTES
     tail_bytes = _CLAUDE_STREAM_TAIL_BYTES
     head_thread_ids = set()
@@ -1662,7 +1680,8 @@ def _parse_codex_attempt_tail(path):
               "thread_ambiguity": len(thread_ids) > 1,
               "activity": activity if len(thread_ids) == 1 else None,
               "exec_tool": next(reversed(open_commands.values())) if open_commands else None}
-    _CODEX_ATTEMPT_CACHE[path] = (cache_key[0], cache_key[1], parsed)
+    _CODEX_ATTEMPT_CACHE[path] = (cache_key, parsed)
+    parse_cache.save(disk_key, parsed, path, cache_key)
     if len(_CODEX_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
     return parsed
@@ -1792,10 +1811,18 @@ def _parse_opencode_attempt_tail(path):
         st = os.stat(path)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size)
+    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _OPENCODE_ATTEMPT_CACHE.get(path)
-    if cached and cached[:2] == cache_key:
-        return cached[2]
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    disk_key = parse_cache.key("opencode-attempt", path, cache_key,
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES))
+    parsed = parse_cache.load(disk_key)
+    if isinstance(parsed, dict):
+        _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
+        if len(_OPENCODE_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+            _OPENCODE_ATTEMPT_CACHE.pop(next(iter(_OPENCODE_ATTEMPT_CACHE)))
+        return parsed
     start = max(0, st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
     try:
         with open(path, "rb") as stream:
@@ -1837,7 +1864,8 @@ def _parse_opencode_attempt_tail(path):
         "ambiguity": "multiple-stream-session-ids" if len(session_ids) > 1 else None,
         "active_context_tokens": active,
     }
-    _OPENCODE_ATTEMPT_CACHE[path] = (cache_key[0], cache_key[1], parsed)
+    _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
+    parse_cache.save(disk_key, parsed, path, cache_key)
     if len(_OPENCODE_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _OPENCODE_ATTEMPT_CACHE.pop(next(iter(_OPENCODE_ATTEMPT_CACHE)))
     return parsed
@@ -3575,6 +3603,9 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
                 twin._proc_liveness = getattr(job, "liveness", None)
         proc_jobs = kept_proc
     jobs = proc_jobs + log_jobs
+    # F-83 retention uses registry/route evidence, never stream telemetry. Apply
+    # that existing rule before any location/title/log reads for discarded owners.
+    jobs = _retain_dead_terminal_owners(jobs, time.time(), jobs_path=jobs_path)
     _fill_locations(jobs)          # F-97a; own try/except inside, never raises
     _campaign_labels(jobs)         # F-97c; own try/except inside, never raises
     # Typed-mode+profile backfill for proc jobs whose argv/env omitted metadata.
