@@ -59,6 +59,29 @@ class WorkStartTest(unittest.TestCase):
         self.current = mock.patch.object(W, "current_delivery_state", side_effect=self.delivery)
         self.current.start(); self.addCleanup(self.current.stop)
 
+    def test_legacy_continuation_normal_start_reads_original_request_without_rewriting(self):
+        source = json.loads(json.dumps(self.route))
+        source_path = self.path.with_name("source.json")
+        source_path.write_text(json.dumps(source))
+        self.route = {**self.route, "route_id": "rt-continuation", "route_hash": "sha256:continued",
+                      "source_route_id": source["route_id"], "source_route_hash": source["route_hash"],
+                      "nodes": [{"id": "review"}]}
+        self.route.pop("work_request")
+        self.path.write_text(json.dumps(self.route))
+        before = self.path.read_bytes()
+        self.ready = self.released = True
+        module = SimpleNamespace(resolve_route_argument=lambda *a: source_path,
+                                 verify_route=lambda value: value)
+        with mock.patch.object(W, "_route_module", return_value=module):
+            first = self.start()
+            second = self.start()
+        self.assertTrue(first["owner_started"])
+        self.assertTrue(second["owner_started"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][self.calls[0].index("--prompt-text") + 1], source["work_request"]["text"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn("work_request", self.route)
+
     def test_start_and_resume_prepare_the_same_canonical_root_request(self):
         primary = Path(self.tmp.name) / "primary"
         project = Path(self.tmp.name) / "linked"

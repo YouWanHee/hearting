@@ -10258,7 +10258,8 @@ def launch_orphan_watch(
 
     The watcher is deterministic infrastructure, not a model worker. It only
     waits for the recorded PID/start identity to end and then asks the shared
-    registry classifier to close a true orphan; it never resumes work.
+    registry classifier to close a true orphan. A waiting adopted continuation
+    retains its children and goes through its existing normal start after join.
     """
     if not attempt_id or pid <= 0 or not pid_start:
         raise DispatchContractError(

@@ -248,6 +248,16 @@ or terminal-row lease evidence fails closed. Phase edges append outer PID/start
 and before/after phase to the attempt-scoped transition audit. This shared rule
 supersedes the Codex-only lease wording later in this section.
 
+Owner supervision follows the owner's current adopted route through the shared
+owner-route lifecycle resolver, including a continuation adopted during a model
+turn. The launch route remains historical evidence, not the child-selection
+boundary. If the supervisor exits with a waiting child on that continuation,
+the existing post-exit watcher retains the child, waits for its exact settlement,
+and calls that continuation's normal `start` once. Normal start claims suppress
+duplicate owners. Explicit cancellation and a genuine FAIL/BLOCKED handoff keep
+their existing meaning. This repairs the BC spec owner that lost its continuation
+review on 2026-10-08; no extra caller command or recovery input is required.
+
 `AGENT_DISPATCH_JOBS` is the sole canonical dispatch registry. Its default
 fallback (SD-112 §13.33.2) is the canonical dispatch state root's `jobs.log`:
 `${XDG_STATE_HOME:-$HOME/.local/state}/hearting/dispatch`, or the
