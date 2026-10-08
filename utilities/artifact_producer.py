@@ -8482,7 +8482,10 @@ def _observe_control_changes(root: Path, cycle_id: str, *, now: Optional[float] 
             return
         binding = artifact_locator.cycle_binding_bytes(record["campaign_id"], cycle_id,
                                                        started_on=record.get("started_on"))
-        paths = [(directory / "manifest.json", record.get("manifest_digest")),
+        journal = _read_json(journal_path(root, cycle_id)) or {}
+        manifest_expected = (journal.get("manifest_digest") if journal.get("state") == "refreshing"
+                             else record.get("manifest_digest"))
+        paths = [(directory / "manifest.json", manifest_expected),
                  (directory / artifact_locator.CYCLE_BINDING, _digest(binding)),
                  (cycle_record_path(root, cycle_id), record.get("control_record_digest") or _record_content_digest(record))]
         if locator_cache:
