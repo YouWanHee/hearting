@@ -2319,9 +2319,12 @@ def _begin_cycle_record(
             parent = read_cycle_record(root, parent_cycle_id)
             if parent is None:
                 raise ProducerError("parent-cycle-not-joinable", parent_cycle_id)
+            if parent.get("deleted_at") and read_campaign(root, parent["campaign_id"]) is None:
+                parent = None
+                parent_cycle_id = None
             # §45 D-123: a parent is a reference to any cycle of this root, in any
             # state and any campaign; it selects a campaign only when none was named.
-            if campaign is None:
+            if campaign is None and parent is not None:
                 campaign = read_campaign(root, parent["campaign_id"])
                 if campaign is None:
                     raise ProducerError("campaign-unknown", parent["campaign_id"])
@@ -4509,11 +4512,6 @@ def _record_cycle_manifest_path(root: Path, record: Mapping[str, Any]) -> Path:
         if locator:
             cycle_path = artifact_locator.safe_child(root, parent, locator)
             binding = artifact_locator.read_cycle_binding(cycle_path)
-            if binding is None:
-                raise ProducerError(
-                    "sealed-cycle-state-unknown",
-                    f"{cycle_id}: cycle-binding=missing",
-                )
         else:
             cycle_path = artifact_locator.safe_child(
                 root, artifact_locator.safe_child(root, parent, "cycles"), cycle_id
@@ -8698,6 +8696,12 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
             after={"value": new_campaign_id}, reason=reason, now=now, by=by))
         changed += [old_campaign_id, new_campaign_id]
     if updated.get("locator") != new_directory.name:
+        if old_campaign_id == new_campaign_id:
+            before_path = _cycle_rel(root, new_directory.parent / str(record.get("locator") or cycle_id))
+            lines.append(_command_line(
+                command=command, stamp=stamp, target_type="cycle", target_id=cycle_id, target_path=where,
+                operation="move", field="path", before={"value": before_path}, after={"value": where},
+                reason=reason, now=now, by=by))
         base = artifact_locator.locator_base(started, record.get("slug") or "") if started else ""
         updated["locator"] = new_directory.name
         updated["locator_suffix"] = _locator_suffix(base, new_directory.name)
@@ -9099,6 +9103,19 @@ class _LayoutScan:
         return found
 
 
+def _folder_cycle_id(folder: Path, manifest: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+    """The surviving identity, shared by the scan and its locked confirmation."""
+    try:
+        binding = artifact_locator.read_cycle_binding(folder)
+    except artifact_locator.LocatorError:
+        binding = None
+    if binding is not None:
+        return binding["cycle_id"]
+    document = manifest if manifest is not None else (_read_json(folder / "manifest.json") or {})
+    cycle_id = (document.get("cycle") or {}).get("cycle_id")
+    return cycle_id if artifact_identity.is_well_formed(cycle_id, "cycle") else None
+
+
 def _scan_layout(root: Path) -> _LayoutScan:
     """Where every campaign and cycle ID sits, read from the folders alone (a `lstat` and a few small files each).
 
@@ -9159,14 +9176,10 @@ def _scan_layout(root: Path) -> _LayoutScan:
             if child == "cycles":
                 scan.complete = False  # an old layout: moves are not judged from it
                 continue
-            try:
-                binding = artifact_locator.read_cycle_binding(path)
-            except artifact_locator.LocatorError:
-                binding = None
-            if binding is None:
+            cycle_id = _folder_cycle_id(path)
+            if cycle_id is None:
                 scan.complete = False
                 continue
-            cycle_id = binding["cycle_id"]
             if cycle_id in scan.cycles or cycle_id in scan.duplicates:
                 scan.duplicates.add(cycle_id)
                 scan.cycles.pop(cycle_id, None)
@@ -9232,11 +9245,11 @@ def _manifest_fingerprint(folder: Path) -> Optional[Tuple[int, int, int]]:
 
 
 def _preread_manifests(root: Path, changes: Mapping[str, Any]) -> Dict[str, _PreManifest]:
-    """Read, with no lock held, the manifest of each closed cycle a reconcile is about to adopt or revive."""
+    """Read, with no lock held, each moved cycle's surviving manifest and identity."""
     out: Dict[str, _PreManifest] = {}
     for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
         record = read_cycle_record(root, cycle_id)
-        if record is None or not _closed_record(record):
+        if record is None:
             continue
         fingerprint = _manifest_fingerprint(folder)
         found = _read_manifest_raw(folder)
@@ -9255,14 +9268,23 @@ def reconcile_root(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]
     copy, a link or a folder with no ID is left alone.  Best effort: it never fails its caller."""
     try:
         root = Path(root).resolve()
-        if not is_active(root) or not (root / "campaigns").is_dir():
+        if not is_active(root):
             return {"status": "inactive"}
         # The folders are read with no lock held (§45 D-124); the lock only confirms what was found.
         # A change that no longer holds when the lock is taken is looked for once more.
         for _attempt in range(2):
             published = artifact_locator._load_index(root)
             if published is None:
-                return {"status": "unchanged"}
+                # INDEX is a disposable cache. The admission rows retain
+                # last locations even when the entire campaigns tree is gone.
+                index = artifact_admission.load_index(root)
+                published = {}
+                for cycle_id, row in index.cycles.items():
+                    where = row.get("cycle_path") if isinstance(row, dict) else None
+                    record = read_cycle_record(root, cycle_id)
+                    if isinstance(where, str) and record is not None:
+                        published[cycle_id] = where
+                        published[record["campaign_id"]] = str(Path(where).parent)
             scan = _scan_layout(root)
             if scan.mapping(root) == published:
                 return {"status": "unchanged"}
@@ -9336,7 +9358,8 @@ def _look_again_before_gone(root: Path, changes: Mapping[str, Any]) -> Tuple[Dic
                        if item not in again.campaigns and item not in again.duplicates]), seen
 
 
-def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mapping[str, str]) -> bool:
+def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mapping[str, str],
+                       manifests: Optional[Mapping[str, _PreManifest]] = None) -> bool:
     """Under the lock, with `lstat` and the small files that name an ID: is each change the scan found still there?"""
     def gone(relative: str) -> bool:
         try:
@@ -9356,11 +9379,10 @@ def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mappin
         if not campaign or campaign.get("campaign_id") != campaign_id or campaign.get("locator") == folder.name:
             return False
     for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
-        try:
-            binding = artifact_locator.read_cycle_binding(folder) if folder_is(folder) else None
-        except artifact_locator.LocatorError:
-            binding = None
-        if binding is None or binding.get("cycle_id") != cycle_id:
+        pre = (manifests or {}).get(cycle_id)
+        document = (pre.found[1] if pre is not None and pre.found is not None else {}) \
+            if manifests is not None else None
+        if not folder_is(folder) or _folder_cycle_id(folder, document) != cycle_id:
             return False
     for identifier in list(changes["cycle_gone"]) + list(changes["campaign_gone"]):
         if identifier not in published or not gone(published[identifier]):
@@ -9378,12 +9400,14 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
     held = artifact_admission.holds_lock(root)
     lock_fd = None if held else artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS, now=now)
     try:
-        if artifact_locator._load_index(root) != published or not _hand_changes_hold(root, changes, published):
+        current_index = artifact_locator._load_index(root)
+        if ((current_index is not None and current_index != published)
+                or not _hand_changes_hold(root, changes, published, manifests)):
             return None
         if manifests is not None:
             for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
                 current = read_cycle_record(root, cycle_id)
-                if current is None or not _closed_record(current):
+                if current is None:
                     continue
                 pre = manifests.get(cycle_id)
                 if pre is None or pre.fingerprint != _manifest_fingerprint(folder):
@@ -9454,7 +9478,8 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             last_path = published.get(campaign_id, "") or f"campaigns/{campaign_id}"
             members = [r for r in list_cycle_records(root) if r.get("campaign_id") == campaign_id]
             for member in members:
-                if member.get("deleted_at") or not _closed_record(member) or member["cycle_id"] in seen:
+                if (member.get("deleted_at") or not _closed_record(member) or member["cycle_id"] in seen
+                        or (member.get("relocation") or {}).get("artifact_root")):
                     continue
                 _tombstone_cycle_locked(root, member, where=_last_known_path(root, member, published.get(member["cycle_id"], "")),
                                         command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
