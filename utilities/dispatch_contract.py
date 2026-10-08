@@ -3570,7 +3570,7 @@ def resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False)
 def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
     """Reconcile cleanup on an exact terminal row, preserving its committed result.
 
-    The runtime join and operator reconcile use this same bounded, signal-free
+    The runtime join and operator reconcile use this same bounded cleanup
     authority. A missing proof remains an obligation; no cancellation or retry
     receipt is issued. Process observations happen outside the registry lock.
     """
@@ -3586,6 +3586,10 @@ def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False
         return {**result, "reason": "cleanup-terminal-result-required"}
     validate_attempt_metadata(metadata)
     process = attempt_process_quiescence(metadata, terminal_receipt=True)
+    if apply and process.state == "live":
+        from route_parent_close import reap_terminal_descendants
+        reap_terminal_descendants(jobs, fields)
+        process = attempt_process_quiescence(metadata, terminal_receipt=True)
     # A namespace-extinct verdict is quiescent only from a host-like observer.
     # Still seal the existing cleanup receipt when its proof holds, so a later
     # sandboxed reader of this row sees the same settled state.
