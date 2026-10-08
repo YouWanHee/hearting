@@ -89,6 +89,36 @@ def resource_body_digest(row):
     return RESUME.row_digest(body)
 
 
+def resource_execution_succeeded(row):
+    """A past status word cannot substitute for the exact exit and sentinel."""
+    from resource_run_registry import classify_identity
+    return (row.get("status") not in {"launching", "failed"}
+            and not row.get("cancel_requested") and not row.get("parent_close_requested")
+            and classify_identity(row)[0] == "exited"
+            and supervisor().runner().read_sentinel(row.get("sentinel")) == 0)
+
+
+def resource_evidence_paths_conflict(left, right):
+    """Protect prior evidence across path roles, symlinks, and hard links."""
+    def paths(row):
+        values = [row.get(key) for key in ("log", "sentinel", "progress_file") if row.get(key)]
+        return [Path(path).resolve(strict=False) for value in values
+                for path in (value, value + ".partial")]
+    a, b = paths(left), paths(right)
+    if set(a) & set(b):
+        return True
+    def inodes(values):
+        result = set()
+        for path in values:
+            try:
+                stat = path.stat()
+                result.add((stat.st_dev, stat.st_ino))
+            except FileNotFoundError:
+                pass
+        return result
+    return bool(inodes(a) & inodes(b))
+
+
 def controller_intent(row):
     return ((row.get("owner_wait") or {}).get("launch_scope") == "codex-owner-controller"
             and row.get("launch_state") in {"queued", "claimed"}
@@ -248,6 +278,23 @@ def pending_prompt(path, parent, args=None, control=None):
                     "jobs": str(Path(args.jobs).resolve())}
         found = context(args, control)
         row = next((r for _, r in found[3] if resource_key(r) == box["key"]), None) if found else None
+        if row is None and found and found[3] and receipt.get("reason") == "awaiting-next-resource":
+            sup, route, ledger, _ = found
+            for armed, prior in sup.resource_predecessors(ledger, receipt["node"]):
+                owner = prior.get("owner_wait") or {}
+                if (armed.get("route_id") == args.route_id and armed.get("route_hash") == args.route_hash
+                        and armed.get("route_file") == str(Path(args.route_file).resolve())
+                        and armed.get("jobs") == expected["jobs"]
+                        and armed.get("successor_external") is True
+                        and armed.get("successor_command") is None
+                        and prior.get("resource_policy") == "supervised-owner"
+                        and prior.get("parent_attempt_id") == parent
+                        and owner.get("parent_attempt_id") == parent
+                        and owner.get("session_id") == control.thread_id
+                        and resource_key(prior) == box["key"]
+                        and resource_execution_succeeded(prior)):
+                    row = prior
+                    break
         if (any(receipt.get(k) != v for k, v in expected.items()) or row is None
                 or RESUME.row_digest(row) != receipt.get("resource_sha256")):
             raise JOIN.JoinContractError("resource-outbox-binding-changed")
@@ -338,7 +385,9 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
         if lost_watch and evidence.get("liveness") == "working":
             recovery = sup.reattach_resource_watch(route, ledger, armed)
             lost_watch = not (recovery and recovery.get("supervisor_alive"))
-        if stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
+        intermediate = (stage.get("state") == "RUNNING"
+                        and (stage.get("evidence") or {}).get("awaiting_next_resource") is True)
+        if intermediate or stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
             current_rows = context(args, control)[3]
             receipt_row = next((r for _, r in current_rows if resource_key(r) == key), None)
             if receipt_row is None:
@@ -349,15 +398,19 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
                 and sup.runner().read_sentinel(receipt_row.get("sentinel")) == 0
                 and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row)
                 and not artifact.get("missing"))
+            execution_only = (intermediate and evidence.get("succeeded")
+                and resource_execution_succeeded(receipt_row)
+                and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row))
             outcome = ("cancelled" if receipt_row.get("cancel_requested") else
-                       "succeeded" if proven else "needs-attention")
+                       "succeeded" if proven or execution_only else "needs-attention")
             receipt = {"type": "resource-completion", "parent_attempt_id": args.parent_attempt_id,
                 "session_id": control.thread_id, "route_id": args.route_id, "route_hash": args.route_hash,
                 "jobs": str(Path(args.jobs).resolve()), "node": armed["node"], "run_id": row["run_id"],
                 "resource_key": key, "resource_sha256": RESUME.row_digest(receipt_row), "state": outcome, "exit_code": evidence.get("exit_code"),
-                "reason": "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
+                "reason": "awaiting-next-resource" if execution_only else
+                    "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
                 "verification_pass": False, "workflow_complete": False,
-                "successors": list(armed["successors"]) if outcome == "succeeded" else []}
+                "successors": list(armed["successors"]) if proven else []}
             digest = RESUME.row_digest(receipt)
             resource["outbox"] = {"receipt_id": "resource-" + digest[:32], "digest": digest,
                                   "key": key, "receipt": receipt}

@@ -755,6 +755,21 @@ whose owner already ended hands proven resource completion to that owner's
 existing parent carrier; it does not start a new training run. Explicit parent
 close suppresses this continuation and all cancelled successors.
 
+A supervised owner can register sequential resources for one route/node using
+the same `resource-runner start`. Exact replay preserves its run; a new run may
+replace the armed predecessor only after an exact successful exit while that
+stage is still waiting for its declared outputs. The ledger lock serializes
+the binding change, preserves the prior execution evidence, and refuses active
+or failed identities, different owners, completed stages, and parent close.
+All prior bindings protect their log, sentinel and progress paths across registries
+and path aliases. Existing active workflow progress is preserved. The final payload
+release checks parent close under the same ledger lock before publishing identity
+and opening its private launch fence.
+The owner receives intermediate execution success with no successor admission;
+an unacknowledged result remains recoverable from its original binding after the
+next registration, with no lifetime receipt-count ceiling.
+The resource that supplies the declared stage outputs can complete the stage.
+
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
 `<jobs-parent>/workflow/<route-id>` even if the raising and releasing actors
@@ -781,6 +796,9 @@ predecessor's declared output artifacts. Missing, unreadable, or
 namespace-unverifiable evidence is not success. A nonzero exit, a `FAIL`/
 `BLOCKED` verdict, or an absent declared artifact records `FAILED_RETRYABLE` or
 `FAILED_TERMINAL` and starts nothing downstream.
+For a supervised owner resource, successful exit with missing stage outputs
+instead records a wait for the next resource in the existing running stage;
+the output requirement for downstream work is unchanged.
 
 **Exactly-once is claim-based, not schedule-based.** The successor key is
 derived from the sealed `route_hash`, the predecessor node, the predecessor's
@@ -851,6 +869,11 @@ its declared route node; a supervised parked owner shows that node and
 `resource-parked` instead of presenting an old model summary as current work.
 Resource liveness stays independent of the owner's model activity, and a missing
 progress declaration leaves only elapsed time and liveness (2026-10-07 SR eval-run).
+Verified working resources whose exact parent owner is no longer drawn
+remain on their project card in both Fleet views. The row reuses exact GPU
+identity and existing elapsed/progress; absent a fresh GPU match, it shows
+the resource row. Cwd places the card and never implies a session owner.
+Terminal/stale resources drop the fallback without reviving an ended owner.
 A worker card shows its assigned work, not every node in the
 route: a depth-1 frame owns only its exact frame node; the later owner owns the
 execution stages, excluding the separate pre-owner frame pair. Depth alone does
@@ -1324,6 +1347,13 @@ runtime `peer-messages/pending/` directory (0700, payload/lock files 0600).
 It is bound to the immutable transfer ref, actual sender/recipient and digest,
 not a public ledger field. Receipt removes the private body and retains the ref
 for replay deduplication; unknown, stale or ambiguous identities keep their binding.
+An external shell may have no sender session: `unknown`/empty and null sender
+fields mean an unattributed sender, not an invalid message. Its sealed ref/body
+and exact known recipient still govern delivery and receipt. Legacy unsent rows
+held only for that absent sender use the normal pending path; ambiguous sends
+remain unverified. Locked or temporarily unreadable rows stay in place for the
+next ordinary callback. Damaged private rows are moved aside with their bytes intact
+and diagnosed once, so unrelated messages proceed without repeated warnings.
 Late redelivery sends its delay notice and the sealed message in one prompt.
 The notice is transport context: receivers may remove only that recognized
 prefix with the matching transfer ref before checking the unchanged body digest.
