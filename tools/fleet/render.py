@@ -7646,14 +7646,18 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     governor_read = background_read(_collect_governor)
     hosts_read = (background_read(compute_hosts_refresh)
                   if callable(compute_hosts_refresh) else None)
-    sessions, jobs = collect_all(harness_filter=hfilter)
+    try:
+        sessions, jobs = collect_all(harness_filter=hfilter)
+    finally:
+        # Drain reads even when session collection fails; a retry must not
+        # leave an earlier observer running against the same cache.
+        governor_snapshot = governor_read.result()
+        if hosts_read is not None:
+            set_compute_hosts(hosts_read.result())
     resources = list(getattr(collect_all, "last_resource_jobs", []))
     usage_snapshots = dict(getattr(collect_all, "last_usage_snapshots", {}))
     malformed = _malformed()
     mem_snapshot = _collect_memory()
-    governor_snapshot = governor_read.result()
-    if hosts_read is not None:
-        set_compute_hosts(hosts_read.result())
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
         import shutil
@@ -8535,8 +8539,11 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     def collect_snapshot():
         nonlocal first_snapshot
         governor_read = background_read(_collect_governor)
-        sessions, jobs = collect_all(harness_filter=hfilter,
-                                     **({"fast_first": True} if first_snapshot else {}))
+        try:
+            sessions, jobs = collect_all(harness_filter=hfilter,
+                                         **({"fast_first": True} if first_snapshot else {}))
+        finally:
+            governor_snapshot = governor_read.result()
         # Only the first publication is fast: every later tick (the existing
         # background refresh) runs the full pass, filling the details the
         # first snapshot honestly left empty. --once/JSON never sets the flag.
@@ -8557,7 +8564,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             usage_snapshots=dict(getattr(collect_all, "last_usage_snapshots", {})),
             malformed=_malformed(),
             memory=_collect_memory(),
-            governor=governor_read.result(),
+            governor=governor_snapshot,
             hearting=dict(hearting) if isinstance(hearting, dict) else None,
         )
 

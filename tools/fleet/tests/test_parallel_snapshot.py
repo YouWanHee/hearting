@@ -95,6 +95,29 @@ class ParallelSnapshotTest(unittest.TestCase):
             self.assertEqual(render.render_once(lambda **kw: ([], []), None, "both"), 0)
         self.assertIsNone(build.call_args.kwargs["governor"])
 
+    def test_failed_sessions_drain_reads_and_preserve_host_failure_priority(self):
+        hosts_finished, governor_finished = threading.Event(), threading.Event()
+
+        def hosts():
+            hosts_finished.set()
+            raise ValueError("host failure")
+
+        def governor():
+            governor_finished.set()
+            return None
+
+        def sessions(**kwargs):
+            raise LookupError("session failure")
+
+        with self.quiet_renderer(), \
+             mock.patch.object(render, "_collect_governor", side_effect=governor), \
+             mock.patch.object(render, "_build_lines") as build:
+            with self.assertRaisesRegex(ValueError, "host failure"):
+                render.render_once(sessions, None, "both", compute_hosts_refresh=hosts)
+            build.assert_not_called()
+        self.assertTrue(hosts_finished.is_set())
+        self.assertTrue(governor_finished.is_set())
+
     def test_background_read_transfers_exception(self):
         def failed():
             raise LookupError("read failure")
