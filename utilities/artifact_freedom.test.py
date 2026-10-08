@@ -214,6 +214,29 @@ class ArtifactFreedomTest(FX.ProducerTestBase):
             record = P.read_cycle_record(self.root, first["cycle_id"])
             self.assertEqual(record["cycle_state"], "active")
             self.assertEqual(record["manifest_digest"], original_digest)
+            self.assertEqual(P.artifact_admission.load_index(self.root).manifests[first["cycle_id"]]["manifest_digest"],
+                             original_digest)
+            self.assertEqual(path.read_bytes(), edited)
+        self.next_work(first)
+
+    def test_manifest_only_state_edit_with_no_preserved_publication_cannot_create_completion(self):
+        route, route_file = self.route(slug="unprepared", campaign_key="freedom")
+        first = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        self.write_output(first)
+        with self.assertRaises(P.artifact_admission.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=first["cycle_id"], allow_open_route=True, crash_after_manifest=True)
+        path = Path(first["cycle_dir"]) / "manifest.json"
+        document = json.loads(path.read_text())
+        P.journal_path(self.root, first["cycle_id"]).unlink()
+        P.artifact_lifecycle.manifest_snapshot_path(self.root, first["cycle_id"],
+                                                   document["manifest_revision_id"]).unlink()
+        document["cycle"]["state"] = "completed"
+        path.write_text(json.dumps(document))
+        edited = path.read_bytes()
+        for _ in range(2):
+            P.recover(self.root)
+            self.assertEqual(P.read_cycle_record(self.root, first["cycle_id"])["state"], "open")
+            self.assertNotIn(first["cycle_id"], P.artifact_admission.load_index(self.root).manifests)
             self.assertEqual(path.read_bytes(), edited)
         self.next_work(first)
 

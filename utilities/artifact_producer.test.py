@@ -5612,6 +5612,7 @@ class RouteLineageBindingTest(ProducerTestBase):
                 record = P.read_cycle_record(self.root, cid)
                 tampered = dict(record, route_bindings=[dict(e) for e in bindings])
                 P._write_cycle_record(self.root, tampered, exclusive=False)
+                tampered = P.read_cycle_record(self.root, cid)  # includes the normal writer's observation digest
 
                 for route in (a, b, d):
                     self.assertTrue(P.cycle_route_admission(self.root, tampered, route).allow)

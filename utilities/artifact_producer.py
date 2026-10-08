@@ -6997,12 +6997,31 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
             if (directory / "manifest.json").is_file():
                 document = _read_json(directory / "manifest.json")
                 if document is not None:
+                    _raise_if_recovery_fenced(root, record["cycle_id"], now=now)
                     digest = artifact_manifest.manifest_digest(document)
                     published = artifact_lifecycle.find_manifest_snapshot(root, record["cycle_id"], manifest_digest=digest)
                     if published is None:
-                        result["open"].append(record["cycle_id"])
-                        continue
-                    _raise_if_recovery_fenced(root, record["cycle_id"], now=now)
+                        # Older interrupted publications may have no copy or
+                        # journal. Use their actual terminal proof, never a
+                        # state field alone, before admitting a new result.
+                        identity = artifact_lifecycle.read_root_identity(root)
+                        cycle = document.get("cycle") or {}
+                        valid_identity = (identity is not None
+                                          and document.get("artifact_root_id") == identity.artifact_root_id
+                                          and cycle.get("cycle_id") == record["cycle_id"]
+                                          and cycle.get("campaign_id") == record["campaign_id"]
+                                          and (document.get("producer") or {}).get("producer_id") == record["producer_id"])
+                        try:
+                            route_file, _ = resolve_cycle_manifest_route(root, record, document)
+                            completion = artifact_lifecycle.evaluate_cycle_completion(
+                                document, content_root=directory, route_file=route_file,
+                                expected_root_id=identity.artifact_root_id if identity else None)
+                            valid = valid_identity and completion.ok
+                        except (ProducerError, artifact_lifecycle.LifecycleError, OSError, ValueError):
+                            valid = False
+                        if not valid:
+                            result["open"].append(record["cycle_id"])
+                            continue
                     artifact_locator.prepare_index_update(root, [record["campaign_id"]])
                     _commit_sealed(root, record, document, artifact_manifest.manifest_digest(document), now=now)
                     result["rolled_forward"].append(record["cycle_id"])
