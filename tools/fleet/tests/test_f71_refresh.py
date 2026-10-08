@@ -158,6 +158,7 @@ class RefreshPumpTest(unittest.TestCase):
         # failures that passed when that file ran alone).
         self.addCleanup(setattr, render, "_REFRESH_HEALTH", render._REFRESH_HEALTH)
         collector_entered = threading.Event()
+        governor_entered = threading.Event()
         release = threading.Event()
         getch_called = threading.Event()
         collector_threads = []
@@ -186,6 +187,10 @@ class RefreshPumpTest(unittest.TestCase):
         def run_loop():
             result.append(render._loop(Screen(), collector, None, "both", 2.0))
 
+        def governor_read():
+            governor_entered.set()
+            return None
+
         # After `release`, the snapshot worker still runs the side collectors.
         # Unpatched, `_malformed()` first-imports collectors.dispatch (~80
         # modules, compiled from source under PYTHONDONTWRITEBYTECODE) and
@@ -196,13 +201,14 @@ class RefreshPumpTest(unittest.TestCase):
              mock.patch.object(render.curses, "curs_set"), \
              mock.patch.object(render, "_malformed", return_value=0), \
              mock.patch.object(render, "_collect_memory", return_value=None), \
-             mock.patch.object(render, "_collect_governor", return_value=None), \
+             mock.patch.object(render, "_collect_governor", side_effect=governor_read), \
              mock.patch.dict(render.os.environ, {"HERDR_ENV": "1"}):
             thread = threading.Thread(target=run_loop)
             thread.start()
             # The collector stays blocked until `release`, so these waits are
             # hang guards: getch is reached while it is blocked or never.
             self.assertTrue(collector_entered.wait(5.0))
+            self.assertTrue(governor_entered.wait(5.0))
             self.assertTrue(getch_called.wait(5.0))
             release.set()
             # Hang guard only; `_loop` itself bounds its exit by its 1.0s stop join.
