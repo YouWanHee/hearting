@@ -1439,7 +1439,7 @@ about a real target (`source=watch`; a mistyped target leaves no flag), or by a
 `peer-steward.py start` that launched a session (`source=start`). No `record` path and
 no send raises it — not a steer/handoff/gate-relay and not a `SendMessage` with `notify_when_idle`, which the
 Claude hook records as `kind=watch`. Fleet renders an evidenced marker
-as the pink tag and model flag only for targets confirmed in the same repository.
+as the pink tag and leading relation flag only for targets confirmed in the same repository.
 Fleet and herdr use `steward.role_targets` for that display decision, comparing
 Git common directories (so linked worktrees count as the same repository) from
 existing session metadata. Unknown or foreign repository targets grant no role,
@@ -1449,11 +1449,18 @@ reads one supervisor per target: the newest same-repository start/watch/explicit
 evidence wins, with a stable identity tie-break. Sessions with their own winning
 targets form separate supervisor groups; supervisor-to-supervisor relations
 remain communication (`✉`). This shared projection is a display handover, not a
-refusal or marker rewrite. Supervisor groups share one connector column under
-the first character inside `[id]`, with `╷`/`╵` half-line ends between identities
-(`│` for a one-row gap). All session detail text and box left edges clear that
-column by two spaces, even without a connector; model, routing, NOW and box
-right-edge anchors stay fixed. Depth-1 frame cards use the owner model/gauge,
+refusal or marker rewrite. Every session's first row keeps its status glyph first,
+then a two-cell relation slot and a space before the aligned `[id]`: supervisors
+use `⚑ `, visible targets use `├╌` (last target `╰╌`), and unrelated sessions leave
+the slot blank. A subtle explicit grey `┆` continues in the slot's first column
+from below the supervisor through the row above its last target, including owner
+boxes. An off-screen target leaves only the supervisor's flag. Detail text and
+box left edges retain column 8; title, model-detail, routing, NOW and box right-edge
+anchors stay fixed. The first-row harness/model field absorbs the three added
+cells in wide layouts. Narrow/stack first-row titles start two cells later for
+every session, preserving the full `opencode` label and a following gap while
+only the title's trailing budget shrinks; detail anchors stay fixed.
+Depth-1 frame cards use the owner model/gauge,
 routing and close-rail status layout on every harness; worker layouts retain
 their existing columns. Fleet ignores a marker whose entries carry no role source;
 `peer-message prune-steward-markers [--apply]` lists/removes those, and `peer-steward.py steward off` (or `peer-message release`)
