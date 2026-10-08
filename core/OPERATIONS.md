@@ -1467,7 +1467,11 @@ existing session metadata. Unknown or foreign repository targets grant no role,
 connector or pink tag; cross-repository messages remain communication (`✉`).
 No new role probe or execution authority follows from this projection. Fleet
 reads one supervisor per target: the newest same-repository start/watch/explicit
-evidence wins, with a stable identity tie-break. Sessions with their own winning
+evidence wins, with a stable identity tie-break. A session's watch of the
+same-repository supervisor that started it is reply-wait communication, not
+supervisor-role evidence. The common lookup excludes that reverse watch after
+resolving the start's exact/name/alias identities; the watch record and its actual
+wait/wake behavior stay intact. Sessions with their own winning
 targets form separate supervisor groups; supervisor-to-supervisor relations
 remain communication (`✉`). This shared projection is a display handover, not a
 refusal or marker rewrite. Every session's first row keeps its status glyph first,
