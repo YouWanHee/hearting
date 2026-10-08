@@ -193,6 +193,12 @@ they must not expose the whole agent home or grant contract edits. Existing
 worker write guards remain in force. A spec-read marker records an observed
 read and does not deliver file contents or prove that a contract was read.
 
+Worker runtime defaults must not index the full working directory before the
+first turn. OpenCode worker homes disable native snapshots in both their private
+config and the invocation's inline config (which overrides project config).
+Git and the existing Hearting artifact/checkpoint records retain work evidence;
+the worker has no OpenCode UI undo snapshot. Interactive user config is preserved.
+
 A portable capability describes:
 
 - trigger semantics;

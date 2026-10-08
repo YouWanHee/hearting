@@ -971,6 +971,12 @@ join retains every owned attempt, including `done` rows, until the exact process
 group and tagged descendants are settled. `dispatch-reconcile --attempt <id>
 --apply` uses the same bounded cleanup proof authority on terminal rows; it
 preserves the result, marker, and delivery receipt and grants no retry credit.
+After the recorded leader has exited, the existing post-exit watcher and applied
+cleanup terminate its exact attempt-tagged leftovers with TERM, then bounded
+KILL. They revalidate the row, namespace and PID birth before signalling, and
+preserve resource/compute runs and their branches under the same protection as
+parent close. A live leader or unknown identity remains pending. This applies
+equally to all three harnesses and requires no caller input.
 An exact authenticated portable cleanup receipt remains settled when a later
 same-namespace tag scan cannot read an unrelated process and the current owned
 group is empty; any visible live leader, group member or tagged

@@ -114,6 +114,23 @@ class WorkerHomes(unittest.TestCase):
         self.assertEqual((home / 'plugins').resolve(), (self.source / 'plugins').resolve())
         self.assertEqual(env['OPENCODE_DISABLE_CLAUDE_CODE_PROMPT'], '1')
 
+    def test_opencode_all_worker_types_override_snapshot_without_changing_user_config(self):
+        config = {'snapshot': True, 'permission': {'bash': {'secret *': 'deny'}}}
+        source = self.source / 'opencode.json'
+        source.write_text(json.dumps(config))
+        self.env.update(OPENCODE_CONFIG_DIR=str(self.source),
+                        OPENCODE_CONFIG_CONTENT=json.dumps({'snapshot': True, 'model': 'test/model'}))
+        before = source.read_bytes()
+        for typ in ('owner', 'stage', 'review', 'support', 'frame'):
+            env = prepare_worker_home(ROOT, 'opencode', typ, 'snapshot-' + typ, env=self.env)
+            actual = json.loads((Path(env['OPENCODE_CONFIG_DIR']) / 'opencode.json').read_text())
+            self.assertFalse(actual['snapshot'])
+            inline = json.loads(env['OPENCODE_CONFIG_CONTENT'])
+            self.assertFalse(inline['snapshot'])
+            self.assertEqual(inline['model'], 'test/model')
+            self.assertEqual(actual['permission']['bash'], config['permission']['bash'])
+        self.assertEqual(source.read_bytes(), before)
+
     def test_profile_specialization_uses_same_guard_preserving_home(self):
         (self.source / 'settings.json').write_text('{"permissions":{"deny":["Read(secret)"]}}')
         self.env['CLAUDE_CONFIG_DIR'] = str(self.source)
