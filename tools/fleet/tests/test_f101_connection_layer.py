@@ -353,7 +353,10 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     Exception on record: 2026-09-29 the usage-header label for that same harness became
     "opencode go" (user: 상단 opencode→opencode go, so the row names the GO account whose
     quota it shows, matching 'claude code') — the four r7 goldens were regenerated with
-    the exact capture procedure above; the only diff was that one label line per width."""
+    the exact capture procedure above; the only diff was that one label line per width.
+    Exception on record: 2026-10-08 the approved shared detail inset and aligned
+    MAIN/OWNER/FRAME gauge anchor moved the three context tracks from 12 to 20;
+    these four goldens record that intentional layout change."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

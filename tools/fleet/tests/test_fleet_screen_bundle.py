@@ -1,4 +1,4 @@
-"""Approved 1008 bundle: OWNER rails/columns, under-id hierarchy, GPU folds, memory events."""
+"""Approved 1008 bundle: OWNER/FRAME columns, flat supervisor lines, GPU folds, memory events."""
 import copy
 import datetime
 import os
@@ -152,19 +152,16 @@ class BundleTest(unittest.TestCase):
         self.assertTrue(any("╰" in row and "dead-runtime-exit resume=execute" in row for row in rows))
 
     def hierarchy(self):
-        a = session("aa", steward=True, steward_targets=[target("bb"), target("cc")])
+        a = session("aa", steward=True, steward_targets=[target("cc")])
         b = session("bb", steward=True, steward_targets=[target("old-dd"), target("ee")])
         c, d, e, z = [session(sid) for sid in ("cc", "dd", "ee", "zz")]
         d.session_aliases = ["old-dd"]
-        b.steward_targets.append(target("aa"))  # cycle
-        c.steward = True
-        c.steward_targets = [target("dd")]      # shared target
         return [z, c, e, d, b, a]
 
-    def test_hierarchy_uses_target_order_aliases_and_breaks_cycles_once(self):
+    def test_flat_groups_use_target_order_aliases_and_emit_each_session_once(self):
         sessions = self.hierarchy()
         ordered = render._sort_group_sessions(sessions + [sessions[-1]])
-        self.assertEqual([s.session_id for s in ordered], ["aa", "bb", "dd", "ee", "cc", "zz"])
+        self.assertEqual([s.session_id for s in ordered], ["aa", "cc", "bb", "dd", "ee", "zz"])
         for shuffled in (list(reversed(sessions)), sessions[2:] + sessions[:2]):
             self.assertEqual([s.session_id for s in render._sort_group_sessions(shuffled)],
                              [s.session_id for s in ordered])
@@ -183,11 +180,17 @@ class BundleTest(unittest.TestCase):
                    for sid in ("aa", "bb", "cc", "dd", "ee", "zz")}
             # Every MAIN chip keeps its original column and no line overlays an ID.
             for sid, i in ids.items():
-                self.assertEqual(rows[i].index("[%s]" % sid), render._STEWARD_LINE_COL)
+                self.assertEqual(rows[i].index("[%s]" % sid) + 1, render._STEWARD_LINE_COL)
                 self.assertNotIn("│", rows[i])
-            for i in range(ids["aa"] + 1, ids["cc"]):
-                if i not in ids.values():
-                    self.assertEqual(rows[i][render._STEWARD_LINE_COL], "│", rows[i])
+            for parent, end in (("aa", "cc"), ("bb", "ee")):
+                for i in range(ids[parent] + 1, ids[end]):
+                    if i in ids.values():
+                        continue
+                    below = i - 1 in ids.values()
+                    above = i + 1 in ids.values()
+                    mark = "│" if below == above else "╷" if below else "╵"
+                    self.assertEqual(rows[i][render._STEWARD_LINE_COL], mark, rows[i])
+                    self.assertEqual(rows[i][render._STEWARD_LINE_COL + 1:render._RAIL_COL], "  ")
             self.assertTrue(any("│" in r and "╭" in r for r in rows))
             box = [r for r in rows if "╭" in r or "╰" in r]
             self.assertTrue(all(r.index(r[-1]) == render._dispatch_box_width(width, render._layout_mode(width)) - 1
@@ -198,7 +201,7 @@ class BundleTest(unittest.TestCase):
         original = render._session_row_2line(session("aa", model="MODEL", effort="medium"))[1]
         joined = render._under_id_connector(original)
         self.assertIn("3h", render._plain(joined))
-        self.assertIn("│ 3h", render._plain(joined))
+        self.assertIn("│  3h", render._plain(joined))
         self.assertEqual(render._plain(original).index("MODEL"), render._plain(joined).index("MODEL"))
         worker = DispatchJob(key="code-execute", harness="codex", depth=2, worker_type="stage",
                              model="MODEL", effort="medium", liveness="working", elapsed_min=17)
@@ -327,7 +330,7 @@ class BundleTest(unittest.TestCase):
                     if "╰" in row:
                         inside = False
                     if inside or "╰" in row:
-                        self.assertEqual(row[render._STEWARD_LINE_COL], "│", row)
+                        self.assertIn(row[render._STEWARD_LINE_COL], "│╷╵", row)
                 self.assertNotIn("╭│", "\n".join(rows))
                 self.assertNotIn("││", "\n".join(rows))
                 self.assertTrue(any("9m" in row and row[render._RAIL_COL] == "│"
@@ -341,7 +344,7 @@ class BundleTest(unittest.TestCase):
         start = before.index("━")
         self.assertEqual(before[start:], after[start:])
         self.assertIn(" 82%", after)
-        self.assertIn("│ herdr", after)
+        self.assertIn("│  herdr", after)
 
     def test_long_korean_owner_title_cannot_move_routing_anchor(self):
         main = session("aa", model="gpt-6.1-sol", effort="xhigh")
@@ -378,39 +381,67 @@ class BundleTest(unittest.TestCase):
         self.assertEqual(render._dw(shown), 99)
         self.assertTrue(shown.endswith("… │"), shown)
 
-    def test_nested_supervisor_lanes_end_at_last_direct_target_and_boxes_clear_both(self):
-        for last in (True, False):
-            root = session("aa", steward=True, steward_targets=[target("bb")])
-            inner = session("bb", steward=True, steward_targets=[target("cc"), target("dd")])
-            children = [session("cc"), session("dd")]
-            if not last:
-                root.steward_targets.append(target("ee"))
-                children.append(session("ee"))
-            review = DispatchJob(key="code", slug="review", worker_type="review", depth=1,
-                                 harness="codex", model="gpt-6.1-sol", effort="xhigh",
-                                 cwd=root.cwd, parent_sid="bb", is_child=True, liveness="working")
-            for width in (100, 168):
-                rows = text(self.build([root, inner] + children, [review], width))
-                ids = {sid: next(i for i, row in enumerate(rows) if "[%s]" % sid in row)
-                       for sid in ("aa", "bb", "cc", "dd")}
-                for i in range(ids["bb"] + 1, ids["dd"]):
-                    if i in ids.values():
-                        continue
-                    self.assertEqual(rows[i][6], "│", rows[i])
-                    self.assertEqual(rows[i][4] == "│", not last, rows[i])
-                box = next(row for row in rows if "╭" in row)
-                self.assertEqual(box.index("╭"), 8)
-                self.assertEqual(box[-1], "╮")
-                for i in ids.values():
-                    self.assertNotIn("│", rows[i])
+    def test_detail_inset_is_identical_with_and_without_supervisor_lines(self):
+        parent = session("aa", steward=True, steward_targets=[target("bb")],
+                         model="MODEL", effort="high", herdr_attached=True, summary="NOWTEXT")
+        child = session("bb", model="MODEL", effort="high", herdr_attached=True, summary="NOWTEXT")
+        for width in (60, 100, 168):
+            rows = text(self.build([parent, child], width=width))
+            where = [row for row in rows if "herdr" in row and "NOWTEXT" in row]
+            self.assertEqual([row.index("herdr") for row in where], [render._SESSION_DETAIL_COL] * 2)
+            self.assertEqual([row.index("NOWTEXT") for row in where], [render._NAME_COL] * 2)
+            self.assertEqual(where[0][render._STEWARD_LINE_COL], "│" if width == 168 else "╵")
+            self.assertEqual(where[1][render._STEWARD_LINE_COL], " ")
+            if width != 168:
+                elapsed = [row for row in rows if "3h 00m" in row and "MODEL" in row]
+                self.assertEqual([row.index("3h 00m") for row in elapsed], [render._SESSION_DETAIL_COL] * 2)
+                self.assertEqual([row.index("MODEL") for row in elapsed], [4 + render._HW] * 2)
 
-    def test_inner_lane_moves_the_complete_elapsed_word_including_its_space(self):
-        row = render._session_row_2line(session("aa", model="MODEL", effort="high"))[1]
-        before = render._plain(row)
-        connected = render._plain(render._under_id_connector(row, 6))
-        self.assertIn("│ 3h 00m", connected)
-        self.assertEqual(before.index("MODEL"), connected.index("MODEL"))
-        self.assertNotIn("3h│00m", connected)
+    def test_single_row_between_identities_has_a_full_line(self):
+        parent = session("aa", steward=True, steward_targets=[target("bb")])
+        rows = text(self.build([parent, session("bb")], width=168))
+        start = next(i for i, row in enumerate(rows) if "[aa]" in row)
+        end = next(i for i, row in enumerate(rows) if "[bb]" in row)
+        self.assertEqual(end - start, 2)
+        self.assertEqual(rows[start + 1][render._STEWARD_LINE_COL], "│")
+
+    def test_mixed_owner_frame_worker_columns_across_harnesses_and_widths(self):
+        main = session("aa", model="MAINMODEL", effort="xhigh", ctx_pct=50,
+                       context_window_tokens=1000000, herdr_attached=True)
+        main.route_chain = {"visible": True, "nodes": [{"label": "MAINROUTE", "state": "open"}]}
+        jobs = []
+        for harness, model in (("claude", "Opus"), ("codex", "gpt-6.1-sol"), ("opencode", "gpt-6-luna")):
+            for kind in ("owner", "frame", "stage"):
+                key = {"owner": "code", "frame": "route-frame", "stage": "code-execute"}[kind]
+                jobs.append(DispatchJob(key=key, slug=harness + "-" + kind, cwd=main.cwd,
+                                        parent_sid="aa", is_child=True, depth=1, worker_type=kind,
+                                        harness=harness, model=model, effort="xhigh", elapsed_min=17,
+                                        capability_owner="autopilot-" + key, intensity="standard",
+                                        stage="running", liveness="working", ctx_pct=50,
+                                        work_projection=WorkProjection(source="route", stage_label="frame 0/1")
+                                        if kind == "frame" else None))
+        for width in (60, 100, 168):
+            with self.subTest(width=width):
+                lines = self.build([main], jobs, width)
+                rows = text(lines)
+                layout = render._layout_mode(width)
+                anchor = render._session_routing_column(layout, render._wide_name_width(width))
+                starts = []
+                for row in lines:
+                    pos = 0
+                    for value, key in row or ():
+                        if key == "name_dim" and value in ("code", "route-frame"):
+                            starts.append(pos)
+                        if not render._is_fill(value):
+                            pos += render._dw(value)
+                self.assertEqual(starts, [anchor] * 6)
+                gauges = [row.index("━") for row in rows if "━" in row and "50%" in row]
+                self.assertEqual(gauges.count(4 + render._HW), 7)  # MAIN + three OWNER/FRAME pairs
+                self.assertEqual(gauges.count(17), 3)              # original worker detail column
+                self.assertEqual(sum("frame 0/1" in row for row in rows if "╰" in row), 3)
+                self.assertFalse(any("frame 0/1" in row for row in rows if "╭" in row or "│" in row))
+                self.assertTrue(all(row.index("╭") == render._SESSION_DETAIL_COL
+                                    for row in rows if "╭" in row))
 
 
 class SameRepositoryRoleTest(unittest.TestCase):
@@ -541,10 +572,14 @@ class SameRepositoryRoleTest(unittest.TestCase):
                  mock.patch.object(herdr, "_clear_gpu_session_aliases", return_value=[]), \
                  mock.patch.object(herdr_projection.os, "getcwd", return_value=str(self.repo)):
                 steward.enrich(rows)
-                self.assertEqual([t["session_id"] for t in root.steward_targets], ["inner"])
+                self.assertIsNone(root.steward_targets)
+                self.assertFalse(root.steward)
                 self.assertEqual([t["session_id"] for t in inner.steward_targets], ["child-new"])
                 self.assertEqual(child.steward_parents[0]["session_id"], "inner")
                 self.assertEqual(len(child.steward_parents), 1)
+                self.assertIsNone(inner.steward_parents)
+                self.assertEqual(steward.role_targets("claude", "root", markers=markers, sessions=rows), [])
+                self.assertFalse(herdr_projection.is_steward("claude", "root"))
                 self.assertFalse(foreign.steward)
                 self.assertTrue(herdr_projection.is_steward(harness, "inner"))
                 self.assertEqual(markers, before)

@@ -17,8 +17,8 @@ FULL, EMPTY = render._BAR_FULL, render._BAR_EMPTY
 
 
 def track_of(row):
-    """The gauge track text of a context detail row (the two segments after the lead cell)."""
-    return "".join(value for value, _key in row[0][2:4])
+    """The measured track, independent of detail padding segments."""
+    return "".join(value for value, _key in row[0] if value and all(ch in (FULL, EMPTY) for ch in value))
 
 
 class F52aGlyphTest(unittest.TestCase):
@@ -256,15 +256,15 @@ class F100bNarrowDegradeTest(unittest.TestCase):
 
     def test_now_yields_before_the_chip(self):
         wide = "".join(v for v, _k in self._row(168))
-        tight = "".join(v for v, _k in self._row(36))
+        tight = "".join(v for v, _k in self._row(40))
         self.assertIn("NOW", wide)
         self.assertNotIn("NOW", tight)
-        self.assertEqual(self._lead_text(self._row(36)), render._CTX_ON_TEXT.ljust(7) + " ")
+        self.assertEqual(self._lead_text(self._row(40)), render._CTX_ON_TEXT.ljust(7) + " ")
 
     def test_the_chip_yields_whole_only_when_it_cannot_share_the_row(self):
-        # 4 indent + 8 slot + 16 track + 4 value = 32 cells is the last width that fits.
-        self.assertEqual(self._lead_text(self._row(32)), render._CTX_ON_TEXT.ljust(7) + " ")
-        degraded = self._row(31)
+        # MAIN/OWNER/FRAME gauge anchor 20 + 16 track + 4 value = 40 cells.
+        self.assertEqual(self._lead_text(self._row(40)), render._CTX_ON_TEXT.ljust(7) + " ")
+        degraded = self._row(39)
         visible = "".join(v for v, _k in degraded)
         self.assertNotIn("herdr", visible)
         self.assertNotIn("herd", visible)
@@ -273,7 +273,7 @@ class F100bNarrowDegradeTest(unittest.TestCase):
         self.assertIn(degraded[1][0][0], (FULL, EMPTY))
 
     def test_a_short_track_keeps_the_chip_at_widths_a_full_track_could_not(self):
-        self.assertEqual(self._lead_text(self._row(24, window=256000)),
+        self.assertEqual(self._lead_text(self._row(28, window=256000)),
                          render._CTX_ON_TEXT.ljust(7) + " ")
 
     def test_the_chip_is_whole_or_absent_never_clipped(self):
@@ -292,8 +292,8 @@ class F100bNarrowDegradeTest(unittest.TestCase):
 
 class F52WidthLedgerTest(unittest.TestCase):
     def test_left_anchor_is_untouched_and_the_wide_slack_ledger_holds(self):
-        # F-52's left anchor is independent of every wide-row width edit and never moves.
-        self.assertEqual(render._CONTEXT_INDENT_W, 4)
+        # Approved 1008 detail inset clears the one supervisor line by two spaces.
+        self.assertEqual(render._CONTEXT_INDENT_W, 8)
         # F-57 (v41) removed the dead `_CTX_W` (24) term from `fixed_row` and the `_CTX_BOOST`
         # (12) skim from the allocator; F-58 (v44) then narrowed `_HMW` 42→32, which shrinks
         # `_NAME_COL` — and therefore `fixed_row` — by another 10; F-64 (v49) widened `_HMW`
