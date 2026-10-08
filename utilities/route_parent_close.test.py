@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Safe real-process fixtures for parent close; no provider or live project runs."""
 from __future__ import annotations
+from types import SimpleNamespace
+import contextlib
+import io
+import time
 import importlib.util
 import json
 import os
@@ -95,12 +99,12 @@ class ParentCloseTest(unittest.TestCase):
     def aid(self, name):
         return name + "-" + self.suffix
 
-    def process(self, aid, *, ignore_term=False, script=None):
+    def process(self, aid, *, ignore_term=False, script=None, env=None):
         script = script or ("import signal,time; " +
             ("signal.signal(signal.SIGTERM,signal.SIG_IGN); " if ignore_term else "") +
             "print('ready',flush=True); time.sleep(300)")
         process = subprocess.Popen([sys.executable, "-c", script], start_new_session=True,
-            stdout=subprocess.PIPE, text=True, env={**os.environ, "AGENT_DISPATCH_ATTEMPT_ID": self.aid(aid)})
+            stdout=subprocess.PIPE, text=True, env={**os.environ, "AGENT_DISPATCH_ATTEMPT_ID": self.aid(aid), **(env or {})})
         self.processes.append(process)
         self.assertTrue(select.select([process.stdout], [], [], 5)[0])
         self.assertEqual(process.stdout.readline().strip(), "ready")
@@ -135,6 +139,221 @@ class ParentCloseTest(unittest.TestCase):
 
     def close(self, **kwargs):
         return CLOSE.close(self.route, self.path, jobs=self.jobs, **kwargs)
+
+    def test_attached_then_advanced_owner_and_old_children_close_current_binding(self):
+        import owner_route_binding as OWNER
+        owner = self.process("att-owner")
+        self.row("att-owner", process=owner, owner_route_file="", owner_route_id="", owner_route_hash="")
+        self.route.update(advance_generation=0, owner_attempt_id=self.aid("att-owner"),
+                          route_family_key="fixture-family")
+        self.path.write_text(json.dumps(self.route))
+        env = {"AGENT_DISPATCH_ATTEMPT_ID": self.aid("att-owner"),
+               "AGENT_DISPATCH_WORKER_TYPE": "owner", "AGENT_DISPATCH_DEPTH": "1",
+               "AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION": "2",
+               "AGENT_DISPATCH_EXECUTION_SURFACE": "registered-headless",
+               "AGENT_DISPATCH_REGISTERED_WORKER": "1", "AGENT_DISPATCH_OWNER_HARNESS": "codex",
+               "AGENT_DISPATCH_PARENT_SESSION_ID": "fixture-parent", "AGENT_DISPATCH_JOBS": str(self.jobs)}
+        with mock.patch.object(OWNER.ROUTE, "verify_route", side_effect=lambda raw, *a, **k: raw):
+            OWNER.publish_owner_route_attachment_from_environment(self.jobs,
+                target_route={**self.route, "route_file": str(self.path)}, environ=env)
+            old = self.route.copy()
+            old_child = self.process("att-old")
+            self.row("att-old", parent="att-owner", process=old_child)
+            advanced = {**old, "route_id": old["route_id"] + "-next", "route_hash": "sha256:next",
+                "advance_generation": 1, "source_route_id": old["route_id"],
+                "source_route_hash": old["route_hash"], "source_route_supersession": {
+                    "from_route_id": old["route_id"], "from_route_hash": old["route_hash"]}}
+            next_path = self.path.with_name(advanced["route_id"] + ".json")
+            next_path.write_text(json.dumps(advanced))
+            OWNER.publish_owner_route_advance_from_environment(self.jobs,
+                source_route={**old, "route_file": str(self.path)},
+                target_route={**advanced, "route_file": str(next_path)}, environ=env)
+            self.route, self.path = advanced, next_path
+            self.row("att-new", parent="att-owner", process=self.process("att-new"),
+                route_file=str(next_path), route_node=self.route["nodes"][0]["id"],
+                unit="dev/backend", capability="autopilot-code", capability_mode="dev",
+                artifact_root=str(self.artifacts), intensity="standard")
+            original = self.jobs.read_text()
+            value = CLOSE.request(self.route, self.path, jobs=self.jobs)
+            self.jobs.write_text(original)  # Interrupted before row annotations.
+            old_meta = CLOSE._rows(self.jobs)[self.aid("att-old")][1]
+            self.assertTrue(CLOSE.row_requested(old_meta, self.jobs))
+            self.assertEqual(CLOSE.recover_attempt(self.jobs, old_meta)["state"], "cancelled")
+            self.assertIn(self.aid("att-old"), value["attempts"])
+            replay = work_start.start_work(old, Path(old_meta.get("route_file") or self.path), self.jobs)
+            self.assertEqual(replay["state"], "cancelled")
+            self.assertNotIn("resume_command", replay)
+        self.assertIsNotNone(owner.poll())
+        self.assertIsNotNone(old_child.poll())
+
+    def test_same_group_foreign_resource_and_watcher_survive_both_choices(self):
+        for stop in (False, True):
+            child = ParentCloseTest(); child.setUp()
+            try:
+                pidfile = child.base / "branches.json"
+                script = ("import os,time,json; ps=[]\n"
+                    "for i in range(3):\n"
+                    " p=os.fork()\n"
+                    " if not p: time.sleep(300); os._exit(0)\n"
+                    " ps.append(p)\n"
+                    "open(" + repr(str(pidfile)) + ",'w').write(json.dumps(ps))\n"
+                    "print('ready',flush=True); time.sleep(300)")
+                owner = child.process("att-owner", script=script)
+                child.row("att-owner", process=owner)
+                target, foreign, watcher = json.loads(pidfile.read_text())
+                registry, _ = child.resource(SimpleNamespace(pid=target))
+                data = json.loads(registry.read_text())
+                data["runs"]["foreign"] = {**RR.proc_identity(foreign), "run_id": "foreign",
+                    "process_group": owner.pid, "parent_attempt_id": "att-other", "route": "/other/route",
+                    "supervision": RR.proc_identity(watcher), "status": "running"}
+                registry.write_text(json.dumps(data))
+                result = child.close(stop_resources=stop)
+                self.assertEqual(result["state"], "cancelled")
+                self.assertEqual(DC.process_observation(target)[0] == "present" and
+                    DC.process_observation(target)[2] != "Z", not stop)
+                for pid in (foreign, watcher):
+                    self.assertEqual(DC.process_observation(pid)[0], "present")
+                    self.assertNotEqual(DC.process_observation(pid)[2], "Z")
+            finally:
+                child.doCleanups()
+
+    def test_wrong_resource_namespace_remains_pending_without_local_pid_signals(self):
+        owner = self.process("att-owner"); self.row("att-owner", process=owner)
+        resource = self.process("att-owner")
+        registry, run = self.resource(resource)
+        run["pid_namespace"] = "pid:[foreign-namespace]"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": run}}))
+        result = self.close(stop_resources=True)
+        self.assertEqual(result["state"], "termination-pending")
+        self.assertEqual(result["resources"][0]["state"], "termination-pending")
+        self.assertIsNone(resource.poll())
+        self.assertIsNotNone(owner.poll())
+        self.assertNotIn((resource.pid, run["starttime"]), CLOSE._protected([
+            {"kind": "resource", "row": run}]))
+        run["pid_namespace"] = os.readlink("/proc/self/ns/pid")
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": run}}))
+        self.assertEqual(self.close()["state"], "cancelled")
+        self.assertIsNotNone(resource.poll())
+
+    def test_escaped_payload_is_durable_after_root_exit_and_observer_restart(self):
+        owner = self.process("att-owner"); self.row("att-owner", process=owner)
+        pidfile = self.base / "escaped.pid"
+        script = ("import os,time,signal; p=os.fork()\n"
+            "if not p:\n os.setsid(); signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(300); os._exit(0)\n"
+            "open(" + repr(str(pidfile)) + ",'w').write(str(p)); print('ready',flush=True); time.sleep(300)")
+        resource = self.process("att-owner", script=script)
+        registry, run = self.resource(resource)
+        payload = int(pidfile.read_text())
+        value = CLOSE.request(self.route, self.path, jobs=self.jobs, stop_resources=True)
+        self.assertIn(payload, {p for p, _ in value["resource_branches"]["fixture-run"]})
+        resource.terminate(); resource.wait(timeout=2)
+        registry.unlink()  # The durable intent survives deleted runtime sidecar.
+        self.assertEqual(CLOSE.recover_attempt(self.jobs,
+            CLOSE._rows(self.jobs)[self.aid("att-owner")][1])["state"], "cancelled")
+        self.assertIn(DC.process_observation(payload)[2], (None, "", "Z"))
+
+    def test_payload_born_during_term_grace_is_captured_by_exact_resource_tag(self):
+        owner = self.process("att-owner"); self.row("att-owner", process=owner)
+        pidfile = self.base / "new-payload.pid"
+        script = ("import os,time,signal\n"
+            "def term(s,f):\n signal.signal(signal.SIGTERM,signal.SIG_IGN); p=os.fork()\n"
+            " if not p: os.setsid(); time.sleep(300); os._exit(0)\n"
+            " open(" + repr(str(pidfile)) + ",'w').write(str(p))\n"
+            "signal.signal(signal.SIGTERM,term); print('ready',flush=True); time.sleep(300)")
+        resource = self.process("att-owner", script=script, env={
+            "HEARTING_RESOURCE_RUN_ID": "fixture-run",
+            "HEARTING_RESOURCE_REGISTRY": str(self.base / "resources.json")})
+        self.resource(resource)
+        self.assertEqual(self.close(stop_resources=True)["state"], "cancelled")
+        payload = int(pidfile.read_text())
+        self.assertIn(DC.process_observation(payload)[2], (None, "", "Z"))
+        ledger = WS.WorkflowLedger(self.route["route_id"], self.route["route_hash"], jobs=self.jobs)
+        value = CLOSE.ledger_intent(self.route, ledger)
+        self.assertIn(payload, {p for p, _ in CLOSE._saved_branches(value, ledger)["fixture-run"]})
+
+    def test_pending_cancel_blocks_poll_and_all_direct_gate_mutators(self):
+        owner = self.process("att-owner"); self.row("att-owner", process=owner)
+        CLOSE.request(self.route, self.path, jobs=self.jobs)
+        ledger = WS.WorkflowLedger(self.route["route_id"], self.route["route_hash"], jobs=self.jobs)
+        with mock.patch.object(SUP, "_evaluate", side_effect=AssertionError("advance")), \
+             mock.patch.object(SUP, "read_armed", return_value={}):
+            self.assertEqual(SUP.poll_once(self.route, ledger), [{"action": "cancelled"}])
+        args = SimpleNamespace(route=str(self.path), jobs=str(self.jobs))
+        for command in (SUP.cmd_arm, SUP.cmd_gate, SUP.cmd_release, SUP.cmd_complete):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(command(args), 0)
+            self.assertEqual(json.loads(output.getvalue())["reason"], CLOSE.NOTE)
+        self.assertIsNone(owner.poll())
+
+    def test_poll_admission_and_close_intent_are_serialized_in_both_orders(self):
+        owner = self.process("att-owner"); self.row("att-owner", process=owner)
+        ledger = WS.WorkflowLedger(self.route["route_id"], self.route["route_hash"], jobs=self.jobs)
+        entered, release = threading.Event(), threading.Event()
+        def evaluate(*args):
+            self.assertIsNone(CLOSE.ledger_intent(self.route, ledger))
+            entered.set(); self.assertTrue(release.wait(5))
+        armed = {self.route["nodes"][0]["id"]: {"continuation_kind": "supervised"}}
+        with mock.patch.object(SUP, "read_armed", return_value=armed), \
+             mock.patch.object(SUP, "_evaluate", side_effect=evaluate):
+            poll = threading.Thread(target=SUP.poll_once, args=(self.route, ledger)); poll.start()
+            self.assertTrue(entered.wait(5))
+            close = threading.Thread(target=CLOSE.request, args=(self.route, self.path), kwargs={"jobs": self.jobs})
+            close.start(); time.sleep(0.05)
+            self.assertIsNone(CLOSE.intent(self.route, self.jobs))
+            release.set(); poll.join(5); close.join(5)
+            self.assertFalse(poll.is_alive()); self.assertFalse(close.is_alive())
+        with mock.patch.object(SUP, "read_armed", return_value={}), \
+             mock.patch.object(SUP, "_evaluate", side_effect=AssertionError("advance-after-intent")):
+            self.assertEqual(SUP.poll_once(self.route, ledger)[0]["action"], "cancelled")
+
+    def test_pending_completion_defers_existing_receipt_without_finish_or_failure(self):
+        self.row("att-owner")
+        CLOSE.request(self.route, self.path, jobs=self.jobs)
+        with mock.patch.object(CLOSE, "_agent_processes", return_value=([], False)):
+            state = JOIN.current_delivery_state(self.jobs, self.aid("att-owner"), parent_attempt_id="fixture-parent")
+            self.assertTrue(state.cancellation_requested)
+            self.assertFalse(state.cancelled)
+            with self.assertRaisesRegex(JOIN.CompletionDeferred, "termination-pending"):
+                JOIN.delivery_required_action(state)
+        receipt = {"schema_version": 2, "state": "ready", "children": [{
+            "attempt_id": self.aid("att-owner"), "status": "done", "reason": "registry-closed",
+            "required_action": "inspect-done-failure"}]}
+        pending = JOIN.CurrentDeliveryState(None, "", "", "", "done", "CANCELLED", False, 1,
+            False, workflow_complete=False, cancellation_requested=True)
+        with mock.patch.object(JOIN, "current_delivery_state", return_value=pending):
+            with self.assertRaises(JOIN.CompletionDeferred):
+                JOIN.receipt_with_delivery_observability(receipt, jobs=self.jobs)
+        observed = JOIN.wait_for_delivery_projection(receipt, jobs=self.jobs)
+        self.assertEqual(observed["children"][0]["required_action"], "advance-completed")
+        self.assertEqual(observed["delivery_classification"], "success")
+
+    def test_completion_projection_propagates_ordinary_errors_without_retry(self):
+        with mock.patch.object(JOIN, "receipt_with_delivery_observability",
+                side_effect=JOIN.JoinContractError("ordinary-contract-error")) as projection:
+            with self.assertRaisesRegex(JOIN.JoinContractError, "ordinary-contract-error"):
+                JOIN.wait_for_delivery_projection({}, jobs=self.jobs)
+            self.assertEqual(projection.call_count, 1)
+        self.jobs.write_text("1\topen\t/repo\t/wt\towner\tattempt_id=att-owner,worker_type=owner\n")
+        self.assertFalse(CLOSE.row_requested({"attempt_id": "att-owner", "worker_type": "owner"}, self.jobs))
+
+    def test_direct_successor_started_before_intent_is_stopped_from_existing_claim(self):
+        owner = self.process("att-owner"); self.row("att-owner", process=owner)
+        ledger = WS.WorkflowLedger(self.route["route_id"], self.route["route_hash"], jobs=self.jobs)
+        first, successor = self.route["nodes"][0]["id"], self.route["nodes"][1]["id"]
+        armed = {"route_id": self.route["route_id"], "successor_cwd": str(self.base),
+                 "successor_command": [sys.executable, "-c", "import time; time.sleep(300)", str(self.base)],
+                 "successor_log": str(self.base / "successor.log")}
+        original_spawn = subprocess.Popen
+        def spawn(*args, **kwargs):
+            process = original_spawn(*args, **kwargs); self.processes.append(process); return process
+        with ledger.lock(), mock.patch.object(SUP.subprocess, "Popen", side_effect=spawn):
+            outcome = SUP._claim_successors(self.route, ledger, armed, first, [successor])[0]
+        process = self.processes[-1]
+        self.assertEqual(outcome["pid"], process.pid)
+        result = self.close()
+        self.assertEqual(result["state"], "cancelled")
+        self.assertIsNotNone(process.poll())
+        self.assertIsNotNone(owner.poll())
 
     def test_three_harnesses_inline_and_parked_owner_close_real_processes(self):
         for harness in ("claude", "codex", "opencode"):

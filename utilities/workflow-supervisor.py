@@ -439,8 +439,21 @@ def terminal_gate_state(route, jobs=None):
 # commands
 # --------------------------------------------------------------------------------
 
+def cancelled_mutation(route, ledger):
+    import route_parent_close
+    if route_parent_close.ledger_intent(route, ledger):
+        print(json.dumps({"state": "cancelled", "reason": "cancelled-by-parent",
+                          "route_id": route["route_id"]}, sort_keys=True))
+        return True
+    return False
+
+
 def cmd_arm(args):
     route = load_route(args.route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
+    with ledger.lock():
+        if cancelled_mutation(route, ledger):
+            return 0
     node = WS.route_node(route, args.node)
     if node is None:
         raise SupervisorError(f"unknown route node: {args.node}")
@@ -517,6 +530,8 @@ def cmd_arm(args):
             record["resource_binding"] = OWNER_RESOURCE.resource_body_digest(resource)
     ledger = ledger_for(route, getattr(args, "jobs", None))
     with ledger.lock():
+        if cancelled_mutation(route, ledger):
+            return 0
         armed_dir(ledger).mkdir(parents=True, exist_ok=True)
         target = armed_dir(ledger) / f"{args.node}.json"
         if args.predecessor_kind == "resource" and target.exists():
@@ -770,7 +785,7 @@ def _evaluate(route, ledger, armed, results):
     results.append(row)
 
 
-def poll_once(route, ledger):
+def _poll_once_locked(route, ledger):
     import route_parent_close
     closing = route_parent_close.ledger_intent(route, ledger)
     if closing:
@@ -781,30 +796,38 @@ def poll_once(route, ledger):
             if armed["predecessor_kind"] == "resource":
                 evidence = resource_evidence(armed)
                 if evidence.get("terminal"):
-                    with ledger.lock():
-                        prior = [e for e in ledger.journal() if (e.get("evidence") or {}).get(
-                            "cancelled_resource_result", {}).get("identity") == evidence.get("identity")]
-                        if not prior:
-                            ledger._append({"at": WS.now_iso(), "route_id": route["route_id"],
-                                "route_hash": route["route_hash"], "actor": "resource-supervisor",
-                                "evidence": {"cancelled_resource_result": {"node": node_id, **evidence}}})
+                    prior = [e for e in ledger.journal() if (e.get("evidence") or {}).get(
+                        "cancelled_resource_result", {}).get("identity") == evidence.get("identity")]
+                    if not prior:
+                        ledger._append({"at": WS.now_iso(), "route_id": route["route_id"],
+                            "route_hash": route["route_hash"], "actor": "resource-supervisor",
+                            "evidence": {"cancelled_resource_result": {"node": node_id, **evidence}}})
                 results.append({"node": node_id, "action": "cancelled-result" if evidence.get("terminal")
                                 else "wait-preserved-resource", "evidence": evidence})
         return results or [{"action": "cancelled"}]
     results = []
+    for node_id, armed in sorted(read_armed(ledger).items()):
+        state = ledger.state()["nodes"].get(node_id, {}).get("state")
+        if state in ("STAGE_SUCCEEDED", "FAILED_TERMINAL", "CANCELLED"):
+            results.append({"node": node_id, "action": "settled", "state": state})
+            continue
+        if state == "FAILED_RETRYABLE":
+            results.append({"node": node_id, "action": "halted", "state": state})
+            continue
+        if armed["continuation_kind"] == "human-gate":
+            results.append({"node": node_id, "action": "human-gate"})
+            continue
+        _evaluate(route, ledger, armed, results)
+    return results
+
+
+def poll_once(route, ledger):
     with ledger.lock():
-        for node_id, armed in sorted(read_armed(ledger).items()):
-            state = ledger.state()["nodes"].get(node_id, {}).get("state")
-            if state in ("STAGE_SUCCEEDED", "FAILED_TERMINAL", "CANCELLED"):
-                results.append({"node": node_id, "action": "settled", "state": state})
-                continue
-            if state == "FAILED_RETRYABLE":
-                results.append({"node": node_id, "action": "halted", "state": state})
-                continue
-            if armed["continuation_kind"] == "human-gate":
-                results.append({"node": node_id, "action": "human-gate"})
-                continue
-            _evaluate(route, ledger, armed, results)
+        results = _poll_once_locked(route, ledger)
+        import route_parent_close
+        closing = route_parent_close.ledger_intent(route, ledger)
+    if closing:
+        return results
     # A supervised run is live work: let its open cycle republish the interim
     # manifest (detached and rate-limited, outside the ledger lock).
     try:
@@ -868,6 +891,10 @@ def cmd_watch(args):
 
 def cmd_gate(args):
     route = load_route(args.route)
+    ledger = ledger_for(route, getattr(args, "jobs", None))
+    with ledger.lock():
+        if cancelled_mutation(route, ledger):
+            return 0
     if args.block and not getattr(args, "jobs", None) \
             and os.environ.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1":
         # A registered worker's own registry, the same default `arm` takes.
@@ -887,6 +914,8 @@ def cmd_gate(args):
     payload = {"gate": args.gate,
                **ledger_metadata(getattr(args, "jobs", None), ledger)}
     with ledger.lock():
+        if cancelled_mutation(route, ledger):
+            return 0
         if args.release:
             state = ledger.state()["workflow_state"]
             if state != "BLOCKED_HUMAN_GATE":
@@ -1857,6 +1886,9 @@ def cmd_release(args):
     """
     route = load_route(args.route)
     ledger = ledger_for(route, getattr(args, "jobs", None))
+    with ledger.lock():
+        if cancelled_mutation(route, ledger):
+            return 0
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:
         raise SupervisorError(f"route declares no human gate {args.gate!r}")
@@ -1872,6 +1904,8 @@ def cmd_release(args):
     actor_kind = release_actor_kind()
     actor = resolved_released_by(actor_kind, args.actor)
     with ledger.lock():
+        if cancelled_mutation(route, ledger):
+            return 0
         state = ledger.state()["workflow_state"]
         if state != "BLOCKED_HUMAN_GATE":
             refuse_gate_not_blocked(route, args.gate, state)
@@ -2339,6 +2373,8 @@ def cmd_complete(args):
     if not terminal_nodes:
         raise SupervisorError("route declares no terminal node")
     with ledger.lock():
+        if cancelled_mutation(route, ledger):
+            return 0
         state = ledger.state()
         gates = terminal_gate_state(route, getattr(args, "jobs", None))
         unproven = {node: row for node, row in gates.items() if row.get("passed") is not True}

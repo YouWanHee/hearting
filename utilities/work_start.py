@@ -716,6 +716,11 @@ def _capacity_pause(result, attention, resume):
 
 def _outcome(jobs, aid):
     state = current_delivery_state(jobs, aid, parent_attempt_id=aid, advance=False)
+    if state.cancellation_requested:
+        return {"attempt_id": aid, "classification": "success" if state.cancelled else "pending",
+                "required_action": "advance-completed" if state.cancelled else "",
+                "cancellation_requested": True, "state": "cancelled" if state.cancelled else "termination-pending",
+                "reason": "cancelled-by-parent"}
     action = delivery_required_action(state)
     result = {"attempt_id": aid, "classification": delivery_classification(state),
             "required_action": action, "marker": state.marker,
@@ -1395,6 +1400,9 @@ def _exited_owner_response(route, result, jobs, aid, **extra):
     from dispatch_terminal_commit import inspect_owner_completion
     status, metadata = _rows(jobs)[aid]
     outcome = _outcome(jobs, aid)
+    if outcome.get("cancellation_requested"):
+        return {"route_id": route["route_id"], "state": outcome["state"],
+                "reason": "cancelled-by-parent", "launches": [], "owner_started": False, "result": outcome}
     if outcome["classification"] == "success":
         return _with_next_leg(route, {**result, "state": "completed", "result": outcome})
     return {**result, "state": "needs-attention", "reason": "owner-settlement-pending",
@@ -1902,6 +1910,15 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
     import route_parent_close
     closing = route_parent_close.intent(route, jobs)
+    if not closing:
+        for _, metadata in _rows(jobs).values():
+            if (route["route_id"] in {metadata.get("owner_route_id"), metadata.get("route_id")}
+                    and route_parent_close.requested(metadata)):
+                closing = route_parent_close.intent({
+                    "route_id": metadata.get("parent_close_route_id"),
+                    "route_hash": metadata.get("parent_close_route_hash")}, jobs)
+                if closing:
+                    break
     if closing:
         outcome = route_parent_close.continue_close(closing, jobs=jobs)
         return {"route_id": route["route_id"], "route_file": str(path), "launches": [],

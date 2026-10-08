@@ -59,10 +59,32 @@ def settled_result(route, ledger):
 def row_requested(metadata, jobs):
     if requested(metadata):
         return True
-    route = {"route_id": metadata.get("owner_route_id") or metadata.get("route_id"),
-             "route_hash": metadata.get("owner_route_hash") or metadata.get("route_hash")}
-    value = intent(route, jobs)
+    route = {"route_id": metadata.get("parent_close_route_id") or metadata.get("owner_route_id") or metadata.get("route_id"),
+             "route_hash": metadata.get("parent_close_route_hash") or metadata.get("owner_route_hash") or metadata.get("route_hash")}
+    value = intent(route, jobs) or _current_owner_intent(metadata, jobs)
     return bool(value and metadata.get("attempt_id") in value["attempts"])
+
+
+def _current_owner_intent(metadata, jobs):
+    # Attachments and adopted advances leave launch rows unchanged. Resolve
+    # their current owner before accepting an old child's late result.
+    try:
+        rows = _rows(Path(jobs))
+    except (OSError, ValueError):
+        return None  # Ordinary join owns its registry-shape refusal.
+    current, seen = metadata, set()
+    while current.get("worker_type") != "owner":
+        parent = current.get("parent_attempt_id")
+        if parent in seen or parent not in rows:
+            return None
+        seen.add(parent)
+        current = rows[parent][1]
+    import owner_route_binding as OWNER
+    try:
+        binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=current["attempt_id"])
+    except OWNER.OwnerRouteBindingError:
+        return None  # An unbound ordinary owner is not cancellation evidence.
+    return intent({"route_id": binding.route_id, "route_hash": binding.route_hash}, jobs) if binding else None
 
 
 def _rows(jobs):
@@ -88,9 +110,17 @@ def _owner(route, path, jobs, rows):
     for aid, (fields, meta) in rows.items():
         if meta.get("worker_type") != "owner":
             continue
-        if route["route_id"] not in {meta.get("owner_route_id"), meta.get("route_id")}:
+        if str(Path(fields[3]).resolve()) != str(Path(route["cwd"]).resolve()):
             continue
-        binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=aid)
+        binding, reason = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=aid)
+        owned = AUTH.owns(meta, AUTH.default_parent_session_id(), jobs)
+        if not owned:
+            if binding and (binding.route_id, binding.route_hash, binding.route_file) == (
+                    route["route_id"], route["route_hash"], str(path.resolve())) and fields[1] in OPEN:
+                raise ValueError("parent-close-owner-not-owned")
+            continue
+        if fields[1] in OPEN and (not binding or "unresolvable" in reason or "conflict" in reason):
+            raise ValueError("parent-close-current-owner-unobservable:" + reason)
         if binding and (binding.route_id, binding.route_hash, binding.route_file) == (
                 route["route_id"], route["route_hash"], str(path.resolve())):
             candidates.append((aid, fields, meta))
@@ -116,8 +146,6 @@ def _owned_attempts(route, rows, owner):
     while True:
         children = {aid for aid, (fields, meta) in rows.items()
                     if meta.get("parent_attempt_id") in selected
-                    and meta.get("route_id", "") in {"", route["route_id"]}
-                    and meta.get("route_hash", "") in {"", route["route_hash"]}
                     and fields[2] == rows[owner][0][2]
                     and (fields[3] == rows[owner][0][3] or DC.is_linked_worktree_slice(meta))}
         if children <= selected:
@@ -151,6 +179,11 @@ def request(route, path, *, jobs=None, stop_resources=False, summary=None, commi
                      "stop_resources": bool(stop_resources), "at": WS.now_iso(),
                      "summary": summary, "head_commit": commit}
             value["resources"] = linked_resources(route, path, jobs, attempts)
+            value["protected_resources"] = known_resources(route, path, jobs, attempts)
+            # Capture escaped payloads before stopping their launcher or agent.
+            value["resource_branches"] = resource_branches(value["resources"])
+            value["workflow_processes"] = sorted(_workflow_processes(route, ledger)[0])
+            value["observer_namespace"] = DC.process_namespace_identity()
             # The intent is durable before either the launch fence or any signal.
             ledger._append({"at": value["at"], "route_id": route["route_id"],
                             "route_hash": route["route_hash"], "actor": "parent-close",
@@ -174,7 +207,7 @@ def request(route, path, *, jobs=None, stop_resources=False, summary=None, commi
             return value
 
 
-def linked_resources(route, path, jobs, attempts):
+def linked_resources(route, path, jobs, attempts, *, all_known=False):
     """Discover existing run records, never GPU census or a project-name match."""
     import resource_run_registry as RR
     registries, _ = RR.indexed_paths()
@@ -200,13 +233,14 @@ def linked_resources(route, path, jobs, attempts):
             if not isinstance(run, dict):
                 continue
             owner = run.get("owner_wait") or {}
-            if (run.get("route") != str(path.resolve())
+            if not all_known and (run.get("route") != str(path.resolve())
                     or run.get("parent_attempt_id") not in attempts
                     or run.get("jobs") not in {None, "", str(jobs)}
                     or owner.get("route_hash", route["route_hash"]) != route["route_hash"]
                     or run.get("node") not in {n["id"] for n in route.get("nodes", [])}):
                 continue
-            result.append({"kind": "resource", "run_id": rid, "registry": str(registry), "row": run})
+            result.append({"kind": "resource", "run_id": rid, "registry": str(registry),
+                           "row": {**run, "_registry": str(registry)}})
     # compute-hosts already records route + starting attempt in each run's meta.
     compute = _compute()
     try:
@@ -222,13 +256,17 @@ def linked_resources(route, path, jobs, attempts):
             continue
         provenance = meta.get("provenance") or {}
         binding = provenance.get("route") or {}
-        if (binding.get("route_id") == route["route_id"] and binding.get("route_file") == str(path.resolve())
+        if all_known or (binding.get("route_id") == route["route_id"] and binding.get("route_file") == str(path.resolve())
                 and provenance.get("attempt_id") in attempts):
             state = compute._run_state(config, meta_path.parent.name)
             result.append({"kind": "compute", "run_id": meta_path.parent.name,
                            "state": "stopped" if state["stop_reason"] else state["state"],
                            "config": str(compute.config_path())})
     return result
+
+
+def known_resources(route, path, jobs, attempts):
+    return linked_resources(route, path, jobs, attempts, all_known=True)
 
 
 def _compute():
@@ -238,43 +276,152 @@ def _compute():
     return compute
 
 
-def _protected(resources):
-    protected = set()
-    for resource in resources:
-        run = resource.get("row", {})
-        supervision = run.get("supervision") or {}
-        if supervision.get("pid") and supervision.get("starttime"):
-            observed, actual, _ = DC.process_observation(int(supervision["pid"]))
-            if observed == "present" and actual == str(supervision["starttime"]):
-                protected.add((int(supervision["pid"]), str(supervision["starttime"])))
-        try:
-            pid, start = int(run["pid"]), str(run["starttime"])
-        except (KeyError, ValueError, TypeError):
-            continue
-        observed, actual, _ = DC.process_observation(pid)
-        if observed == "present" and actual == start:
-            protected.add((pid, start))
-            if int(run.get("process_group", pid)) == pid:
-                group = DC.process_group_observation(pid)
-                protected.update((p, s) for p, s, state in group.members if state != "Z")
-    # A run can share the owner's group. Preserve its descendants, not its
-    # ancestors/controller (the model supervisor may itself be that controller).
-    if not protected:
-        return protected
+def _namespace_authoritative(run):
+    try:
+        return run.get("pid_namespace", os.readlink("/proc/self/ns/pid")) == os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return False
+
+
+def _branch(run, seeds=()):
+    """Exact root/descendant identities, including descendants in another group."""
+    if not _namespace_authoritative(run):
+        return set(), False
+    selected = set()
+    for pid, start in seeds:
+        visible, actual, state = DC.process_observation(int(pid))
+        if visible == "inaccessible":
+            return selected, False
+        if visible == "present" and actual == str(start) and state != "Z":
+            selected.add((int(pid), str(start)))
+    try:
+        pid, start = int(run["pid"]), str(run["starttime"])
+    except (KeyError, ValueError, TypeError):
+        return selected, False
+    visible, actual, state = DC.process_observation(pid)
+    if visible == "inaccessible":
+        return selected, False
+    if visible == "present" and actual == start and state != "Z":
+        selected.add((pid, start))
     children = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
             tail = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
-            children.append((int(entry.name), tail[19], int(tail[1])))
+            if tail[0] != "Z":
+                children.append((int(entry.name), tail[19], int(tail[1])))
         except (FileNotFoundError, ProcessLookupError):
             continue
+        except (OSError, ValueError, IndexError):
+            return selected, False
+        if run.get("run_id") and run.get("_registry"):
+            try:
+                env = (entry / "environ").read_bytes().split(b"\0")
+                if (b"HEARTING_RESOURCE_RUN_ID=" + run["run_id"].encode() in env
+                        and b"HEARTING_RESOURCE_REGISTRY=" + run["_registry"].encode() in env):
+                    selected.add((int(entry.name), tail[19]))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            except OSError:
+                return selected, False
     while True:
-        descendants = {(p, s) for p, s, parent in children if parent in {p for p, _ in protected}}
-        if descendants <= protected:
-            return protected
-        protected |= descendants
+        descendants = {(p, s) for p, s, parent in children if parent in {p for p, _ in selected}}
+        if descendants <= selected:
+            return selected, True
+        selected |= descendants
+
+
+def resource_branches(resources):
+    return {r["run_id"]: sorted(_branch(r["row"])[0])
+            for r in resources if r["kind"] == "resource"}
+
+
+def _protected(resources):
+    protected = set()
+    for resource in resources:
+        if resource["kind"] != "resource":
+            continue
+        run = resource["row"]
+        if not _namespace_authoritative(run):
+            continue  # A foreign namespace's PID is never a local PID authority.
+        branch, _ = _branch(run)
+        protected |= branch
+        supervision = run.get("supervision") or {}
+        if supervision.get("pid") and supervision.get("starttime"):
+            watcher = (int(supervision["pid"]), str(supervision["starttime"]))
+            if resource.get("parent_close_linked"):
+                visible, actual, state = DC.process_observation(watcher[0])
+                if visible == "present" and actual == watcher[1] and state != "Z":
+                    protected.add(watcher)
+            else:
+                protected |= _branch({**run, "pid": watcher[0], "starttime": watcher[1]})[0]
+    return protected
+
+
+def _workflow_processes(route, ledger, seeds=()):
+    selected = set()
+    for pid, start in seeds:
+        visible, actual, state = DC.process_observation(int(pid))
+        if visible == "inaccessible":
+            return selected, False
+        if visible == "present" and actual == str(start) and state != "Z":
+            selected.add((int(pid), str(start)))
+    claims = {key: row for key, row in ledger.claims().items()
+              if row.get("route_id") == route["route_id"]}
+    if not claims:
+        return selected, True
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        parent = None
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            tail = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+            parent = int(tail[1])
+            env = dict(item.split(b"=", 1) for item in (entry / "environ").read_bytes().split(b"\0")
+                       if b"=" in item)
+            key = env.get(b"AGENT_WORKFLOW_CLAIM", b"").decode(errors="replace")
+            claim = claims.get(key)
+            if (claim and env.get(b"AGENT_WORKFLOW_ROUTE_ID") == route["route_id"].encode()
+                    and env.get(b"AGENT_WORKFLOW_NODE") == str(claim["successor"]).encode()):
+                visible, birth, state = DC.process_observation(int(entry.name))
+                if visible == "inaccessible":
+                    return selected, False
+                if visible == "present" and state != "Z":
+                    selected.add((int(entry.name), birth))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, ValueError, KeyError):
+            # Unrelated same-user processes need not expose their environment.
+            # Unreadability inside the exact captured branch remains pending.
+            if int(entry.name) in {p for p, _ in selected} or (
+                    parent in {p for p, _ in selected}):
+                return selected, False
+            continue
+    return selected, True
+
+
+def _drain_workflow(value, ledger, resources, grace, kill_wait):
+    if value.get("observer_namespace", DC.process_namespace_identity()) != DC.process_namespace_identity():
+        return False
+    deadline, sent = time.monotonic() + grace + kill_wait, set()
+    while True:
+        processes, observed = _workflow_processes(value["route"], ledger, value.get("workflow_processes", []))
+        if not observed:
+            return False
+        processes -= _protected(resources)
+        if not processes:
+            return True
+        escalated = time.monotonic() >= deadline - kill_wait
+        for pid, birth in processes:
+            if escalated or (pid, birth) not in sent:
+                _signal(pid, birth, signal.SIGKILL if escalated else signal.SIGTERM)
+                sent.add((pid, birth))
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
 
 
 def _agent_processes(meta, resources):
@@ -296,6 +443,13 @@ def _agent_processes(meta, resources):
     members = {(p, s) for p, s, state in (*group.members, *tagged.members) if state != "Z"}
     if visibility == "present" and actual == identity.expected_start and leader_state != "Z":
         members.add((identity.pid, actual))
+    ambiguous = {int(r["row"]["pid"]) for r in resources if r["kind"] == "resource"
+                 and not _namespace_authoritative(r["row"]) and str(r["row"].get("pid", "")).isdigit()}
+    if any(pid in ambiguous for pid, _ in members):
+        if (visibility == "present" and actual == identity.expected_start
+                and leader_state != "Z" and identity.pid not in ambiguous):
+            return [(identity.pid, actual)], True
+        return [], False  # An ambiguous resource cannot become an agent target.
     members -= _protected(resources)
     # Resource-run environment tags also identify a re-setsid branch.
     run_ids = {r["run_id"] for r in resources}
@@ -327,49 +481,110 @@ def _signal(pid, start, signum):
         pass
 
 
-def _stop_resources(resources):
+def _saved_branches(value, ledger):
+    branches = {rid: {tuple(pair) for pair in pairs}
+                for rid, pairs in value.get("resource_branches", {}).items()}
+    for event in ledger.journal():
+        if event.get("route_hash") != value["route"]["route_hash"]:
+            continue
+        for rid, pairs in (event.get("evidence") or {}).get("parent_close_resource_branches", {}).items():
+            branches.setdefault(rid, set()).update(tuple(pair) for pair in pairs)
+    return branches
+
+
+def _resource_liveness(run):
     import resource_run_registry as RR
+    if not _namespace_authoritative(run):
+        return "termination-pending"
+    live, _, reason = RR.classify_identity(run)
+    if live in {"stale", "reaping"}:
+        try:
+            pid, start = int(run["pid"]), str(run["starttime"])
+        except (KeyError, ValueError, TypeError):
+            return "termination-pending"
+        visible, actual, state = DC.process_observation(pid)
+        if visible == "missing" or (visible == "present" and (actual != start or state == "Z")):
+            return "exited"
+        return "termination-pending"
+    return live
+
+
+def _save_branches(value, ledger, branches):
+    with ledger.lock():
+        prior = _saved_branches(value, ledger)
+        merged = {rid: prior.get(rid, set()) | pairs for rid, pairs in branches.items()}
+        if any(merged[rid] != prior.get(rid, set()) for rid in merged):
+            ledger._append({"at": WS.now_iso(), "route_id": value["route"]["route_id"],
+                "route_hash": value["route"]["route_hash"], "actor": "parent-close",
+                "evidence": {"parent_close_resource_branches":
+                    {rid: sorted(pairs) for rid, pairs in merged.items()}}})
+    return merged
+
+
+def _stop_resources(value, resources, protected_resources, ledger):
+    import resource_run_registry as RR
+    target_ids = {(r["kind"], r["run_id"], r.get("registry")) for r in resources}
+    foreign = _protected([r for r in protected_resources
+        if (r["kind"], r["run_id"], r.get("registry")) not in target_ids])
+    saved = _saved_branches(value, ledger)
+    pending = set()
     for resource in resources:
-        members = ()
-        if resource["kind"] == "resource":
-            if resource["row"].get("status") in {"succeeded", "failed"}:
-                continue
-            if RR.classify_identity(resource["row"])[0] != "working":
-                continue
-            command = [sys.executable, str(Path(__file__).with_name("resource-runner.py")),
-                       "--registry", resource["registry"], "stop", "--run-id", resource["run_id"]]
-            run = resource["row"]
-            pid = int(run.get("pid", 0))
-            start = str(run.get("starttime", ""))
-            if DC.exact_process_group_signal_authority(pid, start) == "authoritative":
-                members = DC.process_group_observation(pid).members
-            else:
-                # Legacy runs can share an agent group. The runner's group
-                # stop is inapplicable; select only the exact resource branch.
-                branch = {**resource, "row": {k: v for k, v in run.items() if k != "supervision"}}
-                members = tuple((p, s, "S") for p, s in _protected([branch]))
-        else:
+        rid = resource["run_id"]
+        if resource["kind"] == "compute":
             if resource["state"] != "running":
                 continue
-            command = [sys.executable, str(Path(__file__).with_name("compute-hosts.py")),
-                       "stop", resource["run_id"]]
-        try:
-            stop_env = ({**os.environ, "COMPUTE_HOSTS_CONFIG": resource["config"]}
-                        if resource["kind"] == "compute" else None)
-            stopped = subprocess.run(command, capture_output=True, text=True, timeout=30, env=stop_env)
-        except (OSError, subprocess.TimeoutExpired):
-            continue  # Re-observation below retains a live run as pending.
-        if resource["kind"] == "resource":
-            # The existing stop sends TERM. Complete its exact group cleanup
-            # here, escalating only still-identical members after the grace.
-            if stopped.returncode != 0:
-                if RR.classify_identity(resource["row"])[0] != "working":
-                    continue
-                for member, birth, _state in members:
-                    _signal(member, birth, signal.SIGTERM)
-            time.sleep(0.3)
-            for member, birth, _state in members:
-                _signal(member, birth, signal.SIGKILL)
+            try:
+                subprocess.run([sys.executable, str(Path(__file__).with_name("compute-hosts.py")),
+                    "stop", rid], capture_output=True, text=True, timeout=30,
+                    env={**os.environ, "COMPUTE_HOSTS_CONFIG": resource["config"]})
+            except (OSError, subprocess.TimeoutExpired):
+                pending.add(rid)
+            continue
+        run = resource["row"]
+        live = _resource_liveness(run)
+        if live == "termination-pending":
+            pending.add(rid)
+            continue
+        branch, observed = _branch(run, saved.get(rid, ()))
+        branch -= foreign
+        saved = _save_branches(value, ledger, {**saved, rid: saved.get(rid, set()) | branch})
+        if not observed:
+            pending.add(rid)
+            continue
+        # Reuse existing stop only when its group is entirely the selected
+        # branch. Shared groups use the same exact TERM cleanup locally.
+        pid, start = int(run["pid"]), str(run["starttime"])
+        group = DC.process_group_observation(pid)
+        group_pairs = {(p, s) for p, s, state in group.members if state != "Z"}
+        if (live == "working" and group.state != "unverifiable" and group_pairs <= branch
+                and DC.exact_process_group_signal_authority(pid, start) == "authoritative"):
+            try:
+                subprocess.run([sys.executable, str(Path(__file__).with_name("resource-runner.py")),
+                    "--registry", resource["registry"], "stop", "--run-id", rid],
+                    capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        deadline = time.monotonic() + 0.8
+        term_sent = set()
+        while True:
+            branch, observed = _branch(run, saved.get(rid, ()))
+            branch -= foreign
+            saved = _save_branches(value, ledger, {**saved, rid: saved.get(rid, set()) | branch})
+            if not observed:
+                pending.add(rid)
+                break
+            if not branch:
+                break
+            escalated = time.monotonic() >= deadline - 0.5
+            for member, birth in sorted(branch, reverse=True):
+                if escalated or (member, birth) not in term_sent:
+                    _signal(member, birth, signal.SIGKILL if escalated else signal.SIGTERM)
+                    term_sent.add((member, birth))
+            if time.monotonic() >= deadline:
+                pending.add(rid)
+                break
+            time.sleep(0.02)
+    return pending
 
 
 def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
@@ -382,6 +597,13 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
         _finish_existing_cycle(route)
         return prior
     resources = _resources_for_close(value, jobs)
+    protected = {(r["kind"], r["run_id"], r.get("registry")): r
+                 for r in value.get("protected_resources", [])}
+    protected.update({(r["kind"], r["run_id"], r.get("registry")): r
+        for r in known_resources(route, path, jobs, set(value["attempts"]))})
+    protected.update({(r["kind"], r["run_id"], r.get("registry")):
+        {**r, "parent_close_linked": True} for r in resources})
+    protected_resources = list(protected.values())
     rows = _rows(jobs)
     pending = []
     # Reconstruct annotations after a crash between durable intent and registry.
@@ -403,7 +625,7 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
         settled = False
         while True:
             try:
-                processes, observed = _agent_processes(meta, resources)
+                processes, observed = _agent_processes(meta, protected_resources)
             except OSError:
                 processes, observed = [], False
             if not observed:
@@ -421,7 +643,7 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
                     never = DC.attempt_row_never_started(fields)
                     settled = DC.close_attempt_row_if(jobs, aid, NOTE,
                         lambda fresh: requested(DC.parse_registry_metadata(fresh[5])) and
-                            _agent_processes(DC.parse_registry_metadata(fresh[5]), resources) == ([], True),
+                            _agent_processes(DC.parse_registry_metadata(fresh[5]), protected_resources) == ([], True),
                         evidence={"failure_class": "cancelled", "parent_close_settled": "1",
                                   **({"launch_outcome": "never-launched"} if never else {})})
                     if not settled:
@@ -443,18 +665,19 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
             time.sleep(0.02)
         if not settled:
             pending.append(aid)
-    if value["stop_resources"]:
-        _stop_resources(resources)
+    if not _drain_workflow(value, ledger, protected_resources, grace, kill_wait):
+        pending.append("workflow:" + route["route_id"])
+    resource_pending = (_stop_resources(value, resources, protected_resources, ledger)
+                        if value["stop_resources"] else set())
     resources = _resources_for_close(value, jobs)
     resource_states = []
     import resource_run_registry as RR
     for resource in resources:
         if resource["kind"] == "resource":
             live = RR.classify_identity(resource["row"])[0]
-            if value["stop_resources"] and live == "stale":
-                visibility, actual, state = DC.process_observation(int(resource["row"].get("pid", 0)))
-                if visibility != "missing" and not (visibility == "present" and (
-                        actual != str(resource["row"].get("starttime")) or state == "Z")):
+            if value["stop_resources"]:
+                live = _resource_liveness(resource["row"])
+                if resource["run_id"] in resource_pending:
                     live = "termination-pending"
         else:
             live = resource["state"]
@@ -518,7 +741,7 @@ def _finish_existing_cycle(route):
 def recover_attempt(jobs, metadata):
     route = {"route_id": metadata.get("parent_close_route_id") or metadata.get("owner_route_id") or metadata.get("route_id"),
              "route_hash": metadata.get("parent_close_route_hash") or metadata.get("owner_route_hash") or metadata.get("route_hash")}
-    value = intent(route, jobs)
+    value = intent(route, jobs) or _current_owner_intent(metadata, jobs)
     return continue_close(value, jobs=jobs) if value else None
 
 

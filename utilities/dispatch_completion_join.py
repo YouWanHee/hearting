@@ -142,6 +142,10 @@ class JoinContractError(RuntimeError):
     """A registry or liveness boundary could not be proved."""
 
 
+class CompletionDeferred(JoinContractError):
+    """Cancellation cleanup is retained by the existing execution observer."""
+
+
 def canonical_delivery_receipt(receipt: dict[str, object]) -> dict[str, object]:
     """Select only the digest-material keys of one v2 receipt (SD-111 D-2).
 
@@ -688,11 +692,14 @@ class CurrentDeliveryState:
     terminal_conflict: bool = False
     workflow_complete: bool = True
     cancelled: bool = False
+    cancellation_requested: bool = False
 
 
 def delivery_classification(state: CurrentDeliveryState) -> str:
     """Return the sole shared success/attention decision for delivery writers."""
 
+    if state.cancellation_requested and not state.cancelled:
+        raise CompletionDeferred("termination-pending")
     if state.cancelled and state.quiescent and state.workflow_complete and state.owned_children == 0:
         return "success"
     return (
@@ -915,6 +922,17 @@ def settle_open_pass(jobs: Path, attempt_id: str) -> bool:
             or terminal.get("artifact_state") != "readable"):
         return False
     return bool(settle_finished_attempt(Path(jobs), row).get("closed"))
+
+
+def wait_for_delivery_projection(receipt, *, jobs, timing=None):
+    """Keep a queued receipt parked until existing cancellation cleanup settles."""
+    while True:
+        try:
+            return receipt_with_delivery_observability(receipt, jobs=jobs, timing=timing)
+        except CompletionDeferred:
+            # This carrier already owns completion observation. Retain only
+            # cancellation waiting here; ordinary contract errors propagate.
+            time.sleep(0.05)
 
 
 def receipt_with_delivery_observability(
@@ -1618,7 +1636,7 @@ def receipt_with_current_actions(
         seen.add(attempt)
     if seen != set(indexed):
         raise JoinContractError("supervisor-outbox-attempt-set-mismatch")
-    return receipt_with_delivery_observability(receipt, jobs=jobs)
+    return wait_for_delivery_projection(receipt, jobs=jobs)
 
 
 def prepare_supervisor_outbox(
@@ -2902,7 +2920,8 @@ def current_delivery_state(
                        and current and current.metadata.get("parent_close_settled") == "1")
         return CurrentDeliveryState(None, "", child_row_revision(current),
             hashlib.sha256(current.raw.encode()).hexdigest(), current.status, "CANCELLED",
-            settled, 0 if settled else 1, False, settled, False, settled, cancelled=settled)
+            settled, 0 if settled else 1, False, settled, False, settled,
+            cancelled=settled, cancellation_requested=True)
     if snapshot is None:
         expected_revision = ""
         expected_process_identity: tuple[tuple[str, str], ...] = ()

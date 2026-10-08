@@ -38,7 +38,7 @@ from dispatch_completion_join import (
     reconcile_finished_children,
     read_supervisor_phase_state,
     receipt_with_current_actions,
-    receipt_with_delivery_observability,
+    wait_for_delivery_projection,
     receipt_with_stage_advance,
     remove_supervisor_state,
     runtime_wait_requested,
@@ -371,7 +371,7 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
     join_timing = advance_delivery_timing(
         join_timing, "join_completed_ns", at_ns=completed_ns
     )
-    observed = receipt_with_delivery_observability(
+    observed = wait_for_delivery_projection(
         receipt,
         jobs=Path(args.jobs),
         timing=join_timing,
