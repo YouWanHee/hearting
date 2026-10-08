@@ -2102,7 +2102,10 @@ class C1MarkTest(C1ChangesBase):
             self.assertRegex(mark["marked_at"], RFC3339)
             self.assertNotIn("superseded_by", mark)
             # Only the one field moved: state, manifest digest, files and manifest bytes are as they were.
-            self.assertEqual({k: v for k, v in after.items() if k != "disposition"}, before)
+            # Normal writer observation digest follows the disposition; all
+            # other record fields and payload bytes stay as they were.
+            self.assertEqual({k: v for k, v in after.items() if k not in {"disposition", "control_record_digest"}},
+                             {k: v for k, v in before.items() if k != "control_record_digest"})
             self.assertEqual(self.tree_digest(self.cycle_path(target)), files_before)
             if manifest_before is not None:
                 self.assertEqual((self.cycle_path(target) / "manifest.json").read_bytes(), manifest_before)
@@ -2189,11 +2192,13 @@ class C1MarkTest(C1ChangesBase):
         record = json.loads(record_path.read_text())
         self.assertEqual(record["disposition"]["kind"], "discarded")
         self.assertEqual(record["disposition"]["reason"], reason)
-        self.assertEqual({k: v for k, v in record.items() if k != "disposition"}, before)
+        self.assertEqual({k: v for k, v in record.items() if k not in {"disposition", "control_record_digest"}},
+                         {k: v for k, v in before.items() if k != "control_record_digest"})
         self.assertEqual(self.tree_digest(campaigns), payload)  # no file or manifest of any cycle moved
         self.assertEqual(len(self.lines(field="disposition")), 1)
         P.cycle_mark(copy, TASLP_MANUSCRIPT, clear=True)
-        self.assertEqual(json.loads(record_path.read_text()), before)
+        self.assertEqual({k: v for k, v in json.loads(record_path.read_text()).items() if k != "control_record_digest"},
+                         {k: v for k, v in before.items() if k != "control_record_digest"})
         self.assertEqual(self.tree_digest(campaigns), payload)
         self.assertEqual(len(self.lines(field="disposition")), 2)
         # The real root was only read.
@@ -3117,7 +3122,8 @@ class D1LegacyConsumersTest(C1ChangesBase):
         self.assertEqual((mark["kind"], mark["superseded_by"]), ("superseded", [second["cycle_id"]]))
         self.assertEqual(mark["superseded_event_id"], "evt_" + "1" * 32)
         # Only the one field moved: the cycle is as finished as it was and stays writable.
-        self.assertEqual({k: v for k, v in after.items() if k != "disposition"}, before)
+        self.assertEqual({k: v for k, v in after.items() if k not in {"disposition", "control_record_digest"}},
+                         {k: v for k, v in before.items() if k != "control_record_digest"})
         self.assertEqual((self.cycle_path(first) / "manifest.json").read_bytes(), manifest_before)
         self.assertEqual(self.lines(kind="lifecycle", field="disposition", target_id=first["cycle_id"])[0]["operation"], "add")
         self.edit(first, "plans/cycle/plan.md", b"edited after the mark\n")
