@@ -1491,6 +1491,13 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                                       "outcome": closed,
                                       **({"completion_delivery": delivery} if delivery else {}),
                                       **({"shared_publication": publication} if publication is not None else {})})
+    import dispatch_resource_wait as OWNER_RESOURCE
+    watches = (OWNER_RESOURCE.supervisor().recover_resource_watches(route, jobs)
+               if any(n.get("kind") == "resource-runner" for n in route.get("nodes", [])) else [])
+    if watches:
+        return {**result, "state": "resource-watching", "required_action": "end-turn",
+                "resource_watches": watches, "parent_next": "end-turn",
+                "next_step": "The exact resource retains its watch and declared continuation; end this turn."}
     if RESOURCE_RESUME.route_selected(route):
         resource = RESOURCE_RESUME.observation(route, jobs)
         if resource["state"] != "resource-succeeded":

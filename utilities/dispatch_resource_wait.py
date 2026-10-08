@@ -329,6 +329,9 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
         evidence = sup.resource_evidence(armed)
         stage = ledger.state().get("nodes", {}).get(armed["node"], {})
         lost_watch = not RESUME.supervisor_alive(row.get("supervision"))
+        if lost_watch and evidence.get("liveness") == "working":
+            recovery = sup.reattach_resource_watch(route, ledger, armed)
+            lost_watch = not (recovery and recovery.get("supervisor_alive"))
         if stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
             current_rows = context(args, control)[3]
             receipt_row = next((r for _, r in current_rows if resource_key(r) == key), None)

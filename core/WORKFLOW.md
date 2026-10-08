@@ -935,6 +935,11 @@ After pending user corrections, the watch writes the resource completion marker
 from the original producer artifact before recording stage success and claiming
 next work. Exit and this marker are neither verification PASS nor workflow completion.
 
+A resource watch lasts while its recorded PID/start/command identity is alive,
+without a fixed elapsed-time ceiling. The existing start/resume can reattach a
+lost or expired watch to the same run without releasing a payload again. Explicit
+parent cancellation still suppresses the preserved resource's successors.
+
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
 keeps the exact question and gate available for a later real answer; independent
