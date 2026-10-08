@@ -103,6 +103,31 @@ class ResourceWatchHorizonTest(FIX.WorkflowFixture):
                     start.assert_not_called()
                 self.assertEqual(json.loads(registry.read_text())["runs"]["fixture-run"], row)
 
+    def test_real_observer_ready_handshake_and_replay_keep_the_same_resource(self):
+        route, _, _, registry, _, ledger, armed, original = self.living()
+        owned = []
+        start = SUP.runner().start_watch
+        def observer(*args):
+            proc, identity = start(*args)
+            owned.append(proc)
+            return proc, identity
+        try:
+            with mock.patch.object(SUP.runner(), "start_watch", side_effect=observer):
+                first = SUP.reattach_resource_watch(route, ledger, armed)
+                again = SUP.reattach_resource_watch(route, ledger, armed)
+            self.assertEqual(len(owned), 1)
+            self.assertTrue(SUP.RESOURCE_RESUME.supervisor_alive(first["supervision"]))
+            self.assertFalse(again["recovered"])
+            row = json.loads(registry.read_text())["runs"]["fixture-run"]
+            self.assertEqual({k: v for k, v in row.items() if k != "supervision"},
+                             {k: v for k, v in original.items() if k != "supervision"})
+        finally:
+            # These handles belong only to the fixture's new observers.
+            for proc in owned:
+                if proc.poll() is None:
+                    proc.terminate()
+                proc.wait(timeout=5)
+
     def test_parent_close_journal_suppresses_recovery_without_reclassifying_resource(self):
         route, _, _, registry, _, ledger, armed, row = self.living()
         original = copy.deepcopy(row)
