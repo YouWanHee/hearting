@@ -91,6 +91,19 @@ class OwnerResourceChildrenTest(unittest.TestCase):
         # A route is shared by retries, but the parked activity belongs to its exact owner only.
         self.assertIsNotNone(self.owner.resource_wait)
 
+    def test_parked_owner_active_resource_uses_the_shared_manual_blink_phase(self):
+        self.attach()
+        phases = []
+        for phase in (True, False):
+            with mock.patch.object(render, "_BLINK_ON", phase):
+                lines = render._build_lines([], [self.owner], "both", False, 0,
+                                            layout="wide", term_width=180, resources=[self.resource])
+                phases.append([key for line in lines if line for text, key in line
+                               if text == "eval-run" and key and key.startswith("stg")])
+        self.assertTrue(phases[0] and phases[1])
+        self.assertNotEqual(phases[0], phases[1])
+        self.assertEqual(self.owner.liveness, "idle")
+
     def test_duplicate_exact_parent_rows_and_missing_parent_never_guess(self):
         duplicate = replace(self.owner)
         self.attach(jobs=[self.owner, duplicate])
