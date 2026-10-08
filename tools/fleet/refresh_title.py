@@ -161,10 +161,20 @@ def _now_lang():
     return _LANG_WORDS.get(code, "")
 
 
-def _title_lang():
+def _user_language(anchor):
+    """Script evidence from the user's task context, never the worker/tool delta."""
+    for script, language in ((r"[\uac00-\ud7a3]", "Korean"),
+                             (r"[\u3040-\u30ff]", "Japanese"),
+                             (r"[\u3400-\u9fff]", "Chinese")):
+        if re.search(script, anchor or ""):
+            return language
+    return ""
+
+
+def _title_lang(anchor=""):
     language = config.title_language()
     if language.lower() == "auto":
-        language = _now_lang() or "the conversation's own language"
+        language = _now_lang() or _user_language(anchor) or "the conversation's own language"
     aliases = {"en": "English", "한국어": "Korean", "日本語": "Japanese", "中文": "Chinese"}
     return aliases.get(language.lower(), _LANG_WORDS.get(language.lower(), language))
 
@@ -186,9 +196,22 @@ def _prior_title_block(prior_title):
 
 def _prompt(delta, prior_title=None, anchor="", title_lang=None):
     return PROMPT_TEMPLATE.format(
-        delta=delta, anchor=anchor, now_lang=_now_lang() or "the conversation's own language",
-        title_lang=title_lang or _title_lang(),
+        delta=delta, anchor=anchor,
+        now_lang=_now_lang() or _user_language(anchor) or "the conversation's own language",
+        title_lang=title_lang or _title_lang(anchor),
         prior_title_block=_prior_title_block(prior_title))
+
+
+def _title_language_matches(title, language):
+    if not title:
+        return True
+    scripts = {"Korean": r"[\uac00-\ud7a3]", "Japanese": r"[\u3040-\u30ff\u3400-\u9fff]",
+               "Chinese": r"[\u3400-\u9fff]"}
+    if language in scripts:
+        return bool(re.search(scripts[language], title))
+    if language == "English":
+        return not re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]", title)
+    return True
 
 _TITLE_LINE_RE = re.compile(r"^\s*TITLE\s*:\s*(.*)$", re.IGNORECASE)
 _NOW_LINE_RE = re.compile(r"^\s*NOW\s*:\s*(.*)$", re.IGNORECASE)
@@ -308,7 +331,8 @@ def _record_role(data, harness):
 
 def _origin_text(raw, harness="claude"):
     """Choose a bounded task context without mistaking runtime bootstrap for intent."""
-    parser = _codex_text if harness == "codex" else _claude_text
+    parser = (_codex_text if harness == "codex" else
+              (lambda value: [_opencode_text(value)]) if harness == "opencode" else _claude_text)
     fallback = ""
     codex_user = ""
     saw_role = False
@@ -1479,19 +1503,24 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         return False
     now = time.time() if now is None else now
     previous = titles.read(sid, harness=harness) or {}
+    anchor = anchor_text or (read_prompt_anchor(prompt_path) if prompt_path else "")
+    if not anchor and transcript and previous.get("title"):
+        anchor = read_origin(transcript, harness)
+    language_changed = not _title_language_matches(previous.get("title"), _title_lang(anchor))
     ts = previous.get("ts") if isinstance(previous.get("ts"), (int, float)) else 0
     failures = _summary_failures(previous)
     retry_delay = SUMMARY_RETRY_DELAYS[failures - 1] if failures else debounce
-    if ts and now - ts <= retry_delay:
+    if ts and now - ts <= retry_delay and not language_changed:
         return False
     try:
         transcript_mtime = os.path.getmtime(transcript) if transcript else now
     except OSError:
         return False
-    if ts and transcript_mtime <= ts and not failures:
+    if ts and transcript_mtime <= ts and not failures and not language_changed:
         return False
     if (source_kind != "opencode-db" and previous.get("title") and previous.get("summary")
-            and not failures and not priority and quota_class not in ("initial", "final")):
+            and not failures and not language_changed and not priority
+            and quota_class not in ("initial", "final")):
         offset = previous.get("offset")
         if isinstance(offset, int):
             try:
@@ -1753,6 +1782,15 @@ def main(argv=None):
                 if args.prompt else read_origin(args.transcript, args.harness)
             )
         source = previous.get("source") or _provider_source()
+        title_lang = _title_lang(anchor)
+        if not _title_language_matches(previous_title, title_lang):
+            previous_title = ""
+            offset = 0
+            if args.opencode_db:
+                delta, new_offset, _ = read_opencode_delta(
+                    args.opencode_db, args.opencode_session, 0, table=table)
+            else:
+                delta, new_offset = read_delta(args.transcript, 0, harness=args.harness)
         minor_peer = (previous_title and previous_summary and not previous_failures
                       and not args.priority and args.quota_class not in ("initial", "final")
                       and _minor_peer_delta(delta))
@@ -1772,7 +1810,6 @@ def main(argv=None):
             return 0
 
         provider_box = {}
-        title_lang = _title_lang()
         output = run_worker(
             _prompt(delta, prior_title=previous_title, anchor=anchor, title_lang=title_lang),
             capacity_held=True, label=args.sid, provider_box=provider_box,
