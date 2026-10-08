@@ -417,7 +417,7 @@ class BorrowTest(CatalogBase):
         self.assertIn("빌린 부품 autopilot-research:retrieval·autopilot-research:synthesis", R.compose_card(route))
         self.assertNotIn("빌린 부품", R.compose_card(plain))
 
-    def test_auxiliary_leg_needs_a_selected_arbiter(self):
+    def test_auxiliary_leg_restores_a_missing_arbiter(self):
         arbitrated = self.compose("audit", "default", AUDIT_BORROW, "thorough")
         R.verify_route(arbitrated, R.ROOT)
         self.assertIn("autopilot-research-retrieval-assumption", self.ids(arbitrated))
@@ -425,17 +425,21 @@ class BorrowTest(CatalogBase):
         alone = self.compose("audit", "default", "inspect,autopilot-research:retrieval,report", "thorough")
         R.verify_route(alone, R.ROOT)
         self.assertEqual(self.ids(alone), [
-            "inspect", "autopilot-research-retrieval", "autopilot-research-retrieval-alternative", "report"])
-        self.assertEqual(alone["composed_recipe"]["compose"]["omitted_parallel_presets"], [{
-            "id": "autopilot-research-retrieval", "reason": "auxiliary-arbiter-not-selected",
-            "legs": ["assumption"]}])
-        self.assertEqual(R.compose_omission_lines(alone), [
-            "  thorough group autopilot-research-retrieval legs assumption dropped by --graph: auxiliary-arbiter-not-selected"])
+            "inspect", "autopilot-research-retrieval", "autopilot-research-retrieval-alternative",
+            "autopilot-research-retrieval-assumption", "autopilot-research-synthesis", "report"])
+        self.assertNotIn("omitted_parallel_presets", alone["composed_recipe"]["compose"])
+        self.assertEqual(alone["composed_recipe"]["compose"]["auto_completed_nodes"], [{
+            "id": "autopilot-research-synthesis", "reason": "auxiliary-arbiter-not-selected",
+            "anchors": ["autopilot-research-retrieval"], "intensity": "thorough"}])
+        self.assertEqual(R.compose_omission_lines(alone), [])
         self.assertIn("autopilot-research-retrieval", [g["id"] for g in alone["parallel_groups"]])
         report = self.node(alone, "report")
-        self.assertEqual(report["inputs"], [
-            "reviews/audit/**", RETRIEVAL,
-            "shards/parts/autopilot-research/retrieval/shards/retrieval-alternative/**"])
+        synthesis = self.node(alone, "autopilot-research-synthesis")
+        self.assertEqual(report["inputs"], ["reviews/audit/**", *synthesis["outputs"]])
+        self.assertEqual(synthesis["write_scope"], self.node(arbitrated, synthesis["id"])["write_scope"])
+        self.assertEqual(synthesis["part_io"], self.node(arbitrated, synthesis["id"])["part_io"])
+        self.assertEqual(R._resolve_auxiliary_arbiter(alone, "autopilot-research-retrieval"),
+                         ("node", "autopilot-research-synthesis"))
 
     def test_every_host_scope_class_takes_a_borrowed_part(self):
         cases = {

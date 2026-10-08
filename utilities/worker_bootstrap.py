@@ -563,6 +563,39 @@ def plan_leg_prompt(route, node_id=None) -> str:
     return "Plan for this leg (approved in the frame interview; base the verdict on it):\n" + "\n".join(lines) + "\n\n"
 
 
+def auxiliary_arbitration_prompt(route, node_id, artifact="artifact") -> str:
+    """Explain the existing gate using only the sealed realized groups and legs."""
+    import dispatch_contract
+    resolver = dispatch_contract._route_module()
+    groups, required = resolver._auxiliary_groups_arbitrated_by(route, node_id)
+    if not groups:
+        return ""
+    legs = [leg for group in groups for leg in resolver._realized_auxiliary_nodes(route, group)]
+    lines = [
+        f"Auxiliary arbitration for groups {', '.join(groups)}: {required} realized auxiliary leg(s) "
+        f"({', '.join(leg['id'] for leg in legs)}). The {artifact} must carry "
+        f"auxiliary_findings_considered with exactly {required} entries, one per auxiliary leg, "
+        "stating how its findings affected the conclusion. Use Markdown frontmatter as follows:",
+        "---", "auxiliary_findings_considered:",
+        *(f'  - "{leg["id"]}: <finding and disposition>"' for leg in legs), "---",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def automatic_consumer_prompt(route, node_id) -> str:
+    additions = ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", [])
+    addition = next((row for row in additions if row["id"] == node_id
+                     and row["reason"] != "terminal-anchor"), None)
+    if addition is None:
+        return ""
+    node = next(node for node in route["nodes"] if node["id"] == node_id)
+    return (
+        f"Your automatic registry consumer {node_id}: read every predecessor result "
+        f"({', '.join(node.get('depends_on') or [])}) and complete the existing "
+        f"{node['completion_gate']} gate using only your sealed inputs, outputs and write scope.\n"
+        + auxiliary_arbitration_prompt(route, node_id) + "\n")
+
+
 def owner_close_prompt(args) -> str:
     """Project the automatic closing node and its existing arbitration obligation."""
     if getattr(args, "worker_type", None) != "owner":
@@ -574,7 +607,6 @@ def owner_close_prompt(args) -> str:
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return ""  # Preview-only bindings retain the existing prompt fallback.
-    import dispatch_contract
     lines = []
     for node in route.get("nodes") or []:
         if node.get("completion_gate") != "compose-owner-close":
@@ -583,18 +615,9 @@ def owner_close_prompt(args) -> str:
             f"Your automatic closing node {node['id']}: finish every predecessor "
             f"({', '.join(node.get('depends_on') or [])}), read all their results, reconcile findings, "
             f"and write only {', '.join(node['outputs'])}. No publication, synchronization, or edits to prior artifacts.")
-        resolver = dispatch_contract._route_module()
-        groups, required = resolver._auxiliary_groups_arbitrated_by(route, node['id'])
-        if groups:
-            legs = [leg for group in groups for leg in resolver._realized_auxiliary_nodes(route, group)]
-            lines.append(
-                f"Auxiliary arbitration for groups {', '.join(groups)}: {required} realized auxiliary leg(s) "
-                f"({', '.join(leg['id'] for leg in legs)}). The closing summary must carry "
-                f"auxiliary_findings_considered with exactly {required} entries, one per auxiliary leg, "
-                "stating how its findings affected the conclusion. Use Markdown frontmatter as follows:")
-            lines.extend(["---", "auxiliary_findings_considered:"])
-            lines.extend(f'  - "{leg["id"]}: <finding and disposition>"' for leg in legs)
-            lines.append("---")
+        arbitration = auxiliary_arbitration_prompt(route, node['id'], "closing summary")
+        if arbitration:
+            lines.append(arbitration.rstrip())
     return "\n".join(lines) + ("\n\n" if lines else "")
 
 
@@ -616,6 +639,7 @@ def assignment_prompt(args, task: str, environ) -> str:
         )
         return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
+                f"{automatic_consumer_prompt(route, getattr(args, 'route_node', None))}"
                 f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
     outputs = []
     route_file = getattr(args, "route_file", None)
