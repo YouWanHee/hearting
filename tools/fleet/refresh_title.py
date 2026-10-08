@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -371,6 +372,19 @@ def _record_role(data, harness):
     return (str(role).lower() if role else str(data.get("type")).lower() if exposed else None), exposed
 
 
+class _UserOrigin(str):
+    """Keep the string API and the native human-message time for observations."""
+
+    def __new__(cls, text, timestamp):
+        value = super().__new__(cls, text)
+        try:
+            value.observed_at = (datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+                                 if isinstance(timestamp, str) else float(timestamp))
+        except (TypeError, ValueError, OverflowError):
+            value.observed_at = None
+        return value
+
+
 def _origin_text(raw, harness="claude", latest=False):
     """Choose a bounded task context without mistaking runtime bootstrap for intent."""
     parser = (_codex_text if harness == "codex" else
@@ -402,7 +416,7 @@ def _origin_text(raw, harness="claude", latest=False):
             if harness == "codex" or latest:
                 # Codex refreshes after every submitted prompt.  The latest real user
                 # turn is the current subject signal; the prior title supplies stability.
-                codex_user = text
+                codex_user = _UserOrigin(text, data.get("timestamp")) if latest else text
                 continue
             return text
         if not exposed and not fallback:
@@ -1947,9 +1961,12 @@ def main(argv=None):
             if not language and human and re.search(r"[A-Za-z]", human):
                 language = "English"
             previous_observation = _USER_LANGUAGE_SOURCE.search(source)
+            observed_at = getattr(human, "observed_at", None)
             if language and (explicit_anchor or not previous_observation
-                             or previous_observation[1] != language):
-                observation = "|user-language=%s@%.6f" % (language, time.time())
+                             or (observed_at is not None and observed_at > float(previous_observation[2]))
+                             or (observed_at is None and previous_observation[1] != language)):
+                observation = "|user-language=%s@%.6f" % (
+                    language, observed_at if observed_at is not None else time.time())
         source = _language_source(source, observation)
         observed_language = (_USER_LANGUAGE_SOURCE.search(source)[1]
                              if observation and not args.sid.startswith("dispatch-") else "")

@@ -129,6 +129,20 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
             self.assertIn("NOW: one sentence, in English,", worker.call_args.args[0])
             self.assertIn("user-language=English@300", titles.read("main-observation")["source"])
 
+    def test_old_main_hydration_cannot_overwrite_a_newer_human_language(self):
+        titles.write("recent-main", "최근 한국어 요청", harness="codex",
+                     source="refresher:codex|user-language=Korean@200")
+        path = Path(self._tmp.name) / "old-main.jsonl"
+        path.write_text(json.dumps({"type":"user", "timestamp":"1970-01-01T00:01:40Z",
+                                   "message":{"role":"user", "content":"Earlier English request"}}))
+        with mock.patch.dict(os.environ, {"LANG":"en_US.UTF-8", "LC_ALL":"",
+                                          "LC_MESSAGES":"", "FLEET_NOW_LANG":""}), \
+             mock.patch.object(rt, "run_worker", return_value=""):
+            rt.main(["--sid", "old-main", "--transcript", str(path),
+                     "--slotdir", str(Path(self._tmp.name) / "slot")])
+            self.assertIn("user-language=English@100", titles.read("old-main")["source"])
+            self.assertEqual(rt._observed_main_language(), "Korean")
+
     def test_language_limits_and_localized_failure_outputs(self):
         for language, title in (("Korean", "세션 제목 일관성"), ("Japanese", "セッションのタイトル"),
                                 ("Chinese", "会话标题一致性"), ("French", "Résumé des sessions")):
