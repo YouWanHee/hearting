@@ -1417,8 +1417,7 @@ steward on` (`source=explicit`), by `peer-steward.py wait`/`watch` once herdr an
 about a real target (`source=watch`; a mistyped target leaves no flag), or by a
 `peer-steward.py start` that launched a session (`source=start`). No `record` path and
 no send raises it — not a steer/handoff/gate-relay and not a `SendMessage` with `notify_when_idle`, which the
-Claude hook records as `kind=watch`. A session taking the role runs `peer-steward.py
-steward on` once. Fleet renders an evidenced marker
+Claude hook records as `kind=watch`. Fleet renders an evidenced marker
 as the pink tag and model flag only for targets confirmed in the same repository.
 Fleet and herdr use `steward.role_targets` for that display decision, comparing
 Git common directories (so linked worktrees count as the same repository) from
@@ -1426,10 +1425,16 @@ existing session metadata. Unknown or foreign repository targets grant no role,
 connector or pink tag; cross-repository messages remain communication (`✉`).
 No new role probe or execution authority follows from this projection. Fleet
 reads one supervisor per target: the newest same-repository start/watch/explicit
-evidence wins, with a stable identity tie-break. This is a display handover, not
-a refusal or marker rewrite. Nested supervisors keep their tree; each inner
-connector is two columns farther right and every box clears the active lines.
-ignores a marker whose entries carry no role source;
+evidence wins, with a stable identity tie-break. Sessions with their own winning
+targets form separate supervisor groups; supervisor-to-supervisor relations
+remain communication (`✉`). This shared projection is a display handover, not a
+refusal or marker rewrite. Supervisor groups share one connector column under
+the first character inside `[id]`, with `╷`/`╵` half-line ends between identities
+(`│` for a one-row gap). All session detail text and box left edges clear that
+column by two spaces, even without a connector; model, routing, NOW and box
+right-edge anchors stay fixed. Depth-1 frame cards use the owner model/gauge,
+routing and close-rail status layout on every harness; worker layouts retain
+their existing columns. Fleet ignores a marker whose entries carry no role source;
 `peer-message prune-steward-markers [--apply]` lists/removes those, and `peer-steward.py steward off` (or `peer-message release`)
 clears a marker.
 

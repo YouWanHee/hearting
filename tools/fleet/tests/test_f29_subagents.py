@@ -1066,7 +1066,8 @@ class NoRegressionTest(unittest.TestCase):
         the 2-cell and 4-cell insets read as siblings, not children). depth-1 rows are
         arrowless since F-64c, so the anchor is the rail column the strip must clear."""
         self.assertEqual(render._SUBAGENT_IND.strip(), "")
-        self.assertGreaterEqual(len(render._SUBAGENT_IND), render._RAIL_COL + 2)
+        self.assertEqual(len(render._SUBAGENT_IND), render._SESSION_DETAIL_COL)
+        self.assertGreaterEqual(len(render._conn_indent(1, in_card=True)), render._RAIL_COL + 2)
 
     def test_strip_depth_pushes_the_inset_further_inward(self):
         """A dispatch-owned strip (depth ≥ 1) indents 2 more cells per level than a

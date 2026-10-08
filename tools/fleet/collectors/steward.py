@@ -197,8 +197,13 @@ def _role_winners(markers, rows, evidence):
                 owners[parent[0]] = (rank, parent[0], dict(target, session_id=child[0][1]), order)
             else:
                 owners[parent[0]] = (*previous[:3], order)
-    return {child: max(owners.values(), key=lambda claim: claim[0])
-            for child, owners in claims.items()}
+    winners = {child: max(owners.values(), key=lambda claim: claim[0])
+               for child, owners in claims.items()}
+    # Decide peers after the existing handover: only an actor with a winning
+    # same-repository target is a supervisor. Relations between those actors
+    # are communication, not another layer of supervision. Keep marker bytes.
+    supervisors = {claim[1] for claim in winners.values()}
+    return {child: claim for child, claim in winners.items() if child not in supervisors}
 
 
 def _owner_targets(winners, harness, session_id):

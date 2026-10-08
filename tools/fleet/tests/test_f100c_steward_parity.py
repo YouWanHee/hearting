@@ -421,7 +421,7 @@ class StewardReverseIndexTest(unittest.TestCase):
         solo = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
         self._enrich([solo],
                      {"sidP": {"harness": "claude", "kind": "watch", "source": "watch"}})
-        self.assertTrue(solo.steward)
+        self.assertFalse(solo.steward)
         self.assertIsNone(solo.steward_parents)
 
     def test_a_resumed_target_still_joins_through_its_alias(self):

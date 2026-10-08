@@ -1410,9 +1410,10 @@ def _one_shot_route(route_seq):
 
 
 def _route_rides_the_rail(j, route_seq, in_card):
-    """All OWNER states belong to the close rail; worker micro-status stays inline."""
+    """OWNER and depth-1 FRAME cards share a layout; worker status stays inline."""
     depth = max(1, int(getattr(j, "depth", 1) or 1))
     return bool(in_card and (_is_owner_mode_row(j)
+                            or (depth == 1 and getattr(j, "worker_type", None) == "frame")
                             or (depth == 1 and not getattr(j, "worker_type", None))))
 
 
@@ -2093,8 +2094,9 @@ def _compact_dispatch_name(name, max_width=_DISPATCH_NAME_MAX):
 # Card inset: the left edge reserves the under-id relation column;
 # the existing right-edge budget stays independent so only the interior shrinks.
 _CARD_INSET = 1               # worker content placement stays unchanged
-_STEWARD_LINE_COL = 4         # start of the MAIN [id] chip
-_OWNER_CARD_INSET = _STEWARD_LINE_COL  # clear the connector column on every box
+_STEWARD_LINE_COL = 5         # first character inside the MAIN [id] chip
+_SESSION_DETAIL_COL = _STEWARD_LINE_COL + 3  # two blank cells after the connector
+_OWNER_CARD_INSET = _SESSION_DETAIL_COL - 2  # box left edge at the shared detail column
 
 
 def _dispatch_prefix(j, orphan=False, in_card=False, card_rail_col=None):
@@ -2260,6 +2262,9 @@ def _reserve_frame_prefix(segs, rail_col, elapsed_only=False):
     for value, style in segs:
         if isinstance(style, str) and style.startswith(("nm_", "nmd_")):
             boundary = width
+            break
+        if value and all(ch in (_BAR_FULL, _BAR_EMPTY) for ch in value):
+            boundary = width  # context word/padding ends at its own gauge anchor
             break
         width += _dw(value)
     end, width = 0, 0
@@ -3149,7 +3154,8 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     # L2: elapsed time sits UNDER the harness column (fills the old empty indent — user
     # Put time under the harness, model under the name, and gauge immediately after.
     # indent / no far-right flush).
-    l2 = [("    ", None), (_pad(fmt_min(s.elapsed_min), _HW), "dim")]
+    l2 = [(" " * _SESSION_DETAIL_COL, None),
+          (_pad(fmt_min(s.elapsed_min), 4 + _HW - _SESSION_DETAIL_COL), "dim")]
     l2 += _model_cell(s.model, s.effort, _MW, dim=dim_tel,
                       steward=bool(getattr(s, "steward", False)))
     # Same cell as the wide row (capability tag, route chain, spec breadcrumb): this card
@@ -3223,7 +3229,7 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
     name_key_j = ("nm_dead" if j.liveness == "dead"
                   else _NAME_KEY_DIM.get(j.harness, "nmd_other"))
     l1 = [("  ", None), (prefix, "dim"), (gch, gkey), (" ", None),
-          (_badge_cell(hn, _HW - len(prefix)), _BADGE_KEY.get(j.harness, "dim")), (shown_name, name_key_j)]
+          (_badge_cell(hn, max(9, _HW - len(prefix))), _BADGE_KEY.get(j.harness, "dim")), (shown_name, name_key_j)]
     if orphan:
         l1.append(("  (orphan)", "gate_u"))
     br_segs = _branch_suffix_segs(
@@ -3522,10 +3528,10 @@ def _sort_group_sessions(ss):
 
 
 def _steward_hierarchy(rows):
-    """Stable forest over existing enriched role targets and proven session joins.
+    """Flat supervisor groups over enriched role targets and proven session joins.
 
-    A shared target belongs to the first displayed supervisor; a cycle starts at
-    the first remaining supervisor. Each session is emitted once, with no probing.
+    The shared role collector has already removed supervisor-to-supervisor
+    relations. Each session is emitted once, with no probing or nested lanes.
     """
     from .collectors.steward import _session_keys
     unique = {}
@@ -3538,7 +3544,7 @@ def _steward_hierarchy(rows):
             continue
         for key in _session_keys(s):
             by_key.setdefault(key, []).append(s)
-    targets, incoming = {}, set()
+    targets = {}
     for s in rows:
         children = []
         if getattr(s, "steward", False):
@@ -3550,7 +3556,6 @@ def _steward_hierarchy(rows):
                 child = candidates[0]
                 if child is not s and child not in children:
                     children.append(child)
-                    incoming.add(id(child))
         targets[id(s)] = children
     ordered, seen, edges = [], set(), {}
 
@@ -3566,60 +3571,14 @@ def _steward_hierarchy(rows):
 
     stewards = sorted((s for s in rows if getattr(s, "steward", False)),
                       key=lambda s: repr(_live_session_identity(s)))
-    for s in [s for s in stewards if id(s) not in incoming] + stewards + rows:
+    for s in stewards + rows:
         visit(s)
     return ordered, edges
 
 
-def _under_id_connector(segs, column=_STEWARD_LINE_COL):
-    """Reserve one line cell by shifting only the occupied leading slot's padding.
-
-    MAIN identity rows are excluded by the caller. Time/context content can move
-    inside its existing slot; model and routing columns retain their anchors.
-    """
-    pos = 0
-    for i, (text, key) in enumerate(segs):
-        width = _dw(text)
-        if pos <= column < pos + width:
-            offset = column - pos
-            content = text.strip()
-            elapsed = bool(content and re.fullmatch(r"[0-9dhms —-]+", content))
-            if text[offset:offset + 1] == " " and not (elapsed and offset < len(text.rstrip())):
-                return _overwrite_rail_text(segs, column, "│", "dim")
-            # Elapsed and the WHERE word move as whole words inside their own
-            # slot. Never split `4h` or `herdr`, or borrow the percentage gap.
-            if content in ("herdr", "tty") or re.fullmatch(r"[0-9dhms —-]+", content or "!"):
-                lead = offset + 2
-                room = width - lead
-                shown = content if _dw(content) <= room else ""
-                rebuilt = [(" " * offset, None), ("│", "dim"), (" ", None),
-                           (_pad(shown, max(0, room)), key)]
-                return segs[:i] + rebuilt + segs[i + 1:]
-            # Use the occupied slot's own padding first: the context lead word
-            # must not steal the gap between its gauge and percentage.
-            stop = i
-            while (stop < len(segs) and text[offset:].count(" ") < 2
-                   and pos + _dw(text) < 4 + _HW):
-                stop += 1
-                if stop < len(segs):
-                    text += segs[stop][0]
-            fragment = segs[i:stop + 1]
-            chars = [(ch, style) for value, style in fragment for ch in value]
-            spares = [n for n in reversed(range(offset, len(chars))) if chars[n][0] == " "][:2]
-            if not spares:
-                return segs
-            for spare in spares:
-                chars.pop(spare)
-            chars[offset:offset] = [("│", "dim")] + ([(" ", None)] if len(spares) == 2 else [])
-            rebuilt = []
-            for ch, style in chars:
-                if rebuilt and rebuilt[-1][1] == style:
-                    rebuilt[-1] = (rebuilt[-1][0] + ch, style)
-                else:
-                    rebuilt.append((ch, style))
-            return segs[:i] + rebuilt + segs[stop + 1:]
-        pos += width
-    return segs
+def _under_id_connector(segs, mark="│"):
+    """Paint only the reserved cell; detail layout never depends on a relation."""
+    return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, "dim")
 
 
 def _live_session_identity(s):
@@ -4335,9 +4294,11 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
         # the hierarchy back onto the main-session detail column.
         shown_depth = min(depth, 1) if in_card else depth
         indicator_col = _dw("  " + _dispatch_prefix(job, orphan=orphan, in_card=in_card))
+        detail_indent = (4 + _HW - _CTX_LABEL_W if _route_rides_the_rail(job, None, in_card)
+                         else indicator_col + 2)
         return _context_detail_row(
             job, depth=shown_depth, term_width=term_width, dim=True,
-            indent_width=indicator_col + 2, muted=True)
+            indent_width=detail_indent, muted=True)
     summary = getattr(job, "summary", None)
     if not summary:
         return []
@@ -4563,10 +4524,7 @@ _CTX_CHIP_W = 7                     # F-55's slot: plain literal, evaluated befo
 _CTX_LABEL_W = _CTX_CHIP_W + 1      # + one trailing space = the F-55 slot width, unchanged.
 _CONTEXT_VALUE_W = 4
 _CONTEXT_NOW_GAP = 3          # minimum gap; F-42c widens it until NOW reaches the session column.
-_CONTEXT_INDENT_W = 4        # left inset that aligns the row under the HARNESS NAME (user
-                               # 2026-07-24 "하네스에서 좌측 정렬"): the session row leads with
-                               # ``"  " + glyph + " "`` = 4 cells before the harness field, so the
-                               # context bar starts at that same column in every layout.
+_CONTEXT_INDENT_W = _SESSION_DETAIL_COL
 
 
 def _compact_context_gauge_width(available, depth=0):
@@ -4676,6 +4634,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     resource_wait = getattr(entity, "resource_wait", None)
     if resource_wait:
         now_text = "%s · resource-parked" % ",".join(resource_wait["nodes"])
+    main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
     indent = " " * max(0, int(indent_width))
@@ -4691,8 +4650,15 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     # whatever is left below), and the track length is a MEASUREMENT (F-52b) that must not be
     # shrunk to buy room. The lead word is the last thing to give, and it gives whole
     # (F-100b): only when word + track + value cannot fit the row at all, even with zero NOW.
-    degrade = (_CTX_LABEL_W + track + _CONTEXT_VALUE_W) > available
+    lead_width = max(_CTX_LABEL_W, 4 + _HW - _dw(indent)) if main_detail else _CTX_LABEL_W
+    degrade = (lead_width + track + _CONTEXT_VALUE_W) > available
+    if degrade and term_width:
+        indent = " " * min(_dw(indent), max(0, term_width - track - _CONTEXT_VALUE_W))
     segs = [(indent, None)] + _context_lead_chip(entity, dim=dim, degrade=degrade)
+    if main_detail and not degrade:
+        # MAIN, OWNER and FRAME gauges share the fixed model-column anchor;
+        # the WHERE word sits at the shared detail inset, without moving NOW.
+        segs = _pad_to_column(segs, 4 + _HW)
     segs.extend(_gauge_segs(shown_pct, gauge_width, track=track))
     if shown_pct is None:
         value_text = "—"
@@ -7438,18 +7404,6 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         if live_order is not None:
             shown = live_order.reconcile_sessions(name, shown)
         shown, steward_edges = _steward_hierarchy(shown)
-        steward_depths = {}
-        positions = {id(session): i for i, session in enumerate(shown)}
-        session_columns = {}
-        for s in shown:
-            depth = steward_depths.get(id(s), 0)
-            targets = steward_edges.get(id(s), ())
-            for child in targets:
-                steward_depths[id(child)] = depth + 1
-            if targets:
-                column = _STEWARD_LINE_COL + 2 * depth
-                for index in range(positions[id(s)], positions[id(targets[-1])]):
-                    session_columns.setdefault(id(shown[index]), set()).add(column)
         session_starts, session_identity_rows = {}, set()
         rendered_parent_sids = set()  # ambiguous enrichment must not duplicate a dispatch tree
         for s in shown:
@@ -7556,28 +7510,25 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             for plugin_job in plugin_kids:
                 lines.extend(_plugin_agent_row(plugin_job, term_width=term_width))
             for i, cj in enumerate(dispatch_kids):
-                passing = session_columns.get(id(s), ())
                 _emit_dispatch_tree(cj, parent_model=s.model, parent_harness=s.harness,
                                     parent_effort=s.effort, orphan=False,
                                     is_last=(i == len(dispatch_kids) - 1),
                                     detached_root=(
                                         max(1, int(getattr(cj, "depth", 1) or 1)) >= 2
-                                    ), card_rail_col=max(_RAIL_COL, max(passing, default=-2) + 2))
+                                    ), card_rail_col=_RAIL_COL)
         # Draw each supervisor interval after its complete session/card block exists.
-        # Each nested supervisor takes the next two-cell lane. A parent's last
-        # target ends its own line at that target's ID, before the inner subtree.
-        connector_rows = {}
+        connector_rows = set()
         for parent, targets in steward_edges.items():
             if parent in session_starts and targets:
                 stop = session_starts.get(id(targets[-1]))
                 if stop is not None:
-                    column = _STEWARD_LINE_COL + 2 * steward_depths.get(parent, 0)
-                    for index in range(session_starts[parent] + 1, stop):
-                        connector_rows.setdefault(index, set()).add(column)
-        for idx in sorted(set(connector_rows) - session_identity_rows):
+                    connector_rows.update(range(session_starts[parent] + 1, stop))
+        for idx in sorted(connector_rows - session_identity_rows):
             if lines[idx]:
-                for column in sorted(connector_rows[idx]):
-                    lines[idx] = _under_id_connector(lines[idx], column)
+                below_id = idx - 1 in session_identity_rows
+                above_id = idx + 1 in session_identity_rows
+                mark = "│" if below_id == above_id else "╷" if below_id else "╵"
+                lines[idx] = _under_id_connector(lines[idx], mark)
         if group_sessions and hidden:
             lines.append([("     +%d stale/companion hidden" % hidden, "dim")])
 
