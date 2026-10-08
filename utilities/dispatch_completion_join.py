@@ -744,6 +744,10 @@ def completion_harvest_command(attempt_id: str, action: str, *, jobs: str, surfa
 
 
 def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
+    if receipt.get("children") and all(child.get("reason") == "cancelled-by-parent"
+            and child.get("required_action") == "advance-completed" for child in receipt["children"]):
+        return ("Parent-requested close has settled. No harvest, next-stage launch, "
+                "route restart, or manual finalization is required.")
     # A submitted work request already owns preparation and continuation. Give
     # its parent that exact handle again, rather than ask it to rediscover a
     # route or synthesize a new workflow from generic harvest instructions.
@@ -756,6 +760,9 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
             try:
                 row = exact_attempt_row(Path(jobs), child["attempt_id"])
                 meta = row.metadata
+                import route_parent_close
+                if route_parent_close.row_requested(meta, Path(jobs)):
+                    continue
                 if meta.get("dispatch_depth") != "1" or meta.get("worker_type") not in {"frame", "owner"}:
                     continue
                 if meta["worker_type"] == "owner" and child["required_action"] == "advance-completed":
@@ -2914,10 +2921,9 @@ def current_delivery_state(
     snapshot = current_attempt_row(jobs, attempt_id)
     import route_parent_close
     if snapshot is not None and route_parent_close.row_requested(snapshot.metadata, jobs):
-        outcome = route_parent_close.recover_attempt(jobs, snapshot.metadata)
+        route_parent_close.recover_attempt(jobs, snapshot.metadata)
         current = current_attempt_row(jobs, attempt_id)
-        settled = bool(outcome and outcome.get("state") == "cancelled"
-                       and current and current.metadata.get("parent_close_settled") == "1")
+        settled = bool(current and route_parent_close.cancellation_settled(current.metadata, jobs))
         return CurrentDeliveryState(None, "", child_row_revision(current),
             hashlib.sha256(current.raw.encode()).hexdigest(), current.status, "CANCELLED",
             settled, 0 if settled else 1, False, settled, False, settled,

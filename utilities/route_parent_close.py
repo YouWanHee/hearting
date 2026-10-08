@@ -65,6 +65,25 @@ def row_requested(metadata, jobs):
     return bool(value and metadata.get("attempt_id") in value["attempts"])
 
 
+def cancellation_settled(metadata, jobs):
+    """Observe the whole close, without driving cleanup from a queue consumer.
+
+    An individual terminal row can precede resource/process settlement. The
+    existing journal, rather than removable producer artifacts, owns that end.
+    None is ordinary work; False leaves the existing observer responsible.
+    """
+    route = {"route_id": metadata.get("parent_close_route_id") or metadata.get("owner_route_id") or metadata.get("route_id"),
+             "route_hash": metadata.get("parent_close_route_hash") or metadata.get("owner_route_hash") or metadata.get("route_hash")}
+    value = intent(route, jobs) or _current_owner_intent(metadata, jobs)
+    if not requested(metadata) and not (value and metadata.get("attempt_id") in value["attempts"]):
+        return None
+    if not value or metadata.get("parent_close_settled") != "1":
+        return False
+    route = value["route"]
+    result = settled_result(route, WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs))
+    return bool(result and result.get("state") == "cancelled")
+
+
 def _current_owner_intent(metadata, jobs):
     # Attachments and adopted advances leave launch rows unchanged. Resolve
     # their current owner before accepting an old child's late result.
@@ -112,17 +131,33 @@ def _owner(route, path, jobs, rows):
             continue
         if str(Path(fields[3]).resolve()) != str(Path(route["cwd"]).resolve()):
             continue
-        binding, reason = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=aid)
         owned = AUTH.owns(meta, AUTH.default_parent_session_id(), jobs)
+        relevant = (meta.get("owner_route_id") == route["route_id"]
+                    or meta.get("owner_route_file") == str(path.resolve())
+                    or route.get("owner_attempt_id") == aid)
+        # Ordinary route-free owners and unrelated historical rows coexist in
+        # this registry. Their absent/old binding is not current-route evidence.
+        if (not owned or fields[1] not in OPEN) and not relevant:
+            continue
+        try:
+            binding, reason = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=aid)
+        except OWNER.OwnerRouteBindingError as exc:
+            if not owned:
+                raise ValueError("parent-close-owner-not-owned") from exc
+            raise ValueError("parent-close-current-owner-unobservable:" + str(exc)) from exc
         if not owned:
             if binding and (binding.route_id, binding.route_hash, binding.route_file) == (
                     route["route_id"], route["route_hash"], str(path.resolve())) and fields[1] in OPEN:
                 raise ValueError("parent-close-owner-not-owned")
             continue
-        if fields[1] in OPEN and (not binding or "unresolvable" in reason or "conflict" in reason):
+        if binding is None and reason == "owner-route-binding-absent":
+            continue
+        matches = binding and (binding.route_id, binding.route_hash, binding.route_file) == (
+                route["route_id"], route["route_hash"], str(path.resolve()))
+        if fields[1] in OPEN and (matches or relevant) and (
+                not binding or "unresolvable" in reason or "conflict" in reason):
             raise ValueError("parent-close-current-owner-unobservable:" + reason)
-        if binding and (binding.route_id, binding.route_hash, binding.route_file) == (
-                route["route_id"], route["route_hash"], str(path.resolve())):
+        if matches:
             candidates.append((aid, fields, meta))
     active = [c for c in candidates if c[1][1] in OPEN]
     if len(active) > 1:

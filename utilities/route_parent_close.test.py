@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import contextlib
 import io
+import hashlib
 import time
 import importlib.util
 import json
@@ -186,6 +187,24 @@ class ParentCloseTest(unittest.TestCase):
         self.assertIsNotNone(owner.poll())
         self.assertIsNotNone(old_child.poll())
 
+    def test_current_close_ignores_unrelated_incomplete_history_and_route_free_owner(self):
+        self.row("att-owner")
+        for parent in ("fixture-parent", "foreign-parent"):
+            self.row("att-history-" + parent, status="done", parent_sid=parent,
+                     owner_route_file=str(self.base / "removed-old-route.json"),
+                     owner_route_id="", owner_route_hash="")
+        self.row("att-route-free", owner_route_file="", owner_route_id="", owner_route_hash="")
+        result = self.close()
+        self.assertEqual(result["state"], "cancelled")
+        self.assertEqual(result["owner_attempt_id"], self.aid("att-owner"))
+        self.assertEqual(CLOSE._rows(self.jobs)[self.aid("att-route-free")][0][1], "open")
+
+    def test_current_incomplete_binding_still_refuses_without_intent(self):
+        self.row("att-owner", owner_route_id="", owner_route_hash="")
+        with self.assertRaisesRegex(ValueError, "current-owner-unobservable.*binding-incomplete"):
+            self.close()
+        self.assertIsNone(CLOSE.intent(self.route, self.jobs))
+
     def test_same_group_foreign_resource_and_watcher_survive_both_choices(self):
         for stop in (False, True):
             child = ParentCloseTest(); child.setUp()
@@ -335,6 +354,72 @@ class ParentCloseTest(unittest.TestCase):
             self.assertEqual(projection.call_count, 1)
         self.jobs.write_text("1\topen\t/repo\t/wt\towner\tattempt_id=att-owner,worker_type=owner\n")
         self.assertFalse(CLOSE.row_requested({"attempt_id": "att-owner", "worker_type": "owner"}, self.jobs))
+
+    def test_pending_resource_defers_all_queue_carriers_then_replays_same_records(self):
+        import dispatch_pending_delivery as PD
+        # The carrier's conventional registry is entirely inside this fixture.
+        self.jobs = self.jobs.with_name("jobs.log")
+        self.jobs.touch()
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
+        owner = self.process("att-owner"); self.row("att-owner", process=owner)
+        resource = self.process("att-resource")
+        registry, run = self.resource(resource)
+        run["pid_namespace"] = "pid:[foreign-namespace]"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": run}}))
+        self.assertEqual(self.close(stop_resources=True)["state"], "termination-pending")
+        meta = CLOSE._rows(self.jobs)[self.aid("att-owner")][1]
+        self.assertEqual(meta["parent_close_settled"], "1")  # Agent alone is already terminal.
+        original = {}
+        kinds = ("claude-parent-runtime", "codex-native-queue", "opencode-turn")
+        for kind in kinds:
+            for action in ("advance-completed", "inspect-done-failure"):
+                receipt = DC._terminal_delivery_receipt(meta)
+                receipt["children"][0].update(required_action=action,
+                    delivery_classification="attention" if action.startswith("inspect") else "success")
+                receipt["delivery_classification"] = receipt["children"][0]["delivery_classification"]
+                did = "delivery-" + hashlib.sha256((kind + action).encode()).hexdigest()[:32]
+                original[did] = PD.create(self.jobs.parent, recipient_kind=kind, recipient_key="fixture-parent",
+                    delivery_id=did, session_generation="", session_generation_supported="0",
+                    attempt_ids=[self.aid("att-owner")], parent_attempt_id="fixture-parent",
+                    route_id=self.route["route_id"], route_node="owner", receipt=receipt,
+                    receipt_digest=PD._canonical_receipt_digest(receipt), row_revisions={self.aid("att-owner"): "fixture"})
+
+        def carrier(kind, action="deliver", payload=None):
+            env = {**os.environ, "HOME": str(self.base), "HARNESS_STATE_ROOT": str(self.base)}
+            proc = subprocess.run([sys.executable, str(HERE / "dispatch_session_sweep.py"), action,
+                "--recipient-kind", kind, "--session", "fixture-parent"], cwd=self.base, env=env,
+                input=json.dumps(payload or {}), capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)
+
+        for kind in kinds:
+            for _ in range(2):
+                self.assertEqual(carrier(kind), {"text": "", "records": []})
+        for did, record in original.items():
+            observed = PD.read(self.jobs.parent, "fixture-parent", did)
+            self.assertEqual(observed["state"], "pending")
+            self.assertEqual(observed["receipt"], record["receipt"])
+            self.assertEqual(observed["receipt_digest"], record["receipt_digest"])
+
+        run["pid_namespace"] = os.readlink("/proc/self/ns/pid")
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": run}}))
+        self.assertEqual(self.close()["state"], "cancelled")
+        self.assertIsNotNone(resource.poll())
+        shutil.rmtree(self.artifacts)  # No artifact retention condition for delivery/replay.
+        for kind in kinds:
+            delivered = carrier(kind)
+            self.assertEqual(len(delivered["records"]), 2)
+            self.assertIn("Parent-requested close has settled", delivered["text"])
+            self.assertIn("required_action=advance-completed", delivered["text"])
+            self.assertNotIn("inspect-done-failure", delivered["text"])
+            self.assertNotIn("(no harvest command; advance the route)", delivered["text"])
+            self.assertEqual(carrier(kind, "ack", delivered)["count"], 2)
+            self.assertEqual(carrier(kind)["records"], [])
+        for did, record in original.items():
+            observed = PD.read(self.jobs.parent, "fixture-parent", did)
+            self.assertEqual(observed["state"], "acked")
+            self.assertEqual(observed["receipt"], record["receipt"])
+            self.assertEqual(observed["receipt_digest"], record["receipt_digest"])
 
     def test_direct_successor_started_before_intent_is_stopped_from_existing_claim(self):
         owner = self.process("att-owner"); self.row("att-owner", process=owner)
