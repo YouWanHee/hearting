@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import dispatch_contract as D
 import dispatch_completion_join as JOIN
@@ -21,6 +22,11 @@ class OrdinaryReviewDeliveryTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.root = self.base / ".agent_reports"
         self.root.mkdir()
+        # A registered reviewer inherits the caller's canonical artifact root.
+        # Bind both the inspector and real reaper to this fixture instead.
+        environment = mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(self.root)})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.report = self.root / "review.md"
         self.report.write_text("## Verdict: PASS\nNo blocking findings.\n")
         self.log = self.base / "review.jsonl"
