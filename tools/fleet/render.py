@@ -4358,7 +4358,7 @@ def _resource_gpu_suffix(children, room=None):
     return _clip_w(out, room) if room is not None else out
 
 
-def _resource_gpu_resources(child, snapshot, commands=False):
+def _resource_gpu_resources(child, snapshot, commands=False, excluded_processes=()):
     """Reuse local PID/start/group marks, exact run id or remote parent attempt."""
     if not isinstance(snapshot, dict):
         return []
@@ -4376,6 +4376,10 @@ def _resource_gpu_resources(child, snapshot, commands=False):
             matched = []
             for process in gpu.get("processes") or ():
                 if not isinstance(process, dict):
+                    continue
+                process_key = (host.get("host") or "?", process.get("pid"),
+                               str(process.get("proc_start")))
+                if process_key in excluded_processes:
                     continue
                 owner = process.get("owner")
                 local = host.get("self") is True and (
@@ -4436,13 +4440,14 @@ def _owner_gpu_resource_rows(job, session_by_identity, gpu_resources, term_width
 
 
 def _gpu_and_resource_rows(children, resources=(), term_width=None, depth=0, in_card=False,
-                           commands=False):
+                           commands=False, excluded_processes=()):
     """The same observed resource rows under an owner or its project fallback."""
     combined = {(resource["host"], resource["index"]): resource for resource in resources}
     snapshot, _age = _fresh_compute_hosts()
     linked = []
     for child in children:
-        matched = _resource_gpu_resources(child, snapshot, commands=commands)
+        matched = _resource_gpu_resources(child, snapshot, commands=commands,
+                                         excluded_processes=excluded_processes)
         if matched:
             linked.append(child)
             for resource in matched:
@@ -6197,7 +6202,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         first = False
         lines.append([("  ● ", "g_work"), (name + "/", "grp_hot")])
         gpu_rows, resource_rows = _gpu_and_resource_rows(
-            children, term_width=term_width, commands=True)
+            children, term_width=term_width, commands=True, excluded_processes=excluded)
         lines.extend(gpu_rows + resource_rows)
         for child in children:
             for gpu in _resource_gpu_resources(child, snapshot):
@@ -6887,7 +6892,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             resource_processes.update(_drawn_gpu_processes(
                 _drawn_group_jobs(classified, shown), session_by_identity, gpu_resources, snapshot))
         for name, children in _orphan_resource_groups(resources, drawn_jobs).items():
-            groups.setdefault(name, {"sessions": [], "jobs": []})["resources"] = children
+            group = groups.setdefault(name, {"sessions": [], "jobs": []})
+            group["resources"] = children
+            group["resource_excluded_processes"] = set(resource_processes)
             for child in children:
                 for gpu in _resource_gpu_resources(child, snapshot):
                     resource_processes.update(gpu["_process_keys"])
@@ -7436,7 +7443,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # F-104: live GPU work that no registry run or session GPU strip shows.
         if emission["resources"]:
             gpu_rows, resource_rows = _gpu_and_resource_rows(
-                emission["resources"], term_width=term_width, commands=True)
+                emission["resources"], term_width=term_width, commands=True,
+                excluded_processes=g.get("resource_excluded_processes", ()))
             lines.extend(gpu_rows + resource_rows)
         lines.extend(_gpu_work_strip(emission["gpu"], term_width))
 

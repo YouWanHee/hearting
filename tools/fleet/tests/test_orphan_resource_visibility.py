@@ -147,6 +147,75 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
         self.assertIn("second-node", output)
         self.assertEqual(output.count("s_baseline"), 2)  # top command + project label
 
+    def test_owner_session_gpu_overlap_keeps_only_unshown_fallback_processes(self):
+        for harness in ("claude", "codex", "opencode"):
+            for complete in (False, True):
+                for process in (False, True):
+                    with self.subTest(harness=harness, complete=complete, process=process):
+                        owner = DispatchJob(
+                            key="code", slug="visible-owner", cwd="/work/project", pid=480,
+                            proc_start="9", attempt_id="att-other", harness=harness,
+                            intensity="standard", liveness="working", worker_type="owner",
+                            work_projection=WorkProjection(source="none"))
+                        owner._runtime_session_id = "exact-session"
+                        for i, proc in enumerate(self.snapshot["hosts"][0]["gpus"][0]["processes"]):
+                            proc["session_owner"] = ({"kind": "session", "harness": harness,
+                                                      "id": "exact-session"}
+                                                     if complete or i == 0 else None)
+                        output = text(self.lines(jobs=[owner], process=process))
+                        rows = [row for row in output.splitlines() if "● GPU gpu-host:0" in row]
+                        self.assertEqual(len(rows), 1 if complete else 2)
+                        self.assertEqual(output.count("full-run"), 1)
+                        if complete:
+                            self.assertIn("2 GB", rows[0])
+                            self.assertIn("resource full-run", output)
+                        else:
+                            self.assertTrue(all("1 GB" in row for row in rows))
+                            fallback = next(row for row in rows if "full-run" in row)
+                            self.assertIn("s_strided", fallback)
+                            self.assertNotIn("s_baseline", fallback)
+
+    def test_attached_resource_overlap_preserves_orphan_progress_without_duplicate_gpu(self):
+        for complete in (False, True):
+            for process in (False, True):
+                with self.subTest(complete=complete, process=process):
+                    attached = replace(self.child, run_id="attached-run", node="owner-node",
+                                       parent_attempt_id="att-live-owner")
+                    if not complete:
+                        attached = replace(attached, pid=501, starttime="20", process_group=None)
+                    owner = DispatchJob(
+                        key="code", slug="live-owner", cwd="/work/project", pid=480,
+                        proc_start="9", attempt_id=attached.parent_attempt_id, harness="codex",
+                        intensity="standard", liveness="working", worker_type="owner",
+                        work_projection=WorkProjection(source="none"))
+                    projection._attach_resource_children([owner], [attached, self.child])
+                    output = text(self.lines(children=[attached, self.child], jobs=[owner],
+                                             process=process))
+                    rows = [row for row in output.splitlines() if "● GPU gpu-host:0" in row]
+                    self.assertEqual(len(rows), 1 if complete else 2)
+                    self.assertEqual(output.count("owner-node"), 1)
+                    self.assertEqual(output.count("full-run"), 1)
+                    if complete:
+                        self.assertIn("resource full-run", output)
+                        self.assertIn("2 GB", rows[0])
+                    else:
+                        self.assertTrue(all("1 GB" in row for row in rows))
+                        fallback = next(row for row in rows if "full-run" in row)
+                        self.assertIn("s_strided", fallback)
+                        self.assertNotIn("s_baseline", fallback)
+
+    def test_fallback_groups_share_process_exclusions_and_keep_each_resource_row(self):
+        other = replace(self.child, run_id="other-project-run", cwd="/work/other-project",
+                        project="other-project", node="other-node")
+        for process in (False, True):
+            with self.subTest(process=process):
+                output = text(self.lines(children=[self.child, other], process=process))
+                self.assertEqual(output.count("● GPU gpu-host:0"), 1)
+                self.assertEqual(output.count("2 GB"), 1)
+                self.assertEqual(output.count("full-run"), 1)
+                self.assertEqual(output.count("other-node"), 1)
+                self.assertEqual(output.count("resource "), 1)
+
     def test_resource_only_project_is_hot_unfolded_and_section_filtered(self):
         group = {"sessions": [], "jobs": [], "resources": [self.child]}
         self.assertEqual(render._group_activity_rank(group), 0)
