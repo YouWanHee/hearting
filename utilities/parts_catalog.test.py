@@ -137,6 +137,28 @@ def _historical_setup_projection(recipe, case):
     return {**recipe, "promotion_signals": signals}
 
 
+def _historical_terminal_notice_projection(recipe, case):
+    """This fixture predates terminal omission diagnostics, not their graph."""
+    meta = recipe.get("compose") or {}
+    omissions = meta.get("omitted_parallel_presets", [])
+    terminal = [row for row in omissions if row.get("reason") == "terminal-anchor"]
+    if not terminal:
+        return recipe
+    case.assertEqual(len(terminal), 1)
+    nodes = recipe["standard_plus"]["nodes"]
+    case.assertTrue(nodes[-1]["terminal"])
+    case.assertEqual(terminal, [{"id": nodes[-1]["id"], "reason": "terminal-anchor"}])
+    original = TOPO.resolve_recipe(TOPO.load_registry(), recipe["capability"], recipe["modes"][0])
+    case.assertIn(nodes[-1]["id"], [g["id"] for g in original["standard_plus"].get("parallel_groups", [])])
+    remaining = [row for row in omissions if row not in terminal]
+    meta = dict(meta)
+    if remaining:
+        meta["omitted_parallel_presets"] = remaining
+    else:
+        meta.pop("omitted_parallel_presets")
+    return {**recipe, "compose": meta}
+
+
 def _historical_gpu_card(route, card, case):
     lines = card.splitlines()
     # Later routing observations are not part of the pre-catalog graph. Drop
@@ -190,6 +212,8 @@ def golden_payload(case):
         # policy suite checks that new selection and its warning separately.
         if isinstance(value, dict) and value.get("capability") == "autopilot-lab" and "setup" in value.get("modes", []):
             value = _historical_setup_projection(value, case)
+        if isinstance(value, dict) and "compose" in value:
+            value = _historical_terminal_notice_projection(value, case)
         text = _normalize(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False), case)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
 
@@ -405,6 +429,9 @@ class BorrowTest(CatalogBase):
         self.assertEqual(alone["composed_recipe"]["compose"]["omitted_parallel_presets"], [{
             "id": "autopilot-research-retrieval", "reason": "auxiliary-arbiter-not-selected",
             "legs": ["assumption"]}])
+        self.assertEqual(R.compose_omission_lines(alone), [
+            "  thorough group autopilot-research-retrieval legs assumption dropped by --graph: auxiliary-arbiter-not-selected"])
+        self.assertIn("autopilot-research-retrieval", [g["id"] for g in alone["parallel_groups"]])
         report = self.node(alone, "report")
         self.assertEqual(report["inputs"], [
             "reviews/audit/**", RETRIEVAL,
