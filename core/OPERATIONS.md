@@ -1471,7 +1471,11 @@ evidence wins, with a stable identity tie-break. A session's watch of the
 same-repository supervisor that started it is reply-wait communication, not
 supervisor-role evidence. The common lookup excludes that reverse watch after
 resolving the start's exact/name/alias identities; the watch record and its actual
-wait/wake behavior stay intact. Sessions with their own winning
+wait/wake behavior stay intact. Each target entry retains its first `start_ts`
+through later watch/explicit updates and name-only-to-SID completion, so the
+common lookup can still identify the launcher after the latest evidence changes.
+Existing `source=start` entries remain readable without migration.
+Sessions with their own winning
 targets form separate supervisor groups; supervisor-to-supervisor relations
 remain communication (`✉`). This shared projection is a display handover, not a
 refusal or marker rewrite. Every session's first row keeps its status glyph first,

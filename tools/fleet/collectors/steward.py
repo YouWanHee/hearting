@@ -188,7 +188,7 @@ def _role_winners(markers, rows, evidence):
                 continue
             resolved.append((parent[0], child[0], target))
     starts = {(parent, child) for parent, child, target in resolved
-              if (target.get("source") or target.get("kind")) == "start"}
+              if target.get("source") == "start" or "start_ts" in target}
     claims = {}
     for parent, child, target in resolved:
         # Waiting for the launcher does not turn its worker into a supervisor.
