@@ -844,6 +844,11 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
+The existing owner input state receives the verified native session identity
+as soon as the transport binds it, including during the first model turn.
+A registered resource launched in that turn uses the same live supervisor and
+session binding, available during the turn itself.
+
 For the explicit `resume-run,run-verify` graph, `resource-runner start` also
 arms the shared supervisor and starts its watch, without a model waiting on the
 payload. The same route's normal `start` is the claimed successor: before the
