@@ -1299,6 +1299,7 @@ def _open_gate_pending(launch: Launch) -> bool:
 def _gate_notices(
     launch: Launch, *, attempt_only: bool = False, settle: str = "ack",
     announced: list[str] | None = None,
+    supervision_claims: list[tuple[Path, str, str, str]] | None = None,
 ) -> list[str]:
     """SD-123 (8)(b) carrier 1: fold every open gate record for this recipient
     into the wake this hook is about to emit.
@@ -1360,6 +1361,8 @@ def _gate_notices(
         notices.append(_bounded_receipt_text({**record, CONTINUED_KEY: continued} if continued else record))
         if announced is not None:
             announced.append(delivery_id)
+        if supervision_claims is not None and record.get("receipt", {}).get("kind") == "supervision":
+            supervision_claims.append((root, recipient_key, delivery_id, claim_owner))
         try:
             if settle == "sent-ambiguous":
                 pending_delivery.mark_sent_ambiguous(
@@ -1606,13 +1609,27 @@ def _run_carrier(launch, claim, payload, observation, holder) -> int:
             # announce) sleeps one interval and resumes waiting -- never a
             # tight loop (review round 1, B3).
             announced: list[str] = []
+            supervision_claims: list[tuple[Path, str, str, str]] = []
             notices = _gate_notices(
-                launch, attempt_only=True, settle="sent-ambiguous", announced=announced
+                launch, attempt_only=True, settle="sent-ambiguous", announced=announced,
+                supervision_claims=supervision_claims,
             )
             if notices:
                 observation.update(wait_state="gate", reason="human-gate-open")
                 code = emit_receipt("attention", gate_wake_message(launch, notices), block=False)
                 settle_arm(claim, "gate-wake-sent", gate_delivery_id=announced[0])
+                # The native wake immediately runs UserPromptSubmit. Keeping
+                # this exited carrier's 30s lease prevents that synchronous
+                # sweep from consuming the warning, so every Bash call in a
+                # short attention turn refuses to re-arm as `gate-open`.
+                # Return only our supervision claims; the sweep owns the ACK.
+                for state_root, recipient, delivery_id, claim_owner in supervision_claims:
+                    try:
+                        pending_delivery.release_claim(
+                            state_root, recipient, delivery_id, claim_owner=claim_owner
+                        )
+                    except pending_delivery.PendingDeliveryError:
+                        pass
                 return code
             time.sleep(interval)
         if wait_state not in {"ready", "attention"}:

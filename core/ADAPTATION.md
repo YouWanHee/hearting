@@ -489,6 +489,14 @@ stamp path in `core/HOOKS.md`.
   owner or different live gate, records an audited `expired` state atomically,
   and never writes a release, deletes the route/registry/marker/record, or turns
   the source attempt into PASS.
+- **Supervision wake handoff.** A supervision warning does not wait for a
+  human gate release. After emitting its in-wait wake, the Claude carrier
+  returns only its own supervision-notice claims to the existing queue. The
+  synchronous prompt sweep on the awakened turn can consume or retire them
+  immediately, allowing that turn's next Bash call to re-arm the same attempt
+  for completion. The async emit is not an acknowledgement; a lost wake stays
+  recoverable. Human-gate notices retain their existing speculative lease and
+  release semantics, and another carrier's successor claim is preserved.
 - The interactive Claude `asyncRewake` bridge never reads the Bash command
   text (2026-09-09; six consecutive reviews had each found a new hole in the
   shell parsing that decided which owner a command had started). It

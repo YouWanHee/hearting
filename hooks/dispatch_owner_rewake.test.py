@@ -2816,6 +2816,109 @@ class GateCarrierTest(unittest.TestCase):
         self.assertFalse(rewake.is_human_gate_record(record))
 
 
+class SupervisionWakeRearmTest(unittest.TestCase):
+    """An attention wake must hand its notice to the immediate prompt sweep,
+    so that turn can arm a second carrier for the same owner's success."""
+
+    ANCESTRY = CarrierOneClaimGateTest.ANCESTRY
+    payload = CarrierOneClaimGateTest.payload
+
+    def setUp(self):
+        CarrierOneClaimGateTest.setUp(self)
+        CarrierOneClaimGateTest._open_row(self)
+        self.jobs.write_text(self.jobs.read_text().replace(
+            "parent_attempt_id=att-owner-parent,", ""), encoding="utf-8")
+        rewake._RECIPIENT_KEY_CACHE.clear()
+        rewake._PROBE_DIRECTORY_MTIME.clear()
+        rewake._PROBE_NEXT_DEADLINE_NS.clear()
+        from dispatch_supervision import materialize
+        self.notice = materialize(self.jobs, {"att-owner-1"}, reason="join-deadline")[0]
+
+    def _run(self, wait_state, payload=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(payload or self.payload()))), \
+             mock.patch.object(rewake.sys, "stdout", stdout), \
+             mock.patch.object(rewake.sys, "stderr", stderr), \
+             mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
+             mock.patch.object(rewake, "wait_for_attempt", return_value=(wait_state, "test-readiness")):
+            code = rewake.main()
+        return code, stderr.getvalue()
+
+    def _parent_call(self):
+        payload = self.payload()
+        payload["tool_input"] = {"command": "git status"}
+        payload["tool_response"] = {"stdout": "", "stderr": ""}
+        return payload
+
+    def _dead_holder(self):
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        record = json.loads(path.read_text())
+        record["holder"] = DEAD_HOLDER
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+    def _complete_owner(self):
+        namespace = DEAD_HOLDER[2]
+        drained = (
+            f",failure_class=pass,pid=4194304,pid_start=1,pgid=4194304,"
+            f"pid_ns={namespace},pid_observer_ns={namespace},pid_scope=namespace-local,"
+            "launch_lifecycle=detached,launch_outcome=governed-process-group-drained,"
+            "group_reap_pgid=4194304,group_reap_proof=pgid-empty-v1,"
+            f"attempt_descendant_proof=attempt-tagged-empty-v1,attempt_descendant_observer_ns={namespace}"
+        )
+        self.jobs.write_text(self.jobs.read_text().rstrip() + drained + "\n", encoding="utf-8")
+        self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", "completed-supervisor"))
+        path = JOIN.materialize_pending_delivery(self.jobs, self.jobs.read_text().splitlines()[0].split("\t"))
+        self.assertIsNotNone(path)
+        return path
+
+    def test_attention_sweep_rearm_success_without_waiting_for_a_lease(self):
+        from dispatch_session_sweep import sweep_deliver, ack_delivered
+        code, text = self._run("gate")
+        self.assertEqual(code, 2)
+        self.assertIn("Hearting supervision needs attention", text)
+        self.assertNotIn("human gate", text)
+        self._dead_holder()  # the first async hook process exited
+        records, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual([r["delivery_id"] for r in records], [self.notice["delivery_id"]])
+        self.assertEqual(ack_delivered(self.root, "session-1", records, acked_by="parent-prompt"), 1)
+        # The ordinary Bash call in that awakened turn arms again while open.
+        launch, claim = rewake.registry_launch(self._parent_call())
+        self.assertEqual((launch.armed, claim.arms), ("registry-rearm", 2))
+        self.assertFalse(rewake._open_gate_pending(launch))
+        self._dead_holder()
+        completion = self._complete_owner()
+        code, text = self._run("ready", self._parent_call())
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", text)
+        self.assertIn("advance-completed", text)
+        self.assertEqual(json.loads(completion.read_text())["state"], "sent-ambiguous")
+        self.assertEqual(rewake._read_arm(claim.path)["state"], "ended")
+        self.assertEqual(rewake.registry_launch(self._parent_call()).reason, "ended")
+
+    def test_lost_wake_is_not_acked_and_successor_claim_is_preserved(self):
+        pending = rewake.pending_delivery
+        delivery_id = self.notice["delivery_id"]
+
+        def other_carrier_claims(*args, **kwargs):
+            pending.reclaim(self.root, "session-1", delivery_id, now_ns=time.monotonic_ns() + 10**12)
+            pending.claim(self.root, "session-1", delivery_id, claim_owner="successor", lease_seconds=120)
+            return 2
+
+        with mock.patch.object(rewake, "emit_receipt", side_effect=other_carrier_claims):
+            self.assertEqual(self._run("gate")[0], 2)
+        record = pending.read(self.root, "session-1", delivery_id)
+        self.assertEqual((record["state"], record["claim_owner"]), ("claimed", "successor"))
+        self.assertIsNone(record["acked_by"])
+
+    def test_emit_failure_keeps_the_notice_recoverable(self):
+        with mock.patch.object(rewake, "emit_receipt", side_effect=RuntimeError("emit failed")):
+            with self.assertRaisesRegex(RuntimeError, "emit failed"):
+                self._run("gate")
+        record = rewake.pending_delivery.read(self.root, "session-1", self.notice["delivery_id"])
+        self.assertEqual(record["state"], "sent-ambiguous")
+        self.assertIsNone(record["acked_by"])
+
+
 class GateCloseRearmTest(GateCarrierTest):
     """SD-129 without command parsing: the wake spent on a gate is re-armed by
     the first same-session Bash call after that gate record closes -- the
