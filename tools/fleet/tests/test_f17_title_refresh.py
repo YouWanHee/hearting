@@ -1309,6 +1309,20 @@ class TriggerLogicTest(unittest.TestCase):
             lines = [ln for ln in f.read().splitlines() if ln.strip()]
         self.assertEqual(len(lines), 1)
 
+    def test_trigger_grown_transcript_waits_for_five_minutes(self):
+        sc_dir = os.path.join(self.root, "title-state", "claude")
+        os.makedirs(sc_dir, exist_ok=True)
+        sc_path = os.path.join(sc_dir, "sidT.json")
+        with open(sc_path, "w", encoding="utf-8") as handle:
+            json.dump({"title": "x", "summary": "work", "offset": 0}, handle)
+        now = time.time()
+        os.utime(sc_path, (now - 180, now - 180))
+        self._run()
+        self.assertFalse(os.path.exists(self.sentinel))
+        os.utime(sc_path, (now - 301, now - 301))
+        self._run()
+        self.assertTrue(os.path.exists(self.sentinel))
+
     def test_trigger_summary_failure_retries_without_new_transcript_mtime(self):
         sc_dir = os.path.join(self.root, "title-state", "claude")
         os.makedirs(sc_dir, exist_ok=True)
