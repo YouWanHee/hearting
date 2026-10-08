@@ -5,8 +5,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+import worker_runtime_home
 from worker_runtime_home import prepare_worker_home, codex_worker_arguments, claude_worker_arguments
 from worker_bootstrap import render_worker_bootstrap
 
@@ -138,6 +141,107 @@ class WorkerHomes(unittest.TestCase):
         default = self.base / 'other-session/sessions'
         self.assertEqual(mod.sessions_dir_for(pipe, 'job', ROOT, default), actual / 'sessions')
         self.assertEqual(mod.sessions_dirs_for(pipe, 'job', ROOT, default, str(ROOT)), [actual / 'sessions'])
+
+    def test_concurrent_home_builders_reuse_the_same_link_in_every_harness(self):
+        # Force both creators past the missing-path observation before either
+        # symlink is published, rather than relying on a lucky thread schedule.
+        original = Path.symlink_to
+        for harness, filename, variable in (
+                ('codex', 'AGENTS.md', 'CODEX_HOME'),
+                ('claude', 'CLAUDE.md', 'CLAUDE_CONFIG_DIR'),
+                ('opencode', 'AGENTS.md', 'OPENCODE_CONFIG_DIR')):
+            with self.subTest(harness=harness):
+                barrier = threading.Barrier(2)
+                env = {**self.env, variable: str(self.source)}
+                def synchronized(path, *args, **kwargs):
+                    if path.name == filename:
+                        barrier.wait(timeout=5)
+                    return original(path, *args, **kwargs)
+                def build():
+                    return prepare_worker_home(ROOT, harness, 'stage', harness, env=env)
+                with patch.object(Path, 'symlink_to', synchronized), ThreadPoolExecutor(2) as pool:
+                    futures = [pool.submit(build) for _ in range(2)]
+                    results = [future.result(timeout=10) for future in futures]
+                self.assertEqual(results[0], results[1])
+                home = Path(results[0][variable])
+                self.assertEqual((home / filename).read_bytes(),
+                                 (ROOT / f'profiles/templates/bootstrap-{harness}.md').read_bytes())
+                self.assertEqual(json.loads((home / 'worker-home.json').read_text())['harness'], harness)
+
+    def test_generated_files_and_profile_refresh_publish_complete_bytes(self):
+        settings = {'permissions': {'deny': ['Read(secret)']}}
+        (self.source / 'settings.json').write_text(json.dumps(settings))
+        env = {**self.env, 'CLAUDE_CONFIG_DIR': str(self.source)}
+        first = prepare_worker_home(ROOT, 'claude', 'stage', 'profile-refresh',
+                                    env=env, profile='code-report')
+        home = Path(first['CLAUDE_CONFIG_DIR'])
+        before = {p.name: p.read_bytes() for p in home.iterdir() if p.is_file()}
+        bootstrap_inode = (home / 'CLAUDE.md').stat().st_ino
+        original = os.replace
+        publications = []
+        def checked_replace(source, destination):
+            destination = Path(destination)
+            self.assertEqual(destination.read_bytes(), before[destination.name])
+            if destination.suffix == '.json':
+                json.loads(Path(source).read_text())
+            self.assertEqual(Path(source).stat().st_mode & 0o777, 0o600)
+            publications.append(destination.name)
+            return original(source, destination)
+        with patch.object(worker_runtime_home._builder.os, 'replace', checked_replace), ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(prepare_worker_home, ROOT, 'claude', 'stage',
+                                   'profile-refresh', env=env, profile='code-report') for _ in range(2)]
+            self.assertEqual([f.result(timeout=10) for f in futures], [first, first])
+        self.assertEqual(publications.count('CLAUDE.md'), 0)
+        self.assertEqual((home / 'CLAUDE.md').stat().st_ino, bootstrap_inode)
+        self.assertEqual(publications.count('settings.json'), 2)
+        self.assertEqual(publications.count('worker-home.json'), 2)
+
+    def test_concurrent_profile_bootstrap_publication_is_idempotent(self):
+        builder = worker_runtime_home._builder
+        env = {**self.env, 'CLAUDE_CONFIG_DIR': str(self.source)}
+        original = os.link
+        barrier = threading.Barrier(2)
+        def synchronized(source, destination, *args, **kwargs):
+            if Path(destination).name == 'CLAUDE.md':
+                barrier.wait(timeout=5)
+            return original(source, destination, *args, **kwargs)
+        with patch.object(builder.os, 'link', synchronized), ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(prepare_worker_home, ROOT, 'claude', 'stage',
+                                   'new-profile', env=env, profile='code-report') for _ in range(2)]
+            results = [f.result(timeout=10) for f in futures]
+        self.assertEqual(results[0], results[1])
+        self.assertIn('profiles/code-report.yaml',
+                      (Path(results[0]['CLAUDE_CONFIG_DIR']) / 'CLAUDE.md').read_text())
+
+    def test_profile_preserves_a_foreign_regular_bootstrap(self):
+        home = self.base / 'foreign-home'
+        home.mkdir()
+        bootstrap = home / 'CLAUDE.md'
+        bootstrap.write_text('foreign instructions')
+        with self.assertRaisesRegex(ValueError, 'worker home collision'):
+            prepare_worker_home(ROOT, 'claude', 'stage', 'foreign-profile',
+                                env={**self.env, 'CLAUDE_CONFIG_DIR': str(self.source)},
+                                destination=home, profile='code-report')
+        self.assertEqual(bootstrap.read_text(), 'foreign instructions')
+
+    def test_link_refresh_is_atomic_and_foreign_file_is_preserved(self):
+        builder = worker_runtime_home._builder
+        old, new, target = self.base / 'old', self.base / 'new', self.base / 'link'
+        old.write_text('old'); new.write_text('new')
+        builder.publish_symlink(old, target)
+        original = os.replace
+        def checked_replace(source, destination):
+            self.assertEqual(target.read_text(), 'old')
+            return original(source, destination)
+        with patch.object(builder.os, 'replace', checked_replace):
+            builder.publish_symlink(new, target)
+        self.assertEqual(target.read_text(), 'new')
+        with patch.object(Path, 'unlink', side_effect=AssertionError('matching link removed')):
+            builder.publish_symlink(new, target)
+        target.unlink(); target.write_text('foreign')
+        with self.assertRaisesRegex(ValueError, 'worker home collision'):
+            builder.publish_symlink(new, target)
+        self.assertEqual(target.read_text(), 'foreign')
 
 
 if __name__ == '__main__':
