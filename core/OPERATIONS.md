@@ -745,6 +745,15 @@ whose owner already ended hands proven resource completion to that owner's
 existing parent carrier; it does not start a new training run. Explicit parent
 close suppresses this continuation and all cancelled successors.
 
+A supervised owner can register sequential resources for one route/node using
+the same `resource-runner start`. Exact replay preserves its run; a new run may
+replace the armed predecessor only after an exact successful exit while that
+stage is still waiting for its declared outputs. The ledger lock serializes
+the binding change, preserves the prior execution evidence, and refuses active
+or failed identities, different owners, completed stages, and parent close.
+The owner receives intermediate execution success with no successor admission.
+The resource that supplies the declared stage outputs can complete the stage.
+
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
 `<jobs-parent>/workflow/<route-id>` even if the raising and releasing actors
@@ -771,6 +780,9 @@ predecessor's declared output artifacts. Missing, unreadable, or
 namespace-unverifiable evidence is not success. A nonzero exit, a `FAIL`/
 `BLOCKED` verdict, or an absent declared artifact records `FAILED_RETRYABLE` or
 `FAILED_TERMINAL` and starts nothing downstream.
+For a supervised owner resource, successful exit with missing stage outputs
+instead records a wait for the next resource in the existing running stage;
+the output requirement for downstream work is unchanged.
 
 **Exactly-once is claim-based, not schedule-based.** The successor key is
 derived from the sealed `route_hash`, the predecessor node, the predecessor's

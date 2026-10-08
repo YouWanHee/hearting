@@ -89,6 +89,15 @@ def resource_body_digest(row):
     return RESUME.row_digest(body)
 
 
+def resource_execution_succeeded(row):
+    """A past status word cannot substitute for the exact exit and sentinel."""
+    from resource_run_registry import classify_identity
+    return (row.get("status") not in {"launching", "failed"}
+            and not row.get("cancel_requested") and not row.get("parent_close_requested")
+            and classify_identity(row)[0] == "exited"
+            and supervisor().runner().read_sentinel(row.get("sentinel")) == 0)
+
+
 def controller_intent(row):
     return ((row.get("owner_wait") or {}).get("launch_scope") == "codex-owner-controller"
             and row.get("launch_state") in {"queued", "claimed"}
@@ -338,7 +347,9 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
         if lost_watch and evidence.get("liveness") == "working":
             recovery = sup.reattach_resource_watch(route, ledger, armed)
             lost_watch = not (recovery and recovery.get("supervisor_alive"))
-        if stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
+        intermediate = (stage.get("state") == "RUNNING"
+                        and (stage.get("evidence") or {}).get("awaiting_next_resource") is True)
+        if intermediate or stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
             current_rows = context(args, control)[3]
             receipt_row = next((r for _, r in current_rows if resource_key(r) == key), None)
             if receipt_row is None:
@@ -349,15 +360,19 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
                 and sup.runner().read_sentinel(receipt_row.get("sentinel")) == 0
                 and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row)
                 and not artifact.get("missing"))
+            execution_only = (intermediate and evidence.get("succeeded")
+                and resource_execution_succeeded(receipt_row)
+                and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row))
             outcome = ("cancelled" if receipt_row.get("cancel_requested") else
-                       "succeeded" if proven else "needs-attention")
+                       "succeeded" if proven or execution_only else "needs-attention")
             receipt = {"type": "resource-completion", "parent_attempt_id": args.parent_attempt_id,
                 "session_id": control.thread_id, "route_id": args.route_id, "route_hash": args.route_hash,
                 "jobs": str(Path(args.jobs).resolve()), "node": armed["node"], "run_id": row["run_id"],
                 "resource_key": key, "resource_sha256": RESUME.row_digest(receipt_row), "state": outcome, "exit_code": evidence.get("exit_code"),
-                "reason": "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
+                "reason": "awaiting-next-resource" if execution_only else
+                    "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
                 "verification_pass": False, "workflow_complete": False,
-                "successors": list(armed["successors"]) if outcome == "succeeded" else []}
+                "successors": list(armed["successors"]) if proven else []}
             digest = RESUME.row_digest(receipt)
             resource["outbox"] = {"receipt_id": "resource-" + digest[:32], "digest": digest,
                                   "key": key, "receipt": receipt}
