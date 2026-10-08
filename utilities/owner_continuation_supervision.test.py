@@ -154,6 +154,25 @@ class ContinuationSupervisionTest(unittest.TestCase):
             self.assertFalse(W.recover_waiting_continuation(self.args))
             start.assert_not_called()
 
+    def test_unknown_observation_reparks_watch_without_terminal_commit(self):
+        self.args.pid, self.args.pid_start = 99999999, "1"
+        with mock.patch.object(W, "process_start", return_value=None), \
+             mock.patch.object(W, "observed_owner_lifecycle", side_effect=[
+                 (SimpleNamespace(process_state="unverifiable"), "recovery", {}),
+                 (SimpleNamespace(process_state="quiescent"), "recovery", {})]), \
+             mock.patch.object(W.time, "sleep") as pause, \
+             mock.patch.object(W, "reconcile_exact_exit", return_value=0) as close:
+            self.assertEqual(W.watch(self.args), 0)
+            pause.assert_called_once_with(.01)
+            close.assert_called_once()
+            self.assertIn("now\topen", self.jobs.read_text())
+        with mock.patch.object(W, "observed_owner_lifecycle", return_value=(
+                SimpleNamespace(process_state="unverifiable"), "recovery", {})), \
+             mock.patch.object(W, "_finish_recovery", return_value=False), \
+             mock.patch.object(W, "reconcile_supervisor_terminal") as terminal:
+            self.assertEqual(W.reconcile_exact_exit(self.args), 70)
+            terminal.assert_not_called()
+
     def test_refused_start_keeps_state_and_parent_notice(self):
         with mock.patch("dispatch_supervision._pending", return_value=False), \
              mock.patch.object(W, "reconcile_supervisor_terminal", return_value="closed"), \

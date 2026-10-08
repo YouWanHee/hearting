@@ -239,6 +239,10 @@ def reconcile_exact_exit(args) -> int:
     envelope. Every transition remains exact-attempt and conditionally atomic.
     """
 
+    observed, _phase, _metadata = observed_owner_lifecycle(args)
+    if observed is not None and observed.process_state != "quiescent":
+        _finish_recovery(args)
+        return 70
     recovered = recover_waiting_continuation(args)
     if recovered is not None:
         return 0 if recovered else 70
@@ -307,7 +311,7 @@ def watch(args) -> int:
             )
         if process_start(args.pid) != args.pid_start:
             observed, _phase, _metadata = observed_owner_lifecycle(args)
-            if observed is not None and observed.state == "parked-supervised":
+            if observed is not None and observed.process_state != "quiescent":
                 time.sleep(args.interval)
                 continue
             break
