@@ -1195,11 +1195,11 @@ class PaneTitleLadderTest(unittest.TestCase):
         from tools.fleet.herdr_projection import session_title
         return session_title("claude", self.SID)
 
-    def test_the_transcript_title_is_used_when_the_sidecar_has_none(self):
+    def test_native_transcript_title_cannot_replace_a_failed_fleet_title(self):
         # The real case: the title worker ran and failed, leaving `title: ""`.
         self._write_sidecar("")
         self._write_transcript("r1-model S8 재진입 버그 수정")
-        self.assertEqual(self._title(), "r1-model S8 재진입 버그 수정")
+        self.assertEqual(self._title(), "")
 
     def test_a_fresh_sidecar_still_outranks_the_transcript(self):
         # Order matters: the sidecar is the worker's considered summary, the ai-title is
@@ -1208,12 +1208,12 @@ class PaneTitleLadderTest(unittest.TestCase):
         self._write_sidecar("v6 Command Model Release")
         self.assertEqual(self._title(), "v6 Command Model Release")
 
-    def test_a_stale_sidecar_yields_to_the_transcript_but_beats_nothing(self):
+    def test_last_successful_sidecar_survives_without_native_title_substitution(self):
         # The board drops a sidecar this old; the header keeps it rather than going blank,
         # but only once the rung the board WOULD have used has been tried.
         self._write_sidecar("aged summary", age_sec=86400)
         self._write_transcript("current transcript title")
-        self.assertEqual(self._title(), "current transcript title")
+        self.assertEqual(self._title(), "aged summary")
         self.transcript.unlink()
         self.assertEqual(self._title(), "aged summary")
 

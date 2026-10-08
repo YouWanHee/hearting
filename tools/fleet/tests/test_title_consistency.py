@@ -69,6 +69,44 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
         for bad in ("진행 중 제목 갱신", "제목 없음", "알 수 없습니다", "Awaiting worker result"):
             self.assertIsNone(rt.validate_title(bad, "Korean"))
 
+    def test_auto_uses_user_task_language_under_english_locale_not_worker_delta(self):
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8", "LC_ALL": "",
+                                          "LC_MESSAGES": "", "FLEET_NOW_LANG": ""}):
+            prompt = rt._prompt("Registered worker: scan implementation logs", anchor="제목 언어를 맞춰줘")
+            self.assertIn("in Korean.", prompt)
+            self.assertIn("NOW: one sentence, in Korean,", prompt)
+            config.ensure()
+            config.config_path().write_text('{"title_language":"en"}\n')
+            self.assertEqual(rt._title_lang("제목 언어를 맞춰줘"), "English")
+
+    def test_wrong_language_prior_is_regenerated_even_without_new_delta_and_dropped_on_failure(self):
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8", "LC_ALL": "",
+                                          "LC_MESSAGES": "", "FLEET_NOW_LANG": ""}):
+            for harness in ("claude", "codex", "opencode"):
+                with self.subTest(harness=harness):
+                    path = self._transcript(harness)
+                    sid = harness + "-old-language"
+                    titles.write(sid, "Old English Subject", harness=harness,
+                                 offset=path.stat().st_size, summary="이전 요약")
+                    with mock.patch.object(rt, "run_worker", return_value="") as worker:
+                        rt.main(["--harness", harness, "--sid", sid, "--transcript", str(path),
+                                 "--slotdir", str(Path(self._tmp.name) / "slot")])
+                    self.assertEqual(worker.call_count, 1)
+                    self.assertIn("in Korean.", worker.call_args.args[0])
+                    self.assertNotIn("PRIOR TITLE (data", worker.call_args.args[0])
+                    self.assertIsNone(titles.last_title(sid, harness=harness))
+
+    def test_language_change_reaches_existing_scheduler_despite_recent_unchanged_source(self):
+        path = self._transcript("claude")
+        titles.write("changed-language", "Old English Subject", now=time.time(),
+                     offset=path.stat().st_size, summary="이전 요약")
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8", "LC_ALL": "",
+                                          "LC_MESSAGES": "", "FLEET_NOW_LANG": ""}), \
+             mock.patch.object(rt, "worker_argv", return_value=["missing"]) as probe, \
+             mock.patch.object(rt, "_executable_available", return_value=False):
+            self.assertFalse(rt.maybe_spawn("claude", "changed-language", str(path)))
+            probe.assert_called_once_with("probe")
+
     def test_auto_normalizes_now_language_codes_without_changing_now(self):
         for code, name in (("ko", "Korean"), ("en", "English"), ("ja", "Japanese")):
             with self.subTest(code=code), mock.patch.dict(os.environ, {"FLEET_NOW_LANG": code}):
