@@ -32,7 +32,10 @@ class _BaseTest(unittest.TestCase):
         self.env["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
         self.env.pop("AGENT_HOME", None)
         for key in ("FLEET_TITLE_REFRESH", "MEM_DISTILL", "AGENT_SESSION_ROLE",
-                    "AGENT_DISPATCH_DEPTH", "CLAUDE_CODE_CHILD_SESSION"):
+                    "AGENT_DISPATCH_DEPTH", "CLAUDE_CODE_CHILD_SESSION",
+                    "CODEX_THREAD_ID", "CODEX_SESSION_ID", "AGENT_SESSION_ID",
+                    "CLAUDE_CODE_SESSION_ID", "OPENCODE_SESSION_ID",
+                    "AGENT_DISPATCH_CALLER_HARNESS", "AGENT_DISPATCH_CURRENT_HARNESS"):
             self.env.pop(key, None)
 
     def _run(self, mode, payload):

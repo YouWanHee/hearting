@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Unit tests for utilities/peer-message.py (SD-122 peer-message ledger)."""
 import hashlib
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -812,15 +814,144 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch("builtins.print") as diagnostic:
             ordinary = peer_message.prepare_peer_message("healthy ordinary", self.sender, recipient)
             deferred = peer_message.prepare_peer_message("healthy deferred", self.sender, recipient, defer=True)
-        self.assertTrue(any(call.args == ("peer-pending-invalid ref=" + "0" * 32,)
-                            for call in diagnostic.call_args_list))
-        with self.assertRaises(ValueError):
-            peer_message.deliver_pending_codex("0" * 32) # Exact-ref refusal stays strict.
+        self.assertEqual(sum(call.args == ("peer-pending-invalid ref=" + "0" * 32,)
+                             for call in diagnostic.call_args_list), 1)
+        self.assertEqual(peer_message.deliver_pending_codex("0" * 32)["status"], "unsupported")
         self.assertTrue(ordinary[0].startswith("healthy ordinary"))
         self.assertEqual([r["ref"] for r in peer_message.pending_messages(recipient)], [deferred[1]])
         self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
-        self.assertEqual(damaged.read_text(), "malformed original")
+        preserved = list((damaged.parent.parent / "quarantine").rglob(damaged.name))
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].read_text(), "malformed original")
+        self.assertFalse(damaged.exists())
         self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+
+    def legacy_shell_pending(self, recipient, sender=None):
+        sender = sender if sender is not None else {"harness": "unknown", "session_id": "", "name": None}
+        text, ref = peer_message.prepare_peer_message("external notification", sender, recipient, defer=True)
+        path = peer_message._pending_path(ref)
+        row = json.loads(path.read_text())
+        # Exact format left by the old writer; no mutation of the transfer seal.
+        row.update(state="unverified", receipt="peer-endpoint-unverified")
+        peer_message._save_pending(row)
+        return text, ref
+
+    def test_legacy_shell_sender_is_delivered_and_received_once_on_each_harness(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                recipient = dict(self.recipient, harness=harness)
+                text, ref = self.legacy_shell_pending(recipient)
+                path = peer_message._pending_path(ref)
+                original = path.read_bytes()
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    for _ in range(2):
+                        self.assertEqual([r["ref"] for r in peer_message.pending_messages(recipient)], [ref])
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(path.read_bytes(), original)  # Read compatibility is not a repair write.
+                self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+                parsed = peer_message.parse_peer_trailer(text, recipient, include_ref=True)
+                self.assertIsNone(parsed["session_id"])
+                self.assertEqual(parsed["transfer_ref"], ref)
+                peer_message.receive_peer_message(text, dict(recipient, session_id="foreign"))
+                peer_message.receive_peer_message("changed " + text, recipient)
+                self.assertEqual(path.read_bytes(), original)
+                peer_message.receive_peer_message(text, recipient)
+                notice = self._ledger_file("").read_bytes()
+                peer_message.receive_peer_message(text, recipient)
+                self.assertEqual(self._ledger_file("").read_bytes(), notice)
+                row = peer_message._read_pending(ref)
+                self.assertEqual(row["state"], "received")
+                self.assertIsNone(row["text"])
+                self.assertEqual(row["from"], {"harness": "unknown", "session_id": "", "name": None})
+
+    def test_new_shell_sender_uses_normal_pending_for_null_and_empty_forms(self):
+        for sender in ({"harness": "unknown", "session_id": ""},
+                       {"harness": None, "session_id": None}):
+            for harness in ("claude", "codex", "opencode"):
+                with self.subTest(sender=sender, harness=harness):
+                    recipient = dict(self.recipient, harness=harness)
+                    text, ref = peer_message.prepare_peer_message("shell notification", sender, recipient, defer=True)
+                    self.assertEqual(peer_message._read_pending(ref)["state"], "pending")
+                    self.assertEqual(peer_message.parse_peer_trailer(text, recipient, include_ref=True)["transfer_ref"], ref)
+
+    def test_legacy_shell_sender_uses_existing_claude_context_and_codex_queue(self):
+        recipient = dict(self.recipient, harness="claude")
+        text, ref = self.legacy_shell_pending(recipient)
+        stream = io.StringIO()
+        peer_message.emit_peer_context(recipient, "UserPromptSubmit", stream=stream)
+        context = json.loads(stream.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(context, text)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        peer_message.receive_peer_message(context, recipient)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "received")
+        import codex_queue_delivery as queue
+        text, ref = self.legacy_shell_pending(self.recipient)
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
+            self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "queued")
+            self.assertTrue(send.call_args.kwargs["allow_add"])
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "consumed"}) as send:
+            self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "received")
+            self.assertFalse(send.call_args.kwargs["allow_add"])
+        self.assertIsNone(peer_message._read_pending(ref)["text"])
+
+    def test_unknown_sender_does_not_reset_ambiguous_send_or_invent_recipient(self):
+        _text, ref = self.legacy_shell_pending(self.recipient)
+        row = json.loads(peer_message._pending_path(ref).read_text())
+        for receipt in ("herdr-delivery-inflight", "native-queue-inflight", "context-api-inflight"):
+            peer_message._save_pending(dict(row, receipt=receipt))
+            self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+            self.assertIsNone(peer_message.claim_pending_herdr(ref, self.recipient))
+        peer_message._save_pending(dict(row, actual_message_id="accepted"))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        peer_message._save_pending(dict(row, rpc_claim={"token": "inflight"}))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+        for recipient in ({"harness": "claude", "session_id": None},
+                          {"harness": None, "session_id": None}):
+            _text, missing = self.legacy_shell_pending(recipient)
+            self.assertEqual(peer_message._read_pending(missing)["state"], "unverified")
+            self.assertEqual(peer_message.pending_messages(recipient), [])
+
+    def test_unknown_sender_compatibility_still_checks_binding_and_body(self):
+        _text, ref = self.legacy_shell_pending(self.recipient)
+        original = peer_message._pending_path(ref).read_bytes()
+        for changed in ({"from": {"harness": "unknown", "session_id": "forged"}},
+                        {"to": dict(self.recipient, session_id="foreign")}, {"text": "tampered"}):
+            row = json.loads(original)
+            row.update(changed)
+            peer_message._save_pending(row)
+            with self.assertRaisesRegex(ValueError, "peer-pending-(binding|body)-invalid"):
+                peer_message._read_pending(ref)
+
+    def test_quarantine_preserves_symlink_without_touching_its_target(self):
+        outside = self.tmp_root / "outside"
+        outside.write_bytes(b"unrelated bytes")
+        damaged = peer_message._pending_dir() / ("0" * 32 + ".json")
+        damaged.symlink_to(outside)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            for _ in range(2):
+                self.assertEqual(list(peer_message._pending_rows()), [])
+        self.assertEqual(errors.getvalue().count("peer-pending-invalid"), 1)
+        preserved = list((damaged.parent.parent / "quarantine").rglob(damaged.name))
+        self.assertEqual(len(preserved), 1)
+        self.assertTrue(preserved[0].is_symlink())
+        self.assertEqual(preserved[0].readlink(), outside)
+        self.assertEqual(outside.read_bytes(), b"unrelated bytes")
+
+    def test_quarantine_leaves_a_valid_successor_in_place(self):
+        _text, ref = self.pending()
+        path = peer_message._pending_path(ref)
+        original = path.read_bytes()
+        path.write_text("malformed")
+        old = path.lstat()
+        replacement = path.with_name(".replacement")
+        replacement.write_bytes(original)
+        replacement.chmod(0o600)
+        os.replace(replacement, path)
+        self.assertFalse(peer_message._quarantine_pending(path, old))
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [ref])
 
     def test_acceptance_stays_queued_and_disables_restart_and_ambiguous_retry(self):
         import codex_queue_delivery as queue
