@@ -302,8 +302,14 @@ legs, its assignment names the realized groups and the required
 `auxiliary_findings_considered` frontmatter entries, derived from the sealed route.
 It does not publish, sync, or change the preceding artifacts. The group anchor stays non-terminal and
 the owner holds the terminal completion gate. Compose displays this addition
-alongside omission notices. A pipeline group still needs its declared review
-consumer; an unavailable safe completion remains an omission with a warning.
+alongside omission notices. If a retained group lacks its review consumer or
+auxiliary arbiter, compose restores the unique, safe downstream node declared
+by that group's recipe, including borrowed-part paths and inputs. It inserts
+the node directly after the anchor and preserves the caller's selected order;
+it adds no publication, synchronization, resource run, or source mutation.
+The assignment identifies any realized auxiliary legs and their existing
+consideration obligation. Compose names every automatic addition. Ambiguous,
+unavailable, or conflicting completions remain omissions with a warning.
 Standard and lower routes and already sealed graphs keep their existing shape.
 
 **Frame procedure at depth-0 (`framed`).** `start` launches the frame legs

@@ -2864,8 +2864,121 @@ def _unarbitrated_auxiliary_legs(registry, group, anchor, consumers):
     return auxiliary
 
 
+def _compose_unarbitrated_groups(registry, recipe):
+    nodes = recipe["standard_plus"]["nodes"]
+    for group in recipe["standard_plus"].get("parallel_groups", []):
+        anchor = next(node for node in nodes if node["id"] == group["node"])
+        consumers = [node for node in nodes if anchor["id"] in node.get("depends_on", [])]
+        missing = _unarbitrated_auxiliary_legs(registry, group, anchor, consumers)
+        if missing:
+            yield {"id": group["id"], "reason": "auxiliary-arbiter-not-selected", "legs": missing}
+
+
+def _complete_compose_group_consumers(registry, base, graph, find_input, **kwargs):
+    """Restore missing safe registry consumers through the ordinary part assembler.
+
+    Replaying the original selection remains possible: historical recipes do not
+    ask for this completion, and new recipes record the inserted nodes rather
+    than treating them as caller-selected stages.
+    """
+    recipe = compose_subgraph_recipe(registry, base, graph, find_input, **kwargs)
+    original = json.loads(json.dumps(recipe["compose"]))
+    additions = []
+    contracts = registry.get("completion_gate_contracts") or {}
+    while True:
+        nodes = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
+        completed = False
+        pending = recipe["compose"].get("omitted_parallel_presets", []) + list(
+            _compose_unarbitrated_groups(registry, recipe))
+        for omission in pending:
+            anchor = nodes.get(omission["id"])
+            if anchor is None:
+                declared = next((row for row in base["standard_plus"].get("parallel_groups", [])
+                                 if row["id"] == omission["id"]), {})
+                anchor = nodes.get(declared.get("node"))
+            if anchor is None:
+                continue
+            part_id = anchor.get("part")
+            found = TOPO.part_recipe(registry, part_id) if part_id else (base, anchor)
+            if found is None:
+                continue
+            origin, source = found
+            group = next((row for row in origin["standard_plus"].get("parallel_groups", [])
+                          if row["node"] == source["id"]), None)
+            if group is None or ORDER[kwargs["group_intensity"]] < ORDER[group["min_intensity"]]:
+                continue
+            reason = omission["reason"]
+            if reason == "terminal-anchor" and anchor["kind"] == "pipeline-stage":
+                reason = "review-consumer-not-selected"
+            if reason not in ("review-consumer-not-selected", "auxiliary-arbiter-not-selected"):
+                continue
+            consumers = [node for node in origin["standard_plus"]["nodes"]
+                         if source["id"] in node.get("depends_on", [])]
+            if anchor["kind"] == "pipeline-stage":
+                consumers = [node for node in consumers if node["kind"] == "review-worker"]
+            if any(leg.get("leg_class") == "auxiliary" for leg in group["legs"]):
+                consumers = [node for node in consumers
+                             if contracts[node["completion_gate"]].get("auxiliary_arbiter") is True]
+            if len(consumers) != 1:
+                continue
+            consumer = consumers[0]
+            if (consumer["kind"] not in ("review-worker", "pipeline-stage")
+                    or consumer.get("resource_class") != "normal"
+                    or consumer.get("dispatch_depth") != 2 or consumer.get("commit_expected")
+                    or any(worktree_mutating_scope(scope) for scope in consumer["write_scope"])
+                    or (consumer.get("continuation") or {}).get("kind") != "inline-next"):
+                continue
+            key = f"{origin['capability']}:{consumer['id']}" if part_id else consumer["id"]
+            consumer_id = key.replace(":", "-") if part_id else key
+            if consumer_id in nodes or part_id and TOPO.resolve_shared_part(registry, base, key) is None:
+                continue  # Never duplicate or move a caller-selected stage.
+            selected = recipe["compose"]["graph"]
+            anchor_key = part_id or anchor["id"]
+            if anchor_key not in selected:
+                continue
+            augmented = list(selected)
+            augmented.insert(augmented.index(anchor_key) + 1, key)
+            overrides = recipe["compose"]["unit_overrides"]
+            try:
+                candidate = compose_subgraph_recipe(registry, base,
+                    [(stage, overrides.get(stage)) for stage in augmented], find_input, **kwargs)
+            except ValueError:
+                continue  # A declared consumer may conflict with a selected dependency.
+            if any(row["id"] == omission["id"]
+                   for row in candidate["compose"].get("omitted_parallel_presets", []) + list(
+                       _compose_unarbitrated_groups(registry, candidate))):
+                continue  # Declared ordering/extra stages may make completion unsafe.
+            additions.append({"id": consumer_id, "reason": reason, "anchors": [anchor["id"]],
+                              "intensity": kwargs["group_intensity"]})
+            recipe, completed = candidate, True
+            break
+        if not completed:
+            break
+    # Host groups historically kept auxiliary declarations even without their
+    # arbiter and then failed topology validation. Strong+ uses the same safe
+    # omission as borrowed groups when the declared consumer cannot be restored.
+    missing = list(_compose_unarbitrated_groups(registry, recipe))
+    for omission in missing:
+        group = next(row for row in recipe["standard_plus"]["parallel_groups"] if row["id"] == omission["id"])
+        group["legs"] = [leg for leg in group["legs"] if leg["suffix"] not in omission["legs"]]
+        group["width_by_intensity"] = {
+            tier: min(width, len(group["legs"])) for tier, width in group["width_by_intensity"].items()}
+        recipe["compose"].setdefault("omitted_parallel_presets", []).append(omission)
+    if missing:
+        # Assembly metadata only, so this new omission can replay without
+        # reinterpreting historical graphs that never requested completion.
+        recipe["compose"]["group_completion_intensity"] = kwargs["group_intensity"]
+    if additions:
+        recipe["compose"]["graph"] = original["graph"]
+        recipe["compose"]["unit_overrides"] = original["unit_overrides"]
+        recipe["compose"]["auto_completed_nodes"] = additions + recipe["compose"].get("auto_completed_nodes", [])
+    if (additions or missing) and kwargs.get("preserve_base_dependencies"):
+        recipe["compose"]["preserve_base_dependencies"] = True
+    return recipe
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False,
-                            extra_stages=None, group_intensity=None):
+                            extra_stages=None, group_intensity=None, complete_group_consumers=False):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
     The nodes keep their unit, kind, gate, write scope, profile and permissions;
@@ -2884,6 +2997,10 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
     inside the host's own artifact scope; the name mapping is sealed as
     `part_io`. A graph that names none of these assembles exactly as before.
     """
+    if complete_group_consumers and group_intensity is not None and ORDER[group_intensity] >= ORDER["strong"]:
+        return _complete_compose_group_consumers(registry, base_recipe, graph_spec, find_input,
+            preserve_base_dependencies=preserve_base_dependencies,
+            extra_stages=extra_stages, group_intensity=group_intensity)
     host = base_recipe["capability"]
     base_nodes = {node["id"]: node for node in base_recipe["standard_plus"]["nodes"]}
     optional = dict(TOPO.recipe_optional_parts(registry, base_recipe))
@@ -3294,7 +3411,9 @@ def _versioned_subgraph(registry, recipe):
         auto = meta.get("auto_completed_nodes") or []
         expected = compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None,
                                            extra_stages=meta.get("extra_stages"),
-                                           group_intensity=auto[0]["intensity"] if auto else None,
+                                           group_intensity=meta.get("group_completion_intensity") or (auto[0]["intensity"] if auto else None),
+                                           complete_group_consumers=bool(meta.get("group_completion_intensity")) or any(
+                                               row["reason"] != "terminal-anchor" for row in auto),
                                            preserve_base_dependencies=meta.get("preserve_base_dependencies", False))
         if expected == recipe:
             return True
@@ -3312,13 +3431,25 @@ def _versioned_subgraph(registry, recipe):
 
 
 def _validate_compose_owner_close(registry, recipe, intensity=None):
-    """An automatic close must be the exact registry-derived assembly."""
+    """Automatic closing/consumer nodes must be the exact registry-derived assembly."""
     carries = any(node.get("completion_gate") == "compose-owner-close"
                   for node in recipe["standard_plus"]["nodes"])
-    auto = (recipe.get("compose") or {}).get("auto_completed_nodes")
-    if carries or auto:
-        if (not carries or not auto or not _versioned_subgraph(registry, recipe)
-                or intensity is not None and auto[0]["intensity"] != intensity):
+    meta = recipe.get("compose") or {}
+    auto = meta.get("auto_completed_nodes")
+    selected = {key.replace(":", "-") for key in meta.get("graph", [])}
+    extra = bool(meta.get("graph")) and any(node["id"] not in selected and not node.get("plan_stage")
+                                            for node in recipe["standard_plus"]["nodes"])
+    completion_intensity = meta.get("group_completion_intensity")
+    nodes = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
+    host_omission = any(row["reason"] == "auxiliary-arbiter-not-selected"
+                        and row["id"] in nodes and not nodes[row["id"]].get("part")
+                        for row in meta.get("omitted_parallel_presets", []))
+    if carries or auto or extra or completion_intensity or host_omission:
+        if ((carries or auto or extra) and not auto
+                or carries != any(row["reason"] == "terminal-anchor" for row in auto or [])
+                or not _versioned_subgraph(registry, recipe)
+                or intensity is not None and (any(row["intensity"] != intensity for row in auto or [])
+                                             or completion_intensity and completion_intensity != intensity)):
             raise ValueError("compose-owner-close-differs-from-assembly")
 
 
@@ -3887,7 +4018,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         extra_stages = route_plan["leg"].get("extra_stages")   # the plan's own stages, from the sealed leg
     selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input,
                                                 preserve_base_dependencies=execution_scope == "report",
-                                                extra_stages=extra_stages, group_intensity=requested)
+                                                extra_stages=extra_stages, group_intensity=requested,
+                                                complete_group_consumers=True)
                        if graph_spec is not None else base)
     if execution_scope == "report" and shape == "staged" and graph_spec is not None and profile is None:
         # The narrowed graph is made only from existing recipe/catalog parts. Keep each
@@ -4499,8 +4631,9 @@ def compose_decision_lines(route):
     lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
                  f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)")
     for row in ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", []):
+        purpose = "owner closing summary" if row["reason"] == "terminal-anchor" else "registry consumer"
         lines.append(f"  {row['intensity']} group {','.join(row['anchors'])}: "
-                     f"auto-added {row['id']} (terminal-anchor; owner closing summary)")
+                     f"auto-added {row['id']} ({row['reason']}; {purpose})")
     return lines + compose_omission_lines(route)
 
 

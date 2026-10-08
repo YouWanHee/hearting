@@ -7174,7 +7174,13 @@ class ComposeRouteTest(TestRoute):
   import work_start
   with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
    root=Path(tmp);prompt=root/"task.md";prompt.write_text("Existing metrics judgment")
-   route=self.compose(intensity="strong",graph="plan,test,report",artifact_root=str(root/"artifacts"))
+   # Historical/unsafe omissions still have the same shared diagnostic surface.
+   compose=R.compose_subgraph_recipe
+   def historical(*args,**kwargs):
+    kwargs["complete_group_consumers"]=False
+    return compose(*args,**kwargs)
+   with mock.patch.object(R,"compose_subgraph_recipe",side_effect=historical):
+    route=self.compose(intensity="strong",graph="plan,test,report",artifact_root=str(root/"artifacts"))
    warning="strong group plan dropped by --graph: review-consumer-not-selected"
    for harness in ("claude","codex","opencode"):
     for action in ("explain","start"):
@@ -7799,15 +7805,160 @@ class ComposeRouteTest(TestRoute):
   with self.assertRaisesRegex(ValueError,"compose-graph-unknown-node:deploy"):
    self.compose(capability="autopilot-ship",capability_mode="package",graph="package,deploy")
  def test_chosen_graph_does_not_require_presets_review_stage(self):
-  for intensity in ("standard","strong"):
-   route=self.compose(graph="plan,test,report",intensity=intensity)
-   self.assertEqual([n["id"] for n in route["nodes"]],["plan","test","report"])
-   self.assertEqual(route["parallel_groups"],[])
-   self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],
+  route=self.compose(graph="plan,test,report",intensity="standard")
+  self.assertEqual([n["id"] for n in route["nodes"]],["plan","test","report"])
+  self.assertEqual(route["parallel_groups"],[])
+  self.assertEqual(route["composed_recipe"]["compose"]["omitted_parallel_presets"],
     [{"id":"plan","reason":"review-consumer-not-selected"}])
-   self.assertEqual(R.compose_omission_lines(route),[
-    "  strong group plan dropped by --graph: review-consumer-not-selected"] if intensity=="strong" else [])
+  self.assertEqual(R.compose_omission_lines(route),[])
+  R.verify_route(route,R.ROOT)
+ def test_strong_subgraph_restores_review_consumer_and_all_leg_inputs(self):
+  for intensity in ("strong","thorough","adversarial"):
+   route=self.compose(graph="plan,test,report",intensity=intensity)
+   nodes={n["id"]:n for n in route["nodes"]}
+   groups={g["id"]:g for g in route["parallel_groups"]}
+   self.assertEqual(nodes["plan-check"]["depends_on"],groups["plan"]["members"])
+   self.assertEqual(nodes["test"]["depends_on"],groups["plan-check"]["members"])
+   for member in groups["plan"]["members"]:
+    self.assertTrue(set(nodes[member]["outputs"])<=set(nodes["plan-check"]["inputs"]))
+   self.assertEqual(nodes["plan-check"]["write_scope"],["_internal/plan_reviews/**"])
+   meta=route["composed_recipe"]["compose"]
+   self.assertEqual(meta["graph"],["plan","test","report"])
+   self.assertEqual(meta["auto_completed_nodes"],[{"id":"plan-check",
+    "reason":"review-consumer-not-selected","anchors":["plan"],"intensity":intensity}])
+   self.assertNotIn("omitted_parallel_presets",meta)
+   self.assertIn("auto-added plan-check (review-consumer-not-selected; registry consumer)",R.compose_card(route))
    R.verify_route(route,R.ROOT)
+ def test_terminal_pipeline_group_restores_consumer_then_owner_close(self):
+  route=self.compose(graph="plan",intensity="strong")
+  self.assertEqual([n["id"] for n in route["nodes"]],
+   ["plan","plan-alternative","plan-check","plan-check-alternative","owner-close"])
+  self.assertEqual(route["nodes"][-1]["write_scope"],["owner-close.md"])
+  self.assertEqual(route["workflow_contract"]["terminal_nodes"],["owner-close"])
+  self.assertEqual([r["reason"] for r in route["composed_recipe"]["compose"]["auto_completed_nodes"]],
+   ["review-consumer-not-selected","terminal-anchor"])
+  R.verify_route(route,R.ROOT)
+ def test_selected_consumer_is_not_added_again_and_old_sealed_omission_replays(self):
+  selected=self.compose(graph="plan,plan-check,test,report",intensity="strong")
+  self.assertNotIn("auto_completed_nodes",selected["composed_recipe"]["compose"])
+  self.assertEqual(len([n for n in selected["nodes"] if n["id"]=="plan-check"]),1)
+  compose=R.compose_subgraph_recipe
+  def historical(*args,**kwargs):
+   kwargs["complete_group_consumers"]=False
+   return compose(*args,**kwargs)
+  with mock.patch.object(R,"compose_subgraph_recipe",side_effect=historical):
+   old=self.compose(graph="plan,test,report",intensity="strong")
+  before=R.canonical(old)
+  self.assertEqual([n["id"] for n in old["nodes"]],["plan","test","report"])
+  R.verify_route(old,R.ROOT)
+  self.assertEqual(before,R.canonical(old))
+ def test_unsafe_or_ambiguous_registry_consumer_keeps_omission(self):
+  registry=R.TOPO.load_registry()
+  for reason in ("source-write","ambiguous","transaction"):
+   base=json.loads(R.canonical(R.TOPO.resolve_recipe(registry,"autopilot-code","dev")))
+   consumer=next(n for n in base["standard_plus"]["nodes"] if n["id"]=="plan-check")
+   if reason=="source-write":consumer["write_scope"]=["source/**"]
+   if reason=="transaction":consumer["continuation"]={"kind":"human-gate","gate":"approval"}
+   if reason=="ambiguous":base["standard_plus"]["nodes"].append(dict(consumer,id="other-check"))
+   recipe=R.compose_subgraph_recipe(registry,base,[(n,None) for n in ("plan","test","report")],
+    group_intensity="strong",complete_group_consumers=True)
+   self.assertNotIn("auto_completed_nodes",recipe["compose"],reason)
+   self.assertEqual(recipe["compose"]["omitted_parallel_presets"],
+    [{"id":"plan","reason":"review-consumer-not-selected"}],reason)
+ def test_restored_consumer_metadata_gate_scope_and_intensity_are_sealed(self):
+  route=self.compose(graph="plan,test,report",intensity="strong")
+  registry=R.TOPO.load_registry()
+  for change in ("metadata","scope","gate","intensity"):
+   recipe=json.loads(R.canonical(route["composed_recipe"]))
+   consumer=next(n for n in recipe["standard_plus"]["nodes"] if n["id"]=="plan-check")
+   if change=="metadata":recipe["compose"].pop("auto_completed_nodes")
+   if change=="scope":consumer["write_scope"].append("source/**")
+   if change=="gate":consumer["completion_gate"]="code-test"
+   if change=="intensity":recipe["compose"]["auto_completed_nodes"][0]["intensity"]="standard"
+   with self.subTest(change=change),self.assertRaisesRegex(ValueError,"differs-from-assembly"):
+    R._validate_compose_owner_close(registry,recipe,"strong")
+ def test_restored_arbiter_assignment_and_completion_contract(self):
+  import worker_bootstrap as W
+  from types import SimpleNamespace
+  with tempfile.TemporaryDirectory() as tmp:
+   root=Path(tmp)
+   route=self.compose(capability="audit",capability_mode="default",intensity="thorough",
+    graph="inspect,autopilot-research:retrieval,report",artifact_root=str(root))
+   path=root/"route.json";path.write_text(json.dumps(route))
+   arbiter=next(n for n in route["nodes"] if n["id"]=="autopilot-research-synthesis")
+   group=next(g for g in route["parallel_groups"] if g["id"]=="autopilot-research-retrieval")
+   self.assertEqual(arbiter["depends_on"],group["members"])
+   for member in group["members"]:
+    leg=next(n for n in route["nodes"] if n["id"]==member)
+    self.assertTrue(set(leg["outputs"])<=set(arbiter["inputs"]))
+   for harness in ("claude","codex","opencode"):
+    args=SimpleNamespace(worker_type="stage",adapter=harness,route_node=arbiter["id"],
+     route_file=str(path),parent_attempt_id=None)
+    prompt=W.assignment_prompt(args,"Analyze existing results",{})
+    self.assertIn("automatic registry consumer "+arbiter["id"],prompt)
+    self.assertIn("exactly 1 entries",prompt)
+    self.assertIn(group["members"][-1]+": <finding and disposition>",prompt)
+   evidence=root/"analysis.md";evidence.write_text("Results reconciled\n")
+   with self.assertRaisesRegex(ValueError,"requires auxiliary_findings_considered"):
+    R._validate_auxiliary_arbiter(route,arbiter,evidence)
+   evidence.write_text('---\nauxiliary_findings_considered:\n  - "assumption: adopted"\n---\nResults reconciled\n')
+   R._validate_auxiliary_arbiter(route,arbiter,evidence)
+   plain=self.compose(capability="audit",capability_mode="default",intensity="thorough",
+    graph="inspect,autopilot-research:retrieval,autopilot-research:synthesis,report")
+   self.assertEqual(W.automatic_consumer_prompt(plain,arbiter["id"]),"")
+ def test_host_auxiliary_arbiter_restored_without_widening_scope(self):
+  for cap,mode,graph,arbiter_id in (("autopilot-research","technology","retrieval,report","synthesis"),
+                                   ("autopilot-spec","app","research,prd-transaction","review")):
+   route=self.compose(capability=cap,capability_mode=mode,graph=graph,intensity="thorough")
+   source=R.TOPO.resolve_recipe(R.TOPO.load_registry(),cap,mode)
+   declared=next(n for n in source["standard_plus"]["nodes"] if n["id"]==arbiter_id)
+   arbiter=next(n for n in route["nodes"] if n["id"]==arbiter_id)
+   for field in ("unit","kind","completion_gate","write_scope","resource_class","dispatch_depth"):
+    self.assertEqual(arbiter[field],declared[field])
+   self.assertEqual(route["composed_recipe"]["compose"]["auto_completed_nodes"][0]["id"],arbiter_id)
+   self.assertNotIn("omitted_parallel_presets",route["composed_recipe"]["compose"])
+   R.verify_route(route,R.ROOT)
+ def test_unavailable_host_arbiter_omits_auxiliary_and_replays_exactly(self):
+  registry=json.loads(json.dumps(R.TOPO.load_registry()))
+  base=R.TOPO.resolve_recipe(registry,"autopilot-research","technology")
+  consumer=next(n for n in base["standard_plus"]["nodes"] if n["id"]=="synthesis")
+  consumer["commit_expected"]=True  # Unsafe to add automatically.
+  recipe=R.compose_subgraph_recipe(registry,base,[(n,None) for n in ("retrieval","report")],
+   group_intensity="thorough",complete_group_consumers=True)
+  self.assertEqual(recipe["compose"]["omitted_parallel_presets"],[
+   {"id":"retrieval","reason":"auxiliary-arbiter-not-selected","legs":["assumption"]}])
+  self.assertEqual(recipe["standard_plus"]["parallel_groups"][0]["width_by_intensity"]["thorough"],2)
+  R.TOPO._validate_recipe(recipe,registry,registry["owner_profile_by_intensity"]["standard"])
+  self.assertTrue(R._versioned_subgraph(registry,recipe))
+  R._validate_compose_owner_close(registry,recipe,"thorough")
+  recipe["compose"].pop("group_completion_intensity")
+  with self.assertRaisesRegex(ValueError,"differs-from-assembly"):
+   R._validate_compose_owner_close(registry,recipe,"thorough")
+ def test_auto_consumer_notices_are_once_before_explain_and_start(self):
+  import work_start
+  with tempfile.TemporaryDirectory() as tmp,mock.patch.dict(os.environ,{"AGENT_HOME":str(R.ROOT),"AGENT_DISPATCH_ATTEMPT_ID":""}):
+   root=Path(tmp);prompt=root/"task.md";prompt.write_text("Plan and test the change")
+   route=self.compose(graph="plan,test,report",intensity="strong",artifact_root=str(root/"artifacts"))
+   notice="strong group plan: auto-added plan-check (review-consumer-not-selected; registry consumer)"
+   for harness in ("claude","codex","opencode"):
+    for action in ("explain","start"):
+     out,err=io.StringIO(),io.StringIO()
+     argv=[str(P),"compose","--shape","staged","--intensity","strong","--capability","autopilot-code",
+      "--capability-mode","dev","--graph","plan,test,report","--cwd",str(R.ROOT),
+      "--artifact-root",str(root/"artifacts"),"--unassigned","--parent-harness",harness,
+      "--prompt-file",str(prompt),"--jobs",str(root/"jobs.log"),"--"+action]
+     receipt={"state":"waiting-owner","parent_next":"end-turn"}
+     def start(*args,**kwargs):
+      self.assertEqual(err.getvalue().count(notice),1)
+      return dict(receipt)
+     with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+      mock.patch.object(work_start,"start_work",side_effect=start),mock.patch.object(R,"_record_route_chain"), \
+      mock.patch.object(R,"_route_autoclose"),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+      self.assertEqual(R.main(),0)
+     self.assertEqual(err.getvalue().count(notice),1)
+     payload=json.loads(out.getvalue())
+     if action=="start":self.assertEqual({k:payload[k] for k in receipt},receipt)
+     else:self.assertEqual(len(payload["parallel_groups"]),2)
  def test_frame_pair_stays_independent_and_gates_the_following_work(self):
   route=self.compose(graph="frame,frame-alternative,plan,test,report")
   nodes={n["id"]:n for n in route["nodes"]}
