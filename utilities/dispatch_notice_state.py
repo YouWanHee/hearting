@@ -288,6 +288,9 @@ def notice_is_current(record: dict, *, jobs: Path | None = None) -> bool:
             current = True
             continue  # Old route-free completion records remain deliverable.
         status, meta = row
+        import route_parent_close
+        if route_parent_close.row_requested(meta, jobs) and action != "advance-completed":
+            continue
         if action.startswith("human-gate:"):
             if not _legacy_gate_current(record, jobs, child, meta):
                 return False

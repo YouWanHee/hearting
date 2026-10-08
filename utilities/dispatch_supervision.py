@@ -85,6 +85,10 @@ def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
 
 
 def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
+    import route_parent_close
+    attempts = [aid for aid in attempts if aid not in rows or not route_parent_close.row_requested(rows[aid][1], jobs)]
+    if not attempts:
+        return False
     if reason == "owner-input-undelivered":
         from dispatch_owner_input import unresolved
         return any(unresolved(jobs, aid) for aid in attempts)

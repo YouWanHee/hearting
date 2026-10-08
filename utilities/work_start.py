@@ -1900,6 +1900,13 @@ def _compose_again(route) -> str:
 
 def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
+    import route_parent_close
+    closing = route_parent_close.intent(route, jobs)
+    if closing:
+        outcome = route_parent_close.continue_close(closing, jobs=jobs)
+        return {"route_id": route["route_id"], "route_file": str(path), "launches": [],
+                "owner_started": False, "state": outcome["state"], "reason": route_parent_close.NOTE,
+                "resources": outcome.get("resources", [])}
     result = {"route_file": str(Path(path).resolve()), "route_id": route["route_id"],
               "launches": [], "owner_started": False,
               "advisories": OWNER_WRITE_ADVISORY.advisories(route),

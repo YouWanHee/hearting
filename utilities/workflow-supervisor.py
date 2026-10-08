@@ -771,6 +771,26 @@ def _evaluate(route, ledger, armed, results):
 
 
 def poll_once(route, ledger):
+    import route_parent_close
+    closing = route_parent_close.ledger_intent(route, ledger)
+    if closing:
+        # The original watcher keeps the resource result obligation. It must
+        # not read deleted producer artifacts or launch a cancelled successor.
+        results = []
+        for node_id, armed in sorted(read_armed(ledger).items()):
+            if armed["predecessor_kind"] == "resource":
+                evidence = resource_evidence(armed)
+                if evidence.get("terminal"):
+                    with ledger.lock():
+                        prior = [e for e in ledger.journal() if (e.get("evidence") or {}).get(
+                            "cancelled_resource_result", {}).get("identity") == evidence.get("identity")]
+                        if not prior:
+                            ledger._append({"at": WS.now_iso(), "route_id": route["route_id"],
+                                "route_hash": route["route_hash"], "actor": "resource-supervisor",
+                                "evidence": {"cancelled_resource_result": {"node": node_id, **evidence}}})
+                results.append({"node": node_id, "action": "cancelled-result" if evidence.get("terminal")
+                                else "wait-preserved-resource", "evidence": evidence})
+        return results or [{"action": "cancelled"}]
     results = []
     with ledger.lock():
         for node_id, armed in sorted(read_armed(ledger).items()):
@@ -821,8 +841,9 @@ def cmd_watch(args):
         last = poll_once(route, ledger)
         last.extend(resume_recovered_resource_owner(route, ledger))
         state = ledger.state()["workflow_state"]
+        waiting_preserved = any(row.get("action") == "wait-preserved-resource" for row in last)
         if state in ("COMPLETE", "TERMINAL_VERIFY", "FAILED_TERMINAL", "FAILED_RETRYABLE",
-                     "CANCELLED", "BLOCKED_HUMAN_GATE"):
+                     "CANCELLED", "BLOCKED_HUMAN_GATE") and not waiting_preserved:
             break
         if all(row.get("action") in ("advanced", "settled", "halted", "human-gate")
                for row in last) and last:

@@ -687,11 +687,14 @@ class CurrentDeliveryState:
     completion_proven: bool = False
     terminal_conflict: bool = False
     workflow_complete: bool = True
+    cancelled: bool = False
 
 
 def delivery_classification(state: CurrentDeliveryState) -> str:
     """Return the sole shared success/attention decision for delivery writers."""
 
+    if state.cancelled and state.quiescent and state.workflow_complete and state.owned_children == 0:
+        return "success"
     return (
         "success"
         if (
@@ -2891,6 +2894,15 @@ def current_delivery_state(
     """
 
     snapshot = current_attempt_row(jobs, attempt_id)
+    import route_parent_close
+    if snapshot is not None and route_parent_close.row_requested(snapshot.metadata, jobs):
+        outcome = route_parent_close.recover_attempt(jobs, snapshot.metadata)
+        current = current_attempt_row(jobs, attempt_id)
+        settled = bool(outcome and outcome.get("state") == "cancelled"
+                       and current and current.metadata.get("parent_close_settled") == "1")
+        return CurrentDeliveryState(None, "", child_row_revision(current),
+            hashlib.sha256(current.raw.encode()).hexdigest(), current.status, "CANCELLED",
+            settled, 0 if settled else 1, False, settled, False, settled, cancelled=settled)
     if snapshot is None:
         expected_revision = ""
         expected_process_identity: tuple[tuple[str, str], ...] = ()
@@ -3295,6 +3307,20 @@ def _join_snapshot(
         pending = False
         recovered = False
         for row in rows:
+            import route_parent_close
+            if route_parent_close.row_requested(row.metadata, jobs):
+                outcome = route_parent_close.recover_attempt(jobs, row.metadata)
+                current = current_attempt_row(jobs, row.attempt_id)
+                settled = bool(outcome and outcome.get("state") == "cancelled" and current
+                               and current.metadata.get("parent_close_settled") == "1")
+                pending = pending or not settled
+                closure_eligible[row.attempt_id] = settled
+                children.append({"attempt_id": row.attempt_id, "slug": row.slug,
+                    "status": current.status if current else row.status,
+                    "readiness": "ready" if settled else "pending",
+                    "reason": "cancelled-by-parent" if settled else "termination-pending",
+                    "required_action": "advance-completed" if settled else "complete-open"})
+                continue
             observed = observed_attempt_liveness(
                 row.status,
                 row.metadata,
