@@ -100,6 +100,7 @@ def _projection_sessions():
         if harness and cwd:
             rows.append(SimpleNamespace(harness=harness, session_id=sid, cwd=cwd,
                                         _herdr_name=agent.get("name"),
+                                        session_aliases=herdr.pane_session_aliases(harness, sid, pane, cwd),
                                         _gpu_session_aliases=herdr._clear_gpu_session_aliases(harness, sid, pane)))
     current_keys = {key for row in rows for key in _session_keys(row)}
     return rows + [row for row in _registry_sessions()

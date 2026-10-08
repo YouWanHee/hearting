@@ -397,13 +397,14 @@ def _await_tui_and_project(session_id: str, report_session: bool) -> None:
         time.sleep(2)
 
 
-def _opencode_lifecycle(harness, session_seq, session_start_source):
+def _session_lifecycle(harness, session_seq, session_start_source):
     """Optional native bootstrap fields; never infer a source or widen a guard."""
     if session_seq is None and session_start_source is None:
         return {}
-    if (harness != "opencode" or type(session_seq) is not int
-            or not 0 < session_seq <= 9007199254740991
-            or session_start_source not in (None, "startup")):
+    max_seq = 9007199254740991 if harness == "opencode" else 18446744073709551615
+    if (harness not in HARNESSES or type(session_seq) is not int
+            or not 0 < session_seq <= max_seq
+            or session_start_source not in (None, "startup", "resume", "clear", "compact", "fork")):
         return None
     return dict(session_seq=session_seq, session_start_source=session_start_source)
 
@@ -437,7 +438,20 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
         if codex_main and runtime_identity() == ("codex", None):
             _defer_until_proven(session_id, report_session)
         return True
-    lifecycle = _opencode_lifecycle(harness, session_seq, session_start_source)
+    if report_session and session_seq is None and session_start_source is None:
+        # A start may precede native process identity. The next existing callback
+        # reuses that recorded source once this exact runtime is identifiable.
+        try:
+            utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+            if utilities not in sys.path:
+                sys.path.insert(0, utilities)
+            import session_tidy
+            session_start_source = session_tidy.session_start_source(harness, session_id, pane)
+            if session_start_source:
+                session_seq = time.time_ns() if harness != "opencode" else time.time_ns() // 1000
+        except Exception:
+            session_start_source = None
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
     if lifecycle is None:
         report_session, lifecycle = False, {}
     if observation is not None:
@@ -459,7 +473,7 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
                                  label=label)
     source = "herdr:%s" % harness
     commands = []
-    lifecycle = _opencode_lifecycle(harness, session_seq, session_start_source)
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
     if lifecycle is None:
         report_session = False
     if report_session:
@@ -508,8 +522,8 @@ def main(argv=None) -> int:
                         help="skip report-agent-session (the runtime's own hook owns it)")
     parser.add_argument("--seq", type=int,
                         help="optional OpenCode native publisher sequence")
-    parser.add_argument("--session-start-source", choices=["startup"],
-                        help="one real OpenCode native bootstrap attempt, never a new session")
+    parser.add_argument("--session-start-source", choices=["startup", "resume", "clear", "compact", "fork"],
+                        help="the actual native session-start source")
     parser.add_argument("--print", action="store_true",
                         help="print the composed metadata instead of reporting it")
     parser.add_argument("--await-codex-tui", action="store_true",

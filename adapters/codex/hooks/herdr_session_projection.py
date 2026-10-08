@@ -10,6 +10,7 @@ its two lifecycle hooks already call.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,4 +22,9 @@ from fleet.herdr_projection import project as _project  # noqa: E402
 
 
 def project(payload: dict[str, Any] | None, session_id: str, *, worker: bool = False) -> bool:
-    return _project("codex", session_id, worker=worker)
+    lifecycle = {}
+    if isinstance(payload, dict) and payload.get("hook_event_name") == "SessionStart":
+        source = payload.get("source")
+        if source in {"startup", "resume", "clear", "compact", "fork"}:
+            lifecycle = dict(session_seq=time.time_ns(), session_start_source=source)
+    return _project("codex", session_id, worker=worker, **lifecycle)

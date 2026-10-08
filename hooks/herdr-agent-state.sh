@@ -123,6 +123,10 @@ else:
     }
     if agent_session_id:
         request["params"]["agent_session_id"] = agent_session_id
+    if hook_event_name == "SessionStart" and hook_input.get("source") in {
+            "startup", "resume", "clear", "compact", "fork"}:
+        # Herdr retains a pane's previous ID without the native start source.
+        request["params"]["session_start_source"] = hook_input["source"]
 
 try:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

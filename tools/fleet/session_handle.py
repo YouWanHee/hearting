@@ -265,6 +265,7 @@ def resolve_tag(harness: object, session_id: object, *, home: object = None) -> 
     # Claude: the derived `<basename>-<xx>` name is the only carrier, and only while the
     # record still says `derived` (a user-set `release-1a` has the same shape, F-100a).
     sessions = _claude_sessions_dir(home)
+    records = []
     try:
         for entry in os.listdir(sessions or ""):
             if not entry.endswith(".json"):
@@ -274,7 +275,10 @@ def resolve_tag(harness: object, session_id: object, *, home: object = None) -> 
                     record = json.load(fh)
             except Exception:
                 continue
-            if not isinstance(record, dict) or record.get("sessionId") != sid:
+            if not isinstance(record, dict):
+                continue
+            records.append(record)
+            if record.get("sessionId") != sid:
                 continue
             if record.get("nameSource") != "derived":
                 break
@@ -287,7 +291,18 @@ def resolve_tag(harness: object, session_id: object, *, home: object = None) -> 
     # Fleet's own snapshot of that tag survives a later rename (F-100a).
     try:
         from fleet.titles import read_tag
-        return read_tag(sid, harness="claude")
+        remembered = read_tag(sid, harness="claude")
+        if remembered:
+            return remembered
+        # Keep the derived pane badge across a native resume. The alias lookup
+        # is the same display-only seat history Fleet uses, never a cwd guess.
+        from fleet.collectors.herdr import pane_session_aliases
+        aliases = pane_session_aliases("claude", sid, os.environ.get("HERDR_PANE_ID"), os.getcwd())
+        tags = {derived_tag(record.get("name")) for record in records
+                if record.get("sessionId") in aliases and record.get("nameSource") == "derived"}
+        tags.update(read_tag(alias, harness="claude") for alias in aliases)
+        tags.discard(None)
+        return tags.pop() if len(tags) == 1 else None
     except Exception:
         return None
 
