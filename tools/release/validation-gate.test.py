@@ -217,7 +217,7 @@ class ChecksWorkflowContractTest(unittest.TestCase):
         for option in ("--shard ${{ matrix.shard }}/8", "--suite-list", "--retries 1", "--xpass-nonfatal",
                        "--strict-leak-sweep", "--diagnostics-dir", "--seed-baseline"):
             self.assertIn(option, shard)
-        self.assertIn("sudo timeout 300 apt-get", shard)  # tracing fixtures are needed by each shard
+        self.assertIn("bash tools/release/install-ci-fixtures.sh ripgrep strace", shard)
 
     def test_shard_and_marker_uploads_replace_an_earlier_attempt(self):
         shard = job_block(self.checks, "full-suite-shard")
