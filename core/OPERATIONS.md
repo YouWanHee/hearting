@@ -1082,7 +1082,15 @@ The static half — addresses, ports, environment roots, and the shared run root
 other cross-runtime policy files; install seeds it once as a commented template
 and neither install nor update ever rewrites it. `harness config status` shows
 its state next to the other user-owned config surfaces. The
-launcher is shared across runtimes, repairs only an exact owned link, preserves
+worker runtime preserves that exact inventory location through the existing
+`COMPUTE_HOSTS_CONFIG` environment value before isolating its XDG directories;
+it neither copies the inventory nor exposes the user's whole config home.
+GPU lab owners include the inventory directory as a read-only root and SSH
+network need in their normal execution-access request. Execution/validation
+children remain inside the parent's grant; non-execution nodes get no new
+automatic network request. The effective record reports this logical network
+grant separately from OS enforcement. An explicit network request still wins.
+The launcher is shared across runtimes, repairs only an exact owned link, preserves
 foreign collisions, and is removed only by a full uninstall. That file
 is byte-identical on every host: which entry is the local machine is discovered
 by matching its declared `hostname`, not written down, so promoting a different

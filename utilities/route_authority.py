@@ -900,6 +900,16 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
                                   dispatch_state_root=dispatch_state_root(args.jobs_path),
                                   agent_home=args.agent_home, environ=os.environ)
     parent = None
+    compute_scope = None
+    route_file = getattr(args, "route_file", None)
+    owner_binding = getattr(args, "owner_route_binding", None)
+    if not route_file and owner_binding is not None:
+        route_file = owner_binding.route_file
+    if route_file and request_path(args.execution_access_file, os.environ) is not None:
+        from gpu_execution_sandbox import select as gpu_selection
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        compute_scope = gpu_selection(route, node=getattr(args, "route_node", None),
+                                      owner=args.dispatch_depth == 1, environ={})["gpu_scope"]
     if args.dispatch_depth >= 2 and request_path(args.execution_access_file, os.environ) is not None:
         if args.parent_binding is None:
             # Prospective probes without an access request need no live owner.
@@ -936,7 +946,7 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
         network_available=network_available or bool(parent_network and parent is not None
                                                      and parent.network_allowed),
         effective_sandbox=effective_sandbox, gpu_resource_scope=gpu_resource_scope,
-        inherit_parent_sandbox=inherit_parent_sandbox)
+        inherit_parent_sandbox=inherit_parent_sandbox, compute_execution_scope=compute_scope)
 
 
 # ---------------------------------------------------------------------------

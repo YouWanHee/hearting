@@ -543,6 +543,12 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         # copied user settings retain all user guard hooks and permission rules.
         values['CLAUDE_CONFIG_DIR'] = str(home)
     else:
+        # XDG isolation belongs to OpenCode, not the user's compute inventory.
+        # Pin the existing inventory input before masking XDG_CONFIG_HOME, so
+        # same- and cross-harness descendants keep reading the original file.
+        config_root = Path(env.get('XDG_CONFIG_HOME') or Path(env.get('HOME') or Path.home()) / '.config')
+        inventory = env.get('COMPUTE_HOSTS_CONFIG') or config_root / 'hearting/compute-hosts.yaml'
+        values['COMPUTE_HOSTS_CONFIG'] = str(Path(inventory).expanduser().absolute())
         source = Path(env.get('OPENCODE_CONFIG_DIR') or Path(env.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'opencode')
         config = read_json(first_existing(source / 'opencode.jsonc', source / 'opencode.json') or source / 'opencode.json')
         config = deepcopy(config)

@@ -7,6 +7,14 @@
 owner의 정상 접근 범위 안에 두기 위한 기본값이다. 일반 code owner와 frame에는
 이 기본값을 추가하지 않는다. Resource child는 실제 부모 grant 안에서만 접근한다.
 
+GPU 실행 범위가 있는 lab owner는 inventory 폴더를 읽기 전용으로 받고, 별도 명시 요청이
+없으면 compute-hosts SSH 네트워크 필요도 같은 요청에 포함된다. OpenCode 작업자 홈은
+XDG 경로를 격리하기 전에 기존 `COMPUTE_HOSTS_CONFIG` 입력에 사용자 inventory의 정확한
+경로를 유지한다. 파일을 복사하거나 사용자 설정을 바꾸지 않는다. 기존 준비 파일이 있는
+route도 정상 start·correction에서 기존 도출 root를 유지한 채 이 실행 기본값을 준비한다.
+비실행 child에는 이 자동 요청을 더하지 않으며 child의 실제 요청은 부모 grant를 넘을 수 없다.
+Claude·OpenCode의 `network_allowed`는 논리적 허용이며 OS 네트워크 격리 보장이 아니다.
+
 Inventory가 없거나 주석 템플릿 상태라면 경로를 추측하지 않는다. 잘못된 inventory,
 홈 전체 같은 넓은 root, symlink로 넓은 root에 도달하는 요청은 기존 검증에서 거부한다.
 준비 과정은 inventory를 읽고 요청 파일만 만들며 실제 `run_root`를 만들거나 작업을
