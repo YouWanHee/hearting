@@ -2918,6 +2918,13 @@ class SupervisionWakeRearmTest(unittest.TestCase):
         self.assertEqual(record["state"], "sent-ambiguous")
         self.assertIsNone(record["acked_by"])
 
+    def test_handoff_io_failure_preserves_the_native_wake_and_retryable_notice(self):
+        with mock.patch.object(rewake.pending_delivery, "release_claim", side_effect=OSError("disk error")):
+            self.assertEqual(self._run("gate")[0], 2)
+        record = rewake.pending_delivery.read(self.root, "session-1", self.notice["delivery_id"])
+        self.assertEqual(record["state"], "sent-ambiguous")
+        self.assertIsNone(record["acked_by"])
+
 
 class GateCloseRearmTest(GateCarrierTest):
     """SD-129 without command parsing: the wake spent on a gate is re-armed by

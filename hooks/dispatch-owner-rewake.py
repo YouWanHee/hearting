@@ -1628,7 +1628,7 @@ def _run_carrier(launch, claim, payload, observation, holder) -> int:
                         pending_delivery.release_claim(
                             state_root, recipient, delivery_id, claim_owner=claim_owner
                         )
-                    except pending_delivery.PendingDeliveryError:
+                    except (pending_delivery.PendingDeliveryError, OSError):
                         pass
                 return code
             time.sleep(interval)
