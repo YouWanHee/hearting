@@ -6993,6 +6993,16 @@ class ComposeRouteTest(TestRoute):
                                           if not r["axis"].startswith("compose-")]
   self.assertIn("source=sealed-route","\n".join(R.compose_decision_lines(legacy)))
   self.assertNotIn("강도 안내","\n".join(R.compose_decision_lines(legacy)))
+  legacy_display="\n".join(R.compose_decision_lines(legacy))
+  self.assertIn("capability=autopilot-code (source=sealed-route)",legacy_display)
+  self.assertNotIn("source=compose-default",legacy_display)
+  framed=self.compose(capability=None,capability_mode=None,shape="framed",graph=None)
+  framed["selection"]["selection_basis"]=[r for r in framed["selection"]["selection_basis"]
+                                         if not r["axis"].startswith("compose-")]
+  frame_display="\n".join(R.compose_decision_lines(framed))
+  self.assertIn("capability=frame 결정 대기 (source=sealed-route)",frame_display)
+  self.assertNotIn(R.ROUTE_FRAME_CAPABILITY,frame_display)
+  self.assertNotIn("source=compose-default",frame_display)
   self.assertEqual(set(R.compose_observations(default)),{"confirmation","pre_execution_answers"})
  def test_compose_decisions_show_real_group_leg_profiles_and_resource_dispatch_count(self):
   grouped=self.compose(capability="autopilot-lab",capability_mode="eval",intensity="strong",

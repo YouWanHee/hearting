@@ -4376,12 +4376,16 @@ def compose_decision_lines(route):
     lines = [f"  intensity={route['effective_intensity']} (source={source}{detail})"]
     if source == "shape-default":
         lines.append("  강도 안내: 판정·원인 분석이면 --intensity strong 검토")
+    shape = (route.get("selection") or {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     capability = basis.get("compose-capability", {})
     if capability.get("source") == "compose-default":
         lines.append(f"  capability={route['capability']} (source=compose-default, --capability 지정 안 됨; "
                      "고정 기본값, 과제 문장 분류 없음; 결과 분석·평가·비교는 autopilot-lab/eval 검토)")
     elif capability.get("source") == "frame-shape":
         lines.append("  capability=frame 결정 대기 (source=frame-shape)")
+    elif not capability:
+        label = "frame 결정 대기" if shape == "framed" else route["capability"]
+        lines.append(f"  capability={label} (source=sealed-route)")
     profiles = {}
     nodes = route.get("nodes", [])
     for node in nodes:
@@ -4393,7 +4397,6 @@ def compose_decision_lines(route):
         profiles.setdefault(anchor, []).append(profile)
     lines.append("  tiers: " + (" ".join(f"{node}={'+'.join(values)}" for node, values in profiles.items()) or "없음"))
     workers = sum(n.get("dispatch_depth") == 2 or _frame_node(n) for n in nodes)
-    shape = (route.get("selection") or {}).get("shape") or shape_for_intensity(route["effective_intensity"])
     owners = int(shape != "framed" and route["effective_intensity"] != "direct")
     resources = [n["id"] for n in nodes if n.get("kind") == "resource-runner"]
     lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
