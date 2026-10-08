@@ -54,7 +54,7 @@ class ResourceWatchHorizonTest(FIX.WorkflowFixture):
         args = SimpleNamespace(route=path, jobs=None, max=86400, interval=1, ready_fd=None)
         with mock.patch.object(SUP, "poll_once", side_effect=[[r] for r in results]) as poll, \
                 mock.patch.object(SUP, "read_armed", return_value=armed), \
-                mock.patch.object(SUP, "resume_recovered_resource_owner"), \
+                mock.patch.object(SUP, "resume_recovered_resource_owner", return_value=[]), \
                 mock.patch.object(SUP.time, "monotonic", side_effect=lambda: now[0]), \
                 mock.patch.object(SUP.time, "sleep", side_effect=sleep), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
@@ -126,6 +126,27 @@ class ResourceWatchHorizonTest(FIX.WorkflowFixture):
         log.write_text(json.dumps(receipt) + "\n")
         self.assertFalse(SUP.resource_watch_expired(ledger, armed, row))
 
+    def test_complete_timeout_receipt_and_second_recovery_preserve_expiry(self):
+        route, _, _, registry, _, ledger, armed, row = self.living()
+        log = ledger.root / "resource/watch.log"
+        log.parent.mkdir()
+        receipt = {"route_id": route["route_id"], "timeout": True, "results": [{
+            "node": armed["node"], "evidence": {"liveness": "working",
+            "identity": f"{row['run_id']}:{row['pid']}:{row['starttime']}:None",
+            "artifacts": {"path": "x" * 70000}}}]}
+        log.write_text(json.dumps(receipt) + "\n" + "unrelated crash noise\n" * 8000)
+        self.assertTrue(SUP.resource_watch_expired(ledger, armed, row))
+        for recovery in range(2):
+            with mock.patch.object(SUP.RESOURCE_RESUME, "supervisor_alive", return_value=False), \
+                    mock.patch.object(SUP.runner(), "start_watch", return_value=(mock.Mock(), SUP.RR.proc_identity(os.getpid()))):
+                recovered = SUP.reattach_resource_watch(route, ledger, armed)
+                self.assertTrue(recovered["supervision"]["expired"])
+                if recovery == 0:
+                    log.write_text("rotated\n")
+        actual = json.loads(registry.read_text())["runs"]["fixture-run"]
+        self.assertEqual(actual["pid"], row["pid"])
+        self.assertEqual(actual["starttime"], row["starttime"])
+
     def test_existing_start_returns_the_resource_continuation_before_owner_replacement(self):
         import work_start as START
         route, path, jobs, _, _, _, _, _ = self.living()
@@ -171,8 +192,8 @@ class ResourceWatchHorizonTest(FIX.WorkflowFixture):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness), \
                     mock.patch.object(INPUT, "_target", return_value=(SimpleNamespace(
-                        status="done", metadata={"harness": harness}), "target")), \
-                    mock.patch.object(INPUT, "_answers_blocked_owner", return_value=True), \
+                        status="done", metadata={"harness": harness, "note": "dead-worker-blocked"}), "target")), \
+                    mock.patch.object(INPUT, "supervisor_lease_is_held", return_value=False), \
                     mock.patch.object(INPUT, "retained", return_value=[]), \
                     mock.patch.object(INPUT, "submit", return_value={"retained": True}) as submit, \
                     mock.patch.object(DELIVERY, "materialize", return_value=[{
@@ -183,11 +204,45 @@ class ResourceWatchHorizonTest(FIX.WorkflowFixture):
                 self.assertEqual(submit.call_args.args[:2], (str(jobs), "att-parent"))
                 self.assertEqual(deliver.call_args.kwargs["reason"], DELIVERY.ANSWER_AWAITING_PARENT)
                 self.assertIn("do not launch its payload again", submit.call_args.args[2])
-                self.assertEqual(resume.call_args.kwargs["session_id"], "original-parent")
+                resume.assert_not_called()
         with mock.patch.object(ledger, "journal", return_value=[{"evidence": {"parent_close": {"close": True}}}]), \
                 mock.patch.object(INPUT, "submit") as submit:
             SUP.resume_recovered_resource_owner(route, ledger)
             submit.assert_not_called()
+
+        for harness in ("claude", "codex", "opencode"):
+            for status, note in (("done", "dead-worker-fail"), ("running", "dead-worker-blocked")):
+                with self.subTest(harness=harness, status=status, note=note), \
+                        mock.patch.object(INPUT, "_target", return_value=(SimpleNamespace(status=status,
+                            metadata={"harness": harness, "note": note, "terminal_verdict": "FAIL"}), "target")), \
+                        mock.patch.object(INPUT, "submit") as submit, \
+                        mock.patch.object(DELIVERY, "materialize") as deliver:
+                    SUP.resume_recovered_resource_owner(route, ledger)
+                    submit.assert_not_called()
+                    deliver.assert_not_called()
+
+    def test_settled_watch_retries_held_lease_and_submission_race_before_exiting(self):
+        import dispatch_owner_input as INPUT
+        import dispatch_supervision as DELIVERY
+        route, path, jobs, registry, _ = self._resume_fixture(ordinary=True)
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        row.update(status="succeeded", exit_code=0, supervision={"expired": True})
+        registry.write_text(json.dumps({"runs": {"fixture-run": row}}))
+        ledger = SUP.ledger_for(route, jobs)
+        evidence = SUP.resource_evidence(SUP.read_armed(ledger)["full-run"])
+        ledger.record("full-run", "STAGE_SUCCEEDED", evidence=evidence, actor="fixture")
+        args = SimpleNamespace(route=path, jobs=jobs, max=86400, interval=1, ready_fd=None)
+        with mock.patch.object(SUP, "poll_once", side_effect=lambda *a: [{"node": "full-run", "action": "settled"}]) as poll, \
+                mock.patch.object(INPUT, "_target", return_value=(SimpleNamespace(status="done",
+                    metadata={"note": "dead-worker-blocked"}), "target")), \
+                mock.patch.object(INPUT, "supervisor_lease_is_held", side_effect=[True, False, False]), \
+                mock.patch.object(INPUT, "retained", return_value=[]), \
+                mock.patch.object(INPUT, "submit", side_effect=[INPUT.InputError("lease-race"), {"retained": True}]) as submit, \
+                mock.patch.object(DELIVERY, "materialize") as deliver, \
+                mock.patch.object(SUP.time, "sleep"), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(SUP.cmd_watch(args), 0)
+        self.assertEqual((poll.call_count, submit.call_count, deliver.call_count), (3, 2, 1))
+        self.assertFalse(json.loads(out.getvalue())["timeout"])
 
 
 if __name__ == "__main__":

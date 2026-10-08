@@ -182,10 +182,17 @@ def reattach_resource_watch(route, ledger, armed):
             if RESOURCE_RESUME.supervisor_alive(row.get("supervision")):
                 return {"run_id": row["run_id"], "node": armed["node"], "recovered": False,
                         "supervision": row["supervision"], "supervisor_alive": True}
-            expired = resource_watch_expired(ledger, armed, row)
+            # A run's PID/start/command never changes on observer recovery.
+            # Keep its already observed timeout even after log rotation/noise.
+            previous = row.get("supervision") or {}
+            resource_identity = f"{row['run_id']}:{row['pid']}:{row['starttime']}:{row['command_hash']}"
+            expired = (previous.get("expired") is True and
+                       previous.get("expiry_identity", resource_identity) == resource_identity)
+            expired = expired or resource_watch_expired(ledger, armed, row)
             _watch, identity = runner().start_watch(armed["route_file"], armed["jobs"],
                 row["cwd"], ledger.root / "resource")
-            row["supervision"] = {**identity, "recovered": True, "expired": expired}
+            row["supervision"] = {**identity, "recovered": True, "expired": expired,
+                                  "expiry_identity": resource_identity}
             return {"run_id": row["run_id"], "node": armed["node"], "recovered": True,
                     "supervision": row["supervision"], "supervisor_alive": True}
         return runner().locked_update(armed["resource_registry"], recover)
@@ -195,24 +202,23 @@ def resource_watch_expired(ledger, armed, row):
     """Recognize the old observer's existing timeout receipt, never a human stop."""
     identity = f"{row['run_id']}:{row.get('pid')}:{row.get('starttime')}:None"
     try:
-        with (ledger.root / "resource/watch.log").open("rb") as log:
-            log.seek(0, os.SEEK_END)
-            log.seek(max(0, log.tell() - 65536))
-            lines = log.read().decode("utf-8", errors="replace").splitlines()
+        with (ledger.root / "resource/watch.log").open("r", encoding="utf-8", errors="replace") as log:
+            for line in log:
+                try:
+                    receipt = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(receipt, dict) or not isinstance(receipt.get("results"), list):
+                    continue
+                if (receipt.get("route_id") == ledger.route_id and receipt.get("timeout") is True
+                        and any(isinstance(result, dict) and result.get("node") == armed["node"]
+                            and isinstance(result.get("evidence"), dict)
+                            and result["evidence"].get("identity") == identity
+                            and result["evidence"].get("liveness") == "working"
+                            for result in receipt["results"])):
+                    return True
     except OSError:
         return False
-    for line in reversed(lines):
-        try:
-            receipt = json.loads(line)
-        except ValueError:
-            continue
-        if (isinstance(receipt, dict) and receipt.get("route_id") == ledger.route_id
-                and receipt.get("timeout") is True and any(
-                    result.get("node") == armed["node"]
-                    and result.get("evidence", {}).get("identity") == identity
-                    and result.get("evidence", {}).get("liveness") == "working"
-                    for result in receipt.get("results", []))):
-            return True
     return False
 
 
@@ -223,48 +229,55 @@ def recover_resource_watches(route, jobs):
 
 
 def resume_recovered_resource_owner(route, ledger):
-    """Hand a proven result to the original parent through its existing carrier."""
+    """Publish proven resource success; only the claiming parent carrier resumes it."""
     import dispatch_owner_input as INPUT
     import dispatch_supervision as SUPERVISION
+    pending = []
     with ledger.lock():
         if resource_continuation_cancelled(route, ledger) or route.get("human_gates"):
-            return
+            return pending
         for node, armed in read_armed(ledger).items():
             if (armed.get("predecessor_kind") != "resource" or not armed.get("successor_external")
                     or ledger.state().get("nodes", {}).get(node, {}).get("state") != "STAGE_SUCCEEDED"):
                 continue
-            row = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
-            if (row.get("resource_policy") != "supervised-owner"
-                    or not (row.get("supervision") or {}).get("expired")
-                    or row.get("cancel_requested") or row.get("parent_close_requested")):
-                continue
-            owner = (row.get("owner_wait") or {}).get("parent_attempt_id")
-            target, _ = INPUT._target(armed["jobs"], owner)
-            if (target.status in {"open", "running"} or target.metadata.get("parent_close_requested") == "1"
-                    or not INPUT._answers_blocked_owner(target, False)):
-                continue
-            evidence = resource_evidence(armed)
-            stage = ledger.state()["nodes"][node].get("evidence") or {}
-            if (not evidence.get("succeeded") or evidence.get("liveness") != "exited"
-                    or stage.get("resource_sha256") != RESOURCE_RESUME.row_digest(row)):
-                continue
-            request = "resource-" + hashlib.sha256(
-                (route["route_hash"] + node + evidence["identity"]).encode()).hexdigest()[:32]
-            if any(item["id"] != request for item in INPUT.retained(armed["jobs"], owner)):
-                # A person's pending correction still owns what happens next.
-                continue
-            submitted = INPUT.submit(armed["jobs"], owner,
-                f"The recovered resource watch proved {node} completed successfully for run {row['run_id']}. "
-                "Continue the same sealed route from its resource completion marker and pending successors. "
-                "Preserve this run; do not launch its payload again.", request_id=request)
-            if not submitted.get("retained"):
-                continue
-            records = SUPERVISION.materialize(Path(armed["jobs"]), {owner},
-                reason=SUPERVISION.ANSWER_AWAITING_PARENT)
-            for record in records:
-                receipt = record["receipt"]
-                SUPERVISION.continue_for_parent(record,
-                    session_id=receipt["recipient_thread_id"], recipient_kind=record["recipient_kind"])
+            try:
+                row = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
+                if (row.get("resource_policy") != "supervised-owner"
+                        or not (row.get("supervision") or {}).get("expired")
+                        or row.get("cancel_requested") or row.get("parent_close_requested")):
+                    continue
+                owner = (row.get("owner_wait") or {}).get("parent_attempt_id")
+                target, _ = INPUT._target(armed["jobs"], owner)
+                if (target.metadata.get("parent_close_requested") == "1"
+                        or INPUT.route_authority.answerable_owner_end(target.status, target.metadata) != "BLOCKED"):
+                    continue
+                if INPUT.supervisor_lease_is_held(armed["jobs"], target.metadata):
+                    pending.append({"node": node, "action": "wait-owner-resume", "reason": "owner-lease-held"})
+                    continue
+                evidence = resource_evidence(armed)
+                stage = ledger.state()["nodes"][node].get("evidence") or {}
+                if (not evidence.get("succeeded") or evidence.get("liveness") != "exited"
+                        or stage.get("resource_sha256") != RESOURCE_RESUME.row_digest(row)):
+                    continue
+                request = "resource-" + hashlib.sha256(
+                    (route["route_hash"] + node + evidence["identity"]).encode()).hexdigest()[:32]
+                if any(item["id"] != request for item in INPUT.retained(armed["jobs"], owner)):
+                    # A person's pending correction still owns what happens next.
+                    continue
+                submitted = INPUT.submit(armed["jobs"], owner,
+                    f"The recovered resource watch proved {node} completed successfully for run {row['run_id']}. "
+                    "Continue the same sealed route from its resource completion marker and pending successors. "
+                    "Preserve this run; do not launch its payload again.", request_id=request)
+                if submitted.get("retained"):
+                    # No parent SID injection or second resume scheduler here.
+                    # The existing carrier claims this notice and owns continuation.
+                    SUPERVISION.materialize(Path(armed["jobs"]), {owner},
+                        reason=SUPERVISION.ANSWER_AWAITING_PARENT)
+            except (OSError, ValueError, KeyError) as error:
+                # The owner may release its lease immediately after row closure,
+                # or its existing delivery surface may be transiently unavailable.
+                pending.append({"node": node, "action": "wait-owner-resume", "reason": str(error)})
+    return pending
 
 
 # --------------------------------------------------------------------------------
@@ -806,7 +819,7 @@ def cmd_watch(args):
     last = []
     while True:
         last = poll_once(route, ledger)
-        resume_recovered_resource_owner(route, ledger)
+        last.extend(resume_recovered_resource_owner(route, ledger))
         state = ledger.state()["workflow_state"]
         if state in ("COMPLETE", "TERMINAL_VERIFY", "FAILED_TERMINAL", "FAILED_RETRYABLE",
                      "CANCELLED", "BLOCKED_HUMAN_GATE"):
