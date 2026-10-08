@@ -60,6 +60,89 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
             self.assertIn("NOW: one sentence, in Korean,", prompt)
             self.assertIsNone(rt.validate_title("세션 제목 일관성", rt._title_lang()))
 
+    def test_claude_command_metadata_cannot_be_anchor_or_language(self):
+        rows = [
+            {"type": "user", "message": {"role": "user", "content": text}}
+            for text in ("<local-command-caveat>Do not respond</local-command-caveat>",
+                         "<command-name>/model</command-name>",
+                         "<local-command-stdout>Set model</local-command-stdout>",
+                         "<task-notification>Background task finished</task-notification>",
+                         "제목 언어를 맞춰줘")
+        ]
+        rows.append({"type": "user", "isMeta": True,
+                     "message": {"role": "user", "content": "Injected English bootstrap"}})
+        rows.append({"type": "user", "isCompactSummary": True,
+                     "message": {"role": "user", "content": "Earlier conversation summary"}})
+        raw = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+        self.assertEqual(rt._origin_text(raw, "claude"), "제목 언어를 맞춰줘")
+        self.assertEqual(rt._origin_text(raw, "claude", latest=True), "제목 언어를 맞춰줘")
+        self.assertNotIn("Set model", rt._delta_text(raw, "claude"))
+        self.assertEqual(rt._user_language("<command-name>한국어 메타</command-name>"), "")
+
+    def test_owner_uses_last_main_observation_for_both_lines(self):
+        titles.write("main-ko", "한국어 제목", harness="claude", now=900,
+                     source="refresher:claude|user-language=Korean@200")
+        titles.write("main-ja", "日本語の題名", harness="opencode", now=1000,
+                     source="refresher:opencode|user-language=Japanese@100")
+        titles.write("dispatch-att-owner", "English owner", harness="codex", now=1100,
+                     source="refresher:codex|user-language=English@300")
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8", "LC_ALL": "",
+                                          "LC_MESSAGES": "", "FLEET_NOW_LANG": ""}):
+            prompt = rt._prompt("Registered worker: scan logs", anchor="Assignment: implementation")
+            self.assertIn("in Korean.", prompt)
+            self.assertIn("NOW: one sentence, in Korean,", prompt)
+            config.ensure()
+            config.config_path().write_text('{"title_language":"en"}\n')
+            self.assertEqual(rt._title_lang(), "English")
+
+    def test_latest_user_language_ignores_later_native_metadata(self):
+        rows = [
+            {"type": "user", "message": {"role": "user", "content": text}}
+            for text in ("Earlier English request", "제목을 한국어로 맞춰줘",
+                         "<local-command-stdout>Set model</local-command-stdout>")
+        ]
+        raw = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+        self.assertEqual(rt._origin_text(raw, "claude", latest=True), "제목을 한국어로 맞춰줘")
+        codex = [{"type":"response_item", "payload":{"type":"message", "role":"user",
+                  "content":[{"type":"input_text", "text":text}]}}
+                 for text in ("제목을 한국어로 맞춰줘", "AGENT_HARNESS_COMPLETION_V1\n{}")]
+        self.assertEqual(rt._origin_text("\n".join(json.dumps(row, ensure_ascii=False)
+                                                 for row in codex), "codex", latest=True),
+                         "제목을 한국어로 맞춰줘")
+
+    def test_main_observation_survives_failed_refresh_and_current_language_wins(self):
+        path = self._transcript("claude")
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8", "LC_ALL": "",
+                                          "LC_MESSAGES": "", "FLEET_NOW_LANG": ""}), \
+             mock.patch.object(rt, "run_worker", return_value="") as worker:
+            with mock.patch("time.time", return_value=200):
+                rt.main(["--sid", "main-observation", "--transcript", str(path),
+                         "--slotdir", str(Path(self._tmp.name) / "slot")])
+            self.assertIn("user-language=Korean@200", titles.read("main-observation")["source"])
+            with path.open("a") as handle:
+                handle.write(json.dumps({"type":"user", "message":{"role":"user",
+                                         "content":"Please use English now"}}) + "\n")
+            with mock.patch("time.time", return_value=300):
+                rt.main(["--sid", "main-observation", "--transcript", str(path),
+                         "--slotdir", str(Path(self._tmp.name) / "slot")])
+            self.assertIn("in English.", worker.call_args.args[0])
+            self.assertIn("NOW: one sentence, in English,", worker.call_args.args[0])
+            self.assertIn("user-language=English@300", titles.read("main-observation")["source"])
+
+    def test_old_main_hydration_cannot_overwrite_a_newer_human_language(self):
+        titles.write("recent-main", "최근 한국어 요청", harness="codex",
+                     source="refresher:codex|user-language=Korean@200")
+        path = Path(self._tmp.name) / "old-main.jsonl"
+        path.write_text(json.dumps({"type":"user", "timestamp":"1970-01-01T00:01:40Z",
+                                   "message":{"role":"user", "content":"Earlier English request"}}))
+        with mock.patch.dict(os.environ, {"LANG":"en_US.UTF-8", "LC_ALL":"",
+                                          "LC_MESSAGES":"", "FLEET_NOW_LANG":""}), \
+             mock.patch.object(rt, "run_worker", return_value=""):
+            rt.main(["--sid", "old-main", "--transcript", str(path),
+                     "--slotdir", str(Path(self._tmp.name) / "slot")])
+            self.assertIn("user-language=English@100", titles.read("old-main")["source"])
+            self.assertEqual(rt._observed_main_language(), "Korean")
+
     def test_language_limits_and_localized_failure_outputs(self):
         for language, title in (("Korean", "세션 제목 일관성"), ("Japanese", "セッションのタイトル"),
                                 ("Chinese", "会话标题一致性"), ("French", "Résumé des sessions")):

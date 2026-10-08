@@ -85,22 +85,9 @@ REVIEW_AGENT = """---
 description: "No-tools workflow group reviewer. Emits one JSON object only."
 mode: primary
 tools:
-  bash: false
-  edit: false
-  write: false
-  read: false
-  grep: false
-  glob: false
-  list: false
-  patch: false
-  webfetch: false
-  todowrite: false
-  todoread: false
-  task: false
+  "*": false
 permission:
-  bash: deny
-  edit: deny
-  webfetch: deny
+  "*": deny
 ---
 You are a no-tools workflow group reviewer. Output exactly one JSON object and nothing else.
 """

@@ -33,6 +33,12 @@ state and parent links to prevent overwrites and ad hoc loss. Automatically read
 the user's existing layer, prefix, and config patterns priority. Graduate
 refinement or library work to autopilot-code.
 
+Within `eval`, the named **Existing-result analysis** default composes
+`metrics → diagnose → report`. At strong or higher, include `independent-verify`
+with its declared two-way group and automatic owner close. For one requested
+new measurement, add `eval-run` with its existing inputs and sealed raw-result
+write scope. The mode-specific examples below cover both compositions.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 ## Artifact Ownership
@@ -101,6 +107,42 @@ shape, the derivation and current runtime limits.
 | `setup` | Experiment spec, scaffold, run commands, pending `_RUNLOG` row, birth `run.json`, post-run verification, and a recorded handoff naming the successor workflow. |
 | `eval` | Eval spec, evaluation execution or guidance, metrics and per-array analysis, figures/media, report, `_RUNLOG` completion, lineage finalization. |
 
+### Existing-result analysis (eval default composition)
+
+For a request that analyzes existing results without a new measurement, default
+to the named **Existing-result analysis** composition: `metrics → diagnose → report`.
+At `strong` or higher, include `independent-verify`; its declared two-way group
+feeds the automatic owner close, which reconciles both verdicts in one summary.
+This uses the existing `eval` recipe and `--graph`, with the same `setup`/`eval`
+modes. A frame uses this default when assembling that work; an already decided
+route can use this staged example:
+
+```sh
+hearting run capability-route compose --prompt-file <task> \
+  --shape staged --capability autopilot-lab --capability-mode eval \
+  --intensity strong --graph metrics,diagnose,report,independent-verify --explain
+```
+
+Reuse the existing `raw-results/**` and `run.json`; omit already completed
+aggregation when its metrics are sufficient. At standard or lower, the default
+graph is `metrics,diagnose,report`. Selected inputs, report provenance and
+completion contracts still apply.
+
+For **analysis plus one small measurement**, add the existing `eval-run` before
+metrics. With the required checkpoint, eval spec, smoke attestation and config
+provenance already available, use the same command with
+`--graph eval-run,metrics,diagnose,report,independent-verify`. If the measurement
+needs a new contract or smoke attestation, use
+`--graph eval-spec,eval-smoke,eval-run,metrics,diagnose,report,independent-verify`.
+Both strong graphs retain the two-way verification and automatic owner close.
+
+Bound a single CPU inference by its sample, checkpoint, count and output paths
+in the eval spec and approved task. Run it through `eval-run`, whose write scope
+already covers `run.json`, `raw-results/**` and `logs/**`; it retains the registry
+resource class, hash-bound smoke/config requirements and supervised continuation.
+The `metrics` stage, including `metrics:qa/ml-debug`, writes only `metrics.jsonl`
+and `summary-stats.json`. It cannot create the new raw results.
+
 ### Setup does not end at the training process
 
 The existing start choice may select `report`, which ends successfully after
@@ -164,7 +206,7 @@ stay as they are; the following appear only in an explicit `--graph`:
 | `autopilot-lab:diagnose` | review-worker, `qa/ml-debug` | After `metrics`: `reviews/diagnosis.md` with hypotheses, reproduction conditions, verdict and a falsifying experiment. Optional external inputs (field samples, reproduction conditions) are named in the assignment. Shareable. |
 | `metrics:qa/ml-debug` | unit choice | Runs `metrics` with the diagnosing unit instead of `material/data-script`. |
 
-Example: `--graph eval-spec,eval-smoke,eval-run,metrics,diagnose,report`. When
+The analysis and new-measurement examples above use these existing parts. When
 `eval-spec` or `eval-smoke` is left out of a partial graph, `eval-run`'s
 `eval-spec` and `smoke-attestation` inputs are filled from the prior cycle under
 the catalog's name mapping (`eval-spec.md`, `reviews/smoke-attestation.json`);

@@ -1123,7 +1123,7 @@ class ModelCallTest(unittest.TestCase):
                                              "AGENT_ROUTE_ID": "rt-x", "FLEET_TITLE_PROVIDER": "codex",
                                              "AGENT_ARTIFACT_WORKFLOW_GROUP_ID": "wg-x"}), \
                 mock.patch.object(rt, "selected_providers", return_value=("claude", "opencode")) as select, \
-                mock.patch.object(rt, "provider_model", return_value="model-x") as model, \
+                mock.patch.object(rt, "provider_settings", return_value={"model": "model-x", "budget": "low"}) as model, \
                 mock.patch.object(rt, "_executable_available", return_value=True), \
                 mock.patch.object(rt, "run_provider_cascade", cascade), \
                 mock.patch.object(R, "_load_governor", return_value=governor):
@@ -1176,7 +1176,7 @@ class ModelCallTest(unittest.TestCase):
             self.assertEqual(R._invoke_model("p"), ("", None))
         with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), \
                 mock.patch.object(rt, "selected_providers", return_value=("claude",)), \
-                mock.patch.object(rt, "provider_model", return_value="m"), \
+                mock.patch.object(rt, "provider_settings", return_value={"model": "m", "budget": "low"}), \
                 mock.patch.object(rt, "_executable_available", return_value=True), \
                 mock.patch.object(R, "_load_governor", side_effect=ImportError("nope")):
             self.assertEqual(R._invoke_model("p"), ("", None))
