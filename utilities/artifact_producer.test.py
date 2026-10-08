@@ -3036,7 +3036,11 @@ class FinalizeStateConflictTest(ProducerTestBase):
         self.assertEqual(caught.exception.code, "sealed-cycle-state-unreadable")
         self.assertEqual(manifest_path.read_bytes(), before["manifest"])
         self.assertNotEqual(manifest_path.read_bytes(), manifest_before)
-        self.assertEqual(P.cycle_record_path(self.root, cycle_id).read_bytes(), before["record"])
+        # Ordinary edits leave automatic observation history; the past result
+        # and identity still agree, and malformed bytes never grant completion.
+        observed = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual({k: v for k, v in observed.items() if k not in {"control_observations", "control_baselines"}},
+                         json.loads(before["record"]))
         self.assertEqual((self.root / "campaigns" / "INDEX.json").read_bytes(), before["index_json"])
         self.assertEqual((self.root / "campaigns" / "INDEX.md").read_bytes(), before["index_md"])
 
@@ -3588,11 +3592,13 @@ class TerminalExactRecoveryTest(ProducerTestBase):
         normal = P.finalize(self.root, cycle_id=cycle_id)
         self.assertEqual(normal["status"], "already-sealed")
         self.assertEqual(normal["cycle_state"], "completed")
+        observed = P.read_cycle_record(self.root, cycle_id)
+        self.assertEqual({k: v for k, v in observed.items() if k not in {"control_observations", "control_baselines"}}, before)
         for operation in (P.verify_finalized_cycle, P.finalize_exact_cycle):
             with self.subTest(operation=operation.__name__):
                 with self.assertRaisesRegex(P.ProducerError, "already-sealed-mismatch"):
                     operation(self.root, cycle_id=cycle_id, expected_binding=binding)
-        self.assertEqual(P.read_cycle_record(self.root, cycle_id), before)
+        self.assertEqual(P.read_cycle_record(self.root, cycle_id), observed)
         self.assertFalse(manifest.exists())
 
     def prepared(self):
