@@ -193,8 +193,13 @@ evaluation program uses code. Small experiment-support scripts remain within
 lab's existing implementation stages and do not automatically open a code cycle.
 Existing-result analysis, evaluation, and comparison therefore select
 `autopilot-lab --capability-mode eval` under this same purpose rule. The parent
-chooses the capability: omitting `--capability` in ordinary compose uses the
-fixed `autopilot-code` default, not a classifier of the task text; framed work
+defaults to the named **Existing-result analysis** composition in
+[the lab contract](../capabilities/autopilot-lab.md#existing-result-analysis-eval-default-composition):
+`metrics → diagnose → report`, adding `independent-verify` at strong or higher
+with its declared group and automatic owner close. Include `eval-run` only when
+the request needs new raw results, using its existing inputs and write scope.
+The parent chooses the capability: omitting `--capability` in ordinary compose
+uses the fixed `autopilot-code` default, not a classifier of the task text; framed work
 leaves that choice to its frame.
 Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs
