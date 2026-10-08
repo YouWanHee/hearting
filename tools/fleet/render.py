@@ -61,6 +61,7 @@ _A_REVERSE = getattr(curses, "A_REVERSE", 0)
 # Eight-color terminals keep their native colors as a checked fallback.
 _MUTED_256 = {
     "steward_pink": 219,
+    "relation_grey": 244,  # #808080 — neutral on both dark and light backgrounds
     "orange": 137,
     "soft": 253,       # #dadada — focal text, below pure white
     "green": 150,     # #afd787 — richer sage
@@ -185,6 +186,7 @@ _HUE_OF = {
     # F-100c: a STEWARD session (depth −1: `steward on`, or it watched/started a session) wears
     # bright pink text: distinct from white/yellow, without a special background.
     "tag_steward": ("p", _A_B),
+    "relation": ("s", 0),
     # Badge text, NOT the glyph: plain yellow, distinct from the dim g_unused glyph so the
     # ●>○>◌ ink-weight gradient still reads.
     "g_unused_b": ("y", 0),
@@ -408,6 +410,13 @@ def _init_colors():
     _COLOR["tag"] = _COLOR.get("soft", 0)
     _COLOR["tag_dim"] = curses.A_DIM
     try:
+        curses.init_pair(19, _palette_fg("relation_grey", curses.COLOR_WHITE), bg)
+        _COLOR["relation"] = curses.color_pair(19)
+        if curses.COLORS < 256:
+            _COLOR["relation"] |= curses.A_DIM
+    except Exception:
+        _COLOR["relation"] = curses.A_DIM
+    try:
         curses.init_pair(18, _palette_fg("steward_pink", curses.COLOR_MAGENTA), bg)
         _COLOR["tag_steward"] = curses.color_pair(18) | curses.A_BOLD
     except Exception:
@@ -507,6 +516,7 @@ def _init_colors():
                     "m": _palette_fg("magenta", curses.COLOR_MAGENTA),
                     "o": _palette_fg("orange", curses.COLOR_YELLOW),
                     "p": _palette_fg("steward_pink", curses.COLOR_MAGENTA),
+                    "s": _palette_fg("relation_grey", curses.COLOR_WHITE),
                     "l": _palette_fg("blue", curses.COLOR_BLUE)}
             n_pair = 20
             for tch, lvl in _TINT_LVL.items():
@@ -1132,7 +1142,7 @@ def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown=
                      ("·", "dim"), (_DEFAULT_EFFORT_MARK, "dim"), (")", "dim")]
             used += 2 + len(name) + 1 + len(_DEFAULT_EFFORT_MARK) + 1
         elif room > 0:
-            nm = name[: max(1, room)]
+            nm = _clip_w(name, max(1, room))
             segs += [(" (", "dim"), (nm, _model_key(model, dim=dim)), (")", "dim")]
             used += 2 + len(nm) + 1
     segs += flag
@@ -1943,14 +1953,18 @@ def _session_tag_chip(s, dim=False):
             return [("[", "dim"), (body, "tag_dim"), ("]", "dim"), (" ", None)]
         if not steward:
             return [(" " * _TAG_W, None)]
-        # F-100c: an untagged steward still gets a badge, but `*` sat in the column that
-        # everywhere else holds a session number, so it read as an id nobody could look up
-        # (user 2026-09-09: "그 id 가 안뜨는 경우도 있는것 같은데?"). The role's own mark
-        # says role, not number, and matches the `⚑` on this session's relation line.
-        tag = _ICON_STEWARD
+        # The relation slot already names the role; keep an unknown ID blank.
+        return [(" " * _TAG_W, None)]
     body = tag[: _TAG_W - 3].ljust(_TAG_W - 3)
     key = "tag_dim" if dim else ("tag_steward" if steward else "tag")
     return [("[", "dim"), (body, key), ("]", "dim"), (" ", None)]
+
+
+def _session_relation_slot(s, dim=False):
+    """A fixed three-cell prefix shared by every MAIN identity row."""
+    if getattr(s, "steward", False):
+        return [(_ICON_STEWARD + " ", "tag_dim" if dim else "tag_steward"), (" ", None)]
+    return [(" " * _RELATION_W, None)]
 
 
 def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
@@ -1979,13 +1993,13 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     # F-33 (v11): harness field carries model/effort as a parenthetical — a dead/stale row has
     # no live telemetry to show (F-13), so it renders the bare harness name only.
     segs = [("  ", None), (gch, gkey), (" ", None)]
+    segs += _session_relation_slot(s, dim=dim_tel)
     segs += _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
     segs += _harness_model_cell(s.harness, None if dead_stale else s.model,
-                                None if dead_stale else s.effort, _HMW - _TAG_W, hkey,
+                                None if dead_stale else s.effort, _HMW - _TAG_W - _RELATION_W, hkey,
                                  dim=dim_tel,
                                  effort_default=(not dead_stale
-                                                 and bool(getattr(s, "effort_default", False))),
-                                 steward=bool(getattr(s, "steward", False)))
+                                                  and bool(getattr(s, "effort_default", False))))
 
     # F-22: reserve identity suffixes first, then let the title consume the
     # responsive name column. Calls without a terminal-derived width retain the
@@ -2091,11 +2105,13 @@ def _compact_dispatch_name(name, max_width=_DISPATCH_NAME_MAX):
     return _clip_w(name or "", max_width)
 
 
-# Card inset: the left edge reserves the under-id relation column;
+# Card inset: the left edge clears the two-cell relation slot;
 # the existing right-edge budget stays independent so only the interior shrinks.
 _CARD_INSET = 1               # worker content placement stays unchanged
-_STEWARD_LINE_COL = 5         # first character inside the MAIN [id] chip
-_SESSION_DETAIL_COL = _STEWARD_LINE_COL + 3  # two blank cells after the connector
+_STEWARD_LINE_COL = 4         # relation slot, after the unchanged status glyph
+_RELATION_W = 3               # two relation cells plus a gap before [id]
+_NARROW_TITLE_SHIFT = 2       # full opencode label + gap on every MAIN first row
+_SESSION_DETAIL_COL = 8       # detail text and boxes keep their existing anchor
 _OWNER_CARD_INSET = _SESSION_DETAIL_COL - 2  # box left edge at the shared detail column
 
 
@@ -3098,8 +3114,9 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     name_key = (_NAME_KEY_DIM.get(s.harness, "nmd_other") if dim_tel
                 else _NAME_KEY.get(s.harness, "nm_other"))   # F-76b, see `_session_row`
     l1 = ([("  ", None), (gch, gkey), (" ", None)]
+          + _session_relation_slot(s, dim=dim_tel)
           + _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HW field
-          + [(_badge_cell(hn, _HW - _TAG_W), hkey)])   # word-boundary clip, last cell blank
+          + [(_badge_cell(hn, _HW - _TAG_W - _RELATION_W + _NARROW_TITLE_SHIFT), hkey)])
     suffix = []
     if is_parent and child_count:
         suffix.append((" ▾%d" % child_count, name_key))
@@ -3156,8 +3173,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     # indent / no far-right flush).
     l2 = [(" " * _SESSION_DETAIL_COL, None),
           (_pad(fmt_min(s.elapsed_min), 4 + _HW - _SESSION_DETAIL_COL), "dim")]
-    l2 += _model_cell(s.model, s.effort, _MW, dim=dim_tel,
-                      steward=bool(getattr(s, "steward", False)))
+    l2 += _model_cell(s.model, s.effort, _MW, dim=dim_tel)
     # Same cell as the wide row (capability tag, route chain, spec breadcrumb): this card
     # used to call the bare projection text and showed `-` for inline work the wide row named.
     l2 = _pad_to_column(l2, _session_routing_column("narrow"))
@@ -3576,9 +3592,13 @@ def _steward_hierarchy(rows):
     return ordered, edges
 
 
-def _under_id_connector(segs, mark="│"):
+# Detail rows use a vertical dash; target identity rows continue it with a branch.
+_STEWARD_LINE_MARK = "┆"
+
+
+def _under_id_connector(segs, mark=_STEWARD_LINE_MARK):
     """Paint only the reserved cell; detail layout never depends on a relation."""
-    return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, "dim")
+    return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, "relation")
 
 
 def _live_session_identity(s):
@@ -7504,7 +7524,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             session_resources = _gpu_resources_for_session(s, parent_gpu_resources)
             if session_resources:
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
-            # Peer communication remains a strip; steward relations use under-id lines.
+            # Peer communication remains a strip; steward relations use dashed branches.
             lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,
                                           tag_by_key, term_width=term_width))
             for plugin_job in plugin_kids:
@@ -7520,15 +7540,17 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         connector_rows = set()
         for parent, targets in steward_edges.items():
             if parent in session_starts and targets:
-                stop = session_starts.get(id(targets[-1]))
+                visible = [s for s in targets if id(s) in session_starts]
+                stop = session_starts.get(id(visible[-1])) if visible else None
                 if stop is not None:
                     connector_rows.update(range(session_starts[parent] + 1, stop))
+                    for i, target in enumerate(visible):
+                        idx = session_starts[id(target)]
+                        mark = "╰╌" if i == len(visible) - 1 else "├╌"
+                        lines[idx] = _under_id_connector(lines[idx], mark)
         for idx in sorted(connector_rows - session_identity_rows):
             if lines[idx]:
-                below_id = idx - 1 in session_identity_rows
-                above_id = idx + 1 in session_identity_rows
-                mark = "│" if below_id == above_id else "╷" if below_id else "╵"
-                lines[idx] = _under_id_connector(lines[idx], mark)
+                lines[idx] = _under_id_connector(lines[idx])
         if group_sessions and hidden:
             lines.append([("     +%d stale/companion hidden" % hidden, "dim")])
 
@@ -7744,6 +7766,9 @@ def _snapshot_line(segs, colored=False, colors=256):
         piece = _plain([(text, key)])
         if key == "tag_steward":
             style = "\033[1;38;5;219m" if colors >= 256 else "\033[1;35m"
+            piece = style + piece + "\033[0m"
+        elif key == "relation":
+            style = "\033[38;5;244m" if colors >= 256 else "\033[2;37m"
             piece = style + piece + "\033[0m"
         elif key in {"gpu_legacy", "gpu_legacy_active"}:
             style = "\033[38;5;137m" if colors >= 256 else "\033[33m"

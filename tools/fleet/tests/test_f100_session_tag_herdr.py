@@ -102,12 +102,12 @@ class TagChipLedgerTest(unittest.TestCase):
                 self.assertEqual(sum(render._dw(t) for t, _k in segs[:i]), render._NAME_COL)
                 self.assertEqual(_text(segs).index("a title"), render._NAME_COL)
                 if s.session_tag:
-                    self.assertEqual(segs[3:7], [("[", "dim"), (s.session_tag, "tag"),
+                    self.assertEqual(segs[4:8], [("[", "dim"), (s.session_tag, "tag"),
                                                  ("]", "dim"), (" ", None)])
                     self.assertIn("[%s] claude code" % s.session_tag if s.harness == "claude"
                                   else "[%s] opencode" % s.session_tag, _text(segs))
                 else:
-                    self.assertEqual(segs[3], (" " * render._TAG_W, None))
+                    self.assertEqual(segs[4], (" " * render._TAG_W, None))
 
     def test_wide_row_chip_sits_between_the_glyph_and_the_harness_text(self):
         segs = render._session_row(self._s(session_tag="46", liveness="idle"), narrow=False,
@@ -121,13 +121,14 @@ class TagChipLedgerTest(unittest.TestCase):
         bare, _ = render._session_row_2line(self._s(), term_width=100)
         for l1 in (tagged, bare):
             prefix = l1[: l1.index(next(seg for seg in l1 if seg[1] in render.NAME_KEYS))]
-            self.assertEqual(sum(render._dw(t) for t, _k in prefix), 4 + render._HW)
+            self.assertEqual(sum(render._dw(t) for t, _k in prefix), 4 + render._HW + render._NARROW_TITLE_SHIFT)
         self.assertIn(("46", "tag"), tagged)
-        # narrow: 11 cells remain for the harness badge, so `claude code` falls back to its
+        # narrow: 10 cells remain for the harness badge, so `claude code` falls back to its
         # first word with the guaranteed blank last cell — the same shape the narrow
         # dispatch rows already draw — and the badge keeps its own gap cell.
         self.assertIn("[46] claude", _text(tagged))
-        self.assertIn((render._badge_cell("claude code", render._HW - render._TAG_W), "hb_claude"),
+        self.assertIn((render._badge_cell("claude code", render._HW - render._TAG_W - render._RELATION_W
+                                         + render._NARROW_TITLE_SHIFT), "hb_claude"),
                       tagged)
         self.assertNotIn("]claude", _text(tagged))
         self.assertNotIn("claudea", _text(tagged))
@@ -137,7 +138,7 @@ class TagChipLedgerTest(unittest.TestCase):
             with self.subTest(over=over):
                 segs = render._session_row(self._s(session_tag="46", **over), narrow=False,
                                            name_width=render._wide_name_width(168))
-                self.assertEqual(segs[4], ("46", "tag_dim"))
+                self.assertIn(("46", "tag_dim"), segs)
                 l1, _ = render._session_row_2line(self._s(session_tag="46", **over),
                                                   term_width=100)
                 self.assertIn(("46", "tag_dim"), l1)

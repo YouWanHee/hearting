@@ -558,7 +558,9 @@ class UnpairedBadgeTest(unittest.TestCase):
         steward.steward = True
         steward._session_tag_unpaired = True
         self.assertEqual(self._text(render._session_tag_chip(steward)),
-                         "[%s ] " % render._ICON_STEWARD)
+                         " " * render._TAG_W)
+        slot = render._session_relation_slot(steward)
+        self.assertEqual(self._text(slot), render._ICON_STEWARD + "  ")
 
     def test_a_shared_tag_renders_exactly_like_a_minted_one(self):
         paired = _codex(100, app_server=True, managed_dir=_DIR_A, tag="9c")
