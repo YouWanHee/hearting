@@ -2,6 +2,8 @@
 """Unit tests for utilities/peer-message.py (SD-122 peer-message ledger)."""
 import hashlib
 import contextlib
+import errno
+import fcntl
 import io
 import importlib.util
 import json
@@ -952,6 +954,54 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertFalse(peer_message._quarantine_pending(path, old))
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [ref])
+
+    def test_locked_transfer_is_readable_on_the_next_callback(self):
+        _text, ref = self.legacy_shell_pending(self.recipient)
+        path = peer_message._pending_path(ref)
+        original = path.read_bytes()
+        errors = io.StringIO()
+        with peer_message._transfer_path(ref).open() as seal, contextlib.redirect_stderr(errors):
+            fcntl.flock(seal.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(peer_message.pending_messages(self.recipient), [])
+            self.assertTrue(path.exists())
+            self.assertEqual(path.read_bytes(), original)
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [ref])
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_temporary_read_failure_does_not_quarantine_a_healthy_row(self):
+        _text, ref = self.pending()
+        path = peer_message._pending_path(ref)
+        original = path.read_bytes()
+        errors = io.StringIO()
+        with mock.patch.object(peer_message, "_read_transfer_record", side_effect=OSError(errno.EIO, "temporary read")), \
+                contextlib.redirect_stderr(errors):
+            self.assertEqual(peer_message.pending_messages(self.recipient), [])
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [ref])
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_every_quarantined_row_is_diagnosed_once_in_a_batch(self):
+        _text, healthy_ref = self.pending()
+        originals = {}
+        for index in range(4):
+            ref = f"{index:032x}"
+            path = peer_message._pending_dir() / (ref + ".json")
+            raw = f"malformed original {index}".encode()
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            originals[ref] = raw
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            for _ in range(2):
+                self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [healthy_ref])
+        quarantine = peer_message._pending_dir().parent / "quarantine"
+        self.assertEqual(len(list(quarantine.rglob("*.json"))), 4)
+        for ref, raw in originals.items():
+            self.assertEqual(errors.getvalue().count(f"peer-pending-invalid ref={ref}\n"), 1)
+            self.assertEqual(next(quarantine.rglob(ref + ".json")).read_bytes(), raw)
 
     def test_acceptance_stays_queued_and_disables_restart_and_ambiguous_retry(self):
         import codex_queue_delivery as queue

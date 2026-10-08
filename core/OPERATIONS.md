@@ -1328,7 +1328,8 @@ An external shell may have no sender session: `unknown`/empty and null sender
 fields mean an unattributed sender, not an invalid message. Its sealed ref/body
 and exact known recipient still govern delivery and receipt. Legacy unsent rows
 held only for that absent sender use the normal pending path; ambiguous sends
-remain unverified. Damaged private rows are moved aside with their bytes intact
+remain unverified. Locked or temporarily unreadable rows stay in place for the
+next ordinary callback. Damaged private rows are moved aside with their bytes intact
 and diagnosed once, so unrelated messages proceed without repeated warnings.
 Late redelivery sends its delay notice and the sealed message in one prompt.
 The notice is transport context: receivers may remove only that recognized

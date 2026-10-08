@@ -7,6 +7,7 @@ messages alone retain bounded private runtime payloads until exact receipt.
 import argparse
 import functools
 import contextlib
+import errno
 import stat
 import math
 import tempfile
@@ -329,19 +330,21 @@ def _quarantine_pending(path, expected):
 
 
 def _pending_rows():
-    diagnosed = 0
     for path in sorted(_pending_dir().glob("*.json")):
         expected = None
         try:
             expected = path.lstat()
             row = _read_pending(path.stem)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+                # A lock or temporary I/O failure proves no damage; the next
+                # ordinary callback can read this entry in its original place.
+                continue
             # Preserve without ack. Only the successful move diagnoses the row,
             # so concurrent callbacks and later commands do not repeat warnings.
-            if expected is not None and _quarantine_pending(path, expected) and diagnosed < 3:
+            if expected is not None and _quarantine_pending(path, expected):
                 ref = path.stem if re.fullmatch(r"[0-9a-f]{32}", path.stem) else "invalid-ref"
                 print(f"peer-pending-invalid ref={ref}", file=sys.stderr)
-                diagnosed += 1
             continue
         if row and row["state"] != "received":
             yield row
