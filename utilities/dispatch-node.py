@@ -309,7 +309,7 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
  except OSError:
   return prior
  for cols, meta in ROUTE.review_round_records(lines, route_ids, node_id,jobs=jobs):
-  if exclude_slug and cols[4]==exclude_slug and (meta.get("route_id") or meta.get("route"))==route_id: continue
+  if not exclude_attempt and exclude_slug and cols[4]==exclude_slug and (meta.get("route_id") or meta.get("route"))==route_id: continue
   if exclude_attempt and meta.get("attempt_id")==exclude_attempt: continue
   prior.append((cols,meta))
  return prior
@@ -362,11 +362,14 @@ class RoundAdmission:
  `auto_revisions` contains every revision marker this call recorded (13.59.3
  rule 8). A read-only preview leaves that tuple empty and reports eligible
  nodes in `planned_revision_nodes`; the budget still accounts for them.
+ `prior_attempt_ids` is that same census, so batch input/identity consumers
+ can distinguish the admitted next round without a second history query.
  """
  budget: object
  auto_revisions: tuple = ()
  planned_revision_nodes: frozenset[str] = frozenset()
  reviewed_input: object = None
+ prior_attempt_ids: frozenset[str] = frozenset()
 
 
 def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
@@ -487,6 +490,7 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
    str(item["node_id"]) for item in auto_revisions if item.get("node_id") in dependency_ids
   ),
   reviewed_input=reviewed_input,
+  prior_attempt_ids=frozenset(meta["attempt_id"] for _cols,meta in rows if meta.get("attempt_id")),
  )
 
 
