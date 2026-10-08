@@ -66,12 +66,16 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
             for text in ("<local-command-caveat>Do not respond</local-command-caveat>",
                          "<command-name>/model</command-name>",
                          "<local-command-stdout>Set model</local-command-stdout>",
+                         "<task-notification>Background task finished</task-notification>",
                          "제목 언어를 맞춰줘")
         ]
         rows.append({"type": "user", "isMeta": True,
                      "message": {"role": "user", "content": "Injected English bootstrap"}})
+        rows.append({"type": "user", "isCompactSummary": True,
+                     "message": {"role": "user", "content": "Earlier conversation summary"}})
         raw = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
         self.assertEqual(rt._origin_text(raw, "claude"), "제목 언어를 맞춰줘")
+        self.assertEqual(rt._origin_text(raw, "claude", latest=True), "제목 언어를 맞춰줘")
         self.assertNotIn("Set model", rt._delta_text(raw, "claude"))
         self.assertEqual(rt._user_language("<command-name>한국어 메타</command-name>"), "")
 

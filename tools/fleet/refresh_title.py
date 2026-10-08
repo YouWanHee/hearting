@@ -150,7 +150,7 @@ _LANG_WORDS = {"ko": "Korean", "ja": "Japanese", "zh": "Chinese", "de": "German"
                "fr": "French", "es": "Spanish", "pt": "Portuguese", "it": "Italian",
                "ru": "Russian"}
 _CLAUDE_COMMAND_META = re.compile(
-    r"^\s*<(?:local-command-caveat|command-name|command-message|command-args|local-command-stdout)(?:\s|>)")
+    r"^\s*<(?:local-command-caveat|command-name|command-message|command-args|local-command-stdout|task-notification)(?:\s|>)")
 _USER_LANGUAGE_SOURCE = re.compile(r"\|user-language=([A-Za-z]+)@([0-9.]+)$")
 
 
@@ -265,7 +265,7 @@ def _labeled_line(raw, pattern):
 
 
 def _claude_text(data):
-    if isinstance(data, dict) and data.get("isMeta"):
+    if isinstance(data, dict) and (data.get("isMeta") or data.get("isCompactSummary")):
         return []
     msg = data.get("message") if isinstance(data, dict) else None
     if isinstance(msg, str):
