@@ -351,7 +351,11 @@ and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `veri
 and `hands_over`, and the brief whose route the person chose, reach the owner and
 every stage worker of that leg from the sealed decision; a `qa/*` stage records
 each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
-`route_plan.read_leg_items`). A leg's `extra_stages` entry becomes node
+`route_plan.read_leg_items`). A leg may name its existing worktree with optional
+`cwd`; validation, first launch, later legs and the printed compose command use
+that folder and check dispatch there. Relative paths are based on the frame's
+original cwd. Omission keeps the existing worktree preparation and inheritance;
+this adds no question, flag or required input. A leg's `extra_stages` entry becomes node
 `plan-<id>` right after its `after` stage, shaped on a catalogue check or
 measurement stage of the same unit (one that writes no source; its gate, review
 budget and start approval) and writing under

@@ -4143,10 +4143,12 @@ def proposal_readiness(frame_route, jobs):
 
 
 def _leg_compose_kwargs(leg_args, *, frame_route, frame_cycle_id, slug):
+    import route_plan as RP
     spec = ((frame_route.get("tracked_gate_evidence") or {}).get("spec_read") or {}).get("source") or "auto"
     return dict(
         capability=leg_args["capability"], capability_mode=leg_args["capability_mode"], shape=leg_args["shape"],
-        graph=leg_args["graph"], intensity=leg_args["intensity"], slug=slug, cwd=frame_route["cwd"],
+        graph=leg_args["graph"], intensity=leg_args["intensity"], slug=slug,
+        cwd=RP.leg_cwd(leg_args, frame_route["cwd"]),
         artifact_root=frame_route["artifact_root"],
         spec_read="auto" if str(spec).startswith("compose-auto:") else spec,
         campaign_key=frame_route.get("campaign_key"), parent_cycle_id=frame_cycle_id,
@@ -4161,10 +4163,11 @@ def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
     The registry, graph, order, unit, scope and gate rules are the ones compose applies when it seals.
     """
     import route_plan as RP
-    return compose_route(
-        **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
-                              slug=f"{frame_route.get('slug') or 'framed'}-leg{index}"),
-        **_leg_evidence(leg, readiness), frameless=True, extra_stages=leg.get("extra_stages"))
+    kwargs = _leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
+                                 slug=f"{frame_route.get('slug') or 'framed'}-leg{index}")
+    probe = (lambda: readiness(kwargs["cwd"])) if leg.get("cwd") else readiness
+    return compose_route(**kwargs, **_leg_evidence(leg, probe), frameless=True,
+                         extra_stages=leg.get("extra_stages"))
 
 
 def _leg_evidence(leg, readiness):
@@ -4185,12 +4188,14 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     import route_plan as RP
     kwargs = _leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
                                  slug=f"{context['slug']}-leg{index}")
+    kwargs["cwd"] = RP.leg_cwd(leg, frame_route["cwd"], base_cwd=context["cwd"])
     owner = context.get("owner") or ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness")
     if work_request is not None:
         work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
-    route = compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
-                           parent_harness=owner or "claude")
-    if leg["shape"] != "direct" and _isolates_worktree(route):
+    probe = (lambda: readiness(kwargs["cwd"])) if leg.get("cwd") else readiness
+    route = compose_route(**kwargs, **_leg_evidence(leg, probe), work_request=work_request, route_plan=binding,
+                            parent_harness=owner or "claude")
+    if not leg.get("cwd") and leg["shape"] != "direct" and _isolates_worktree(route):
         # Every leg of one decision shares the frame's worktree, prepared by the first leg that changes source.
         worktree = prepare_isolated_worktree(frame_route["cwd"], frame_route.get("slug"))
         if worktree.get("cwd"):
@@ -10646,6 +10651,9 @@ def main():
         if route_plan_binding is not None:
             # A continuation leg keeps the pins its frame was composed with; a pin given here replaces only its own target.
             pins={**_inherited_selection_pins(route_plan_binding,artifact_root),**pins}
+            if a.cwd is None:
+                context=route_plan_binding["record"]["decision"]["first_leg_compose"]["context"]
+                cwd=RP.leg_cwd(route_plan_binding["leg"],cwd,base_cwd=context["cwd"])
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         compose_args=dict(
@@ -10671,6 +10679,7 @@ def main():
         route=compose_route(**compose_args)
         worktree=None
         if (a.start and a.cwd is None and a.dispatch_evidence is None and shape!="direct"
+                and not (route_plan_binding or {}).get("leg",{}).get("cwd")
                 and _isolates_worktree(route)):
             # Work that changes source runs in its own worktree, not in the shared primary checkout.
             worktree=prepare_isolated_worktree(cwd,a.slug)

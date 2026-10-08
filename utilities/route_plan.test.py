@@ -202,6 +202,14 @@ class ExtractionTest(unittest.TestCase):
         self.assertNotIn("budget", proposal["legs"][0])
         self.assertEqual(notes, ["ignored:note", "ignored:done_when", "ignored:legs[0]:budget"])
 
+    def test_cwd_is_optional_and_an_interview_cannot_silently_change_the_worktree(self):
+        one = self.parse(brief([{**DIRECT, "cwd": "/existing/worktree one"}]))
+        two = self.parse(brief([{**DIRECT, "cwd": "/existing/worktree two"}]))
+        self.assertEqual(one["legs"][0]["cwd"], "/existing/worktree one")
+        self.assertTrue(RP.same_proposal(one, one))
+        self.assertFalse(RP.same_proposal(one, two))
+        self.assertNotIn("cwd", self.parse(brief([DIRECT]))["legs"][0])
+
     def test_an_indented_fence_under_a_list_item_is_read(self):
         body = "route_proposal_v1:\n  summary: s\n  legs:\n    - {capability: autopilot-code, shape: direct}\n"
         indented = "".join("   " + line + "\n" for line in body.splitlines())
@@ -662,6 +670,13 @@ class NextLegTest(PlanFixture):
         self.assertEqual(argv[argv.index("compose") + 1], "--start")
         self.assertTrue(Path(argv[argv.index("--prompt-file") + 1]).is_file())
 
+    def test_a_leg_without_cwd_prints_the_previous_legs_worktree(self):
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        previous_cwd = self.root.parent / "prepared-worktree"
+        leg = RP.project_next_leg({**route, "cwd": str(previous_cwd)}, "cyc_" + "b" * 32)
+        argv = shlex.split(leg["compose_command"])
+        self.assertEqual(argv[argv.index("--cwd") + 1], str(previous_cwd))
+
     def test_the_last_leg_an_unreadable_record_and_a_lost_prompt_have_no_key(self):
         route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
         last = {**route, "route_plan": {**route["route_plan"], "index": 1}}
@@ -678,6 +693,26 @@ class NextLegTest(PlanFixture):
 class SecondLegCommandTest(PlanFixture):
     # A direct second leg needs no readiness probe, so the real CLI compiles the printed command.
     LEGS = [DIRECT, {"capability": "autopilot-code", "shape": "direct", "why": "second"}]
+
+    def test_route_plan_cli_without_cwd_uses_the_legs_folder_relative_to_the_original_frame(self):
+        record = self.record()
+        context = record["decision"]["first_leg_compose"]["context"]
+        target = self.root.parent
+        record["decision"]["proposal"]["legs"][1]["cwd"] = os.path.relpath(target, context["cwd"])
+        record["digest"] = RP.decision_digest(record["decision"])
+        self.decision_path.write_bytes(RP.render(record))
+        command = [sys.executable, str(HERE / "capability-route.py"), "compose", "--start", "--shape", "direct",
+                   "--slug", "chosen-cwd", "--capability", "autopilot-code", "--artifact-root", str(self.root),
+                   "--campaign-key", "framed-key", "--spec-read", "fixture", "--prompt-file", context["prompt_file"],
+                   "--route-plan", f"{self.decision_path}#1"]
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_DISPATCH_")}
+        done = subprocess.run(command, cwd=self.root, text=True, capture_output=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        receipt = json.loads(done.stdout)
+        route = json.loads(Path(receipt["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(route["cwd"], str(target))
+        self.assertEqual(route["route_plan"]["index"], 1)
+        self.assertEqual(receipt["state"], "inline")
 
     def test_a164_7_the_printed_command_seals_the_next_route_with_index_plus_one_and_the_parent_cycle(self):
         route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
