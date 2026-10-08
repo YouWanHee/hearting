@@ -1733,7 +1733,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "it starts the owner again."}
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
     result["correction_command"] = correction_command(aid, jobs, agent_home=ROOT)
-    if status in {"open", "running"} and metadata.get("launch_claimed") == "1":
+    if (status in {"open", "running"} and metadata.get("launch_claimed") == "1"
+            and metadata.get("replacement_original_attempt_id")):
         from model_profile import sealed_pin_harness
         pinned = sealed_pin_harness(route_authority.route_in_force(route), worker_type="owner")
         if pinned and metadata.get("harness") and metadata.get("harness") != pinned:
