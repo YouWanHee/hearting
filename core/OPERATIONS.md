@@ -438,6 +438,8 @@ Partial-group continuation launches retain the sealed source request as the
 raw assignment checked by every adapter. A changed retry brief is appended to
 the worker's recovery context, along with later-round guidance, without changing
 that assignment or its digest.
+The existing sealed launch input also retains this recovery guidance so an
+automatic replacement replays the same instructions and semantic round.
 The replacement manifest binds the current owner attempt; successful peers keep
 their original owner and completion evidence. Launch refusals retain their
 field-level detail in both the batch receipt and its diagnostic ledger.

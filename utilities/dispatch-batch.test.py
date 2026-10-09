@@ -260,7 +260,7 @@ class DispatchBatchTest(unittest.TestCase):
         ]
         return contextlib.ExitStack(), assignments
 
-    def legs(self, assignments=None):
+    def legs(self, assignments=None, prompt=None):
         assignments = assignments or self.common_patches()[1]
         legs = []
         for node, adapter, hop, ordinal in assignments:
@@ -281,7 +281,7 @@ class DispatchBatchTest(unittest.TestCase):
                     ordinal,
                 ),
                 "assignment_sha256": "sha256:" + __import__("hashlib").sha256(
-                    BATCH.DEFAULT_PROMPT.encode("utf-8")
+                    (BATCH.DEFAULT_PROMPT if prompt is None else prompt).encode("utf-8")
                 ).hexdigest(),
                 "independence": "cross-harness",
                 "model_profile": str(node["model_profile"]),
@@ -680,6 +680,12 @@ class DispatchBatchTest(unittest.TestCase):
     def test_partial_continuation_legacy_rows_keep_assignment_with_new_brief(self):
         self._partial_continuation_launch(retry_prompt="Recover the failed leg only.")
 
+    def test_partial_continuation_legacy_custom_assignment_keeps_matching_prompt(self):
+        self._partial_continuation_launch(
+            original_prompt="The original custom assignment.",
+            retry_prompt="The original custom assignment.",
+        )
+
     def test_partial_continuation_new_owner_keeps_source_parent_and_replacement(self):
         self._partial_continuation_launch(
             retry_prompt="Continue the authorized gap.", sealed=True,
@@ -687,13 +693,13 @@ class DispatchBatchTest(unittest.TestCase):
         )
 
     def _partial_continuation_launch(self, *, retry_prompt=None, sealed=False,
-                                    parent_attempt="att-parent-fixture"):
-        source_legs = self.legs()
+                                    parent_attempt="att-parent-fixture", original_prompt=None):
+        source_legs = self.legs(prompt=original_prompt)
         _source_manifest, continuation, partial = self.partial_continuation(source_legs)
         peer, gap = source_legs
-        self.write_existing(peer, status="done", note="completed-marker")
+        self.write_existing(peer, status="done", note="completed-marker", all_legs=source_legs)
         self.write_existing(
-            gap, status="done", note="cancelled-receipt-unavailable"
+            gap, status="done", note="cancelled-receipt-unavailable", all_legs=source_legs
         )
         if sealed:
             self.seal_original_input()
@@ -821,7 +827,7 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(len(created), 1)
         command = created[0].command
         self.assertEqual(command[command.index("--prompt-text") + 1],
-                         BATCH.DEFAULT_PROMPT)
+                         BATCH.DEFAULT_PROMPT if original_prompt is None else original_prompt)
         self.assertEqual(created[0].env["AGENT_DISPATCH_RETRY_BRIEF"],
                          retry_prompt if retry_prompt is not None else BATCH.DEFAULT_PROMPT)
         self.assertEqual(command[command.index("--parent-attempt-id") + 1], parent_attempt)

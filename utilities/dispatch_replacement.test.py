@@ -798,6 +798,40 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(Path(cmd[cmd.index('--prompt-file')+1]).read_text(),'the raw task')
         self.assertEqual(cmd.count('--start'),1)
 
+    def test_automatic_replacement_preserves_later_round_recovery_guidance(self):
+        brief = 'Recover the failed leg only.\n## Round protocol\nReview only the prior blocking findings.'
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_RETRY_BRIEF': brief}):
+            self.assertIn(brief, R.recovery_instructions(self.args))
+            self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args, 'codex', 'the raw task')))
+        self.write(self.meta)
+        record = self.claim()
+        source = R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        replay = R.launch_input(self.jobs, 'att-source', source)
+        self.assertEqual(replay['task'], 'the raw task')
+        command = R._command(self.jobs, record, source, replay)
+        self.assertEqual(Path(command[command.index('--prompt-file')+1]).read_text(), 'the raw task')
+        successor = SimpleNamespace(**{**vars(self.args), 'attempt_id': record['replacement_attempt_id'],
+                                      'automatic_retry_of': 'att-source', 'worker_type': 'stage',
+                                      'replacement_input_argv': R._replacement_argv(record, source, replay)})
+        del successor.replacement_retry_brief
+        with mock.patch.dict(os.environ, {}, clear=True):
+            guidance = R.recovery_instructions(successor)
+        self.assertIn(brief, guidance)
+        self.assertEqual(guidance.count('## Round protocol'), 1)
+        fragment = R.seal_launch_input(successor, 'codex', 'the raw task')
+        sealed = R.launch_input(self.jobs, successor.attempt_id, D.parse_registry_metadata(fragment))
+        self.assertEqual(sealed['retry_brief'], brief)
+        self.assertEqual(sealed['task'], 'the raw task')
+
+    def test_unstarted_attempt_cannot_reseal_changed_recovery_guidance(self):
+        self.args.replacement_retry_brief = 'Review only prior blocking findings.'
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        R.seal_launch_input(self.args, 'codex', 'the raw task')
+        self.args.replacement_retry_brief = 'Review a different scope.'
+        with self.assertRaises(D.DispatchContractError):
+            R.seal_launch_input(self.args, 'codex', 'the raw task')
+
     # SD106 writes retry_attempt_id on the original row only. These fixtures
     # deliberately retain that production shape, with no automatic_retry_of.
     def _legacy_real_route(self, name, parent=None):

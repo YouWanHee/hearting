@@ -2966,11 +2966,16 @@ def main(argv: list[str] | None = None) -> int:
                     "reason": "batch-interrupted-before-wrapper",
                 })
                 continue
+            launch_prompt = args.prompt_text
+            if partial is not None:
+                original_prompt = partial_input["options"].get("prompt_text")
+                if original_prompt is not None:
+                    launch_prompt = original_prompt
+                elif leg["assignment_sha256"] == "sha256:" + hashlib.sha256(DEFAULT_PROMPT.encode("utf-8")).hexdigest():
+                    launch_prompt = DEFAULT_PROMPT
             command = node_launch_command(
                 route_path=route_path, leg=leg, parent=args.parent,
-                prompt_text=((partial_input["options"].get("prompt_text")
-                              if partial_input["options"].get("prompt_text") is not None
-                              else DEFAULT_PROMPT) if partial is not None else args.prompt_text),
+                prompt_text=launch_prompt,
                 reviewed_evidence=(args.review_inputs[leg["node"]]["path"]
                                    if leg["node"] in args.review_inputs else None),
                 jobs=jobs, parent_attempt=parent_attempt, log_dir=args.log_dir,

@@ -443,7 +443,7 @@ REPLACEMENT_FIXED_KEYS = ("harness", "jobs", "worktree")
 LAUNCH_LOCATION_VALUES = frozenset({"launch_lifecycle", "runtime_sandbox"})
 
 # The sealed launch input of one attempt: the work and its granted permissions.
-RESEAL_STABLE_KEYS = ("schema", "attempt_id", "harness", "jobs", "worktree", "argv", "task",
+RESEAL_STABLE_KEYS = ("schema", "attempt_id", "harness", "jobs", "worktree", "argv", "task", "retry_brief",
                       "route_id", "route_node", "owner_route_id")
 
 # The registry row of one never-started attempt. Per-launch values (lease nonce, release home,
