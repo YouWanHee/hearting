@@ -50,7 +50,7 @@ def ledger_intent(route, ledger):
 
 
 def settled_result(route, ledger):
-    return next((entry["evidence"]["parent_close_result"] for entry in ledger.journal()
+    return next((entry["evidence"]["parent_close_result"] for entry in reversed(ledger.journal())
                  if entry.get("route_hash") == route["route_hash"]
                  and isinstance(entry.get("evidence"), dict)
                  and isinstance(entry["evidence"].get("parent_close_result"), dict)), None)

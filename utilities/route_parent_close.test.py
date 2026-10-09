@@ -191,6 +191,25 @@ class ParentCloseTest(unittest.TestCase):
                     replay = subprocess.run(command, capture_output=True, text=True, timeout=60)
                     self.assertEqual(replay.returncode, 0, replay.stderr)
                     self.assertEqual(json.loads(replay.stdout)["successor_route"], str(successor_path))
+                    with mock.patch.object(ROUTE, "build_continuation_route",
+                                           side_effect=AssertionError("replayed close rebuilt its suffix")), \
+                            mock.patch.object(work_start, "_route_module", return_value=ROUTE):
+                        replayed = work_start.pin_handoff_continuation(
+                            child.route, child.path, child.jobs, closed)
+                    self.assertEqual(replayed["successor_route"], str(successor_path))
+                    # Changing back to the original harness still follows the current pin,
+                    # rather than returning the previously prepared target from the journal.
+                    for selected in (harness, target):
+                        for pin_target in ("owner", "worker"):
+                            AUTH.record_pin_change(child.route, target=pin_target,
+                                pin={"harness": selected, "model": None, "effort": None},
+                                by={"harness": "codex", "session_id": "fixture-parent"},
+                                source="fixture", tuples=[], candidates=[])
+                        replayed = work_start.pin_handoff_continuation(
+                            child.route, child.path, child.jobs, CLOSE.close(child.route, child.path, jobs=child.jobs))
+                        replay_route = json.loads(Path(replayed["successor_route"]).read_text())
+                        self.assertEqual(AUTH.sealed_pin_harness(replay_route, worker_type="owner"), selected)
+                        self.assertIsNone(resource.poll())
                     calls = []
                     def launch(command, **kwargs):
                         calls.append(command)

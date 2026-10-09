@@ -1487,38 +1487,51 @@ def pin_handoff_continuation(route, path, jobs, outcome):
     if not _owns(metadata, _current_parent_session_id(), jobs):
         return {**outcome, "handoff_reason": "work-parent-recovery-required"}
     pinned = route_authority.sealed_pin_harness(route, worker_type="owner")
-    if not pinned or pinned == metadata.get("harness"):
+    if not pinned:
         return outcome
-    module = _route_module()
-    try:
-        for node in route.get("nodes", []):
-            try:
-                module._continuation_reused_evidence(route, node)
-            except ValueError:
-                boundary = node["id"]
-                break
-        else:
-            return outcome  # all content settled before close; nothing to replay
-        evidence = route_authority.route_in_force(route).get("dispatch_evidence")
-        successor = module.build_continuation_route(
-            route, resume_from_node=boundary, requested_boundary=boundary,
-            reason=f"{PIN_HANDOFF_SUMMARY}:{metadata['attempt_id']}:{pinned}",
-            artifact_root=route["artifact_root"],
-            dispatch_evidence=evidence if evidence != route.get("dispatch_evidence") else None)
-        target = module.canonical_route_path(route["artifact_root"], successor["route_id"])
-        module.publish_continuation_route(successor, route, target)
-        module.verify_route(successor)
-        module._record_route_chain(successor, str(target), "continuation")
-        return {**outcome, "successor_route": str(target),
-                "recovery_command": resume_command(target, jobs, agent_home=ROOT),
-                "next_step": "The previous owner is settled and resource runs are preserved. "
-                    "Run recovery_command to start the unfinished stages on the current pin; "
-                    "completed stages remain reused."}
-    except (OSError, ValueError) as exc:
-        return {**outcome, "handoff_reason": str(exc),
-                "recovery_command": resume_command(path, jobs, agent_home=ROOT),
-                "next_step": "Owner cleanup settled; continuation preparation did not. "
-                    "Inspect handoff_reason, then run recovery_command to retry preparation."}
+    import route_parent_close
+    import workflow_state as WS
+    ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
+    with ledger.lock():
+        pins = route_authority.selection_pin_rows(route)
+        recorded = route_parent_close.settled_result(route, ledger) or outcome
+        if recorded.get("successor_route") and recorded.get("handoff_pins") == pins:
+            return recorded  # follow the published suffix, even after runtime/source changes
+        module = _route_module()
+        try:
+            for node in route.get("nodes", []):
+                try:
+                    module._continuation_reused_evidence(route, node)
+                except ValueError:
+                    boundary = node["id"]
+                    break
+            else:
+                return outcome  # all content settled before close; nothing to replay
+            evidence = route_authority.route_in_force(route).get("dispatch_evidence")
+            successor = module.build_continuation_route(
+                route, resume_from_node=boundary, requested_boundary=boundary,
+                reason=f"{PIN_HANDOFF_SUMMARY}:{metadata['attempt_id']}:{pinned}",
+                artifact_root=route["artifact_root"],
+                dispatch_evidence=evidence if evidence != route.get("dispatch_evidence") else None)
+            target = module.canonical_route_path(route["artifact_root"], successor["route_id"])
+            module.publish_continuation_route(successor, route, target)
+            module.verify_route(successor)
+            module._record_route_chain(successor, str(target), "continuation")
+            prepared = {**outcome, "successor_route": str(target),
+                    "handoff_pins": pins,
+                    "recovery_command": resume_command(target, jobs, agent_home=ROOT),
+                    "next_step": "The previous owner is settled and resource runs are preserved. "
+                        "Run recovery_command to start the unfinished stages on the current pin; "
+                        "completed stages remain reused."}
+            ledger._append({"at": WS.now_iso(), "route_id": route["route_id"],
+                            "route_hash": route["route_hash"], "actor": "parent-close",
+                            "evidence": {"parent_close_result": prepared}})
+            return prepared
+        except (OSError, ValueError) as exc:
+            return {**outcome, "handoff_reason": str(exc),
+                    "recovery_command": resume_command(path, jobs, agent_home=ROOT),
+                    "next_step": "Owner cleanup settled; continuation preparation did not. "
+                        "Inspect handoff_reason, then run recovery_command to retry preparation."}
 
 
 def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=None,
