@@ -1668,6 +1668,28 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self._release()
         self._wait_for_receipt(self._fields(proc.stdout)["watch_id"])
 
+    def test_watch_on_a_pane_before_its_first_session_continues_on_that_session(self):
+        """2026-10-10 regression: a fresh Codex has no session until its first
+        input; the watch follows the pane and then takes the session it gets."""
+        identity_path = self.tmp_root / "identity.json"
+        identity_path.write_text(json.dumps({"session_id": ""}))
+        env = self._env("held")
+        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
+        proc = self._run("watch", "peer-a", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        fields = self._fields(proc.stdout.splitlines()[0])
+        self.assertEqual(fields["state"], "armed", proc.stdout)
+        watch_id = fields["watch_id"]
+        arm = json.loads((self.watch_root / f"{watch_id}.json").read_text())
+        self.assertEqual((arm["agent"]["session_id"], arm["agent"]["pane"]), ("-", "w1:p9"))
+        self._wait_for_lock(watch_id)
+        identity_path.write_text(json.dumps({"session_id": "sid-first"}))
+        again = self._run("watch", "peer-a", env=env)
+        self.assertEqual(self._fields(again.stdout.splitlines()[0]).get("watch_id"), watch_id)
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("sid-first", "w1:p9"))
+
     def test_same_name_new_session_gets_separate_watch_and_old_rearm_cannot_overwrite_claim(self):
         env = self._env("timeout")
         first = self._run("watch", "peer-a", env=env)
@@ -2335,6 +2357,39 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         # sending a handoff is a message, not a steward act: no marker (user 2026-09-06)
         self.assertEqual(peer_steward.peer_message.read_steward_markers(), {})
         self.assertFalse(peer_steward.peer_message.steward_marker_path("claude", "sid-steward").exists())
+
+    def test_codex_before_its_first_session_takes_the_typed_send(self):
+        """2026-10-10 regression: a fresh Codex has no session until its first
+        input, and the readiness gate parked every prompt in the SID-bound native
+        queue (`peer-endpoint-unverified`), so the first input never arrived."""
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        # The row an earlier parked attempt left behind must not capture the retry.
+        peer_steward.peer_message.prepare_peer_message(
+            "first brief", {"harness": "claude", "session_id": "sid-steward", "name": None},
+            {"harness": "codex", "session_id": None, "name": "fresh"},
+            defer=True, receipt="pane-identity-unverified")
+        for status, outcome in (("idle", "true"), ("blocked", "unverified")):
+            with self.subTest(status=status):
+                calls = []
+                with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(
+                         _agent_json("codex", None, "fresh", status=status), calls=calls)), \
+                     mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
+                                       return_value={"status": "unverified",
+                                                     "reason": "peer-endpoint-unverified"}) as queue, \
+                     mock.patch("builtins.print") as print_mock:
+                    peer_steward.main(["prompt", "fresh", "first brief"])
+                line = print_mock.call_args[0][0]
+                self.assertIn(f"prompted={outcome} ", line)
+                typed = [c for c in calls if c[:3] == ["herdr", "agent", "prompt"]]
+                if status == "idle":
+                    self.assertIn("verify=state-flip", line)
+                    self.assertEqual(len(typed), 1)
+                    self.assertIn("--wait", typed[0])
+                    queue.assert_not_called()
+                else:
+                    # An open form still receives no keystrokes.
+                    self.assertEqual(typed, [])
 
     def test_consecutive_prompt_captures_sender_and_recipient_once(self):
         calls = []
@@ -4639,8 +4694,8 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
 
 
 class _RetireWorld:
-    def __init__(self, harness="codex", status="idle", screen=None, exits=True):
-        self.harness, self.status = harness, status
+    def __init__(self, harness="codex", status="idle", screen=None, exits=True, sid="old-sid"):
+        self.harness, self.status, self.sid = harness, status, sid
         self.screen = screen if screen is not None else {
             "codex": CODEX_EMPTY, "claude": CLAUDE_EMPTY, "opencode": OPENCODE_EMPTY}[harness]
         self.calls, self.gets, self.process_reads = [], 0, 0
@@ -4652,7 +4707,7 @@ class _RetireWorld:
     def agent(self):
         self.gets += 1
         return {"agent": self.harness, "agent_status": self.status, "name": "old",
-                "pane_id": "w1:pOld", "agent_session": {"value": "other" if self.changed and self.gets > 1 else "old-sid"}}
+                "pane_id": "w1:pOld", "agent_session": {"value": "other" if self.changed and self.gets > 1 else self.sid}}
 
     def info(self):
         self.process_reads += 1
@@ -4920,6 +4975,31 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("reason=already-complete", line)
         self.assertEqual(world.actions(), before)
+
+    def test_pane_before_its_first_session_retires_by_its_pane(self):
+        """2026-10-10 regression: a Codex that never took input has no session,
+        and its retire stayed `pane-identity-unverified` for good."""
+        world = _RetireWorld(sid=None)
+        rc, line = self.retire(world)
+        self.assertEqual((rc, line), (0, "retired=true reason=normal-exit agent=codex name=old pane=w1:pOld"))
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+
+    def test_repeated_retire_retries_its_waiting_duty_now(self):
+        world = _RetireWorld(status="working")
+        rc, line = self.retire(world)
+        self.assertEqual(rc, 0)
+        self.assertIn("retired=false reason=agent-working", line)
+        world.status = "idle"
+        rc, line = self.retire(world, clear_existing=False)
+        self.assertEqual((rc, line), (0, "retired=true reason=normal-exit agent=codex name=old pane=w1:pOld"))
+        self.assertEqual(len(peer_steward.peer_obligations.ObligationStore().list()), 0)
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
 
     def test_confirmed_normal_exit_closes_once_and_records_notice(self):
         for harness, status in (("codex", "idle"), ("opencode", "done"), ("claude", "idle")):
