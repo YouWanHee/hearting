@@ -274,7 +274,7 @@ class StewardParentStripTest(unittest.TestCase):
                                                layout="wide", term_width=168))
         self.assertFalse(any("⚑ →" in t for t in rows))
         self.assertFalse(any("⚑ ←" in t for t in rows))
-        self.assertTrue(any("┆" in t for t in rows))
+        self.assertTrue(any("⚑" in t for t in rows))
 
 
 class RelationLineBudgetTest(unittest.TestCase):

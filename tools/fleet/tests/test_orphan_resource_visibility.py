@@ -85,7 +85,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                 self.assertEqual(session.work_projection.source, "none")
                 self.assertFalse(getattr(session, "resource_children", None))
 
-    def test_exact_live_owner_still_shows_resource_only_once_in_both_views(self):
+    def test_exact_live_owner_shows_resource_in_now_and_one_gpu_row_in_both_views(self):
         for harness in ("claude", "codex", "opencode"):
             for process in (False, True):
                 with self.subTest(harness=harness, process=process):
@@ -97,8 +97,16 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                     projection._attach_resource_children([owner], [self.child])
                     output = text(self.lines(jobs=[owner], process=process))
                     self.assertIn("live-owner", output)
-                    self.assertEqual(output.count("● GPU gpu-host:0"), 1)
-                    self.assertEqual(output.count("full-run"), 1)
+                    gpu_rows = [row for row in output.splitlines()
+                                if "● GPU gpu-host:0" in row]
+                    self.assertEqual(len(gpu_rows), 1)
+                    self.assertIn("full-run", gpu_rows[0])
+                    self.assertIn("2 GB", gpu_rows[0])
+                    now_rows = [row for row in output.splitlines()
+                                if "full-run" in row and "● GPU" not in row]
+                    self.assertEqual(len(now_rows), 1)
+                    self.assertIn("gpu-host:0", now_rows[0])
+                    self.assertIn("로그 없음", now_rows[0])
                     self.assertEqual(owner.resource_children, [self.child])
 
     def test_probe_absence_or_expiry_preserves_resource_liveness_and_elapsed(self):
@@ -198,7 +206,11 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                                              process=process))
                     rows = [row for row in output.splitlines() if "● GPU gpu-host:0" in row]
                     self.assertEqual(len(rows), 1 if complete else 2)
-                    self.assertEqual(output.count("owner-node"), 1)
+                    self.assertEqual(sum(row.count("owner-node") for row in rows), 1)
+                    now_rows = [row for row in output.splitlines()
+                                if "owner-node" in row and "● GPU" not in row]
+                    self.assertEqual(len(now_rows), 1)
+                    self.assertIn("gpu-host:0", now_rows[0])
                     self.assertEqual(output.count("full-run"), 1)
                     if complete:
                         self.assertIn("resource full-run", output)

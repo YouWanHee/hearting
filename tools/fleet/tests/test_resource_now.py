@@ -85,6 +85,30 @@ class ResourceNowTest(unittest.TestCase):
             child.parent_attempt_id = "foreign"
             self.assertNotIn("cnn:1", render._resource_now_text(owner))
 
+    def test_exited_resource_keeps_its_result_when_resumed_owner_has_no_now(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                owner, child = self.owner(self.rows[2], harness)
+                owner.liveness, owner.resource_wait, owner.summary = "working", None, None
+                child.liveness, child.exit_code, child.ended_at = "exited", 1, 1791514929
+                now = render._resource_now_text(owner)
+                self.assertIn("마지막 eval-run eval_v54.py", now)
+                self.assertIn("실패(exit 1)", now)
+                self.assertIn("로그 ", now)
+                owner.summary = "model handling the result"
+                self.assertIsNone(render._resource_now_text(owner))
+                owner.summary, owner.exec_child = None, {"name": "python3"}
+                self.assertIsNone(render._resource_now_text(owner))
+                owner.exec_child, owner.exec_tool = None, {"name": "exec_command"}
+                self.assertIsNone(render._resource_now_text(owner))
+                owner.exec_tool, owner.liveness = None, "idle"
+                owner.state_evidence = {"inputs": {"observed_liveness": {"state": "parked-supervised"}}}
+                owner.summary = "previous model turn before resource wait"
+                self.assertIn("실패(exit 1)", render._resource_now_text(owner))
+                owner.resource_wait = {"run_ids": [child.run_id]}
+                self.assertIn("실패(exit 1)", render._resource_now_text(owner))
+                self.assertEqual(child.exit_code, 1)
+
 
 class SnapshotMaintenanceTest(unittest.TestCase):
     def helper(self, argv, parent="opencode"):

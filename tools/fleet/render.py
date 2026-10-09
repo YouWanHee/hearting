@@ -1132,25 +1132,6 @@ def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown=
     return segs
 
 
-def _session_model_cell(s, width, dim=False, hkey=None, hide_model=False):
-    """MAIN model phrase with one role flag after it, on every layout."""
-    steward = bool(getattr(s, "steward", False))
-    model = None if hide_model else s.model
-    effort = None if hide_model else s.effort
-    room = width - (2 if steward else 0)
-    if hkey is None:
-        segs = _model_cell(model, effort, room, dim=dim)
-    else:
-        segs = _harness_model_cell(s.harness, model, effort, room, hkey, dim=dim,
-            effort_default=not hide_model and bool(getattr(s, "effort_default", False)))
-    if steward:
-        padding = segs.pop() if segs and segs[-1][1] is None and not segs[-1][0].strip() else None
-        segs.append((" " + _ICON_STEWARD, "tag_dim" if dim else "tag_steward"))
-        if padding:
-            segs.append(padding)
-    return segs
-
-
 _DIAL_MAX = 34                # F-78 (user 2026-08-14 "뜰때 안뜰때가 일관성이 없고 …
                               # 전부 다 뜰때 가로로 너무 길어지는데"): ONE options-dial budget
                               # for every dispatch row. It used to be `28 if in_card else None`
@@ -1987,8 +1968,10 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     # no live telemetry to show (F-13), so it renders the bare harness name only.
     segs = [("  ", None), (gch, gkey), (" ", None)]
     segs += _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
-    segs += _session_model_cell(s, _HMW - _TAG_W, hkey=hkey,
-                                dim=dim_tel, hide_model=dead_stale)
+    segs += _harness_model_cell(s.harness, None if dead_stale else s.model,
+                                None if dead_stale else s.effort, _HMW - _TAG_W,
+                                hkey, dim=dim_tel,
+                                effort_default=not dead_stale and bool(getattr(s, "effort_default", False)))
 
     # F-22: reserve identity suffixes first, then let the title consume the
     # responsive name column. Calls without a terminal-derived width retain the
@@ -3159,7 +3142,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     # indent / no far-right flush).
     l2 = [(" " * _SESSION_DETAIL_COL, None),
           (_pad(fmt_min(s.elapsed_min), 4 + _HW - _SESSION_DETAIL_COL), "dim")]
-    l2 += _session_model_cell(s, _MW, dim=dim_tel)
+    l2 += _model_cell(s.model, s.effort, _MW, dim=dim_tel)
     # Same cell as the wide row (capability tag, route chain, spec breadcrumb): this card
     # used to call the bare projection text and showed `-` for inline work the wide row named.
     l2 = _pad_to_column(l2, _session_routing_column("narrow"))
@@ -3583,9 +3566,9 @@ def _steward_hierarchy(rows):
 _STEWARD_LINE_MARK = "┆"
 
 
-def _under_id_connector(segs, mark=_STEWARD_LINE_MARK):
+def _under_id_connector(segs, mark=_STEWARD_LINE_MARK, key="dim"):
     """Paint only the reserved cell; detail layout never depends on a relation."""
-    return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, "dim")
+    return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, key)
 
 
 def _live_session_identity(s):
@@ -4640,10 +4623,29 @@ def _resource_now_text(entity, room=None):
         "observed_liveness") or {}
     parked = (getattr(entity, "liveness", None) == "idle"
               and observed.get("state") == "parked-supervised")
-    children = [child for child in getattr(entity, "resource_children", ())
-                if child.liveness == "working"
-                and (not wait or child.run_id in wait.get("run_ids", ()))]
-    if not wait and not parked and not (getattr(entity, "liveness", None) == "idle" and children):
+    attached = [child for child in getattr(entity, "resource_children", ())
+                if not wait or child.run_id in wait.get("run_ids", ())]
+    children = [child for child in attached if child.liveness == "working"]
+    summary = getattr(entity, "summary", None)
+    tool = getattr(entity, "exec_child", None) or getattr(entity, "exec_tool", None)
+    resource_context = (wait or parked
+                        or (children and (getattr(entity, "liveness", None) == "idle"
+                                          or not summary and not tool)))
+    if not children and tool:
+        return None
+    if not children and (resource_context or not summary):
+        terminal = [child for child in attached if child.liveness in ("exited", "dead")
+                    and type(getattr(child, "exit_code", None)) is int]
+        if terminal:
+            child = max(terminal, key=lambda c: getattr(c, "ended_at", None) or 0)
+            node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+            command = _resource_command_label(getattr(child, "command", None))
+            state = "실패" if child.exit_code else "종료"
+            text = "마지막 %s%s · %s(exit %d) · %s" % (
+                node, " " + command if command else "", state, child.exit_code,
+                _resource_log_age(child))
+            return _clip_w(text, room) if room is not None else text
+    if not resource_context:
         return None
     if not children:
         return "대기"
@@ -4677,10 +4679,7 @@ def _resource_now_text(entity, room=None):
             label = _gpu_process_label(process["command"])
             command = label if label != process["command"] else _resource_command_label(label)
     progress = _resource_progress_tail(child)
-    log_ts = getattr(child, "log_updated_at", None)
-    log = ("로그 " + _fmt_exec_age(max(0, time.time() - log_ts))
-           if isinstance(log_ts, (int, float)) and not isinstance(log_ts, bool)
-           else "로그 없음")
+    log = _resource_log_age(child)
     facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, log) if part)
     if len(children) > 1:
         facts += " · +%d" % (len(children) - 1)
@@ -4693,6 +4692,13 @@ def _resource_now_text(entity, room=None):
             # Narrow NOW still identifies the work and its observed location.
             return _clip_w(node + " · " + where + " · " + log, room)
     return label + " · " + facts
+
+
+def _resource_log_age(child):
+    log_ts = getattr(child, "log_updated_at", None)
+    return ("로그 " + _fmt_exec_age(max(0, time.time() - log_ts))
+            if isinstance(log_ts, (int, float)) and not isinstance(log_ts, bool)
+            else "로그 없음")
 
 
 def _context_detail_row(entity, depth=0, term_width=None, dim=False,
@@ -7482,7 +7488,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         if live_order is not None:
             shown = live_order.reconcile_sessions(name, shown)
         shown, steward_edges = _steward_hierarchy(shown)
-        session_starts, session_identity_rows = {}, set()
+        session_starts, session_identity_rows, steward_markers = {}, set(), {}
         rendered_parent_sids = set()  # ambiguous enrichment must not duplicate a dispatch tree
         for s in shown:
             if getattr(s, "mem_worker", False):
@@ -7594,6 +7600,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                                     detached_root=(
                                         max(1, int(getattr(cj, "depth", 1) or 1)) >= 2
                                     ), card_rail_col=_RAIL_COL)
+            if getattr(s, "steward", False):
+                marker_row = session_starts[id(s)] + 1
+                if marker_row == len(lines):
+                    lines.append([(" " * _SESSION_DETAIL_COL, None)])
+                steward_markers[marker_row] = ("tag_dim" if s.liveness in ("stale", "dead")
+                                                else "tag_steward")
         # Draw each supervisor interval after its complete session/card block exists.
         connector_rows = set()
         for parent, targets in steward_edges.items():
@@ -7601,9 +7613,11 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 stop = session_starts.get(id(targets[-1]))
                 if stop is not None:
                     connector_rows.update(range(session_starts[parent] + 1, stop))
-        for idx in sorted(connector_rows - session_identity_rows):
+        for idx in sorted(connector_rows - session_identity_rows - steward_markers.keys()):
             if lines[idx]:
                 lines[idx] = _under_id_connector(lines[idx])
+        for idx, key in steward_markers.items():
+            lines[idx] = _under_id_connector(lines[idx], _ICON_STEWARD, key)
         if group_sessions and hidden:
             lines.append([("     +%d stale/companion hidden" % hidden, "dim")])
 
