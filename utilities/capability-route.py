@@ -4009,6 +4009,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     capabilities = {recipe["capability"] for recipe in registry["recipes"]
                     if recipe["capability"] != ROUTE_FRAME_CAPABILITY}
     if find_input is not None and frameless:
+        if parent_cycle_id is None and route_plan is None:
+            find_input = _without_implicit_frame_briefs(registry, find_input)
         find_input = _frame_brief_finder(registry, capability, find_input)
     if planned_full:
         # No graph: the recipe's own order, minus the frame nodes the plan already ran.
@@ -4114,6 +4116,30 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     route["route_hash"] = route_hash(route)
     route["route_id"] = ROUTE_IDENTITY.route_id_from_hash(route["route_hash"])
     return route
+
+
+def _without_implicit_frame_briefs(registry, finder):
+    """Keep campaign lookup for ordinary results, but do not infer frame lineage from it.
+
+    The blocked names come from the frame contract, including capability-specific consumer names
+    and the borrowed-part relocation form used by `_compose_inputs`. An explicit parent or route
+    proposal bypasses this wrapper at the compose call site and keeps the existing mapping.
+    """
+    catalog = TOPO.part_catalog(registry)
+    frame = catalog.get("frame") or {}
+    names = set(frame.get("brief_outputs") or [])
+    names.update(name for brief in (frame.get("briefs") or {}).values()
+                 for name in brief.get("inputs", []))
+    blocked = set(names)
+    aliases = frame.get("aliases") or []
+    for part_id in (catalog.get("parts") or {}):
+        part_capability = part_id.partition(":")[0]
+        blocked.update(f"parts/{part_capability}/{producer}/{name}"
+                       for producer in aliases for name in names)
+
+    def find(name):
+        return None if name in blocked else finder(name)
+    return find
 
 
 def _frame_brief_finder(registry, capability, finder):
