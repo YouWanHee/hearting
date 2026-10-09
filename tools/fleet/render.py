@@ -61,7 +61,6 @@ _A_REVERSE = getattr(curses, "A_REVERSE", 0)
 # Eight-color terminals keep their native colors as a checked fallback.
 _MUTED_256 = {
     "steward_pink": 219,
-    "relation_grey": 244,  # #808080 — neutral on both dark and light backgrounds
     "orange": 137,
     "soft": 253,       # #dadada — focal text, below pure white
     "green": 150,     # #afd787 — richer sage
@@ -186,7 +185,6 @@ _HUE_OF = {
     # F-100c: a STEWARD session (depth −1: `steward on`, or it watched/started a session) wears
     # bright pink text: distinct from white/yellow, without a special background.
     "tag_steward": ("p", _A_B),
-    "relation": ("s", 0),
     # Badge text, NOT the glyph: plain yellow, distinct from the dim g_unused glyph so the
     # ●>○>◌ ink-weight gradient still reads.
     "g_unused_b": ("y", 0),
@@ -410,13 +408,6 @@ def _init_colors():
     _COLOR["tag"] = _COLOR.get("soft", 0)
     _COLOR["tag_dim"] = curses.A_DIM
     try:
-        curses.init_pair(19, _palette_fg("relation_grey", curses.COLOR_WHITE), bg)
-        _COLOR["relation"] = curses.color_pair(19)
-        if curses.COLORS < 256:
-            _COLOR["relation"] |= curses.A_DIM
-    except Exception:
-        _COLOR["relation"] = curses.A_DIM
-    try:
         curses.init_pair(18, _palette_fg("steward_pink", curses.COLOR_MAGENTA), bg)
         _COLOR["tag_steward"] = curses.color_pair(18) | curses.A_BOLD
     except Exception:
@@ -516,7 +507,6 @@ def _init_colors():
                     "m": _palette_fg("magenta", curses.COLOR_MAGENTA),
                     "o": _palette_fg("orange", curses.COLOR_YELLOW),
                     "p": _palette_fg("steward_pink", curses.COLOR_MAGENTA),
-                    "s": _palette_fg("relation_grey", curses.COLOR_WHITE),
                     "l": _palette_fg("blue", curses.COLOR_BLUE)}
             n_pair = 20
             for tch, lvl in _TINT_LVL.items():
@@ -1080,25 +1070,20 @@ def _eff_key(effort, dim):
 _EFF_SHORT = {"low": "lo", "medium": "md", "high": "hi", "xhigh": "xh", "max": "mx"}
 
 
-def _model_cell(model, effort, width, dim=False, steward=False):
+def _model_cell(model, effort, width, dim=False):
     """Render model and effort together as one flowing phrase, padded to width."""
-    flag = [(" " + _ICON_STEWARD, "tag_dim" if dim else "tag_steward")] if steward else []
-    width -= sum(_dw(t) for t, _k in flag)
     name = _clean_model(dash(model)) or "—"
     sfx = _effort_text(effort)
     lkey = _model_key(model, dim=dim)
     if sfx:
         name = name[: max(1, width - len(sfx) - 4)]
         pad = max(0, width - len(name) - len(sfx) - 3)
-        return [(name, lkey), (" (" + sfx + ")", _eff_key(sfx, dim))] + flag + [(" " * pad, None)]
-    if flag:
-        name = name[: width - 1]
-        return [(name, lkey)] + flag + [(" " * (width - len(name)), None)]
+        return [(name, lkey), (" (" + sfx + ")", _eff_key(sfx, dim))] + [(" " * pad, None)]
     return [(_pad(name[: width - 1], width), lkey)]
 
 
 def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown="?",
-                       effort_default=False, steward=False):
+                       effort_default=False):
     """F-33 (v11, 사용자 확정 2026-07-16) — WIDE-layout harness field with model/effort folded
     in as a parenthetical: 'claude code (Fable 5·xhigh)'. The harness text keeps its
     existing hb_*/h_* badge color (`hkey`); the parenthetical reuses `_model_cell`'s
@@ -1114,9 +1099,6 @@ def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown=
     uninformative default". That is not an effort level, so it never claims a real one —
     it renders a small dim '(default)' instead, distinguishing it from a session that
     reported no effort at all (both would otherwise be the same blank)."""
-    flag = [(" " + _ICON_STEWARD, "tag_dim" if dim else "tag_steward")] if steward else []
-    flag_width = sum(_dw(t) for t, _k in flag)
-    width -= flag_width
     hn = _BADGE_TEXT.get(harness, unknown) if harness else unknown
     segs = [(hn, hkey)]
     used = len(hn)
@@ -1142,12 +1124,30 @@ def _harness_model_cell(harness, model, effort, width, hkey, dim=False, unknown=
                      ("·", "dim"), (_DEFAULT_EFFORT_MARK, "dim"), (")", "dim")]
             used += 2 + len(name) + 1 + len(_DEFAULT_EFFORT_MARK) + 1
         elif room > 0:
-            nm = _clip_w(name, max(1, room))
+            nm = name[: max(1, room)]
             segs += [(" (", "dim"), (nm, _model_key(model, dim=dim)), (")", "dim")]
             used += 2 + len(nm) + 1
-    segs += flag
     if used < width:
         segs.append((" " * (width - used), None))
+    return segs
+
+
+def _session_model_cell(s, width, dim=False, hkey=None, hide_model=False):
+    """MAIN model phrase with one role flag after it, on every layout."""
+    steward = bool(getattr(s, "steward", False))
+    model = None if hide_model else s.model
+    effort = None if hide_model else s.effort
+    room = width - (2 if steward else 0)
+    if hkey is None:
+        segs = _model_cell(model, effort, room, dim=dim)
+    else:
+        segs = _harness_model_cell(s.harness, model, effort, room, hkey, dim=dim,
+            effort_default=not hide_model and bool(getattr(s, "effort_default", False)))
+    if steward:
+        padding = segs.pop() if segs and segs[-1][1] is None and not segs[-1][0].strip() else None
+        segs.append((" " + _ICON_STEWARD, "tag_dim" if dim else "tag_steward"))
+        if padding:
+            segs.append(padding)
     return segs
 
 
@@ -1953,18 +1953,11 @@ def _session_tag_chip(s, dim=False):
             return [("[", "dim"), (body, "tag_dim"), ("]", "dim"), (" ", None)]
         if not steward:
             return [(" " * _TAG_W, None)]
-        # The relation slot already names the role; keep an unknown ID blank.
+        # Unknown session ID stays blank; the model cell carries the role.
         return [(" " * _TAG_W, None)]
     body = tag[: _TAG_W - 3].ljust(_TAG_W - 3)
     key = "tag_dim" if dim else ("tag_steward" if steward else "tag")
     return [("[", "dim"), (body, key), ("]", "dim"), (" ", None)]
-
-
-def _session_relation_slot(s, dim=False):
-    """A fixed three-cell prefix shared by every MAIN identity row."""
-    if getattr(s, "steward", False):
-        return [(_ICON_STEWARD + " ", "tag_dim" if dim else "tag_steward"), (" ", None)]
-    return [(" " * _RELATION_W, None)]
 
 
 def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
@@ -1993,13 +1986,9 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     # F-33 (v11): harness field carries model/effort as a parenthetical — a dead/stale row has
     # no live telemetry to show (F-13), so it renders the bare harness name only.
     segs = [("  ", None), (gch, gkey), (" ", None)]
-    segs += _session_relation_slot(s, dim=dim_tel)
     segs += _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HMW field
-    segs += _harness_model_cell(s.harness, None if dead_stale else s.model,
-                                None if dead_stale else s.effort, _HMW - _TAG_W - _RELATION_W, hkey,
-                                 dim=dim_tel,
-                                 effort_default=(not dead_stale
-                                                  and bool(getattr(s, "effort_default", False))))
+    segs += _session_model_cell(s, _HMW - _TAG_W, hkey=hkey,
+                                dim=dim_tel, hide_model=dead_stale)
 
     # F-22: reserve identity suffixes first, then let the title consume the
     # responsive name column. Calls without a terminal-derived width retain the
@@ -2105,13 +2094,11 @@ def _compact_dispatch_name(name, max_width=_DISPATCH_NAME_MAX):
     return _clip_w(name or "", max_width)
 
 
-# Card inset: the left edge clears the two-cell relation slot;
+# Card inset: the left edge reserves the under-id relation column;
 # the existing right-edge budget stays independent so only the interior shrinks.
 _CARD_INSET = 1               # worker content placement stays unchanged
-_STEWARD_LINE_COL = 4         # relation slot, after the unchanged status glyph
-_RELATION_W = 3               # two relation cells plus a gap before [id]
-_NARROW_TITLE_SHIFT = 2       # full opencode label + gap on every MAIN first row
-_SESSION_DETAIL_COL = 8       # detail text and boxes keep their existing anchor
+_STEWARD_LINE_COL = 5         # first character inside the MAIN [id] chip
+_SESSION_DETAIL_COL = _STEWARD_LINE_COL + 3  # two blank cells after the connector
 _OWNER_CARD_INSET = _SESSION_DETAIL_COL - 2  # box left edge at the shared detail column
 
 
@@ -3114,9 +3101,8 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     name_key = (_NAME_KEY_DIM.get(s.harness, "nmd_other") if dim_tel
                 else _NAME_KEY.get(s.harness, "nm_other"))   # F-76b, see `_session_row`
     l1 = ([("  ", None), (gch, gkey), (" ", None)]
-          + _session_relation_slot(s, dim=dim_tel)
           + _session_tag_chip(s, dim=dim_tel)          # F-100a — inside the _HW field
-          + [(_badge_cell(hn, _HW - _TAG_W - _RELATION_W + _NARROW_TITLE_SHIFT), hkey)])
+          + [(_badge_cell(hn, _HW - _TAG_W), hkey)])   # word-boundary clip, last cell blank
     suffix = []
     if is_parent and child_count:
         suffix.append((" ▾%d" % child_count, name_key))
@@ -3173,7 +3159,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     # indent / no far-right flush).
     l2 = [(" " * _SESSION_DETAIL_COL, None),
           (_pad(fmt_min(s.elapsed_min), 4 + _HW - _SESSION_DETAIL_COL), "dim")]
-    l2 += _model_cell(s.model, s.effort, _MW, dim=dim_tel)
+    l2 += _session_model_cell(s, _MW, dim=dim_tel)
     # Same cell as the wide row (capability tag, route chain, spec breadcrumb): this card
     # used to call the bare projection text and showed `-` for inline work the wide row named.
     l2 = _pad_to_column(l2, _session_routing_column("narrow"))
@@ -3592,13 +3578,14 @@ def _steward_hierarchy(rows):
     return ordered, edges
 
 
-# Detail rows use a vertical dash; target identity rows continue it with a branch.
+# Dashed so a supervisor line never reads as an owner box border; the dashes
+# already leave a gap beside each ID, so every row uses the same mark.
 _STEWARD_LINE_MARK = "┆"
 
 
 def _under_id_connector(segs, mark=_STEWARD_LINE_MARK):
     """Paint only the reserved cell; detail layout never depends on a relation."""
-    return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, "relation")
+    return _overwrite_rail_text(segs, _STEWARD_LINE_COL, mark, "dim")
 
 
 def _live_session_identity(s):
@@ -4635,6 +4622,79 @@ def _context_lead_chip(entity, dim=False, degrade=False):
     return [(" " * _CTX_LABEL_W, None)]
 
 
+def _resource_command_label(command):
+    """A bounded argv label, without interpreting workload logs or lifecycle."""
+    words = command if isinstance(command, list) else _gpu_command_words(str(command or ""))
+    for index, word in enumerate(words):
+        if word == "-m" and index + 1 < len(words):
+            return _gpu_safe_text(words[index + 1].rsplit(".", 1)[-1])
+        if word.endswith(".py"):
+            return _gpu_safe_text(os.path.basename(word))
+    return _gpu_safe_text(os.path.basename(words[0])) if words else ""
+
+
+def _resource_now_text(entity, room=None):
+    """Current work of an exact resource-waiting owner, shared by every harness."""
+    wait = getattr(entity, "resource_wait", None)
+    observed = ((getattr(entity, "state_evidence", None) or {}).get("inputs") or {}).get(
+        "observed_liveness") or {}
+    parked = (getattr(entity, "liveness", None) == "idle"
+              and observed.get("state") == "parked-supervised")
+    children = [child for child in getattr(entity, "resource_children", ())
+                if child.liveness == "working"
+                and (not wait or child.run_id in wait.get("run_ids", ()))]
+    if not wait and not parked and not (getattr(entity, "liveness", None) == "idle" and children):
+        return None
+    if not children:
+        return "대기"
+    snapshot, _age = _fresh_compute_hosts()
+    child = children[0]
+    resources = _resource_gpu_resources(child, snapshot, commands=True)
+    if resources:
+        where = ",".join("%s:%s" % (r["host"], r["index"]) for r in resources)
+    else:
+        local = next((host for host in (snapshot or {}).get("hosts", ())
+                      if isinstance(host, dict) and host.get("self") is True
+                      and host.get("reachable") is True), None)
+        argv = getattr(child, "command", None) or []
+        assignments = []
+        if argv and argv[0] == "env":
+            for arg in argv[1:]:
+                if "=" not in arg:
+                    break
+                assignments.append(arg)
+        identity = getattr(child, "state_evidence", None) or {}
+        cpu_only = ("CUDA_VISIBLE_DEVICES=" in assignments
+                    and identity.get("reason") == "exact-identity-match"
+                    and not getattr(child, "remote_training", None))
+        where = ("%s:CPU" % _gpu_safe_text(local["host"])
+                 if local and cpu_only else "호스트/GPU 미확인")
+    node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+    command = _resource_command_label(getattr(child, "command", None))
+    if resources:
+        process = next((p for r in resources for p in r.get("processes", ())), None)
+        if process:
+            label = _gpu_process_label(process["command"])
+            command = label if label != process["command"] else _resource_command_label(label)
+    progress = _resource_progress_tail(child)
+    log_ts = getattr(child, "log_updated_at", None)
+    log = ("로그 " + _fmt_exec_age(max(0, time.time() - log_ts))
+           if isinstance(log_ts, (int, float)) and not isinstance(log_ts, bool)
+           else "로그 없음")
+    facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, log) if part)
+    if len(children) > 1:
+        facts += " · +%d" % (len(children) - 1)
+    label = node + (" " + command if command else "")
+    if room is not None:
+        budget = room - _dw(" · " + facts)
+        if budget > 0:
+            label = _clip_w(label, budget)
+        else:
+            # Narrow NOW still identifies the work and its observed location.
+            return _clip_w(node + " · " + where + " · " + log, room)
+    return label + " · " + facts
+
+
 def _context_detail_row(entity, depth=0, term_width=None, dim=False,
                         indent_width=None, muted=False, now_key="now_sub"):
     """One ``<herdr|tty> <gauge> <value>   NOW`` row for every live card.
@@ -4651,9 +4711,9 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     context = getattr(entity, "context", None)
     pct = getattr(context, "used_pct", None) if context is not None else getattr(entity, "ctx_pct", None)
     now_text = getattr(entity, "summary", None)
-    resource_wait = getattr(entity, "resource_wait", None)
-    if resource_wait:
-        now_text = "%s · resource-parked" % ",".join(resource_wait["nodes"])
+    resource_now = _resource_now_text(entity)
+    if resource_now is not None:
+        now_text = resource_now
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
@@ -4685,7 +4745,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     else:
         value_text = "%d%%" % shown_pct
     segs.append((value_text.rjust(_CONTEXT_VALUE_W), "dim"))
-    exec_segs = _exec_detail_segs(entity)
+    exec_segs = [] if resource_now is not None else _exec_detail_segs(entity)
     if now_text or exec_segs:
         prefix_width = sum(_dw(text) for text, _key in segs)
         gap = max(_CONTEXT_NOW_GAP, _NAME_COL - prefix_width)
@@ -4704,12 +4764,10 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             # F-63: same reserved-width age tag as the dispatch subtitle row — the
             # tag survives clipping; only when the zone cannot hold tag + any text
             # does it drop and the bare NOW clip behaves exactly as before.
-            tag = None if resource_wait else _summary_age_tag(getattr(entity, "summary_ts", None))
+            tag = None if resource_now is not None else _summary_age_tag(getattr(entity, "summary_ts", None))
             text_room = now_room - _dw(sep)
-            if resource_wait and text_room < _dw(now_text):
-                # The declared node already rides the breadcrumb and child row.
-                # Preserve the complete current wait state before repeating that node.
-                now_text = resource_wait["state"]
+            if resource_now is not None:
+                now_text = _resource_now_text(entity, max(0, text_room))
             tag_w = (_dw(tag) + 1) if tag else 0
             if tag and text_room > tag_w:
                 clipped = _clip_w(str(now_text), text_room - tag_w)
@@ -7524,7 +7582,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             session_resources = _gpu_resources_for_session(s, parent_gpu_resources)
             if session_resources:
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
-            # Peer communication remains a strip; steward relations use dashed branches.
+            # Peer communication remains a strip; steward relations use under-id lines.
             lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,
                                           tag_by_key, term_width=term_width))
             for plugin_job in plugin_kids:
@@ -7540,14 +7598,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         connector_rows = set()
         for parent, targets in steward_edges.items():
             if parent in session_starts and targets:
-                visible = [s for s in targets if id(s) in session_starts]
-                stop = session_starts.get(id(visible[-1])) if visible else None
+                stop = session_starts.get(id(targets[-1]))
                 if stop is not None:
                     connector_rows.update(range(session_starts[parent] + 1, stop))
-                    for i, target in enumerate(visible):
-                        idx = session_starts[id(target)]
-                        mark = "╰╌" if i == len(visible) - 1 else "├╌"
-                        lines[idx] = _under_id_connector(lines[idx], mark)
         for idx in sorted(connector_rows - session_identity_rows):
             if lines[idx]:
                 lines[idx] = _under_id_connector(lines[idx])
@@ -7766,9 +7819,6 @@ def _snapshot_line(segs, colored=False, colors=256):
         piece = _plain([(text, key)])
         if key == "tag_steward":
             style = "\033[1;38;5;219m" if colors >= 256 else "\033[1;35m"
-            piece = style + piece + "\033[0m"
-        elif key == "relation":
-            style = "\033[38;5;244m" if colors >= 256 else "\033[2;37m"
             piece = style + piece + "\033[0m"
         elif key in {"gpu_legacy", "gpu_legacy_active"}:
             style = "\033[38;5;137m" if colors >= 256 else "\033[33m"

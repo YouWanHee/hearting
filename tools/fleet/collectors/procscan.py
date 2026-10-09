@@ -408,11 +408,41 @@ def _exec_is_helper(pid, comm):
     # runtime plumbing, not the user's work). Nested harnesses already own their own rows.
     if base in HARNESSES or any(base.startswith(h + "-") for h in HARNESSES):
         return True
+    if base == "git" and _opencode_snapshot_maintenance(pid):
+        return True
     low = base.lower()
     if any(needle in low for needle in _EXEC_HELPER_COMMS):
         return True
     env = read_environ(pid)
     return env.get("MEM_DISTILL") == "1" or env.get("FLEET_TITLE_REFRESH") == "1"
+
+
+def _opencode_snapshot_maintenance(pid):
+    """Git in the runtime's private snapshot repository is not user work."""
+    parent = _ppid_of(pid)
+    if not parent or _comm_of(parent) != "opencode":
+        return False
+    env = read_environ(parent)
+    data = env.get("XDG_DATA_HOME") or os.path.join(env.get("HOME") or "", ".local", "share")
+    if not os.path.isabs(data):
+        return False
+    try:
+        with open("/proc/%s/cmdline" % pid, "rb") as handle:
+            raw = handle.read(16385)
+        if len(raw) > 16384:
+            return False
+        args = raw.decode(errors="replace").split("\0")
+        paths = []
+        for i, arg in enumerate(args):
+            if arg == "--git-dir" and i + 1 < len(args):
+                paths.append(args[i + 1])
+            elif arg.startswith("--git-dir="):
+                paths.append(arg.split("=", 1)[1])
+        root = os.path.realpath(os.path.join(data, "opencode", "snapshot"))
+        return len(paths) == 1 and os.path.commonpath(
+            [root, os.path.realpath(paths[0])]) == root and os.path.realpath(paths[0]) != root
+    except (OSError, ValueError):
+        return False
 
 
 def proc_tree():

@@ -556,11 +556,12 @@ class UnpairedBadgeTest(unittest.TestCase):
         self.assertEqual(self._text(render._session_tag_chip(blank)), " " * render._TAG_W)
         steward = _codex(100, app_server=True)
         steward.steward = True
+        steward.model, steward.effort = "gpt-6.1", "high"
         steward._session_tag_unpaired = True
         self.assertEqual(self._text(render._session_tag_chip(steward)),
                          " " * render._TAG_W)
-        slot = render._session_relation_slot(steward)
-        self.assertEqual(self._text(slot), render._ICON_STEWARD + "  ")
+        self.assertEqual(self._text(render._session_model_cell(steward, 38)).count(
+            render._ICON_STEWARD), 1)
 
     def test_a_shared_tag_renders_exactly_like_a_minted_one(self):
         paired = _codex(100, app_server=True, managed_dir=_DIR_A, tag="9c")
