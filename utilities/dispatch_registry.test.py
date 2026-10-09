@@ -29,21 +29,32 @@ def fixture_process_scope(jobs):
  """
  raw_scan=D.scan_process_table; raw_context=D._PROCESS_TABLE_SCAN
  def snapshot():
-  scan=raw_scan(); controlled=set()
+  scan=raw_scan(); controlled=set(); groups=set(); attempts=set()
   path=jobs() if callable(jobs) else jobs
+  if not path or not Path(path).is_file(): return scan
   if path and Path(path).is_file():
    for line in Path(path).read_text().splitlines():
     fields=line.split("\t")
     if len(fields)!=6: continue
     metadata=D.parse_registry_metadata(fields[5])
+    if metadata.get("pgid","").isdigit(): groups.add(int(metadata["pgid"]))
+    if metadata.get("attempt_id"): attempts.add(metadata["attempt_id"])
     for key in ("pid","pid_host","pgid","parent_pid","parent_pid_host"):
      if metadata.get(key,"").isdigit(): controlled.add(int(metadata[key]))
+  for group in groups:
+   controlled.update(member[0] for member in scan.members_by_pgid.get(group,()))
+  for attempt in attempts:
+   controlled.update(member[0] for member in scan.members_by_attempt.get(attempt,()))
+  for _order,group,reason in scan.group_errors:
+   match=re.match(r"procfs-(?:member|environ):(\d+):",reason)
+   if group in groups and match: controlled.add(int(match.group(1)))
   def outside(reason):
    match=re.match(r"procfs-(?:member|environ):(\d+):",reason)
    return bool(match and int(match.group(1)) not in controlled)
   return dataclasses.replace(scan,
    incomplete_reason="" if outside(scan.incomplete_reason) else scan.incomplete_reason,
-   group_errors=tuple(error for error in scan.group_errors if not outside(error[2])),
+   group_errors=tuple(error for error in scan.group_errors
+                      if error[1] in groups or not outside(error[2])),
    tag_access_errors=tuple(error for error in scan.tag_access_errors if error[0] in controlled))
  class Context:
   def get(self,*args): return raw_context.get(*args) or snapshot()
@@ -91,15 +102,20 @@ class FixtureNamespaceScopeTest(unittest.TestCase):
    jobs.write_text("0\topen\t/r\t/w\tfixture\tattempt_id=att-controlled,pid=300,pgid=300\n")
    controlled="procfs-environ:300:same-uid-unobservable"
    unrelated="procfs-environ:400:same-uid-unobservable"
-   scan=D.ProcessTableScan({"att-visible":((500,"10","S"),)}, {},
+   member="procfs-member:301:malformed"
+   tagged="procfs-environ:501:same-uid-unobservable"
+   scan=D.ProcessTableScan({"att-visible":((500,"10","S"),),
+                           "att-controlled":((501,"11","S"),)}, {},
         incomplete_reason=unrelated,
-        group_errors=((0,None,controlled),(1,None,unrelated)),
-        tag_access_errors=((300,"",controlled),(400,"",unrelated)))
+        group_errors=((0,None,controlled),(1,None,unrelated),(2,300,member)),
+        tag_access_errors=((300,"",controlled),(400,"",unrelated),
+                           (301,"",member),(501,"11",tagged)))
    with mock.patch.object(D,"scan_process_table",return_value=scan), fixture_process_scope(jobs):
     snapshot=D._PROCESS_TABLE_SCAN.get()
     self.assertEqual(snapshot.members_by_attempt,scan.members_by_attempt)
-    self.assertEqual(snapshot.group_errors,((0,None,controlled),))
-    self.assertEqual(snapshot.tag_access_errors,((300,"",controlled),))
+    self.assertEqual(snapshot.group_errors,((0,None,controlled),(2,300,member)))
+    self.assertEqual(snapshot.tag_access_errors,((300,"",controlled),
+                                               (301,"",member),(501,"11",tagged)))
     self.assertEqual(snapshot.incomplete_reason,"")
     self.assertEqual(D.process_group_observation(300).state,"unverifiable")
 

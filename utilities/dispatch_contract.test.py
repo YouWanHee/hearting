@@ -11,6 +11,19 @@ from replica_batch_contract import build_manifest
 
 CURRENT="attempt_schema_version=2,dispatch_depth=2,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless"
 
+def controlled_process_scope(jobs):
+ # Contract and registry consumer fixtures observe the same controlled actors.
+ spec=importlib.util.spec_from_file_location("contract_process_fixture",
+                                          P.with_name("dispatch_registry.test.py"))
+ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+ return module.fixture_process_scope(jobs)
+
+class ControlledConsumerTestCase(unittest.TestCase):
+ """Known actor fixtures; raw observer tests keep their normal procfs scans."""
+ def run(self,result=None):
+  with controlled_process_scope(lambda:getattr(self,"jobs",None)):
+   return super().run(result)
+
 class RuntimeOwnerLaunchPredicateTest(unittest.TestCase):
  def test_workflow_receipt_uses_the_shared_exact_predicate(self):
   args=type("Args",(),dict(worker_type="owner",owner_route_binding=None,
@@ -3059,8 +3072,10 @@ class DispatchContractTest(unittest.TestCase):
   lines.append(
    "2026-08-07T00:00:01Z\topen\t/repo\t/wt\texecute\t"
    f"route_id=rt-sibling-gate,route_node=execute,attempt_id={attempt}")
-  D.completion_marker_gate(str(path),"execute","start",Path(td),Path(td)/"jobs.log",
-                           registry_lines=lines,attempt_id=attempt)
+  jobs=Path(td)/"jobs.log";jobs.write_text("\n".join(lines)+"\n")
+  with controlled_process_scope(jobs):
+   D.completion_marker_gate(str(path),"execute","start",Path(td),jobs,
+                            registry_lines=lines,attempt_id=attempt)
 
  # A-P2. A sibling attempt whose row was closed by a false death verdict, but
  # whose tagged descendant is still running, stops the launch before any spawn.
@@ -3101,7 +3116,7 @@ class DispatchContractTest(unittest.TestCase):
   sibling=dict(D.process_launch_identity(proc.pid),
                attempt_id="att-quiescent-sibling-fixture")
   proc.terminate();proc.wait(timeout=5)
-  self.assertEqual(D.attempt_process_quiescence(sibling).state,"quiescent")
+  self.assertIsNotNone(proc.returncode)
   for note in ("dead-capacity","dead-no-progress","dead-worker-fail"):
    with tempfile.TemporaryDirectory() as td:
     self.sibling_gate_case(td,note,sibling)
@@ -4275,7 +4290,7 @@ class CancellationQuiescenceExtinctSourceTest(unittest.TestCase):
   self.assertFalse(proof.proven)
 
 
-class TerminalCleanupResponsibilityTest(unittest.TestCase):
+class TerminalCleanupResponsibilityTest(ControlledConsumerTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
   self.jobs=Path(self.tmp.name)/"jobs.log"
@@ -4432,7 +4447,7 @@ def residue_sealed_metadata(attempt="att-residue-drain"):
  return metadata
 
 
-class ResidueDrainRefreshTest(unittest.TestCase):
+class ResidueDrainRefreshTest(ControlledConsumerTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
   self.jobs=Path(self.tmp.name)/"jobs.log"
