@@ -109,6 +109,7 @@ utility-deferred	commit_policy.py
 utility-deferred	compose-route.py
 utility-deferred	compose_route.test.py
 utility-deferred	compute-hosts.py
+utility-deferred	gpu_leases.py
 utility-deferred	dispatch-artifact-root.test.py
 utility-deferred	dispatch-attempt-ready.py
 utility-deferred	dispatch-batch.py

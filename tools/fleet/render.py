@@ -5751,6 +5751,15 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
                 _compute_host_rows.fold_rows.append({"line": len(rows),
                     "card_key": _gpu_fold_key(host.get("host"), gpu.get("index")), "folded": folded})
             rows.append(_clip_segs([(indent, None)] + token + chip, width)[0])
+            for lease in gpu.get("reservations") or ():
+                owner = lease.get("owner") or {}
+                label = owner.get("label") or "%s:%s" % (owner.get("harness", "?"), str(owner.get("id", "unknown"))[:8])
+                started = lease.get("started_at")
+                when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
+                task = _gpu_safe_text(lease.get("task") or lease.get("run_id") or "?")
+                reserved = [(indent + "  reserved ", "lvl_y"), (_gpu_safe_text(label), "tag"),
+                            (" · " + when + " · " + task, "dim")]
+                rows.append(_clip_segs(reserved, width)[0])
             if not folded:
                 rows.extend(_gpu_process_rows(gpu, indent, width))
     return rows

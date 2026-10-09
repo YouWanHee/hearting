@@ -23,6 +23,7 @@ CLEAN_ENV = {k: v for k, v in os.environ.items() if not (
     or k.startswith("AGENT_ARTIFACT_")
 )}
 CLEAN_ENV["AGENT_HOME"] = str(ROOT)
+CLEAN_ENV["CUDA_VISIBLE_DEVICES"] = ""  # authorization/lifecycle fixtures run CPU payloads
 RUNNER = ROOT / "utilities" / "resource-runner.py"
 ROUTER = ROOT / "utilities" / "capability-route.py"
 SMOKE = ROOT / "tools" / "smoke-attestation.py"
