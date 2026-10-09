@@ -1381,9 +1381,18 @@ def probe_host(name, host, owner_claims=None, ssh_session_bridges=None):
         ssh_session_bridges = collect_ssh_session_bridges()
     bridges_json = json.dumps(list(ssh_session_bridges)[:SSH_BRIDGE_MAX_CONNECTIONS],
                               ensure_ascii=False, separators=(",", ":"))
+    import gpu_leases
+    lease_source = Path(gpu_leases.__file__).read_text()
+    lease_code = ("\ntry:\n    lease_api = {}\n    exec(%r, lease_api)\n"
+                  "    payload['gpu_leases'] = lease_api['snapshot'](%r)\n"
+                  "except Exception as exc:\n    payload['reservation_detail'] = str(exc)[:120]\n") % (
+                      lease_source, str(gpu_leases.state_path()))
+    ending = "print(json.dumps(payload, ensure_ascii=False, sort_keys=True))"
+    before, after = PROBE_SCRIPT.rsplit(ending, 1)
+    probe_script = before + lease_code + ending + after
     script = ("export HEARTING_OWNER_CLAIMS_JSON=%s\n"
               "export HEARTING_SSH_SESSION_BRIDGES_JSON=%s\n%s") % (
-                  shlex.quote(claims_json), shlex.quote(bridges_json), PROBE_SCRIPT)
+                  shlex.quote(claims_json), shlex.quote(bridges_json), probe_script)
     try:
         result = remote(host, script, timeout=GPU_PROBE_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1413,6 +1422,8 @@ def probe_host(name, host, owner_claims=None, ssh_session_bridges=None):
         gpu["free_mib"] = total - used if isinstance(total, int) and isinstance(used, int) else None
         if not isinstance(gpu.get("processes"), list):
             gpu["processes"] = []
+        gpu["reservations"] = [lease for lease in payload.get("gpu_leases", [])
+                               if str(gpu["index"]) in lease.get("gpus", [])]
         gpus.append(gpu)
     row = {"host": name, "reachable": True,
            "hostname": payload.get("hostname"), "load": payload.get("load"),
@@ -1425,6 +1436,8 @@ def probe_host(name, host, owner_claims=None, ssh_session_bridges=None):
            "swap_used_mib": payload.get("swap_used_mib"),
            "gpus": gpus, "observed_at": payload.get("observed_at") or observed_at,
            "unmatched_processes": payload.get("unmatched_processes") or []}
+    if payload.get("reservation_detail"):
+        row["reservation_detail"] = payload["reservation_detail"]
     if payload.get("gpu_error"):
         row["detail"] = str(payload["gpu_error"])[:120]
     if payload.get("process_error"):
@@ -1498,6 +1511,18 @@ def cmd_list(args):
         cpu_text = "%s%%" % cpu if isinstance(cpu, int) else "—"
         print(f" {here}{row['host']:<10} up   cpu {cpu_text:<4} "
               f"load {row.get('load', '?')}  | {summary}")
+        import gpu_leases
+        for gpu in row["gpus"]:
+            for lease in gpu.get("reservations", []):
+                print(f"    gpu{gpu['index']} reserved: {gpu_leases.description(lease)}")
+            if not gpu.get("reservations"):
+                for process in gpu.get("processes", []):
+                    owner = process.get("session_owner") or process.get("owner")
+                    print(f"    gpu{gpu['index']} in use: {gpu_leases.owner_label(owner)} · "
+                          f"{process.get('command') or process.get('process_name') or 'GPU process'} · "
+                          f"pid {process.get('pid', '?')}")
+        if row.get("reservation_detail"):
+            print(f"    reservations unknown: {row['reservation_detail']}")
     return 0
 
 
@@ -1623,25 +1648,27 @@ def _run_id(host_name, label, now, run_root=None):
 
 
 def _run_gpu_observation(name, host):
-    """Use the normal bounded probe; a snapshot never grants or denies a run."""
+    """Use the normal bounded probe; admission also checks locked reservations."""
     try:
         row = probe_host(name, host, ssh_session_bridges=[])
     except (OSError, subprocess.TimeoutExpired) as exc:
         row = {"reachable": False, "detail": str(exc)[:120], "gpus": [],
                "observed_at": datetime.datetime.now().timestamp()}
     gpus = [{key: gpu.get(key) for key in
-             ("index", "name", "free_mib", "total_mib", "utilization_gpu_pct")}
+             ("index", "uuid", "name", "free_mib", "total_mib", "utilization_gpu_pct", "processes", "reservations")}
             for gpu in row.get("gpus", [])]
     idle = [gpu for gpu in row.get("gpus", [])
-            if row.get("reachable") and not row.get("process_detail")
+            if row.get("reachable") and not row.get("process_detail") and not row.get("reservation_detail")
             and gpu.get("utilization_gpu_pct") == 0
             and gpu.get("processes") == []
+            and not gpu.get("reservations")
             and type(gpu.get("free_mib")) is int and gpu["free_mib"] > 0]
     suggested = max(idle, key=lambda gpu: (gpu["free_mib"], -gpu["index"]),
                     default=None)
     return {"observed_at": row.get("observed_at"),
             "reachable": row.get("reachable"), "detail": row.get("detail"),
             "process_detail": row.get("process_detail"), "gpus": gpus,
+            "reservation_detail": row.get("reservation_detail"),
             "suggested_gpu": suggested["index"] if suggested is not None else None}
 
 
@@ -1703,8 +1730,7 @@ def cmd_run(args):
             raise ConfigError(f"host {name} declares no conda root for --env")
         setup.append(f". {shlex.quote(conda)}/etc/profile.d/conda.sh")
         setup.append(f"conda activate {shlex.quote(env)}")
-    if args.gpus:
-        setup.append(f"export CUDA_VISIBLE_DEVICES={shlex.quote(args.gpus)}")
+    setup.append("__HEARTING_GPU_SETUP__")
     preamble = " && ".join(setup)
     body = f"{preamble} && {rendered}" if preamble else rendered
 
@@ -1712,32 +1738,51 @@ def cmd_run(args):
     # mounts it can follow the run without touching the machine running it.
     log_path = run_dir / "log"
     exit_path = run_dir / "exit_code"
-    inner = (f"mkdir -p {shlex.quote(str(run_dir))} && "
-             f"cd {shlex.quote(str(run_dir))} && "
+    inner = (f"cd {shlex.quote(str(run_dir))} && "
              f"( {body} ) > {shlex.quote(str(log_path))} 2>&1; "
              f"run_status=$?; printf '%s\\n' \"$run_status\" "
              f"> {shlex.quote(str(exit_path))}")
-    launch = (
-        f"mkdir -p {shlex.quote(str(run_dir))} && "
-        f"if command -v tmux >/dev/null 2>&1; then "
-        f"tmux new-session -d -s {shlex.quote(run_id)} {shlex.quote(inner)}; "
-        f"else setsid nohup bash -lc {shlex.quote(inner)} "
-        f">/dev/null 2>&1 < /dev/null & fi; echo started"
-    )
     gpu_observation = _run_gpu_observation(name, host)
+    import gpu_leases
+    command_devices = gpu_leases.requested_devices(command)
+    if args.gpus is not None and command_devices is not None and command_devices != args.gpus:
+        raise ConfigError("command CUDA_VISIBLE_DEVICES conflicts with --gpus")
+    requested = args.gpus if args.gpus is not None else gpu_leases.requested_devices(
+        command, os.environ.get("CUDA_VISIBLE_DEVICES"))
+    share = getattr(args, "share", False)
+    lease_owner = gpu_leases.launcher_owner() if owner else None
+    options = {"state_path": str(gpu_leases.state_path()), "observation": gpu_observation,
+               "requested": requested, "share": share, "owner": lease_owner,
+               "task": args.name or rendered, "run_id": run_id, "run_dir": str(run_dir), "inner": inner}
     if args.dry_run:
+        leases = {lease["token"]: lease for gpu in gpu_observation.get("gpus", [])
+                  for lease in gpu.get("reservations") or []}
+        try:
+            selected = gpu_leases.select(gpu_observation, list(leases.values()), requested, share)
+        except gpu_leases.GPUUnavailable as exc:
+            raise ConfigError(str(exc)) from exc
+        preamble = preamble.replace("__HEARTING_GPU_SETUP__", "export CUDA_VISIBLE_DEVICES=" + ",".join(selected))
         print(f"run_id: {run_id}\nrun_dir: {run_dir}\nhost: {name}\n"
               f"would run: {rendered}\nsetup: {preamble}")
         _print_run_gpu_observation(gpu_observation)
         return 0
 
+    source = Path(gpu_leases.__file__).read_text()
+    script = source + ("\ntry:\n    print(json.dumps(launch_compute(%r, %r)))\n"
+                       "except Exception as exc:\n    print(str(exc), file=sys.stderr)\n    raise SystemExit(2)\n") % (options, source)
+    launch = "python3 -c " + shlex.quote(script)
     result = remote(host, launch)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
-        print(f"launch failed on {name}: {detail[:300]}", file=sys.stderr)
+        print(f"launch failed on {name}: {detail}", file=sys.stderr)
         return 1
+    try:
+        admission = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise ConfigError("invalid GPU launch receipt") from exc
     meta = {"run_id": run_id, "host": name, "command": command,
-            "cwd": workdir, "env": env, "gpus": args.gpus,
+            "cwd": workdir, "env": env, "gpus": admission["gpus"],
+            "gpu_lease": admission.get("gpu_lease"), "share": share,
             "gpu_observation": gpu_observation,
             "provenance": {"agent_home": provenance.get("AGENT_HOME"),
                            "attempt_id": provenance.get("AGENT_DISPATCH_ATTEMPT_ID"),
@@ -2102,6 +2147,7 @@ def build_parser():
     p_run.add_argument("--env", help="conda environment to activate")
     p_run.add_argument("--cwd", help="working directory on that host")
     p_run.add_argument("--gpus", help="value for CUDA_VISIBLE_DEVICES")
+    p_run.add_argument("--share", action="store_true", help="Allow intentional GPU sharing")
     p_run.add_argument("--name", help="label appended to the run id")
     p_run.add_argument("--dry-run", action="store_true")
     p_run.add_argument("--json", action="store_true")

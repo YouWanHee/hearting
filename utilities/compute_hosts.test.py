@@ -176,14 +176,16 @@ class RunGPUObservationTest(unittest.TestCase):
         self.config = {"run_root": self.run_root, "hosts": {"here": self.host}}
 
     def session_receipt(self, values):
+        import gpu_leases
         args = SimpleNamespace(host="here", command=["true"], name="identity",
                                cwd=None, env=None, gpus=None, dry_run=False, json=True)
         output = io.StringIO()
         with mock.patch.dict(os.environ, values, clear=True), \
+                mock.patch.object(gpu_leases, "state_path", return_value=self.run_root.parent / "gpu-leases.json"), \
                 mock.patch.object(self.module, "load_config", return_value=self.config), \
                 mock.patch.object(self.module, "_run_gpu_observation", return_value={}), \
                 mock.patch.object(self.module, "remote", return_value=subprocess.CompletedProcess(
-                    [], 0, "started", "")) as launch, \
+                    [], 0, '{"gpus": null}', "")) as launch, \
                 mock.patch.object(self.module, "_launcher_provenance", return_value={}), \
                 mock.patch.object(self.module, "_launcher_route", return_value=None), \
                 mock.patch.object(self.module, "_spawn_completion_watch", return_value=False), \
@@ -213,16 +215,16 @@ class RunGPUObservationTest(unittest.TestCase):
         for key, _harness in self.module.SESSION_ENV_KEYS:
             self.assertNotIn("export " + key + "=", launch)
 
-    def run_receipt(self, row, *, dry_run=False, json_output=False):
+    def run_receipt(self, row, *, dry_run=False, json_output=False, cpu=False):
         args = SimpleNamespace(host="here", command=["true"], name="headroom",
-                               cwd=None, env=None, gpus="2", dry_run=dry_run,
+                               cwd=None, env=None, gpus="" if cpu else None, dry_run=dry_run,
                                json=json_output)
         output = io.StringIO()
         with mock.patch.object(self.module, "load_config", return_value=self.config), \
                 mock.patch.object(self.module, "probe_host", side_effect=row if isinstance(row, Exception)
                                   else None, return_value=row) as probe, \
                 mock.patch.object(self.module, "remote", return_value=subprocess.CompletedProcess(
-                    [], 0, "started", "")) as launch, \
+                    [], 0, '{"gpus": "0"}', "")) as launch, \
                 mock.patch.object(self.module, "_launcher_provenance", return_value={}), \
                 mock.patch.object(self.module, "_launcher_route", return_value=None), \
                 mock.patch.object(self.module, "_spawn_completion_watch", return_value=False), \
@@ -232,7 +234,7 @@ class RunGPUObservationTest(unittest.TestCase):
         probe.assert_called_once_with("here", self.host, ssh_session_bridges=[])
         return output.getvalue(), launch
 
-    def test_run_receipt_keeps_headroom_and_only_suggests_measured_idle_gpus(self):
+    def test_run_receipt_keeps_headroom_and_selected_gpu(self):
         row = {"reachable": True, "observed_at": 1728000000, "gpus": [
             {"index": 0, "name": "idle", "free_mib": 9000, "total_mib": 10000,
              "utilization_gpu_pct": 0, "processes": []},
@@ -249,8 +251,8 @@ class RunGPUObservationTest(unittest.TestCase):
         self.assertEqual(observed["observed_at"], row["observed_at"])
         self.assertEqual(observed["suggested_gpu"], 0)
         self.assertEqual(observed["gpus"][2]["utilization_gpu_pct"], None)
-        self.assertEqual(receipt["gpus"], "2")
-        self.assertIn("CUDA_VISIBLE_DEVICES=2", launch.call_args.args[1])
+        self.assertEqual(receipt["gpus"], "0")
+        self.assertIn("launch_compute", launch.call_args.args[1])
         meta = json.loads((self.run_root / receipt["run_id"] / "meta.json").read_text())
         self.assertEqual(meta["gpu_observation"], observed)
 
@@ -265,11 +267,11 @@ class RunGPUObservationTest(unittest.TestCase):
         launch.assert_not_called()
         self.assertFalse(self.run_root.exists())
 
-    def test_failed_probe_preserves_launch_and_unknown_receipt(self):
+    def test_failed_probe_preserves_explicit_cpu_launch_and_unknown_receipt(self):
         for row in ({"reachable": False, "observed_at": 1728000000,
                      "detail": "timed out", "gpus": []}, OSError("probe unavailable")):
             with self.subTest(row=row):
-                text, launch = self.run_receipt(row)
+                text, launch = self.run_receipt(row, cpu=True)
                 self.assertIn("started ", text)
                 self.assertIn("GPU headroom: unknown", text)
                 self.assertNotIn("suggested:", text)
@@ -280,7 +282,7 @@ class RunGPUObservationTest(unittest.TestCase):
                "process_detail": "compute process query unavailable", "gpus": [
                    {"index": 0, "free_mib": 8000, "utilization_gpu_pct": 0,
                     "processes": []}]}
-        text, _ = self.run_receipt(row, json_output=True)
+        text, _ = self.run_receipt(row, json_output=True, cpu=True)
         self.assertIsNone(json.loads(text)["gpu_observation"]["suggested_gpu"])
 
 
@@ -311,6 +313,8 @@ class ComputeHostsTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_tool(self, *args):
+        if args[:1] == ("run",) and "--gpus" not in args:
+            args = (*args[:2], "--gpus", "", *args[2:])
         return subprocess.run([sys.executable, str(TOOL), *args],
                               text=True, capture_output=True, env=self.env)
 
@@ -634,7 +638,7 @@ class ComputeHostsTest(unittest.TestCase):
         env = {**clean, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
                "CODEX_THREAD_ID": "launch-thread"}
         result = subprocess.run(
-            [sys.executable, str(TOOL), "run", "here", "--name", "tmux-owner",
+            [sys.executable, str(TOOL), "run", "here", "--gpus", "", "--name", "tmux-owner",
              "--", "bash", "-c",
              "printf '%s|%s|%s' \"$CODEX_THREAD_ID\" "
              "\"${CODEX_SESSION_ID-}\" \"${CLAUDE_CODE_SESSION_ID-}\""],
@@ -648,7 +652,7 @@ class ComputeHostsTest(unittest.TestCase):
     def test_conflicting_launcher_sessions_fail_closed_in_nohup_payload(self):
         fakebin = self.root / "nohup-bin"
         fakebin.mkdir()
-        for command in ("bash", "mkdir", "nohup", "setsid"):
+        for command in ("bash", "mkdir", "nohup", "setsid", "python3", "sh"):
             target = Path("/usr/bin") / command
             if not target.exists():
                 target = Path("/bin") / command
@@ -659,7 +663,7 @@ class ComputeHostsTest(unittest.TestCase):
                "CODEX_THREAD_ID": "conflicting-codex",
                "CLAUDE_CODE_SESSION_ID": "conflicting-claude"}
         result = subprocess.run(
-            [sys.executable, str(TOOL), "run", "here", "--name", "nohup-owner",
+            [sys.executable, str(TOOL), "run", "here", "--gpus", "", "--name", "nohup-owner",
              "--", "bash", "-c",
              "printf '%s|%s' \"${CODEX_THREAD_ID-}\" "
              "\"${CLAUDE_CODE_SESSION_ID-}\""],
@@ -724,11 +728,18 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertIn("conda root", result.stderr)
 
     def test_gpu_selection_and_workdir_reach_the_command(self):
-        result = self.run_tool("run", "here", "--gpus", "1", "--cwd", str(self.root),
-                               "--dry-run", "--", "true")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("CUDA_VISIBLE_DEVICES=1", result.stdout)
-        self.assertIn(f"cd {self.root}", result.stdout)
+        module = load_module()
+        observation = {"reachable": True, "gpus": [{"index": 1, "free_mib": 100,
+                        "utilization_gpu_pct": 0, "processes": []}]}
+        out = io.StringIO()
+        with mock.patch.object(module, "load_config", return_value={"run_root": self.run_root,
+             "hosts": {"here": {"ssh_host": "local"}}}), \
+             mock.patch.object(module, "_run_gpu_observation", return_value=observation), \
+             mock.patch("sys.stdout", out):
+            self.assertEqual(module.main(["run", "here", "--gpus", "1", "--cwd", str(self.root),
+                                         "--dry-run", "--", "true"]), 0)
+        self.assertIn("CUDA_VISIBLE_DEVICES=1", out.getvalue())
+        self.assertIn(f"cd {self.root}", out.getvalue())
 
     def test_host_probes_run_in_parallel_and_keep_inventory_order(self):
         module = load_module()
@@ -1251,6 +1262,8 @@ class LauncherProvenanceTest(unittest.TestCase):
         return env
 
     def run_tool(self, *args, env=None):
+        if args[:1] == ("run",) and "--gpus" not in args:
+            args = (*args[:2], "--gpus", "", *args[2:])
         return subprocess.run([sys.executable, str(TOOL), *args],
                               text=True, capture_output=True,
                               env=self.env if env is None else env)

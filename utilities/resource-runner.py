@@ -4,6 +4,8 @@ import argparse, contextlib, fcntl, hashlib, json, os, re, select, signal, subpr
 from pathlib import Path
 import resource_resume as RESOURCE_RESUME
 from resource_progress import environment as progress_environment
+import gpu_leases
+from gpu_execution_sandbox import gpu_resource_nodes
 from resource_run_registry import (
     classify_identity,
     is_alive,
@@ -23,6 +25,7 @@ SENTINEL_SCRIPT = (
     '"$@"; ec=$?; '
     'printf %s "$ec" > "$AGENT_RESOURCE_SENTINEL.partial" 2>/dev/null && '
     'mv "$AGENT_RESOURCE_SENTINEL.partial" "$AGENT_RESOURCE_SENTINEL" 2>/dev/null; '
+    'if [ -n "${HEARTING_GPU_LEASE_RELEASE:-}" ]; then /bin/sh -c "$HEARTING_GPU_LEASE_RELEASE"; fi; '
     'exit $ec'
 )
 
@@ -111,6 +114,8 @@ def controller_argv(registry, row):
     for name in ("smoke_attestation", "config_manifest"):
         if request[name]:
             argv += ["--" + name.replace("_", "-"), request[name]]
+    if row.get("share"):
+        argv += ["--share"]
     return argv + ["--", *row["command"]]
 
 
@@ -161,7 +166,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                        route=str(route_file), jobs=str(jobs))
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
-            "resource_policy", "owner_wait", "launch_request")
+            "resource_policy", "owner_wait", "launch_request", "share")
     import dispatch_resource_wait as OWNER_RESOURCE
     sup = OWNER_RESOURCE.supervisor()
     ledger = sup.ledger_for(route, jobs) if route.get("route_id") else None
@@ -204,6 +209,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     release = None
     watch = None
     payload_released = False
+    lease_path, gpu_lease = None, None
     try:
         register_registry(registry)
         artifacts = prepare_route_artifact_env(route_file, start=True, jobs=jobs)
@@ -233,6 +239,10 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                               "required_action": "yield-owner-turn", "verification_admitted": False,
                               "workflow_complete": False}))
             return
+        node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
+        lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
+            node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
+            share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
         watch, supervision = start_watch(route_file, jobs, placeholder["cwd"], runtime)
         log = Path(placeholder["log"])
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -245,6 +255,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         launch_argv = ["/bin/sh", "-c", 'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
                        + SENTINEL_SCRIPT, "resource-runner", *(controller.command if controller else placeholder["command"])]
         environment.update(progress_environment(placeholder))
+        environment.update(HEARTING_GPU_LEASE_RELEASE="")
+        environment.update(gpu_env)
         environment.update(HEARTING_RESOURCE_RUN_ID=args.run_id, HEARTING_RESOURCE_REGISTRY=str(registry.resolve()))
         environment.update(AGENT_RESOURCE_SENTINEL=str(sentinel), AGENT_RESOURCE_LAUNCH_FD=str(wait_read))
         try:
@@ -263,8 +275,12 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             time.sleep(.01)
         if not ident or not RESOURCE_RESUME.supervisor_alive(supervision):
             raise ValueError("resource-launch-identity-unconfirmed")
+        if gpu_lease:
+            gpu_leases.bind(lease_path, gpu_lease, gpu_leases.identity(proc.pid))
         row = {**placeholder, **ident, "pid_namespace": os.readlink("/proc/self/ns/pid"), "process_group": os.getpgid(proc.pid), "launch_argv": launch_argv,
                "status": "running", "workflow_state": "RUNNING", "supervision": supervision}
+        if gpu_lease:
+            row.update(gpu_lease=gpu_lease, gpus=",".join(gpu_lease["gpus"]))
         if controller is not None:
             row.update(launch_state="started", pid_namespace=controller.identity["pid_namespace"],
                        payload_sandbox=controller.sandbox)
@@ -293,6 +309,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=2)
         if not payload_released:
+            gpu_leases.release(lease_path, gpu_lease)
             if watch is not None and watch.poll() is None:
                 # This is our unreaped child, not a PID rediscovered in a registry.
                 with contextlib.suppress(ProcessLookupError):
@@ -324,6 +341,7 @@ def main(argv=None, *, controller=None):
     a=s.add_parser("start"); a.add_argument("--run-id",required=True); a.add_argument("--cwd",required=True); a.add_argument("--log",required=True); a.add_argument("--route",required=True); a.add_argument("--node",required=True); a.add_argument("--smoke-attestation"); a.add_argument("--config-manifest")
     a.add_argument("--parent-attempt-id",help="registered headless attempt that owns this resource child")
     a.add_argument("--jobs", help="canonical dispatch registry for the existing continuation")
+    a.add_argument("--share", action="store_true", help="Allow intentional GPU sharing")
     a.add_argument("command",nargs=argparse.REMAINDER)
     for name in ("status","stop","tail","reap"):
         x=s.add_parser(name); x.add_argument("--run-id",required=True)
@@ -404,6 +422,8 @@ def main(argv=None, *, controller=None):
                      "sentinel":str(sentinel),"progress_file":str(log)+".progress.json",
                      "parent_attempt_id":args.parent_attempt_id,
                      "workflow_state":"READY","started_at":time.time()}
+        if args.share:
+            placeholder["share"] = True
         owner_wait = None
         if not resume and (node.get("continuation") or {}).get("kind") == "supervised":
             import dispatch_resource_wait as OWNER_RESOURCE
@@ -434,23 +454,39 @@ def main(argv=None, *, controller=None):
             sentinel.unlink()
         with contextlib.suppress(OSError):
             Path(str(sentinel)+".partial").unlink()
-        launch_argv=["/bin/sh","-c",SENTINEL_SCRIPT,"resource-runner",*command]
-        environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel),
-                     "HEARTING_RESOURCE_RUN_ID": args.run_id, "HEARTING_RESOURCE_REGISTRY": str(registry.resolve())}
-        out=open(log,"ab",buffering=0)
+        lease_path, gpu_lease, gpu_env = None, None, {}
         try:
-            proc=subprocess.Popen(launch_argv,cwd=cwd,env=environment,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
+            lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
+                node, command, gpu_scoped=args.node in gpu_resource_nodes(route),
+                share=args.share, jobs=args.jobs, run_id=args.run_id)
         except Exception:
-            out.close()
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             raise
+        wait_read, release = os.pipe()
+        launch_argv=["/bin/sh","-c",'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
+                     + SENTINEL_SCRIPT,"resource-runner",*command]
+        environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel),
+                     "HEARTING_RESOURCE_RUN_ID": args.run_id, "HEARTING_RESOURCE_REGISTRY": str(registry.resolve()),
+                     "HEARTING_GPU_LEASE_RELEASE": "", **gpu_env, "AGENT_RESOURCE_LAUNCH_FD": str(wait_read)}
+        out=open(log,"ab",buffering=0)
+        try:
+            proc=subprocess.Popen(launch_argv,cwd=cwd,env=environment,pass_fds=(wait_read,),stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
+        except Exception:
+            out.close()
+            os.close(wait_read); os.close(release)
+            gpu_leases.release(lease_path, gpu_lease)
+            locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
+            raise
+        os.close(wait_read)
         ident=None
         for _ in range(20):
             ident=proc_identity(proc.pid)
             if ident: break
             time.sleep(.01)
         if not ident:
+            os.close(release)
             proc.kill()
+            gpu_leases.release(lease_path, gpu_lease)
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             fail("could not establish process identity")
         run={**ident,"pid_namespace":os.readlink("/proc/self/ns/pid"),"run_id":args.run_id,"process_group":os.getpgid(proc.pid),"cwd":str(cwd),"log":str(log),"command":command,
@@ -460,7 +496,25 @@ def main(argv=None, *, controller=None):
              "started_at":placeholder["started_at"]}
         def add(data):
             data["runs"][args.run_id]=run
-        locked_update(registry,add); print(json.dumps(run)); return
+        try:
+            if gpu_lease:
+                gpu_leases.bind(lease_path, gpu_lease, gpu_leases.identity(proc.pid))
+                run.update(gpu_lease=gpu_lease, gpus=",".join(gpu_lease["gpus"]))
+            if args.share:
+                run["share"] = True
+            locked_update(registry,add)
+            os.write(release, b"start\n")
+        except Exception:
+            gpu_leases.release(lease_path, gpu_lease)
+            def discard_own(data):
+                if data["runs"].get(args.run_id) in (placeholder, run):
+                    data["runs"].pop(args.run_id)
+            locked_update(registry, discard_own)
+            raise
+        finally:
+            os.close(release)
+            out.close()
+        print(json.dumps(run)); return
     data=json.loads(registry.read_text())
     if args.cmd=="list":
         rows=[]
