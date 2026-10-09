@@ -384,8 +384,8 @@ def announced_session(
     The summary owner is launched while the governed worker is still behind its
     launch fence, so an empty log means "not yet", not "not supervised" — caching
     that as unsupervised would pin the follower to the receipt log for the whole
-    run.  The announcement is emitted before the first turn, so a first row that is
-    anything else is a decisive negative.
+    run. Supervisor control rows may precede the announcement. A first native
+    stream row instead establishes a one-shot transcript.
     """
     try:
         with open(path, "rb") as handle:
@@ -400,11 +400,19 @@ def announced_session(
         except ValueError:
             # A torn trailing line is not evidence either way; keep waiting.
             return False, None
+        if (isinstance(row, dict) and row.get("type") != "dispatch.supervisor.session"
+                and str(row.get("type") or "").startswith("dispatch.supervisor.")):
+            continue
         if not isinstance(row, dict) or row.get("type") != "dispatch.supervisor.session":
             return True, None
         session_id = row.get("session_id")
         if isinstance(session_id, str) and ATTEMPT_RE.fullmatch(session_id):
-            return True, {"session_id": session_id, "cwd": row.get("cwd") or ""}
+            announced = {"session_id": session_id, "cwd": row.get("cwd") or ""}
+            if row.get("runtime"):
+                announced["runtime"] = row["runtime"]
+            if row.get("runtime") == "opencode":
+                announced["parent_attempt_id"] = row.get("parent_attempt_id") or ""
+            return True, announced
         return True, None
     return False, None
 
@@ -453,6 +461,26 @@ def _summary_source(log_path: Path, cache: dict[str, Any]) -> Path | None:
     if announced is None:
         cache["source"] = log_path
         return log_path
+    if announced.get("runtime") == "opencode":
+        jobs = os.environ.get("AGENT_DISPATCH_JOBS")
+        match = re.search(r"\.(att-[A-Za-z0-9_-]+)\.opencode\.jsonl$", log_path.name)
+        if not jobs or not match:
+            return None
+        if announced.get("parent_attempt_id") != match[1]:
+            return None
+        row = _read_exact_row(Path(jobs), match[1])
+        metadata = row[1] if row else {}
+        runtime = metadata.get("opencode_runtime_dir")
+        if (metadata.get("harness") != "opencode" or metadata.get("log_file") != str(log_path)
+                or not runtime or not os.path.isabs(runtime)
+                or not re.fullmatch(r"ses_[A-Za-z0-9]+", announced["session_id"])):
+            return None
+        db = Path(runtime) / "data" / "opencode" / "opencode.db"
+        if db.is_file():
+            cache.update(source=db, refresh_source={"kind": "opencode-db", "db_path": str(db),
+                                                   "session_id": announced["session_id"]})
+            return db
+        return None
     transcript = session_transcript(announced)
     if transcript is not None:
         cache["source"] = transcript
@@ -462,10 +490,12 @@ def _summary_source(log_path: Path, cache: dict[str, Any]) -> Path | None:
 def _refresh(
     harness: str, sid: str, transcript: Path, *,
     phase: str, debounce: int, priority: bool, prompt_path: Path | None = None,
+    refresh_source: dict | None = None,
 ) -> bool:
     try:
         from fleet import refresh_title
 
+        source_kw = {"refresh_source": refresh_source} if refresh_source else {}
         return bool(refresh_title.maybe_spawn(
             harness=harness,
             sid=sid,
@@ -474,6 +504,7 @@ def _refresh(
             priority=priority,
             quota_class=phase if phase in {"initial", "final"} else None,
             prompt_path=str(prompt_path) if prompt_path else None,
+            **source_kw,
         ))
     except Exception:
         return False
@@ -582,7 +613,8 @@ def supervise(
                 previous = _read_sidecar(harness, sid)
                 if not initial_requested and not previous.get("summary"):
                     initial_requested = _refresh(
-                        harness, sid, source, phase="initial", debounce=0, priority=True, prompt_path=prompt)
+                        harness, sid, source, phase="initial", debounce=0, priority=True, prompt_path=prompt,
+                        refresh_source=source_cache.get("refresh_source"))
                     if initial_requested:
                         state.update(last_refresh_phase="initial", last_refresh_at=time.time())
                         _atomic_write(state_path, state)
@@ -595,6 +627,7 @@ def supervise(
                         if _refresh(
                             harness, sid, source, phase="periodic",
                             debounce=periodic_debounce, priority=False, prompt_path=prompt,
+                            refresh_source=source_cache.get("refresh_source"),
                         ):
                             state.update(last_refresh_phase="periodic", last_refresh_at=time.time())
                             _atomic_write(state_path, state)
@@ -627,12 +660,20 @@ def supervise(
         while final_size and time.monotonic() < final_deadline:
             sidecar = _read_sidecar(harness, sid)
             offset = sidecar.get("offset") if isinstance(sidecar.get("offset"), int) else 0
-            if offset >= final_size and sidecar.get("summary"):
+            db_source = source_cache.get("refresh_source")
+            db_fresh = False
+            if db_source:
+                from fleet.refresh_title import _opencode_source_signatures
+                stamps = _opencode_source_signatures(str(source))
+                source_ts = max(info[4] / 1e9 for info in stamps.values() if info)
+                db_fresh = (sidecar.get("ts") or 0) >= source_ts
+            if (db_fresh if db_source else offset >= final_size) and sidecar.get("summary"):
                 final_complete = True
                 break
             if not final_started:
                 final_started = _refresh(
-                    harness, sid, source, phase="final", debounce=0, priority=True, prompt_path=prompt)
+                    harness, sid, source, phase="final", debounce=0, priority=True, prompt_path=prompt,
+                    refresh_source=source_cache.get("refresh_source"))
                 if final_started:
                     state.update(last_refresh_phase="final", last_refresh_at=time.time())
                     _atomic_write(state_path, state)
