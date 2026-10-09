@@ -281,13 +281,20 @@ def _verdict_history(node: Mapping[str, Any], marker: Mapping[str, Any], marker_
         evidence_path = evidence.get("path") if isinstance(evidence, dict) else None
         try:
             verdict_path = Path(evidence_path)
-            verdict = snapshot.json(verdict_path, MAX_REPORT_BYTES)
-        except (ProjectionProblem, TypeError):
+            raw = snapshot.read(verdict_path, MAX_REPORT_BYTES)
+            if _digest(raw) != _digest_value(evidence.get("sha256")):
+                raise ProjectionProblem("historical-evidence-unbound")
+            verdict = json.loads(raw.decode("utf-8"))
+        except (ProjectionProblem, TypeError, UnicodeError, ValueError):
             verdict = None
         if (isinstance(verdict, dict) and verdict.get("schema") == "acfu-eval-verdict-v1"
-                and verdict.get("route") == route_id and verdict.get("leg") == node.get("id")):
+                and verdict.get("route") == route_id and verdict.get("leg") == node.get("id")
+                and verdict.get("verdict") in {"PASS", "FAIL"}):
             history.append({"sequence": sequence, "round": verdict.get("round"),
                             "verdict": verdict.get("verdict")})
+        else:
+            history.append({"sequence": sequence, "verdict": "unresolved",
+                            "reason": "historical-evidence-unbound"})
         current, current_path = prior, prior_path
     return history
 
@@ -385,6 +392,16 @@ def _completion(root: Path, cycle_dir: Path, document: Mapping[str, Any], route:
     return {"state": state, "reason": reason, "obligations": obligations}
 
 
+def _verdict_limitations(verdict: Mapping[str, Any]) -> dict[str, Any]:
+    """Carry bounded existing scope disclosures without interpreting them."""
+    result = {}
+    for key in ("unverified", "fallback", "limitations"):
+        value = verdict.get(key)
+        if value is not None and len(json.dumps(value, ensure_ascii=False)) <= 8192:
+            result[key] = value
+    return result
+
+
 def _peer_result(root: Path, route: Mapping[str, Any], node: Mapping[str, Any],
                  cycle_dir: Path, document: Mapping[str, Any], input_revisions: Mapping[str, dict],
                  jobs: Path | None, snapshot: ReadSnapshot) -> tuple[dict[str, Any], str | None]:
@@ -429,11 +446,10 @@ def _peer_result(root: Path, route: Mapping[str, Any], node: Mapping[str, Any],
         if not isinstance(relative, str):
             return ({"leg": node_id, "verdict": "unresolved", "reason": "peer-inputs-malformed"},
                     "peer-inputs-malformed")
-        if not relative.startswith("report/"):
-            continue
         try:
             key = _safe_rel(relative)
-            revision = input_revisions[key]
+            revision = (input_revisions[key] if key.startswith("report/") else
+                        _revision_for(document, cycle_dir, "artifacts/" + key, snapshot))
             expected_path = str(revision["_path"].resolve(strict=True))
         except (ProjectionProblem, KeyError, OSError, ValueError):
             return ({"leg": node_id, "verdict": "unresolved", "reason": "required-input-missing",
@@ -448,6 +464,16 @@ def _peer_result(root: Path, route: Mapping[str, Any], node: Mapping[str, Any],
     try:
         capability_route = artifact_lifecycle._load_capability_route()
         marker_path = capability_route.completion_dir(str(route["route_id"]), jobs=jobs) / f"{node_id}.json"
+        if verdict["verdict"] == "FAIL" and not marker_path.exists():
+            registry_lines = snapshot.read(jobs, MAX_REGISTRY_BYTES).decode(
+                "utf-8", errors="replace").splitlines()
+            dispatch_contract.observe_terminal_review_failure(
+                route, dict(node), str(verdict.get("attempt_id") or ""),
+                verdict_path, output_rev["_sha256"], registry_lines)
+            return ({"leg": node_id, "verdict": "FAIL", "round": verdict["round"],
+                     "attempt_id": verdict["attempt_id"], "currency": "current",
+                     "evidence_digest": output_rev["_sha256"], "history": [],
+                     "limitations": _verdict_limitations(verdict)}, "FAIL")
         marker = snapshot.json(marker_path, 2 * 1024 * 1024)
         evidence = marker.get("evidence") if isinstance(marker, dict) else None
         evidence_path = Path(str(evidence.get("path") or "")) if isinstance(evidence, dict) else None
@@ -460,16 +486,17 @@ def _peer_result(root: Path, route: Mapping[str, Any], node: Mapping[str, Any],
                 or evidence_path.resolve(strict=False) != verdict_path.resolve(strict=False)
                 or _digest_value(evidence.get("sha256")) != output_rev["_sha256"]):
             raise ProjectionProblem("completion-marker-evidence-conflict")
-        currency = dispatch_contract.evidence_currency(route, dict(node), marker_path, marker)
-        gate = dispatch_contract.gate_currency(route, dict(node), marker_path, marker)
+        currency = dispatch_contract.evidence_currency(route, dict(node), marker_path, marker, observe=True)
+        gate = dispatch_contract.gate_currency(route, dict(node), marker_path, marker, observe=True)
         if currency.state != "current" or gate.state != "current":
-            raise ProjectionProblem("completion-marker-not-current")
+            raise ProjectionProblem(getattr(currency if currency.state != "current" else gate,
+                                            "reason", "completion-marker-not-current"))
         registry_lines = snapshot.read(jobs, MAX_REGISTRY_BYTES).decode(
             "utf-8", errors="replace").splitlines()
         readiness = dispatch_contract.completion_attempt_readiness(
-            route, dict(node), marker, jobs, registry_lines=registry_lines)
+            route, dict(node), marker, jobs, registry_lines=registry_lines, observe=True)
         if readiness.state != "ready":
-            raise ProjectionProblem("completion-attempt-not-current")
+            raise ProjectionProblem(getattr(readiness, "reason", "completion-attempt-not-current"))
     except ProjectionProblem as exc:
         return ({"leg": node_id, "verdict": "unresolved", "reason": exc.code,
                  "round": verdict["round"], "attempt_id": (marker.get("attempt_id") if "marker" in locals() else None)},
@@ -480,7 +507,8 @@ def _peer_result(root: Path, route: Mapping[str, Any], node: Mapping[str, Any],
     history = _verdict_history(node, marker, marker_path, snapshot, str(route.get("route_id")))
     return ({"leg": node_id, "verdict": verdict["verdict"], "round": verdict["round"],
              "attempt_id": marker.get("attempt_id"), "currency": gate.state,
-             "evidence_digest": output_rev["_sha256"], "history": history}, verdict["verdict"])
+             "evidence_digest": output_rev["_sha256"], "history": history,
+             "limitations": _verdict_limitations(verdict)}, verdict["verdict"])
 
 
 def _resolve_source(source: Path, root: Path, jobs: Path | None, snapshot: ReadSnapshot,
@@ -560,8 +588,11 @@ def _resolve_source(source: Path, root: Path, jobs: Path | None, snapshot: ReadS
                 or route_rows[0].get("route_hash") != route_hash
                 or route_identity.route_hash(route) != route_hash):
             raise ProjectionProblem("route-hash-binding-mismatch")
-        from route_lineage import verified_route_lineage
-        lineage = verified_route_lineage(route, artifact_root=root)
+        from route_lineage import RouteLineageError, verified_route_lineage
+        try:
+            lineage = verified_route_lineage(route, artifact_root=root, observe=True)
+        except RouteLineageError as exc:
+            raise ProjectionProblem(exc.code) from exc
         if not lineage:
             raise ProjectionProblem("route-lineage-unverified")
         report_node = _find_report_node(route, report_revisions)
@@ -614,9 +645,11 @@ def _resolve_source(source: Path, root: Path, jobs: Path | None, snapshot: ReadS
         verdict = ("FAIL" if "FAIL" in valid_verdicts else
                    "PASS" if len(valid_verdicts) == len(peers) and valid_verdicts
                    and all(value == "PASS" for value in valid_verdicts) else "unresolved")
-        reasons = input_failures or [row["reason"] for row in peer_results if row.get("reason")]
-        required_state = "failed" if input_failures else (
-            "confirmed" if verdict in {"PASS", "FAIL"} else "unresolved")
+        reasons = [row["reason"] for row in peer_results if row.get("reason")]
+        unreadable = any(row.get("reason") == "peer-output-unreadable" for row in peer_results)
+        required_state = "failed" if input_failures or unreadable else (
+            "confirmed" if all(row.get("verdict") in {"PASS", "FAIL"}
+                               for row in peer_results) else "unresolved")
         if expected_artifact_id:
             matched = [row for row in report_revisions.values()
                        if row.get("artifact_id") == expected_artifact_id

@@ -326,7 +326,15 @@ remain unchanged. Bind every displayed judgment to the exact selected report
 artifact revision and input digests through existing lineage and currency
 readers. A status query reads existing completion and obligation state without
 creating a verification round, route, proof, input, publication, or durable
-display record.
+display record. Execution compatibility with gates off does not attest evidence
+integrity: read observations retain tombstones, hash/history conflicts, and
+unverified lineage independently of execution permission. A terminal review
+FAIL needs its exact readable attempt and input binding, not a PASS completion
+marker. Historical verdicts require bytes bound to the historical evidence
+digest; unavailable originals remain unresolved. Required input observation
+is confirmed only when every required peer input/output was observed, even
+when another peer establishes FAIL. Existing unverified/fallback limitations
+travel with the read payload without adding execution requirements.
 
 Schema v2 stays exact: experiment logs, report documents, and media are ordinary
 members of `files[]`; adding them never adds manifest properties or creates a

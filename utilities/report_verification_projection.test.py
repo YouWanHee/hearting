@@ -26,6 +26,12 @@ import peer_obligations  # noqa: E402
 import route_identity  # noqa: E402
 import route_lineage  # noqa: E402
 
+REAL_EVIDENCE = dispatch_contract.evidence_currency
+REAL_GATE = dispatch_contract.gate_currency
+REAL_READINESS = dispatch_contract.completion_attempt_readiness
+REAL_LINEAGE = route_lineage.verified_route_lineage
+REAL_ROUTE_HASH = route_identity.route_hash
+
 
 ROOT_ID = "root_" + "a" * 32
 CYCLE_ID = "cyc_" + "b" * 32
@@ -278,7 +284,8 @@ class ProjectionBehaviorTests(ProjectionFixture):
                                            "leg": leg, "verdict": "FAIL", "round": 1}))
         prior_marker = {"schema_version": 2, "stage_authority": "attempt",
                         "route_id": ROUTE_ID, "node_id": leg,
-                        "evidence": {"path": str(prior_verdict)}}
+                        "evidence": {"path": str(prior_verdict),
+                                     "sha256": sha(prior_verdict.read_bytes())}}
         prior_marker_path = self.marker_dir / f"{leg}.1.json"
         prior_marker_path.write_bytes(encoded(prior_marker))
         marker_path = self.marker_dir / f"{leg}.json"
@@ -368,6 +375,215 @@ class ProjectionBehaviorTests(ProjectionFixture):
         self.assertIn("검증 통과", html_result.stdout)
         self.assertIn("file://", html_result.stdout)
         self.assertEqual(tree_snapshot(base), before)
+
+
+class ClosedFindingTests(ProjectionFixture):
+    def real_currency(self, leg="independent-verify"):
+        node = next(n for n in self.route["nodes"] if n["id"] == leg)
+        node["dispatch_depth"] = 2
+        node["completion_gate"] = "review"
+        marker_path = self.marker_dir / f"{leg}.json"
+        marker = json.loads(marker_path.read_text())
+        marker.update(sequence=1, registry_digest=None, completion_gate="review",
+                      dispatch_depth=2, transport="headless",
+                      execution_surface="registered-headless", registered_worker=True,
+                      fallback_hop="same-harness-headless")
+        link = {key: marker.get(key) for key in (
+            "schema_version", "route_id", "node_id", "attempt_id", "dispatch_depth",
+            "transport", "execution_surface", "registered_worker", "fallback_hop")}
+        link.update(evidence_sha256=marker["evidence"]["sha256"],
+                    completion_marker=str(marker_path),
+                    completion_marker_history=str(self.marker_dir / f"{leg}.1.json"))
+        (self.marker_dir / f"{leg}.{marker['attempt_id']}.attempt.json").write_bytes(encoded(link))
+        self.save_marker(leg, marker)
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(dispatch_contract, "evidence_currency", REAL_EVIDENCE).start()
+        mock.patch.object(dispatch_contract, "gate_currency", REAL_GATE).start()
+        return node, marker_path, marker
+
+    def save_marker(self, leg, marker):
+        for name in (f"{leg}.json", f"{leg}.{marker['sequence']}.json"):
+            (self.marker_dir / name).write_bytes(encoded(marker))
+
+    def test_gates_off_tombstone_is_execution_current_but_read_unresolved(self):
+        node, path, marker = self.real_currency()
+        marker["state"] = "superseded-by-upstream-revision"
+        self.save_marker(node["id"], marker)
+        with mock.patch.dict(os.environ, HEARTING_GATES="off"):
+            self.assertEqual(REAL_GATE(self.route, node, path, marker).state, "current")
+            self.assertEqual(REAL_GATE(self.route, node, path, marker, observe=True).state, "superseded")
+            before = tree_snapshot(Path(self.tmp.name))
+            self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
+            self.assertEqual(tree_snapshot(Path(self.tmp.name)), before)
+            self.assertEqual(os.environ["HEARTING_GATES"], "off")
+
+    def test_history_conflict_and_live_digest_edit_are_not_read_current(self):
+        node, path, marker = self.real_currency()
+        prior = dict(marker, route_hash="sha256:" + "0" * 64)
+        (self.marker_dir / f"{node['id']}.1.json").write_bytes(encoded(prior))
+        with mock.patch.dict(os.environ, HEARTING_GATES="off"):
+            self.assertEqual(REAL_GATE(self.route, node, path, marker).state, "current")
+            self.assertNotEqual(REAL_GATE(self.route, node, path, marker, observe=True).state, "current")
+            self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
+            self.save_marker(node["id"], marker)
+            self.peer_paths[node["id"]].write_bytes(b"changed evidence")
+            self.assertEqual(REAL_EVIDENCE(self.route, node, path, marker).state, "current")
+            self.assertEqual(REAL_EVIDENCE(self.route, node, path, marker, observe=True).state,
+                             "revised-unrecorded")
+
+    def test_attempt_hash_mismatch_retains_execution_compatibility(self):
+        node, path, marker = self.real_currency()
+        meta = self.terminal_metadata(node["id"])
+        meta["route_hash"] = "sha256:" + "0" * 64
+        meta["note"] = "completed-marker"
+        lines = [self.registry_line(meta)]
+        with mock.patch.dict(os.environ, HEARTING_GATES="off"):
+            self.assertEqual(REAL_READINESS(self.route, node, marker, self.jobs,
+                                           registry_lines=lines).state, "ready")
+            result = REAL_READINESS(self.route, node, marker, self.jobs,
+                                    registry_lines=lines, observe=True)
+            self.assertEqual(result.reason, "attempt-route-hash-mismatch")
+            with mock.patch.object(dispatch_contract, "completion_attempt_readiness", REAL_READINESS):
+                self.jobs.write_text(lines[0] + "\n")
+                self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
+
+    def test_real_lineage_source_hash_mismatch_cannot_pass(self):
+        parent = dict(self.route, route_id="rt-" + "a" * 16)
+        parent["route_hash"] = REAL_ROUTE_HASH(parent)
+        routes = self.root / ".runtime" / "routes"
+        routes.mkdir(parents=True)
+        (routes / f"{parent['route_id']}.json").write_bytes(encoded(parent))
+        self.route.update(continuation_contract_version=1, source_route_id=parent["route_id"],
+                          source_route_hash="sha256:" + "0" * 64)
+        self.route["route_hash"] = REAL_ROUTE_HASH(self.route)
+        self.document["routes"][0]["route_hash"] = self.route["route_hash"]
+        self.route_path.write_bytes(encoded(self.route))
+        (self.cycle / "manifest.json").write_bytes(encoded(self.document))
+        with mock.patch.dict(os.environ, HEARTING_GATES="off"), mock.patch.object(
+                route_identity, "route_hash", REAL_ROUTE_HASH), mock.patch.object(
+                route_lineage, "verified_route_lineage", REAL_LINEAGE):
+            self.assertEqual(len(REAL_LINEAGE(self.route)), 2)
+            with self.assertRaises(route_lineage.RouteLineageError):
+                REAL_LINEAGE(self.route, observe=True)
+            before = tree_snapshot(Path(self.tmp.name))
+            self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
+            self.assertEqual(tree_snapshot(Path(self.tmp.name)), before)
+
+    def terminal_metadata(self, leg):
+        work = Path(self.tmp.name) / "work"
+        work.mkdir(exist_ok=True)
+        self.route["cwd"] = str(work)
+        self.route_path.write_bytes(encoded(self.route))
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(.1)"],
+                                 start_new_session=True)
+        try:
+            identity = dispatch_contract.process_launch_identity(child.pid)
+        finally:
+            child.wait(timeout=5)
+        return dict(identity, attempt_schema_version="2", dispatch_depth="2", transport="headless",
+                    execution_surface="registered-headless", registered_worker="1",
+                    fallback_hop="same-harness-headless", worker_type="review",
+                    artifact_root=str(self.root), route_id=ROUTE_ID, route_hash=ROUTE_HASH,
+                    route_node=leg, attempt_id=self.attempts[leg], note="completed-review-blocking")
+
+    def registry_line(self, meta):
+        return "\t".join(["fixture", "done", self.route["cwd"], self.route["cwd"], "-",
+                            ",".join(f"{key}={value}" for key, value in meta.items())])
+
+    def terminal_fail(self):
+        leg = "independent-verify"
+        self.revise_peer(leg, "FAIL")
+        (self.marker_dir / f"{leg}.json").unlink()
+        meta = self.terminal_metadata(leg)
+        log = Path(self.tmp.name) / "review.log"
+        text = f"artifact: {self.peer_paths[leg]}\nverdict: FAIL\nblocker: scientific finding\n"
+        log.write_bytes(encoded({"type": "item.completed", "item": {"type": "agent_message",
+                              "text": text}}) + encoded({"type": "turn.completed"}))
+        meta["log_file"] = str(log)
+        self.jobs.write_text(self.registry_line(meta) + "\n")
+        return meta
+
+    def test_markerless_fail_uses_real_terminal_inspector_and_preserves_axes(self):
+        self.terminal_fail()
+        with mock.patch.dict(os.environ, AGENT_ARTIFACT_ROOT=str(self.root)):
+            before = tree_snapshot(Path(self.tmp.name))
+            result = self.payload()
+            self.assertEqual(result["verification"]["verdict"], "FAIL")
+            self.assertEqual(result["completion"]["state"], "complete")
+            self.assertEqual(result["required_input_observation"]["state"], "confirmed")
+            self.assertEqual(tree_snapshot(Path(self.tmp.name)), before)
+            self.revise_peer("independent-verify-alternative", input_digest="0" * 64)
+            self.assertEqual(self.payload()["verification"]["verdict"], "FAIL")
+            self.assertEqual(self.payload()["required_input_observation"]["state"], "failed")
+
+    def test_markerless_fail_wrong_attempt_digest_conflict_and_live_retry_are_unresolved(self):
+        meta = self.terminal_fail()
+        with mock.patch.dict(os.environ, AGENT_ARTIFACT_ROOT=str(self.root)):
+            for key, value in (("attempt_id", "att-wrong"), ("route_hash", "wrong"),
+                               ("terminal_conflict", "1")):
+                bad = dict(meta, **{key: value})
+                self.jobs.write_text(self.registry_line(bad) + "\n")
+                self.assertEqual(self.payload()["verification"]["verdict"], "unresolved", key)
+            retry = dict(meta, attempt_id="att-active-retry")
+            self.jobs.write_text(self.registry_line(meta) + "\n" +
+                                self.registry_line(retry).replace("\tdone\t", "\trunning\t") + "\n")
+            self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
+            self.jobs.write_text(self.registry_line(meta) + "\n")
+            # The marker is intentionally absent: change the bound input and manifest only.
+            value = json.loads(self.peer_paths["independent-verify"].read_text())
+            value["inputs"][next(iter(value["inputs"]))] = "0" * 64
+            path = self.peer_paths["independent-verify"]
+            path.write_bytes(encoded(value))
+            for row in self.document["artifact_revisions"]:
+                if row["locator"]["path"] == "artifacts/reviews/eval-verdict.json":
+                    row.update(content_digest="sha256:" + sha(path.read_bytes()), byte_size=path.stat().st_size)
+            (self.cycle / "manifest.json").write_bytes(encoded(self.document))
+            self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
+
+    def test_reused_historical_path_never_substitutes_current_pass(self):
+        self.real_currency("independent-verify-alternative")
+        node, path, prior = self.real_currency()
+        leg = node["id"]
+        self.revise_peer(leg, "FAIL")
+        prior = json.loads(path.read_text())
+        self.save_marker(leg, prior)
+        link_path = self.marker_dir / f"{leg}.{prior['attempt_id']}.attempt.json"
+        link = json.loads(link_path.read_text())
+        link["evidence_sha256"] = prior["evidence"]["sha256"]
+        link_path.write_bytes(encoded(link))
+        prior_raw = (self.marker_dir / f"{leg}.1.json").read_bytes()
+        self.revise_peer(leg, "PASS")
+        current = json.loads(path.read_text())
+        current.update(sequence=2, stage_authority="revision",
+                       revision={"of_sequence": 1, "of_marker_sha256": sha(prior_raw),
+                                 "evidence_sha256": current["evidence"]["sha256"]})
+        self.save_marker(leg, current)
+        with mock.patch.dict(os.environ, HEARTING_GATES="off"):
+            self.assertEqual(REAL_GATE(self.route, node, path, current, observe=True).state, "current")
+            result = self.payload()
+            self.assertEqual(result["verification"]["verdict"], "PASS")
+            self.assertEqual(result["verification"]["history"], [{"sequence": 1,
+                "verdict": "unresolved", "reason": "historical-evidence-unbound"}])
+
+    def test_existing_scope_disclosures_travel_with_peer_payload(self):
+        leg = "independent-verify"
+        path = self.peer_paths[leg]
+        value = json.loads(path.read_text())
+        value.update(unverified=["browser observation"], fallback={"approved": True})
+        path.write_bytes(encoded(value))
+        self.revise_peer(leg)
+        payload = self.payload()
+        peer = next(row for row in payload["verification"]["peers"] if row["leg"] == leg)
+        self.assertEqual(peer["limitations"], {"unverified": ["browser observation"],
+                                             "fallback": {"approved": True}})
+
+    def test_fail_and_deleted_required_peer_output_do_not_confirm_inputs(self):
+        self.revise_peer("independent-verify", "FAIL")
+        self.peer_paths["independent-verify-alternative"].unlink()
+        result = self.payload()
+        self.assertEqual(result["verification"]["verdict"], "FAIL")
+        self.assertEqual(result["required_input_observation"]["state"], "failed")
+        self.assertIn("peer-output-unreadable", result["required_input_observation"]["reasons"])
 
 
 def tree_snapshot(root):
