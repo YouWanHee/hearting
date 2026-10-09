@@ -941,7 +941,7 @@ def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> boo
             if len(fields) != 6:
                 return False
             meta = dispatch_contract.parse_registry_metadata(fields[5])
-            if meta.get("route_id") == route["route_id"] or meta.get("owner_route_id") == route["route_id"]:
+            if route["route_id"] in {meta.get("route_id"), meta.get("route"), meta.get("owner_route_id")}:
                 return False
         markers = module.completion_dir(route["route_id"], jobs=jobs)
         if markers.exists() and any(markers.iterdir()):

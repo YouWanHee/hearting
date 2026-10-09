@@ -5071,11 +5071,16 @@ class RouteLineageBindingTest(ProducerTestBase):
         self.assertTrue(P._closed_unexecuted_continuation(self.root, successor))
         self.assertTrue(P.cycle_route_admission(self.root, record, begin, finalize=True).allow)
 
-        for launch_started in ("0", "1"):
-            self.jobs.write_text(f"2026-10-09\tdone\t{R.ROOT}\t{R.ROOT}\tchild\t"
-                                 f"route_id={successor['route_id']},attempt_id=att-child,launch_started={launch_started}\n")
-            self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
-            self.assertFalse(P.cycle_route_admission(self.root, record, begin, finalize=True).allow)
+        for metadata_key in ("route_id", "route", "owner_route_id"):
+            for launch_started in ("0", "1"):
+                for registry_status in ("open", "done"):
+                    with self.subTest(metadata_key=metadata_key, launch_started=launch_started,
+                                      registry_status=registry_status):
+                        self.jobs.write_text(f"2026-10-09\t{registry_status}\t{R.ROOT}\t{R.ROOT}\tchild\t"
+                                             f"{metadata_key}={successor['route_id']},attempt_id=att-child,"
+                                             f"launch_started={launch_started}\n")
+                        self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
+                        self.assertFalse(P.cycle_route_admission(self.root, record, begin, finalize=True).allow)
         self.jobs.write_text("corrupt registry row\n")
         self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
         self.jobs.write_text("")
