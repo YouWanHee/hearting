@@ -155,6 +155,158 @@ class AttemptDecision:
         return bool(self.retry_kind) and self.action == "inspect-failure"
 
 
+@dataclass(frozen=True)
+class RegisteredWorkObservation:
+    """One exact registered attempt plus its existing policy and closure evidence."""
+
+    attempt_id: str
+    decision: AttemptDecision
+    process_state: str
+    evidence_state: str
+    owner_completion_state: str = "settled"
+    cleanup_state: str = "settled"
+    provenance: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class PaneObservation:
+    """Native pane evidence; it does not invent a registered attempt or result."""
+
+    server: str
+    pane: str
+    harness: str
+    session_id: str
+    pid_birth: str
+    identity_verified: bool
+    native_turn: str
+    form_state: str = "unknown"
+    draft_state: str = "unknown"
+    bound_work: tuple[RegisteredWorkObservation, ...] = ()
+    bindings_state: str = "observed"
+    provenance: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class CompletionReadiness:
+    """Shared readiness projection; outcome, next action and observation source stay distinct."""
+
+    state: str
+    scope: str
+    outcome: str | None
+    next_owed: str
+    reason: str
+    provenance: tuple[tuple[str, str], ...] = ()
+    identity: tuple[tuple[str, str], ...] = ()
+    form_state: str = "unknown"
+    draft_state: str = "unknown"
+
+
+_SETTLED_WORK_OUTCOMES = frozenset({
+    "succeeded", "failed", "review-blocked", "cancelled",
+})
+_NATIVE_READY_TURNS = frozenset({"idle", "done"})
+_NATIVE_TURN_STATES = frozenset({
+    "idle", "done", "busy", "working", "finalizing", "blocked", "unknown",
+})
+
+
+def _registered_readiness(observation: RegisteredWorkObservation) -> CompletionReadiness:
+    decision = observation.decision
+    provenance = (("attempt_id", observation.attempt_id),
+                  ("process_state", observation.process_state),
+                  ("evidence_state", observation.evidence_state),
+                  ("owner_completion_state", observation.owner_completion_state),
+                  ("cleanup_state", observation.cleanup_state),
+                  *observation.provenance)
+    if (not observation.attempt_id or observation.owner_completion_state not in
+            {"settled", "pending", "unknown"} or observation.cleanup_state not in
+            {"settled", "pending", "unknown"}):
+        return CompletionReadiness("unknown", "registered-work", decision.outcome,
+                                   decision.action, "registered-observation-invalid",
+                                   provenance)
+    if observation.owner_completion_state == "unknown" or observation.cleanup_state == "unknown":
+        return CompletionReadiness("unknown", "registered-work", decision.outcome,
+                                   decision.action, "registered-closure-unknown",
+                                   provenance)
+    if observation.owner_completion_state != "settled" or observation.cleanup_state != "settled":
+        return CompletionReadiness("pending", "registered-work", decision.outcome,
+                                   decision.action, "registered-follow-through-pending",
+                                   provenance)
+    if decision.action == "inspect-conflict" or decision.outcome == "unknown":
+        return CompletionReadiness("unknown", "registered-work", decision.outcome,
+                                   decision.action, decision.reason, provenance)
+    if (decision.action in {"advance", "review", "inspect-failure"}
+            and decision.outcome in _SETTLED_WORK_OUTCOMES):
+        return CompletionReadiness("ready", "registered-work", decision.outcome,
+                                   decision.action, decision.reason, provenance)
+    if decision.action in {"wait", "reconcile", "complete", "recover",
+                           "cancel", "settle-cancellation"}:
+        state = "unknown" if decision.action == "recover" else "pending"
+        return CompletionReadiness(state, "registered-work", decision.outcome,
+                                   decision.action, decision.reason, provenance)
+    return CompletionReadiness("unknown", "registered-work", decision.outcome,
+                               decision.action, "registered-action-unclassified",
+                               provenance)
+
+
+def completion_readiness(
+    observation: RegisteredWorkObservation | PaneObservation,
+) -> CompletionReadiness:
+    """Project registered work or a native pane into one provenance-preserving result.
+
+    Native idle/done means only that the interactive turn is ready. A bound
+    registered attempt is evaluated through its already computed policy decision
+    and can keep the pane pending or unknown.
+    """
+    if isinstance(observation, RegisteredWorkObservation):
+        return _registered_readiness(observation)
+    if not isinstance(observation, PaneObservation):
+        raise TypeError("completion-readiness-observation-invalid")
+    identity = (("server", observation.server), ("pane", observation.pane),
+                ("harness", observation.harness), ("session_id", observation.session_id),
+                ("pid_birth", observation.pid_birth))
+    provenance = (("native_turn", observation.native_turn),
+                  ("bindings_state", observation.bindings_state),
+                  *observation.provenance)
+    if (not observation.identity_verified or any(not value for _, value in identity)):
+        return CompletionReadiness("unknown", "native-turn", None, "observe-identity",
+                                   "pane-identity-unverified", provenance, identity,
+                                   observation.form_state, observation.draft_state)
+    if observation.bindings_state != "observed":
+        return CompletionReadiness("unknown", "native-turn", None, "observe-bound-work",
+                                   "registered-bindings-unavailable", provenance, identity,
+                                   observation.form_state, observation.draft_state)
+    if observation.native_turn not in _NATIVE_TURN_STATES:
+        return CompletionReadiness("unknown", "native-turn", None, "observe-native-turn",
+                                   "native-turn-unclassified", provenance, identity,
+                                   observation.form_state, observation.draft_state)
+    if observation.native_turn not in _NATIVE_READY_TURNS:
+        state = "unknown" if observation.native_turn == "unknown" else "pending"
+        turn = "busy" if observation.native_turn == "working" else observation.native_turn
+        return CompletionReadiness(state, "native-turn", None, "wait-native-turn",
+                                   "native-turn-" + turn, provenance,
+                                   identity, observation.form_state, observation.draft_state)
+    work_results = [completion_readiness(item) for item in observation.bound_work]
+    if any(result.state == "unknown" for result in work_results):
+        return CompletionReadiness("unknown", "native-turn", None, "resolve-bound-work",
+                                   "bound-registered-work-unknown", provenance + tuple(
+                                       pair for result in work_results for pair in result.provenance),
+                                   identity, observation.form_state, observation.draft_state)
+    if any(result.state != "ready" for result in work_results):
+        return CompletionReadiness("pending", "native-turn", None, "finish-bound-work",
+                                   "bound-registered-work-pending", provenance + tuple(
+                                       pair for result in work_results for pair in result.provenance),
+                                   identity, observation.form_state, observation.draft_state)
+    outcomes = {result.outcome for result in work_results}
+    outcome = next(iter(outcomes)) if len(outcomes) == 1 and len(work_results) == 1 else None
+    next_owed = (work_results[0].next_owed if len(work_results) == 1
+                 else "native-turn")
+    return CompletionReadiness("ready", "native-turn", outcome, next_owed,
+                               "native-turn-ready", provenance + tuple(
+                                   pair for result in work_results for pair in result.provenance),
+                               identity, observation.form_state, observation.draft_state)
+
+
 def decide_attempt(
     status: str, metadata: Mapping[str, str], *, process_state: str,
     process_reason: str = "", terminal_observed: bool = False,

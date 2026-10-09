@@ -263,6 +263,12 @@ _FAKE_HERDR = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 target = argv[2] if len(argv) > 2 else "-"
+if argv[:2] == ["pane", "process-info"]:
+    print(json.dumps({"result": {"process_info": {
+        "pane_id": argv[-1], "shell_pid": os.getppid(),
+        "foreground_process_group_id": os.getppid(),
+        "foreground_processes": [{"pid": os.getppid(), "argv": ["zsh"]}]}}}))
+    sys.exit(0)
 print(json.dumps({"result": {"agent": {"agent": "claude",
     "agent_session": {"value": "sid-fake"}, "agent_status": "idle",
     "name": target, "pane_id": "w1:p9"}, "type": "agent_info"}}))

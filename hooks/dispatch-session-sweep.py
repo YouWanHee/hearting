@@ -83,6 +83,22 @@ def main() -> int:
     # Gate notices reach the session here too (SD-123 (8)(b) carrier 2): whether the
     # `asyncRewake` hook process survives an interrupt or a compaction is unmeasured
     # (SD-OPEN-29/32), so the next prompt is the required fallback.
+    #
+    # The same activation also reconnects retained registered-batch observers:
+    # lock-guarded, completed duties are never replayed and the original
+    # assignment is never relaunched. Fail-open like every other path here.
+    try:
+        from dispatch_batch_obligations import ensure_observers
+    except Exception:
+        ensure_observers = None
+    if ensure_observers is not None:
+        for root in seen:
+            try:
+                jobs_log = Path(root) / "jobs.log"
+                if jobs_log.is_file():
+                    ensure_observers(jobs_log)
+            except Exception:  # noqa: BLE001
+                continue
     context = delivery_context(batches)
     for root, records in batches:
         try:

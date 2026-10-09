@@ -29,6 +29,12 @@ target = argv[2] if len(argv) > 2 else "-"
 info = {"result": {"agent": {"agent": "claude", "agent_session": {"value": "sid-fake"},
         "agent_status": "idle", "name": target, "pane_id": "w1:p9"}, "type": "agent_info"}}
 verb = argv[1] if len(argv) > 1 else ""
+if argv[:2] == ["pane", "process-info"]:
+    print(json.dumps({"result": {"process_info": {
+        "pane_id": argv[-1], "shell_pid": os.getppid(),
+        "foreground_process_group_id": os.getppid(),
+        "foreground_processes": [{"pid": os.getppid(), "argv": ["zsh"]}]}}}))
+    sys.exit(0)
 if verb == "wait" and mode == "held":
     with open(os.environ["FAKE_HERDR_FIFO"], "r") as fh:
         fh.read()
@@ -56,6 +62,18 @@ class _HookMixin:
 
     def _env(self, mode="idle", session_id=None):
         env = dict(os.environ)
+        # Drop inherited runtime/session/dispatch identities before supplying
+        # fixture values; a worker runtime's own session id must never become
+        # the fixture steward identity.
+        for key in tuple(env):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_",
+                               "AGENT_THREAD_", "HERDR_")):
+                env.pop(key, None)
+        for key in ("AGENT_SESSION_ID", "AGENT_SESSION_ROLE", "CLAUDE_CODE_SESSION_ID",
+                    "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+                    "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG",
+                    "AGENT_HERDR_SESSION"):
+            env.pop(key, None)
         env["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         # C-1 moved the peer ledger (and _watch_root(), which watch/status read/write
         # through) off the AGENT_DISPATCH_JOBS-anchored resolver onto peer_state_root();
@@ -191,13 +209,16 @@ class DeliveryTest(_HookMixin, unittest.TestCase):
         self.assertIn("state=idle", proc.stderr)
 
         root = self._watch_root()
-        rearmed = [
-            json.loads(p.read_text()) for p in root.glob("*.json")
-            if not p.name.endswith((".receipt.json", ".ack.json"))
+        arms = [
+            (p, json.loads(p.read_text())) for p in root.glob("*.json")
+            if not p.name.endswith((".receipt.json", ".ack.json", ".observation.json"))
         ]
-        children = [a for a in rearmed if a.get("rearmed_from") == fields["watch_id"]]
-        self.assertEqual(len(children), 1, "exactly one rearm")
-        self.assertEqual(children[0]["rearm_count"], 1)
+        # Retained-duty rearm replaces only the observer: the same watch id
+        # survives with a new observer generation, never a second watch row.
+        self.assertEqual([p.name for p, _ in arms], [fields["watch_id"] + ".json"],
+                         "exactly one rearm, same watch id")
+        self.assertEqual(arms[0][1]["rearm_count"], 1)
+        self.assertGreaterEqual(arms[0][1].get("observer_generation", 1), 2)
 
     def test_second_death_is_attention_not_another_rearm(self):
         armed = self._arm(mode="held")

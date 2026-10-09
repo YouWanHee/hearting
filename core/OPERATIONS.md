@@ -383,9 +383,9 @@ separate facts.
 |---|---|---|
 | Start and execution lifetime | Claimed execution boundary | Publish the actual runner identity, enforce its finite budget, and account for governed descendants before releasing resources. |
 | Completion | Exact terminal writer under the jobs lock | Preserve the committed result. A later process observation cannot turn success into failure. |
-| Wait, recovery, and retry eligibility | Shared attempt policy and supervision controller | Reconcile exact evidence, retry only a settled retryable failure, and transfer an unresolved decision to the parent through durable delivery. |
+| Wait, recovery, and retry eligibility | Shared attempt policy and supervision controller | Reconcile exact evidence, retry only a settled retryable failure, and retain the unresolved decision for the existing controller to deliver after an observation checkpoint or receiver restart. |
 | Failure cleanup and supervisor exit | Execution boundary, with the exact post-exit watcher as recovery owner | Finish or retain an explicit cleanup obligation. |
-| User notification | Shared pending-delivery record and recipient runtime carrier | Keep the obligation until accepted or explicitly handed back. A display update or expired polling interval is not delivery. |
+| User notification | Shared pending-delivery record and recipient runtime carrier | Keep the obligation through exact acceptance or receipt; reconnect the existing carrier after observer/session restart. A display update or expired polling interval is not delivery. |
 
 A blocked transition owes either a bounded recovery action or an actionable
 parent notice naming the unresolved attempts and the responsible component.
@@ -393,6 +393,17 @@ An elapsed join interval is a checkpoint, not child death or owner failure.
 Duplicate observations converge on the existing obligation; successful results
 and already accepted notifications are not replayed as retries. Read-only
 queries neither cancel work nor acquire these responsibilities.
+
+The completion duty belongs to the outer controller and durable pending record,
+not to the lifetime of one model turn, watcher process, or tab location. A
+timeout or unavailable observation leaves the same exact duty pending for the
+existing startup/recovery path to resume. Keep committed PASS/FAIL separate from
+delivery and cleanup state. An unknown native observation authorizes no prompt,
+exit key, signal, or pane close. Interactive readiness accepts either exact
+registered-work evidence or a verified native pane observation; an ordinary
+pane with no registered work can be ready for a native turn without implying a
+work result, while any bound unfinished or unobservable registered work keeps
+the common result pending or unknown.
 
 An awaited receipt contains only the exact route-bound batch, including its
 verified owner-route advance; unrelated attempts under the same parent retain
@@ -1664,11 +1675,14 @@ detached watch receipt plus the adapter wake (the watching side reads screen/dis
 directly); `SendMessage` is secondary.
 
 **Detached watch (model-visible).** `peer-steward.py watch <target>` returns one typed
-`state=armed` line carrying the same `parent_next` directive a launch receipt does;
-`join`/`status`/`rearm`/`ack` read the watcher's disk receipt, and every line that is
-not a hook-armed watch (`wake=none`, a dedupe hit, a session-printed `rearm`) prints
-`bounded-wait` with a bounded `join <watch_id>`. Watcher, lock, receipt, and the Claude
-wake hook are runtime-owned (`core/ADAPTATION.md §7.3`).
+`state=armed` line carrying the same `parent_next` directive a launch receipt does.
+The exact server/pane/session obligation remains stored when a bounded observer
+times out, loses herdr, or exits; the existing startup/reconnect path replaces
+only that observer and continues the same watch id. `join`/`status`/`ack` report
+the stored obligation and its current observation; a fulfilled duty may be
+followed by an explicit new watch. A tab is a location hint, not identity.
+Watcher, lock, receipt, and available wake carriers are runtime-owned
+(`core/ADAPTATION.md §7.3`).
 
 Realization (Claude, measured): sending `SendMessage` fires; `PostToolUse(SendMessage)`
 writes one `peer_message_v1` record before the send completes; it lands in the ledger,

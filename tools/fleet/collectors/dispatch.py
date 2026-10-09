@@ -3435,6 +3435,12 @@ def _pending_delivery_counts(paths):
     silently invisible -- reproducing in miniature the exact problem
     SD-111 exists to fix. `expired` is exposed as its own count; expired
     records are never deleted, so this only counts, never removes.
+    `retained_batch_duties` counts unfinished registered-batch obligation
+    records (`supervisor-state/obligations/batch-*.json` in an observing,
+    delivery-pending, or unknown state): duties the existing controller
+    resumes after an observer restart, shown here so a retained
+    late-completion duty is never invisible while it has no delivery
+    record yet.
 
     Enumeration failure fails open: a bad line, an unreadable directory, or
     a corrupt record is skipped, never raised -- the caller keeps every row
@@ -3463,6 +3469,7 @@ def _pending_delivery_counts(paths):
 
     pending = 0
     expired = 0
+    retained_batch_duties = 0
     all_records = set()
     seen_roots = set()
     for path in paths:
@@ -3473,6 +3480,21 @@ def _pending_delivery_counts(paths):
         if root in seen_roots:
             continue
         seen_roots.add(root)
+        obligation_root = root / "supervisor-state" / "obligations"
+        try:
+            duty_files = sorted(obligation_root.glob("batch-*.json"))[:128]
+        except OSError:
+            duty_files = []
+        for duty_file in duty_files:
+            try:
+                if duty_file.is_symlink():
+                    continue
+                duty = json.loads(duty_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(duty, dict) and duty.get("state") in {
+                    "observing", "delivery-pending", "unknown"}:
+                retained_batch_duties += 1
         pending_root = root / "pending-delivery"
         if not pending_root.is_dir():
             continue
@@ -3506,7 +3528,8 @@ def _pending_delivery_counts(paths):
         if (delivery_id, recipient_digest) not in all_records:
             unmaterialized += 1
 
-    return {"pending": pending + unmaterialized, "expired": expired}
+    return {"pending": pending + unmaterialized, "expired": expired,
+            "retained_batch_duties": retained_batch_duties}
 
 
 def _fill_locations(jobs):

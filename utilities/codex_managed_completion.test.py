@@ -87,6 +87,9 @@ class ControlServer:
                 if not chunk:
                     break
                 data.extend(chunk)
+            if not data:
+                connection.close()
+                continue
             request = json.loads(bytes(data).split(b"\n", 1)[0])
             if request.get("op") == "status":
                 response = {
@@ -148,6 +151,7 @@ class ManagedCompletionTest(unittest.TestCase):
             """\
 import json, sys, pathlib
 pathlib.Path(__file__).with_name('join-calls.log').open('a').write('x\\n')
+call_count = len(pathlib.Path(__file__).with_name('join-calls.log').read_text().splitlines())
 mode = sys.argv[1]
 if '--parent-session-id' in sys.argv:
     identity_key = 'parent_session_id'
@@ -156,11 +160,11 @@ else:
     identity_key = 'parent_attempt_id'
     parent = sys.argv[sys.argv.index('--parent-attempt-id') + 1]
 attempts = [sys.argv[i + 1] for i, value in enumerate(sys.argv) if value == '--attempt-id']
-state = 'timeout' if mode == 'timeout' else 'ready'
+state = 'timeout' if mode == 'timeout' or (mode == 'timeout-once' and call_count == 1) else 'ready'
 children = [
     {
         'attempt_id': attempt,
-        'status': 'open' if mode in {'timeout', 'terminal'} else 'done',
+        'status': 'open' if state == 'timeout' or mode == 'terminal' else 'done',
         'readiness': 'ready' if state == 'ready' else 'pending',
         'reason': (
             'terminal-observed' if mode == 'terminal'
@@ -169,7 +173,7 @@ children = [
             else 'process-alive'
         ),
         'required_action': (
-            'complete-open' if mode in {'timeout', 'terminal'}
+            'complete-open' if state == 'timeout' or mode == 'terminal'
             else 'inspect-recovery' if mode == 'closure-blocked'
             else 'advance-completed'
         ),
@@ -187,6 +191,49 @@ raise SystemExit(3 if state == 'timeout' else 0)
 """,
             encoding="utf-8",
         )
+        self.addCleanup(self._stop_recovery_observers)
+
+    def fixture_env(self):
+        env = dict(os.environ)
+        for key in list(env):
+            if (key.startswith(("AGENT_DISPATCH_", "HERDR_"))
+                    or key in {"AGENT_SESSION_ID", "AGENT_SESSION_ROLE",
+                               "CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID",
+                               "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG"}):
+                env.pop(key, None)
+        return env
+
+    def run_sidecar(self, command, **kwargs):
+        kwargs.setdefault("env", self.fixture_env())
+        return subprocess.run(command, **kwargs)
+
+    def popen_sidecar(self, command, **kwargs):
+        kwargs.setdefault("env", self.fixture_env())
+        return subprocess.Popen(command, **kwargs)
+
+    def _stop_recovery_observers(self):
+        root = self.jobs.parent / "supervisor-state" / "obligations"
+        if not root.is_dir():
+            return
+        for path in root.glob("batch-*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                observer = record.get("observer") or {}
+                pid = int(observer.get("pid"))
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\\0", b" ")
+                if (str(SIDECAR).encode() not in cmdline
+                        or record.get("id", "").encode() not in cmdline):
+                    continue
+                os.kill(pid, 15)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
 
     def command(
         self,
@@ -315,7 +362,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         )
         server = ControlServer(self.control_path)
         self.addCleanup(server.close)
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(attempts),
             text=True,
             capture_output=True,
@@ -373,7 +420,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         target = self.base / "real-jobs.log"
         target.write_text(row("att-one", harness="codex"), encoding="utf-8")
         self.jobs.symlink_to(target)
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(["att-one"]),
             text=True,
             capture_output=True,
@@ -394,7 +441,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         # -- a large value here keeps this within-process-lifetime assertion
         # meaningful instead of exercising the deadline this test is not
         # about (see test_sidecar_stops_at_own_deadline for that).
-        process = subprocess.Popen(self.command(attempts, mode="timeout", timeout="30"),
+        process = self.popen_sidecar(self.command(attempts, mode="timeout", timeout="30"),
                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.7)
@@ -414,7 +461,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         attempts = ["att-a", "att-b"]
         self.jobs.write_text(row(attempts[0], harness="codex", status="open")
                              + row(attempts[1], harness="claude", status="open"), encoding="utf-8")
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(attempts, mode="timeout", timeout="0.05"),
             text=True, capture_output=True, timeout=10,
         )
@@ -435,7 +482,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         attempts = ["att-a", "att-b"]
         self.jobs.write_text(row(attempts[0], harness="codex", status="done")
                              + row(attempts[1], harness="claude", status="done"), encoding="utf-8")
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(attempts, mode="timeout", timeout="30"),
             text=True, capture_output=True, timeout=10,
         )
@@ -443,6 +490,42 @@ raise SystemExit(3 if state == 'timeout' else 0)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "retryable")
         self.assertEqual(payload["reason"], "receiver-unavailable")
+
+    def test_late_batch_completion_resumes_same_join_and_delivers_after_deadline(self) -> None:
+        self.jobs.write_text(row("att-late", harness="codex", status="open"), encoding="utf-8")
+        server = ControlServer(self.control_path)
+        self.addCleanup(server.close)
+        initial = self.run_sidecar(
+            self.command(["att-late"], mode="timeout-once", timeout="0"),
+            text=True, capture_output=True, timeout=5,
+        )
+        self.assertEqual(initial.returncode, 75, initial.stdout + initial.stderr)
+        self.assertEqual(json.loads(initial.stdout)["reason"], "watch-deadline")
+        self.assertTrue(server.called.wait(5), "recovered batch was not delivered")
+        self.assertEqual(server.request["op"], "deliver")
+        self.assertEqual(server.request["sealed_batch_id"], "batch-1")
+        self.assertEqual(self.join_calls.read_text(encoding="utf-8").count("x\n"), 2)
+
+        import dispatch_batch_obligations as obligations
+        records = list((self.base / "supervisor-state" / "obligations").glob("batch-*.json"))
+        self.assertEqual(len(records), 1)
+        deadline = time.monotonic() + 5
+        duty = obligations.read(self.jobs, records[0].stem)
+        while duty["state"] != "complete" and time.monotonic() < deadline:
+            time.sleep(0.02)
+            duty = obligations.read(self.jobs, records[0].stem)
+        self.assertEqual(duty["state"], "complete")
+        self.assertEqual(duty["delivery"], "accepted")
+        self.assertEqual(duty["outcome"]["state"], "ready")
+        self.assertEqual(duty["effective_attempts"], ["att-late"])
+
+        rescanned = self.run_sidecar(
+            [sys.executable, str(SIDECAR), "--ensure-obligations", "--jobs", str(self.jobs)],
+            text=True, capture_output=True, timeout=5,
+        )
+        self.assertEqual(rescanned.returncode, 0, rescanned.stdout + rescanned.stderr)
+        self.assertEqual(json.loads(rescanned.stdout)["resumed"], 0)
+        self.assertEqual(self.join_calls.read_text(encoding="utf-8").count("x\n"), 2)
 
     def test_sidecar_delivers_closure_blocked_receipt_once_without_relaunching_join(self) -> None:
         # item 8, unfinishable-watch: when the join itself already returns a
@@ -454,7 +537,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         self.jobs.write_text(row(attempts[0], harness="codex", status="done"), encoding="utf-8")
         server = ControlServer(self.control_path)
         self.addCleanup(server.close)
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(attempts, mode="closure-blocked", timeout="30"),
             text=True, capture_output=True, timeout=10,
         )
@@ -477,7 +560,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         )
         server = ControlServer(self.control_path)
         self.addCleanup(server.close)
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(["att-terminal"], mode="terminal"),
             text=True,
             capture_output=True,
@@ -501,7 +584,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
             ),
             encoding="utf-8",
         )
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(["att-current", "att-foreign"]),
             text=True,
             capture_output=True,
@@ -516,7 +599,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         self.jobs.write_text(
             row("att-one", harness="codex"), encoding="utf-8"
         )
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.command(["att-one", "att-one"]),
             text=True,
             capture_output=True,
@@ -535,7 +618,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
         )
         server = ControlServer(self.control_path)
         self.addCleanup(server.close)
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.session_command(attempts),
             text=True,
             capture_output=True,
@@ -569,7 +652,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
 
         thread = threading.Thread(target=delayed_server)
         thread.start()
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.session_command(["att-reconnect"], retry_window=1.0),
             text=True,
             capture_output=True,
@@ -601,7 +684,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
 
         thread = threading.Thread(target=claim_worker)
         thread.start()
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.session_command(["att-prelaunch"]),
             text=True,
             capture_output=True,
@@ -616,7 +699,7 @@ raise SystemExit(3 if state == 'timeout' else 0)
             "att-never-launched", harness="claude"
         ).replace("launch_claimed=1", "launch_claimed=0")
         self.jobs.write_text(never_launched, encoding="utf-8")
-        result = subprocess.run(
+        result = self.run_sidecar(
             self.session_command(
                 ["att-never-launched"], launch_ready_timeout=0.1
             ),

@@ -38,6 +38,7 @@ from dispatch_completion_join import (  # noqa: E402
     completion_followup_text,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import dispatch_batch_obligations as batch_obligations  # noqa: E402
 import codex_queue_delivery
 from codex_queue_dispatch import resolve_queue_socket
 import human_gate_receipt
@@ -843,7 +844,7 @@ def parser() -> argparse.ArgumentParser:
         default=None,
     )
     value.add_argument("--parent-session-id")
-    value.add_argument("--sealed-batch-id", required=True)
+    value.add_argument("--sealed-batch-id")
     value.add_argument("--thread-id")
     value.add_argument("--gateway-epoch", type=int)
     value.add_argument("--binding-generation", type=int)
@@ -854,6 +855,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--delivery-retry-window", type=float, default=300.0)
     value.add_argument("--delivery-retry-interval", type=float, default=2.0)
     value.add_argument("--join-command")
+    value.add_argument("--resume-obligation", help=argparse.SUPPRESS)
+    value.add_argument("--obligation-lock-fd", type=int, help=argparse.SUPPRESS)
+    value.add_argument("--ensure-obligations", action="store_true", help=argparse.SUPPRESS)
     return value
 
 
@@ -959,7 +963,7 @@ def _await_notice_ack(
         time.sleep(min(1.0, remaining))
 
 
-def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if args.control_socket is None and args.queue_socket is None:
         raise CompletionError("control-socket-missing")
     if (
@@ -982,67 +986,91 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         or len(attempts) > 4
     ):
         raise CompletionError("attempt-set-invalid")
-    wait_for_session_launch_claims(args, attempts)
-    watcher: HumanGateWatcher | None = None
-    if args.parent_session_id:
-        # Keep the courier alive through a disconnected gateway. It must
-        # prove a live binding before each claim, including after reconnect.
-        capability = (
-            {"epoch": 1} if args.queue_socket else negotiate_human_gate(args)
-        )
-        watcher = HumanGateWatcher(args, attempts, capability)
-        watcher.start()
-    try:
-        from dispatch_supervision import wait_for_batch
-        # The sidecar's own `--timeout` is its unfinishable-watch deadline
-        # (item 8, defect (3)): a completion service must not run forever
-        # just because the batch never settles. `stop_check` (defect (4))
-        # gives up sooner, without waiting out the full deadline, once the
-        # delivery gateway is provably gone and nothing is left to deliver
-        # for anyway.
-        monitored = set(attempts)
-        def replacement_checkpoint(selected):
-            from dispatch_replacement import advance_batch
-            nonlocal monitored
-            result = advance_batch(args.jobs, selected,
-                authority_check=(lambda jobs, aid, metadata: replacement_authority(args, jobs, aid, metadata))
-                    if args.parent_session_id else None)
-            monitored = set(result[0])
+    duty_id = getattr(args, "_obligation_id", None)
+    obligation = batch_obligations.read(args.jobs, duty_id) if duty_id else None
+    normalized = obligation.get("outcome") if obligation else None
+    if normalized is None:
+        wait_for_session_launch_claims(args, attempts)
+        watcher: HumanGateWatcher | None = None
+        if args.parent_session_id:
+            capability = (
+                {"epoch": 1} if args.queue_socket else negotiate_human_gate(args)
+            )
+            watcher = HumanGateWatcher(args, attempts, capability)
+            watcher.start()
+        try:
+            from dispatch_supervision import wait_for_batch
+            monitored = set(attempts)
+
+            def replacement_checkpoint(selected):
+                from dispatch_replacement import advance_batch
+                nonlocal monitored
+                advanced = advance_batch(args.jobs, selected,
+                    authority_check=(lambda jobs, aid, metadata: replacement_authority(args, jobs, aid, metadata))
+                        if args.parent_session_id else None)
+                monitored = set(advanced[0])
+                if watcher is not None:
+                    watcher.attempts = set(monitored)
+                if duty_id:
+                    batch_obligations.update(
+                        args.jobs, duty_id, effective_attempts=sorted(monitored),
+                        replacement_lineage=advanced[1], reason="replacement-checkpoint",
+                    )
+                return advanced
+
+            resume = bool(getattr(args, "_resume_execution", False))
+            receipt = wait_for_batch(
+                join=lambda selected: run_join(args, selected),
+                attempts=attempts, jobs=args.jobs,
+                parent_attempt_id=delivery_parent_id(args),
+                deadline=None if resume else time.monotonic() + max(0.0, args.timeout),
+                stop_check=None if resume else lambda: _receiver_unavailable_reason(args, monitored),
+                replacement_checkpoint=replacement_checkpoint,
+            )
+            from dispatch_replacement import adopt_receipt
+            attempts, _replaced_attempts = adopt_receipt(args.jobs, attempts, receipt)
+            if receipt.get("state") == "watch-expired":
+                reason = receipt.get("reason") or "watch-deadline"
+                if reason == "watch-deadline" and args.parent_session_id:
+                    _await_notice_ack(
+                        args.jobs.resolve(strict=False).parent, args.parent_session_id,
+                        receipt.get("delivery_records") or [], timeout=130.0,
+                    )
+                if duty_id:
+                    batch_obligations.update(
+                        args.jobs, duty_id,
+                        state="unknown", reason=reason,
+                        effective_attempts=sorted(monitored),
+                        replacement_lineage=receipt.get("replacement_lineage") or [],
+                    )
+                return {"schema_version": 1, "status": "retryable", "reason": reason}, 75
+        finally:
             if watcher is not None:
-                watcher.attempts = set(monitored)
-            return result
-        receipt = wait_for_batch(join=lambda selected: run_join(args, selected),
-                                 attempts=attempts, jobs=args.jobs,
-                                 parent_attempt_id=delivery_parent_id(args),
-                                 deadline=time.monotonic() + max(0.0, args.timeout),
-                                 stop_check=lambda: _receiver_unavailable_reason(args, monitored),
-                                 replacement_checkpoint=replacement_checkpoint)
-        from dispatch_replacement import adopt_receipt
-        attempts, replaced_attempts = adopt_receipt(args.jobs, attempts, receipt)
-        if receipt.get("state") == "watch-expired":
-            reason = receipt.get("reason") or "watch-deadline"
-            if reason == "watch-deadline" and args.parent_session_id:
-                _await_notice_ack(
-                    args.jobs.resolve(strict=False).parent, args.parent_session_id,
-                    receipt.get("delivery_records") or [], timeout=130.0,
-                )
-            return {"schema_version": 1, "status": "retryable", "reason": reason}, 75
-    finally:
-        if watcher is not None:
-            watcher.close()
-    delivery_parent = delivery_parent_id(args)
-    normalized = normalize_receipt(
-        receipt,
-        jobs=args.jobs,
-        parent_attempt_id=args.parent_attempt_id,
-        parent_session_id=args.parent_session_id,
-        delivery_parent_id=delivery_parent,
-        attempts=attempts,
-        parent_completion_delivery=(
-            CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
-            else MANAGED_SESSION_PARENT_DELIVERY
-        ),
-    )
+                watcher.close()
+        delivery_parent = delivery_parent_id(args)
+        normalized = normalize_receipt(
+            receipt,
+            jobs=args.jobs,
+            parent_attempt_id=args.parent_attempt_id,
+            parent_session_id=args.parent_session_id,
+            delivery_parent_id=delivery_parent,
+            attempts=attempts,
+            parent_completion_delivery=(
+                CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
+                else MANAGED_SESSION_PARENT_DELIVERY
+            ),
+        )
+        if duty_id:
+            current = batch_obligations.read(args.jobs, duty_id) or {}
+            lineage = normalized.get("replacement_lineage") or current.get("replacement_lineage") or []
+            batch_obligations.update(
+                args.jobs, duty_id, state="delivery-pending", reason="result-settled",
+                outcome=normalized, effective_attempts=sorted(attempts),
+                replacement_lineage=lineage,
+            )
+    else:
+        attempts = set(obligation.get("effective_attempts") or attempts)
+        delivery_parent = delivery_parent_id(args)
     if args.queue_socket:
         result = deliver_to_native_queue(args, normalized, attempts)
         status = result.get("status")
@@ -1072,6 +1100,122 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "sent-ambiguous": 74,
         "rejected": 65,
     }.get(status, 65)
+
+
+def _restore_obligation_arguments(record: dict) -> argparse.Namespace:
+    values = dict(record.get("arguments") or {})
+    for name in ("jobs", "control_socket", "queue_socket"):
+        if values.get(name) is not None:
+            values[name] = Path(values[name])
+    return argparse.Namespace(**values)
+
+
+def _validate_obligation_identity(args: argparse.Namespace, identity: dict) -> None:
+    if args.jobs is None:
+        raise CompletionError("jobs-path-invalid")
+    args.jobs = Path(args.jobs)
+    if args.control_socket is not None:
+        args.control_socket = Path(args.control_socket)
+    if args.queue_socket is not None:
+        args.queue_socket = Path(args.queue_socket)
+    if not args.parent_attempt_id and not args.parent_session_id:
+        args.parent_attempt_id = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+    if bool(args.parent_attempt_id) == bool(args.parent_session_id):
+        raise CompletionError("parent-identity-invalid")
+    if args.parent_session_id and args.thread_id != args.parent_session_id:
+        raise CompletionError("parent-thread-identity-mismatch")
+    if not args.sealed_batch_id:
+        raise CompletionError("sealed-batch-id-missing")
+    attempts = list(args.attempt_id or [])
+    if not attempts or len(set(attempts)) != len(attempts) or len(attempts) > 4:
+        raise CompletionError("attempt-set-invalid")
+    expected = {
+        "jobs": str(args.jobs.resolve(strict=True)),
+        "sealed_batch_id": args.sealed_batch_id,
+        "parent_attempt_id": args.parent_attempt_id or "",
+        "parent_session_id": args.parent_session_id or "",
+        "attempt_ids": sorted(attempts),
+        "delivery_parent_id": (args.parent_session_id or args.parent_attempt_id or ""),
+    }
+    if expected != identity:
+        raise CompletionError("batch-obligation-identity-mismatch")
+
+
+def execute(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    if getattr(args, "ensure_obligations", False):
+        launched = batch_obligations.ensure_observers(args.jobs)
+        return {"schema_version": 1, "status": "accepted", "resumed": launched}, 0
+
+    inherited_fd = getattr(args, "obligation_lock_fd", None)
+    if getattr(args, "resume_obligation", None):
+        duty_id = args.resume_obligation
+        record = batch_obligations.read(args.jobs, duty_id)
+        if record is None:
+            raise CompletionError("batch-obligation-missing")
+        restored = _restore_obligation_arguments(record)
+        restored._resume_execution = True
+        restored._obligation_id = duty_id
+        restored.obligation_lock_fd = inherited_fd
+        args = restored
+    else:
+        if args.jobs is None or not Path(args.jobs).is_absolute() or Path(args.jobs).is_symlink() \
+                or not Path(args.jobs).is_file():
+            raise CompletionError("jobs-path-invalid")
+        args.jobs = Path(args.jobs)
+        if args.control_socket is not None:
+            args.control_socket = Path(args.control_socket)
+        if args.queue_socket is not None:
+            args.queue_socket = Path(args.queue_socket)
+        if not args.parent_attempt_id and not args.parent_session_id:
+            args.parent_attempt_id = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+        if bool(args.parent_attempt_id) == bool(args.parent_session_id):
+            raise CompletionError("parent-identity-invalid")
+        if args.parent_session_id and args.thread_id != args.parent_session_id:
+            raise CompletionError("parent-thread-identity-mismatch")
+        if not args.sealed_batch_id:
+            raise CompletionError("sealed-batch-id-missing")
+        attempts = list(args.attempt_id or [])
+        if not attempts or len(set(attempts)) != len(attempts) or len(attempts) > 4:
+            raise CompletionError("attempt-set-invalid")
+        duty_id, _record = batch_obligations.create(args)
+        args._obligation_id = duty_id
+        args._resume_execution = False
+
+    record = batch_obligations.read(args.jobs, args._obligation_id)
+    if record is None:
+        raise CompletionError("batch-obligation-missing")
+    _validate_obligation_identity(args, record.get("identity") or {})
+    lease = batch_obligations.acquire(args.jobs, args._obligation_id, inherited_fd)
+    if lease is None:
+        return {"schema_version": 1, "status": "retryable",
+                "reason": "completion-observer-already-running"}, 75
+    batch_obligations.update(args.jobs, args._obligation_id,
+                             observer={"pid": os.getpid()}, reason="observing")
+    result = None
+    code = 75
+    try:
+        result, code = _execute_once(args)
+        status = result.get("status") if isinstance(result, dict) else None
+        current = batch_obligations.read(args.jobs, args._obligation_id) or {}
+        if current.get("outcome") is not None:
+            if status == "accepted":
+                batch_obligations.update(args.jobs, args._obligation_id,
+                    state="complete", delivery="accepted", reason="delivered")
+            else:
+                batch_obligations.update(args.jobs, args._obligation_id,
+                    state="delivery-pending", delivery=status or "unknown",
+                    reason=(result.get("reason") if isinstance(result, dict) else None)
+                           or "delivery-unconfirmed")
+        elif status == "retryable":
+            reason = str(result.get("reason") or "observation-unavailable")
+            batch_obligations.update(args.jobs, args._obligation_id,
+                state="unknown", reason=reason, delivery="pending")
+        return result, code
+    finally:
+        batch_obligations.release(lease)
+        current = batch_obligations.read(args.jobs, args._obligation_id) or {}
+        if current.get("state") in batch_obligations._PENDING:
+            batch_obligations.ensure_observers(args.jobs)
 
 
 def main() -> int:

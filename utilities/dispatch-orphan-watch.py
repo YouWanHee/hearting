@@ -319,6 +319,23 @@ def watch(args) -> int:
     return reconcile_exact_exit(args)
 
 
+def _resume_batch_duties(jobs) -> None:
+    """Reconnect observers for retained registered batches after a restart.
+
+    Lock-guarded and bounded: duties already observed are skipped, completed
+    duties are never replayed, and the original assignment is never relaunched.
+    Every failure is swallowed; the next cycle retries.
+    """
+    try:
+        import dispatch_batch_obligations as batch_obligations
+    except Exception:
+        return
+    try:
+        batch_obligations.ensure_observers(jobs)
+    except Exception:
+        pass
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     from dispatch_contract import inherited_jobs_argument
@@ -340,6 +357,7 @@ def main(argv=None) -> int:
     args.pid_observer_ns = process_namespace_identity() or ""
     while True:
         try:
+            _resume_batch_duties(args.jobs)
             result = watch(args)
             _status, metadata = attempt_record(args.jobs, args.attempt_id)
             import route_parent_close

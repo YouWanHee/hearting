@@ -163,6 +163,12 @@ an unnecessary question just to make the UI more visible.
   pending, unharvested, unintegrated when authorized, or unverified.
 - **Continuation registered before the turn ends** — obey the acting-agent obligation in `core/WORKFLOW.md §0.6` (registered continuation or plain fallback in the same turn; a promise is not a continuation). *Violation signal:* a turn
   ends with a stage "done" and the next stage owned by nobody.
+- **Retained follow-through** — accepted completion, notification, and cleanup
+  duties remain with their shared outer controller through observer and session
+  exit. A timeout is an observation checkpoint; use the existing recovery path
+  to resume the same exact duty rather than making an agent remember a rearm.
+  *Violation signal:* settled work or an accepted message loses its delivery
+  or cleanup owner when a turn or watcher exits.
 - **Auto-continue in-flow follow-ups** — inside an explicit "do X" flow, do not
   re-confirm each follow-up step (commit, stage, push, save, cleanup);
   auto-proceed without another confirmation, then use the applicable concise
