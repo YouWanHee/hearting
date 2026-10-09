@@ -167,6 +167,16 @@ class PlacementNowTest(unittest.TestCase):
         self.snapshot["hosts"][0]["self"] = False
         self.assertEqual(len(compute_hosts.unregistered_gpu(self.snapshot, [self.child])), 1)
 
+    def test_gpu_pid_without_confirmed_identity_does_not_claim_use_or_preuse(self):
+        process = self.snapshot["hosts"][0]["gpus"][0]["processes"][0]
+        process.update(pid=102, proc_start=None, pgid=None,
+                       attribution_reason="process-unavailable")
+        for start in (None, "reused"):
+            process["proc_start"] = start
+            for harness in ("claude", "codex", "opencode"):
+                self.assertIn("moving4:1 지정 · GPU 사용 미관측", self.now(harness))
+            self.assertEqual(render._resource_gpu_resources(self.child, self.snapshot), [])
+
 
 if __name__ == "__main__":
     unittest.main()

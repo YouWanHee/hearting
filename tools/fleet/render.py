@@ -4687,6 +4687,14 @@ def _resource_now_text(entity, room=None):
             checked = (local and local.get("gpus") and not local.get("detail")
                        and not local.get("process_detail") and not local.get("gpu_error")
                        and not local.get("process_error") and placement.get("complete", True))
+            exact = {(p["pid"], str(p["starttime"]))
+                     for p in placement.get("processes", ())}
+            pids = {pid for pid, _ in exact}
+            uncertain = any(p.get("pid") in pids
+                            and (p["pid"], str(p.get("proc_start"))) not in exact
+                            for g in (local or {}).get("gpus", ())
+                            for p in g.get("processes", ()))
+            checked = checked and not uncertain
             state = "GPU 사용 전" if checked else "GPU 사용 미관측"
             where = "%s:%s 지정 · %s" % (host, ",".join(devices), state)
             if placement.get("io_wait"):
