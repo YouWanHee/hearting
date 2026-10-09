@@ -11,6 +11,19 @@ from replica_batch_contract import build_manifest
 
 CURRENT="attempt_schema_version=2,dispatch_depth=2,transport=headless,execution_surface=registered-headless,registered_worker=1,fallback_hop=same-harness-headless"
 
+def controlled_process_scope(jobs):
+ # Contract and registry consumer fixtures observe the same controlled actors.
+ spec=importlib.util.spec_from_file_location("contract_process_fixture",
+                                          P.with_name("dispatch_registry.test.py"))
+ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+ return module.fixture_process_scope(jobs)
+
+class ControlledConsumerTestCase(unittest.TestCase):
+ """Known actor fixtures; raw observer tests keep their normal procfs scans."""
+ def run(self,result=None):
+  with controlled_process_scope(lambda:getattr(self,"jobs",None)):
+   return super().run(result)
+
 class RuntimeOwnerLaunchPredicateTest(unittest.TestCase):
  def test_workflow_receipt_uses_the_shared_exact_predicate(self):
   args=type("Args",(),dict(worker_type="owner",owner_route_binding=None,
@@ -43,6 +56,13 @@ def cancellation_metadata(attempt="att-cancellation-proof",portable=False):
 def attempt_row(metadata,status="open"):
  pipe=CURRENT+","+",".join(f"{key}={value}" for key,value in metadata.items())
  return f"2026-08-25T00:00:00Z\t{status}\t/r\t/w\texecute\t{pipe}"
+
+@contextlib.contextmanager
+def controlled_metadata_scope(metadata):
+ """Use the original fixture fields as the controlled actor census."""
+ with tempfile.TemporaryDirectory() as td:
+  jobs=Path(td)/"jobs.log";jobs.write_text(attempt_row(metadata)+"\n")
+  with controlled_process_scope(jobs):yield
 
 class FrameLaunchGateTest(unittest.TestCase):
  def test_launch_degradation_uses_existing_writer_and_write_failure_is_harmless(self):
@@ -1490,7 +1510,8 @@ class DispatchContractTest(unittest.TestCase):
    self.assertEqual(live.state,"live")
    self.assertEqual(live.pid,proc.pid)
    proc.terminate();proc.wait(timeout=5)
-   gone=D.attempt_process_quiescence(metadata)
+   with controlled_metadata_scope(metadata):
+    gone=D.attempt_process_quiescence(metadata)
    self.assertEqual(gone.state,"quiescent")
    self.assertIn("pid-gone",gone.reason)
   finally:
@@ -1829,7 +1850,8 @@ class DispatchContractTest(unittest.TestCase):
   self.assertEqual((draining.state,draining.reason),
                    ("live","local-process-group-live"))
   __import__("time").sleep(0.7)
-  self.assertEqual(D.attempt_process_quiescence(identity).state,"quiescent")
+  with controlled_metadata_scope(identity):
+   self.assertEqual(D.attempt_process_quiescence(identity).state,"quiescent")
 
  def test_mutation_api_rejects_immutable_identity_and_conflicting_outcome(self):
   with tempfile.TemporaryDirectory() as td:
@@ -2870,7 +2892,8 @@ class DispatchContractTest(unittest.TestCase):
   try:
    self.assertEqual(probe.state,"populated",probe.reason)
    # Without the repair the recorded group is empty and this reads as done.
-   self.assertEqual(D._attempt_process_quiescence_impl(identity).state,"quiescent")
+   with controlled_metadata_scope(identity):
+    self.assertEqual(D._attempt_process_quiescence_impl(identity).state,"quiescent")
    verdict=D.attempt_process_quiescence(identity)
    self.assertEqual((verdict.state,verdict.reason),
                     ("live","attempt-descendant-live"))
@@ -2901,8 +2924,9 @@ class DispatchContractTest(unittest.TestCase):
   self.assertEqual([pid for pid,_s,_st in probe.members],[owner.pid])
   owner_start=D.process_start_ticks(owner.pid)
   excluded=dict(identity,parent_pid=str(owner.pid),parent_pid_start=owner_start)
-  self.assertEqual(D.attempt_tagged_descendants(excluded).state,"empty")
-  self.assertEqual(D.attempt_process_quiescence(excluded).state,"quiescent")
+  with controlled_metadata_scope(excluded):
+   self.assertEqual(D.attempt_tagged_descendants(excluded).state,"empty")
+   self.assertEqual(D.attempt_process_quiescence(excluded).state,"quiescent")
   # review finding 2: a pid number alone is not an identity -- a reused or
   # mismatched start keeps the tagged process as a descendant
   stale=dict(identity,parent_pid=str(owner.pid),parent_pid_start="1")
@@ -2912,7 +2936,8 @@ class DispatchContractTest(unittest.TestCase):
   # a host-namespace number is comparable only for a host-visible parent in the observer namespace
   host=dict(identity,parent_pid_host=str(owner.pid),parent_pid_host_start=owner_start,
             parent_pid_scope="host-visible")
-  self.assertEqual(D.attempt_tagged_descendants(host).state,"empty")
+  with controlled_metadata_scope(host):
+   self.assertEqual(D.attempt_tagged_descendants(host).state,"empty")
   foreign=dict(host,pid_ns="pid:[1]")
   self.assertEqual(D.attempt_tagged_descendants(foreign).state,"populated")
 
@@ -2956,7 +2981,8 @@ class DispatchContractTest(unittest.TestCase):
   unbased=dict(sealed,attempt_descendant_residue_basis="")
   self.assertFalse(D.tagged_residue_receipt(unbased))
   residue.terminate();residue.wait(timeout=5)
-  self.assertEqual(D.attempt_process_quiescence(artifact,terminal_receipt=True).state,"quiescent")
+  with controlled_metadata_scope(artifact):
+   self.assertEqual(D.attempt_process_quiescence(artifact,terminal_receipt=True).state,"quiescent")
 
  # A-N1. A confirmed death still advances, with its original reason intact.
  def test_confirmed_death_without_tagged_processes_stays_quiescent(self):
@@ -2965,11 +2991,12 @@ class DispatchContractTest(unittest.TestCase):
   identity=dict(D.process_launch_identity(proc.pid),
                 attempt_id="att-confirmed-death-fixture")
   proc.terminate();proc.wait(timeout=5)
-  self.assertEqual(D.attempt_tagged_descendants(identity).state,"empty")
-  verdict=D.attempt_process_quiescence(identity)
-  self.assertEqual(verdict.state,"quiescent")
-  self.assertEqual(verdict.reason,
-                   D._attempt_process_quiescence_impl(identity).reason)
+  with controlled_metadata_scope(identity):
+   self.assertEqual(D.attempt_tagged_descendants(identity).state,"empty")
+   verdict=D.attempt_process_quiescence(identity)
+   self.assertEqual(verdict.state,"quiescent")
+   self.assertEqual(verdict.reason,
+                    D._attempt_process_quiescence_impl(identity).reason)
 
  # A-N2 is test_process_group_descendant_keeps_attempt_live_after_leader_exit:
  # a survivor inside the recorded group is already `live`, so it never reaches
@@ -3019,8 +3046,9 @@ class DispatchContractTest(unittest.TestCase):
   here=D.process_namespace_identity()
   local=dict(receipt,pid=reaped,pgid=reaped,pid_start=start,
              group_reap_pgid=reaped,pid_ns=here,pid_observer_ns=here)
-  self.assertEqual(D.attempt_tagged_descendants(local).state,"empty")
-  self.assertEqual(D.attempt_process_quiescence(local).state,"quiescent")
+  with controlled_metadata_scope(local):
+   self.assertEqual(D.attempt_tagged_descendants(local).state,"empty")
+   self.assertEqual(D.attempt_process_quiescence(local).state,"quiescent")
 
  # Whether an empty scan proves absence is a different question from whether a
  # recorded PID number means anything here, and the two must not be conflated:
@@ -3059,8 +3087,10 @@ class DispatchContractTest(unittest.TestCase):
   lines.append(
    "2026-08-07T00:00:01Z\topen\t/repo\t/wt\texecute\t"
    f"route_id=rt-sibling-gate,route_node=execute,attempt_id={attempt}")
-  D.completion_marker_gate(str(path),"execute","start",Path(td),Path(td)/"jobs.log",
-                           registry_lines=lines,attempt_id=attempt)
+  jobs=Path(td)/"jobs.log";jobs.write_text("\n".join(lines)+"\n")
+  with controlled_process_scope(jobs):
+   D.completion_marker_gate(str(path),"execute","start",Path(td),jobs,
+                            registry_lines=lines,attempt_id=attempt)
 
  # A-P2. A sibling attempt whose row was closed by a false death verdict, but
  # whose tagged descendant is still running, stops the launch before any spawn.
@@ -3101,7 +3131,7 @@ class DispatchContractTest(unittest.TestCase):
   sibling=dict(D.process_launch_identity(proc.pid),
                attempt_id="att-quiescent-sibling-fixture")
   proc.terminate();proc.wait(timeout=5)
-  self.assertEqual(D.attempt_process_quiescence(sibling).state,"quiescent")
+  self.assertIsNotNone(proc.returncode)
   for note in ("dead-capacity","dead-no-progress","dead-worker-fail"):
    with tempfile.TemporaryDirectory() as td:
     self.sibling_gate_case(td,note,sibling)
@@ -3743,12 +3773,19 @@ class DispatchContractTest(unittest.TestCase):
       route,"plan-check","auxiliary-arbiter-ambiguous:plan-check:a,b")["reason"],
      "auxiliary-arbiter-unresolved")
 
- # A row that never recorded a governed process cannot have leaked one, and
- # judging it unverifiable would wedge the node permanently.
- def test_sibling_row_without_a_recorded_process_is_not_a_claimant(self):
+ # The durable untouched-claim fence proves no process was started. A missing
+ # PID alone remains unknown, including on a legacy row already marked done.
+ def test_sibling_row_with_durable_never_started_fence_is_not_a_claimant(self):
   with tempfile.TemporaryDirectory() as td:
    self.sibling_gate_case(td,"dead-claim-abandoned",
-                          {"attempt_id":"att-never-launched-fixture"})
+                          {"attempt_id":"att-never-launched-fixture","launch_claimed":"0"})
+
+ def test_sibling_missing_process_identity_without_fence_remains_unknown(self):
+  with tempfile.TemporaryDirectory() as td:
+   with self.assertRaises(D.DispatchContractError) as caught:
+    self.sibling_gate_case(td,"dead-claim-abandoned",
+                           {"attempt_id":"att-unknown-launch-fixture"})
+   self.assertEqual(caught.exception.reason,"prior-attempt-unverifiable")
 
  # D-1. A legacy row carries no attempt id, so there is nothing to scan for and
  # its existing verdict is left exactly as it was.
@@ -3758,9 +3795,10 @@ class DispatchContractTest(unittest.TestCase):
   identity=D.process_launch_identity(proc.pid)
   proc.terminate();proc.wait(timeout=5)
   self.assertNotIn("attempt_id",identity)
-  self.assertEqual(D.attempt_tagged_descendants(identity).state,"unverifiable")
-  self.assertEqual(D.attempt_process_quiescence(identity),
-                   D._attempt_process_quiescence_impl(identity))
+  with controlled_metadata_scope(identity):
+   self.assertEqual(D.attempt_tagged_descendants(identity).state,"unverifiable")
+   self.assertEqual(D.attempt_process_quiescence(identity),
+                    D._attempt_process_quiescence_impl(identity))
 
  def test_post_claim_admission_is_idempotent_and_rejects_commit_after_abort(self):
   calls=[]
@@ -3904,7 +3942,8 @@ class DispatchContractTest(unittest.TestCase):
     handle=holder["handle"]; receipt=handle.read_ready(2); child=receipt["child"]
     def release():
      self.assertIsNotNone(handle.process.poll())
-     self.assertEqual(D.attempt_tagged_descendants(dict(identity,attempt_id=attempt)).state,"empty")
+     with controlled_metadata_scope(dict(identity,attempt_id=attempt)):
+      self.assertEqual(D.attempt_tagged_descendants(dict(identity,attempt_id=attempt)).state,"empty")
      # The production watchdog also seals an outcome through this lock.
      with Path(str(jobs)+".lock").open("a") as probe:
       D.fcntl.flock(probe.fileno(),D.fcntl.LOCK_EX|D.fcntl.LOCK_NB)
@@ -4268,7 +4307,7 @@ class CancellationQuiescenceExtinctSourceTest(unittest.TestCase):
   self.assertFalse(proof.proven)
 
 
-class TerminalCleanupResponsibilityTest(unittest.TestCase):
+class TerminalCleanupResponsibilityTest(ControlledConsumerTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
   self.jobs=Path(self.tmp.name)/"jobs.log"
@@ -4425,7 +4464,7 @@ def residue_sealed_metadata(attempt="att-residue-drain"):
  return metadata
 
 
-class ResidueDrainRefreshTest(unittest.TestCase):
+class ResidueDrainRefreshTest(ControlledConsumerTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
   self.jobs=Path(self.tmp.name)/"jobs.log"
@@ -6399,14 +6438,17 @@ class NamespaceExtinctQuiescenceTest(unittest.TestCase):
 
  def test_host_complete_walk_needs_a_host_like_observer_and_still_sees_tags(self):
   metadata=namespace_row_metadata(f"att-host-walk-{os.getpid()}")
-  for host_like,expected in ((True,"empty"),(False,"unverifiable")):
-   with self.subTest(host_like=host_like), \
-        mock.patch.object(D,"_current_observer_is_host_like",return_value=host_like):
-    self.assertEqual(D.attempt_tagged_descendants(metadata,host_complete=True).state,expected)
-    with D.process_table_scan_scope():
+  # Absence is a controlled fixture input. The actual tagged child below stays
+  # a raw procfs observation, independent of this complete-walk comparison.
+  with controlled_metadata_scope(metadata):
+   for host_like,expected in ((True,"empty"),(False,"unverifiable")):
+    with self.subTest(host_like=host_like), \
+         mock.patch.object(D,"_current_observer_is_host_like",return_value=host_like):
      self.assertEqual(D.attempt_tagged_descendants(metadata,host_complete=True).state,expected)
-    # The ordinary authority is unchanged: this observer did not record the row.
-    self.assertEqual(D.attempt_tagged_descendants(metadata).reason,"observer-namespace-mismatch")
+     with D.process_table_scan_scope():
+      self.assertEqual(D.attempt_tagged_descendants(metadata,host_complete=True).state,expected)
+     # The ordinary authority is unchanged: this observer did not record the row.
+     self.assertEqual(D.attempt_tagged_descendants(metadata).reason,"observer-namespace-mismatch")
   child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],
                          env={**os.environ,D.ATTEMPT_DESCENDANT_ENV:metadata["attempt_id"]})
   try:

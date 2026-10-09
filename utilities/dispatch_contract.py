@@ -2349,7 +2349,12 @@ def attempt_scan_namespace_authority(metadata: dict[str, str]) -> bool:
             metadata.get("pid_host_proof") == PID_HOST_NAMESPACE_PROOF
             and metadata.get("pid_host_ns") == current_namespace
         )
-    return metadata.get("pid_scope", "host-visible") != "namespace-local"
+    # Older rows may carry the checked procfs-root mapping without the later
+    # observer mirror. The same stored host proof already authorizes the PID
+    # reader; it also authorizes a complete descendant scan in that namespace.
+    return (metadata.get("pid_scope", "host-visible") != "namespace-local"
+            or (metadata.get("pid_host_proof") == PID_HOST_NAMESPACE_PROOF
+                and metadata.get("pid_host_ns") == current_namespace))
 
 
 def _current_observer_is_host_like() -> bool:
@@ -4215,182 +4220,9 @@ def replica_batch_expectation(
     return expected
 
 
-def _validate_replica_reservation(
-    payload: dict[str, object], expected: dict[str, object] | None
-) -> None:
-    if expected is None:
-        if payload.get("reservation_kind") in {"replica-batch", "parallel-batch"}:
-            raise DispatchContractError(
-                "parallel-group-reservation-mismatch",
-                "parallel batch token cannot authorize a non-group start",
-            )
-        return
-    public_expected = {
-        key: value for key, value in expected.items() if not key.startswith("_")
-    }
-    mismatches = {
-        key: (value, payload.get(key))
-        for key, value in public_expected.items()
-        if payload.get(key) != value
-    }
-    for key in ("batch_manifest_sha256", "batch_leg_sha256"):
-        value = payload.get(key)
-        if not isinstance(value, str) or not DIGEST.fullmatch(value):
-            mismatches[key] = ("sha256:<64 lowercase hex>", value)
-    manifest = payload.get("batch_manifest")
-    try:
-        verified, manifest_digest, leg_digests = verify_manifest(manifest)
-    except ReplicaBatchContractError as exc:
-        mismatches["batch_manifest"] = ("valid canonical manifest", str(exc))
-        verified, manifest_digest, leg_digests = {}, "", {}
-    if manifest_digest and payload.get("batch_manifest_sha256") != manifest_digest:
-        mismatches["batch_manifest_sha256"] = (
-            manifest_digest,
-            payload.get("batch_manifest_sha256"),
-        )
-    if verified:
-        common = {
-            "route_id": public_expected.get("batch_route_id"),
-            "parent_attempt_id": public_expected.get("batch_parent_attempt_id"),
-        }
-        manifest_group = verified.get("parallel_group") or verified.get("replica_group")
-        if manifest_group != public_expected.get("batch_group"):
-            mismatches["manifest.parallel_group"] = (
-                public_expected.get("batch_group"), manifest_group
-            )
-        for key, value in common.items():
-            if verified.get(key) != value:
-                mismatches[f"manifest.{key}"] = (value, verified.get(key))
-        route_nodes = sorted(str(member.get("route_node", "")) for member in verified["members"])
-        if route_nodes != expected.get("_batch_route_nodes"):
-            mismatches["manifest.route_nodes"] = (
-                expected.get("_batch_route_nodes"), route_nodes
-            )
-        allowed = expected.get("_batch_allowed_members", {})
-        for manifest_member in verified["members"]:
-            member_node = str(manifest_member.get("route_node", ""))
-            profile_fields = expected.get("_batch_profile_selections", {}).get(member_node)
-            if profile_fields is not None:
-                for key, value in profile_fields.items():
-                    if manifest_member.get(key) != value:
-                        mismatches[f"manifest.member.{member_node}.{key}"] = (value, manifest_member.get(key))
-            allowed_for_member = (
-                allowed.get(member_node, []) if isinstance(allowed, dict) else []
-            )
-            member_tuple = {
-                "harness": manifest_member.get("harness"),
-                "fallback_hop": manifest_member.get("fallback_hop"),
-                "fallback_ordinal": manifest_member.get("fallback_ordinal"),
-            }
-            if member_tuple not in allowed_for_member:
-                mismatches[f"manifest.member.{member_node}.route_binding"] = (
-                    allowed_for_member, member_tuple
-                )
-        selected = [
-            member for member in verified["members"]
-            if member.get("attempt_id") == public_expected.get("batch_attempt_id")
-        ]
-        if len(selected) != 1:
-            mismatches["manifest.selected_member"] = (
-                public_expected.get("batch_attempt_id"), len(selected)
-            )
-        else:
-            member = selected[0]
-            member_expected = {
-                "route_node": public_expected.get("batch_route_node"),
-                "harness": public_expected.get("batch_harness"),
-                "fallback_hop": public_expected.get("batch_fallback_hop"),
-                "fallback_ordinal": public_expected.get("batch_fallback_ordinal"),
-            }
-            if int(verified.get("schema_version", 1)) >= 2:
-                member_expected.update({
-                    "model_profile": public_expected.get("batch_model_profile"),
-                    "perspective": public_expected.get("batch_perspective"),
-                    "parallel_leg_index": public_expected.get("batch_parallel_leg_index"),
-                })
-            for key, value in member_expected.items():
-                if member.get(key) != value:
-                    mismatches[f"manifest.member.{key}"] = (value, member.get(key))
-            expected_assignment = public_expected.get("batch_assignment_sha256")
-            if expected_assignment and member.get("assignment_sha256") != expected_assignment:
-                mismatches["manifest.member.assignment_sha256"] = (
-                    expected_assignment, member.get("assignment_sha256")
-                )
-            attempt = str(member.get("attempt_id", ""))
-            if payload.get("batch_leg_sha256") != leg_digests.get(attempt):
-                mismatches["batch_leg_sha256"] = (
-                    leg_digests.get(attempt), payload.get("batch_leg_sha256")
-                )
-        if payload.get("batch_independence") != verified.get("independence"):
-            mismatches["batch_independence"] = (
-                verified.get("independence"), payload.get("batch_independence")
-            )
-    declared_size = public_expected.get("batch_declared_size")
-    admission = payload.get("batch_admission_count")
-    if (isinstance(declared_size, bool) or not isinstance(declared_size, int)
-            or not 2 <= declared_size <= 4):
-        mismatches["batch_declared_size"] = ("integer 2..4", declared_size)
-        declared_size = 0
-    if isinstance(admission, bool) or admission not in {1, declared_size}:
-        mismatches["batch_admission_count"] = (f"1|{declared_size}", admission)
-    elif admission == 1:
-        selected_attempt = str(public_expected.get("batch_attempt_id", ""))
-        peer_members = (
-            [
-                member for member in verified.get("members", [])
-                if str(member.get("attempt_id", "")) != selected_attempt
-            ]
-            if verified
-            else []
-        )
-        expected_peers = sorted(str(member.get("attempt_id", "")) for member in peer_members)
-        proof_keys = {
-            "agent_home", "attempt_id", "jobs", "manifest_sha256",
-            "reason", "route", "state",
-        }
-        proofs = payload.get("batch_peer_set")
-        if payload.get("batch_peer_count") != len(expected_peers):
-            mismatches["batch_peer_count"] = (len(expected_peers), payload.get("batch_peer_count"))
-        if not isinstance(proofs, list) or len(proofs) != len(expected_peers):
-            mismatches["batch_peer_set"] = ("exact N-1 canonical proofs", proofs)
-        else:
-            actual_peers=[]
-            for index, proof in enumerate(proofs):
-                label=f"batch_peer_set[{index}]"
-                if not isinstance(proof, dict) or set(proof) != proof_keys:
-                    mismatches[label] = ("canonical peer proof", proof)
-                    continue
-                actual_peers.append(str(proof.get("attempt_id", "")))
-                if proof.get("manifest_sha256") != manifest_digest:
-                    mismatches[f"{label}.manifest_sha256"] = (manifest_digest, proof.get("manifest_sha256"))
-                if proof.get("state") not in {"active", "completed"}:
-                    mismatches[f"{label}.state"] = ("active|completed", proof.get("state"))
-                for key in ("agent_home", "jobs", "route"):
-                    value=proof.get(key)
-                    if not isinstance(value,str) or not Path(value).is_absolute():
-                        mismatches[f"{label}.{key}"] = ("absolute path", value)
-                if not isinstance(proof.get("reason"),str) or not proof.get("reason"):
-                    mismatches[f"{label}.reason"] = ("non-empty observation reason", proof.get("reason"))
-            if actual_peers != expected_peers:
-                mismatches["batch_peer_set.attempts"] = (expected_peers, actual_peers)
-            encoded=json.dumps(proofs,separators=(",",":"),sort_keys=True).encode("utf-8")
-            proof_digest="sha256:"+hashlib.sha256(encoded).hexdigest()
-            if payload.get("batch_peer_set_sha256") != proof_digest:
-                mismatches["batch_peer_set_sha256"] = (proof_digest,payload.get("batch_peer_set_sha256"))
-    elif admission == declared_size:
-        for key in (
-            "batch_peer_count", "batch_peer_set", "batch_peer_set_sha256",
-            "batch_peer_attempt_id", "batch_peer_state",
-            "batch_peer_proof", "batch_peer_proof_sha256",
-        ):
-            if key in payload:
-                mismatches[key] = ("absent for full batch", payload.get(key))
-    if mismatches:
-        detail = ";".join(
-            f"{key}:expected={wanted}:actual={actual}"
-            for key, (wanted, actual) in sorted(mismatches.items())
-        )
-        raise DispatchContractError("parallel-group-reservation-mismatch", detail)
+def _validate_replica_reservation(payload, expected) -> None:
+    from route_authority import require_batch_reservation
+    require_batch_reservation(payload, expected)
 
 
 def reserve_governor_token(
@@ -7425,7 +7257,7 @@ def _sibling_attempt_gate(
             return
     else:
         lines = registry_lines
-    sibling: tuple[str, dict[str, str]] | None = None
+    sibling: tuple[list[str], dict[str, str]] | None = None
     # Parallel slices of one chain run side by side; only another chain's
     # (or a non-slice) attempt of this node can be a leaked prior execution.
     own_chain = ""
@@ -7451,22 +7283,21 @@ def _sibling_attempt_gate(
             continue
         if own_chain and metadata.get("session_chain_id") == own_chain:
             continue
-        # A row that never recorded a governed process cannot have leaked one,
-        # and judging it `unverifiable` would wedge the node permanently.
-        if not metadata.get("pid"):
+        # Only the existing durable never-started fence can skip a predecessor.
+        # Missing PID on a claimed/started launch is an observation gap.
+        if attempt_row_never_started(fields):
             continue
         # Only the most recent sibling by registry order is authoritative; older
         # rows are its lineage, not independent claimants.
-        sibling = (fields[1], metadata)
+        sibling = (fields, metadata)
     if sibling is None:
         return
-    sibling_status, sibling_metadata = sibling
-    process = attempt_process_quiescence(
-        sibling_metadata,
-        terminal_receipt=sibling_status in {"done", "killed", "cancelled"},
-    )
-    decision = decide_attempt(sibling_status, sibling_metadata,
-                              process_state=process.state, process_reason=process.reason)
+    sibling_fields, sibling_metadata = sibling
+    sibling_status = sibling_fields[1]
+    from recovery_evidence import observe_attempt
+    evidence = observe_attempt(sibling_status, sibling_metadata, registry_rows=lines,
+                               repo=sibling_fields[2], worktree=sibling_fields[3])
+    process, decision = evidence.process, evidence.decision
     if decision.action not in {"wait", "recover"}:
         return
     reason = (
@@ -7476,7 +7307,7 @@ def _sibling_attempt_gate(
     )
     raise DispatchContractError(
         reason,
-        f"{route_node}:{sibling_metadata.get('attempt_id', '-')}:{process.reason}",
+        f"{route_node}:{sibling_metadata.get('attempt_id', '-')}:{decision.reason}",
     )
 
 
@@ -10054,6 +9885,7 @@ def existing_attempt_launch_state(jobs: Path, attempt_id: str) -> tuple[str, str
         return "existing-unknown", "registry-unreadable"
     seen = False
     open_metadata: dict[str, str] | None = None
+    open_fields: list[str] | None = None
     for line in lines:
         fields = line.split("\t")
         if len(fields) != 6:
@@ -10064,16 +9896,22 @@ def existing_attempt_launch_state(jobs: Path, attempt_id: str) -> tuple[str, str
         seen = True
         if fields[1] in {"open", "running"}:
             open_metadata = metadata
+            open_fields = fields
     if open_metadata is None:
         if seen:
             return "existing-completed", "attempt-closed"
         return "existing-unknown", "attempt-row-missing"
     try:
-        process = attempt_process_quiescence(open_metadata)
+        from recovery_evidence import observe_attempt
+        evidence = observe_attempt(open_fields[1], open_metadata, registry_rows=lines,
+                                   repo=open_fields[2], worktree=open_fields[3])
+        process = evidence.process
     except Exception:  # noqa: BLE001 -- a launch receipt must not fail on observation
         return "existing-unverified", "process-observation-failed"
     if process.state == "live":
         return "existing-active", process.reason or "process-live"
+    if evidence.result_state == "unverifiable":
+        return "existing-unverified", "terminal-evidence-unverifiable"
     if process.state == "quiescent":
         return "existing-dead", process.reason or "process-gone"
     return "existing-unverified", process.reason or "process-unverifiable"

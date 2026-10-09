@@ -243,6 +243,7 @@ class FallbackRuntimeWiringTest(unittest.TestCase):
 
 R = _load("dispatch_registry", "dispatch-registry.py")
 J = _load("dispatch_completion_join", "dispatch_completion_join.py")
+FIXTURE = _load("dispatch_registry_matrix_fixture", "dispatch_registry.test.py")
 
 
 def _dead_pid():
@@ -380,7 +381,8 @@ class _TerminalCellFixture:
             "agent_home": self.home, "now": time.time(),
             "jobs": self.jobs, "integration_ref": None,
         })()
-        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(self.root)}):
+        with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(self.root)}), \
+                FIXTURE.fixture_process_scope(self.jobs):
             return R.classify(rows[0], args, {}, rows)
 
     def child_row(self):
@@ -409,7 +411,7 @@ class TerminalHandoffMarkerBoundaryTest(unittest.TestCase):
             category, reason, note = cell.classify()
         self.assertEqual(note, "dead-invalid-envelope")
         self.assertEqual(category, "terminal-handoff")
-        self.assertIn("marker-missing", reason)
+        self.assertEqual(reason, "artifact-is-root")
 
     def test_pass_file_artifact_dead_process_is_dead_missing_marker(self):
         # A readable in-root artifact without the SD-70 marker is still not
@@ -435,14 +437,22 @@ class TerminalHandoffMarkerBoundaryTest(unittest.TestCase):
                     msg=f"{artifact_kind}/{process} -> {note}",
                 )
 
-    def test_pass_live_process_stays_active(self):
+    def test_pass_live_process_waits_for_terminal_drain(self):
         # A still-draining worker that already printed its envelope must not be
         # closed dead by the reconciler (SD-79: quiescence gates the close).
         with tempfile.TemporaryDirectory() as td:
             cell = _TerminalCellFixture(td, artifact_kind="file", process="live")
             category, _, note = cell.classify()
-        self.assertEqual(category, "active")
+            with mock.patch.dict(os.environ, {"AGENT_ARTIFACT_ROOT": str(cell.root)}), \
+                    FIXTURE.fixture_process_scope(cell.jobs):
+                observation = R.observe_attempt(
+                    "open", cell.meta, worktree=cell.worktree,
+                    artifact_root=cell.root,
+                )
+        self.assertEqual(category, "terminal-draining")
         self.assertIsNone(note)
+        self.assertEqual((observation.process.state, observation.result_state,
+                          observation.decision.action), ("live", "settleable", "wait"))
 
     def test_pass_marker_linked_closes_completed_marker(self):
         # With the SD-70 marker + linkage present the row still closes as
@@ -459,11 +469,22 @@ class TerminalHandoffMarkerBoundaryTest(unittest.TestCase):
     def test_fail_and_blocked_keep_typed_failure_notes(self):
         for verdict, expected in (("FAIL", "dead-worker-fail"),
                                   ("BLOCKED", "dead-worker-blocked")):
-            with tempfile.TemporaryDirectory() as td:
+            for artifact_kind in ("file", "bucket"):
+                with self.subTest(verdict=verdict, artifact=artifact_kind), \
+                        tempfile.TemporaryDirectory() as td:
+                    cell = _TerminalCellFixture(
+                        td, verdict=verdict, artifact_kind=artifact_kind, process="dead"
+                    )
+                    category, _, note = cell.classify()
+                    self.assertEqual((category, note), ("terminal-handoff", expected))
+
+    def test_fail_and_blocked_cannot_name_the_artifact_root(self):
+        for verdict in ("FAIL", "BLOCKED"):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as td:
                 cell = _TerminalCellFixture(td, verdict=verdict, process="dead")
-                category, _, note = cell.classify()
-            self.assertEqual((category, note), ("terminal-handoff", expected),
-                             msg=verdict)
+                category, reason, note = cell.classify()
+                self.assertEqual((category, reason, note),
+                                 ("terminal-handoff", "artifact-is-root", "dead-invalid-envelope"))
 
     def test_completed_fallback_formula_not_reintroduced(self):
         # Source guard in this file's convention: the pre-fix one-liner that

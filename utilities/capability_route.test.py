@@ -3465,7 +3465,7 @@ class TestContinuation(unittest.TestCase):
      jobs,owner_attempt_id=attempt,
     )
     self.assertEqual((pending.route_id,pending_status),
-                     (source["route_id"],"owner-route-advance-pending"))
+                     (source["route_id"],"owner-route-post-launch-attachment"))
     with jobs.open("a",encoding="utf-8") as stream:
      stream.write(child_row(r1,r1_path,"r1"))
     current,current_status=O.resolve_owner_route_lifecycle(

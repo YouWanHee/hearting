@@ -256,6 +256,10 @@ def _read_terminal(path: str | Path | None) -> dict[str, object]:
     log_path = Path(path)
     try:
         lines = _tail_lines(log_path)
+    except FileNotFoundError:
+        return _result(
+            2, "absent", "none", "-", "unchecked", "-", reason="log-file-absent"
+        )
     except (OSError, UnicodeDecodeError):
         return _result(
             4,

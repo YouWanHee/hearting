@@ -158,6 +158,7 @@ class AttemptDecision:
 def decide_attempt(
     status: str, metadata: Mapping[str, str], *, process_state: str,
     process_reason: str = "", terminal_observed: bool = False,
+    result_state: str | None = None,
 ) -> AttemptDecision:
     """Select the next obligation without changing a committed outcome.
 
@@ -177,8 +178,11 @@ def decide_attempt(
     if process_state != "quiescent":
         return AttemptDecision(outcome, "recover", "supervision-controller", process_reason or "process-unverifiable")
     if status in OPEN_STATES:
+        if result_state == "unverifiable":
+            return AttemptDecision(outcome, "recover", "supervision-controller", "terminal-evidence-unverifiable")
         return AttemptDecision(outcome, "reconcile", "terminal-writer",
-                               "terminal-observed" if terminal_observed else "process-exited")
+                               "terminal-observed" if result_state == "settleable" or terminal_observed else
+                               "terminal-invalid" if result_state == "invalid" else "process-exited")
     if terminal_conflict_pending(metadata):
         return AttemptDecision(outcome, "inspect-conflict", "workflow-owner", "terminal-evidence-conflict")
     if outcome == "succeeded":

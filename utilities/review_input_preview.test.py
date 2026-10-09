@@ -44,7 +44,7 @@ class WrapperPreviewTest(unittest.TestCase):
     with self.subTest(reason=reason),self.assertRaises(review_input.DC.DispatchContractError) as caught:
      review_input.preview_request_nodes(SimpleNamespace(**raw),f.jobs)
     self.assertEqual(caught.exception.reason,reason)
- def test_all_three_mains_prove_changed_plan_without_publishing(self):
+ def _changed_plan_preview(self, *, prior_quiescent):
   f=self.f
   with f.dispatch_env():
    path=f.route(same_status='supported',intensity='standard');route=json.loads(path.read_text())
@@ -61,6 +61,16 @@ class WrapperPreviewTest(unittest.TestCase):
      # The route tuple is constructed by the fixture compiler; native runtime
      # discovery is outside this no-model test. The real main completion gate,
      # common input resolver and readonly admission are deliberately unmocked.
+     # The old closed review row has no process identity. Supply only this
+     # unit's shared process observation, preserving its original payload.
+     original_observer=review_input.DC.attempt_process_quiescence
+     def observe(meta, **kwargs):
+      if meta.get('attempt_id')=='att-plan-check-round-1':
+       return review_input.DC.ProcessQuiescence(
+        'quiescent' if prior_quiescent else 'unverifiable',
+        'fixture-group-empty' if prior_quiescent else 'process-identity-missing')
+      return original_observer(meta, **kwargs)
+     stack.enter_context(mock.patch.object(review_input.DC,'attempt_process_quiescence',side_effect=observe))
      stack.enter_context(mock.patch.object(w,'validate_route_record',side_effect=lambda args:setattr(args,'route_validation',{}) or 0))
      stack.enter_context(mock.patch.object(w,'headless_attempt_policy',return_value={
       'fallback_hop':'same-harness-headless','fallback_ordinal':1,'quick':False,
@@ -80,9 +90,17 @@ class WrapperPreviewTest(unittest.TestCase):
       '--parent-harness','claude','--parent-transport','headless','--parent-sandbox','default']
      with contextlib.redirect_stdout(io.StringIO()) as out:
       code=w.main(argv)
-     self.assertEqual(code,0,out.getvalue());spawn.assert_not_called()
+     self.assertEqual(code,0 if prior_quiescent else 78,out.getvalue());spawn.assert_not_called()
+     if not prior_quiescent:
+      self.assertIn('prior-attempt-unverifiable',out.getvalue())
+      self.assertIn('child_spawned=0',out.getvalue())
      self.assertEqual(before_jobs,f.jobs.read_bytes())
      self.assertEqual(before,{str(p):p.read_bytes() for p in marker.parent.iterdir() if p.is_file()})
    self.assertEqual(fixture.R.gate_currency(route,next(n for n in route['nodes'] if n['id']=='plan'),marker).state,'revised-unrecorded')
+
+ def test_all_three_mains_prove_changed_plan_without_publishing(self):
+  self._changed_plan_preview(prior_quiescent=True)
+ def test_all_three_mains_preserve_unknown_prior_row_without_publishing(self):
+  self._changed_plan_preview(prior_quiescent=False)
 
 if __name__=='__main__':unittest.main()

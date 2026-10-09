@@ -211,10 +211,9 @@ def _reseal_allowed(jobs, aid, path, payload, *, lines=None, prior=None):
         if not record or record.get('replacement_attempt_id') != aid:
             return False
         _, source, replay = validate_claim_source(jobs, lines, record)
-        if (source.get('worker_type') != 'owner'
-                or any(previous.get(k) != stored.get(k) for k in _RESEAL_STABLE_KEYS if k not in {'harness', 'argv'})
-                or stored.get('task') != _replacement_task(record, source, replay)
-                or (stored.get('resolved') or {}).get('model_profile') != (replay.get('resolved') or {}).get('model_profile')):
+        _, current_route = _route(jobs, prior, source)
+        if not route_authority.same_sealed_work(previous, stored,
+                recovery=(record, source, replay, current_route)):
             return False
     rows = []
     for line in lines:
@@ -1124,20 +1123,7 @@ def admission(jobs, lines, metadata):
     if (not record or record.get('original_attempt_id') != prior
             or record.get('replacement_attempt_id') != metadata.get('attempt_id')):
         raise DC.DispatchContractError('automatic-replacement-exhausted', prior)
-    route_key = 'owner_route_id' if source.get('owner_route_id') else 'route_id'
-    hash_key = 'owner_route_hash' if source.get('owner_route_id') else 'route_hash'
-    if (metadata.get(route_key) != record['route_id'] or metadata.get(hash_key) != record['route_hash']
-            or not route_authority.replacement_parent_matches(source, metadata, jobs)
-            or any(metadata.get(k) != source.get(k) for k in
-                   ('route_node', 'worker_type', 'dispatch_depth',
-                    'session_chain_id','subsession_id','subsession_index','subsession_count',
-                    'subsession_mode','stage_authority','fixed_inputs_sha256',
-                    'narrow_verify_sha256','phase_brief_sha256'))):
-        raise DC.DispatchContractError('replacement-launch-binding-mismatch', prior)
-    if source.get('session_chain_id'):
-        from dispatch_replacement_subsession import SCOPE_KEYS
-        if any(metadata.get(key) != source.get(key) for key in SCOPE_KEYS):
-            raise DC.DispatchContractError('replacement-subsession-scope-mismatch')
+    route_authority.require_recovery_binding(record, source, metadata, jobs)
     _, source, replay = validate_claim_source(jobs, lines, record)
     candidate = launch_input(jobs, metadata['attempt_id'], metadata)
     parent_values = {}
@@ -1151,40 +1137,14 @@ def admission(jobs, lines, metadata):
             parent_args = SimpleNamespace(**{**candidate['resolved'], **parent_values,
                                             'action': 'start', 'dispatch_depth': 1})
             parent_values['parent_completion_delivery'] = resolve_parent_completion_delivery(parent_args)
-    if source.get('review_input_digest') or metadata.get('review_input_digest'):
-        from review_input import read_binding
-        original_input = read_binding(jobs, source, verify_current=True)
-        replacement_input = read_binding(jobs, metadata, verify_current=True)
-        if (any(replacement_input.get(k) != original_input.get(k) for k in ('path', 'sha256', 'producer'))
-                or replacement_input.get('source') != {
-                    'attempt_id': source['attempt_id'], 'binding_digest': source['review_input_digest']}):
-            raise DC.DispatchContractError('reviewed-evidence-replacement-mismatch')
-    expected_task = _replacement_task(record, source, replay)
-    owner = source.get('worker_type') == 'owner'
-    if owner:
-        # Claims bind the work. The ordinary owner launcher resolves the current pin,
-        # allocation and the selected harness's settings at launch, even for an old claim.
-        _, route = _route(jobs, prior, source)
-        from model_profile import sealed_pin_harness
-        pinned = sealed_pin_harness(route_authority.route_in_force(route), worker_type='owner')
-        if pinned and candidate.get('harness') != pinned:
-            raise DC.DispatchContractError('pin-ignored-for-replacement', pinned)
-        for key in ('jobs', 'worktree'):
-            if candidate.get(key) != replay.get(key):
-                raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
-        if (candidate.get('resolved') or {}).get('model_profile') != (replay.get('resolved') or {}).get('model_profile'):
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'model_profile')
-        if record.get('execution_access'):
-            granted = route_authority.granted_permissions(candidate.get('applied_permissions'), candidate.get('launch_home'))
-            if (granted.get('execution_access') or {}).get('request_sha256') != record['execution_access']['request_sha256']:
-                raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'execution_access')
-    else:
-        _check_tuple(candidate, replay, _transition_of(record), record.get('execution_access'), parent_values)
+    expected_task = route_authority.recovery_task(record, source, replay)
+    _, current_route = _route(jobs, prior, source)
+    route_authority.require_recovery_work(
+        candidate, replay, route=current_route, worker_type=source.get('worker_type'),
+        transition=_transition_of(record), access=record.get('execution_access'),
+        parent_values=parent_values)
     if candidate.get('task') != expected_task:
         raise DC.DispatchContractError('replacement-task-mismatch')
-    expected_argv = _replacement_argv(record, source, replay, parent_values)
-    if not owner and candidate.get('argv') != expected_argv:
-        raise DC.DispatchContractError('replacement-argv-mismatch')
     if Path(record['route_file']).with_suffix('.outcome.json').exists():
         raise DC.DispatchContractError('replacement-route-closed')
     route = _read(Path(record['route_file']))
@@ -1197,50 +1157,10 @@ def admission(jobs, lines, metadata):
 RUNTIME_DERIVED_KEYS = route_authority.RELEASE_DERIVED_VALUES
 
 
-# What a verified profile transition lets the candidate resolve differently from the sealed launch.
-PROFILE_DERIVED_KEYS = frozenset({'model_profile', 'model', 'reasoning', 'resolved_model_settings'})
-
-
 def _check_tuple(candidate, replay, transition=None, access=None, parent_values=None):
-    """The candidate must match the sealed input; only runtime-derived values may follow a new release,
-    and only the profile-derived ones may follow a verified profile transition."""
-    for key in route_authority.REPLACEMENT_FIXED_KEYS:
-        if candidate.get(key) != replay.get(key):
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
-    # Each input keeps the release it ran from (`launch_home`); a different one is not a change of work.
-    drift = candidate.get('launch_home') != replay.get('launch_home')
-    old, new = replay.get('resolved') or {}, candidate.get('resolved') or {}
-    for key in sorted(set(old) | set(new)):
-        if (parent_values or {}).get(key, old.get(key)) != new.get(key):
-            if (transition and key in PROFILE_DERIVED_KEYS and old.get('model_profile') == transition['from']
-                    and new.get('model_profile') == transition['to']
-                    and (key != 'resolved_model_settings'
-                         or (new.get(key) or {}).get('profile') == transition['to'])):
-                continue  # the one lower launch the frame rule allows
-            if not (drift and key in RUNTIME_DERIVED_KEYS):
-                raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'resolved')
-    # Where the replacement's launcher runs, and how it spelled its release, is not a permission
-    # change (route_authority).
-    granted = route_authority.granted_permissions(candidate.get('applied_permissions'), candidate.get('launch_home'))
-    sealed = route_authority.granted_permissions(replay.get('applied_permissions'), replay.get('launch_home'))
-    if access:
-        # The access request the claim recorded replaces the source's, and what realizes it.
-        if (granted.get('execution_access') or {}).get('request_sha256') != access['request_sha256']:
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'execution_access')
-        granted, sealed = (_without_access(granted), _without_access(sealed))
-    if granted != sealed:
-        if not drift:
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'applied_permissions')
-        from hearting_gates import same_work_or_refuse
-        same_work_or_refuse('replacement-runtime-drift', 'applied_permissions')
-
-
-def _without_access(permissions):
-    result = {key: value for key, value in permissions.items() if key != 'execution_access'}
-    if isinstance(result.get('opencode_permission'), dict):
-        result['opencode_permission'] = {key: value for key, value in result['opencode_permission'].items()
-                                         if key not in ('external_directory', 'edit')}
-    return result
+    """Compatibility entry for stored standalone inputs; policy lives in route authority."""
+    return route_authority.require_recovery_work(
+        candidate, replay, transition=transition, access=access, parent_values=parent_values)
 
 
 def replacement_row(jobs, lines, row):
@@ -1303,16 +1223,7 @@ def _authorized(jobs, rows, meta):
 
 
 def _replacement_task(record, source, replay):
-    task = replay['task']
-    if source.get('worker_type') == 'owner':
-        original_route = source.get('owner_route_id') or source.get('route_id')
-        if original_route != record['route_id']:
-            route = _read(Path(record['route_file']))
-            request = route.get('work_request') or {}
-            if not isinstance(request.get('text'), str) or not request['text'].strip():
-                raise DC.DispatchContractError('replacement-current-route-input-unproven')
-            task = request['text']
-    return task
+    return route_authority.recovery_task(record, source, replay)
 
 
 def _access_in_force(jobs, route):

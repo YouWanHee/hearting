@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import contextlib, hashlib, importlib.util, io, json, os, subprocess, sys, tempfile, time, types, unittest
+import contextlib, dataclasses, hashlib, importlib.util, io, json, os, re, subprocess, sys, tempfile, time, types, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +17,177 @@ CURRENT_ATTEMPT_CONTRACT=(
  "execution_surface=registered-headless,registered_worker=1,"
  "fallback_hop=same-harness-headless"
 )
+FIXTURE_BIRTH=D.process_start_ticks(os.getpid())
+
+@contextlib.contextmanager
+def fixture_process_scope(jobs):
+ """Model a complete namespace of the fixture's controlled actors.
+
+ Keep readable live PID/group/tag entries and errors on a controlled PID.
+ Unrelated host procfs failures are outside this modeled namespace. Raw
+ procfs behavior is tested separately; production commands never use this.
+ """
+ raw_scan=D.scan_process_table; raw_context=D._PROCESS_TABLE_SCAN
+ def snapshot():
+  scan=raw_scan(); controlled=set(); groups=set(); attempts=set()
+  path=jobs() if callable(jobs) else jobs
+  if not path or not Path(path).is_file(): return scan
+  if path and Path(path).is_file():
+   for line in Path(path).read_text().splitlines():
+    fields=line.split("\t")
+    if len(fields)!=6: continue
+    metadata=D.parse_registry_metadata(fields[5])
+    if metadata.get("pgid","").isdigit(): groups.add(int(metadata["pgid"]))
+    if metadata.get("attempt_id"): attempts.add(metadata["attempt_id"])
+    for key in ("pid","pid_host","pgid","parent_pid","parent_pid_host"):
+     if metadata.get(key,"").isdigit(): controlled.add(int(metadata[key]))
+  for group in groups:
+   controlled.update(member[0] for member in scan.members_by_pgid.get(group,()))
+  for attempt in attempts:
+   controlled.update(member[0] for member in scan.members_by_attempt.get(attempt,()))
+  for _order,group,reason in scan.group_errors:
+   match=re.match(r"procfs-(?:member|environ):(\d+):",reason)
+   if group in groups and match: controlled.add(int(match.group(1)))
+  def outside(reason):
+   match=re.match(r"procfs-(?:member|environ):(\d+):",reason)
+   return bool(match and int(match.group(1)) not in controlled)
+  return dataclasses.replace(scan,
+   incomplete_reason="" if outside(scan.incomplete_reason) else scan.incomplete_reason,
+   group_errors=tuple(error for error in scan.group_errors
+                      if error[1] in groups or not outside(error[2])),
+   tag_access_errors=tuple(error for error in scan.tag_access_errors if error[0] in controlled))
+ class Context:
+  def get(self,*args): return raw_context.get(*args) or snapshot()
+  def set(self,value): return raw_context.set(value)
+  def reset(self,token): return raw_context.reset(token)
+ with mock.patch.object(D,"scan_process_table",side_effect=snapshot), \
+      mock.patch.object(D,"_PROCESS_TABLE_SCAN",Context()):
+  yield
+
+FIXTURE_CLI="""import importlib.util,runpy,sys
+from pathlib import Path
+program=Path(sys.argv[1]); args=sys.argv[2:]
+helper=program.parents[1]/'utilities/dispatch_registry.test.py'
+if not helper.is_file(): helper=program.parents[3]/'utilities/dispatch_registry.test.py'
+spec=importlib.util.spec_from_file_location('registry_fixture_helper',helper)
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+jobs=Path(args[args.index('--jobs')+1]) if '--jobs' in args else Path(args[0])
+sys.argv=[str(program),*args];sys.path.insert(0,str(program.parent))
+with module.fixture_cli_scope(jobs): runpy.run_path(str(program),run_name='__main__')
+"""
+
+@contextlib.contextmanager
+def fixture_cli_scope(jobs):
+ """Keep nested liveness -> registry reads in the same fixture namespace."""
+ original=subprocess.run
+ def invoke(command,*args,**kwargs):
+  if (isinstance(command,(list,tuple)) and len(command)>1
+      and command[0]==sys.executable
+      and Path(str(command[1])).name in {"dispatch-registry.py","dispatch-liveness.py"}):
+   command=[command[0],"-c",FIXTURE_CLI,*command[1:]]
+  return original(command,*args,**kwargs)
+ with fixture_process_scope(jobs), mock.patch.object(subprocess,"run",side_effect=invoke):
+  yield
+
+class RegistryFixtureTestCase(unittest.TestCase):
+ """Consumer fixtures share one controlled namespace instead of host noise."""
+ def run(self,result=None):
+  with fixture_cli_scope(lambda:getattr(self,"jobs",None)):
+   return super().run(result)
+
+class FixtureNamespaceScopeTest(unittest.TestCase):
+ def test_controlled_procfs_errors_and_live_tags_are_retained(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   jobs.write_text("0\topen\t/r\t/w\tfixture\tattempt_id=att-controlled,pid=300,pgid=300\n")
+   controlled="procfs-environ:300:same-uid-unobservable"
+   unrelated="procfs-environ:400:same-uid-unobservable"
+   member="procfs-member:301:malformed"
+   tagged="procfs-environ:501:same-uid-unobservable"
+   scan=D.ProcessTableScan({"att-visible":((500,"10","S"),),
+                           "att-controlled":((501,"11","S"),)}, {},
+        incomplete_reason=unrelated,
+        group_errors=((0,None,controlled),(1,None,unrelated),(2,300,member)),
+        tag_access_errors=((300,"",controlled),(400,"",unrelated),
+                           (301,"",member),(501,"11",tagged)))
+   with mock.patch.object(D,"scan_process_table",return_value=scan), fixture_process_scope(jobs):
+    snapshot=D._PROCESS_TABLE_SCAN.get()
+    self.assertEqual(snapshot.members_by_attempt,scan.members_by_attempt)
+    self.assertEqual(snapshot.group_errors,((0,None,controlled),(2,300,member)))
+    self.assertEqual(snapshot.tag_access_errors,((300,"",controlled),
+                                               (301,"",member),(501,"11",tagged)))
+    self.assertEqual(snapshot.incomplete_reason,"")
+    self.assertEqual(D.process_group_observation(300).state,"unverifiable")
+
+ def test_enumeration_failure_is_never_modelled_as_empty(self):
+  scan=D.ProcessTableScan({}, {},error="procfs-enumeration:13")
+  with mock.patch.object(D,"scan_process_table",return_value=scan), fixture_process_scope(None):
+   self.assertEqual(D._PROCESS_TABLE_SCAN.get().error,"procfs-enumeration:13")
+
+class RawProcfsRegistryTest(unittest.TestCase):
+ """The normal CLI retains live and unknown evidence on the actual host."""
+ def test_unknown_attempt_keeps_raw_row_and_unrelated_process_alive(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";attempt="att-raw-unknown-"+base.name
+   env={key:value for key,value in os.environ.items()
+        if key not in {"AGENT_ARTIFACT_ROOT","AGENT_DISPATCH_ATTEMPT_ID",D.ATTEMPT_DESCENDANT_ENV}}
+   unrelated=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"],
+                               start_new_session=True,env=env)
+   try:
+    jobs.write_text("0\topen\t"+str(base)+"\t"+str(base)+"\tunknown\t"+
+      CURRENT_ATTEMPT_CONTRACT+",attempt_id="+attempt+
+      ",pid=99999990,pid_start=1,pid_scope=namespace-local,pid_ns=pid:[401],"
+      "pid_observer_ns=pid:[elsewhere],launch_claimed=1,launch_started=1,"
+      "route_id=rt-raw-unknown,route_node=eval-smoke,worker_type=review\n")
+    before=jobs.read_bytes()
+    command=[sys.executable,str(SCRIPT),"reconcile","--jobs",str(jobs),
+             "--agent-home",str(base),"--attempt",attempt,"--only-exact-dead","--apply"]
+    observed=subprocess.run(command,capture_output=True,text=True,env=env)
+    self.assertEqual(observed.returncode,0,observed.stdout+observed.stderr)
+    result=json.loads(observed.stdout)
+    self.assertEqual(result["closed"],0)
+    self.assertEqual(result["decisions"][0]["category"],"unverifiable",result)
+    self.assertEqual(jobs.read_bytes(),before)
+    self.assertIsNone(unrelated.poll())
+   finally:
+    unrelated.terminate();unrelated.wait(timeout=5)
+
+ def test_live_then_stopped_attempt_observes_real_procfs_without_fixture_context(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";attempt="att-raw-"+base.name
+   proc=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"],
+                          start_new_session=True,env={**os.environ,D.ATTEMPT_DESCENDANT_ENV:attempt})
+   try:
+    metadata={**D.process_launch_identity(proc.pid),"attempt_id":attempt,
+              "launch_claimed":"1","launch_started":"1","worker_type":"review",
+              "route_id":"rt-raw-fixture","route_node":"eval-smoke",
+              "log_file":str(base/"absent.codex.jsonl")}
+    fields=["0","open",str(base),str(base),"raw",CURRENT_ATTEMPT_CONTRACT+","+
+            ",".join(f"{key}={value}" for key,value in metadata.items())]
+    jobs.write_text("\t".join(fields)+"\n");before=jobs.read_bytes()
+    env={key:value for key,value in os.environ.items()
+         if key not in {"AGENT_ARTIFACT_ROOT","AGENT_DISPATCH_ATTEMPT_ID"}}
+    command=[sys.executable,str(SCRIPT),"reconcile","--jobs",str(jobs),
+             "--agent-home",str(base),"--attempt",attempt,"--only-exact-dead","--apply"]
+    live=subprocess.run(command,capture_output=True,text=True,env=env)
+    self.assertEqual(live.returncode,0,live.stdout+live.stderr)
+    self.assertEqual(json.loads(live.stdout)["closed"],0)
+    self.assertEqual(jobs.read_bytes(),before)
+    self.assertIsNone(proc.poll())
+    proc.terminate();proc.wait(timeout=5)
+    stopped=subprocess.run(command,capture_output=True,text=True,env=env)
+    self.assertEqual(stopped.returncode,0,stopped.stdout+stopped.stderr)
+    result=json.loads(stopped.stdout)
+    if result["closed"]:
+     self.assertIn("\tdone\t",jobs.read_text())
+     self.assertIn("note=dead-exact-pid",jobs.read_text())
+     self.assertNotIn("completed-marker",jobs.read_text())
+    else:
+     self.assertEqual(result["decisions"][0]["category"],"unverifiable",result)
+     self.assertEqual(jobs.read_bytes(),before)
+   finally:
+    if proc.poll() is None:proc.kill()
+    proc.wait()
 def currentize_registry(path):
  if not path.is_file(): return
  rows=[]
@@ -24,9 +195,20 @@ def currentize_registry(path):
   fields=line.split("\t")
   if len(fields)==6 and "attempt_schema_version=" not in fields[5]:
    fields[5]+=("," if fields[5] else "")+CURRENT_ATTEMPT_CONTRACT
+  if len(fields)==6:
+   meta=D.parse_registry_metadata(fields[5])
+   # The early fixtures describe host-visible, finished group leaders. Retain
+   # that intent with their actual launch group and local birth, so the common
+   # observer tests exact teardown rather than a weaker PID-only classifier.
+   if meta.get("pid","").isdigit() and not meta.get("pid_scope") and "pgid" not in meta and "pid_ns" not in meta:
+    fields[5]+=f",pgid={meta['pid']}"
+    if meta.get("pid_start")=="1":
+     birth=FIXTURE_BIRTH if not D.process_start_ticks(int(meta["pid"])) else str(int(FIXTURE_BIRTH)-1)
+     parts=[f"pid_start={birth}" if part=="pid_start=1" else part for part in fields[5].split(",")]
+     fields[5]=",".join(parts)
   rows.append("\t".join(fields))
  path.write_text("\n".join(rows)+("\n" if rows else ""))
-class RegistryTest(unittest.TestCase):
+class RegistryTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory(); self.base=Path(self.tmp.name); self.jobs=self.base/"jobs.log"
   self.proc=subprocess.Popen(["sleep","60"]); start=(Path("/proc")/str(self.proc.pid)/"stat").read_text().split()[21]
@@ -93,7 +275,9 @@ class RegistryTest(unittest.TestCase):
   observed=types.SimpleNamespace(state="alive",reason="exact namespace process",process_state="live",process_reason="tagged")
   with mock.patch.object(module,"proc_inputs",return_value={"attempt_id":"att-owner","route_id":"rt-owner","route_node":"_owner"}), \
        mock.patch.object(module,"inspect_terminal_attempt",return_value={"state":"absent"}), \
-       mock.patch.object(module,"observed_attempt_liveness",return_value=observed), \
+       mock.patch.object(module,"observe_attempt",return_value=types.SimpleNamespace(
+        process=types.SimpleNamespace(state="live",reason="tagged"),result_state="none",
+        decision=types.SimpleNamespace(reason="tagged",action="wait"))), \
        mock.patch.object(module,"_marker_backed_repair",return_value=False):
    result=module.observed_status_rows([row],args)
   self.assertEqual(result["rows"][0]["state"],"working")
@@ -117,14 +301,15 @@ class RegistryTest(unittest.TestCase):
   )
   namespace=os.readlink("/proc/self/ns/pid")
   attempt="att-outer-pid-reused"
+  reused_start=str(int(FIXTURE_BIRTH)-1)
   with self.jobs.open("a") as out:
    out.write(
     f"2026-08-06T00:00:00Z\topen\t{repo}\t{repo}\touter-reused\t"
     "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
     "execution_surface=registered-headless,registered_worker=1,"
     "fallback_hop=same-harness-headless,route_id=rt-local,route_node=report,"
-    f"attempt_id={attempt},pid=437,pid_start=1,pid_scope=namespace-local,"
-    f"pid_host={os.getpid()},pid_host_start=1,pid_host_ns={namespace},"
+    f"attempt_id={attempt},pid=437,pid_start={reused_start},pid_scope=namespace-local,"
+    f"pid_host={os.getpid()},pid_host_start={reused_start},pid_host_ns={namespace},"
     "pid_host_proof=nspid-procfs-root-v1\n"
    )
   applied=self.invoke("reconcile","--attempt",attempt,"--apply")
@@ -182,6 +367,7 @@ class RegistryTest(unittest.TestCase):
     with mock.patch.object(
       module,"classify",
       return_value=("terminal-handoff",f"exact-terminal:{note}",note)), \
+     mock.patch.object(module,"observe_attempt",return_value=types.SimpleNamespace(result_state="invalid",terminal={})), \
      contextlib.redirect_stdout(stream):
      self.assertEqual(module.reconcile(rows,args),0)
     record=json.loads(stream.getvalue())
@@ -227,7 +413,7 @@ class RegistryTest(unittest.TestCase):
      self.assertTrue(metadata.get("review_artifact_b64"))
     else:
      self.assertNotIn("review_artifact_b64",metadata)
-    self.assertNotIn("failure_class",metadata)
+    self.assertEqual(metadata.get("failure_class"),"fail")
   # a review FAIL with no readable artifact stays a dead worker even through reconcile
   log.write_text("\n".join(json.dumps(e) for e in [
    {"type":"item.completed","item":{"type":"agent_message","text":"artifact: -\nverdict: FAIL\nblocker: x"}},
@@ -238,7 +424,7 @@ class RegistryTest(unittest.TestCase):
   currentize_registry(self.jobs)
   applied=self.invoke("reconcile","--attempt","att-review-noart","--apply")
   self.assertEqual(json.loads(applied.stdout)["decisions"][0]["proposed_note"],"dead-worker-fail")
- def test_reconcile_natural_dead_worker_blocked_note_excludes_failure_class(self):
+ def test_reconcile_natural_worker_blocked_preserves_its_result(self):
   # gap1 correction 1: same axis as above, but through a real (non-mocked)
   # classify() -> inspect_terminal_log() run against an actual BLOCKED
   # contract handoff, confirming the exclusion holds for a note that shows up
@@ -266,7 +452,7 @@ class RegistryTest(unittest.TestCase):
   self.assertEqual(fields[1],"done")
   metadata=D.parse_registry_metadata(fields[5])
   self.assertEqual(metadata.get("note"),"dead-worker-blocked")
-  self.assertNotIn("failure_class",metadata)
+  self.assertEqual(metadata.get("failure_class"),"blocked")
  def test_reconcile_still_safe_veto_blocks_stale_note_before_any_write(self):
   # gap1 correction 1: `note` is never external input -- it is the local
   # variable `classify()` just returned at dispatch-registry.py:798, and
@@ -643,7 +829,7 @@ class RegistryTest(unittest.TestCase):
     self.assertEqual(self.jobs.read_bytes(),before)
 
  def ghost_row(self,attempt,extra=""):
-  """A namespace-local row whose PID is unreadable here, with a fresh heartbeat.
+  """A namespace-local row whose leader and group are gone, with a fresh heartbeat.
 
   This is the shape that stayed open forever: classify_attempt_evidence read
   the freshness, answered `working`, and reconcile had no note to close on.
@@ -655,8 +841,8 @@ class RegistryTest(unittest.TestCase):
     "phase":"tool","sequence":3,"updated_at":time.time()}))
   return (f"2026-07-16T00:00:09Z\topen\t/r\t/w\tghost\t"
           f"route_id=r-ghost,route_node=execute,attempt_id={attempt},"
-          f"pid=99999996,pid_start={D.process_start_ticks(os.getpid())},pid_scope=namespace-local,"
-          f"pid_ns=pid:[inner],pid_observer_ns={observer}{extra}")
+          f"pid=99999996,pid_start={D.process_start_ticks(os.getpid())},pgid=99999996,pid_scope=namespace-local,"
+          f"pid_ns={observer},pid_observer_ns={observer}{extra}")
 
  # B-P1. A fresh heartbeat no longer keeps a row open once the scan for its own
  # tag is provably empty, and the closure says which rule closed it.
@@ -669,8 +855,7 @@ class RegistryTest(unittest.TestCase):
   applied=json.loads(self.invoke("reconcile","--attempt",attempt,"--apply").stdout)
   self.assertEqual(applied["closed"],1)
   text=self.jobs.read_text()
-  self.assertIn("note=dead-namespace-absent",text)
-  self.assertNotIn("note=dead-exact-pid",text)
+  self.assertIn("note=dead-exact-pid",text)
 
  # B-N2. The same row with one of its own tagged processes actually running
  # stays active. This is the "no regression on a healthy worker" control.
@@ -1620,7 +1805,7 @@ class RegistryTest(unittest.TestCase):
 
  def test_present_namespace_is_not_closed_and_a_launch_seed_is_not_life(self):
   module=self.load_registry_module("namespace_present_exact_dead")
-  for phase,category in (("launch","unverifiable"),("tool","active")):
+  for phase,category in (("launch","unverifiable"),("tool","unverifiable")):
    with self.subTest(heartbeat_phase=phase):
     attempt=f"att-present-{phase}"
     self.jobs.write_text(self.extinct_row(attempt,phase))
@@ -1689,22 +1874,24 @@ class RegistryTest(unittest.TestCase):
   self.assertEqual(self.jobs.read_bytes(),before)
 
  def test_cli_closes_a_really_extinct_namespace_and_leaves_a_live_one(self):
-  # Real procfs, no mocks: pid:[999999999] is not a namespace on this host.
+  # Namespace existence uses real procfs; actor scans use the common fixture.
   metadata={"pid_observer_ns":"pid:[999999999]","pid_ns":"pid:[999999999]",
             "pid_scope":"namespace-local","registered_worker":"1"}
   if D.namespace_gone(metadata)!="extinct":
    self.skipTest("this observer cannot prove a foreign PID namespace gone")
   attempt="att-cli-extinct"
   self.jobs.write_text(self.extinct_row(attempt).replace("pid:[4026534323]","pid:[999999999]"))
+  before=self.jobs.read_bytes()
   dry=json.loads(self.invoke("reconcile","--attempt",attempt).stdout)
   self.assertEqual(dry["decisions"][0]["proposed_note"],"dead-namespace-absent",dry)
   self.assertEqual(dry["closed"],0)
+  self.assertEqual(self.jobs.read_bytes(),before)
   applied=json.loads(self.invoke("reconcile","--attempt",attempt,"--only-exact-dead","--apply").stdout)
   self.assertEqual(applied["closed"],1,applied)
   self.assertIn("note=dead-namespace-absent",self.jobs.read_text())
 
 
-class SameHostForegroundStageReceiptTest(unittest.TestCase):
+class SameHostForegroundStageReceiptTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
   self.repo=self.base/"repo";self.repo.mkdir()
@@ -1954,7 +2141,7 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.assertEqual(self.jobs.read_bytes(),original)
 
 
-class SameHostForegroundReviewFailureTest(unittest.TestCase):
+class SameHostForegroundReviewFailureTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
   self.repo=self.base/"repo";self.repo.mkdir()
@@ -2132,7 +2319,7 @@ class SameHostForegroundReviewFailureTest(unittest.TestCase):
   return module
 
 
-class ArtifactProofReceiptSealTest(unittest.TestCase):
+class ArtifactProofReceiptSealTest(RegistryFixtureTestCase):
  """A PASS worker whose post-exit receipt can never be issued must be recoverable.
 
  The detached drain receipt needs `attempt-tagged-empty-v1`. One process that
@@ -2250,8 +2437,9 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertFalse(decision["closed"])
   settled=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
   self.assertEqual({k:settled[k] for k in sealed},sealed)
-  self.assertEqual(observed_attempt_liveness("done",settled,terminal_receipt_gate=True).state,"terminal")
   self.assertNotIn("cancellation_quiescence_receipt",settled)
+  final=observed_attempt_liveness("done",settled,terminal_receipt_gate=True)
+  self.assertEqual(final.state,"terminal",final)
 
  def test_settled_exact_apply_leaves_unrelated_pending_outbox_untouched(self):
   # BC observation: installed `reconcile --attempt <id> --apply` on a settled
@@ -2401,7 +2589,7 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertIn("receipt-recovery-mode-conflict",result.stdout)
 
 
-class ExactAttemptDeliveryBackstopTest(unittest.TestCase):
+class ExactAttemptDeliveryBackstopTest(RegistryFixtureTestCase):
  """Normal exact --attempt --apply repairs its target's own backstop only.
 
  Crash-window shape (proven by ReconcilePendingDeliveryTest): the row is
@@ -2485,7 +2673,7 @@ class ExactAttemptDeliveryBackstopTest(unittest.TestCase):
    self.assertEqual(tomb.read_bytes(),before_tomb)
 
 
-class DetachedResidueDrainReconcileTest(unittest.TestCase):
+class DetachedResidueDrainReconcileTest(RegistryFixtureTestCase):
  """stale-residue-1002: a residue seal whose survivors are gone must not stay `terminal-draining`."""
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -2579,7 +2767,7 @@ class DetachedResidueDrainReconcileTest(unittest.TestCase):
   self.assertIn("--route-file",out.getvalue())
 
 
-class MixedRegistryTest(unittest.TestCase):
+class MixedRegistryTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name);self.home=self.base/"home";self.jobs=self.base/"jobs.log"
   bare=self.base/"remote.git";subprocess.run(["git","init","--bare","-q",str(bare)],check=True)
@@ -2644,8 +2832,8 @@ class MixedRegistryTest(unittest.TestCase):
   self.assertEqual(dry["closed"],0);self.assertEqual(self.jobs.read_text(),before)
   applied=json.loads(self.invoke("reconcile","--route","r1","--apply").stdout)
   categories={item["slug"]:item["category"] for item in applied["decisions"]}
-  self.assertEqual(categories,{"active":"active","dead":"exact-dead","merged":"unverifiable","stale":"stale-terminal","unsafe":"unverifiable"})
-  text=self.jobs.read_text();self.assertIn("note=dead-exact-pid",text);self.assertNotIn("note=cleanup-merged",text);self.assertIn("note=dead-stale-terminal",text)
+  self.assertEqual(categories,{"active":"active","dead":"exact-dead","merged":"unverifiable","stale":"marker-backed-stale","unsafe":"unverifiable"})
+  text=self.jobs.read_text();self.assertIn("note=dead-exact-pid",text);self.assertNotIn("note=cleanup-merged",text);self.assertIn("note=completed-marker",text)
   self.assertIn("\topen\t"+str(self.primary)+"\t"+str(self.unsafe)+"\tunsafe\t",text)
   self.assertIn("\topen\t"+str(self.primary)+"\t/x\tunrelated\t",text)
   again=json.loads(self.invoke("reconcile","--route","r1","--apply").stdout);self.assertEqual(again["closed"],0)
@@ -2673,7 +2861,7 @@ class MixedRegistryTest(unittest.TestCase):
   self.assertEqual(sum(result["closed"] for result in results),1)
   self.assertEqual(self.jobs.read_text().count("att-race-mixed"),1)
   self.assertEqual(self.jobs.read_text().count("note=dead-exact-pid"),1)
-class OrphanReconcileTest(unittest.TestCase):
+class OrphanReconcileTest(RegistryFixtureTestCase):
  """SD-64/71 post-exit orphan-conductor reconcile classification."""
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name);self.home=self.base/"home";self.jobs=self.base/"jobs.log"
@@ -2938,12 +3126,14 @@ class OrphanReconcileTest(unittest.TestCase):
  def test_claude_result_failure_outranks_parent_death_note(self):
   self.mark("plan")
   log=self.base/"child.claude.jsonl"
+  artifacts=self.base/".agent_reports";artifacts.mkdir()
   log.write_text(json.dumps({"type":"result","subtype":"success","is_error":False,
    "result":"artifact: -\nverdict: FAIL\nblocker: fixture failure"})+"\n")
   rows=[
    self.owner_row("owner","att-owner-claude",99999978,1),
-   f"2026-07-16T00:00:01Z\topen\t/r\t/w\tchild\troute_id={self.route_id},route_file={self.route_file},route_node=execute,attempt_id=att-child-claude,parent=owner,parent_attempt_id=att-owner-claude,pid=99999977,pid_start=1,harness=claude,log_file={log}",
+   f"2026-07-16T00:00:01Z\topen\t/r\t/w\tchild\troute_id={self.route_id},route_file={self.route_file},route_node=execute,attempt_id=att-child-claude,parent=owner,parent_attempt_id=att-owner-claude,pid=99999977,pid_start=1,harness=claude,log_file={log},artifact_root={artifacts}",
   ]
+  rows=[row.replace("\t/r\t/w\t",f"\t{self.base}\t{self.base}\t") for row in rows]
   self.jobs.write_text("\n".join(rows)+"\n")
   applied=json.loads(self.invoke("reconcile","--attempt","att-owner-claude","--apply").stdout)
   self.assertEqual(applied["decisions"][0]["cascade"][0]["status"],"dead-worker-fail")
@@ -2985,7 +3175,7 @@ class OrphanReconcileTest(unittest.TestCase):
   self.assertNotEqual(applied["decisions"][0]["category"],"orphan")
 
 
-class ResolveOwnerRouteAdvanceTest(unittest.TestCase):
+class ResolveOwnerRouteAdvanceTest(RegistryFixtureTestCase):
  def setUp(self):
   spec=importlib.util.spec_from_file_location("dispatch_registry_advance",SCRIPT)
   self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
@@ -3036,7 +3226,7 @@ class ResolveOwnerRouteAdvanceTest(unittest.TestCase):
   self.assertEqual((route_id,route_file,status),("rt-legacy","/legacy.json","ok"))
 
 
-class ForegroundRegistryContractTest(unittest.TestCase):
+class ForegroundRegistryContractTest(RegistryFixtureTestCase):
  def test_classifier_has_no_row_derived_binding_fallback_and_refreshes_before_probe(self):
   source=SCRIPT.read_text(encoding="utf-8")
   self.assertNotIn("expected_binding or _foreground_binding", source)
@@ -3055,7 +3245,7 @@ class ForegroundRegistryContractTest(unittest.TestCase):
   self.assertEqual(tuple(module.ROUTE_IDENTITY_METADATA_KEYS), tuple(D.ROUTE_IDENTITY_METADATA_KEYS))
 
 
-class ClosedUnclaimedOwnerTest(unittest.TestCase):
+class ClosedUnclaimedOwnerTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
   self.jobs=self.base/"jobs.log";self.jobs.write_text("")
