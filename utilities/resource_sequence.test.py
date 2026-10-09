@@ -89,7 +89,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             return subprocess.CompletedProcess(argv, result)
         watch = mock.Mock()
         watch.poll.return_value = None
-        with mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}), \
+                mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
                 mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
                     return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(output)}), \
                 mock.patch.object(runner, 'register_registry'), \

@@ -128,6 +128,13 @@ class LeasesTest(unittest.TestCase):
         self.assertEqual(subprocess.run(["sh", "-c", env["HEARTING_GPU_LEASE_RELEASE"]]).returncode, 0)
         self.assertNotIn(lease["token"], {r["token"] for r in G.snapshot(self.state)})
 
+    def test_explicit_cpu_payload_in_gpu_scoped_route_skips_gpu_probe_and_lease(self):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}), \
+             mock.patch.object(G, "local_observation") as probe:
+            self.assertEqual(G.resource_admission({"resource_class": "long-running"},
+                             ["python", "cpu_payload.py"], gpu_scoped=True), (None, None, {}))
+        probe.assert_not_called()
+
     def test_unbound_wrapper_never_runs_after_its_pending_reservation_was_reaped(self):
         lease = self.acquire()
         G.release(self.state, lease)
