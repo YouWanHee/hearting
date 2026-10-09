@@ -900,7 +900,55 @@ def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[
 
     The directory is read through `_route_edges` (once per process while it is unchanged); the
     edges are copied out so a caller's edit never reaches the next one."""
-    return copy.deepcopy(_route_edges(root).get((route_id, route_hash_value), []))
+    return [copy.deepcopy(child)
+            for child in _route_edges(root).get((route_id, route_hash_value), [])
+            if not _closed_unexecuted_continuation(root, child)]
+
+
+def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
+    """A closed, unused candidate cannot take an executed predecessor's cycle.
+
+    Audit bindings are history, not execution evidence. Read the exact sealed
+    route's registry and marker directory afresh; missing or unreadable evidence
+    is unknown. Any attempt, marker, or descendant keeps the route attached.
+    """
+    outcome = _read_json(route_lineage.canonical_route_path(root, route["route_id"]).with_suffix(".outcome.json"))
+    if (not isinstance(outcome, dict)
+            or outcome.get("route_id") != route["route_id"]
+            or outcome.get("route_hash") != route["route_hash"]
+            or outcome.get("terminal_gate_proven") is not False
+            or _route_edges(root).get((route["route_id"], route["route_hash"]))):
+        return False
+    try:
+        module = artifact_lifecycle._load_capability_route()
+        sealed_jobs = ((route.get("launch_compatibility_tuple") or {}).get("jobs_path") or {}).get("path")
+        if not isinstance(sealed_jobs, str) or not Path(sealed_jobs).is_absolute():
+            return False
+        resolution = module.resolve_dangling_registry(Path(sealed_jobs))
+        if resolution.status not in ("exact", "aliased"):
+            return False
+        jobs = resolution.jobs_path
+        before = jobs.stat()
+        lines = jobs.read_text(encoding="utf-8").splitlines()
+        after = jobs.stat()
+        if any(getattr(before, key) != getattr(after, key)
+               for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
+            return False
+        for line in lines:
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            if len(fields) != 6:
+                return False
+            meta = dispatch_contract.parse_registry_metadata(fields[5])
+            if route["route_id"] in {meta.get("route_id"), meta.get("route"), meta.get("owner_route_id")}:
+                return False
+        markers = module.completion_dir(route["route_id"], jobs=jobs)
+        if markers.exists() and any(markers.iterdir()):
+            return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 class LineageHandover(NamedTuple):
@@ -923,14 +971,13 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
     begin_route = load_route(root, Path(record["route_file"]))
     if begin_route["route_hash"] != record["route_hash"]:
         raise ProducerError("route-hash-drift", record["cycle_id"])
-    children_of = _route_edges(root)
     tree = {begin_route["route_id"]}
     queue = [begin_route]
     while queue:
         node = queue.pop()
         if not route_is_closed(root, node):
             return LineageHandover(False, frozenset())
-        for child in children_of.get((node["route_id"], node["route_hash"]), []):
+        for child in _lineage_children(root, node["route_id"], node["route_hash"]):
             if (child.get("capability") != record.get("capability")
                     or child.get("effective_intensity") != record.get("intensity")):
                 continue

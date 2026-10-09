@@ -16,6 +16,7 @@ shell writes has nothing to open.
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 from dispatch_contract import dispatch_state_root
 
@@ -47,7 +48,14 @@ def route_bound_worker_writable_dirs(args) -> tuple[Path, ...]:
     owner that dispatches children from inside its own sandbox."""
     if not (getattr(args, "route_id", None) or getattr(args, "nested_headless_network", False)):
         return ()
-    return tuple(path.resolve() for path in (core_grounding_dir(args),) if path.is_dir())
+    paths = [path.resolve() for path in (core_grounding_dir(args),) if path.is_dir()]
+    if getattr(args, "nested_headless_network", False):
+        # Owners that publish continuations also append their parent session's
+        # route chain. Use the ledger's own path resolver, including overrides.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+        from fleet.route_chain import state_root
+        paths.append(Path(state_root()).resolve())
+    return tuple(paths)
 
 
 def progress_writable_dirs(args) -> tuple[Path, ...]:

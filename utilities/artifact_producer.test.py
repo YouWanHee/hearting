@@ -6,6 +6,8 @@ real canonical root, registry, and routes directory are never touched.
 """
 import dataclasses
 import importlib.util
+import io
+import contextlib
 import fcntl
 import json
 import hashlib
@@ -3740,6 +3742,72 @@ class QuickOwnerBindingIntegrationTest(ProducerTestBase):
 
 
 class TerminalTransactionIntegrationTest(ProducerTestBase):
+    def test_closed_unstarted_continuation_does_not_take_spec_settlement(self):
+        import dispatch_terminal_commit as terminal
+        from dispatch_completion_join import exact_attempt_row
+
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                fixture = TerminalTransactionIntegrationTest()
+                fixture.setUp()
+                try:
+                    route, path, jobs, owner, cycle, review, request = fixture._prepare_fixture(harness, "autopilot-spec")
+                    successor = R.build_continuation_route(
+                        route, resume_from_node="review", requested_boundary="review",
+                        reason="batch-refused-before-start", artifact_root=fixture.root)
+                    successor_file = R.canonical_route_path(fixture.root, successor["route_id"])
+                    R.publish_continuation_route(successor, route, successor_file)
+                    batch_spec = importlib.util.spec_from_file_location("unstarted_batch", Path(__file__).with_name("dispatch-batch.py"))
+                    batch = importlib.util.module_from_spec(batch_spec)
+                    batch_spec.loader.exec_module(batch)
+                    batch_output = io.StringIO()
+                    before_batch = jobs.read_bytes()
+                    with mock.patch.object(batch, "load_route", return_value=successor), \
+                            mock.patch.object(batch.subprocess, "Popen") as spawn, \
+                            contextlib.redirect_stdout(batch_output), contextlib.redirect_stderr(io.StringIO()):
+                        code = batch.main(["--action", "start", "--route", str(successor_file),
+                                           "--parallel-group", "research", "--parent", "owner",
+                                           "--slug-prefix", "refused", "--jobs", str(jobs)])
+                    self.assertEqual(code, 65, batch_output.getvalue())
+                    self.assertEqual(json.loads(batch_output.getvalue())["reason"], "parallel-group-cardinality")
+                    spawn.assert_not_called()
+                    self.assertEqual(jobs.read_bytes(), before_batch)
+                    # Old publish-time audit bindings must recover without editing records.
+                    R.bind_continuation_cycle(fixture.root, route, successor)
+                    outcome, _ = R.close_route(successor, successor_file, summary="batch admitted 0, spawned 0")
+                    self.assertFalse(outcome["terminal_gate_proven"])
+                    report = fixture.write_output(cycle, rel="spec/_internal/owner-report.md",
+                                                  data=b"verified transaction report\n")
+                    text = f"artifact: {report}\nverdict: PASS\nblocker: none"
+                    native = {
+                        "codex": [{"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+                                  {"type": "turn.completed"}],
+                        "claude": [{"type": "result", "subtype": "success", "is_error": False, "result": text}],
+                        "opencode": [{"type": "text", "sessionID": "ses_test", "part": {"type": "text", "text": text}},
+                                     {"type": "step_finish", "sessionID": "ses_test", "part": {"type": "step-finish", "reason": "stop"}}],
+                    }[harness]
+                    log = jobs.parent / "owner.jsonl"
+                    log.write_text("\n".join(json.dumps(row) for row in native) + "\n")
+                    jobs.write_text(jobs.read_text().replace("worker_type=owner", f"attempt_schema_version=2,worker_type=owner,log_file={log},workflow_completion=runtime-v1"))
+                    fixture._closed_owner(jobs, owner)
+                    metadata = exact_attempt_row(jobs, owner).metadata
+                    before_jobs = jobs.read_bytes()
+                    before_successor = successor_file.read_bytes()
+                    with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+                        settled = terminal.settle_owner_completion(jobs, "done", metadata)
+                        self.assertEqual(settled.result, "completed", settled)
+                        self.assertEqual(P.read_cycle_record(fixture.root, cycle["cycle_id"])["state"], "sealed")
+                        manifest = json.loads((Path(cycle["cycle_dir"]) / "manifest.json").read_text())
+                        self.assertEqual(manifest["routes"][0]["route_id"], route["route_id"])
+                        self.assertEqual(settled.shared_publication["status"], "admitted", settled.shared_publication)
+                        references = P.list_references(fixture.root, "spec")
+                        self.assertEqual(len(references), 1)
+                        self.assertEqual(terminal.settle_owner_completion(jobs, "done", metadata).result, "completed")
+                        self.assertEqual(jobs.read_bytes(), before_jobs)
+                        self.assertEqual(successor_file.read_bytes(), before_successor)
+                finally:
+                    fixture.doCleanups()
+
     def _prepare_fixture(self, harness="claude", capability="autopilot-code"):
         import dispatch_terminal_commit as terminal
         self.activate()
@@ -4990,6 +5058,42 @@ class RouteLineageBindingTest(ProducerTestBase):
             transport=None, inline_reason="atomic-direct",
             tracking="tracked", tracked_gate_evidence=gate_evidence(), slug=slug,
         )
+
+    def test_closed_unused_candidate_keeps_execution_and_unknown_evidence_attached(self):
+        begin = self._root_route("unused-candidate-boundaries")
+        self._publish_root(begin)
+        started = self._begin(begin)
+        successor = self._continuation(begin)
+        record = P.read_cycle_record(self.root, started["cycle_id"])
+        self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
+        successor_file = R.canonical_route_path(self.root, successor["route_id"])
+        R.close_route(successor, successor_file, summary="unused candidate")
+        self.assertTrue(P._closed_unexecuted_continuation(self.root, successor))
+        self.assertTrue(P.cycle_route_admission(self.root, record, begin, finalize=True).allow)
+
+        for metadata_key in ("route_id", "route", "owner_route_id"):
+            for launch_started in ("0", "1"):
+                for registry_status in ("open", "done"):
+                    with self.subTest(metadata_key=metadata_key, launch_started=launch_started,
+                                      registry_status=registry_status):
+                        self.jobs.write_text(f"2026-10-09\t{registry_status}\t{R.ROOT}\t{R.ROOT}\tchild\t"
+                                             f"{metadata_key}={successor['route_id']},attempt_id=att-child,"
+                                             f"launch_started={launch_started}\n")
+                        self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
+                        self.assertFalse(P.cycle_route_admission(self.root, record, begin, finalize=True).allow)
+        self.jobs.write_text("corrupt registry row\n")
+        self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
+        self.jobs.write_text("")
+        with mock.patch.object(P.artifact_lifecycle._load_capability_route(), "resolve_dangling_registry",
+                               side_effect=OSError("unreadable registry")):
+            self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
+        markers = R.completion_dir(successor["route_id"], jobs=self.jobs)
+        markers.mkdir(parents=True, exist_ok=True)
+        (markers / "inline.json").write_text("{}")
+        self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
+        (markers / "inline.json").unlink()
+        self._continuation(successor)
+        self.assertFalse(P._closed_unexecuted_continuation(self.root, successor))
 
     def _publish_root(self, route):
         path = R.canonical_route_path(self.root, route["route_id"])

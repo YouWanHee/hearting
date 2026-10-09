@@ -1038,6 +1038,11 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         self.P._write_cycle_record(self.root, record, exclusive=False)
         for cycle in (first, second):
             self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        # This case represents used fork branches, not merely published candidates.
+        self.jobs.write_text("".join(
+            f"2026-10-09\tdone\t{self.R.ROOT}\t{self.R.ROOT}\tchild\t"
+            f"route_id={route['route_id']},attempt_id=att-{route['route_id']},launch_started=1\n"
+            for route in (x, y)))
         for route in (a, x, y):
             self._close_unproven(route)
         summary = self._sweep()
@@ -1045,6 +1050,18 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
                                                   second["cycle_id"]: "cycle-abandoned"})
         self.assertEqual(self._manifest_routes(first), [x["route_id"]])
         self.assertEqual(self._manifest_routes(second), [y["route_id"]])
+
+    def test_closed_unused_fork_keeps_predecessor_as_manifest_route(self):
+        a = self._root_route("leftover-unused-fork")
+        self._publish_root(a)
+        x = self._continuation(a, reason="unused-x")
+        y = self._continuation(a, reason="unused-y")
+        cycle = self._begin(a)
+        self.write_output(cycle, "plans/leftover/note.md", b"predecessor work\n")
+        for route in (a, x, y):
+            self._close_unproven(route)
+        self.assertEqual(self._results(self._sweep()), {cycle["cycle_id"]: "cycle-abandoned"})
+        self.assertEqual(self._manifest_routes(cycle), [a["route_id"]])
 
     def test_a_lineage_walk_past_its_deadline_leaves_the_cycle_open_and_completes_without_one(self):
         import route_autoclose
@@ -1054,6 +1071,8 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         c = self._continuation(b)
         cycle = self._begin(a)
         self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        self.jobs.write_text(f"2026-10-09\tdone\t{self.R.ROOT}\t{self.R.ROOT}\tchild\t"
+                             f"route_id={c['route_id']},attempt_id=att-deadline-child,launch_started=1\n")
         for route in (a, b, c):
             self._close_unproven(route)
         record = self._record(cycle)

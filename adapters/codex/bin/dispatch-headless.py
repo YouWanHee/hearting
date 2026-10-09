@@ -894,6 +894,7 @@ def ensure_owner_writable_dirs(args: argparse.Namespace) -> None:
     not a silently narrowed grant list."""
 
     to_create = list(progress_writable_dirs(args))
+    to_create.extend(route_bound_worker_writable_dirs(args))
     if getattr(args, "nested_headless_network", False):
         to_create.append(owner_root())
     if spec_read_marker_required(args):
