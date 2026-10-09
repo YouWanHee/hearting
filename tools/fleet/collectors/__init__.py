@@ -303,10 +303,9 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     jobs_path:      override for .dispatch/jobs.log (else env / default).
     usage:          only exact ``refresh`` may schedule a background usage fetch;
                     all other values are cache-only.
-    fast_first:     internal first-live-publication hint, threaded to dispatch
-                    only (exact classification inputs stay attached; display
-                    details fill on the next full tick). ``--once``/JSON and
-                    every other caller keep the full pass.
+    fast_first:     internal basic-live observation hint. Exact classification,
+                    NOW and resource inputs stay attached; display details fill
+                    independently. ``--once``/JSON keep the full pass.
     """
     sessions = procscan.scan(harness_filter=harness_filter)
 
@@ -530,7 +529,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
 
     try:
-        _adopt_child_titles(sessions, jobs)
+        if not fast_first:
+            _adopt_child_titles(sessions, jobs)
     except Exception:
         pass
 
@@ -538,7 +538,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         from .. import route_chain as _route_chain
         _route_chain.enrich(sessions, jobs=jobs,
                              node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
-                             now=_time.time())
+                             now=_time.time(), **({"fast_first": True} if fast_first else {}))
     except Exception:
         pass
 
@@ -565,7 +565,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
                            now=_time.time(),
                            node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
                            degradations=getattr(dispatch.collect, "last_degradations", None),
-                           resources=resource_jobs)
+                           resources=resource_jobs, **({"fast_first": True} if fast_first else {}))
     except Exception:
         # Projection failure is fail-closed at the row boundary, never a reason to drop data.
         from ..model import WorkProjection
@@ -579,7 +579,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     peer = None
     try:
         from . import peer_messages
-        peer = peer_messages.collect()
+        peer = None if fast_first else peer_messages.collect()
         apply_peer_rows(sessions, (peer or {}).get("by_session") or {})
     except Exception:
         peer = None
