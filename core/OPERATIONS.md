@@ -1232,13 +1232,26 @@ row uses the existing stalled-age warning rather than forcing fresh-age or
 basis explanations onto it. Original phase/metric names are preserved, and
 combined arm totals, ETA, speed and epoch-mean loss are not inferred.
 
-`run` measures the selected host through the existing bounded probe before
-launch, including for `--dry-run`. Its receipt and run metadata carry the
-observation time, GPU free memory and utilization. When the probe observes a
-GPU with zero utilization and no compute processes, it suggests the one with
-the most free memory. This is a snapshot, not a reservation: the caller's host
-and `--gpus` choice remain unchanged. An unavailable probe is reported as
-unknown and never blocks launch; no separate pre-launch `probe` is required.
+`run` and GPU `resource-runner start` automatically reserve their devices in
+one host-local `gpu-leases.json` beside the canonical dispatch registry. All
+launchers targeting that host share the same locked selection and publication;
+the harness never chooses a host. Without a device choice, launch selects one
+unreserved GPU with no compute processes and zero utilization, preferring free
+memory. Memory-holding idle processes are occupied too. An occupied explicit
+choice starts nothing and reports its owner, task, start time and free devices.
+`--share` is the single optional override for deliberate sharing; no reservation
+command or additional required input is involved. An explicit empty
+`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution. GPU measurement failure
+cannot establish availability. Receipts retain the observed memory/utilization.
+
+Reservation lifetime follows the exact wrapper PID, start time and PID namespace,
+not its launching session. Normal exit releases it; the next launch or status
+observation removes proven-dead/reused-PID reservations, preserving unknown
+identity. Existing work is not adopted or interrupted: its probe processes mark
+the GPU occupied. `compute-hosts list` and Fleet's top compute panel show GPU
+reservations, including the session tag, task and start time, before CUDA has
+allocated memory. Host-local storage lets callers on different machines converge
+without depending on a shared NAS mount or an installed harness on the target.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work

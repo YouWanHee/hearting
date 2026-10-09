@@ -123,6 +123,20 @@ class ComputeHostCollectorTest(unittest.TestCase):
 
 
 class ComputeHostRenderTest(unittest.TestCase):
+    def test_reservation_owner_task_and_start_are_visible_even_with_folded_processes(self):
+        gpu = self.snapshot["hosts"][0]["gpus"][0]
+        gpu["reservations"] = [{"owner": {"label": "SR_CorrNet [cd]"},
+                                "task": "css 1ch training", "started_at": 1728000000}]
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: True}
+        render.set_compute_hosts(self.snapshot)
+        for width in (60, 100, 168):
+            rows = render._compute_host_rows(width)
+            text = "\n".join(render._plain(row) for row in rows)
+            self.assertIn("reserved SR_CorrNet [cd]", text)
+            self.assertIn("10-04", text)
+            self.assertIn("css", text)
+            self.assertTrue(all(render._dw(render._plain(row)) <= width for row in rows))
+
     def setUp(self):
         self.addCleanup(setattr, render, "_ROUTE_FOLD", render._ROUTE_FOLD)
         render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
