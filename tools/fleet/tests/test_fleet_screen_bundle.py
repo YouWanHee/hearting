@@ -106,7 +106,7 @@ class BundleTest(unittest.TestCase):
                     self.assertTrue(all(r.index(next(c for c in "╭╰├" if c in r)) > render._STEWARD_LINE_COL
                                         for r in box_rows))
 
-    def test_all_owner_states_are_once_on_close_rail_worker_stays_inline(self):
+    def test_all_owner_states_are_once_on_divider_worker_stays_inline(self):
         main = session("aa")
         for state, live in (("preparing", "working"), ("scaffold", "working"),
                             ("done", "done")):
@@ -118,9 +118,9 @@ class BundleTest(unittest.TestCase):
                                  cwd=main.cwd, depth=2, is_child=True, liveness="working")
             for width in (60, 100, 168):
                 rows = text(self.build([main], [owner, worker], width))
-                rail = next(r for r in rows if "╰" in r)
+                rail = next(r for r in rows if "├" in r)
                 self.assertIn(state, rail)
-                self.assertFalse(any(state in r for r in rows if "╭" in r or "├" in r))
+                self.assertFalse(any(state in r for r in rows if "╭" in r or "╰" in r))
                 self.assertTrue(any("running" in r for r in rows))
                 self.assertNotIn("\033[5m", "\n".join(rows))
 
@@ -150,6 +150,78 @@ class BundleTest(unittest.TestCase):
         owner._dead_terminal_owner = True
         rows = text(self.build([session("aa")], [owner], 100))
         self.assertTrue(any("╰" in row and "dead-runtime-exit resume=execute" in row for row in rows))
+
+    def test_owner_status_position_across_harnesses_and_child_types(self):
+        for harness in ("claude", "codex", "opencode"):
+            for child_type in (None, "worker", "resource"):
+                for state, label in (("preparing", "preparing"), ("scaffold", "scaffold"),
+                                     ("one-shot", "one-shot"), ("done", "done ✓"),
+                                     ("dead", "dead @execute"),
+                                     ("orphaned", "⚠ ORPHANED resume=execute")):
+                    owner = DispatchJob(
+                        key="code", slug="owner", cwd="/work/bundle", parent_sid="aa",
+                        is_child=True, harness=harness, depth=1, worker_type="owner",
+                        intensity="standard", stage="execute" if state in ("dead", "orphaned") else state,
+                        liveness="dead" if state in ("dead", "orphaned") else
+                                 "done" if state == "done" else "working",
+                        note="dead-parent-orphaned" if state == "orphaned" else None,
+                        resume_boundary="execute",
+                        work_projection=WorkProjection(source="inline", stage_label="execute"
+                                                       if state in ("dead", "orphaned") else state))
+                    owner.afterglow = state == "done"
+                    jobs = [owner]
+                    if child_type == "worker":
+                        jobs.append(DispatchJob(key="code-execute", slug="worker",
+                                                parent_slug=owner.slug, cwd=owner.cwd,
+                                                depth=2, is_child=True, liveness="working"))
+                    elif child_type == "resource":
+                        owner.resource_children = [ResourceJob(run_id="resource", node="train",
+                                                               liveness="working", elapsed_min=1)]
+                    for width in (60, 100, 168):
+                        with self.subTest(harness=harness, child=child_type, state=state, width=width):
+                            with mock.patch.object(render, "_SHOW_ALL", state in ("dead", "orphaned")):
+                                rows = text(self.build([session("aa", harness)], jobs, width))
+                            rail = next(row for row in rows if ("├" if child_type else "╰") in row)
+                            self.assertIn(label, rail)
+                            self.assertEqual(sum(row.count(label) for row in rows), 1)
+                            other = "╰" if child_type else "├"
+                            self.assertFalse(any(label in row for row in rows if other in row))
+                            self.assertTrue(all(render._dw(row) <= width for row in rows
+                                                if any(mark in row for mark in "╭│├╰")))
+
+    def stage_divider_screen(self, width):
+        """Fixed screen with GPU, worker and childless cards under a supervisor."""
+        main = session("aa", "claude", steward=True, steward_targets=[target("bb")],
+                       model="Opus", effort="high", summary="NOW owner work")
+        child = session("bb", "codex", model="gpt-6.1-sol", effort="medium")
+        owners = []
+        for slug, harness, state in (("gpu-owner", "claude", "one-shot"),
+                                     ("worker-owner", "codex", "preparing"),
+                                     ("childless-owner", "opencode", "scaffold")):
+            owners.append(DispatchJob(
+                key="code", slug=slug, cwd=main.cwd, parent_sid="aa", is_child=True,
+                harness=harness, depth=1, worker_type="owner", intensity="standard",
+                model="Opus" if harness == "claude" else "gpt-6.1-sol",
+                effort="high", liveness="working", stage=state,
+                work_projection=WorkProjection(source="inline", stage_label=state)))
+        owners[0].resource_children = [ResourceJob(run_id="golden-gpu", node="train",
+                                                  liveness="working", elapsed_min=2)]
+        owners.append(DispatchJob(key="code-execute", slug="worker", cwd=main.cwd,
+                                  parent_slug="worker-owner", is_child=True, depth=2,
+                                  harness="codex", model="gpt-6.1-sol", effort="medium",
+                                  liveness="working", elapsed_min=3))
+        render.set_compute_hosts({"configured": True, "collected_at": 1700000000.0, "hosts": [
+            {"host": "gpu", "reachable": True, "gpus": [{"index": 0, "processes": [
+                {"pid": 123, "proc_start": "456", "command": "python train.py",
+                 "owner": {"kind": "run", "id": "golden-gpu"}}]}]}]})
+        with mock.patch("time.time", return_value=1700000000.0):
+            return "\n".join(text(self.build([main, child], owners, width))) + "\n"
+
+    def test_stage_divider_screen_matches_wide_and_narrow_goldens(self):
+        for width in (60, 100, 168):
+            with self.subTest(width=width):
+                golden = Path(__file__).parent / "fixtures" / "stage_divider" / ("screen-%d.txt" % width)
+                self.assertEqual(self.stage_divider_screen(width), golden.read_text())
 
     def hierarchy(self):
         a = session("aa", steward=True, steward_targets=[target("cc")])

@@ -1,7 +1,7 @@
 """OWNER rail geometry and status placement.
 
-Approved 1008 correction: singleton/boot/done and full pipelines all live on the
-close rail. A child divider remains bare. Worker micro-status remains inline.
+F-81: singleton/boot/done and full pipelines share the child divider, or the
+close rail when childless. Worker micro-status remains inline.
 """
 import os
 import re
@@ -316,7 +316,7 @@ class CardIntegrationTest(unittest.TestCase):
                     self.assertEqual(phases[0] != phases[1], state == "active")
                     self.assertNotIn("\033[5m", render._snapshot_line(phases[0], colored=True))
 
-    def test_one_shot_resource_child_leaves_label_on_close_rail_not_divider(self):
+    def test_one_shot_resource_child_places_label_on_divider_not_close_rail(self):
         from fleet.model import ResourceJob, Session
         job = _owner(route_seq=[("one-shot", "active")], done=0, total=1)
         job.attempt_id = "att-one-shot-resource"
@@ -326,13 +326,13 @@ class CardIntegrationTest(unittest.TestCase):
         job.resource_children = [resource]
         session = Session(harness="claude", pid=915, cwd=job.cwd, session_id="sid-parent",
                           slug="main-parent", liveness="working")
-        for width in (80, 168):
+        for width in (60, 100, 168):
             lines = render._build_lines([session], [job], "both", False, 0,
                                         layout=render._layout_mode(width), term_width=width,
                                         resources=[resource])
             rows = [_text(line) for line in lines if line]
-            self.assertTrue(any("╰" in row and "one-shot" in row for row in rows))
-            self.assertFalse(any("├" in row and "one-shot" in row for row in rows))
+            self.assertTrue(any("├" in row and "one-shot" in row for row in rows))
+            self.assertFalse(any("╰" in row and "one-shot" in row for row in rows))
 
     def test_breadcrumb_survives_when_every_descendant_folded_to_done(self):
         # F-81's own regression: an owner whose children are ALL `done` folds them out of
@@ -357,8 +357,8 @@ class CardIntegrationTest(unittest.TestCase):
                 rail = [r for r in rows if "╰" in r]
                 self.assertTrue(divider,
                                 "breadcrumb-only card must still draw its header divider")
-                self.assertNotIn("plan-check ✓", divider[0])
-                self.assertIn("plan-check ✓", rail[0])
+                self.assertIn("plan-check ✓", divider[0])
+                self.assertNotIn("plan-check ✓", rail[0])
                 for row in rows:
                     if any(mark in row for mark in ("╭", "│", "├", "╰")):
                         self.assertLessEqual(render._dw(row), width)
@@ -439,7 +439,8 @@ class CardIntegrationTest(unittest.TestCase):
                 rail = [r for r in rows if "╰" in r]
                 self.assertTrue(divider)
                 self.assertEqual(sum(r.count("plan-check ✓") for r in rows), 1)
-                self.assertIn("plan-check ✓", rail[0])
+                self.assertIn("plan-check ✓", divider[0])
+                self.assertNotIn("plan-check ✓", rail[0])
                 for row in rows:
                     if any(mark in row for mark in ("╭", "│", "├", "╰")):
                         self.assertLessEqual(render._dw(row), width)
