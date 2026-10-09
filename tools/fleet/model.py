@@ -599,6 +599,7 @@ class ResourceJob:
     pid: Optional[int] = None
     starttime: Optional[str] = None
     command_hash: Optional[str] = None
+    command: Optional[list] = None  # registry argv, display only; never ownership proof
     process_group: Optional[int] = None
     registry_status: Optional[str] = None
     registry_path: Optional[str] = None

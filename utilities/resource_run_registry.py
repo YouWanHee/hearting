@@ -334,6 +334,8 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "cwd": cwd, "elapsed_min": elapsed_min, "liveness": liveness,
         "pid": run.get("pid"), "starttime": run.get("starttime"),
         "command_hash": run.get("command_hash"), "process_group": run.get("process_group"),
+        "command": (run["command"] if isinstance(run.get("command"), list)
+                    and all(isinstance(arg, str) for arg in run["command"]) else None),
         "registry_status": run.get("status"), "registry_path": str(registry),
         "log_path": log_path, "log_updated_at": log_updated_at,
         "route": run.get("route"), "node": run.get("node"),

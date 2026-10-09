@@ -1526,7 +1526,7 @@ about a real target (`source=watch`; a mistyped target leaves no flag), or by a
 `peer-steward.py start` that launched a session (`source=start`). No `record` path and
 no send raises it — not a steer/handoff/gate-relay and not a `SendMessage` with `notify_when_idle`, which the
 Claude hook records as `kind=watch`. Fleet renders an evidenced marker
-as the pink tag and leading relation flag only for targets confirmed in the same repository.
+as the pink tag and model flag only for targets confirmed in the same repository.
 Fleet and herdr use `steward.role_targets` for that display decision, comparing
 Git common directories (so linked worktrees count as the same repository) from
 existing session metadata. Unknown or foreign repository targets grant no role,
@@ -1544,17 +1544,17 @@ Existing `source=start` entries remain readable without migration.
 Sessions with their own winning
 targets form separate supervisor groups; supervisor-to-supervisor relations
 remain communication (`✉`). This shared projection is a display handover, not a
-refusal or marker rewrite. Every session's first row keeps its status glyph first,
-then a two-cell relation slot and a space before the aligned `[id]`: supervisors
-use `⚑ `, visible targets use `├╌` (last target `╰╌`), and unrelated sessions leave
-the slot blank. A subtle explicit grey `┆` continues in the slot's first column
-from below the supervisor through the row above its last target, including owner
-boxes. An off-screen target leaves only the supervisor's flag. Detail text and
-box left edges retain column 8; title, model-detail, routing, NOW and box right-edge
-anchors stay fixed. The first-row harness/model field absorbs the three added
-cells in wide layouts. Narrow/stack first-row titles start two cells later for
-every session, preserving the full `opencode` label and a following gap while
-only the title's trailing budget shrinks; detail anchors stay fixed.
+refusal or marker rewrite. Supervisor groups share one connector column under
+the first character inside `[id]`, drawn as a dashed `┆` on every row so it
+never reads as a box border. All session detail text and box left edges clear that
+column by two spaces, even without a connector; model, routing, NOW and box
+right-edge anchors stay fixed. The supervisor flag appears once after the model
+and effort. Resource-waiting owners use the same NOW projection on all three harnesses:
+show the exact resource's node and command, observed host/GPU, declared counters
+when available, elapsed time and last-log age. Missing observations remain named
+(`대기`, `로그 없음`, or unknown host/GPU); they never borrow another session's
+activity or change resource liveness. Runtime maintenance in a private snapshot
+repository is plumbing, not a user tool call.
 Depth-1 frame cards use the owner model/gauge,
 routing and close-rail status layout on every harness; worker layouts retain
 their existing columns. Fleet ignores a marker whose entries carry no role source;
