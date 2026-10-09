@@ -89,12 +89,21 @@ def resource_body_digest(row):
     return RESUME.row_digest(body)
 
 
+def resource_execution_finished(row):
+    """A terminal payload, successful or failed, can precede another run."""
+    from resource_run_registry import classify_identity
+    if (row.get("status") == "launching" or row.get("cancel_requested")
+            or row.get("parent_close_requested") or classify_identity(row)[0] != "exited"):
+        return False
+    code = supervisor().runner().read_sentinel(row.get("sentinel"))
+    return (code is not None and row.get("exit_code", code) == code
+            and not (row.get("status") == "failed" and code == 0)
+            and not (row.get("status") == "succeeded" and code != 0))
+
+
 def resource_execution_succeeded(row):
     """A past status word cannot substitute for the exact exit and sentinel."""
-    from resource_run_registry import classify_identity
-    return (row.get("status") not in {"launching", "failed"}
-            and not row.get("cancel_requested") and not row.get("parent_close_requested")
-            and classify_identity(row)[0] == "exited"
+    return (resource_execution_finished(row)
             and supervisor().runner().read_sentinel(row.get("sentinel")) == 0)
 
 
@@ -278,7 +287,7 @@ def pending_prompt(path, parent, args=None, control=None):
                     "jobs": str(Path(args.jobs).resolve())}
         found = context(args, control)
         row = next((r for _, r in found[3] if resource_key(r) == box["key"]), None) if found else None
-        if row is None and found and found[3] and receipt.get("reason") == "awaiting-next-resource":
+        if row is None and found and found[3]:
             sup, route, ledger, _ = found
             for armed, prior in sup.resource_predecessors(ledger, receipt["node"]):
                 owner = prior.get("owner_wait") or {}
@@ -292,7 +301,7 @@ def pending_prompt(path, parent, args=None, control=None):
                         and owner.get("parent_attempt_id") == parent
                         and owner.get("session_id") == control.thread_id
                         and resource_key(prior) == box["key"]
-                        and resource_execution_succeeded(prior)):
+                        and resource_execution_finished(prior)):
                     row = prior
                     break
         if (any(receipt.get(k) != v for k, v in expected.items()) or row is None

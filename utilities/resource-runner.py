@@ -181,13 +181,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             if any(current.get(k) != placeholder.get(k) for k in keys):
                 raise ValueError("resource-route-body-conflict")
             return False, current
-        if matches and (not owner_wait or any(
-                row.get("resource_policy") != "supervised-owner"
-                or row.get("owner_wait") != owner_wait
-                or not OWNER_RESOURCE.resource_execution_succeeded(row)
-                or OWNER_RESOURCE.resource_evidence_paths_conflict(row, placeholder) for row in matches)):
-            raise ValueError("resource-route-body-conflict")
-        if any(OWNER_RESOURCE.resource_evidence_paths_conflict(row, placeholder) for row in history):
+        if any(not OWNER_RESOURCE.resource_execution_finished(row)
+               or OWNER_RESOURCE.resource_evidence_paths_conflict(row, placeholder)
+               for row in [*matches, *history]):
             raise ValueError("resource-route-body-conflict")
         data["runs"][args.run_id] = placeholder
         return True, placeholder
