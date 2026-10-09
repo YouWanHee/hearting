@@ -70,6 +70,32 @@ class StageSessionStateDirTests(unittest.TestCase):
         runtime.bind(args, artifact_root=self.root, action="dry-run")
         self.assertFalse((self.root / ".runtime").exists())
 
+    def test_adapter_binding_accepts_next_route_literals_and_rejects_globs(self):
+        names = ["app/[id]/page.tsx", "app/[...slug]/page.tsx", "app/(group)/page.tsx"]
+        for name in names:
+            path = self.worktree / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("page\n")
+        args = _args(self.worktree, self.brief, self.fixed, fixed_file=names)
+        runtime.bind(args, artifact_root=self.root, action="dry-run")
+        self.assertEqual(args.fixed_file, sorted(str(self.worktree / name) for name in names))
+        for pattern in ("app/*/page.tsx", "app/?.tsx", "app/[ab]/page.tsx"):
+            with self.subTest(pattern=pattern), self.assertRaises(DispatchContractError) as caught:
+                runtime.bind(_args(self.worktree, self.brief, self.fixed, fixed_file=[pattern]),
+                             artifact_root=self.root, action="dry-run")
+            self.assertEqual(caught.exception.reason, "subsession-fixed-file-not-exact")
+        self.assertFalse((self.root / ".runtime").exists())
+
+    def test_a_bracket_in_the_checkout_name_does_not_turn_a_new_file_into_a_glob(self):
+        tree = self.worktree / "project[1]"
+        tree.mkdir()
+        from stage_session_contract import _fixed_files
+        expected = [str(tree / "new.tsx")]
+        self.assertEqual(_fixed_files(["new.tsx"], worktree=tree, session_id="ss-fixture"), expected)
+        args = _args(tree, self.brief, self.fixed, fixed_file=["new.tsx"])
+        runtime.bind(args, artifact_root=self.root, action="dry-run")
+        self.assertEqual(args.fixed_file, expected)
+
     def test_legacy_state_dir_is_refused_once_the_cutover_is_active(self):
         artifact_producer.activate(self.root, repository_id="repo_" + "c" * 32, artifact_root_id="root_" + "d" * 32)
         legacy = self.root / "plans" / "stage-sessions" / "rt-0123456789abcdef" / "_internal" / "state"
