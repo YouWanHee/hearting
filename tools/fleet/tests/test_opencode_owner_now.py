@@ -11,6 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fleet import refresh_title as rt
 from fleet import titles
+from fleet import render
 from fleet.collectors import dispatch
 from fleet.model import DispatchJob
 
@@ -67,9 +68,12 @@ class OwnerNowTest(unittest.TestCase):
         self.part({"type":"tool","tool":"bash","state":{"status":"running",
             "input":{"command":"env DEVICE=1 python train.py"},"output":"PRIVATE OUTPUT"}}, stamp=2000)
         self.enrich()
-        self.assertEqual(self.job.exec_tool,"python")
+        self.assertEqual(self.job.exec_tool,{"name":"python"})
         self.assertEqual(self.job.summary,"데이터를 확인하고 학습을 준비합니다")
         self.assertEqual(self.job.summary_ts,1.0)
+        row = render._plain(render._context_detail_row(self.job,term_width=168)[0])
+        self.assertIn("⚙ python",row)
+        self.assertIn("데이터를 확인하고 학습을 준비합니다",row)
 
     def test_completed_tools_are_not_running(self):
         self.message(completed=True)
@@ -143,6 +147,35 @@ class OwnerNowTest(unittest.TestCase):
         self.message()
         self.enrich()
         self.assertEqual(self.job.summary,"모델 응답 중")
+
+    def test_malformed_native_time_does_not_assert_a_running_call(self):
+        self.message()
+        self.con.execute("UPDATE message SET data=?",(json.dumps({"role":"assistant","time":"bad"}),))
+        self.con.commit()
+        self.part({"type":"tool","tool":"bash","state":{"status":"running"}})
+        self.enrich()
+        self.assertIsNone(self.job.exec_tool)
+        self.assertIsNone(self.job.summary)
+
+    def test_foreign_supervisor_announcement_is_refused(self):
+        self.log.write_text(self.log.read_text().replace("att-test","att-other"))
+        self.enrich()
+        self.assertIsNone(self.job.summary)
+        self.assertEqual(self.job.association_ambiguity,"opencode-announcement-identity-mismatch")
+
+    def test_streaming_copy_stops_at_byte_budget_when_source_grows(self):
+        src = self.root / "growing"
+        target = self.root / "copy"
+        src.write_bytes(b"x"*40)
+        smaller = mock.Mock(st_size=1,st_mode=0o600)
+        native_stat = os.stat
+        def source_stat(path, *args, **kwargs):
+            return smaller if str(path) == str(src) else native_stat(path,*args,**kwargs)
+        with mock.patch.object(rt.os,"stat",side_effect=source_stat), \
+                mock.patch.object(rt,"fcntl",None):
+            with self.assertRaises(OSError):
+                rt._copy_opencode_file(str(src),str(target),max_bytes=10)
+        self.assertLessEqual(target.stat().st_size,10)
 
     def test_tf_and_bc_terminal_protocol_is_readable(self):
         self.message(completed=True)

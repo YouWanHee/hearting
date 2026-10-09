@@ -1937,7 +1937,7 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
         if cached and cached[0] == signatures:
             activity = cached[1]
         else:
-            with refresh_title._opencode_snapshot(db) as connection:
+            with refresh_title._opencode_snapshot(db, max_bytes=_OPENCODE_ACTIVITY_BYTES) as connection:
                 deadline = time.monotonic() + .05
                 connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
                 activity = refresh_title.read_opencode_activity(connection, session_id)
@@ -1949,7 +1949,8 @@ def _enrich_opencode_native_activity(job, session_id, fast_first=False):
         job.exec_tool = None
         tool = activity.get("tool")
         if tool:
-            job.exec_tool = _tool_label(tool.get("name"), tool.get("input"))
+            label = _tool_label(tool.get("name"), tool.get("input"))
+            job.exec_tool = {"name": label} if label else None
         if activity.get("summary"):
             job._native_now = (activity["summary"], activity.get("summary_ts"))
     except (OSError, sqlite3.Error, TypeError, ValueError):

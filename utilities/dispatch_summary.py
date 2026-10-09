@@ -665,7 +665,7 @@ def supervise(
             if db_source:
                 from fleet.refresh_title import _opencode_source_signatures
                 stamps = _opencode_source_signatures(str(source))
-                source_ts = max(info[4] / 1e9 for info in stamps.values() if info)
+                source_ts = max((info[4] / 1e9 for info in stamps.values() if info), default=float("inf"))
                 db_fresh = (sidecar.get("ts") or 0) >= source_ts
             if (db_fresh if db_source else offset >= final_size) and sidecar.get("summary"):
                 final_complete = True
