@@ -1199,7 +1199,94 @@ def _mark_started(args, sid, mode):
         "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start")
 
 
+def _grid_split(layout):
+    """Match partial 2×2 grids, including herdr's odd-cell rounding."""
+    area, panes = layout.get("area"), layout.get("panes")
+    if not isinstance(area, dict) or not isinstance(panes, list) or not 1 <= len(panes) <= 3:
+        return None
+    keys = ("x", "y", "width", "height")
+    if any(type(area.get(k)) is not int for k in keys) or min(area["width"], area["height"]) < 4:
+        return None
+    for pane in panes:
+        rect = pane.get("rect") if isinstance(pane, dict) else None
+        if not isinstance(rect, dict) or any(type(rect.get(k)) is not int for k in keys):
+            return None
+    panes = sorted(panes, key=lambda p: (p["rect"]["x"], p["rect"]["y"]))
+    # Expected rectangles in x/y order, index of the full cell, split direction.
+    full = (0, 0, 1, 1)
+    left, right = (0, 0, .5, 1), (.5, 0, .5, 1)
+    top, bottom = (0, 0, 1, .5), (0, .5, 1, .5)
+    tl, bl, tr, br = (0, 0, .5, .5), (0, .5, .5, .5), (.5, 0, .5, .5), (.5, .5, .5, .5)
+    patterns = (([full], 0, "right"), ([left, right], 1, "down"),
+                ([left, tr, br], 0, "down"), ([tl, bl, right], 2, "down"),
+                ([top, bottom], 0, "right"), ([tl, bottom, tr], 1, "right"),
+                ([top, bl, br], 0, "right"))
+    for expected, index, direction in patterns:
+        if len(expected) != len(panes):
+            continue
+        matches = True
+        for pane, (x, y, w, h) in zip(panes, expected):
+            desired = (area["x"] + x * area["width"], area["y"] + y * area["height"],
+                       w * area["width"], h * area["height"])
+            if any(abs(pane["rect"][k] - v) > .5 for k, v in zip(keys, desired)):
+                matches = False
+                break
+        if matches:
+            return panes[index]["pane_id"], direction
+    return None
+
+
+def _start_placement(beside):
+    """Choose a split, a safe shell, or a fresh tab from this tab's live layout."""
+    try:
+        proc = subprocess.run(_herdr_argv("pane", "layout", "--pane", beside),
+                              capture_output=True, text=True, timeout=_herdr_get_timeout())
+        payload = json.loads(proc.stdout or "")
+        result = payload.get("result") if isinstance(payload, dict) else None
+        layout = result.get("layout") if isinstance(result, dict) else None
+        if (proc.returncode or not isinstance(payload, dict) or payload.get("error")
+                or not isinstance(layout, dict)):
+            return None
+        panes, workspace = layout.get("panes"), layout.get("workspace_id")
+        if (not isinstance(workspace, str) or not workspace.strip()
+                or not isinstance(layout.get("tab_id"), str) or not isinstance(panes, list)
+                or not panes or any(not isinstance(p, dict) or not isinstance(p.get("pane_id"), str)
+                                    or not p["pane_id"].strip() for p in panes)):
+            return None
+        ids = [p["pane_id"] for p in panes]
+        if (beside not in ids or len(ids) != len(set(ids))
+                or not layout["tab_id"].startswith(workspace + ":")
+                or any(not pane_id.startswith(workspace + ":") for pane_id in ids)):
+            return None
+        split = _grid_split(layout)
+        if split:
+            return "split", split[0], split[1]
+        for pane in panes:
+            pane_id = pane["pane_id"]
+            if (_pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None
+                    and _wait_for_shell_prompt(pane_id, timeout_ms=1)
+                    and _pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None):
+                return "reuse", pane_id, None
+        return "tab", workspace, None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def cmd_start(args):
+    beside = args.beside or (os.environ.get("HERDR_PANE_ID", "").strip() if not args.pane else None)
+    if not beside:
+        return _start_in_pane(args)
+    # Hold the workspace claim until native start settles, including shell reuse.
+    # A second start then reads the new layout instead of splitting the old cell.
+    key = hashlib.sha256(f"{_HERDR_SESSION or 'default'}:{beside.split(':')[0]}".encode()).hexdigest()
+    root = peer_message.peer_state_root() / "peer-starts"
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / f"{key}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _start_in_pane(args)
+
+
+def _start_in_pane(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
     if not args.pane and not args.beside:
@@ -1267,36 +1354,47 @@ def cmd_start(args):
         return note
 
     if getattr(args, "beside", None):
-        cmd = _herdr_argv("pane", "split", "--pane", args.beside,
-                          "--direction", "right", "--no-focus")
-        if pane_cwd:
-            cmd += ["--cwd", pane_cwd]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=_herdr_get_timeout())
-            payload = json.loads(proc.stdout or "")
-            result = payload.get("result") if isinstance(payload, dict) else None
-            pane = result.get("pane") if isinstance(result, dict) else None
-            new_id = pane.get("pane_id") if isinstance(pane, dict) else None
-            split_ok = (proc.returncode == 0 and isinstance(payload, dict) and not payload.get("error")
-                        and isinstance(new_id, str) and bool(new_id.strip())
-                        and new_id != args.beside and pane.get("focused") is False)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            split_ok = False
-        if not split_ok:
-            print(f"started=false reason=pane-split-failed agent={args.kind} "
+        placement = _start_placement(args.beside)
+        if placement is None:
+            print(f"started=false reason=pane-layout-unavailable agent={args.kind} "
                   f"name={args.name} pane=- beside={args.beside}")
             return 1
-        args.pane = new_id
-        created_pane = True
-        created_shell = _start_shell_identity(new_id)
-        created_deadline = time.monotonic() + _BESIDE_READY_SECONDS
-        readiness, created_shell = _wait_for_created_shell(
-            args.pane, pane_cwd, created_shell, created_deadline)
-        if readiness:
-            print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
-                  f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
-            return 1
+        action, target, direction = placement
+        if action == "reuse":
+            args.pane = target
+        else:
+            cmd = (_herdr_argv("pane", "split", "--pane", target, "--direction", direction,
+                               "--ratio", "0.5", "--no-focus") if action == "split" else
+                   _herdr_argv("tab", "create", "--workspace", target, "--no-focus"))
+            if pane_cwd:
+                cmd += ["--cwd", pane_cwd]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      timeout=_herdr_get_timeout())
+                payload = json.loads(proc.stdout or "")
+                result = payload.get("result") if isinstance(payload, dict) else None
+                pane = result.get("pane" if action == "split" else "root_pane") if isinstance(result, dict) else None
+                new_id = pane.get("pane_id") if isinstance(pane, dict) else None
+                split_ok = (proc.returncode == 0 and isinstance(payload, dict) and not payload.get("error")
+                            and isinstance(new_id, str) and bool(new_id.strip())
+                            and new_id != args.beside and pane.get("focused") is False)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                split_ok = False
+            if not split_ok:
+                reason = "pane-split-failed" if action == "split" else "pane-tab-create-failed"
+                print(f"started=false reason={reason} agent={args.kind} "
+                      f"name={args.name} pane=- beside={args.beside}")
+                return 1
+            args.pane = new_id
+            created_pane = True
+            created_shell = _start_shell_identity(new_id)
+            created_deadline = time.monotonic() + _BESIDE_READY_SECONDS
+            readiness, created_shell = _wait_for_created_shell(
+                args.pane, pane_cwd, created_shell, created_deadline)
+            if readiness:
+                print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
+                      f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
+                return 1
 
     # Before the agent is started, not after: this is the line that decides whether the
     # session that comes up is hearting-managed at all.
@@ -1457,7 +1555,7 @@ def cmd_start(args):
     # Interactive managed ingress is retired, so `managed=false` is no longer a defect
     # signal; the field stays for receipt compatibility and `session_id=` is what says
     # whether the session got an identity.
-    if started and getattr(args, "beside", None):
+    if started and getattr(args, "beside", None) and args.pane != args.beside:
         _mark_seat_successor(args.pane, args.beside, args.kind, started_sid)
     managed = "-"
     if started and _MANAGED_INGRESS.get(args.kind):

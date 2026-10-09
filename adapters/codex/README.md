@@ -447,3 +447,12 @@ never resumes/subscribes to a thread or rewrites its settings. Refused delivery
 remains a durable pending obligation.
 
 Session and prompt bridges retain `hookSpecificOutput.additionalContext` for optional memory and lifecycle context.
+
+## Peer start placement
+
+`hearting run peer-steward start <name> --kind <harness>` fills the calling
+tab's 2×2 grid without focus: right, right-column down, then remaining-column
+down, each at ratio 0.5. `--beside` selects the reference tab; `--pane` keeps
+explicit pane reuse. A full or irregular tab reuses an agent-free, idle shell
+with an empty prompt, or opens a tab in the same workspace. No pane move or
+extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.14`.
