@@ -135,6 +135,10 @@ def _registered_run_marks(resource_jobs):
         pid = getattr(job, "pid", None)
         if _pos_int(pid):
             exact.add((pid, str(getattr(job, "starttime", None))))
+        for process in (getattr(job, "local_placement", None) or {}).get("processes", ()):
+            if (_pos_int(process.get("pid"))
+                    and str(process.get("starttime", "")).isdigit()):
+                exact.add((process["pid"], str(process["starttime"])))
         group = getattr(job, "process_group", None)
         if _pos_int(group):
             groups.add(group)
