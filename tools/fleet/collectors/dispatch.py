@@ -1242,8 +1242,9 @@ def _enrich_attempt_summary(job, fast_first=False):
         if not getattr(job, "title", None):
             job.title = titles.fresh_title(sid, harness=job.harness)
         if not getattr(job, "summary", None):
-            job.summary, job.summary_ts = titles.fresh_summary_with_ts(
-                sid, harness=job.harness)
+            job.summary, job.summary_ts = titles.fresh_summary_with_ts(sid, harness=job.harness)
+            if not job.summary and getattr(job, "_native_now", None):
+                job.summary, job.summary_ts = job._native_now
     except Exception:
         pass
 
@@ -1809,7 +1810,7 @@ def _parse_opencode_attempt_tail(path):
     the session-level opencode collector uses.  ``output``/``reasoning`` are excluded, and
     the per-step numbers are never summed: a bounded tail cannot prove a session total.
 
-    No ``exec_tool`` is derived here, and that is a schema fact rather than an omission:
+    No ``exec_tool`` is derived from the stream:
     opencode publishes a ``tool_use`` event only once the call has already finished.
     Across six real attempt logs every one of 400+ tool events carried a ``state.status``
     of ``completed`` or ``error`` and never an in-flight state, so claude's tool_use ↔
@@ -1825,7 +1826,7 @@ def _parse_opencode_attempt_tail(path):
     if cached and cached[0] == cache_key:
         return cached[1]
     disk_key = parse_cache.key("opencode-attempt", path, cache_key,
-                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES))
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES, "native-session-v3"))
     parsed = parse_cache.load(disk_key)
     if isinstance(parsed, dict):
         _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
@@ -1835,6 +1836,7 @@ def _parse_opencode_attempt_tail(path):
     start = max(0, st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
     try:
         with open(path, "rb") as stream:
+            head = stream.read(_CLAUDE_SUPERVISOR_HEAD_BYTES)
             stream.seek(start)
             raw = stream.read(_CLAUDE_STREAM_TAIL_BYTES)
     except OSError:
@@ -1843,6 +1845,22 @@ def _parse_opencode_attempt_tail(path):
     if start > 0 and lines:
         lines = lines[1:]                       # a seek mid-file truncates the first line
     session_ids = set()
+    announced_attempts = set()
+    announced_cwds = set()
+    for line in head.decode("utf-8", "replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(event, dict) and event.get("type") == "dispatch.supervisor.session"
+                and event.get("runtime") == "opencode"):
+            sid = event.get("session_id")
+            if isinstance(sid, str) and re.fullmatch(r"ses_[A-Za-z0-9]+", sid):
+                session_ids.add(sid)
+                if event.get("parent_attempt_id"):
+                    announced_attempts.add(str(event["parent_attempt_id"]))
+                if event.get("cwd"):
+                    announced_cwds.add(str(event["cwd"]))
     active = None
     for line in lines:
         line = line.strip()
@@ -1872,6 +1890,8 @@ def _parse_opencode_attempt_tail(path):
         "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
         "ambiguity": "multiple-stream-session-ids" if len(session_ids) > 1 else None,
         "active_context_tokens": active,
+        "announced_attempts": sorted(announced_attempts),
+        "announced_cwds": sorted(announced_cwds),
     }
     _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
     parse_cache.save(disk_key, parsed, path, cache_key)
@@ -1893,12 +1913,55 @@ def _opencode_job_context_window(job):
         return None
 
 
+_OPENCODE_ACTIVITY_CACHE = {}
+_OPENCODE_ACTIVITY_BYTES = 32 * 1024 * 1024
+
+
+def _enrich_opencode_native_activity(job, session_id, fast_first=False):
+    """Observe only the attempt-private DB; first publication remains log-only."""
+    if fast_first or not session_id:
+        return
+    runtime = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir")
+    if not isinstance(runtime, str) or not os.path.isabs(runtime):
+        return
+    db = os.path.join(runtime, "data", "opencode", "opencode.db")
+    try:
+        from .. import refresh_title
+        signatures = refresh_title._opencode_source_signatures(db)
+        if (not signatures[""] or signatures["-journal"] or
+                sum(info[2] for suffix, info in signatures.items()
+                    if info and suffix in ("", "-wal")) > _OPENCODE_ACTIVITY_BYTES):
+            return
+        key = (db, session_id)
+        cached = _OPENCODE_ACTIVITY_CACHE.get(key)
+        if cached and cached[0] == signatures:
+            activity = cached[1]
+        else:
+            with refresh_title._opencode_snapshot(db, max_bytes=_OPENCODE_ACTIVITY_BYTES) as connection:
+                deadline = time.monotonic() + .05
+                connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+                activity = refresh_title.read_opencode_activity(connection, session_id)
+            if signatures != refresh_title._opencode_source_signatures(db):
+                return
+            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity)
+            if len(_OPENCODE_ACTIVITY_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+                _OPENCODE_ACTIVITY_CACHE.pop(next(iter(_OPENCODE_ACTIVITY_CACHE)))
+        job.exec_tool = None
+        tool = activity.get("tool")
+        if tool:
+            label = _tool_label(tool.get("name"), tool.get("input"))
+            job.exec_tool = {"name": label} if label else None
+        if activity.get("summary"):
+            job._native_now = (activity["summary"], activity.get("summary_ts"))
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return
+
+
 def _enrich_opencode_attempt_session(job, fast_first=False):
     """Attach exact session identity and prompt telemetry.
 
-    ``fast_first`` is accepted for a uniform fast-first call site but defers
-    nothing here: the tail parse is mtime-cached and already yields the exact
-    session association the single classifier reads.
+    ``fast_first`` retains the cached, bounded log association and defers the
+    private native database snapshot until the full publication.
     """
     path = _owned_attempt_log_path(job)
     if getattr(job, "harness", None) != "opencode" or path is None:
@@ -1909,9 +1972,15 @@ def _enrich_opencode_attempt_session(job, fast_first=False):
     if parsed.get("ambiguity"):
         job.association_ambiguity = parsed["ambiguity"]
         return
+    if (any(attempt != job.attempt_id for attempt in parsed.get("announced_attempts", ()))
+            or any(not _same_path(cwd, job.cwd) for cwd in parsed.get("announced_cwds", ())
+                   if getattr(job, "cwd", None))):
+        job.association_ambiguity = "opencode-announcement-identity-mismatch"
+        return
     job._dispatch_context_owned = True
     if parsed.get("session_id"):
         job._runtime_session_id = parsed["session_id"]
+        _enrich_opencode_native_activity(job, parsed["session_id"], fast_first=fast_first)
     telemetry = telemetry_from_explicit(
         adapter="opencode", session_id=parsed.get("session_id"),
         active_context_tokens=parsed.get("active_context_tokens"),

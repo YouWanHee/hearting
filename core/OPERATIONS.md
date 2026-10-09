@@ -1564,6 +1564,12 @@ Observed GPU use takes precedence; selection alone creates no GPU usage
 row or memory total. The same NOW path serves every harness. Existing process
 state supplies `입출력 대기`. Observation uses targeted procfs reads within its
 process/time budget, without device queries or resource lifecycle changes.
+OpenCode headless owners use the native session announced by their exact attempt
+and that attempt's private runtime database for the same summary and command
+fields. Public assistant text supplies a bounded fallback while the summary is
+absent; only unfinished native tool state represents a running command. The
+first publication skips database snapshots, and later reads reuse unchanged
+source metadata. This observation leaves running owners and resources intact.
 Depth-1 frame cards use the owner model/gauge,
 routing and close-rail status layout on every harness; worker layouts retain
 their existing columns. Fleet ignores a marker whose entries carry no role source;
