@@ -589,9 +589,11 @@ def current_capability(chain, marker_fields, *, session_start, slack):
     return marker_fields
 
 
-def enrich(sessions, jobs=(), node_evidence=None, now=None):
+def enrich(sessions, jobs=(), node_evidence=None, now=None, fast_first=False):
     """Attach `session.route_chain` to every eligible session (env-writer harness, not a
     dispatch child, not an app-server row, with a session id). Exceptions are per-session."""
+    if fast_first:
+        return  # route/outcome and ledger reads belong to the next detail tick
     from . import route as _route
 
     node_evidence = node_evidence or {}

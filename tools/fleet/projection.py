@@ -1647,10 +1647,41 @@ def resolve_projection(*args, **kwargs):
 def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                       route_records=None, node_evidence=None, artifact_root=None, now=None,
                       spec_markers=None, spec_marker_home=None,
-                      capability_groundings=None, degradations=None, resources=None):
+                      capability_groundings=None, degradations=None, resources=None,
+                      fast_first=False):
     """Attach work to every row and exact-owned context to live cards."""
     sessions, jobs = list(sessions), list(jobs)
     _attach_resource_children(jobs, resources)
+    if fast_first:
+        # Exact observation comes first. Route authority/progress stays unknown
+        # until detail collection verifies it; resources already own exact attempts.
+        for entity in sessions + jobs:
+            entity._details_pending = True
+            owned = isinstance(entity, Session) or (entity.source == "plugin-queue"
+                    or getattr(entity, "_dispatch_context_owned", False))
+            if owned:
+                entity.context, entity._context_evidence = normalize_context(
+                    _evidence(entity), now=now, live=_is_live(entity))
+            else:
+                entity.context = None
+                entity._context_evidence = None
+            rid = _field(entity, "owner_route_id") or _field(entity, "route_id")
+            rhash = _field(entity, "owner_route_hash") or _field(entity, "route_hash")
+            entity.work_projection = WorkProjection(
+                source="registry-exact" if rid else "none", route_id=rid,
+                route_hash=rhash, route_node=_field(entity, "route_node"),
+                attempt_id=_field(entity, "attempt_id"), node_state="unknown")
+            if isinstance(entity, DispatchJob):
+                entity.stage = None
+                observed = ((_field(entity, "state_evidence") or {}).get("inputs") or {}).get(
+                    "observed_liveness") or {}
+                if entity.liveness == "idle" and observed.get("state") == "parked-supervised":
+                    children = _working_resources_for_record(
+                        {"route_id": rid, "route_hash": rhash}, [entity])
+                    if children:
+                        entity.resource_wait = {"state": "resource-parked", "nodes": list(children),
+                            "run_ids": [r.run_id for group in children.values() for r in group]}
+        return sessions, jobs
     route_records = _load_evidence_records(node_evidence, route_records, sessions + jobs)
     home = spec_marker_home or _grounding_home()
     if spec_markers is None:

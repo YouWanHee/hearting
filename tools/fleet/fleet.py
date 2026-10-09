@@ -356,6 +356,13 @@ def main(argv=None):
     live_collector.last_usage_snapshots = {}
     # Live-only metadata refresh. render's snapshot pump invokes this off the curses
     # thread; --once/--json never opt into remote release discovery.
+    # Passive detail collection reuses exact rows; never performs a second
+    # procscan/classifier pass or delays the basic observation pump.
+    if __package__ in (None, ""):
+        from fleet import details
+    else:
+        from . import details
+    live_collector.detail_refresh = details.enrich
     live_collector.hearting_refresh = lambda: installinfo.collect(
         refresh_remote=True, fast_local=True)
     # F-83: SSH/GPU polling has its own slower pump in render. Never put it in

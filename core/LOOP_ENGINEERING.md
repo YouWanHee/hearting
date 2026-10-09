@@ -165,11 +165,15 @@ meaning stays in the core (§3); a shared mechanism may live outside it.
 ## 10. The operator sees delegated work at a glance
 
 Fleet is how a person sees the work they delegated, and for dispatched sessions
-it is often the only way. It opens quickly (first frame in about five seconds)
+it is often the only way. It opens quickly (first observed state in about five seconds,
+measured from launch; a loading frame does not count)
 and shows, for every live session and dispatched owner, what is happening now:
 the model turn, the running command, or the resource the owner is waiting on
 with its host, GPU, and progress. An empty NOW while work is running is a
 defect. A slower or emptier view is a regression even when every check passes.
+Publish observed session identity, execution/wait reasons and resources first;
+campaign titles, route details and installation/git metadata fill asynchronously.
+Unknown observations stay unknown, and slow details must not stop basic refresh.
 
 ## Basis and current scope
 
