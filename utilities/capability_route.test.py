@@ -3539,15 +3539,10 @@ class TestContinuation(unittest.TestCase):
     if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
 
- def test_continuation_cli_prints_cycle_binding_and_fork_advisory(self):
-  # SD-155/D-120, P2 결함 note: the continuation CLI's `cycle_binding_bound`/
-  # `cycle_binding_advisory` stderr fields (capability-route.py :7259-7261)
-  # were only ever exercised by calling `bind_continuation_cycle` directly in
-  # artifact_producer.test.py -- never through the actual CLI subprocess a
-  # real owner runs. This proves the CLI-level wiring end to end: a first
-  # continuation off an open-cycle source binds silently, a sibling fork off
-  # the same source prints the D-120 "분기의 정직 표기" advisory without
-  # blocking publication.
+ def test_continuation_cli_defers_cycle_binding_until_begin(self):
+  # Publication leaves the existing cycle untouched. Execution's existing
+  # begin path records the admitted lineage; publishing a sibling still
+  # leaves that audit alone and write-time fork protection remains intact.
   import subprocess,sys
   with tempfile.TemporaryDirectory() as tmp:
    previous_home=os.environ.get("AGENT_HOME")
@@ -3567,8 +3562,10 @@ class TestContinuation(unittest.TestCase):
     # copy too, exactly as a real compile+publish would leave one.
     R.write_once(R.canonical_route_path(artifact,source["route_id"]),source)
     import artifact_producer as AP
-    AP.begin(artifact,route_file=source_path,capability=source["capability"],
+    begun=AP.begin(artifact,route_file=source_path,capability=source["capability"],
              intensity=source["effective_intensity"])
+    record_path=AP.cycle_record_path(artifact,begun["cycle_id"])
+    before_publish=record_path.read_bytes()
     env=os.environ.copy()
     def continuation_command(reason):
      return [
@@ -3578,12 +3575,23 @@ class TestContinuation(unittest.TestCase):
      ]
     first=subprocess.run(continuation_command("cycle-fixture-b"),capture_output=True,text=True,cwd=str(R.ROOT),env=env)
     self.assertEqual(first.returncode,0,first.stderr)
-    self.assertIn("cycle_binding_bound=1",first.stderr)
-    self.assertNotIn("cycle_binding_advisory=",first.stderr)
+    self.assertIn("cycle_binding_bound=0 cycle_binding_deferred=1",first.stderr)
+    self.assertEqual(record_path.read_bytes(),before_publish)
+    first_route=json.loads(first.stdout)
+    resumed=AP.begin(artifact,route_file=R.canonical_route_path(artifact,first_route["route_id"]),
+                     capability=source["capability"],intensity=source["effective_intensity"])
+    self.assertEqual(resumed["cycle_id"],begun["cycle_id"])
+    self.assertEqual(AP.read_cycle_record(artifact,begun["cycle_id"])["route_bindings"][-1]["route_id"],first_route["route_id"])
+    after_begin=record_path.read_bytes()
     second=subprocess.run(continuation_command("cycle-fixture-b-prime"),capture_output=True,text=True,cwd=str(R.ROOT),env=env)
     self.assertEqual(second.returncode,0,second.stderr)
     self.assertIn("cycle_binding_bound=0",second.stderr)
-    self.assertIn("cycle_binding_advisory=cycle-lineage-fork",second.stderr)
+    self.assertIn("cycle_binding_deferred=1",second.stderr)
+    self.assertEqual(record_path.read_bytes(),after_begin)
+    second_route=json.loads(second.stdout)
+    with self.assertRaisesRegex(AP.ProducerError,"lineage-fork"):
+     AP.begin(artifact,route_file=R.canonical_route_path(artifact,second_route["route_id"]),
+              capability=source["capability"],intensity=source["effective_intensity"])
    finally:
     if previous_home is None: os.environ.pop("AGENT_HOME",None)
     else: os.environ["AGENT_HOME"]=previous_home

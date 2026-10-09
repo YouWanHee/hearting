@@ -10120,7 +10120,7 @@ def _continue_after_answer(jobs, attempt_id, correction):
 
 
 def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None):
-    """Append one route-chain ledger line. Every failure is silent — route creation/start
+    """Append one route-chain ledger line. Failures report their cause — route creation/start
     must never fail because of this sidecar (plan §3 B-1.3). Success/failure is only
     ever observable on stderr."""
     try:
@@ -10150,10 +10150,12 @@ def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None
             route, event=event, harness=harness, session_id=sid, route_file=route_file,
             plan=plan, plan_source=plan_source, dispatch_depth=depth, by_attempt=by_attempt,
         )
-        if rc.append(harness, sid, line):
+        append_errors = []
+        if rc.append(harness, sid, line, on_error=append_errors.append):
             print(f"route_chain_written=1 harness={harness}", file=sys.stderr)
         else:
-            print("route_chain_written=0 reason=append-failed", file=sys.stderr)
+            detail = append_errors[0] if append_errors else "unknown"
+            print(f"route_chain_written=0 reason=append-failed detail={detail}", file=sys.stderr)
     except Exception as exc:
         try:
             print(f"route_chain_written=0 reason={exc}", file=sys.stderr)
@@ -10929,11 +10931,10 @@ def main():
         # which is honest — nothing here claims progress the owner has not proven).
         if os.environ.get("AGENT_DISPATCH_DEPTH") != "1" or advance is not None:
             _record_route_chain(route, str(output_path.resolve()), "continuation")
-        # D-120: the source's open cycle, if any, extends to this continuation.
-        cycle_bind=bind_continuation_cycle(artifact,source,route)
-        print(f"cycle_binding_bound={1 if cycle_bind['bound'] else 0}",file=sys.stderr)
-        if cycle_bind.get("advisory"):
-            print(f"cycle_binding_advisory={cycle_bind['advisory']}",file=sys.stderr)
+        # Publication is a candidate. The existing producer begin path records
+        # cycle admission when execution enters it; a refused batch never
+        # transfers the predecessor's closing responsibility.
+        print("cycle_binding_bound=0 cycle_binding_deferred=1 basis=execution-begin",file=sys.stderr)
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
