@@ -786,16 +786,18 @@ close suppresses this continuation and all cancelled successors.
 
 A supervised owner can register sequential resources for one route/node using
 the same `resource-runner start`. Exact replay preserves its run; a new run may
-replace the armed predecessor only after an exact successful exit while that
-stage is still waiting for its declared outputs. The ledger lock serializes
-the binding change, preserves the prior execution evidence, and refuses active
-or failed identities, different owners, completed stages, and parent close.
+replace the armed predecessor after an exact terminal exit, including a guard
+exit that saved a checkpoint, while that stage is failed/retryable or still
+waiting for its declared outputs. The current launch retains its normal live
+owner/session binding. The ledger lock serializes the binding change, preserves
+the prior execution evidence, and refuses active or unobservable identities,
+completed stages, existing successor claims, unrelated failures, and parent close.
 All prior bindings protect their log, sentinel and progress paths across registries
 and path aliases. Existing active workflow progress is preserved. The final payload
 release checks parent close under the same ledger lock before publishing identity
 and opening its private launch fence.
 The owner receives intermediate execution success with no successor admission;
-an unacknowledged result remains recoverable from its original binding after the
+an unacknowledged success or failure remains recoverable from its original binding after the
 next registration, with no lifetime receipt-count ceiling.
 The resource that supplies the declared stage outputs can complete the stage.
 
@@ -851,13 +853,9 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
-A resource that has verifiably exited, including a nonzero guard exit that
-saved a checkpoint, may be followed by a new run ID on the same route and
-node. Registration and supervisor arming use the same terminal-execution
-judgment; they preserve the old row and journal its predecessor binding.
-An active or unobservable execution cannot be replaced, and evidence paths
-cannot overlap any prior run. Only the failed resource stage returns to
-running; unrelated failures and already claimed successors are preserved.
+Registration and supervisor arming share the terminal-execution judgment for
+same-route/node retries. They retain the old row and predecessor binding;
+only that resource's failed/retryable state returns to running.
 
 The existing owner input state receives the verified native session identity
 as soon as the transport binds it, including during the first model turn.

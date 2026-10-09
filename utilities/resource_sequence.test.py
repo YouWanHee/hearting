@@ -161,7 +161,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual((output / 'run.json').read_text(), 'resumed')
         self.assertTrue((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').is_file())
 
-    def receipt_fixture(self, *, queued_controller=False):
+    def receipt_fixture(self, *, queued_controller=False, failed=False):
         route, path, jobs, registry, output, ledger = self.fixture()
         if queued_controller:
             data = json.loads(registry.read_text())
@@ -172,6 +172,12 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             armed = json.loads(arm_path.read_text())
             armed['resource_binding'] = WAIT.resource_body_digest(row)
             arm_path.write_text(json.dumps(armed))
+        if failed:
+            data = json.loads(registry.read_text())
+            row = data['runs']['fixture-run']
+            Path(row['sentinel']).write_text('3')
+            row.update(status='failed', exit_code=3)
+            registry.write_text(json.dumps(data))
         SUP.poll_once(route, ledger)
         args = SimpleNamespace(parent_attempt_id='att-parent', route_id=route['route_id'],
             route_hash=route['route_hash'], route_file=str(path), jobs=str(jobs))
@@ -312,10 +318,47 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 self.assertFalse(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
                 self.assertIsNone(WAIT.pending_prompt(state, 'att-parent', args, control))
 
+    def test_unacknowledged_failure_receipt_survives_retry_and_receiving_turn_interruption(self):
+        for other_registry, queued in ((False, False), (True, False), (True, True)):
+            with self.subTest(other_registry=other_registry, queued=queued), self.subfixture():
+                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture(queued_controller=queued, failed=True)
+                saved = WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource
+                self.assertEqual(saved['outbox']['receipt']['exit_code'], 3)
+                self.assertEqual(saved['outbox']['receipt']['reason'], 'FAILED_RETRYABLE')
+                body = self.next_body(registry, 'retry', output)
+                target = registry
+                if other_registry:
+                    target = self.base / 'retry-registry.json'
+                    target.write_text(json.dumps({'runs': {}}))
+                if queued:
+                    body.update(launch_state='queued', status='launching', launch_request={})
+                    target.write_text(json.dumps({'runs': {'retry': body}}))
+                    self.arm(path, target, run_id='retry', extra=('--jobs', str(jobs), '--artifact-base', str(output)))
+                else:
+                    self.launch(route, path, jobs, target, output, body)
+                with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
+                        mock.patch.object(WAIT, 'admit_controller_launch') as admit:
+                    self.assertEqual(WAIT.pending_prompt(state, 'att-parent', args, control), prompt)
+                    self.assertEqual(WAIT.wait(args, state, control, set(), lambda _: None), prompt)
+                    admit.assert_not_called()
+                self.assertEqual(WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource, saved)
+                self.assertTrue(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
+                self.assertFalse(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
+                self.assertIsNone(WAIT.pending_prompt(state, 'att-parent', args, control))
+                if not queued:
+                    with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP):
+                        next_prompt = WAIT.wait(args, state, control, set(), lambda _: None,
+                                                sleep=lambda _: self.fail('completed retry should not wait'))
+                    self.assertIn('"run_id":"retry"', next_prompt)
+                    current = WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource
+                    self.assertEqual(current['delivered'], [saved['outbox']['key']])
+                    self.assertTrue(WAIT.acknowledge(state, 'att-parent', current['outbox']['receipt_id']))
+
     def test_historical_receipt_rejects_mutated_identity_sentinel_and_session(self):
-        for mutation in ('identity', 'sentinel', 'session'):
-            with self.subTest(mutation=mutation), self.subfixture():
-                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture()
+        for failed, mutation in ((failed, mutation) for failed in (False, True)
+                                 for mutation in ('identity', 'sentinel', 'session')):
+            with self.subTest(failed=failed, mutation=mutation), self.subfixture():
+                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture(failed=failed)
                 self.launch(route, path, jobs, registry, output, self.next_body(registry, 'next', output))
                 data = json.loads(registry.read_text())
                 old = data['runs']['fixture-run']

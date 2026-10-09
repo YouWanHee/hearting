@@ -287,7 +287,7 @@ def pending_prompt(path, parent, args=None, control=None):
                     "jobs": str(Path(args.jobs).resolve())}
         found = context(args, control)
         row = next((r for _, r in found[3] if resource_key(r) == box["key"]), None) if found else None
-        if row is None and found and found[3] and receipt.get("reason") == "awaiting-next-resource":
+        if row is None and found and found[3]:
             sup, route, ledger, _ = found
             for armed, prior in sup.resource_predecessors(ledger, receipt["node"]):
                 owner = prior.get("owner_wait") or {}
@@ -301,7 +301,7 @@ def pending_prompt(path, parent, args=None, control=None):
                         and owner.get("parent_attempt_id") == parent
                         and owner.get("session_id") == control.thread_id
                         and resource_key(prior) == box["key"]
-                        and resource_execution_succeeded(prior)):
+                        and resource_execution_finished(prior)):
                     row = prior
                     break
         if (any(receipt.get(k) != v for k, v in expected.items()) or row is None
