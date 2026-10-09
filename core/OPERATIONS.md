@@ -178,7 +178,18 @@ Each SD item below keeps the rule an agent acts on; its full decision record is 
 Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).
 
 Actual edits, tests, and QA run in isolated worktrees while the main session
-handles triage, dispatch, harvest, and reporting. Portable `dispatch_depth`
+handles triage, dispatch, harvest, and reporting. Source-changing non-direct compose starts
+prepare that worktree even when the primary checkout has local work: use its
+current HEAD in that case, preserve its uncommitted files in place, and bind the
+owner and every stage to the prepared cwd before launch. Clean primary checkouts
+continue to use the latest default-branch base; an explicitly chosen linked
+worktree is reused. Exact file inventories treat an existing file path literally,
+including `[id]`, `[...slug]`, and `(group)` components. Only a path that does not
+name an existing file is tested for glob syntax, by the shared stage-session
+contract used for subdivision and adapter binding. Containment and disjointness
+still compare canonical paths.
+
+Portable `dispatch_depth`
 describes logical route ownership independently of transport, process ancestry,
 runtime-native nesting, and registered-worker status:
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+from glob import has_magic
 import json
 from pathlib import Path
 import re
@@ -273,6 +274,17 @@ def _absolute(value: object, *, base: Path, field: str) -> Path:
     return path.resolve(strict=False)
 
 
+def is_glob_path(path: Path, *, worktree: Path) -> bool:
+    """An existing exact file wins over glob syntax, including Next.js route names.
+
+    Both subdivision admission and the adapters use this judgment. A missing
+    ordinary path can still name a file the worker will create; a missing glob
+    cannot be an exact file inventory.
+    """
+    # The checkout's own name is never part of a file's pattern syntax.
+    return not path.is_file() and has_magic(path.relative_to(worktree).as_posix())
+
+
 def _fixed_files(values: object, *, worktree: Path, session_id: str) -> list[str]:
     if not isinstance(values, list) or not values:
         raise StageSessionError(f"fixed-files-missing:{session_id}")
@@ -283,7 +295,7 @@ def _fixed_files(values: object, *, worktree: Path, session_id: str) -> list[str
             path.relative_to(worktree)
         except ValueError as exc:
             raise StageSessionError(f"fixed-file-outside-worktree:{session_id}:{path}") from exc
-        if any(char in str(raw) for char in "*?[]"):
+        if is_glob_path(path, worktree=worktree):
             raise StageSessionError(f"fixed-file-must-be-exact:{session_id}:{raw}")
         value = str(path)
         if value not in result:

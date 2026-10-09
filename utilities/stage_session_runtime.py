@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 import artifact_producer
-from stage_session_contract import slice_files_sha256, slice_text_sha256
+from stage_session_contract import is_glob_path, slice_files_sha256, slice_text_sha256
 from dispatch_contract import DispatchContractError, validate_attempt_metadata
 # The declaration judgment is a route authority one; `declared` stays for importers.
 from route_authority import declared_subsession as declared  # noqa: F401
@@ -81,7 +81,7 @@ def bind(args: argparse.Namespace, *, artifact_root: str | Path, action: str) ->
             path.relative_to(worktree)
         except ValueError as exc:
             raise DispatchContractError("subsession-fixed-file-outside-worktree", str(path)) from exc
-        if any(char in raw for char in "*?[]"):
+        if is_glob_path(path, worktree=worktree):
             raise DispatchContractError("subsession-fixed-file-not-exact", raw)
         fixed.append(str(path))
     args.fixed_file = sorted(set(fixed))

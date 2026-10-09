@@ -9823,9 +9823,10 @@ def prepare_isolated_worktree(cwd, slug):
     """The isolated worktree a source-changing route runs in, when `cwd` is a primary checkout.
 
     `<repo>-wt/<slug>` (OPERATIONS §5.9 naming) on a new branch `<slug>` from the latest
-    `origin/<default>`, or the existing worktree at that path, reused as it is. Returns
+    `origin/<default>` (the primary's current HEAD when it has local work), or
+    the existing worktree at that path, reused as it is. Returns
     `{state: created|reused, path, cwd, branch, base}`, or `{state: skipped, reason}` when the
-    caller's cwd stays the route cwd (not a primary checkout, local work the base lacks, or the path
+    caller's cwd stays the route cwd (not a primary checkout, or the path
     or branch is taken).
     Nothing here refuses: a skipped preparation leaves the work where it was asked to run."""
     if OWNER_WRITE_ADVISORY.git_topology(cwd) != "primary":
@@ -9845,11 +9846,12 @@ def prepare_isolated_worktree(cwd, slug):
     default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
     _git(top, "fetch", "-q", "origin", default)
     base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
-    # Work in progress in the checkout (uncommitted or new files, or commits the base lacks) is what the
-    # work may build on; a worktree from the base would leave it behind, so the cwd stays as asked.
+    # Local work must not pin a source-changing owner to the shared primary.
+    # Keep its committed baseline, without copying or changing uncommitted files.
+    # The prepared cwd is sealed before launch, so every stage shares it naturally.
     if (_git(top, "status", "--porcelain") != ""
             or _git(top, "merge-base", "--is-ancestor", "HEAD", base) is None):
-        return {"state": "skipped", "reason": "primary-has-local-work"}
+        base = _git(top, "rev-parse", "HEAD") or "HEAD"
     if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
         made = _git(top, "worktree", "add", str(path), slug)
     else:
