@@ -3630,9 +3630,169 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
 
 
 
+class GridStartTest(_TmpRootMixin, unittest.TestCase):
+    FULL = [(10, 2, 200, 100)]
+    TWO = [(10, 2, 100, 100), (110, 2, 100, 100)]
+    THREE = [(10, 2, 100, 100), (110, 2, 100, 50), (110, 52, 100, 50)]
+    FOUR = [(10, 2, 100, 50), (10, 52, 100, 50), (110, 2, 100, 50), (110, 52, 100, 50)]
+
+    def layout(self, rects, area=None):
+        return {"workspace_id": "w1", "tab_id": "w1:tGrid",
+                "area": dict(zip(("x", "y", "width", "height"), area or self.FULL[0])),
+                "panes": [{"pane_id": f"w1:p{i}", "rect": dict(zip(("x", "y", "width", "height"), rect))}
+                          for i, rect in enumerate(rects)]}
+
+    def decision(self, layout, free=None, foreground=None, prompt=True):
+        free = free or set()
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json({"result": {"layout": layout}})), \
+             mock.patch.object(peer_steward, "_pane_has_agent", side_effect=lambda p: None if p in free else "pane-occupied"), \
+             mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=foreground), \
+             mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=prompt):
+            return peer_steward._start_placement("w1:p0")
+
+    def test_one_two_three_fill_the_grid_even_when_the_reference_is_in_the_other_column(self):
+        for rects, expected in ((self.FULL, ("split", "w1:p0", "right")),
+                                (self.TWO, ("split", "w1:p1", "down")),
+                                (self.THREE, ("split", "w1:p0", "down")),
+                                ([(10, 2, 100, 50), (10, 52, 100, 50), (110, 2, 100, 100)],
+                                 ("split", "w1:p2", "down"))):
+            with self.subTest(rects=rects):
+                self.assertEqual(self.decision(self.layout(rects)), expected)
+
+    def test_horizontal_rows_fill_the_equivalent_grid(self):
+        for rects, target in (([(10, 2, 200, 50), (10, 52, 200, 50)], "w1:p0"),
+                              ([(10, 2, 100, 50), (10, 52, 200, 50), (110, 2, 100, 50)], "w1:p1"),
+                              ([(10, 2, 200, 50), (10, 52, 100, 50), (110, 52, 100, 50)], "w1:p0")):
+            self.assertEqual(self.decision(self.layout(rects)), ("split", target, "right"))
+
+    def test_odd_terminal_dimensions_use_the_actual_half_cells(self):
+        rects = [(23, 1, 138, 76), (161, 1, 137, 38), (161, 39, 137, 38)]
+        self.assertEqual(self.decision(self.layout(rects, (23, 1, 275, 76))), ("split", "w1:p0", "down"))
+
+    def test_full_tab_reuses_only_an_empty_foreground_shell_otherwise_creates_a_tab(self):
+        layout = self.layout(self.FOUR)
+        self.assertEqual(self.decision(layout), ("tab", "w1", None))
+        self.assertEqual(self.decision(layout, {"w1:p3"}), ("reuse", "w1:p3", None))
+        self.assertEqual(self.decision(layout, {"w1:p0"}), ("reuse", "w1:p0", None))
+        for state, prompt in (("pane-busy", True), ("pane-unknown", True), (None, False)):
+            self.assertEqual(self.decision(layout, {"w1:p3"}, state, prompt), ("tab", "w1", None))
+
+    def test_irregular_or_overfull_tab_never_splits(self):
+        for rects in ([(10, 2, 50, 100), (60, 2, 50, 100), (110, 2, 100, 100)],
+                      self.FOUR + [(60, 52, 50, 50)]):
+            self.assertEqual(self.decision(self.layout(rects)), ("tab", "w1", None))
+
+    def test_missing_duplicate_or_foreign_layout_never_allocates(self):
+        missing = self.layout(self.FULL)
+        missing["panes"][0]["pane_id"] = "w1:pElse"
+        duplicate = self.layout(self.TWO)
+        duplicate["panes"][1]["pane_id"] = "w1:p0"
+        foreign = self.layout(self.FOUR)
+        foreign["workspace_id"] = "w2"
+        for layout in (None, {}, missing, duplicate, foreign):
+            self.assertIsNone(self.decision(layout))
+
+    def test_layout_read_failure_does_not_start_or_type(self):
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json({"error": {"code": "pane_not_found"}})) as run, \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["start", "grid", "--kind", "codex", "--beside", "w1:p0",
+                                               "--cwd", str(self.tmp_root)]), 1)
+        self.assertEqual(len(run.call_args_list), 1)
+        self.assertIn("reason=pane-layout-unavailable", printed.call_args[0][0])
+
+    def test_concurrent_starts_in_the_same_workspace_hold_the_claim_through_launch(self):
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork")
+        first_entered, release, second_entered = ctx.Event(), ctx.Event(), ctx.Event()
+        def launch(args):
+            if args.name == "first":
+                first_entered.set()
+                release.wait(5)
+            else:
+                second_entered.set()
+            return 0
+        first_args = peer_steward.build_parser().parse_args(["start", "first", "--kind", "codex", "--beside", "w1:p0"])
+        second_args = peer_steward.build_parser().parse_args(["start", "second", "--kind", "claude", "--beside", "w1:p1"])
+        with mock.patch.object(peer_steward, "_start_in_pane", side_effect=launch):
+            first = ctx.Process(target=peer_steward.cmd_start, args=(first_args,))
+            second = ctx.Process(target=peer_steward.cmd_start, args=(second_args,))
+            first.start()
+            try:
+                self.assertTrue(first_entered.wait(5))
+                second.start()
+                self.assertFalse(second_entered.wait(.1))
+                release.set()
+                self.assertTrue(second_entered.wait(5))
+            finally:
+                release.set()
+                for child in (first, second):
+                    if child.pid:
+                        child.join(5)
+                        if child.is_alive():
+                            child.terminate()
+                            child.join(5)
+            self.assertEqual((first.exitcode, second.exitcode), (0, 0))
+
+    def test_each_harness_uses_the_decision_in_one_start_including_overflow_and_shell_reuse(self):
+        for kind in ("claude", "codex", "opencode"):
+            for rects, free, action, target, direction in (
+                    (self.FULL, None, "split", "w1:p0", "right"),
+                    (self.TWO, None, "split", "w1:p1", "down"),
+                    (self.THREE, None, "split", "w1:p0", "down"),
+                    (self.FOUR, "w1:p3", "reuse", "w1:p3", None),
+                    (self.FOUR, None, "tab", "w1", None)):
+                with self.subTest(kind=kind, action=action, target=target):
+                    calls = []
+                    def run(argv, **kwargs):
+                        calls.append(argv)
+                        if argv[1:3] == ["pane", "layout"]:
+                            return _herdr_json({"result": {"layout": self.layout(rects)}})
+                        if argv[1:3] in (["pane", "split"], ["tab", "create"]):
+                            return _herdr_json({"result": {"pane" if action == "split" else "root_pane":
+                                                          {"pane_id": "w1:pNew", "focused": False}}})
+                        if argv[1:3] == ["agent", "start"]:
+                            return _herdr_json({"result": {"agent": {"agent": kind, "name": "grid"}}})
+                        raise AssertionError(argv)
+                    with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+                         mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+                         mock.patch.object(peer_steward, "_pane_has_agent", side_effect=lambda p: None if p == free else "pane-occupied"), \
+                         mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=None), \
+                         mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=True), \
+                         mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+                         mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+                         mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+                         mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
+                         mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
+                         mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
+                         mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+                         mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), mock.patch("builtins.print"):
+                        self.assertEqual(peer_steward.main(["start", "grid", "--kind", kind,
+                                                           "--beside", "w1:p0", "--cwd", str(self.tmp_root)]), 0)
+                    launch = calls[-1]
+                    self.assertEqual(launch[1:3], ["agent", "start"])
+                    self.assertEqual(launch[launch.index("--pane") + 1], target if action == "reuse" else "w1:pNew")
+                    if action == "reuse":
+                        self.assertEqual(len(calls), 2)  # layout and start, no creation/move
+                    else:
+                        create = calls[1]
+                        self.assertIn("--no-focus", create)
+                        if action == "split":
+                            self.assertEqual(create[create.index("--pane") + 1], target)
+                            self.assertEqual(create[create.index("--direction") + 1], direction)
+                            self.assertEqual(create[create.index("--ratio") + 1], "0.5")
+                        else:
+                            self.assertEqual(create[create.index("--workspace") + 1], "w1")
+
+
 class BesideStartTest(_TmpRootMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
+        # These tests own startup/readiness; GridStartTest owns live layout selection.
+        placement = mock.patch.object(peer_steward, "_start_placement",
+                                      side_effect=lambda pane: ("split", pane, "right"))
+        placement.start()
+        self.addCleanup(placement.stop)
         self.resolve_primary = peer_steward.INSTALL_PATHS.primary_checkout
         patch = mock.patch.object(peer_steward.INSTALL_PATHS, "primary_checkout",
                                   side_effect=lambda cwd: Path(cwd))
@@ -3771,7 +3931,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
                                    "--cwd", cwd, "--permission-mode", "inherit", "--", "--model", "opus"])
         self.assertEqual(rc, 0)
         self.assertEqual(calls[0], ["herdr", "pane", "split", "--pane", "w1:pOld", "--direction",
-                                   "right", "--no-focus", "--cwd", cwd])
+                                   "right", "--ratio", "0.5", "--no-focus", "--cwd", cwd])
         self.assertEqual(calls[1], ["herdr", "agent", "start", "new", "--kind", "claude",
                                    "--pane", "w1:pN", "--", "--model", "opus"])
         ingress.assert_called_once_with("w1:pN", "claude", None)

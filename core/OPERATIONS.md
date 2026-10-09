@@ -1324,9 +1324,18 @@ starts stay exactly attributable; time-candidate threads stay out of Embedded
 attribution (unknown until its own fd proves it), and resume/fork keep theirs.
 
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
-which with no `--pane` or `--beside` opens the successor to the right of the
-calling pane (`HERDR_PANE_ID`) in the same tab without focus, in the Git primary
-checkout (the calling cwd outside Git) unless `--cwd` names another. The new pane's
+which with no `--pane` or `--beside` uses the calling pane (`HERDR_PANE_ID`)
+as its placement reference, in the Git primary checkout (the calling cwd outside
+Git) unless `--cwd` names another. On all three harnesses, `start` reads
+`herdr pane layout` and fills a 2×2 grid without focus: one pane splits right,
+two side-by-side panes split the right column down, and three panes split the
+remaining full column down. Each split uses ratio 0.5. Existing horizontal
+rows fill the equivalent grid by splitting right. `--beside` selects the reference
+tab/pane, not the direction; `--pane` retains explicit reuse. Placement in a full
+or irregular tab reuses an agent-free foreground shell with an empty visible
+prompt or creates a tab in the same workspace, without subdivision. Concurrent starts serialize placement
+through launch so they cannot claim the same shell or subdivide a stale layout.
+The start completes placement without a post-start pane move. The new pane's
 split-cwd and launcher preparation finish under one fixed
 monotonic deadline, including a stable foreground-shell snapshot after bootstrap,
 before its single start request; caller-provided panes keep their existing path.
