@@ -407,9 +407,9 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                         render._BLINK_ON = old
                     top = next(i for i, line in enumerate(lines)
                                if line and "rail-owner" in "".join(p for p, _k in line))
-                    close = next(line for line in lines[top:]
-                                 if line and "╰" in "".join(p for p, _k in line))
-                    owner_keys = [key for _part, key in close]
+                    divider = next(line for line in lines[top:]
+                                   if line and "├" in "".join(p for p, _k in line))
+                    owner_keys = [key for _part, key in divider]
                     self.assertIn(expected, owner_keys)
 
     def test_f66_entire_frame_uses_the_owner_rail_color(self):

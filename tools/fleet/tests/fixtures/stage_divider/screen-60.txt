@@ -1,0 +1,41 @@
+  hearting unknown · unmanaged
+
+  usage claude code   no usage api — plan quota is console-only
+        codex         no usage api — plan quota is console-only
+  fleet ⠋ 2 working   ● 0 idle   ↳ 4 jobs (4 working)
+─────
+  compute resources  1/1
+  ◇ gpu  CPU ────────  — thr  M —/—G  S —/—G
+         ⠋ 0: UTIL    —  VRAM ────      —/—GB ▸ 1
+─────
+
+  SESSIONS   stack · press w to cycle
+● bundle/
+▍ ⠋ [aa] claude     aa ▾4
+▍    ⚑  3h 00m      Opus (high)              -
+▍    ┆              ────────────────   —    NOW owner work
+▍    ┆  ╭─  ⠋ claude   gpu-owner ─────────────────────────╮
+▍    ┆  │  —        Opus (high)              code(std·ow… │
+▍    ┆  │           ────────────────   —    train · gpu:… │
+▍    ┆  ├──────────────────────────────────── one-shot ───┤
+▍    ┆  │ ● GPU gpu:0 · train 2m                          │
+▍    ┆  ╰─────────────────────────────────────────────────╯
+▍    ┆  ╭─  ⠋ codex    worker-owner ──────────────────────╮
+▍    ┆  │  —        gpt-6.1-sol (high)       code(std·ow… │
+▍    ┆  │           ────────────────   —                  │
+▍    ┆  ├─────────────────────────────────── preparing ───┤
+▍    ┆  │   ⠋ codex    exec worker                        │
+▍    ┆  │  3m       gpt-6.1-sol (medium)       code-exec… │
+▍    ┆  │           running                               │
+▍    ┆  │        ────────────────   —                     │
+▍    ┆  ╰─────────────────────────────────────────────────╯
+▍    ┆  ╭─  ⠋ opencode childless-owner ───────────────────╮
+▍    ┆  │  —        gpt-6.1-sol (high)       code(std·ow… │
+▍    ┆  │           ────────────────   —                  │
+▍    ┆  ╰──────────────────────────────────── scaffold ───╯
+▍ ⠋ [bb] codex      bb
+▍       3h 00m      gpt-6.1-sol (medium)     -
+▍                   ────────────────   —
+
+  ⠹ working   ● idle   [id] session   [id] steward
+  ▾N child jobs   ↳ dispatch

@@ -2447,10 +2447,9 @@ def _dispatch_box_bottom(box_width, key, run_key=None, label_segs=None, rail_col
     padding-run fill — so the box reads as identity on top, pipeline on the bottom, and
     gains no line.
 
-    F-81 (user 2026-08-20): the breadcrumb itself moved to the header divider — see
-    `_dispatch_box_divider` — so `label_segs` is always None on this call in practice
-    (kept as a parameter because this is the pre-existing, still-correct placement path,
-    not new code; F-75's `╰───` four-cell stub, width, corner, and grain are unchanged).
+    F-81 (user 2026-08-20, restored 2026-10-09): the breadcrumb rides the header
+    divider when the card has children. Only a childless card carries it here;
+    F-75's `╰───` four-cell stub, width, corner, and grain are unchanged.
 
     F-68's grain contract still holds: the RULE stays steady (`run_key`) while corners keep
     `key`. Only the breadcrumb's own current token blinks, exactly as it did on the owner
@@ -2478,10 +2477,9 @@ def _dispatch_box_divider(box_width, key, run_key=None, label_segs=None, rail_co
     F-81 (user 2026-08-20 "파이프라인은 카드 헤더 밴드가 소유한다"): the owner's route
     breadcrumb now rides THIS rule instead of the close rail, using the exact placement
     `_dispatch_box_bottom` used to (`_dispatch_rail_label_layout` — one shared helper, not
-    a parallel copy). Emitted when descendants follow OR a breadcrumb is present — a
-    childless, breadcrumb-less card keeps its two rows and its close rule, with nothing to
-    divide; a childless card whose owner folded to `done` still needs this rule to keep
-    showing its pipeline (the F-81 regression this exists to fix).
+    a parallel copy). Emitted when worker or resource children exist, even when
+    completed workers folded out of view. A childless card has nothing to divide
+    and carries its stage/status on the close rail instead.
 
     Geometry and grain match `_dispatch_box_bottom` exactly (same `run`, same steady
     `run_key` rule against `key` corners), so the divider reads as part of the frame rather
@@ -7440,11 +7438,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                     term_width=term_width))
             gpu_rows, resource_rows = _owner_gpu_resource_rows(
                 job, session_by_identity, gpu_resources, term_width, depth=depth, in_card=in_card)
-            lines.extend(gpu_rows)
+            resource_children = getattr(job, "resource_children", ())
+            if not resource_children:
+                lines.extend(gpu_rows)
             # Everything emitted above belongs to the owner itself (identity row, its
             # NOW line, its own sub-agent strip). Descendants start here, so this index
             # is where the header divider goes once the frame is drawn.
             header_end = len(lines)
+            if resource_children:
+                lines.extend(gpu_rows)
             lines.extend(resource_rows)
             # The map contains depth-2 workers keyed by their depth-1 owner's
             # slug. A worker can reuse that slug (or another owner's), so looking
@@ -7496,8 +7498,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                         lines[idx], box_width, "top" if idx == block_start else "mid",
                         rail_key, run_key=run_key, rail_col=rail_col,
                         owner_identity=(idx < header_end and _route_rides_the_rail(job, route_seq, True)))
-                # Approved 1008 semantics: every OWNER status/pipeline closes the box.
-                # The divider separates resource/model children without repeating it.
+                # F-81: every OWNER stage/status shares the header divider when
+                # children exist, otherwise the close rail. Keep the label once.
                 route_label = None
                 if _route_rides_the_rail(job, route_seq, in_card=True):
                     budget = max(1, bottom_label_budget(box_width, rail_col))
@@ -7532,13 +7534,14 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                         route_label = _clip_segs(route_label, max(1, budget - _dw(warning)))[0]
                         route_label.append((warning, "gate_u"))
                 # Retain the divider when raw children exist, even if they folded away.
-                has_children = bool(job_children.get(job.slug) or resource_rows)
+                has_children = bool(job_children.get(job.slug) or resource_children or resource_rows)
                 if has_children:
                     lines.insert(header_end,
                                  _dispatch_box_divider(box_width, rail_key, run_key=run_key,
-                                                       rail_col=rail_col))
+                                                       label_segs=route_label, rail_col=rail_col))
                 lines.append(_dispatch_box_bottom(box_width, rail_key, run_key=run_key,
-                                                  label_segs=route_label, rail_col=rail_col))
+                                                  label_segs=None if has_children else route_label,
+                                                  rail_col=rail_col))
 
         shown = _sort_group_sessions(shown)
         if live_order is not None:

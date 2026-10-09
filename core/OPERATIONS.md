@@ -1594,8 +1594,10 @@ fields. Public assistant text supplies a bounded fallback while the summary is
 absent; only unfinished native tool state represents a running command. The
 first publication skips database snapshots, and later reads reuse unchanged
 source metadata. This observation leaves running owners and resources intact.
-Depth-1 frame cards use the owner model/gauge,
-routing and close-rail status layout on every harness; worker layouts retain
+Depth-1 frame cards use the owner model/gauge and routing layout on every harness.
+Owner stage/status labels share one right-aligned position: the owner/child
+divider when worker or resource children exist (including folded workers),
+otherwise the closing rail. The other rail stays bare; worker layouts retain
 their existing columns. Fleet ignores a marker whose entries carry no role source;
 `peer-message prune-steward-markers [--apply]` lists/removes those, and `peer-steward.py steward off` (or `peer-message release`)
 clears a marker.
