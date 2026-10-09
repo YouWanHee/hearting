@@ -1668,27 +1668,43 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self._release()
         self._wait_for_receipt(self._fields(proc.stdout)["watch_id"])
 
-    def test_watch_on_a_pane_before_its_first_session_continues_on_that_session(self):
-        """2026-10-10 regression: a fresh Codex has no session until its first
-        input; the watch follows the pane and then takes the session it gets."""
+    def _unbound_watch(self, mode):
         identity_path = self.tmp_root / "identity.json"
         identity_path.write_text(json.dumps({"session_id": ""}))
-        env = self._env("held")
+        env = self._env(mode)
         env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
         proc = self._run("watch", "peer-a", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         fields = self._fields(proc.stdout.splitlines()[0])
         self.assertEqual(fields["state"], "armed", proc.stdout)
-        watch_id = fields["watch_id"]
-        arm = json.loads((self.watch_root / f"{watch_id}.json").read_text())
+        arm_path = self.watch_root / f"{fields['watch_id']}.json"
+        arm = json.loads(arm_path.read_text())
         self.assertEqual((arm["agent"]["session_id"], arm["agent"]["pane"]), ("-", "w1:p9"))
-        self._wait_for_lock(watch_id)
+        return fields["watch_id"], arm_path, identity_path, env
+
+    def test_watch_on_a_pane_before_its_first_session_arms_on_the_pane(self):
+        """2026-10-10 regression: a fresh Codex has no session until its first
+        input, and `watch` refused it (`watch-identity-unverified`)."""
+        watch_id, _arm, _identity, _env = self._unbound_watch("idle")
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("-", "w1:p9"))
+
+    def test_pane_armed_watch_keeps_the_session_it_took(self):
+        watch_id, arm_path, identity_path, env = self._unbound_watch("checkpoint")
+        self.assertEqual(self._wait_for_observation(watch_id)["reason"], "timeout")
         identity_path.write_text(json.dumps({"session_id": "sid-first"}))
         again = self._run("watch", "peer-a", env=env)
         self.assertEqual(self._fields(again.stdout.splitlines()[0]).get("watch_id"), watch_id)
-        self._release()
-        receipt = self._wait_for_receipt(watch_id)
-        self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("sid-first", "w1:p9"))
+        deadline = time.monotonic() + 10
+        while (json.loads(arm_path.read_text())["agent"]["session_id"] != "sid-first"
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        self.assertEqual(json.loads(arm_path.read_text())["agent"]["session_id"], "sid-first")
+        # Another session in that pane is a different target, as for an exact arm.
+        identity_path.write_text(json.dumps({"session_id": "sid-other"}))
+        other = self._run("watch", "peer-a", env=env)
+        self.assertEqual(self._fields(other.stdout.splitlines()[0]).get("state"), "armed", other.stdout)
+        self.assertNotEqual(self._fields(other.stdout.splitlines()[0])["watch_id"], watch_id)
 
     def test_same_name_new_session_gets_separate_watch_and_old_rearm_cannot_overwrite_claim(self):
         env = self._env("timeout")
@@ -4980,7 +4996,12 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         """2026-10-10 regression: a Codex that never took input has no session,
         and its retire stayed `pane-identity-unverified` for good."""
         world = _RetireWorld(sid=None)
-        rc, line = self.retire(world)
+        # herdr not told yet: a session its process proves keeps the exact checks.
+        with mock.patch.object(peer_steward, "_proven_session", return_value="thread-real"):
+            rc, line = self.retire(world)
+        self.assertIn("retired=false reason=pane-identity-unverified", line)
+        self.assertEqual(world.actions(), [])
+        rc, line = self.retire(world, clear_existing=False)
         self.assertEqual((rc, line), (0, "retired=true reason=normal-exit agent=codex name=old pane=w1:pOld"))
         self.assertEqual(world.actions(), [
             ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],

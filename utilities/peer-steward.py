@@ -2308,6 +2308,26 @@ def _watch_identity_matches(expected, observed):
     return observed.get("session_id") == expected.get("session_id")
 
 
+def _persist_watch_session(args, paths, server, session_id):
+    """Write the session a pane-armed watch took into its arm, under the arm
+    claim, so dedupe and a restarted observer hold that session from now on."""
+    claim = paths.arm.parent / f"{_dedupe_key(args.steward_session_id, args.target, list(args.until or []), server)}.arm"
+    try:
+        claim_fd = _open_lock(claim)
+    except OSError:
+        return False
+    try:
+        if not _acquire_bounded(claim_fd, _CLAIM_TIMEOUT_MS):
+            return False
+        arm = _read_json(paths.arm)
+        agent = arm.get("agent") if isinstance(arm, dict) else None
+        if isinstance(agent, dict) and agent.get("session_id") == "-":
+            _write_json_atomic(paths.arm, {**arm, "agent": {**agent, "session_id": session_id}})
+        return True
+    finally:
+        os.close(claim_fd)
+
+
 def cmd_watch(args):
     root = _watch_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -2578,10 +2598,13 @@ def cmd_watch_run(args):
     checkpoint_ms = args.timeout if args.timeout is not None else _WATCH_OBSERVER_TIMEOUT_MS
     checkpoint_ms = min(600_000, max(500, int(checkpoint_ms)))
     backoff = 1.0
+    unbound = expected["session_id"] == "-"
     while True:
         resolved, current, _code, reason = _interpret_payload(_run_herdr_get(args.target), args.target)
         exact = (reason is None and resolved not in {"agent-not-found", "herdr-unavailable"}
                  and _watch_identity_matches(expected, current))
+        if unbound and expected["session_id"] != "-":
+            unbound = not _persist_watch_session(args, paths, server, expected["session_id"])
         if exact:
             payload = _run_herdr_wait(args.target, args.until, checkpoint_ms)
             state, agent, _code, reason = _interpret_payload(payload, args.target)
@@ -2837,7 +2860,9 @@ def _spawn_watch_observer(watch_id, arm):
             )
         finally:
             os.close(log_fd)
-        updated = dict(arm)
+        # Re-read: the observer may have written the session it took meanwhile.
+        current_arm = _read_json(paths.arm)
+        updated = dict(current_arm if isinstance(current_arm, dict) else arm)
         updated["observer_generation"] = int(arm.get("observer_generation", 1)) + 1
         updated["rearm_count"] = int(arm.get("rearm_count", 0)) + 1
         updated["watcher"] = {"pid": proc.pid, "pid_start": process_start_ticks(proc.pid) or ""}
@@ -3216,13 +3241,17 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
     """Use the shared projection with exact native identity and registered bindings.
 
     A pane whose harness has not assigned a session yet (a fresh Codex before
-    its first input) is exact by pane and shell birth: nothing can be bound to
-    it, so its native turn decides. A caller holding a session still needs it."""
+    its first input: herdr reports none and its process proves none) is exact
+    by pane and shell birth: nothing can be bound to it, so its native turn
+    decides. A caller holding a session still needs it."""
     try:
         observed_state, ident, _code, _reason = _retire_target(target)
         harness, sid, pane = ident.get("harness"), ident.get("session_id"), ident.get("pane")
-        unbound = sid == "-" and expected_sid in {None, "-"}
         info = _retire_pane_info(pane) if pane and pane != "-" else None
+        # herdr's silence alone is not freshness: a session the process proves
+        # (herdr not told yet) keeps the exact-session checks.
+        unbound = (sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict)
+                   and _proven_session(info["foreground_processes"], harness) is None)
         shell_start = (_proc_start_ticks(info.get("shell_pid"))
                        if isinstance(info, dict) else None)
         birth = (f"{info['shell_pid']}:{shell_start}"
@@ -4041,6 +4070,14 @@ def _process_session(pane, harness):
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
         payload = json.loads(proc.stdout or "")
         processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
+    except Exception:
+        return None
+    return _proven_session(processes, harness)
+
+
+def _proven_session(processes, harness):
+    """The session one of these foreground processes proves (`fleet.process_identity`), or None."""
+    try:
         tools_dir = Path(__file__).resolve().parent.parent / "tools"
         if tools_dir.is_dir() and str(tools_dir) not in sys.path:
             sys.path.insert(0, str(tools_dir))
