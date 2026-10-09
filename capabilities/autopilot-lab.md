@@ -179,6 +179,15 @@ Lab scripts may call `resource_progress.write_progress(completed, "epoch", total
 from the shared `utilities/` helper to atomically publish a short counter; a missing
 or invalid observation never interrupts the workload or changes exit/sentinel completion.
 
+The same separation applies to GPU monitoring. Generated execution bridges
+read the payload's terminal evidence before sampling again and retain partial
+samples plus a warning when a probe fails. `compute-hosts probe --json` returns
+availability in the snapshot; a zero command exit does not prove GPU identity
+or headroom. Optional monitoring never raises the payload's exit code, and
+prelaunch identity/headroom requirements remain explicit checks. A required
+during-run sample belongs to the existing `run-verify`/evaluation verification
+check: missing evidence can fail that check without changing resource success.
+
 ### Parts (SD-165)
 
 For an already verified run's same-code/config resume, epoch extension or repeat,

@@ -1598,6 +1598,7 @@ def wrapper_result(
         "check": fields.get("check", "invalid"),
         "launch_state": launch_state,
         "reason": reason,
+        **({"detail": fields["detail"]} if fields.get("detail") else {}),
     }
 
 
@@ -1980,6 +1981,7 @@ def _record_failed_legs(route, results, agent_home):
             attempt_id=leg.get("attempt_id"), exit_code=leg.get("exit_code"),
             launch_state=leg.get("launch_state"), harness=leg.get("adapter") or leg.get("harness"),
             reason=leg.get("reason") or "leg-failure",
+            detail=leg.get("detail") or "",
         )
         if path:
             paths.append(path)
@@ -2639,7 +2641,7 @@ def main(argv: list[str] | None = None) -> int:
             source_members = {member["route_node"]: member for member in source_manifest["members"]}
             for leg in legs:
                 # assignment_sha256 identifies the original group input. The
-                # ordinary worker launch still receives the current retry brief.
+                # Recovery context carries the current brief separately.
                 leg["assignment_sha256"] = source_members[leg["node"]]["assignment_sha256"]
         except ReplicaBatchContractError as exc:
             return fail(
@@ -2964,8 +2966,16 @@ def main(argv: list[str] | None = None) -> int:
                     "reason": "batch-interrupted-before-wrapper",
                 })
                 continue
+            launch_prompt = args.prompt_text
+            if partial is not None:
+                original_prompt = partial_input["options"].get("prompt_text")
+                if original_prompt is not None:
+                    launch_prompt = original_prompt
+                elif leg["assignment_sha256"] == "sha256:" + hashlib.sha256(DEFAULT_PROMPT.encode("utf-8")).hexdigest():
+                    launch_prompt = DEFAULT_PROMPT
             command = node_launch_command(
-                route_path=route_path, leg=leg, parent=args.parent, prompt_text=args.prompt_text,
+                route_path=route_path, leg=leg, parent=args.parent,
+                prompt_text=launch_prompt,
                 reviewed_evidence=(args.review_inputs[leg["node"]]["path"]
                                    if leg["node"] in args.review_inputs else None),
                 jobs=jobs, parent_attempt=parent_attempt, log_dir=args.log_dir,
@@ -2989,12 +2999,17 @@ def main(argv: list[str] | None = None) -> int:
                 # address the incident, since the override gate reads the
                 # launcher's own environment, not the child's.
                 and key != "AGENT_DISPATCH_ALLOW_NAMESPACED_SPAWN"
+                and key != "AGENT_DISPATCH_RETRY_BRIEF"
             }
             env.update({
                 GOVERNOR_RESERVATION_ENV: token,
                 "AGENT_MODEL_GOVERNOR_ROOT": str(governor_root),
                 "AGENT_DISPATCH_JOBS": str(jobs),
             })
+            if partial is not None:
+                # Message content only: the original raw task still supplies
+                # the exact reservation assignment digest in every adapter.
+                env["AGENT_DISPATCH_RETRY_BRIEF"] = args.prompt_text
             try:
                 proc = subprocess.Popen(
                     command,

@@ -798,6 +798,40 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(Path(cmd[cmd.index('--prompt-file')+1]).read_text(),'the raw task')
         self.assertEqual(cmd.count('--start'),1)
 
+    def test_automatic_replacement_preserves_later_round_recovery_guidance(self):
+        brief = 'Recover the failed leg only.\n## Round protocol\nReview only the prior blocking findings.'
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_RETRY_BRIEF': brief}):
+            self.assertIn(brief, R.recovery_instructions(self.args))
+            self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args, 'codex', 'the raw task')))
+        self.write(self.meta)
+        record = self.claim()
+        source = R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        replay = R.launch_input(self.jobs, 'att-source', source)
+        self.assertEqual(replay['task'], 'the raw task')
+        command = R._command(self.jobs, record, source, replay)
+        self.assertEqual(Path(command[command.index('--prompt-file')+1]).read_text(), 'the raw task')
+        successor = SimpleNamespace(**{**vars(self.args), 'attempt_id': record['replacement_attempt_id'],
+                                      'automatic_retry_of': 'att-source', 'worker_type': 'stage',
+                                      'replacement_input_argv': R._replacement_argv(record, source, replay)})
+        del successor.replacement_retry_brief
+        with mock.patch.dict(os.environ, {}, clear=True):
+            guidance = R.recovery_instructions(successor)
+        self.assertIn(brief, guidance)
+        self.assertEqual(guidance.count('## Round protocol'), 1)
+        fragment = R.seal_launch_input(successor, 'codex', 'the raw task')
+        sealed = R.launch_input(self.jobs, successor.attempt_id, D.parse_registry_metadata(fragment))
+        self.assertEqual(sealed['retry_brief'], brief)
+        self.assertEqual(sealed['task'], 'the raw task')
+
+    def test_unstarted_attempt_cannot_reseal_changed_recovery_guidance(self):
+        self.args.replacement_retry_brief = 'Review only prior blocking findings.'
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        R.seal_launch_input(self.args, 'codex', 'the raw task')
+        self.args.replacement_retry_brief = 'Review a different scope.'
+        with self.assertRaises(D.DispatchContractError):
+            R.seal_launch_input(self.args, 'codex', 'the raw task')
+
     # SD106 writes retry_attempt_id on the original row only. These fixtures
     # deliberately retain that production shape, with no automatic_retry_of.
     def _legacy_real_route(self, name, parent=None):
@@ -1539,6 +1573,34 @@ class ReplacementTest(unittest.TestCase):
         budget = review_round_cap.round_budget(self.route, node, rows, revisions=revisions)
         self.assertEqual((budget.state, budget.round_kind), ('admit', 'closure-check'))
         self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), (['att-test-2'], []))
+
+    def test_failed_owner_without_failed_checks_accepts_one_ordinary_correction(self):
+        import dispatch_owner_input as I
+        self._failed_owner(test_fails=0)
+        self.assertTrue(self._answer(text='approved fix: retain missing GPU observation',
+                                    request_id='infra-fix')['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        record = result['record']
+        self.assertEqual(record['proof']['source_result'], 'FAIL')
+        self.assertEqual(record['proof']['answers'], [])
+        self.assertNotIn('after_capacity', record['logical_node'])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('retain missing GPU observation', text)
+        self.assertNotIn('closure-check', text)
+        self.assertEqual(R.answered_fix_revisions(self.jobs, 'rt-test'), [])
+        # Replay converges on the claim; a second FAIL never creates another allowance.
+        self.assertEqual(self.claim(), record)
+        successor = self._successor(record, self.meta | {'worker_type': 'owner'}, status='open')
+        I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
+        successor = self._die(successor, note='dead-worker-fail', failure_class='fail')
+        self.assertTrue(self._answer(aid=successor['attempt_id'], text='another fix',
+                                    request_id='infra-fix-2')['retained'])
+        retry, commands = self._launch(successor['attempt_id'])
+        self.assertEqual(commands, [])
+        self.assertEqual(retry.get('reason'), 'automatic-replacement-exhausted', retry)
+        self.assertEqual(len(list((R._directory(self.jobs) / 'claims').glob('*.json'))), 1)
 
     def test_a_fix_for_a_check_that_used_its_closure_check_makes_no_round(self):
         import route_authority as RA

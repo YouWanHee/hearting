@@ -260,7 +260,7 @@ class DispatchBatchTest(unittest.TestCase):
         ]
         return contextlib.ExitStack(), assignments
 
-    def legs(self, assignments=None):
+    def legs(self, assignments=None, prompt=None):
         assignments = assignments or self.common_patches()[1]
         legs = []
         for node, adapter, hop, ordinal in assignments:
@@ -281,7 +281,7 @@ class DispatchBatchTest(unittest.TestCase):
                     ordinal,
                 ),
                 "assignment_sha256": "sha256:" + __import__("hashlib").sha256(
-                    BATCH.DEFAULT_PROMPT.encode("utf-8")
+                    (BATCH.DEFAULT_PROMPT if prompt is None else prompt).encode("utf-8")
                 ).hexdigest(),
                 "independence": "cross-harness",
                 "model_profile": str(node["model_profile"]),
@@ -680,6 +680,12 @@ class DispatchBatchTest(unittest.TestCase):
     def test_partial_continuation_legacy_rows_keep_assignment_with_new_brief(self):
         self._partial_continuation_launch(retry_prompt="Recover the failed leg only.")
 
+    def test_partial_continuation_legacy_custom_assignment_keeps_matching_prompt(self):
+        self._partial_continuation_launch(
+            original_prompt="The original custom assignment.",
+            retry_prompt="The original custom assignment.",
+        )
+
     def test_partial_continuation_new_owner_keeps_source_parent_and_replacement(self):
         self._partial_continuation_launch(
             retry_prompt="Continue the authorized gap.", sealed=True,
@@ -687,13 +693,13 @@ class DispatchBatchTest(unittest.TestCase):
         )
 
     def _partial_continuation_launch(self, *, retry_prompt=None, sealed=False,
-                                    parent_attempt="att-parent-fixture"):
-        source_legs = self.legs()
+                                    parent_attempt="att-parent-fixture", original_prompt=None):
+        source_legs = self.legs(prompt=original_prompt)
         _source_manifest, continuation, partial = self.partial_continuation(source_legs)
         peer, gap = source_legs
-        self.write_existing(peer, status="done", note="completed-marker")
+        self.write_existing(peer, status="done", note="completed-marker", all_legs=source_legs)
         self.write_existing(
-            gap, status="done", note="cancelled-receipt-unavailable"
+            gap, status="done", note="cancelled-receipt-unavailable", all_legs=source_legs
         )
         if sealed:
             self.seal_original_input()
@@ -718,6 +724,7 @@ class DispatchBatchTest(unittest.TestCase):
 
             def __init__(self, command, **kwargs):
                 self.command = command
+                self.env = kwargs.get("env", {})
                 created.append(self)
 
             def communicate(self):
@@ -820,6 +827,8 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(len(created), 1)
         command = created[0].command
         self.assertEqual(command[command.index("--prompt-text") + 1],
+                         BATCH.DEFAULT_PROMPT if original_prompt is None else original_prompt)
+        self.assertEqual(created[0].env["AGENT_DISPATCH_RETRY_BRIEF"],
                          retry_prompt if retry_prompt is not None else BATCH.DEFAULT_PROMPT)
         self.assertEqual(command[command.index("--parent-attempt-id") + 1], parent_attempt)
         self.assertEqual(
@@ -2644,6 +2653,19 @@ class DispatchBatchTest(unittest.TestCase):
                 self.assertEqual(result[field], "unknown")
                 self.assertEqual(result["reason"], "invalid-wrapper-receipt")
 
+    def test_reservation_mismatch_detail_survives_receipt_and_ledger(self):
+        detail = "batch_assignment_sha256:expected=original:actual=retry"
+        result = BATCH.wrapper_result(
+            {"node": "research-alternative", "adapter": "codex", "attempt_id": "att-gap"},
+            SimpleNamespace(returncode=75),
+            "check=failed\nreason=parallel-group-reservation-mismatch\n"
+            f"detail={detail}\nregistered=0\nstarted=0\nchild_spawned=0\n", "",
+        )
+        self.assertEqual(result["detail"], detail)
+        with mock.patch.object(BATCH, "record_degradation") as record:
+            BATCH._record_failed_legs(self.route, [result], self.base)
+        self.assertEqual(record.call_args.kwargs["detail"], detail)
+
     def test_duplicate_batch_state_does_not_claim_concurrent_launch(self):
         self._assert_duplicate_batch_state()
 
@@ -3990,22 +4012,12 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
                 BATCH.main(argv)
 
     def test_leg_launch_prompt_carries_the_same_round_protocol_block_as_dispatch_node(self):
-        """SD-153 rule 5 correction, 🟡 item: a dispatch-batch-launched capped
-        leg was proven only by reading source (dispatch-node.py appends
-        `round_protocol_block` to whatever raw `--prompt-text` it receives,
-        and dispatch-batch passes that text through unmodified -- P3's own
-        judgment call that a dedicated test was "disproportionate"). This
-        drives dispatch-batch's real `main()` through a real round-capped
-        `impl-review` group leg with one real verdict-less prior round (so
-        the block's "판정 없음(<note>)" text is non-trivial), intercepts the
-        leg's own process spawn with a fake `Popen`, and inside that fake
-        runs `dispatch-node.py`'s real `main()` in-process -- faking only
-        ITS two subprocess calls (the route `verify` gate and the final
-        adapter-wrapper invocation, neither of which this test is about) --
-        to capture the actual final `--prompt-text` argument dispatch-node.py
-        hands the adapter. Asserts it against `DISPATCH_NODE.round_protocol_
-        block(...)`, the same production function, executed for real by
-        production code, not re-derived by this test."""
+        """Real round admission keeps guidance separate from the sealed task.
+
+        Run dispatch-batch and dispatch-node, substituting their launch calls.
+        The wrapper receives the original raw task and the exact round protocol
+        as recovery context, so its assignment digest stays reserved.
+        """
         route = self._route("standard")
         for node in route["nodes"]:
             # `kind="pipeline-stage"` (not "review-worker") deliberately: the
@@ -4049,6 +4061,7 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
             "--jobs", str(self.jobs),
         ]
         captured = {}
+        recovery_context = {}
 
         class FakeProcess:
             def __init__(self, command, **kwargs):
@@ -4061,6 +4074,7 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
                     if "--worktree" in inner_argv:
                         node_id = inner_argv[inner_argv.index("--route-node") + 1]
                         captured[node_id] = list(inner_argv)
+                        recovery_context[node_id] = kw["env"].get("AGENT_DISPATCH_RETRY_BRIEF", "")
                     return subprocess.CompletedProcess(inner_argv, 0, stdout="", stderr="")
 
                 with mock.patch.dict(os.environ, leg_env, clear=True), \
@@ -4134,7 +4148,8 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
         )
         self.assertNotEqual(expected_block, "")
         self.assertIn("판정 없음", expected_block)
-        self.assertEqual(actual_prompt, BATCH.DEFAULT_PROMPT + expected_block)
+        self.assertEqual(actual_prompt, BATCH.DEFAULT_PROMPT)
+        self.assertEqual(recovery_context["impl-review"], expected_block)
 
 
 

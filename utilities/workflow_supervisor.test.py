@@ -661,6 +661,64 @@ class TestSupervisorAdvance(WorkflowFixture):
                 proc.stdin.close()
             proc.wait(timeout=5)
 
+    def test_payload_success_and_failed_gpu_probe_admit_verification_with_missing_sample(self):
+        route, path, jobs, registry, output = self._resume_fixture()
+        runner = _load("probe_fixture_runner", "utilities/resource-runner.py")
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        observation = output / "gpu-observation.json"
+        script = self.base / "probe-bridge.py"
+        script.write_text(f'''
+import importlib.util, io, json, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+# The payload has finished and its output check passes before post-run monitoring.
+assert json.loads(Path({str(output / 'run.json')!r}).read_text())["sum"] == 10
+spec = importlib.util.spec_from_file_location("compute", {str(HERE / 'compute-hosts.py')!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+snapshot = io.StringIO()
+config = {{"run_root": Path({str(self.base / 'compute')!r}), "hosts": {{"gpu": {{"ssh_host": "local"}}}}}}
+with mock.patch.object(module, "load_config", return_value=config), \\
+     mock.patch.object(module, "collect_ssh_session_bridges", return_value=[]), \\
+     mock.patch.object(module, "remote", return_value=subprocess.CompletedProcess([], 1, "", "post-run GPU probe failed")), \\
+     mock.patch("sys.stdout", snapshot):
+    code = module.cmd_probe(SimpleNamespace(hosts=["gpu"], json=True))
+Path({str(observation)!r}).write_text(snapshot.getvalue())
+raise SystemExit(code)
+''')
+        env = {**os.environ, "AGENT_RESOURCE_SENTINEL": row["sentinel"]}
+        with open(row["log"], "wb") as log:
+            proc = subprocess.Popen(["/bin/sh", "-c", "read launch; " + runner.SENTINEL_SCRIPT,
+                                     "probe-bridge", sys.executable, str(script)],
+                                    stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, env=env)
+            try:
+                row.update(runner.proc_identity(proc.pid), status="running")
+                registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": row}}))
+                proc.communicate(b"start\n", timeout=10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+        ledger = SUP.ledger_for(route, jobs)
+        with mock.patch.object(SUP, "_start_successor", return_value={"started": True}) as launch:
+            result = SUP.poll_once(route, ledger)
+            self.assertEqual(result[0]["action"], "advanced", result)
+            self.assertEqual(result[0]["successors"][0]["successor"], "one-shot")
+            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "settled")
+            self.assertEqual(launch.call_count, 1)
+        settled = json.loads(registry.read_text())["runs"]["fixture-run"]
+        self.assertEqual((settled["status"], settled["exit_code"]), ("succeeded", 0))
+        self.assertFalse(json.loads(observation.read_text())[0]["reachable"])
+        self.assertIn("observation unavailable", Path(row["log"]).read_text())
+        import resource_resume
+        self.assertEqual(resource_resume.observation(route, jobs)["state"], "resource-succeeded")
+        self.assertIn("independent post-run verification", resource_resume.verification_prompt(route, jobs))
+        # Admission is not verification PASS. A required sample can fail its existing check.
+        ledger.record("one-shot", "FAILED_RETRYABLE", evidence={"reason": "required-gpu-sample-missing"})
+        self.assertEqual(json.loads(registry.read_text())["runs"]["fixture-run"], settled)
+        self.assertNotEqual(ledger.state()["workflow_state"], "COMPLETE")
+
     def test_verified_resume_exit_marker_claim_and_replay_are_not_workflow_complete(self):
         route, path, jobs, registry, output = self._resume_fixture()
         ledger = SUP.ledger_for(route, jobs)
