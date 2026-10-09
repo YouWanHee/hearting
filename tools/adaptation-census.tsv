@@ -132,6 +132,7 @@ utility-deferred	dispatch-state-root.sh
 utility-deferred	dispatch-wait.sh
 utility-deferred	dispatch-wait.test.sh
 utility-deferred	dispatch_adapters_v11.test.py
+utility-deferred	dispatch_batch_obligations.py
 utility-deferred	dispatch_allocation.py
 utility-deferred	dispatch_allocation_receipt.py
 utility-deferred	dispatch_broker.test.py
@@ -195,6 +196,7 @@ utility-deferred	owner_route_binding.py
 utility-deferred	parent_next_directive.py
 utility-deferred	peer-message.py
 utility-deferred	peer-steward.py
+utility-deferred	peer_obligations.py
 utility-deferred	registered_parent_park.test.py
 utility-deferred	replica_batch_contract.py
 utility-deferred	resource-runner.py

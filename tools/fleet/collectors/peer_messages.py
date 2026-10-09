@@ -17,6 +17,8 @@ from pathlib import Path
 _TAIL_BYTES = 64 * 1024
 _WINDOW_SECONDS = 24 * 3600
 _MAX_RECORDS = 200
+_MAX_PENDING_DUTIES = 128
+_PENDING_DUTY_STATES = {"pending", "unknown", "delivery-pending", "cleanup-pending"}
 
 # C-2 — a herdr sender trailer written 2026-09-08T02:54Z~11:18Z carried a trailing
 # " ; ref=<32hex>" transfer-ref suffix inside the display name (the writer
@@ -159,6 +161,98 @@ def _parse_ts(ts):
         return None
 
 
+def _pending_obligations(roots, now):
+    """Read a bounded, body-free view of accepted peer follow-through."""
+    by_session = {}
+    seen = set()
+    examined = 0
+
+    def add(key, kind, state, created, ref=None):
+        if not key or not key[1]:
+            return
+        row = by_session.setdefault(key, [])
+        entry = {"kind": kind, "state": state,
+                 "age_min": max(0, int((now - created) // 60))}
+        if isinstance(ref, str) and ref:
+            entry["ref"] = ref[:80]
+        row.append(entry)
+
+    for state_root in roots:
+        if examined >= _MAX_PENDING_DUTIES:
+            break
+        obligation_root = Path(state_root) / "peer-steward" / "obligations"
+        try:
+            paths = sorted(obligation_root.glob("*.json"))[:_MAX_PENDING_DUTIES - examined]
+        except OSError:
+            paths = []
+        for path in paths:
+            examined += 1
+            try:
+                if path.is_symlink() or path.stat().st_size > 128 * 1024:
+                    continue
+                duty = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                continue
+            if not isinstance(duty, dict) or duty.get("state") not in _PENDING_DUTY_STATES:
+                continue
+            duty_id = duty.get("id")
+            if not isinstance(duty_id, str) or duty_id in seen:
+                continue
+            seen.add(duty_id)
+            identity = duty.get("identity") or {}
+            intent = duty.get("intent") or {}
+            kind = (intent.get("kind") or duty.get("kind") or "").lower()
+            if kind == "message":
+                target = intent.get("to") or identity
+                label = "delay" if duty_id.startswith("delay-") or intent.get("delay_notice_for") else "message"
+                ref = intent.get("ref") or (duty.get("observation") or {}).get("transfer_ref")
+            elif kind == "retire":
+                target, label, ref = identity, "retire", None
+            else:
+                continue
+            key = (str(target.get("harness") or "").lower(), target.get("session_id"))
+            created = duty.get("accepted_at") or duty.get("updated_at") or now
+            try:
+                created = float(created)
+            except (TypeError, ValueError):
+                created = now
+            add(key, label, duty.get("state"), created, ref)
+
+        watch_root = Path(state_root) / "peer-watches"
+        try:
+            arms = sorted(watch_root.glob("*.json"))[:_MAX_PENDING_DUTIES - examined]
+        except OSError:
+            arms = []
+        for path in arms:
+            if examined >= _MAX_PENDING_DUTIES:
+                break
+            if path.name.endswith((".receipt.json", ".ack.json", ".observation.json")):
+                continue
+            examined += 1
+            try:
+                if path.is_symlink() or path.stat().st_size > 128 * 1024:
+                    continue
+                arm = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(arm, dict):
+                    continue
+                watch_id = arm.get("watch_id")
+                if not isinstance(watch_id, str) or watch_id in seen:
+                    continue
+                seen.add(watch_id)
+                receipt = watch_root / f"{watch_id}.receipt.json"
+                ack = watch_root / f"{watch_id}.ack.json"
+                if receipt.is_file() and ack.is_file():
+                    continue
+                agent = arm.get("agent") or {}
+                key = (str(agent.get("harness") or "").lower(), agent.get("session_id"))
+                created = _parse_ts(str(arm.get("armed_ts") or ""))
+                add(key, "watch", "receipt-pending" if receipt.is_file() else "watching",
+                    created if created is not None else now, None)
+            except (OSError, ValueError, UnicodeError):
+                continue
+    return by_session
+
+
 def collect(state_roots=None):
     records = []
     malformed = 0
@@ -298,6 +392,11 @@ def collect(state_roots=None):
                     _upgrade_recv(to_key, inherited, frm, to, from_key, age_min)
             elif to_key and deliverable:
                 _record_recv(to_key, "notice", frm, to, from_key, age_min)
+
+    for key, duties in _pending_obligations(roots, now).items():
+        _row(key)["pending_obligations"] = sorted(
+            duties, key=lambda item: (item.get("kind", ""), item.get("age_min", 0))
+        )[:8]
 
     collect.last_diagnostics = []
     collect.last_malformed = malformed

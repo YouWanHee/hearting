@@ -294,6 +294,11 @@ class PrintedCommandHomeTest(unittest.TestCase):
     """A printed command names the installed-release pointer, never the release that printed it."""
 
     def setUp(self):
+        inherited = dict(os.environ)
+        for key in tuple(os.environ):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_")):
+                os.environ.pop(key, None)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(inherited)))
         import tempfile
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)

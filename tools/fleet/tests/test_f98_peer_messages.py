@@ -15,6 +15,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from fleet import render  # noqa: E402
+from fleet import collectors  # noqa: E402
 from fleet.collectors import peer_messages  # noqa: E402
 from fleet.model import Session  # noqa: E402
 
@@ -59,6 +60,47 @@ def _rec(from_sid, to_sid=None, to_name=None, kind="steer", summary="hi",
 
 
 class CollectorTest(unittest.TestCase):
+    def test_pending_duties_are_read_only_bounded_and_body_free(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obligations = root / "peer-steward" / "obligations"
+            obligations.mkdir(parents=True)
+            now = time.time()
+            duties = [
+                {"id": "message-ref-a", "state": "pending", "accepted_at": now - 120,
+                 "identity": {"harness": "claude", "session_id": "sid-a"},
+                 "intent": {"kind": "message", "to": {"harness": "claude", "session_id": "sid-a"},
+                            "ref": "ref-a", "body": "PRIVATE_BODY_SENTINEL"}},
+                {"id": "delay-ref-a", "state": "delivery-pending", "accepted_at": now - 60,
+                 "identity": {"recipient_harness": "claude", "recipient_session_id": "sid-a"},
+                 "intent": {"kind": "message", "to": {"harness": "claude", "session_id": "sid-a"},
+                            "delay_notice_for": "ref-a"}},
+                {"id": "retire-a", "state": "cleanup-pending", "accepted_at": now - 30,
+                 "identity": {"harness": "claude", "session_id": "sid-a"},
+                 "intent": {"kind": "retire"}},
+            ]
+            for duty in duties:
+                (obligations / f"{duty['id']}.json").write_text(json.dumps(duty), encoding="utf-8")
+            watch_root = root / "peer-watches"
+            watch_root.mkdir()
+            (watch_root / "watch-a.json").write_text(json.dumps({
+                "watch_id": "watch-a", "armed_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                "agent": {"harness": "claude", "session_id": "sid-a"},
+            }), encoding="utf-8")
+
+            result = peer_messages.collect(state_roots=[str(root)])
+
+        pending = result["by_session"][("claude", "sid-a")]["pending_obligations"]
+        self.assertEqual({item["kind"] for item in pending}, {"message", "delay", "retire", "watch"})
+        self.assertNotIn("PRIVATE_BODY_SENTINEL", json.dumps(pending))
+        session = Session(harness="claude", pid=1, session_id="sid-a")
+        collectors.apply_peer_rows([session], result["by_session"])
+        self.assertEqual(len(session.peer_obligations), 4)
+        strip = render._peer_obligation_strip(session.peer_obligations, term_width=120)
+        rendered = "".join(text for text, _style in strip[0])
+        self.assertIn("pending", rendered)
+        self.assertIn("retire 1", rendered)
+
     def test_three_record_fixture_badge_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             _write_ledger(tmp, "sid-a", [

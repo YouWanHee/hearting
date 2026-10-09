@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import time
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -27,4 +28,15 @@ def project(payload: dict[str, Any] | None, session_id: str, *, worker: bool = F
         source = payload.get("source")
         if source in {"startup", "resume", "clear", "compact", "fork"}:
             lifecycle = dict(session_seq=time.time_ns(), session_start_source=source)
-    return _project("codex", session_id, worker=worker, **lifecycle)
+    projected = _project("codex", session_id, worker=worker, **lifecycle)
+    if not worker and session_id:
+        try:
+            subprocess.Popen(
+                [sys.executable, str(ROOT / "utilities" / "peer-steward.py"),
+                 "__ensure-obligations"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return projected

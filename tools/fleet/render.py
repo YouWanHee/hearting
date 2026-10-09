@@ -4043,6 +4043,26 @@ def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, dep
                         lambda: build(False, False)], term_width)]
 
 
+def _peer_obligation_strip(obligations=None, term_width=None, depth=0, in_card=False):
+    """Show bounded accepted peer follow-through without message content."""
+    counts = {}
+    for item in obligations or []:
+        kind = item.get("kind")
+        if kind in {"message", "delay", "retire", "watch"}:
+            counts[kind] = counts.get(kind, 0) + 1
+    if not counts:
+        return []
+    labels = (("message", "msg"), ("delay", "delay"),
+              ("retire", "retire"), ("watch", "watch"))
+    parts = [f"{label} {counts[kind]}" for kind, label in labels if counts.get(kind)]
+    segs = [(_conn_indent(depth, in_card), None), ("↻ pending ", "lvl_y")]
+    for index, part in enumerate(parts):
+        if index:
+            segs.append((" · ", "dim"))
+        segs.append((part, "lvl_y"))
+    return [_fit_strip([lambda: segs], term_width)]
+
+
 # Past nodes recede (dim); a failure or an unverifiable state keeps its alarm hue.
 _ROUTE_CHAIN_MARK = {"done": ("✓", "dim"), "failed": ("✕", "lvl_r"), "unknown": ("?", "lvl_y")}
 
@@ -7650,6 +7670,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             # Peer communication remains a strip; steward relations use under-id lines.
             lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,
                                           tag_by_key, term_width=term_width))
+            lines.extend(_peer_obligation_strip(getattr(s, "peer_obligations", None),
+                                                term_width=term_width))
             for plugin_job in plugin_kids:
                 lines.extend(_plugin_agent_row(plugin_job, term_width=term_width))
             for i, cj in enumerate(dispatch_kids):

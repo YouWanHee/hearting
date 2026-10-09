@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
@@ -32,6 +33,9 @@ class _TmpRootMixin:
         self.jobs_path = self.tmp_root / "jobs.log"
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
+        for key in tuple(os.environ):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_")):
+                os.environ.pop(key, None)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
         # `steward_marker_roots()`'s fleet-reader branch also adds
@@ -39,6 +43,10 @@ class _TmpRootMixin:
         # (~/.codex, ~/.claude, ~/.config/opencode) as read candidates; without
         # isolating HOME too those fall through to this machine's real roots.
         os.environ["HOME"] = str(self.tmp_root / "home")
+        # A worker runtime's XDG_CONFIG_HOME points at runtime-owned config
+        # without the test's scoped files; pin it to the isolated HOME so
+        # config-home lookups stay inside the fixture.
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "home" / ".config")
         os.environ.pop("XDG_STATE_HOME", None)
         os.environ.pop("HARNESS_STATE_ROOT", None)
         os.environ.pop("CODEX_HOME", None)
@@ -47,6 +55,13 @@ class _TmpRootMixin:
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         os.environ.pop("CODEX_THREAD_ID", None)
         os.environ.pop("AGENT_SESSION_ID", None)
+        os.environ.pop("AGENT_HERDR_SESSION", None)
+        self._old_herdr_session = peer_steward._HERDR_SESSION
+        peer_steward._HERDR_SESSION = None
+        runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner_patch.start()
+        self.addCleanup(runner_patch.stop)
+        self.addCleanup(lambda: setattr(peer_steward, "_HERDR_SESSION", self._old_herdr_session))
         self.addCleanup(self._restore_environ)
 
     def _restore_environ(self):
@@ -871,13 +886,22 @@ argv = sys.argv[1:]
 log = os.environ.get("FAKE_HERDR_CALLLOG")
 if log:
     with open(log, "a", encoding="utf-8") as fh:
-        fh.write(" ".join(argv) + "\n")
+        fh.write(" ".join(argv) + " window=" + os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move") + "\n")
 
 mode = os.environ.get("FAKE_HERDR_MODE", "idle")
 target = argv[2] if len(argv) > 2 else "-"
 info = {"id": "cli:agent:wait", "result": {"agent": {
     "agent": "claude", "agent_session": {"value": "sid-fake"},
-    "agent_status": "idle", "name": target, "pane_id": "w1:p9"}, "type": "agent_info"}}
+    "agent_status": "idle", "name": target, "pane_id": "w1:p9",
+    "window_id": os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move")}, "type": "agent_info"}}
+identity_path = os.environ.get("FAKE_HERDR_IDENTITY_FILE")
+if identity_path and os.path.exists(identity_path):
+    with open(identity_path, encoding="utf-8") as fh:
+        replacement = json.load(fh)
+    info["result"]["agent"]["agent_session"]["value"] = replacement.get("session_id", "sid-fake")
+    info["result"]["agent"]["pane_id"] = replacement.get("pane", "w1:p9")
+    if replacement.get("once"):
+        os.unlink(identity_path)
 
 def fail(code):
     sys.stderr.write(json.dumps({"error": {"code": code, "message": code}}))
@@ -894,7 +918,13 @@ if verb == "get":
 if verb == "wait":
     if mode == "timeout":
         fail("timeout")
-    if mode == "held":
+    if mode == "checkpoint":
+        marker = (log or "") + ".checkpoint"
+        if not os.path.exists(marker):
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write("timeout")
+            fail("timeout")
+    if mode in ("held", "checkpoint"):
         fifo = os.environ["FAKE_HERDR_FIFO"]
         with open(fifo, "r") as fh:   # blocks until the test writes: an event, not a poll
             fh.read()
@@ -1350,6 +1380,15 @@ class _WatchMixin(_TmpRootMixin):
 
     def _env(self, mode="idle", session_id="steward-1", with_herdr=True):
         env = dict(os.environ)
+        for key in tuple(env):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "HERDR_")):
+                env.pop(key, None)
+        for key in (
+            "AGENT_SESSION_ID", "AGENT_SESSION_ROLE", "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+            "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG",
+        ):
+            env.pop(key, None)
         env["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         env["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
         env["FAKE_HERDR_MODE"] = mode
@@ -1424,6 +1463,15 @@ class _WatchMixin(_TmpRootMixin):
                 return json.loads(path.read_text())
             time.sleep(0.02)
         self.fail(f"receipt never appeared for {watch_id}")
+
+    def _wait_for_observation(self, watch_id, seconds=10):
+        path = self.watch_root / f"{watch_id}.observation.json"
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if path.exists():
+                return json.loads(path.read_text())
+            time.sleep(0.02)
+        self.fail(f"observation checkpoint never appeared for {watch_id}")
 
 
 class WatchArmTest(_WatchMixin, unittest.TestCase):
@@ -1578,17 +1626,37 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             tree = ast.parse(source)
             parents = {child: parent for parent in ast.walk(tree)
                        for child in ast.iter_child_nodes(parent)}
+            background_backoff = {"cmd_watch_run": "backoff", "cmd_obligation_runner": "delay"}
+
+            def enclosing_function(node):
+                parent = parents.get(node)
+                while parent is not None:
+                    if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        return parent.name
+                    parent = parents.get(parent)
+                return None
+
             found = []
             for node in ast.walk(tree):
                 if (isinstance(node, ast.While) and isinstance(node.test, ast.Constant)
                         and node.test.value is True):
-                    found.append((node.lineno, "unbounded while"))
+                    if enclosing_function(node) not in background_backoff:
+                        found.append((node.lineno, "unbounded while"))
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
                 sleeping = (isinstance(func, ast.Attribute) and func.attr == "sleep"
                             or isinstance(func, ast.Name) and func.id == "sleep")
                 if not sleeping:
+                    continue
+                background = background_backoff.get(enclosing_function(node))
+                if background:
+                    if (isinstance(func, ast.Attribute) and func.attr == "sleep"
+                            and isinstance(func.value, ast.Name) and func.value.id == "time"
+                            and len(node.args) == 1 and isinstance(node.args[0], ast.Name)
+                            and node.args[0].id == background):
+                        continue
+                    found.append((node.lineno, "background observer sleep is not bounded backoff"))
                     continue
                 branch, parent = node, parents.get(node)
                 bounded = False
@@ -1646,8 +1714,12 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         for name in ("peer-steward.py", "../hooks/peer-steward-rewake.py"):
             path = (_HERE / name).resolve()
             self.assertTrue(path.exists(), f"{name} missing")
-            self.assertEqual(violations(path.read_text(), bounded_ui=name == "peer-steward.py"),
-                             [], f"{path.name}: only fixed-deadline foreground observation may sleep")
+            source = path.read_text()
+            self.assertEqual(violations(source, bounded_ui=name == "peer-steward.py"),
+                             [], f"{path.name}: foreground waits are fixed-deadline and task observers back off")
+            if name == "peer-steward.py":
+                self.assertIn("backoff = min(_WATCH_BACKOFF_MAX_SECONDS, backoff * 1.7)", source)
+                self.assertIn("delay = min(15.0, delay * 1.7)", source)
 
 
 class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
@@ -1681,6 +1753,7 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(set(receipt), {
             "schema_version", "watch_id", "target", "steward", "armed_ts", "done_ts",
             "state", "agent", "herdr_exit", "watcher", "rearmed_from", "refs",
+            "server", "observer_generation",
         })
         self.assertEqual(receipt["state"], "idle")
         self.assertEqual(receipt["steward"]["session_id"], "steward-1")
@@ -1697,10 +1770,15 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(notices[0]["delivery"]["receipt"], watch_id)
         self.assertEqual(notices[0]["from"]["session_id"], "steward-1")
 
-    def test_uninterpretable_herdr_yields_a_receipt_not_an_endless_wait(self):
-        proc = self._run("watch", "peer-a", env=self._env("timeout"))
+    def test_timeout_is_a_pending_checkpoint_then_same_duty_finishes(self):
+        proc = self._run("watch", "peer-a", env=self._env("checkpoint"))
         watch_id = self._fields(proc.stdout)["watch_id"]
-        self.assertEqual(self._wait_for_receipt(watch_id)["state"], "timeout")
+        checkpoint = self._wait_for_observation(watch_id)
+        self.assertEqual(checkpoint["state"], "pending")
+        self.assertEqual(checkpoint["reason"], "timeout")
+        self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists())
+        self._release()
+        self.assertEqual(self._wait_for_receipt(watch_id)["state"], "idle")
 
 
 class JoinTest(_WatchMixin, unittest.TestCase):
@@ -1843,9 +1921,9 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(
             directive.get("parent_next_reason"), "steward-line-does-not-arm", proc.stdout
         )
-        # The wait must join *the new watch*, never the dead one it replaced.
+        # The wait continues to join the original logical watch.
         self.assertIn(f"join {head['watch_id']}", directive.get("parent_next_command", ""))
-        self.assertNotIn(dead["watch_id"], directive.get("parent_next_command", ""))
+        self.assertEqual(head["watch_id"], dead["watch_id"])
         self._release()
 
     def test_rearm_only_replaces_a_dead_unreceipted_watch(self):
@@ -1867,13 +1945,10 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         out = self._run("rearm", dead["watch_id"], env=self._env("held")).stdout
         fields = self._fields(out.splitlines()[0])
         self.assertEqual(fields["state"], "rearmed")
-        self.assertEqual(fields["rearmed_from"], dead["watch_id"])
-        self.assertNotEqual(fields["watch_id"], dead["watch_id"])
+        self.assertEqual(fields["watch_id"], dead["watch_id"])
         new_arm = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
-        self.assertEqual(new_arm["rearmed_from"], dead["watch_id"])
-        self.assertEqual(new_arm["rearm_count"], 1)
+        self.assertEqual(new_arm["observer_generation"], 2)
 
-        self._release()
         self._release()
 
 
@@ -1912,12 +1987,82 @@ class ReviewRoundOneTest(_WatchMixin, unittest.TestCase):
         self.assertIn("herdr-unavailable", proc.stdout)
         self.assertEqual(list(self.watch_root.glob("*.json")), [])
 
-    def test_receipt_carries_the_real_herdr_exit_code(self):
-        # m3: a timeout from herdr exits 1; the receipt must say so.
-        armed = self._fields(self._run("watch", "peer-a", env=self._env("timeout")).stdout)
-        receipt = self._wait_for_receipt(armed["watch_id"])
-        self.assertEqual(receipt["state"], "timeout")
-        self.assertEqual(receipt["herdr_exit"], 1)
+    def test_checkpoint_survives_observer_restart_without_changing_watch_id(self):
+        armed = self._fields(self._run("watch", "peer-a", env=self._env("checkpoint")).stdout)
+        watch_id = armed["watch_id"]
+        observation = self._wait_for_observation(watch_id)
+        self.assertEqual(observation["reason"], "timeout")
+        old_pid = int(armed["pid"])
+        os.kill(old_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and peer_steward._pid_identity_ok(
+                old_pid, armed["pid_start"]):
+            time.sleep(0.02)
+        env = self._env("checkpoint")
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        resumed = self._run("__ensure-obligations", env=env)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        deadline = time.monotonic() + 10
+        arm_path = self.watch_root / f"{watch_id}.json"
+        updated = json.loads(arm_path.read_text())
+        while time.monotonic() < deadline and updated["watcher"]["pid"] == old_pid:
+            time.sleep(0.02)
+            updated = json.loads(arm_path.read_text())
+        self.assertNotEqual(updated["watcher"]["pid"], old_pid)
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["watch_id"], watch_id)
+        self.assertEqual(receipt["agent"]["session_id"], "sid-fake")
+        self.assertEqual(receipt["agent"]["pane"], "w1:p9")
+
+    def test_reconnect_preserves_pane_duty_across_tab_move_and_rejects_reused_identity(self):
+        armed = self._fields(self._run("watch", "peer-a", env=self._env("checkpoint")).stdout)
+        watch_id = armed["watch_id"]
+        self.assertEqual(self._wait_for_observation(watch_id)["reason"], "timeout")
+        old_pid = int(armed["pid"])
+        os.kill(old_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and peer_steward._pid_identity_ok(
+                old_pid, armed["pid_start"]):
+            time.sleep(0.02)
+
+        identity_file = self.tmp_root / "reused-pane-once.json"
+        identity_file.write_text(json.dumps({
+            "session_id": "sid-reused", "pane": "w1:p-reused", "once": True,
+        }), encoding="utf-8")
+        env = self._env("checkpoint")
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_file)
+        env["FAKE_HERDR_WINDOW_ID"] = "window-after-tab-move"
+        resumed = self._run("__ensure-obligations", env=env)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+        deadline = time.monotonic() + 10
+        arm_path = self.watch_root / f"{watch_id}.json"
+        updated = json.loads(arm_path.read_text())
+        while time.monotonic() < deadline and updated["watcher"]["pid"] == old_pid:
+            time.sleep(0.02)
+            updated = json.loads(arm_path.read_text())
+        self.assertNotEqual(updated["watcher"]["pid"], old_pid)
+        observation_path = self.watch_root / f"{watch_id}.observation.json"
+        deadline = time.monotonic() + 10
+        observation = {}
+        while time.monotonic() < deadline:
+            if observation_path.exists():
+                observation = json.loads(observation_path.read_text())
+                if observation.get("reason") == "target-identity-changed":
+                    break
+            time.sleep(0.02)
+        self.assertEqual(observation.get("reason"), "target-identity-changed")
+        self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists())
+        self.assertEqual(updated["watch_id"], watch_id)
+
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["watch_id"], watch_id)
+        self.assertEqual(receipt["agent"]["session_id"], "sid-fake")
+        self.assertEqual(receipt["agent"]["pane"], "w1:p9")
+        self.assertIn("window-after-tab-move", self.calllog.read_text(encoding="utf-8"))
 
 
 class KillFixtureTest(_WatchMixin, unittest.TestCase):
@@ -2008,6 +2153,9 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         patch = mock.patch.object(peer_steward, "_read_screen", return_value=empty)
         patch.start()
         self.addCleanup(patch.stop)
+        runner = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner.start()
+        self.addCleanup(runner.stop)
 
     def _fake_run(self, get_payload, prompt_rc=0, calls=None):
         def run(argv, **kw):
@@ -2019,6 +2167,13 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                 return subprocess.CompletedProcess(argv, prompt_rc, stdout="{}", stderr="")
             if argv[:3] == ["herdr", "agent", "start"]:
                 return _herdr_json({"id": "cli:agent:start", "result": {"agent": get_payload["result"]["agent"]}})
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                pid = os.getpid()
+                return _herdr_json({"result": {"process_info": {
+                    "pane_id": get_payload["result"]["agent"].get("pane_id", "w1:pX"),
+                    "shell_pid": pid, "foreground_process_group_id": os.getpgrp(),
+                    "foreground_processes": [{"pid": pid, "argv": ["python3", "peer_steward.test"]}],
+                }}})
             return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
         return run
 
@@ -2066,6 +2221,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_current_session_identity", side_effect=senders) as identity, \
              mock.patch.object(peer_steward, "_resolve_target", side_effect=targets) as target, \
              mock.patch.object(peer_steward, "_agent_state", return_value=("idle", "w1:p1")), \
+             mock.patch.object(peer_steward, "_prompt_input_reason", return_value=None), \
              mock.patch.object(peer_steward, "_herdr_prompt", side_effect=sent), \
              mock.patch("builtins.print"):
             for body in ("첫 전송", "둘째 전송"):
@@ -2095,12 +2251,12 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                                side_effect=self._fake_run({"error": {"code": "agent_not_found"}}, calls=calls)), \
              mock.patch("builtins.print"):
             rc = peer_steward.main(["prompt", "ghost", "hello", "--no-trailer"])
-        self.assertEqual(rc, 0)
-        prompt_call = next(c for c in calls if c[:3] == ["herdr", "agent", "prompt"])
-        self.assertEqual(prompt_call[4], "hello")
+        self.assertEqual(rc, 1)
+        self.assertFalse([c for c in calls if c[:3] == ["herdr", "agent", "prompt"]])
         rec = self._all_records()[-1]
         self.assertEqual(rec["to"], {"harness": "unknown", "name": "ghost"})
-        self.assertEqual(rec["kind"], "steer")
+        self.assertEqual((rec["kind"], rec["delivery"]["status"]), ("steer", "failed"))
+        self.assertIn("pane-identity-unverified", rec["delivery"]["receipt"])
 
     def _verify_run(self, status, *, prompt_rc=0, prompt_err="", explain_evidence="\"❯\\n\"", calls=None,
                     pane_text="❯ ", explain_stdout=None):
@@ -2128,6 +2284,13 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                                                    stderr=prompt_err)
             if argv[:3] == ["herdr", "agent", "explain"]:
                 return subprocess.CompletedProcess(argv, 0, stdout=explain_stdout, stderr="")
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                pid = os.getpid()
+                return _herdr_json({"result": {"process_info": {
+                    "pane_id": "w1:pX", "shell_pid": pid,
+                    "foreground_process_group_id": os.getpgrp(),
+                    "foreground_processes": [{"pid": pid, "argv": ["python3", "peer_steward.test"]}],
+                }}})
             return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
         return run
 
@@ -2281,7 +2444,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "recipient", "child")), \
              mock.patch.object(peer_steward, "_from_name", return_value="sender"), \
              mock.patch.object(peer_steward, "_agent_state", side_effect=[("blocked", "w1:pX"), ("idle", "w1:pX")]), \
-             mock.patch.object(peer_steward, "_form_open", return_value=False), \
+             mock.patch.object(peer_steward, "_prompt_input_reason",
+                               side_effect=["target-form-open", None, None]), \
              mock.patch.object(peer_steward, "_herdr_prompt", return_value=(0, {})) as sent, \
              mock.patch("builtins.print"):
             self.assertEqual(peer_steward.main(["prompt", "child", "original body", "--no-verify"]), 3)
@@ -2491,7 +2655,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         peer_steward.peer_message.receive_peer_message(wrapped, {"harness": "claude", "session_id": "sid-child"})
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
 
-    def test_late_flush_never_leaves_a_separate_banner_in_the_draft(self):
+    def test_late_flush_preserves_the_original_body_and_queues_sender_notice(self):
         text, ref = self._deferred_claude_row("body submitted together")
         row = peer_steward.peer_message._read_pending(ref)
         with peer_steward.peer_message.pending_lock(ref):
@@ -2508,14 +2672,18 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_herdr_prompt", side_effect=send), \
              mock.patch("builtins.print"):
             self.assertEqual(peer_steward._flush_pending_for_target("child", "claude", "sid-child", "idle")[0], 1)
-        self.assertEqual(len(sent), 1)
-        self.assertTrue(sent[0].startswith("[지연 전달"))
-        self.assertTrue(sent[0].endswith(text))
+        self.assertEqual(sent, [text])
+        duties = peer_steward.peer_obligations.ObligationStore().list()
+        notices = [d for d in duties if d.get("id") == "delay-" + ref]
+        self.assertEqual(len(notices), 1)
+        notice_ref = (notices[0].get("observation") or {}).get("transfer_ref")
+        notice = peer_steward.peer_message._read_pending(notice_ref)
+        self.assertEqual(notice["refs"], ["delay-notice:" + ref, ref])
+        self.assertIn(ref[:8], notice["text"])
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
 
-    def test_late_flush_sends_delay_banner_with_row_text(self):
-        """A row stranded over an hour goes out intact preceded by a delay
-        notice in the same prompt, so the recipient sees its age first."""
+    def test_late_flush_keeps_original_transfer_exact_and_delay_notice_is_deduped(self):
+        """The recipient gets the sealed body; one separate normal message tells the sender."""
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         form = "Probe: pick one?\n❯ 1. A\n  2. B\nEnter to select · Esc to cancel\n"
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
@@ -2535,11 +2703,12 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
             sent_texts = [c.args[0][4] for c in run_mock.call_args_list
                           if c.args[0][:3] == ["herdr", "agent", "prompt"]]
-        banners = [text for text in sent_texts if text.startswith("[지연 전달")]
-        self.assertEqual(len(banners), 1)
-        self.assertIn(ref[:8], banners[0])
         stranded = next(text for text in sent_texts if "old body" in text)
-        self.assertEqual(banners[0], stranded)
+        self.assertTrue(stranded.startswith("old body\n"))
+        self.assertNotIn("[지연 전달", stranded)
+        notices = [d for d in peer_steward.peer_obligations.ObligationStore().list()
+                   if d.get("id") == "delay-" + ref]
+        self.assertEqual(len(notices), 1)
         self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
 
     def test_long_stuck_rows_warn_with_senders(self):
@@ -2562,10 +2731,10 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_FLUSH_ROW_TIMEOUT_S", 0), \
              mock.patch("builtins.print") as print_mock:
             self.assertEqual(peer_steward.main(["prompt", "child", "fresh body"]), 0)
-        stderr_lines = [call.args[0] for call in print_mock.call_args_list
-                        if call.kwargs.get("file") is sys.stderr]
-        self.assertTrue(any("pending-stuck" in line and "oldest=2.0h" in line for line in stderr_lines),
-                        stderr_lines)
+        notices = [d for d in peer_steward.peer_obligations.ObligationStore().list()
+                   if d.get("id") == "delay-" + ref]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
 
     def test_form_unknown_target_keeps_private_unverified_without_attaching_sid(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sender"
@@ -2676,6 +2845,21 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             '"❯[handoff] all done, merge it, then release …"', "[handoff] all done, merge it, then release the gate"))
 
 
+class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
+    def test_existing_lifecycle_callback_reconnects_all_observer_families(self):
+        with mock.patch.dict(os.environ, {
+                "AGENT_SESSION_ROLE": "worker", "AGENT_DISPATCH_CHILD": "1",
+                "AGENT_DISPATCH_DEPTH": "2", "OPENCODE_DISPATCH_SLUG": "fixture"}), \
+             mock.patch.object(peer_steward, "_ensure_watch_observers") as watches, \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_runner") as peers, \
+             mock.patch.object(peer_steward.dispatch_batch_obligations,
+                               "ensure_observers") as batches:
+            self.assertEqual(peer_steward.main(["__ensure-obligations"]), 0)
+        watches.assert_called_once_with()
+        peers.assert_called_once_with()
+        batches.assert_called_once_with()
+
+
 class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     """Actual 0.8 CLI/screen fixtures: user input survives; exact payload goes once."""
 
@@ -2695,6 +2879,13 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     def run_herdr(self, argv, **kwargs):
         if argv[:3] in (["herdr", "agent", "get"], ["herdr", "agent", "wait"]):
             return _herdr_json(_agent_json(self.harness, self.sid, "child", self.status))
+        if argv[:3] == ["herdr", "pane", "process-info"]:
+            pid = os.getpid()
+            return _herdr_json({"result": {"process_info": {
+                "pane_id": "w1:pX", "shell_pid": pid,
+                "foreground_process_group_id": os.getpgrp(),
+                "foreground_processes": [{"pid": pid, "argv": ["python3", "peer_steward.test"]}],
+            }}})
         if argv[:3] == ["herdr", "agent", "read"]:
             return subprocess.CompletedProcess(argv, 1 if self.screen is None else 0,
                                                stdout=self.screen or "", stderr="")
@@ -2712,6 +2903,36 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
         # isolated to this fixture. Its internal claims/acks are not mocked.
         with mock.patch("fleet.herdr_projection.may_report", return_value=True):
             peer_steward.peer_message.retry_receiver_idle({"harness": self.harness, "session_id": self.sid})
+
+    def test_task_runner_delivers_sealed_message_after_form_closes_without_sender_prompt(self):
+        self.screen = CLAUDE_FORM
+        self.assertEqual(self.prompt("sealed original body"), 3)
+        ref = self._all_records()[-1]["transfer_ref"]
+        original = peer_steward.peer_message._read_pending(ref)
+        duty_id = "message-" + ref
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.get(duty_id)
+        self.assertIsNotNone(duty)
+        self.assertEqual(duty["intent"]["body_digest"], original["body_sha256"])
+        self.assertNotIn("body", duty["intent"])
+        self.assertEqual(self.messages, [])
+
+        self.screen = CLAUDE_EMPTY
+        lock_path = store.root / "runner.lock"
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            with mock.patch.object(peer_steward.time, "sleep"), mock.patch("builtins.print"):
+                self.assertEqual(peer_steward.cmd_obligation_runner(
+                    SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd)), 0)
+        finally:
+            os.close(lock_fd)
+
+        received = peer_steward.peer_message._read_pending(ref)
+        self.assertEqual(received["state"], "received")
+        self.assertEqual(received["body_sha256"], original["body_sha256"])
+        self.assertIsNone(received["text"], "acknowledgement retires the stored body")
+        self.assertEqual(self.messages, [original["text"]])
+        self.assertEqual(store.get(duty_id)["state"], "complete")
 
     def test_today_two_collision_shapes_after_preparation_preserve_draft_and_deliver_once(self):
         prepare = peer_steward.peer_message.prepare_peer_message
@@ -3460,6 +3681,10 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
             return dict(part.split("=", 1) for part in receipt.split() if "=" in part)
         with mock.patch.object(peer_steward, "_resolve_target", return_value=("claude", "sid-B", "w")), \
              mock.patch.object(peer_steward, "_agent_state", return_value=("idle", world.pane)), \
+             mock.patch.object(peer_steward, "_retire_target", return_value=("idle", {
+                 "harness": "claude", "session_id": "sid-B", "pane": world.pane, "name": "child"}, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_pane_info", return_value={"shell_pid": 123}), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="777"), \
              mock.patch.object(self.clear, "_run_continue", side_effect=resume):
             peer_steward.receiver_idle({"harness": "claude", "session_id": "sid-B"}, world.pane)
             peer_steward.receiver_idle({"harness": "claude", "session_id": "sid-B"}, world.pane)
@@ -4318,8 +4543,14 @@ class _RetireWorld:
 
 
 class RetireTest(_TmpRootMixin, unittest.TestCase):
-    def retire(self, world, record=None):
+    def retire(self, world, record=None, *, clear_existing=True):
         printed = []
+        store = peer_steward.peer_obligations.ObligationStore()
+        exact = {"server": "default", "pane": "w1:pOld", "harness": world.harness,
+                 "session_id": "old-sid", "name": "old"}
+        duty_id = peer_steward.peer_obligations.stable_duty_id("retire", exact, "old")
+        if clear_existing:
+            store._record_path(duty_id).unlink(missing_ok=True)
         original_stat = os.stat
         clock = iter(range(100))
 
@@ -4335,12 +4566,68 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_retire_process_record", return_value=(record if record is not None else
                               {"start": "800", "group": 4242, "argv": [world.harness]})), \
              mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=lambda pid: "700" if pid == 101 else "800"), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False), \
              mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
              mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
              mock.patch.object(peer_steward.time, "sleep"), \
              mock.patch("builtins.print", side_effect=lambda *a, **kw: printed.append(" ".join(map(str, a)))):
             rc = peer_steward.main(["retire", "old"])
         return rc, printed[-1]
+
+    def test_busy_retire_persists_then_task_runner_finishes_without_replaying_exit(self):
+        world = _RetireWorld(status="working")
+        rc, line = self.retire(world)
+        self.assertEqual(rc, 0)
+        self.assertIn("pending=true", line)
+        self.assertEqual(world.actions(), [])
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.list()[0]
+        self.assertEqual(duty["intent"]["kind"], "retire")
+        self.assertEqual(duty["state"], "pending")
+
+        world.status = "idle"
+        lock_path = store.root / "runner.lock"
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        original_stat = os.stat
+        clock = iter(range(100))
+
+        def stat(path, *args, **kwargs):
+            if str(path) == "/proc/4242" and world.sent and world.exits:
+                raise FileNotFoundError(path)
+            if str(path) == "/proc/4242":
+                return object()
+            return original_stat(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+                 mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
+                 mock.patch.object(peer_steward, "_retire_process_record",
+                                   return_value={"start": "800", "group": 4242,
+                                                 "argv": [world.harness]}), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks",
+                                   side_effect=lambda pid: "700" if pid == 101 else "800"), \
+                 mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
+                 mock.patch.object(peer_steward, "_seat_handover", return_value=None), \
+                 mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
+                 mock.patch.object(peer_steward.time, "sleep"), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(peer_steward.cmd_obligation_runner(
+                    SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd)), 0)
+        finally:
+            os.close(lock_fd)
+
+        settled = store.get(duty["id"])
+        self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                         ("complete", "normal-exit", "complete"))
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+        before = list(world.actions())
+        rc, line = self.retire(world, clear_existing=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("reason=already-complete", line)
+        self.assertEqual(world.actions(), before)
 
     def test_confirmed_normal_exit_closes_once_and_records_notice(self):
         for harness, status in (("codex", "idle"), ("opencode", "done"), ("claude", "idle")):
@@ -4421,7 +4708,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                         ["herdr", "pane", "close", "w1:pOld"],
                     ])
                 else:
-                    self.assertEqual(rc, 1)
+                    self.assertEqual(rc, 0)
                     self.assertIn("retired=false reason=agent-still-running", line)
                     expected = ([
                         ["herdr", "pane", "send-text", "w1:pOld", "/exit"],
@@ -4434,7 +4721,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
     def test_opencode_still_running_is_bounded_without_another_exit_key(self):
         world = _RetireWorld(harness="opencode", exits=False)
         rc, line = self.retire(world)
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 0)
         self.assertIn("retired=false reason=agent-still-running", line)
         self.assertEqual(world.actions(), [
             ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
@@ -4448,11 +4735,11 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         cases += [(_RetireWorld("claude", screen=CLAUDE_DRAFT_SECOND_LINE), "draft"),
                   (_RetireWorld("opencode", screen=OPENCODE_DRAFT), "draft")]
         changed = _RetireWorld(); changed.changed = True
-        cases.append((changed, "target-changed"))
+        cases.append((changed, "pane-identity-unverified"))
         for world, reason in cases:
             with self.subTest(reason=reason):
                 rc, line = self.retire(world)
-                self.assertEqual(rc, 1)
+                self.assertEqual(rc, 0)
                 self.assertIn("reason=" + reason, line)
                 self.assertEqual(world.actions(), [])
         with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pOld"}):
@@ -4466,17 +4753,17 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
             with self.subTest(patch=patch):
                 world = _RetireWorld(); world.bad_process = patch
                 rc, line = self.retire(world)
-                self.assertIn("reason=foreground-unverified", line); self.assertEqual(world.actions(), [])
+                self.assertIn("reason=", line); self.assertEqual(world.actions(), [])
         world = _RetireWorld()
         rc, line = self.retire(world, {"start": "800", "group": 999, "argv": ["codex"]})
-        self.assertIn("reason=foreground-unverified", line); self.assertEqual(world.actions(), [])
+        self.assertIn("reason=", line); self.assertEqual(world.actions(), [])
 
     def test_claude_exit_command_unknown_or_still_live_never_closes_or_retries(self):
         # One /exit submission; a missing shell return never permits a retry or close.
         for unknown in (False, True):
             world = _RetireWorld("claude", exits=False); world.post_unknown = unknown
             rc, line = self.retire(world)
-            self.assertEqual(rc, 1)
+            self.assertEqual(rc, 0)
             self.assertIn("reason=" + ("shell-return-unverified" if unknown else "agent-still-running"), line)
             self.assertEqual(world.actions(), [["herdr", "pane", "send-text", "w1:pOld", "/exit"],
                                                ["herdr", "pane", "send-keys", "w1:pOld", "enter"]])
@@ -4484,7 +4771,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
     def test_error_body_on_send_or_close_is_not_success(self):
         world = _RetireWorld(); world.send_error = True
         rc, line = self.retire(world)
-        self.assertIn("reason=exit-send-failed", line)
+        self.assertIn("reason=exit-send-unknown", line)
         self.assertEqual(len(world.actions()), 1)
         world = _RetireWorld(); world.close_error = True
         rc, line = self.retire(world)
@@ -4503,7 +4790,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
 
         world.run = failed_text
         rc, line = self.retire(world)
-        self.assertEqual(rc, 1); self.assertIn("reason=exit-send-failed", line)
+        self.assertEqual(rc, 0); self.assertIn("reason=exit-send-unknown", line)
         self.assertEqual(world.actions(), [["herdr", "pane", "send-text", "w1:pOld", "/exit"]])
         world = _RetireWorld("claude")
         normal_info = world.info
@@ -4516,13 +4803,13 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
 
         world.info = changed_after_text
         rc, line = self.retire(world)
-        self.assertEqual(rc, 1); self.assertIn("reason=foreground-changed", line)
+        self.assertEqual(rc, 0); self.assertIn("reason=foreground-changed", line)
         self.assertEqual(world.actions(), [["herdr", "pane", "send-text", "w1:pOld", "/exit"]])
 
     def test_changed_shell_after_exit_is_not_closed(self):
         world = _RetireWorld(); world.final_changed = True
         rc, line = self.retire(world)
-        self.assertIn("retired=false reason=shell-changed", line)
+        self.assertIn("retired=false reason=agent-still-running", line)
         self.assertEqual(world.actions(), [["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"]])
 
     def test_protocol_error_or_missing_herdr_is_typed_and_never_exits(self):

@@ -280,10 +280,9 @@ def apply_peer_rows(sessions, by_key):
         if not getattr(s, "session_id", None):
             continue
         rows = [by_key[key] for key in session_registry.session_join_keys(s) if key in by_key]
-        if not rows:
-            continue
-        s.peer_sent_1h = sum(row.get("sent_1h", 0) for row in rows)
-        s.peer_recv_1h = sum(row.get("recv_1h", 0) for row in rows)
+        if rows:
+            s.peer_sent_1h = sum(row.get("sent_1h", 0) for row in rows)
+            s.peer_recv_1h = sum(row.get("recv_1h", 0) for row in rows)
         def _age(entry):
             # A missing or non-numeric age must not win the "freshest" comparison — `or 0`
             # would rank an unparseable entry ahead of every real one.
@@ -294,6 +293,11 @@ def apply_peer_rows(sessions, by_key):
             entries = [row[field] for row in rows if row.get(field)]
             if entries:
                 setattr(s, attr, min(entries, key=_age))
+        duties = [entry for row in rows for entry in row.get("pending_obligations", [])]
+        if duties:
+            s.peer_obligations = sorted(
+                duties, key=lambda item: (item.get("kind", ""), item.get("age_min", 0))
+            )[:8]
 
 
 def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):

@@ -393,7 +393,8 @@ def render_text(receipt: dict, *, continued: dict | None = None) -> str:
                   "is already terminal")
         return (f"{detail}, so it recorded this notice and stopped instead of running forever. The owner "
                 "result and workflow/route closure state are unchanged -- nothing was retried or discarded. "
-                "A human or the next launch must resume the completion watch; this notice alone does not. "
+                "The same observation duty stays retained: the existing controller, orphan recovery, or session "
+                "sweep resumes it automatically without a manual retry command; this notice alone does not. "
                 "Existing transaction recovery: " + command)
     utility = _printed("dispatch-registry.py")
     operation = "resolve-terminal-conflict" if receipt["reason"] == "terminal-evidence-conflict" else "reconcile"

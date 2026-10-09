@@ -82,12 +82,12 @@ class PendingDeliveryCountsTest(unittest.TestCase):
 
     def test_no_records_no_intent_rows_returns_zero(self):
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 0, "expired": 0})
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0})
 
     def test_materialized_pending_record_counted_once(self):
         pending_delivery.create(**_record(root=self.state_root))
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 1, "expired": 0})
+        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0})
 
     def test_expired_record_counted_separately_and_never_deleted(self):
         record = pending_delivery.create(**_record(root=self.state_root))
@@ -97,7 +97,7 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             liveness="known",
         )
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 0, "expired": 1})
+        self.assertEqual(counts, {"pending": 0, "expired": 1, "retained_batch_duties": 0})
         # A-9 visibility clause: the file still exists on disk.
         record_path = pending_delivery.record_path(
             self.state_root, "sess-p6", record["delivery_id"]
@@ -116,7 +116,7 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             "delivery_id": "delivery-" + "b" * 32,
         })
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 1, "expired": 0})
+        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0})
 
     def test_intent_row_and_its_own_materialized_record_counted_once_not_twice(self):
         record = pending_delivery.create(**_record(root=self.state_root))
@@ -127,22 +127,35 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             "delivery_id": record["delivery_id"],
         })
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 1, "expired": 0})
+        self.assertEqual(counts, {"pending": 1, "expired": 0, "retained_batch_duties": 0})
 
     def test_enumeration_failure_fails_open_missing_directory(self):
         missing_jobs = self.state_root / "does-not-exist" / "jobs.log"
         counts = dispatch._pending_delivery_counts([str(missing_jobs)])
-        self.assertEqual(counts, {"pending": 0, "expired": 0})
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0})
 
     def test_corrupt_record_file_skipped_not_raised(self):
         pending_root = self.state_root / "pending-delivery" / ("f" * 64)
         pending_root.mkdir(parents=True, exist_ok=True)
         (pending_root / "delivery-broken.json").write_text("not json", encoding="utf-8")
         counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
-        self.assertEqual(counts, {"pending": 0, "expired": 0})
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 0})
 
-    def test_collect_stashes_counts_on_the_module_like_last_malformed(self):
-        # A-9/A-21 visibility clause: `collect()` (fleet's one read-only
+    def test_retained_batch_duties_counted_while_complete_ones_are_not(self):
+        obligations = self.state_root / "supervisor-state" / "obligations"
+        obligations.mkdir(parents=True, exist_ok=True)
+        for duty_id, state in (("batch-" + "a" * 32, "observing"),
+                               ("batch-" + "b" * 32, "delivery-pending"),
+                               ("batch-" + "c" * 32, "unknown"),
+                               ("batch-" + "d" * 32, "complete")):
+            (obligations / f"{duty_id}.json").write_text(
+                json.dumps({"schema_version": 1, "id": duty_id, "state": state}),
+                encoding="utf-8")
+        (obligations / "batch-broken.json").write_text("not json", encoding="utf-8")
+        counts = dispatch._pending_delivery_counts([str(self.jobs_path)])
+        self.assertEqual(counts, {"pending": 0, "expired": 0, "retained_batch_duties": 3})
+
+    def test_collect_stashes_counts_on_the_module_like_last_malformed(self):        # A-9/A-21 visibility clause: `collect()` (fleet's one read-only
         # entry point, F-27's control module is the only fleet surface with
         # write authority) stashes the pending-delivery counts on itself the
         # same additive way it already stashes last_malformed/
@@ -152,7 +165,7 @@ class PendingDeliveryCountsTest(unittest.TestCase):
             with mock.patch.object(dispatch, "_scan_processes", return_value=[]):
                 dispatch.collect(jobs_path=str(self.jobs_path))
             self.assertEqual(
-                dispatch.collect.last_pending_delivery, {"pending": 1, "expired": 0}
+                dispatch.collect.last_pending_delivery, {"pending": 1, "expired": 0, "retained_batch_duties": 0}
             )
         finally:
             dispatch.collect.last_pending_delivery = None

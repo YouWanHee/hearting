@@ -344,6 +344,7 @@ class Session:
     # Symmetric send side of the same projection: the receive strip alone made the board
     # say who talked to you but never who you talked to. Same shape, `to_*` keys.
     peer_last_sent: Optional[dict] = None # {to_name, to_session_id, to_harness, kind, age_min}
+    peer_obligations: Optional[list] = None # body-free pending watch/message/delay/retire status
     # Prior session ids this same live process still answers to after a resume/fork
     # (`session_registry.session_aliases`). DISPLAY JOIN ONLY — never a ledger address,
     # a `report-agent-session` value, or a completion/wake recipient.

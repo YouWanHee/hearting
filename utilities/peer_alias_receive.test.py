@@ -37,6 +37,15 @@ class AliasReceive(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name)
+        inherited = dict(os.environ)
+        for key in tuple(os.environ):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_",
+                               "AGENT_THREAD_", "HERDR_")):
+                os.environ.pop(key, None)
+        for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
+                    "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG"):
+            os.environ.pop(key, None)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(inherited)))
         self.env = mock.patch.dict(os.environ, {
             "AGENT_DISPATCH_JOBS": str(self.state / "jobs.log"),
             "AGENT_PEER_LEDGER_ROOT": str(self.state),

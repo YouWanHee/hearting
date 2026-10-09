@@ -82,7 +82,10 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    turn; pending closure preserves PASS and carries a recovery notice.
    Inline work and legacy recovery retain explicit route close and producer
    finalize. Runtime-owned owners and their parents have no separate finalize
-   command to remember.
+   command to remember. The controller retains observation, terminal delivery,
+   follow-up, display, and cleanup duties after the model turn or bounded
+   observer exits; startup and reconnect resume the exact unfinished duty
+   without replaying the assignment or requiring a manual rearm.
 5. **shared admission.** This capability's output is cycle-local; it is never admitted to `shared/` (only `spec`, `analysis`, and explicitly promoted `research` are shared kinds).
 
 ## Role Requirements

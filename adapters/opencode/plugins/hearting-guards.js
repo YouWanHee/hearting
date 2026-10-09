@@ -1001,6 +1001,16 @@ function pendingPeerCommand(sid, options = []) {
   try { return JSON.parse(result.stdout || "null") } catch { return null }
 }
 
+function reconnectPeerObligations() {
+  const child = spawn("python3", [path.join(root, "utilities", "peer-steward.py"),
+    "__ensure-obligations"], {
+    cwd: root, env: { ...process.env, AGENT_HOME: root },
+    stdio: "ignore", detached: true,
+  })
+  child.on("error", () => {})
+  child.unref()
+}
+
 const pendingPeerBusy = new Set()
 async function pendingPeerDelivery(ctx, sid) {
   if (!sid || pendingPeerBusy.has(sid) || isWorkerSession()) return
@@ -1085,11 +1095,15 @@ export const AgentHarnessGuards = async (ctx) => {
   markPluginLoaded(dispatchSlug())
   peerIdentityLog(ctx, "plugin", "plugin-registered")
   registerPaneContext(ctx)
+  if (!isWorkerSession()) reconnectPeerObligations()
   const completionCarrier = createCompletionCarrier(ctx)
 
   return ({
   dispose: () => { completionCarrier.dispose(); retirePaneContext(ctx) },
   event: async ({ event }) => {
+    if (event && event.type === "session.created" && !isWorkerSession()) {
+      reconnectPeerObligations()
+    }
     if (event && event.type === "session.compacted") {
       collectCard("compact", (event.properties && event.properties.sessionID) || "", baseDir(ctx))
       runWorkerState("compact-after", event)
