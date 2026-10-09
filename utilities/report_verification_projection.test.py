@@ -562,6 +562,31 @@ class ClosedFindingTests(ProjectionFixture):
             self.jobs.write_text(self.registry_line(invalid_exact) + "\n")
             self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
 
+    def test_terminal_fail_observation_decodes_unpadded_paths_for_all_lengths(self):
+        meta = self.terminal_fail()
+        original = self.peer_paths["independent-verify"]
+        raw = original.read_bytes()
+        node = next(node for node in self.route["nodes"] if node["id"] == "independent-verify")
+        lengths = set()
+        with mock.patch.dict(os.environ, AGENT_ARTIFACT_ROOT=str(self.root)):
+            for suffix in ("a", "aa", "aaa"):
+                path = original.with_name(f"evidence-{suffix}.json")
+                path.write_bytes(raw)
+                lengths.add(len(str(path).encode()) % 3)
+                text = f"artifact: {path}\nverdict: FAIL\nblocker: scientific finding\n"
+                Path(meta["log_file"]).write_bytes(encoded({
+                    "type": "item.completed", "item": {"type": "agent_message", "text": text}})
+                    + encoded({"type": "turn.completed"}))
+                before = tree_snapshot(Path(self.tmp.name))
+                terminal = dispatch_contract.observe_terminal_review_failure(
+                    self.route, node, meta["attempt_id"], path, sha(raw), [self.registry_line(meta)])
+                self.assertEqual(terminal["verdict"], "FAIL")
+                self.assertEqual(tree_snapshot(Path(self.tmp.name)), before)
+                with self.assertRaisesRegex(ValueError, "terminal-review-evidence-conflict"):
+                    dispatch_contract.observe_terminal_review_failure(
+                        self.route, node, meta["attempt_id"], path, "0" * 64, [self.registry_line(meta)])
+        self.assertEqual(lengths, {0, 1, 2})
+
     def test_reused_historical_path_never_substitutes_current_pass(self):
         self.real_currency("independent-verify-alternative")
         node, path, prior = self.real_currency()

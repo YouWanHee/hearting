@@ -7877,7 +7877,8 @@ def observe_terminal_review_failure(
             or terminal.get("failure_note") != "completed-review-blocking"
             or terminal.get("review_verdict_conflict")):
         raise ValueError("terminal-review-failure-unverified")
-    path = Path(base64.urlsafe_b64decode(str(terminal.get("artifact_path_b64", ""))).decode())
+    encoded = str(terminal.get("artifact_path_b64", ""))
+    path = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
     if (path.resolve() != evidence_path.resolve()
             or evidence_digest(path) != evidence_sha256):
         raise ValueError("terminal-review-evidence-conflict")
