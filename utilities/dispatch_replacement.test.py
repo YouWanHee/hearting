@@ -1574,6 +1574,34 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual((budget.state, budget.round_kind), ('admit', 'closure-check'))
         self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), (['att-test-2'], []))
 
+    def test_failed_owner_without_failed_checks_accepts_one_ordinary_correction(self):
+        import dispatch_owner_input as I
+        self._failed_owner(test_fails=0)
+        self.assertTrue(self._answer(text='approved fix: retain missing GPU observation',
+                                    request_id='infra-fix')['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        record = result['record']
+        self.assertEqual(record['proof']['source_result'], 'FAIL')
+        self.assertEqual(record['proof']['answers'], [])
+        self.assertNotIn('after_capacity', record['logical_node'])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('retain missing GPU observation', text)
+        self.assertNotIn('closure-check', text)
+        self.assertEqual(R.answered_fix_revisions(self.jobs, 'rt-test'), [])
+        # Replay converges on the claim; a second FAIL never creates another allowance.
+        self.assertEqual(self.claim(), record)
+        successor = self._successor(record, self.meta | {'worker_type': 'owner'}, status='open')
+        I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
+        successor = self._die(successor, note='dead-worker-fail', failure_class='fail')
+        self.assertTrue(self._answer(aid=successor['attempt_id'], text='another fix',
+                                    request_id='infra-fix-2')['retained'])
+        retry, commands = self._launch(successor['attempt_id'])
+        self.assertEqual(commands, [])
+        self.assertEqual(retry.get('reason'), 'automatic-replacement-exhausted', retry)
+        self.assertEqual(len(list((R._directory(self.jobs) / 'claims').glob('*.json'))), 1)
+
     def test_a_fix_for_a_check_that_used_its_closure_check_makes_no_round(self):
         import route_authority as RA
         self._failed_owner(test_fails=3)                                  # cap 2 + its one closure-check

@@ -881,8 +881,12 @@ def claim(jobs: Path, aid: str) -> dict:
             # The approved fix answers each failed check's last FAIL: one closure-check round each,
             # within the verdict ceiling cap + 1. A check that already used it gets no new round.
             answers, spent = route_authority.fix_answers(route, lines, jobs)
+            if not answers and spent:
+                raise DC.DispatchContractError('replacement-fix-round-spent', ','.join(spent))
             if not answers:
-                raise DC.DispatchContractError('replacement-fix-round-spent', ','.join(spent) or 'no-failed-check')
+                # Infrastructure/resource FAIL has no check round to answer.
+                # Use the ordinary one-replacement allowance, not a new pause family.
+                capacity = False
             proof['answers'] = answers
             proof['source_result'] = 'FAIL'
         logical = _logical_key(route, meta)
@@ -1669,7 +1673,15 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         reason = getattr(exc,'reason','replacement-observation-unavailable')
         if reason == 'automatic-replacement-exhausted':
             family_record = None
-            if not _budget_exhausted(jobs, source, capacity=kind in PAUSE_KINDS):
+            binding = source_binding(jobs, source)
+            family = binding[0] if binding else source.get('replacement_family_id')
+            if family:
+                # The exact existing claim owns the allowance. A corrected FAIL
+                # may belong to an ordinary family, so do not reconstruct it as a pause.
+                digest = binding[2] if binding else source.get('replacement_claim_digest')
+                family_record = _check_record(_read(_record_path(jobs, family)), family,
+                                             {'replacement_claim_digest': digest or None})
+            elif not _budget_exhausted(jobs, source, capacity=kind in PAUSE_KINDS):
                 _, route = _route(jobs, aid, source)
                 logical = _logical_key(route, source)
                 if kind in PAUSE_KINDS:
@@ -1857,8 +1869,9 @@ def recovery_instructions(args):
         opening = f'The previous attempt {prior} never started (its launcher stopped before spawning); this starts the same work on the existing route {record["route_id"]}.\n'
     else:
         opening = f'You replace exact-dead attempt {prior} once, on the existing route {record["route_id"]}.\n'
+    check_fix = fix and bool(record['proof'].get('answers'))
     rerun = ('Rerun the stage that makes the approved fix and every check after it; reuse everything '
-             'else. ' if fix else
+             'else. ' if check_fix else
              'Continue only unfinished work. Do not rerun completed nodes, successful siblings, or completed prefixes. ')
     text = ('\n\n## Verified recovery context\n'
             + opening +
@@ -1866,7 +1879,7 @@ def recovery_instructions(args):
             + rerun +
             'Keep existing human answers and gate releases; do not ask the same scope again. '
             'Preserve the original failure and report any second failure as needs-attention.\n')
-    if fix:
+    if check_fix:
         text += ('The failed checks this fix answers ('
                  + ', '.join(record['proof']['answers']) +
                  ') each get one more verdict round (closure-check) once the fix is in; there is no '

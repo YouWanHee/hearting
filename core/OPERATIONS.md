@@ -861,6 +861,17 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
+GPU monitoring is observation, separate from payload completion. A generated
+resource bridge settles the exact payload exit and declared outputs even when
+a during-run or post-run probe is unavailable; it records the missing sample
+and diagnostic as a warning. It checks terminal payload evidence before taking
+another sample and saves partial monitoring records even after a probe error.
+Optional probe exceptions leave the resource's exit code unchanged.
+If the approved verification contract requires a GPU sample, its existing
+verification check reports that missing evidence as FAIL; resource success
+alone does not satisfy the verification gate. A nonzero bridge exit remains a
+resource failure: the runner cannot infer successful payloads from a traceback.
+
 The existing owner input state receives the verified native session identity
 as soon as the transport binds it, including during the first model turn.
 A registered resource launched in that turn uses the same live supervisor and
@@ -1130,6 +1141,14 @@ the match is against a declared field. Live state is never recorded: `list` and
 `probe` measure reachability, CPU utilization, and GPU utilization/free memory
 at the moment they are asked.
 
+`probe --json` reports measurement availability in each host row (`reachable`,
+`detail`, and `process_detail`). Once it emits a valid snapshot it exits zero,
+including for unavailable measurements, and writes their warning to stderr.
+Zero means the snapshot was returned, not that the host or GPU was verified.
+Configuration/selection errors still fail; the human-readable probe retains
+its reachability exit status. Required measurements are checked from the JSON
+by their owning verification contract, separate from payload execution.
+
 A live direct SSH launch may cross the process boundary without forwarding its
 Claude Code, Codex, or OpenCode session variable. In that case the probe may
 form a transient exact bridge only by joining a stable same-EUID local `ssh`
@@ -1286,7 +1305,12 @@ already running under an older supervisor behaves the same way.
 An owner that already ended `BLOCKED`, or with a readable FAIL a person answers with an
 approved fix, keeps the answer (`retained`), and `correct`
 continues its route in the same call through a replacement owner that receives it
-(see the SD-157 replacement rule in §5.10). When the answer comes from a session
+(see the SD-157 replacement rule in §5.10). A readable FAIL with no failed
+round-capped check uses the existing ordinary replacement allowance once;
+absence of a failed check does not refuse the kept correction. Failed checks
+retain their closure-check ceiling, including refusal when that ceiling is spent.
+No check or extra verdict round is manufactured for an infrastructure correction.
+When the answer comes from a session
 that is not the route's parent, only the parent may launch that replacement: the
 answer stays kept and the parent receives one `answer-awaiting-parent` supervision
 notice. The parent's carrier that delivers it (the shared prompt sweep or the
