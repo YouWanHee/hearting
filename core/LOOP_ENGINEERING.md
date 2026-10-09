@@ -127,6 +127,50 @@ installed copy, and running session distinct. Measure needless model turns,
 restarts, manual intervention, and boundary wait time, but do not present a
 smaller document or fewer lines of code as token or cost savings.
 
+## 7. Recovery follows lineage, not replay
+
+Between an original attempt and its recovery, work changes hands in ordinary
+ways: a supervisor seat is handed over, an owner is replaced, the parent moves a
+harness or model pin, a predecessor fails or is paused by a guard, or only an
+observation step fails. A retry, replacement, continuation, or resume accepts
+these changes through one shared lineage rule. It does not rebuild the original
+record from current values and refuse at the first difference.
+
+Exact comparison protects sealed evidence from tampering; it is not a reason to
+refuse the normal ways work moves. When a recovery path still refuses, the
+refusal names what differs and the supported next step. A state with no
+supported way forward is a defect in the path, not a task for the operator.
+
+## 8. Let real work reshape capabilities and routes
+
+Capabilities, shapes, and routes are revised from the record of real work, not
+defended as fixed contracts. Periodically read what users and agents actually
+ran, where they worked around a capability, where work stalled, and where a
+person had to step in. Widen a capability that work keeps stretching, merge or
+drop one that is rarely used or keeps blocking, and loosen a route rule that
+refuses approved work. Changing the registry or route rules must not strand
+routes that are already running.
+
+## 9. Move hard parity outside the adapters
+
+When a behavior has to be built separately inside each runtime and keeps
+diverging — waking a parent, watching a session, session identity, pane
+placement, remote compute access — build it once in a runtime-neutral layer
+outside the adapters and let all three harnesses use it, as herdr with
+`peer-steward` does for sessions, `compute-hosts` for remote GPUs, and Fleet for
+observation. Adapters then only translate. Prefer one outer mechanism that every
+harness shares over three inner realizations kept in step by hand. Shared
+meaning stays in the core (§3); a shared mechanism may live outside it.
+
+## 10. The operator sees delegated work at a glance
+
+Fleet is how a person sees the work they delegated, and for dispatched sessions
+it is often the only way. It opens quickly (first frame in about five seconds)
+and shows, for every live session and dispatched owner, what is happening now:
+the model turn, the running command, or the resource the owner is waiting on
+with its host, GPU, and progress. An empty NOW while work is running is a
+defect. A slower or emptier view is a regression even when every check passes.
+
 ## Basis and current scope
 
 These principles condense the completion standard the user repeatedly corrected
@@ -135,3 +179,10 @@ operating procedure leaking to the model, and the dispatch responsibility repair
 record keeps both the real completions and the failures. Adopting this document
 does not mean unrepaired paths are complete. Each change must prove itself
 against the standards above.
+
+
+Sections 7–10 restate a memo the user wrote in Hearting's v1 era, made standing
+direction on 2026-10-09. On that day seven defects of the §7 kind (PR #427–#432
+and related) were each fixed by a case-specific allowance, one Fleet render took
+46 seconds, and three dispatched owners waiting on resources showed an empty NOW.
+The Korean original and the memo text are kept with the internal documents.
