@@ -540,6 +540,28 @@ class ClosedFindingTests(ProjectionFixture):
             (self.cycle / "manifest.json").write_bytes(encoded(self.document))
             self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
 
+    def test_markerless_fail_ignores_unrelated_owner_and_worker_rows(self):
+        meta = self.terminal_fail()
+        owner = dict(meta, attempt_id="att-unrelated-owner", dispatch_depth="1",
+                     worker_type="owner", unit="_kernel/owner", route_node="_owner",
+                     owner_route_id=ROUTE_ID, owner_route_hash=ROUTE_HASH)
+        worker = dict(meta, attempt_id="att-unrelated-worker", route_node="other-review")
+        with mock.patch.dict(os.environ, AGENT_ARTIFACT_ROOT=str(self.root)):
+            for unrelated in (owner, worker):
+                for status in ("done", "running"):
+                    line = self.registry_line(unrelated).replace("\tdone\t", f"\t{status}\t")
+                    for before in (True, False):
+                        rows = [line, self.registry_line(meta)] if before else [self.registry_line(meta), line]
+                        self.jobs.write_text("\n".join(rows) + "\n")
+                        snapshot = tree_snapshot(Path(self.tmp.name))
+                        result = self.payload()
+                        self.assertEqual(result["verification"]["verdict"], "FAIL")
+                        self.assertEqual(result["required_input_observation"]["state"], "confirmed")
+                        self.assertEqual(tree_snapshot(Path(self.tmp.name)), snapshot)
+            invalid_exact = dict(owner, attempt_id=meta["attempt_id"])
+            self.jobs.write_text(self.registry_line(invalid_exact) + "\n")
+            self.assertEqual(self.payload()["verification"]["verdict"], "unresolved")
+
     def test_reused_historical_path_never_substitutes_current_pass(self):
         self.real_currency("independent-verify-alternative")
         node, path, prior = self.real_currency()

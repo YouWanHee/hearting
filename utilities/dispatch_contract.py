@@ -7845,10 +7845,15 @@ def observe_terminal_review_failure(
         metadata = parse_registry_metadata(fields[5])
         if metadata.get("attempt_id") == attempt_id:
             exact.append((fields, metadata))
-        elif (registered_node_identity(metadata, node) ==
-              (route.get("route_id"), route.get("route_hash"), node.get("id"))
-              and fields[1] in {"open", "running"}):
-            raise ValueError("conflicting-active-retry")
+        elif fields[1] in {"open", "running"}:
+            try:
+                identity = registered_node_identity(metadata, node)
+            except ValueError:
+                # A node-less owner belongs to its terminal owner node, not
+                # this review. Match readiness's handling of unrelated rows.
+                continue
+            if identity == (route.get("route_id"), route.get("route_hash"), node.get("id")):
+                raise ValueError("conflicting-active-retry")
     if not attempt_id or len(exact) != 1:
         raise ValueError("terminal-review-attempt-not-unique")
     fields, metadata = exact[0]
