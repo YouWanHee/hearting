@@ -102,12 +102,36 @@ class BasicObservationTest(unittest.TestCase):
         for required in ('⚑', '┆', '╭', 'owner', 'train train.py', 'moving4:1', 'GPU moving4:1'):
             self.assertIn(required, screen)
 
-    def test_real_detail_pass_fills_cycle_title_and_verified_route(self):
+    def test_basic_process_view_shows_route_bound_depth_two_worker_now(self):
+        self.addCleanup(setattr, render, '_PROCESS_VIEW', render._PROCESS_VIEW)
+        self.addCleanup(setattr, render, '_SHOW_ALL', render._SHOW_ALL)
+        render._PROCESS_VIEW, render._SHOW_ALL = True, False
+        worker = model.DispatchJob(key='autopilot-code', slug='worker-exact', harness='codex',
+            attempt_id='att-stage', pid=45, proc_start='105', liveness='working', model='gpt-6.1-sol',
+            depth=2, dispatch_depth=2, route_id='rt-exact', route_hash='hash',
+            route_node='execute', route_file='/fixture/route.json', summary='exact stage NOW')
+        projection.attach_projections([], [worker], fast_first=True)
+        with mock.patch.object(route, 'load', side_effect=AssertionError('route read')), \
+                mock.patch.object(render, '_fresh_compute_hosts', return_value=(None, None)):
+            lines = render._build_lines([], [worker], 'both', False, 0, term_width=168)
+        screen = '\n'.join(render._plain(line) for line in lines)
+        self.assertIn('worker-exact', screen)
+        self.assertIn('exact stage NOW', screen)
+        self.assertIn('gpt-6.1-sol', screen)
+        self.assertIn('route 확인 중', screen)
+        self.assertNotIn('no active route', screen)
+        self.assertNotIn('no route record', screen)
+        self.assertIsNone(worker.work_projection.progress)
+
+    def test_real_detail_pass_fills_cycle_title_and_verified_process_route(self):
+        self.addCleanup(setattr, render, '_PROCESS_VIEW', render._PROCESS_VIEW)
+        self.addCleanup(setattr, render, '_SHOW_ALL', render._SHOW_ALL)
+        render._PROCESS_VIEW, render._SHOW_ALL = True, False
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             record = {'schema_version': 1, 'cwd': tmp, 'artifact_root': tmp,
                 'capability': 'autopilot-code', 'effective_intensity': 'standard',
-                'nodes': [{'id': 'execute', 'depends_on': []}]}
+                'nodes': [{'id': 'execute', 'depends_on': []}, {'id': 'train', 'depends_on': []}]}
             record['route_hash'] = route.route_hash(record)
             record['route_id'] = 'rt-' + record['route_hash'].split(':')[1][:16]
             path = root / 'route.json'
@@ -117,21 +141,50 @@ class BasicObservationTest(unittest.TestCase):
             (cycles / 'cyc_fixture.json').write_text(json.dumps(
                 {'route_id': record['route_id'], 'title': 'actual cycle title'}))
             owner = model.DispatchJob(key='code', slug='owner', harness='codex', cwd=tmp,
-                attempt_id='att-owner', pid=42, proc_start='100', liveness='working',
-                qa_source='explicit', worker_type='owner', depth=1, artifact_root=tmp, owner_route_id=record['route_id'],
-                owner_route_hash=record['route_hash'], owner_route_file=str(path))
-            projection.attach_projections([], [owner], fast_first=True)
-            source = LiveSnapshot(jobs=[owner])
+                attempt_id='att-owner', pid=42, proc_start='100', liveness='idle',
+                state_evidence={'inputs': {'observed_liveness': {'state': 'parked-supervised'}}},
+                qa_source='explicit', worker_type='owner', depth=1, artifact_root=tmp,
+                owner_route_id=record['route_id'], owner_route_hash=record['route_hash'],
+                owner_route_file=str(path))
+            worker = model.DispatchJob(key='code-execute', slug='exact-worker', harness='claude', cwd=tmp,
+                attempt_id='att-execute', pid=44, proc_start='102', liveness='working',
+                depth=2, dispatch_depth=2, parent_slug=owner.slug,
+                route_id=record['route_id'], route_hash=record['route_hash'], route_file=str(path),
+                route_node='execute', summary='real worker NOW', qa_source='explicit', artifact_root=tmp)
+            worker.parent_attempt_id = owner.attempt_id
+            resource = model.ResourceJob(run_id='run', parent_attempt_id=owner.attempt_id,
+                route_id=record['route_id'], route_hash=record['route_hash'], route_file=str(path),
+                node='train', liveness='working', pid=43, starttime='101', command=['python', 'train.py'])
+            projection.attach_projections([], [owner, worker], resources=[resource], fast_first=True)
+            source = LiveSnapshot(jobs=[owner, worker], resources=[resource])
+            def screen(snapshot):
+                with mock.patch.object(render, '_fresh_compute_hosts', return_value=(None, None)), \
+                        mock.patch.object(dispatch.collect, 'last_route_nodes', {}):
+                    lines = render._build_lines([], snapshot.jobs, 'both', False, 0,
+                        term_width=168, resources=snapshot.resources, governor=None)
+                return '\n'.join(render._plain(line) for line in lines)
+            with mock.patch.object(route, 'load', side_effect=AssertionError('basic render route read')):
+                before = screen(source)
+            for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py', 'route 확인 중'):
+                self.assertIn(value, before)
+            self.assertNotIn('no active route', before)
             with mock.patch.object(dispatch, '_pending_delivery_counts', return_value=None), \
                     mock.patch.object(dispatch, '_scan_degradations', return_value={}), \
                     mock.patch.object(projection, '_spec_marker_index', return_value={}), \
                     mock.patch.object(projection, '_capability_grounding_index', return_value={}), \
                     mock.patch('fleet.collectors.peer_messages.collect', return_value=None):
                 filled = details.enrich(source)
-            row = details.merge(source, filled).jobs[0]
+            joined = details.merge(source, filled)
+            row = joined.jobs[0]
             self.assertEqual(row.campaign_label, 'actual cycle title')
             self.assertEqual(row.work_projection.source, 'route-exact')
             self.assertIsNotNone(row.work_projection._route_view)
+            self.assertEqual(row.resource_wait['run_ids'], ['run'])
+            after = screen(joined)
+            for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py'):
+                self.assertIn(value, after)
+            self.assertNotIn('route 확인 중', after)
+            self.assertNotIn('no active route', after)
             self.assertIsNone(owner.campaign_label)
 
 
@@ -187,6 +240,23 @@ class CampaignLabelsTest(unittest.TestCase):
         dispatch._campaign_labels([job])
         self.assertIsNone(job.campaign_label)
 
+    def test_open_cycle_inventory_progresses_while_new_files_arrive_each_tick(self):
+        for index in range(401):
+            self.record('%03d.json' % index, 'rt-%d' % index, 'title-%d' % index)
+        job = model.DispatchJob(key='code', route_id='rt-400', artifact_root=str(self.root))
+        for tick in range(3):
+            self.record('new-%d.json' % tick, 'rt-new-%d' % tick, 'new')
+            dispatch._campaign_labels([job])
+        self.assertEqual(job.campaign_label, 'title-400')
+        # Additions are also picked up after the in-flight bounded sweep ends.
+        new = model.DispatchJob(key='code', route_id='rt-new-2', artifact_root=str(self.root))
+        for tick in range(3, 7):
+            self.record('new-%d.json' % tick, 'rt-new-%d' % tick, 'new')
+            dispatch._campaign_labels([new])
+            if new.campaign_label:
+                break
+        self.assertEqual(new.campaign_label, 'new')
+
     def test_two_roots_same_route_id_keep_their_own_titles(self):
         other = self.root / 'other'
         folder = other / '.runtime/artifact-producer/v1/cycles'
@@ -229,6 +299,105 @@ class DelayedJoinTest(unittest.TestCase):
         self.assertEqual(row.summary, 'fresh basic NOW')
         self.assertIsNone(row.exec_tool)
         self.assertIsNone(source.jobs[0].title)  # copied rows, no mutation of basic source
+
+    def test_new_native_title_and_observed_subagents_win_over_delayed_detail(self):
+        source = self.source()
+        session = model.Session(harness='codex', pid=70, proc_start='200',
+            session_id='native-parent', cwd='/other', liveness='working',
+            title='old title', subagents=[model.SubAgent(agent_type='old', active=True)])
+        source.sessions.append(session)
+        detail = self.filled(source)
+        session.title, session.subagents = 'current title', []
+        source.jobs[0].title, source.jobs[0].subagents = 'current job title', []
+        detail.snapshot.jobs[0].subagents = [model.SubAgent(agent_type='old-job', active=True)]
+        joined = details.merge(source, detail)
+        self.assertEqual(joined.sessions[0].title, 'current title')
+        self.assertEqual(joined.sessions[0].subagents, [])
+        self.assertEqual(joined.jobs[0].title, 'current job title')
+        self.assertEqual(joined.jobs[0].subagents, [])
+        # None means unobserved; actual detail, including an observed [], fills it.
+        session.subagents = None
+        detail.snapshot.sessions[0].subagents = []
+        self.assertEqual(details.merge(source, detail).sessions[0].subagents, [])
+
+    def test_exact_child_fallback_context_and_exec_survive_the_join(self):
+        for harness in ('claude', 'codex', 'opencode'):
+            with self.subTest(harness=harness):
+                source = self.source()
+                row = source.jobs[0]
+                row.harness, row._detail_activity_key = harness, None
+                child = model.Session(harness=harness, pid=row.pid, proc_start=row.proc_start,
+                    session_id=row._runtime_session_id, cwd=row.cwd, is_child=True, liveness='working',
+                    ctx_pct=36, active_context_tokens=36000, context_window_tokens=100000,
+                    exec_tool={'name': 'python child.py'})
+                child._context_evidence = model.ContextEvidence(used_pct=36, source='fixture',
+                    sequence=(1, 2), source_head_sequence=(1, 2), observed_at=10, fresh_until=9999999999)
+                source.sessions.append(child)
+                detail = self.filled(source)
+                from fleet.collectors import _adopt_child_titles
+                _adopt_child_titles(detail.snapshot.sessions, detail.snapshot.jobs)
+                projection.attach_projections(detail.snapshot.sessions, detail.snapshot.jobs,
+                                              fast_first=True, now=20)
+                joined = details.merge(source, detail).jobs[0]
+                self.assertTrue(joined._dispatch_context_owned)
+                self.assertEqual(joined.context.used_pct, 36)
+                self.assertEqual(joined.ctx_pct, 36)
+                self.assertEqual(joined.exec_tool, {'name': 'python child.py'})
+                # A newer exact child observation cannot receive its old command/context.
+                child.updated_at = 100
+                joined = details.merge(source, detail).jobs[0]
+                self.assertIsNone(joined.exec_tool)
+                self.assertIsNone(joined.context)
+
+    def test_changed_wait_reason_or_resource_route_path_rejects_old_wait(self):
+        for change in ('reason', 'route_file', 'route'):
+            with self.subTest(change=change):
+                source = self.source()
+                row = source.jobs[0]
+                row.liveness = 'idle'
+                row.state_evidence = {'inputs': {'observed_liveness': {'state': 'parked-supervised',
+                                                                          'reason': 'resource-running'}}}
+                resource = model.ResourceJob(run_id='run', parent_attempt_id=row.attempt_id,
+                    liveness='working', route_id=row.route_id, route_hash=row.route_hash,
+                    route_file='/fixture/route.json', route_node='train')
+                source.resources.append(resource)
+                detail = self.filled(source)
+                detail.snapshot.jobs[0].resource_wait = {'run_ids': ['old-run']}
+                if change == 'reason':
+                    row.state_evidence['inputs']['observed_liveness'] = {'state': 'waiting-children',
+                                                                       'reason': 'owner-idle'}
+                else:
+                    setattr(resource, change, '/fixture/rebound.json')
+                joined = details.merge(source, detail).jobs[0]
+                self.assertIsNone(joined.resource_wait)
+                self.assertEqual(joined.work_projection.node_state, 'unknown')
+                self.assertEqual(joined.campaign_label, 'campaign')
+
+    def test_route_backing_jobs_rebind_to_current_now_in_process_screen(self):
+        source = self.source()
+        source.jobs[0].route_node = 'execute'
+        detail = self.filled(source)
+        old_job = detail.snapshot.jobs[0]
+        nodes = [{'id': 'execute', 'state': 'active', 'job': old_job, 'harness': old_job.harness,
+                  'pid': old_job.pid, 'model': old_job.model, 'effort': old_job.effort,
+                  'elapsed_min': 0, 'depends_on': [], 'level': 0, 'gate': None}]
+        backing = {'record': {'capability': 'autopilot-code'}, 'nodes': nodes,
+                   'view': {'nodes': nodes}}
+        old_job.work_projection = model.WorkProjection(source='route-exact', route_id='rt-work',
+            route_hash='hash', node_state='active', stage_label='execute', _route_view=backing)
+        joined = details.merge(source, detail)
+        for shape in (joined.jobs[0].work_projection._route_view,
+                      joined.jobs[0].work_projection._route_view['view']):
+            self.assertIs(shape['nodes'][0]['job'], joined.jobs[0])
+        self.assertIs(backing['nodes'][0]['job'], old_job)
+        self.assertEqual(old_job.summary, 'older detail NOW')
+        self.addCleanup(setattr, render, '_PROCESS_VIEW', render._PROCESS_VIEW)
+        render._PROCESS_VIEW = True
+        with mock.patch.object(render, '_fresh_compute_hosts', return_value=(None, None)):
+            lines = render._build_lines([], joined.jobs, 'both', False, 0, term_width=168)
+        screen = '\n'.join(render._plain(line) for line in lines)
+        self.assertIn('fresh basic NOW', screen)
+        self.assertNotIn('older detail NOW', screen)
 
     def test_attempt_pid_start_route_or_native_session_changes_reject_old_detail(self):
         for field, value in (('attempt_id', 'att-new'), ('proc_start', '101'),

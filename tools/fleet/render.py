@@ -6216,11 +6216,15 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
     if term_width is not None:
         fixed_w = _dw("  " + arrow + " ") + _dw("[%s] " % tag) + _dw(" — no route record")
         slug = _clip_w(slug, max(4, term_width - fixed_w))
+    pending = getattr(job, "_details_pending", False)
+    label = " — route 확인 중" if pending else " — no route record"
     l1 = [("  " + arrow + " ", "dim"), ("[%s] " % tag, "name_dim"),
-          (slug, "dim"), (" — no route record", "dim")]
+          (slug, "dim"), (label, "dim")]
     out = [l1]
     if folded:
         return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
+    if pending:
+        out.append(_route_job_row(job, max_width=term_width))
     breadcrumb = _stage_segs(job.key, _projection_stage_for_dispatch(job), working=(job.liveness == "working"),
                              max_width=_STAGE_ZONE_MAX)
     out.append([("    ", None)] + breadcrumb)
@@ -6298,6 +6302,16 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
             if parent:
                 covered_slugs.add(parent)
     degrade_jobs = _degrade_candidates(jobs, covered_slugs)
+    # Basic rows already have exact identity/liveness/NOW, while route records
+    # are still pending. Show those rows even for depth-2 route-bound workers;
+    # no DAG, empty progress, or completed/idle claim can be inferred yet.
+    pending_jobs = [j for j in jobs if getattr(j, "_details_pending", False)
+                    and not getattr(getattr(j, "work_projection", None), "_route_view", None)
+                    and (getattr(j, "route_id", None) or getattr(j, "owner_route_id", None))
+                        not in route_views_by_id
+                    and not _is_plugin_agent(j) and (j.liveness != "dead" or _SHOW_ALL)
+                    and j not in degrade_jobs]
+    degrade_jobs.extend(pending_jobs)
 
     # F-29/F-73 — plain top-level sessions owning native or plugin sub-agents. Process view is
     # route-centric and emits no plain-session row, so collect one minimal owner anchor here.

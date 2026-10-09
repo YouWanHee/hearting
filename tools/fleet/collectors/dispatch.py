@@ -3608,7 +3608,10 @@ def _campaign_labels(jobs):
         try:
             stamp = _stat_stamp(cycles_dir)
             inventory = _CYCLE_LABEL_INVENTORIES.get(root)
-            if not inventory or inventory[0] != stamp:
+            # Finish the bounded inventory before accepting a changed directory.
+            # A producer adding files each tick must not reset us to the first
+            # 200 names forever. The next completed sweep sees all new names.
+            if not inventory or (inventory[0] != stamp and inventory[2] == 0):
                 names = sorted(name for name in os.listdir(cycles_dir) if name.endswith(".json"))
                 inventory = (stamp, names, 0)
             stamp, names, offset = inventory
