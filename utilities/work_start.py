@@ -1435,6 +1435,92 @@ def _exited_owner_response(route, result, jobs, aid, **extra):
                 "obligation; waiting for a model turn or starting a replacement cannot finish it."}
 
 
+PIN_HANDOFF_SUMMARY = "owner-pin-handoff"
+
+
+def _pin_handoff_close_command(path, jobs):
+    # close already owns cancellation and resource preservation on every harness.
+    # It reads the registry from the environment rather than a --jobs option.
+    return shlex.join(["env", f"AGENT_DISPATCH_JOBS={Path(jobs).resolve()}", sys.executable,
+                       entrypoint(ROOT, "utilities/capability-route.py"), "close", "--route", str(path),
+                       "--summary", PIN_HANDOFF_SUMMARY])
+
+
+def _owner_pin_handoff(route, path, jobs, result, rows=None):
+    rows = _rows(jobs) if rows is None else rows
+    aid = _slot(route, "owner", rows, jobs)
+    if aid not in rows:
+        return None
+    status, metadata = rows[aid]
+    if (status not in {"open", "running"}
+            or not (metadata.get("launch_claimed") == "1" or metadata.get("launch_started") == "1")):
+        return None
+    pinned = route_authority.sealed_pin_harness(route, worker_type="owner")
+    moved = route_authority.moved_owner_harness(route, metadata.get("harness"))
+    if (not pinned or not metadata.get("harness") or metadata["harness"] == pinned
+            or not (moved or metadata.get("replacement_original_attempt_id"))):
+        return None
+    return {**result, "state": "needs-attention", "reason": PIN_HANDOFF_SUMMARY,
+            "owner_attempt_id": aid, "owner_started": metadata.get("launch_started") == "1",
+            "harness": metadata["harness"], "requested_harness": pinned,
+            "required_action": "close-owner-for-handoff",
+            "recovery_command": _pin_handoff_close_command(path, jobs),
+            "next_step": "Run recovery_command to settle this owner through the existing close. "
+                "Resource runs are preserved. The close receipt then gives the start command "
+                "for the unfinished stages on the current pin."}
+
+
+def pin_handoff_continuation(route, path, jobs, outcome):
+    """After the ordinary close settled, prepare its ordinary unfinished suffix.
+
+    No live identity changes and no owner is spawned here. Each receipt carries
+    one existing command: close while unsettled, then start the prepared suffix.
+    Replays reuse the same source evidence and immutable continuation file.
+    """
+    if outcome.get("summary") != PIN_HANDOFF_SUMMARY:
+        return outcome
+    if outcome.get("terminal_gate_proven") is True:
+        return outcome  # normal completion won the close race; no unfinished handoff
+    if outcome.get("state") != "cancelled":
+        return {**outcome, "recovery_command": _pin_handoff_close_command(path, jobs)}
+    metadata = (_rows(jobs).get(outcome.get("owner_attempt_id")) or (None, {}))[1]
+    if not _owns(metadata, _current_parent_session_id(), jobs):
+        return {**outcome, "handoff_reason": "work-parent-recovery-required"}
+    pinned = route_authority.sealed_pin_harness(route, worker_type="owner")
+    if not pinned or pinned == metadata.get("harness"):
+        return outcome
+    module = _route_module()
+    try:
+        for node in route.get("nodes", []):
+            try:
+                module._continuation_reused_evidence(route, node)
+            except ValueError:
+                boundary = node["id"]
+                break
+        else:
+            return outcome  # all content settled before close; nothing to replay
+        evidence = route_authority.route_in_force(route).get("dispatch_evidence")
+        successor = module.build_continuation_route(
+            route, resume_from_node=boundary, requested_boundary=boundary,
+            reason=f"{PIN_HANDOFF_SUMMARY}:{metadata['attempt_id']}:{pinned}",
+            artifact_root=route["artifact_root"],
+            dispatch_evidence=evidence if evidence != route.get("dispatch_evidence") else None)
+        target = module.canonical_route_path(route["artifact_root"], successor["route_id"])
+        module.publish_continuation_route(successor, route, target)
+        module.verify_route(successor)
+        module._record_route_chain(successor, str(target), "continuation")
+        return {**outcome, "successor_route": str(target),
+                "recovery_command": resume_command(target, jobs, agent_home=ROOT),
+                "next_step": "The previous owner is settled and resource runs are preserved. "
+                    "Run recovery_command to start the unfinished stages on the current pin; "
+                    "completed stages remain reused."}
+    except (OSError, ValueError) as exc:
+        return {**outcome, "handoff_reason": str(exc),
+                "recovery_command": resume_command(path, jobs, agent_home=ROOT),
+                "next_step": "Owner cleanup settled; continuation preparation did not. "
+                    "Inspect handoff_reason, then run recovery_command to retry preparation."}
+
+
 def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=None,
              decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
     """Advance preparation once; repeating this call creates no duplicate job."""
@@ -1522,6 +1608,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                                       "outcome": closed,
                                       **({"completion_delivery": delivery} if delivery else {}),
                                       **({"shared_publication": publication} if publication is not None else {})})
+    handoff = _owner_pin_handoff(route, path, jobs, result)
+    if handoff is not None:
+        return handoff
     import dispatch_resource_wait as OWNER_RESOURCE
     watches = (OWNER_RESOURCE.supervisor().recover_resource_watches(route, jobs)
                if any(n.get("kind") == "resource-runner" for n in route.get("nodes", [])) else [])
@@ -1703,7 +1792,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     refusal = None
     launched_now = aid not in rows
     if aid not in rows:
-        owner_pin = ((route.get("selection_pins") or {}).get("owner") or {}).get("harness")
+        owner_pin = route_authority.sealed_pin_harness(route, worker_type="owner")
         rows, refusal = _launch_admitted(route, path, jobs, "owner", owner_pin or request["owner_harness"], run, result,
                                           wait=wait, sleep=sleep, clock=clock)
     if aid not in rows:
@@ -1733,16 +1822,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "it starts the owner again."}
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
     result["correction_command"] = correction_command(aid, jobs, agent_home=ROOT)
-    if (status in {"open", "running"} and metadata.get("launch_claimed") == "1"
-            and metadata.get("replacement_original_attempt_id")):
-        from model_profile import sealed_pin_harness
-        pinned = sealed_pin_harness(route_authority.route_in_force(route), worker_type="owner")
-        if pinned and metadata.get("harness") and metadata.get("harness") != pinned:
-            return {**result, "state": "needs-attention", "reason": "pin-ignored-for-replacement",
-                    "harness": metadata.get("harness"), "requested_harness": pinned,
-                    "next_step": "The pin is recorded for the next launch. This owner already launched on "
-                        "another harness and keeps its execution identity. Send a correction for a graceful "
-                        "handoff; do not kill its resource work."}
+    handoff = _owner_pin_handoff(route, path, jobs, result, rows)
+    if handoff is not None:
+        return handoff
     if status == "done":
         gate_response = _owner_gate_response(route, path, jobs, aid, metadata, result)
         if gate_response is not None:
@@ -1954,9 +2036,9 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                     break
     if closing:
         outcome = route_parent_close.continue_close(closing, jobs=jobs)
+        outcome = pin_handoff_continuation(route, path, jobs, {**outcome, "summary": closing.get("summary")})
         return {"route_id": route["route_id"], "route_file": str(path), "launches": [],
-                "owner_started": False, "state": outcome["state"], "reason": route_parent_close.NOTE,
-                "resources": outcome.get("resources", [])}
+                "owner_started": False, "reason": route_parent_close.NOTE, **outcome}
     result = {"route_file": str(Path(path).resolve()), "route_id": route["route_id"],
               "launches": [], "owner_started": False,
               "advisories": OWNER_WRITE_ADVISORY.advisories(route),

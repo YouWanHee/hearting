@@ -2,7 +2,7 @@
 """Route authority: the one place that answers four questions about a route.
 
 1. Who continues it (the parent session and its successor).
-2. On which harness (sealed selection pins).
+2. On which harness (sealed selection pins and the parent's recorded changes).
 3. How many attempts of which kind (sub-session standing, retry links,
    round budget, the result envelope).
 4. What it may access (execution access grant).
@@ -195,6 +195,13 @@ def review_owner_authority(route, jobs, author_attempt_id) -> None:
 # pin per target in the route; every launch, resume, replacement and stage
 # fallback reads it from the route file the launch is bound to.
 PIN_TARGETS = ("owner", "frame", "worker")
+
+
+def selection_pin_rows(route) -> dict:
+    """Copied pins in force for a descendant route, without the schema envelope."""
+    pins = route_in_force(route).get("selection_pins") if isinstance(route, dict) else None
+    return {target: dict(pins[target]) for target in PIN_TARGETS
+            if isinstance(pins, dict) and isinstance(pins.get(target), dict)}
 
 
 def pin_target(worker_type: str | None) -> str:

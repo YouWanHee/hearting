@@ -1253,6 +1253,28 @@ class SelectionPinInheritanceTest(PinnedStartBase):
         (leg_path,) = self.leg_routes()
         return json.loads(leg_path.read_text(encoding="utf-8"))
 
+    def test_start_pin_changes_reach_the_selected_leg_and_owner_launch(self):
+        import route_authority as RA
+        self.set_briefs(CODE_STAGED, CODE_STAGED)
+        self.set_interview({"legs": [CODE_STAGED]})
+        before = self.path.read_bytes()
+        with mock.patch.object(R, "_pin_change_probe", return_value=([], [])), \
+                mock.patch.object(RA, "caller_identity", return_value=("claude", "parent")):
+            changed = R._change_pins(self.route, self.jobs, ["owner=codex", "worker=codex"])
+        self.assertTrue(changed["changed"])
+        result = self.settle()
+        leg = self.first_leg()
+        self.assertEqual(leg["selection_pins"]["owner"]["harness"], "codex")
+        self.assertEqual(leg["selection_pins"]["worker"]["harness"], "codex")
+        self.assertEqual(leg["selection_pins"]["frame"]["harness"], "claude")
+        self.assertEqual(leg["work_request"]["owner_harness"], "codex")
+        self.assertEqual({n["harness_affinity"] for n in leg["nodes"] if n.get("dispatch_depth") == 2}, {"codex"})
+        command = self.leg_calls[-1]
+        self.assertEqual(command[command.index("--adapter") + 1], "codex", result)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(RP.frame_selection_pins(self.record()["decision"], self.root),
+                         RA.selection_pin_rows(self.route))
+
     def test_the_first_staged_leg_seals_the_frames_pins_and_every_worker_follows_the_worker_pin(self):
         self.set_briefs(CODE_STAGED, CODE_STAGED)
         self.set_interview({"legs": [CODE_STAGED]})
