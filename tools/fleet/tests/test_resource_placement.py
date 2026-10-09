@@ -1,5 +1,6 @@
 """Local GPU selection is visible before use, without borrowing another run."""
 import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -10,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 sys.path.insert(0, str(ROOT / "tools"))
 import resource_placement as placement
-from fleet import model, render
+from fleet import fleet, model, render
+from fleet.collectors import compute_hosts
 
 
 class PlacementTest(unittest.TestCase):
@@ -91,6 +93,17 @@ class PlacementTest(unittest.TestCase):
         with mock.patch.object(placement.time, "monotonic", side_effect=[0, 1, 1]):
             self.assertIsNone(placement.observe(self.run, self.proc))
 
+    def test_truncated_environment_cannot_hide_a_nested_resource(self):
+        raw = (b"CUDA_VISIBLE_DEVICES=2\0FILLER=" + b"x" * placement.MAX_BYTES
+               + b"\0HEARTING_RESOURCE_RUN_ID=different-resource\0")
+        (self.proc / "102" / "environ").write_bytes(raw)
+        result = self.observe()
+        self.assertEqual(result["requested_devices"], ["1"])
+        self.assertNotIn(102, {p["pid"] for p in result["processes"]})
+        self.assertFalse(result["complete"])
+        (self.proc / "100" / "environ").write_bytes(raw)
+        self.assertIsNone(self.observe())
+
 
 class PlacementNowTest(unittest.TestCase):
     def setUp(self):
@@ -98,7 +111,7 @@ class PlacementNowTest(unittest.TestCase):
             pid=100, starttime="10", process_group=100, command=["python", "resume_run.py"],
             local_placement={"hostname": "moving4.iip.lab", "requested_devices": ["1"],
                 "io_wait": True, "processes": [{"pid": 102, "starttime": "102"}]})
-        self.snapshot = {"hosts": [{"host": "moving4", "self": True, "reachable": True,
+        self.snapshot = {"configured": True, "hosts": [{"host": "moving4", "self": True, "reachable": True,
             "gpus": [{"index": 1, "uuid": "GPU-12345678-abcd", "processes": [
                 {"pid": 777, "proc_start": "777", "pgid": 777,
                  "used_memory_mib": 8192, "command": "unrelated.py"}]}]}]}
@@ -131,11 +144,28 @@ class PlacementNowTest(unittest.TestCase):
         self.assertIn("호스트/GPU 미확인", self.now("codex"))
 
     def test_failed_probe_or_partial_tree_keeps_selection_without_claiming_no_use(self):
-        self.snapshot["hosts"][0]["process_error"] = "unavailable"
-        self.assertIn("moving4:1 지정 · GPU 사용 미관측", self.now("opencode"))
-        self.snapshot["hosts"][0].pop("process_error")
+        host = self.snapshot["hosts"][0]
+        for field in ("detail", "process_detail", "gpu_error", "process_error"):
+            with self.subTest(field=field):
+                host[field] = "unavailable"
+                self.assertIn("moving4:1 지정 · GPU 사용 미관측", self.now("opencode"))
+                host.pop(field)
         self.child.local_placement["complete"] = False
         self.assertIn("GPU 사용 미관측", self.now("opencode"))
+
+    def test_exact_new_group_child_is_registered_in_json_only_on_this_host(self):
+        process = self.snapshot["hosts"][0]["gpus"][0]["processes"][0]
+        process.update(pid=102, proc_start="102", pgid=102)
+        with mock.patch.object(fleet, "_collect_memory", return_value=None), \
+             mock.patch.object(fleet, "_collect_governor", return_value=None):
+            payload = json.loads(fleet._snapshot_json(
+                [], [], resource_jobs=[self.child], compute_host_snapshot=self.snapshot))
+        self.assertEqual(payload["unregistered_gpu"], [])
+        process["proc_start"] = "reused"
+        self.assertEqual(len(compute_hosts.unregistered_gpu(self.snapshot, [self.child])), 1)
+        process["proc_start"] = "102"
+        self.snapshot["hosts"][0]["self"] = False
+        self.assertEqual(len(compute_hosts.unregistered_gpu(self.snapshot, [self.child])), 1)
 
 
 if __name__ == "__main__":

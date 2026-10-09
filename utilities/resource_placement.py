@@ -33,6 +33,8 @@ def _stat(root, pid):
 
 def _environment(root, pid):
     raw = _read(root / str(pid) / "environ")
+    if len(raw) >= MAX_BYTES:
+        raise ValueError("incomplete environment")
     values = {}
     for part in raw.split(b"\0")[:-1]:
         key, sep, value = part.partition(b"=")

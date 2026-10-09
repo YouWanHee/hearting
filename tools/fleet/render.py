@@ -4684,7 +4684,8 @@ def _resource_now_text(entity, room=None):
                            if isinstance(g.get("uuid"), str) and g["uuid"].startswith(device)]
                 gpu = matches[0] if len(matches) == 1 else None
                 devices.append(str(gpu["index"]) if gpu else _gpu_safe_text(device))
-            checked = (local and local.get("gpus") and not local.get("gpu_error")
+            checked = (local and local.get("gpus") and not local.get("detail")
+                       and not local.get("process_detail") and not local.get("gpu_error")
                        and not local.get("process_error") and placement.get("complete", True))
             state = "GPU 사용 전" if checked else "GPU 사용 미관측"
             where = "%s:%s 지정 · %s" % (host, ",".join(devices), state)
