@@ -64,7 +64,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         with contextlib.redirect_stdout(io.StringIO()):
             return SUP.main(argv)
 
-    def launch(self, route, path, jobs, registry, output, body, *, controller=None, close_at=None):
+    def launch(self, route, path, jobs, registry, output, body, *, controller=None, close_at=None, exit_code=0):
         import artifact_producer
         runner = SUP.runner()
         args = SimpleNamespace(jobs=str(jobs), run_id=body['run_id'], node=body['node'])
@@ -99,10 +99,69 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             runner.start_verified(registry, args, route, path, dict(body), controller=controller)
         for proc in payloads:
-            self.assertEqual(proc.wait(timeout=5), 0)
+            self.assertEqual(proc.wait(timeout=5), exit_code)
         return payloads, json.loads(out.getvalue().splitlines()[-1])
 
-    def receipt_fixture(self, *, queued_controller=False):
+    def test_guard_exit_same_route_resume_preserves_checkpoint_and_advances_to_run_verify(self):
+        import dispatch_owner_input as INPUT
+        route, path, jobs, registry, output, ledger = self.fixture()
+        registry.write_text(json.dumps({'schema_version': 1, 'runs': {}}))
+        (ledger.root / 'armed/full-run.json').unlink()
+        checkpoint = self.base / 'checkpoint'
+        def body(name, code):
+            log = self.base / (name + '.log')
+            return {'run_id': name, 'route': str(path), 'node': 'full-run', 'jobs': str(jobs),
+                    'cwd': str(self.base), 'log': str(log), 'sentinel': str(log) + '.exit',
+                    'command': [sys.executable, '-c', code],
+                    'status': 'launching', 'workflow_state': 'READY',
+                    'parent_attempt_id': 'att-parent', 'resource_policy': 'supervised-owner',
+                    'owner_wait': {'parent_attempt_id': 'att-parent', 'session_id': 'same-native'}}
+        first = body('paused', f'from pathlib import Path; Path({str(checkpoint)!r}).write_text("saved"); raise SystemExit(3)')
+        self.launch(route, path, jobs, registry, output, first, exit_code=3)
+        failed = SUP.poll_once(route, ledger)[0]
+        self.assertEqual(failed['action'], 'halt-failed')
+        self.assertEqual(failed['evidence']['exit_code'], 3)
+        self.assertEqual(ledger.claims(), {})
+        old = json.loads(registry.read_text())['runs']['paused']
+        old_bytes = Path(old['sentinel']).read_bytes(), Path(old['log']).read_bytes()
+        old_arm = SUP.read_armed(ledger)['full-run']
+        resumed = body('resumed',
+            f'from pathlib import Path; assert Path({str(checkpoint)!r}).read_text() == "saved"; '
+            f'Path({str(output / "run.json")!r}).write_text("resumed")')
+        procs, receipt = self.launch(route, path, jobs, registry, output, resumed)
+        self.assertEqual(len(procs), 1)
+        self.assertTrue(receipt['payload_spawned'])
+        self.assertEqual(ledger.state()['workflow_state'], 'RUNNING')
+        self.assertEqual(SUP.read_armed(ledger)['full-run']['predecessor_id'], 'resumed')
+        self.assertTrue(any((entry.get('evidence') or {}).get('previous_resource') == old_arm
+                            for entry in ledger.journal()))
+        @contextlib.contextmanager
+        def locked(*a):
+            yield None, {'target': 'same', 'thread_id': 'same-native', 'requests': []}
+        verifier = self.base / 'verifier-starts'
+        def start_verifier(armed, successor, key):
+            self.assertEqual(successor, 'run-verify')
+            subprocess.run([sys.executable, '-c',
+                f'from pathlib import Path; assert Path({str(output / "run.json")!r}).read_text() == "resumed"; '
+                f'Path({str(verifier)!r}).open("a").write("run-verify\\n")'], check=True)
+            ledger.record(successor, 'RUNNING', evidence={'claim': key}, actor='fixture-verifier')
+            return {'started': True, 'surface': 'fixture-external-verifier'}
+        with mock.patch.object(INPUT, '_locked', locked), \
+                mock.patch.object(INPUT, '_target', return_value=(None, 'same')), \
+                mock.patch.object(SUP, '_start_successor', side_effect=start_verifier):
+            advanced = SUP.poll_once(route, ledger)[0]
+            self.assertEqual(advanced['action'], 'advanced')
+            self.assertEqual([item['successor'] for item in advanced['successors']], ['run-verify'])
+            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'settled')
+        self.assertEqual(len(ledger.claims()), 1)
+        self.assertEqual(verifier.read_text(), 'run-verify\n')
+        self.assertEqual(ledger.state()['nodes']['run-verify']['state'], 'RUNNING')
+        self.assertEqual(json.loads(registry.read_text())['runs']['paused'], old)
+        self.assertEqual((Path(old['sentinel']).read_bytes(), Path(old['log']).read_bytes()), old_bytes)
+        self.assertEqual((output / 'run.json').read_text(), 'resumed')
+        self.assertTrue((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').is_file())
+
+    def receipt_fixture(self, *, queued_controller=False, failed=False):
         route, path, jobs, registry, output, ledger = self.fixture()
         if queued_controller:
             data = json.loads(registry.read_text())
@@ -113,6 +172,12 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             armed = json.loads(arm_path.read_text())
             armed['resource_binding'] = WAIT.resource_body_digest(row)
             arm_path.write_text(json.dumps(armed))
+        if failed:
+            data = json.loads(registry.read_text())
+            row = data['runs']['fixture-run']
+            Path(row['sentinel']).write_text('3')
+            row.update(status='failed', exit_code=3)
+            registry.write_text(json.dumps(data))
         SUP.poll_once(route, ledger)
         args = SimpleNamespace(parent_attempt_id='att-parent', route_id=route['route_id'],
             route_hash=route['route_hash'], route_file=str(path), jobs=str(jobs))
@@ -126,6 +191,56 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP):
             prompt = WAIT.wait(args, state, control, set(), lambda _: None, sleep=lambda _: self.fail('extra wait'))
         return route, path, jobs, registry, output, ledger, args, control, state, context, prompt
+
+    def test_failed_predecessor_can_resume_before_poll_and_with_new_owner_or_registry(self):
+        for observed, new_owner, new_registry in ((False, False, False), (True, True, False), (True, False, True)):
+            with self.subTest(observed=observed, new_owner=new_owner, new_registry=new_registry), self.subfixture():
+                route, path, jobs, registry, output, ledger = self.fixture()
+                data = json.loads(registry.read_text())
+                old = data['runs']['fixture-run']
+                Path(old['sentinel']).write_text('3')
+                old.update(status='failed', exit_code=3)
+                registry.write_text(json.dumps(data))
+                if observed:
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'halt-failed')
+                body = self.next_body(registry, 'next', output, final=True)
+                if new_owner:
+                    body.update(parent_attempt_id='att-resumed',
+                                owner_wait={'parent_attempt_id': 'att-resumed', 'session_id': 'resumed-native'})
+                target = registry
+                if new_registry:
+                    target = self.base / 'resumed-registry.json'
+                    target.write_text(json.dumps({'runs': {}}))
+                self.launch(route, path, jobs, target, output, body)
+                self.assertEqual(SUP.read_armed(ledger)['full-run']['predecessor_id'], 'next')
+                self.assertEqual(ledger.state()['workflow_state'], 'RUNNING')
+                self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old)
+                self.assertEqual(Path(old['sentinel']).read_text(), '3')
+
+    def test_verified_resume_failed_predecessor_rearms_and_claims_verification_once(self):
+        route, path, jobs, registry, output = self._resume_fixture()
+        ledger = SUP.ledger_for(route, jobs)
+        armed_path = ledger.root / 'armed/resume-run.json'
+        armed = json.loads(armed_path.read_text())
+        armed['successor_command'] = [sys.executable, str(HERE / 'capability-route.py'),
+                                     'start', '--route', str(path), '--jobs', str(jobs)]
+        armed['successor_log'] = str(ledger.root / 'resource/verification-start.log')
+        armed_path.write_text(json.dumps(armed))
+        data = json.loads(registry.read_text())
+        old = data['runs']['fixture-run']
+        Path(old['sentinel']).write_text('3')
+        old.update(status='failed', exit_code=3)
+        registry.write_text(json.dumps(data))
+        self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'halt-failed')
+        self.launch(route, path, jobs, registry, output, self.next_body(registry, 'resumed', output, final=True))
+        with mock.patch.object(SUP, '_start_successor', return_value={'started': True}) as start:
+            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'advanced')
+            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'settled')
+            self.assertEqual(start.call_count, 1)
+        claim = next(iter(ledger.claims().values()))
+        self.assertEqual(claim['successor'], 'one-shot')
+        self.assertTrue(WS.route_node(route, 'one-shot')['verification_only'])
+        self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old)
 
     def test_cross_role_and_aliased_evidence_paths_refuse_without_changing_bytes(self):
         for collision in ('log-sentinel', 'sentinel-log', 'symlink', 'hardlink', 'partial', 'progress'):
@@ -203,10 +318,47 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 self.assertFalse(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
                 self.assertIsNone(WAIT.pending_prompt(state, 'att-parent', args, control))
 
+    def test_unacknowledged_failure_receipt_survives_retry_and_receiving_turn_interruption(self):
+        for other_registry, queued in ((False, False), (True, False), (True, True)):
+            with self.subTest(other_registry=other_registry, queued=queued), self.subfixture():
+                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture(queued_controller=queued, failed=True)
+                saved = WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource
+                self.assertEqual(saved['outbox']['receipt']['exit_code'], 3)
+                self.assertEqual(saved['outbox']['receipt']['reason'], 'FAILED_RETRYABLE')
+                body = self.next_body(registry, 'retry', output)
+                target = registry
+                if other_registry:
+                    target = self.base / 'retry-registry.json'
+                    target.write_text(json.dumps({'runs': {}}))
+                if queued:
+                    body.update(launch_state='queued', status='launching', launch_request={})
+                    target.write_text(json.dumps({'runs': {'retry': body}}))
+                    self.arm(path, target, run_id='retry', extra=('--jobs', str(jobs), '--artifact-base', str(output)))
+                else:
+                    self.launch(route, path, jobs, target, output, body)
+                with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
+                        mock.patch.object(WAIT, 'admit_controller_launch') as admit:
+                    self.assertEqual(WAIT.pending_prompt(state, 'att-parent', args, control), prompt)
+                    self.assertEqual(WAIT.wait(args, state, control, set(), lambda _: None), prompt)
+                    admit.assert_not_called()
+                self.assertEqual(WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource, saved)
+                self.assertTrue(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
+                self.assertFalse(WAIT.acknowledge(state, 'att-parent', saved['outbox']['receipt_id']))
+                self.assertIsNone(WAIT.pending_prompt(state, 'att-parent', args, control))
+                if not queued:
+                    with mock.patch.object(WAIT, 'context', side_effect=context), mock.patch.object(WAIT, 'supervisor', return_value=SUP):
+                        next_prompt = WAIT.wait(args, state, control, set(), lambda _: None,
+                                                sleep=lambda _: self.fail('completed retry should not wait'))
+                    self.assertIn('"run_id":"retry"', next_prompt)
+                    current = WAIT.JOIN.read_supervisor_phase_state(state, 'att-parent').resource
+                    self.assertEqual(current['delivered'], [saved['outbox']['key']])
+                    self.assertTrue(WAIT.acknowledge(state, 'att-parent', current['outbox']['receipt_id']))
+
     def test_historical_receipt_rejects_mutated_identity_sentinel_and_session(self):
-        for mutation in ('identity', 'sentinel', 'session'):
-            with self.subTest(mutation=mutation), self.subfixture():
-                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture()
+        for failed, mutation in ((failed, mutation) for failed in (False, True)
+                                 for mutation in ('identity', 'sentinel', 'session')):
+            with self.subTest(failed=failed, mutation=mutation), self.subfixture():
+                route, path, jobs, registry, output, ledger, args, control, state, context, prompt = self.receipt_fixture(failed=failed)
                 self.launch(route, path, jobs, registry, output, self.next_body(registry, 'next', output))
                 data = json.loads(registry.read_text())
                 old = data['runs']['fixture-run']
@@ -393,8 +545,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             self.launch(route, path, jobs, registry, output, body)
         self.assertEqual((registry.read_bytes(), SUP.read_armed(ledger)), before)
 
-    def test_same_registry_live_reused_failed_owner_and_reused_log_refuse_before_reservation(self):
-        for invalid in ('live', 'reused', 'failed', 'owner', 'log'):
+    def test_same_registry_live_reused_inconsistent_failure_and_reused_log_refuse_before_reservation(self):
+        for invalid in ('live', 'reused', 'failed', 'log'):
             with self.subTest(invalid=invalid), self.subfixture():
                 route, path, jobs, registry, output, ledger = self.fixture()
                 SUP.poll_once(route, ledger)
@@ -406,8 +558,6 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                         old['starttime'] = 'wrong'
                 elif invalid == 'failed':
                     old['status'] = 'failed'
-                elif invalid == 'owner':
-                    body['owner_wait'] = {'parent_attempt_id': 'foreign', 'session_id': 'foreign'}
                 else:
                     body.update(log=old['log'], sentinel=old['sentinel'])
                 registry.write_text(json.dumps({'schema_version': 1, 'runs': {old['run_id']: old}}))

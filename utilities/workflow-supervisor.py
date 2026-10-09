@@ -616,11 +616,12 @@ def _claim_successors(route, ledger, armed, node_id, successors, evidence=None):
     return started
 
 
-def _checked_resource_row(armed, evidence):
+def _checked_resource_row(armed, evidence, *, require_success=True):
     """Recheck the existing exit tuple at the resource admission boundary."""
     row = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
     if (RESOURCE_RESUME.row_digest(row) != evidence.get("resource_sha256")
-            or runner().read_sentinel(row.get("sentinel")) != 0
+            or runner().read_sentinel(row.get("sentinel")) != evidence.get("exit_code")
+            or (require_success and evidence.get("exit_code") != 0)
             or RR.classify_identity(row)[0] != "exited"):
         return None
     return row
@@ -654,22 +655,23 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
     """Called under the ledger lock, with the old run and journal preserved."""
     import dispatch_resource_wait as OWNER_RESOURCE
     changing = {"predecessor_id", "resource_registry", "resource_binding", "armed_at"}
-    if (prior.get("predecessor_kind") != "resource" or prior.get("successor_external") is not True
+    if (prior.get("predecessor_kind") != "resource"
             or prior.get("predecessor_id") == record.get("predecessor_id")
             or any(prior.get(k) != record.get(k) for k in set(prior) | set(record) if k not in changing)
-            or resource.get("resource_policy") != "supervised-owner"):
+            or resource.get("resource_policy") not in {"supervised-owner", "verified-resume"}):
         raise SupervisorError("resource-watch-binding-conflict")
     evidence = resource_evidence(prior)
-    old = _checked_resource_row(prior, evidence) if evidence.get("succeeded") else None
+    old = _checked_resource_row(prior, evidence, require_success=False) if evidence.get("terminal") else None
     missing = artifact_evidence(prior)
     state = ledger.state()
     stage = state["nodes"].get(prior["node"], {})
-    if (old is None or not OWNER_RESOURCE.resource_execution_succeeded(old)
-            or old.get("resource_policy") != "supervised-owner"
-            or old.get("owner_wait") != resource.get("owner_wait")
-            or not missing.get("checked") or not missing.get("missing")
+    if (old is None or not OWNER_RESOURCE.resource_execution_finished(old)
+            or (evidence.get("succeeded") and (not missing.get("checked") or not missing.get("missing")))
             or stage.get("state") not in {"RUNNING", "FAILED_RETRYABLE"}
             or state["workflow_state"] not in {"RUNNING", "STAGE_SUCCEEDED", "NEXT_REGISTERED", "NEXT_RUNNING", "FAILED_RETRYABLE"}
+            or any(row.get("state") in WS.vocabulary()["failure_states"]
+                   for node, row in state["nodes"].items() if node != prior["node"])
+            or any(claim.get("predecessor") == prior["node"] for claim in ledger.claims().values())
             or any(OWNER_RESOURCE.resource_evidence_paths_conflict(row, resource)
                    for _, row in resource_predecessors(ledger, prior["node"]))):
         raise SupervisorError("resource-watch-binding-conflict")
@@ -677,17 +679,17 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
         previous = stage.get("evidence") or {}
         workflow_failure = next((item for item in reversed(ledger.journal()) if item.get("workflow_state")), {})
         if (previous.get("resource_sha256") != evidence.get("resource_sha256")
-                or previous.get("succeeded") is not True or previous.get("exit_code") != 0
-                or (previous.get("artifacts") or {}).get("reason") != "declared-artifact-missing"
-                or any(row.get("state") in WS.vocabulary()["failure_states"]
-                       for node, row in state["nodes"].items() if node != prior["node"])
+                or previous.get("succeeded") != evidence.get("succeeded")
+                or previous.get("exit_code") != evidence.get("exit_code")
+                or (evidence.get("succeeded") and
+                    (previous.get("artifacts") or {}).get("reason") != "declared-artifact-missing")
                 or (state["workflow_state"] == "FAILED_RETRYABLE"
                     and (workflow_failure.get("evidence") or {}).get("node") != prior["node"])):
             raise SupervisorError("resource-watch-binding-conflict")
         if stage["state"] == "FAILED_RETRYABLE":
             ledger.record(prior["node"], "READY", evidence=previous, actor="arm")
         if state["workflow_state"] == "FAILED_RETRYABLE":
-            ledger.set_workflow_state("READY", evidence={"resolved_resource_artifact_wait": prior["node"]}, actor="arm")
+            ledger.set_workflow_state("READY", evidence={"resuming_resource": prior["node"]}, actor="arm")
     ledger.record(prior["node"], "RUNNING", evidence={"previous_resource": prior,
                   "execution": evidence, "next_resource": record["predecessor_id"]}, actor="arm")
 

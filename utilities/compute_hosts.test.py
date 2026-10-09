@@ -124,6 +124,48 @@ class SSHNamespacePrefixTest(unittest.TestCase):
         self.path.assert_not_called()
 
 
+class ProbeObservationTest(unittest.TestCase):
+    def test_json_snapshot_preserves_probe_failure_without_failing_the_consumer(self):
+        module = load_module()
+        host = {"ssh_host": "local"}
+        config = {"run_root": Path("/unused"), "hosts": {"here": host}}
+        output, warning = io.StringIO(), io.StringIO()
+        with mock.patch.object(module, "load_config", return_value=config), \
+             mock.patch.object(module, "_load_claims", return_value=[]), \
+             mock.patch.object(module, "collect_ssh_session_bridges", return_value=[]), \
+             mock.patch.object(module, "remote", return_value=subprocess.CompletedProcess(
+                 [], 1, "", "GPU query unavailable")), \
+             mock.patch("sys.stdout", output), mock.patch("sys.stderr", warning):
+            code = module.cmd_probe(SimpleNamespace(hosts=["here"], json=True))
+        self.assertEqual(code, 0)
+        row, = json.loads(output.getvalue())
+        self.assertFalse(row["reachable"])
+        self.assertEqual(row["gpus"], [])
+        self.assertIn("GPU query unavailable", row["detail"])
+        self.assertIn("observation unavailable", warning.getvalue())
+
+    def test_human_probe_and_invalid_selection_still_fail(self):
+        module = load_module()
+        config = {"run_root": Path("/unused"), "hosts": {"here": {"ssh_host": "local"}}}
+        with mock.patch.object(module, "load_config", return_value=config), \
+             mock.patch.object(module, "_probe_selected", return_value=[
+                 {"host": "here", "reachable": False, "gpus": [], "detail": "unavailable"}]), \
+             mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(module.cmd_probe(SimpleNamespace(hosts=["here"], json=False)), 1)
+            with self.assertRaises(module.ConfigError):
+                module.cmd_probe(SimpleNamespace(hosts=["unknown"], json=True))
+
+    def test_transport_exception_returns_an_unavailable_sample(self):
+        module = load_module()
+        for error in (OSError("transport unavailable"), subprocess.TimeoutExpired("probe", 1)):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch.object(module, "remote", side_effect=error):
+                row = module.probe_host("gpu", {"ssh_host": "local"}, ssh_session_bridges=[])
+            self.assertFalse(row["reachable"])
+            self.assertEqual(row["gpus"], [])
+            self.assertTrue(row["detail"])
+
+
 class RunGPUObservationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

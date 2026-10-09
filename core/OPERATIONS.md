@@ -796,16 +796,18 @@ close suppresses this continuation and all cancelled successors.
 
 A supervised owner can register sequential resources for one route/node using
 the same `resource-runner start`. Exact replay preserves its run; a new run may
-replace the armed predecessor only after an exact successful exit while that
-stage is still waiting for its declared outputs. The ledger lock serializes
-the binding change, preserves the prior execution evidence, and refuses active
-or failed identities, different owners, completed stages, and parent close.
+replace the armed predecessor after an exact terminal exit, including a guard
+exit that saved a checkpoint, while that stage is failed/retryable or still
+waiting for its declared outputs. The current launch retains its normal live
+owner/session binding. The ledger lock serializes the binding change, preserves
+the prior execution evidence, and refuses active or unobservable identities,
+completed stages, existing successor claims, unrelated failures, and parent close.
 All prior bindings protect their log, sentinel and progress paths across registries
 and path aliases. Existing active workflow progress is preserved. The final payload
 release checks parent close under the same ledger lock before publishing identity
 and opening its private launch fence.
 The owner receives intermediate execution success with no successor admission;
-an unacknowledged result remains recoverable from its original binding after the
+an unacknowledged success or failure remains recoverable from its original binding after the
 next registration, with no lifetime receipt-count ceiling.
 The resource that supplies the declared stage outputs can complete the stage.
 
@@ -861,6 +863,21 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
+Registration and supervisor arming share the terminal-execution judgment for
+same-route/node retries. They retain the old row and predecessor binding;
+only that resource's failed/retryable state returns to running.
+
+GPU monitoring is observation, separate from payload completion. A generated
+resource bridge settles the exact payload exit and declared outputs even when
+a during-run or post-run probe is unavailable; it records the missing sample
+and diagnostic as a warning. It checks terminal payload evidence before taking
+another sample and saves partial monitoring records even after a probe error.
+Optional probe exceptions leave the resource's exit code unchanged.
+If the approved verification contract requires a GPU sample, its existing
+verification check reports that missing evidence as FAIL; resource success
+alone does not satisfy the verification gate. A nonzero bridge exit remains a
+resource failure: the runner cannot infer successful payloads from a traceback.
+
 The existing owner input state receives the verified native session identity
 as soon as the transport binds it, including during the first model turn.
 A registered resource launched in that turn uses the same live supervisor and
@@ -872,7 +889,8 @@ payload. The same route's normal `start` is the claimed successor: before the
 resource succeeds it reports resource readiness/liveness, and afterwards it
 starts only the independent verifier. The receipt distinguishes the resource,
 watch and verification identities. A repeated exact launch returns the existing
-run; a changed launch or another run for that route/node cannot duplicate it.
+run; a changed body under that run ID is refused, and another run ID cannot
+duplicate an active execution on that route/node.
 Exit failure, a missing sentinel or unverifiable identity starts no verifier.
 Verification completion retains the existing parent-delivery receipt and its
 supported fallback; watch startup or queue acceptance alone is not receipt.
@@ -1130,6 +1148,14 @@ the match is against a declared field. Live state is never recorded: `list` and
 `probe` measure reachability, CPU utilization, and GPU utilization/free memory
 at the moment they are asked.
 
+`probe --json` reports measurement availability in each host row (`reachable`,
+`detail`, and `process_detail`). Once it emits a valid snapshot it exits zero,
+including for unavailable measurements, and writes their warning to stderr.
+Zero means the snapshot was returned, not that the host or GPU was verified.
+Configuration/selection errors still fail; the human-readable probe retains
+its reachability exit status. Required measurements are checked from the JSON
+by their owning verification contract, separate from payload execution.
+
 A live direct SSH launch may cross the process boundary without forwarding its
 Claude Code, Codex, or OpenCode session variable. In that case the probe may
 form a transient exact bridge only by joining a stable same-EUID local `ssh`
@@ -1286,7 +1312,12 @@ already running under an older supervisor behaves the same way.
 An owner that already ended `BLOCKED`, or with a readable FAIL a person answers with an
 approved fix, keeps the answer (`retained`), and `correct`
 continues its route in the same call through a replacement owner that receives it
-(see the SD-157 replacement rule in §5.10). When the answer comes from a session
+(see the SD-157 replacement rule in §5.10). A readable FAIL with no failed
+round-capped check uses the existing ordinary replacement allowance once;
+absence of a failed check does not refuse the kept correction. Failed checks
+retain their closure-check ceiling, including refusal when that ceiling is spent.
+No check or extra verdict round is manufactured for an infrastructure correction.
+When the answer comes from a session
 that is not the route's parent, only the parent may launch that replacement: the
 answer stays kept and the parent receives one `answer-awaiting-parent` supervision
 notice. The parent's carrier that delivers it (the shared prompt sweep or the
