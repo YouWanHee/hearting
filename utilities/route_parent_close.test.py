@@ -141,6 +141,99 @@ class ParentCloseTest(unittest.TestCase):
     def close(self, **kwargs):
         return CLOSE.close(self.route, self.path, jobs=self.jobs, **kwargs)
 
+    def test_start_pin_receipt_closes_owner_preserves_resource_and_starts_current_pin(self):
+        import shlex
+        import route_authority as AUTH
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                child = ParentCloseTest(); child.setUp()
+                try:
+                    target = "claude" if harness == "codex" else "codex"
+                    child.route = ROUTE.compose_route(
+                        capability="autopilot-code", capability_mode="debug", shape="staged",
+                        graph="execute,test,report", slug="pin-handoff", cwd=child.base,
+                        artifact_root=child.artifacts, spec_read="fixture", unassigned=True,
+                        dispatch_evidence=child.route["dispatch_evidence"], parent_harness="codex",
+                        work_request={"text": "Fix the bug and verify it", "owner_harness": harness})
+                    child.path = child.path.with_name(child.route["route_id"] + ".json")
+                    child.path.write_text(json.dumps(child.route))
+                    owner = child.process("att-owner")
+                    child.row("att-owner", process=owner, harness=harness)
+                    resource = child.process("att-owner")
+                    child.resource(resource)
+                    sealed = child.path.read_bytes()
+                    # The real CLI records the pin and returns one exact next command.
+                    notice = io.StringIO()
+                    argv = ["capability-route.py", "start", "--route", str(child.path),
+                            "--jobs", str(child.jobs), "--pin", "owner=" + target,
+                            "--pin", "worker=" + target]
+                    with mock.patch.object(ROUTE, "_pin_change_probe", return_value=([], [])), \
+                            mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(notice):
+                        ROUTE.main()
+                    receipt = json.loads(notice.getvalue())
+                    self.assertEqual(receipt.get("reason"), "owner-pin-handoff", receipt)
+                    command = shlex.split(receipt["recovery_command"])
+                    self.assertIn("close", command)
+                    self.assertNotIn("--stop-resources", command)
+                    self.assertIsNone(owner.poll())
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    closed = json.loads(result.stdout)
+                    self.assertEqual(closed["state"], "cancelled", closed)
+                    self.assertIn("successor_route", closed, closed)
+                    owner.wait(timeout=5)
+                    self.assertIsNone(resource.poll())
+                    successor_path = Path(closed["successor_route"])
+                    successor = ROUTE.verify_route(json.loads(successor_path.read_text()))
+                    self.assertEqual(successor["source_route_id"], child.route["route_id"])
+                    self.assertEqual(AUTH.sealed_pin_harness(successor, worker_type="owner"), target)
+                    self.assertEqual(child.path.read_bytes(), sealed)
+                    replay = subprocess.run(command, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(replay.returncode, 0, replay.stderr)
+                    self.assertEqual(json.loads(replay.stdout)["successor_route"], str(successor_path))
+                    with mock.patch.object(ROUTE, "build_continuation_route",
+                                           side_effect=AssertionError("replayed close rebuilt its suffix")), \
+                            mock.patch.object(work_start, "_route_module", return_value=ROUTE):
+                        replayed = work_start.pin_handoff_continuation(
+                            child.route, child.path, child.jobs, closed)
+                    self.assertEqual(replayed["successor_route"], str(successor_path))
+                    # Changing back to the original harness still follows the current pin,
+                    # rather than returning the previously prepared target from the journal.
+                    for selected in (harness, target):
+                        for pin_target in ("owner", "worker"):
+                            AUTH.record_pin_change(child.route, target=pin_target,
+                                pin={"harness": selected, "model": None, "effort": None},
+                                by={"harness": "codex", "session_id": "fixture-parent"},
+                                source="fixture", tuples=[], candidates=[])
+                        replayed = work_start.pin_handoff_continuation(
+                            child.route, child.path, child.jobs, CLOSE.close(child.route, child.path, jobs=child.jobs))
+                        replay_route = json.loads(Path(replayed["successor_route"]).read_text())
+                        self.assertEqual(AUTH.sealed_pin_harness(replay_route, worker_type="owner"), selected)
+                        self.assertIsNone(resource.poll())
+                    calls = []
+                    def launch(command, **kwargs):
+                        calls.append(command)
+                        aid = command[command.index("--attempt-id") + 1]
+                        meta = {"attempt_id": aid, "parent_sid": "fixture-parent", "launch_started": "1",
+                                "worker_type": "owner", "harness": target, "dispatch_depth": "1",
+                                "route_id": successor["route_id"], "route_hash": successor["route_hash"],
+                                "owner_route_id": successor["route_id"], "owner_route_hash": successor["route_hash"],
+                                "owner_route_file": str(successor_path), "parent_completion_delivery": "codex-native-queue"}
+                        with child.jobs.open("a") as stream:
+                            stream.write("now\topen\t12\tparent\ttask\t" + ",".join(k + "=" + v for k, v in meta.items()) + "\n")
+                        return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
+                    with mock.patch.object(work_start, "join_selected_attempts", return_value={"state": "timeout", "children": []}), \
+                            mock.patch.object(work_start, "parent_next", return_value=("end-turn", "fixture", "")):
+                        started = work_start.start_work(successor, successor_path, child.jobs, run=launch)
+                        repeated = work_start.start_work(successor, successor_path, child.jobs, run=launch)
+                    self.assertTrue(started["owner_started"], started)
+                    self.assertTrue(repeated["owner_started"], repeated)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0][calls[0].index("--adapter") + 1], target)
+                    self.assertIsNone(resource.poll())
+                finally:
+                    child.doCleanups()
+
     def test_attached_then_advanced_owner_and_old_children_close_current_binding(self):
         import owner_route_binding as OWNER
         owner = self.process("att-owner")

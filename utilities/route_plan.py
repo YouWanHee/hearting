@@ -728,7 +728,7 @@ def pin_tokens(pins) -> list:
 
 
 def frame_selection_pins(decision, artifact_root) -> dict:
-    """The pins the decision's frame route was composed with, or `{}`.
+    """The pins in force on the decision's verified frame route, or `{}`.
 
     Read from that frame's own route file and trusted only when its id and hash are the ones the
     decision recorded and its bytes still hash to them; nothing is written or rewritten.
@@ -743,8 +743,8 @@ def frame_selection_pins(decision, artifact_root) -> dict:
         if ((frame.get("route_id"), frame.get("route_hash")) != (reference["route_id"], reference["route_hash"])
                 or route_identity.route_hash(frame) != reference["route_hash"]):
             return {}
-        pins = frame.get("selection_pins")
-        return {target: dict(pins[target]) for target in _PIN_TARGETS if isinstance(pins, dict) and target in pins}
+        from route_authority import selection_pin_rows
+        return selection_pin_rows(frame)
     except (OSError, ValueError, KeyError, TypeError):
         return {}
 
@@ -792,8 +792,9 @@ def project_next_leg(route, completed_cycle_id):
         if not Path(context["prompt_file"]).is_file():
             return None
         leg = binding["legs"][index]
-        # The leg's own sealed pins; a leg sealed before pins reached legs takes its frame's.
-        pins = route.get("selection_pins") or frame_selection_pins(binding["record"]["decision"], root)
+        # The leg's pins in force; a leg sealed before pins reached legs takes its frame's.
+        from route_authority import selection_pin_rows
+        pins = selection_pin_rows(route) or frame_selection_pins(binding["record"]["decision"], root)
         argv = compose_argv(
             {**leg, "cwd": leg_cwd(leg, route["cwd"], base_cwd=context["cwd"])},
             context={**context, "campaign_key": route.get("campaign_key") or context.get("campaign_key")},

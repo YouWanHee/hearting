@@ -3173,6 +3173,24 @@ class TestContinuation(unittest.TestCase):
    with self.assertRaisesRegex(ValueError,"invalid selection_pins.owner.harness"):
     R.verify_route(continuation,R.ROOT)
 
+ def test_recorded_pin_changes_ride_a_continuation_with_completed_prefix_preserved(self):
+  import route_authority as AUTH
+  with tempfile.TemporaryDirectory() as tmp:
+   source=self._source(Path(tmp)/"artifacts")
+   self._complete_prefix(source,"test",Path(tmp)/"evidence")
+   before=json.dumps(source,sort_keys=True)
+   AUTH.record_pin_change(source,target="owner",pin={"harness":"codex","model":None,"effort":None},
+    by={"harness":"codex","session_id":"parent"},source="fixture",tuples=[],candidates=[])
+   AUTH.record_pin_change(source,target="worker",pin={"harness":"codex","model":None,"effort":None},
+    by={"harness":"codex","session_id":"parent"},source="fixture",tuples=[],candidates=[])
+   continuation=self._build(source)
+   self.assertEqual(continuation["selection_pins"]["owner"]["harness"],"codex")
+   self.assertEqual(continuation["selection_pins"]["worker"]["harness"],"codex")
+   self.assertTrue(continuation["reused_nodes"])
+   self.assertTrue(all(row["new_attempt_count"]==0 for row in continuation["reused_nodes"]))
+   self.assertEqual(json.dumps(source,sort_keys=True),before)
+   R.verify_route(continuation,R.ROOT)
+
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:
    source=self._source(Path(tmp)/"artifacts-request")

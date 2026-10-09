@@ -700,7 +700,10 @@ class WorkStartTest(unittest.TestCase):
         before = self.jobs.read_bytes()
         result = self.start()
         self.assertEqual((result['state'], result['reason'], result['requested_harness']),
-                         ('needs-attention', 'pin-ignored-for-replacement', 'opencode'))
+                         ('needs-attention', 'owner-pin-handoff', 'opencode'))
+        command = __import__('shlex').split(result['recovery_command'])
+        self.assertIn('close', command)
+        self.assertNotIn('--stop-resources', command)
         self.assertEqual(result['owner_attempt_id'], owner)
         self.assertEqual(self.jobs.read_bytes(), before)
         self.assertEqual(len(self.calls), 3)
@@ -717,6 +720,37 @@ class WorkStartTest(unittest.TestCase):
         self.assertNotEqual(result.get('reason'), 'pin-ignored-for-replacement')
         self.assertEqual(self.jobs.read_bytes(), before)
         self.assertEqual(len(self.calls), 3)
+
+    def test_changed_owner_pin_is_observed_before_the_resource_watch_receipt(self):
+        import dispatch_resource_wait as RESOURCE
+        self.start(); self.ready = self.released = True; created = self.start()
+        owner = created['owner_attempt_id']
+        self.jobs.write_text(self.jobs.read_text().replace('attempt_id='+owner,
+            'harness=codex,launch_claimed=1,attempt_id='+owner))
+        self.route['nodes'].append({'id': 'eval-run', 'kind': 'resource-runner'})
+        self.route['artifact_root'] = self.tmp.name
+        W.route_authority.record_pin_change(self.route, target='owner',
+            pin={'harness': 'opencode', 'model': None, 'effort': None},
+            by={'harness': 'codex', 'session_id': 'parent'},
+            source='fixture', tuples=[], candidates=[])
+        before = self.jobs.read_bytes()
+        watcher = SimpleNamespace(recover_resource_watches=mock.Mock(return_value=[{'state': 'watching'}]))
+        with mock.patch.object(RESOURCE, 'supervisor', return_value=watcher):
+            result = self.start()
+        self.assertEqual((result['state'], result['reason'], result['requested_harness']),
+                         ('needs-attention', 'owner-pin-handoff', 'opencode'))
+        self.assertEqual(result['owner_attempt_id'], owner)
+        self.assertIn(' close ', result['recovery_command'])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        watcher.recover_resource_watches.assert_not_called()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_completed_owner_winning_close_race_has_no_handoff_retry(self):
+        completed = {'state': 'completed', 'terminal_gate_proven': True,
+                     'summary': W.PIN_HANDOFF_SUMMARY}
+        result = W.pin_handoff_continuation(self.route, self.path, self.jobs, completed)
+        self.assertIs(result, completed)
+        self.assertNotIn('recovery_command', result)
 
     def test_owner_exits_during_join_before_the_public_receipt(self):
         self.start(); self.ready = self.released = True; self.start()

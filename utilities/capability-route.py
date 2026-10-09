@@ -1415,8 +1415,12 @@ def build_continuation_route(
         # An approved route plan's leg keeps pointing at its plan when it resumes.
         "route_plan",
     )
-    route={key:json.loads(json.dumps(source_route[key]))
-           for key in inherited_keys if key in source_route}
+    inheritance=ROUTE_AUTHORITY.route_in_force(source_route)
+    route={key:json.loads(json.dumps(inheritance[key]))
+           for key in inherited_keys if key in inheritance}
+    pins=ROUTE_AUTHORITY.selection_pin_rows(source_route)
+    if pins:
+        route["selection_pins"]={"contract_version":SELECTION_PIN_CONTRACT_VERSION,**pins}
     route.update(result)
     if route.get("profile_selection_contract_version") == 1:
         retained = {node["id"] for node in route_nodes} | {"__owner__"}
@@ -4129,10 +4133,8 @@ def _frame_brief_finder(registry, capability, finder):
 
 
 def _frame_pin_rows(frame_route):
-    """A copy of the frame route's sealed pin rows (`{target: pin}`), without `contract_version`."""
-    pins = frame_route.get("selection_pins")
-    return {target: dict(pins[target]) for target in SELECTION_PIN_TARGETS
-            if isinstance(pins, dict) and isinstance(pins.get(target), dict)}
+    """Compatibility name; all descendants read the same pins in force."""
+    return ROUTE_AUTHORITY.selection_pin_rows(frame_route)
 
 
 def proposal_readiness(frame_route, jobs):
@@ -4189,9 +4191,9 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     kwargs = _leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
                                  slug=f"{context['slug']}-leg{index}")
     kwargs["cwd"] = RP.leg_cwd(leg, frame_route["cwd"], base_cwd=context["cwd"])
-    owner = context.get("owner") or ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness")
+    owner = ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness") or context.get("owner")
     if work_request is not None:
-        work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
+        work_request = {**work_request, "owner_harness": owner or work_request.get("owner_harness")}
     probe = (lambda: readiness(kwargs["cwd"])) if leg.get("cwd") else readiness
     route = compose_route(**kwargs, **_leg_evidence(leg, probe), work_request=work_request, route_plan=binding,
                             parent_harness=owner or "claude")
@@ -11044,6 +11046,9 @@ def main():
                 outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=True)
             else:
                 created=True
+                from work_start import pin_handoff_continuation
+                outcome=pin_handoff_continuation(route, a.route, route_parent_close.jobs_path(),
+                                                {**outcome,"summary":a.summary or outcome.get("summary")})
                 print(json.dumps(outcome,sort_keys=True))
                 return
             print(json.dumps(outcome,sort_keys=True))

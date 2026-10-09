@@ -775,6 +775,15 @@ class SelectionPinContinuationTest(PinnedPlanFixture):
 
     FRAME_PINS = {"owner=claude", "worker=claude:sonnet@high", "frame=claude"}
 
+    def test_next_leg_command_reads_the_current_leg_pin_changes(self):
+        import route_authority as AUTH
+        leg = self.leg_route()
+        AUTH.record_pin_change(leg, target="owner", pin={"harness": "codex", "model": None, "effort": None},
+                               by={"harness": "claude", "session_id": "parent"},
+                               source="fixture", tuples=[], candidates=[])
+        self.assertEqual(set(self.pin_values(self.printed(leg))),
+                         {"owner=codex", "worker=claude:sonnet@high", "frame=claude"})
+
     def test_the_printed_command_carries_every_pin_the_leg_was_sealed_with(self):
         leg0 = self.leg_route()
         self.assertEqual(leg0["selection_pins"], self.route["selection_pins"])
