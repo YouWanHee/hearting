@@ -4656,7 +4656,19 @@ def _resource_now_text(entity, room=None):
         local = next((host for host in (snapshot or {}).get("hosts", ())
                       if isinstance(host, dict) and host.get("self") is True
                       and host.get("reachable") is True), None)
-        where = "%s:CPU" % local["host"] if local else "호스트 미확인"
+        argv = getattr(child, "command", None) or []
+        assignments = []
+        if argv and argv[0] == "env":
+            for arg in argv[1:]:
+                if "=" not in arg:
+                    break
+                assignments.append(arg)
+        identity = getattr(child, "state_evidence", None) or {}
+        cpu_only = ("CUDA_VISIBLE_DEVICES=" in assignments
+                    and identity.get("reason") == "exact-identity-match"
+                    and not getattr(child, "remote_training", None))
+        where = ("%s:CPU" % _gpu_safe_text(local["host"])
+                 if local and cpu_only else "호스트/GPU 미확인")
     node = _gpu_safe_text(child.route_node or child.node or child.run_id)
     command = _resource_command_label(getattr(child, "command", None))
     if resources:
@@ -4699,7 +4711,6 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     context = getattr(entity, "context", None)
     pct = getattr(context, "used_pct", None) if context is not None else getattr(entity, "ctx_pct", None)
     now_text = getattr(entity, "summary", None)
-    resource_wait = getattr(entity, "resource_wait", None)
     resource_now = _resource_now_text(entity)
     if resource_now is not None:
         now_text = resource_now

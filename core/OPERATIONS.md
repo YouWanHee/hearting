@@ -1545,15 +1545,15 @@ Sessions with their own winning
 targets form separate supervisor groups; supervisor-to-supervisor relations
 remain communication (`✉`). This shared projection is a display handover, not a
 refusal or marker rewrite. Supervisor groups share one connector column under
-the first character inside `[id]`, drawn as a dashed `┆` on every row so it
-never reads as a box border. All session detail text and box left edges clear that
+the first character inside `[id]`, drawn as a dashed `┆` on every row rather than
+a box border. Session detail text and box left edges clear that
 column by two spaces, even without a connector; model, routing, NOW and box
 right-edge anchors stay fixed. The supervisor flag appears once after the model
-and effort. Resource-waiting owners use the same NOW projection on all three harnesses:
-show the exact resource's node and command, observed host/GPU, declared counters
+and effort. Resource-waiting owners share a NOW projection across harnesses with
+the exact resource's node and command, observed host/GPU, declared counters
 when available, elapsed time and last-log age. Missing observations remain named
-(`대기`, `로그 없음`, or unknown host/GPU); they never borrow another session's
-activity or change resource liveness. Runtime maintenance in a private snapshot
+(`대기`, `로그 없음`, or unknown host/GPU), without borrowed session activity or
+changes to resource liveness. Runtime maintenance in a private snapshot
 repository is plumbing, not a user tool call.
 Depth-1 frame cards use the owner model/gauge,
 routing and close-rail status layout on every harness; worker layouts retain

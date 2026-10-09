@@ -18,7 +18,8 @@ class ResourceNowTest(unittest.TestCase):
         child = model.ResourceJob(run_id="run", node=row["node"], liveness="working",
             pid=row["pid"], starttime=row["starttime"], process_group=row["process_group"],
             elapsed_min=row["elapsed_min"], command=row["command"],
-            log_updated_at=row["log_updated_at"], parent_attempt_id="att-owner")
+            log_updated_at=row["log_updated_at"], parent_attempt_id="att-owner",
+            state_evidence={"reason": "exact-identity-match"})
         return model.DispatchJob(key="lab", slug="owner", harness=harness, liveness="idle",
             attempt_id="att-owner", resource_children=[child],
             resource_wait={"state": "resource-parked", "nodes": [child.node], "run_ids": ["run"]},
@@ -38,7 +39,10 @@ class ResourceNowTest(unittest.TestCase):
                         text = render._resource_now_text(owner)
                         now = render._plain(render._context_detail_row(owner, term_width=180)[0])
                     self.assertIn(child.node, now)
-                    self.assertIn("moving4:" + ("0" if row["gpu"] == 0 else "CPU"), now)
+                    location = ("moving4:0" if row["gpu"] == 0 else
+                                "moving4:CPU" if row["node"] == "eval-run" else
+                                "호스트/GPU 미확인")
+                    self.assertIn(location, now)
                     self.assertIn("로그 ", now)
                     self.assertIn(model.fmt_min(child.elapsed_min), now)
                     self.assertIn(".py", text)
@@ -53,7 +57,7 @@ class ResourceNowTest(unittest.TestCase):
             full = render._resource_now_text(owner)
             self.assertIn("7/40 epoch", full)
             self.assertIn("로그 없음", full)
-            self.assertIn("호스트 미확인", full)
+            self.assertIn("호스트/GPU 미확인", full)
             for width in (60, 80, 100, 168):
                 line = render._context_detail_row(owner, term_width=width)[0]
                 self.assertLessEqual(sum(render._dw(t) for t, _ in line), width)
