@@ -1278,7 +1278,7 @@ def cmd_start(args):
         return _start_in_pane(args)
     # Hold the workspace claim until native start settles, including shell reuse.
     # A second start then reads the new layout instead of splitting the old cell.
-    key = hashlib.sha256(f"{_HERDR_SESSION or ''}:{beside.split(':')[0]}".encode()).hexdigest()
+    key = hashlib.sha256(f"{_HERDR_SESSION or 'default'}:{beside.split(':')[0]}".encode()).hexdigest()
     root = peer_message.peer_state_root() / "peer-starts"
     root.mkdir(parents=True, exist_ok=True)
     with (root / f"{key}.lock").open("a") as lock:

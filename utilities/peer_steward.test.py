@@ -3702,6 +3702,14 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("reason=pane-layout-unavailable", printed.call_args[0][0])
 
     def test_concurrent_starts_in_the_same_workspace_hold_the_claim_through_launch(self):
+        self.assert_serialized(None, None)
+
+    def test_implicit_and_explicit_default_session_share_the_workspace_claim(self):
+        for first_session, second_session in ((None, "default"), ("default", None)):
+            with self.subTest(first=first_session, second=second_session):
+                self.assert_serialized(first_session, second_session)
+
+    def assert_serialized(self, first_session, second_session):
         import multiprocessing
         ctx = multiprocessing.get_context("fork")
         first_entered, release, second_entered = ctx.Event(), ctx.Event(), ctx.Event()
@@ -3714,9 +3722,12 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
             return 0
         first_args = peer_steward.build_parser().parse_args(["start", "first", "--kind", "codex", "--beside", "w1:p0"])
         second_args = peer_steward.build_parser().parse_args(["start", "second", "--kind", "claude", "--beside", "w1:p1"])
+        def start(args, session):
+            peer_steward._HERDR_SESSION = session
+            peer_steward.cmd_start(args)
         with mock.patch.object(peer_steward, "_start_in_pane", side_effect=launch):
-            first = ctx.Process(target=peer_steward.cmd_start, args=(first_args,))
-            second = ctx.Process(target=peer_steward.cmd_start, args=(second_args,))
+            first = ctx.Process(target=start, args=(first_args, first_session))
+            second = ctx.Process(target=start, args=(second_args, second_session))
             first.start()
             try:
                 self.assertTrue(first_entered.wait(5))
