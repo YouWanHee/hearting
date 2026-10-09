@@ -1384,7 +1384,11 @@ def probe_host(name, host, owner_claims=None, ssh_session_bridges=None):
     script = ("export HEARTING_OWNER_CLAIMS_JSON=%s\n"
               "export HEARTING_SSH_SESSION_BRIDGES_JSON=%s\n%s") % (
                   shlex.quote(claims_json), shlex.quote(bridges_json), PROBE_SCRIPT)
-    result = remote(host, script, timeout=GPU_PROBE_TIMEOUT)
+    try:
+        result = remote(host, script, timeout=GPU_PROBE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"host": name, "reachable": False, "detail": str(exc)[:120],
+                "gpus": [], "observed_at": observed_at}
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().splitlines()
         return {"host": name, "reachable": False,
@@ -1502,6 +1506,14 @@ def cmd_probe(args):
     results = _probe_selected(_select(config, args.hosts), config["run_root"])
     if args.json:
         print(json.dumps(results, ensure_ascii=False, sort_keys=True))
+        # JSON is an observation receipt, not a payload verdict. Keep unavailable
+        # samples explicit without making a successful resource bridge exit 1.
+        for row in results:
+            detail = row.get("detail") or row.get("process_detail")
+            if not row["reachable"] or detail:
+                print(f"compute-hosts: observation unavailable or partial for {row['host']}: "
+                      f"{detail or 'unreachable'}", file=sys.stderr)
+        return 0
     else:
         for row in results:
             state = "up" if row["reachable"] else f"down ({row.get('detail', '')})"
