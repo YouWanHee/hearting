@@ -206,7 +206,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                                              process=process))
                     rows = [row for row in output.splitlines() if "● GPU gpu-host:0" in row]
                     self.assertEqual(len(rows), 1 if complete else 2)
-                    self.assertEqual(sum("owner-node" in row for row in rows), 1)
+                    self.assertEqual(sum(row.count("owner-node") for row in rows), 1)
                     now_rows = [row for row in output.splitlines()
                                 if "owner-node" in row and "● GPU" not in row]
                     self.assertEqual(len(now_rows), 1)
