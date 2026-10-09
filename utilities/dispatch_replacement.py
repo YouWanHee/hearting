@@ -174,6 +174,8 @@ def seal_launch_input(args, harness: str, task: str) -> str:
         'route_node': getattr(args, 'route_node', None) or '',
         'owner_route_id': getattr(getattr(args, 'owner_route_binding', None), 'route_id', ''),
     }
+    if getattr(args, 'replacement_retry_brief', ''):
+        payload['retry_brief'] = args.replacement_retry_brief
     path = _directory(jobs)/'inputs'/(aid+'.json')
     try:
         _once(path, payload)
@@ -1822,16 +1824,24 @@ def validate_attention(jobs, attention, *, allowed_attempts=None):
 
 def recovery_instructions(args):
     """Fresh rendering adds resume context without modifying the sealed raw task."""
+    brief = os.environ.pop('AGENT_DISPATCH_RETRY_BRIEF', '')
     prior = getattr(args, 'automatic_retry_of', None)
-    if not prior or getattr(args, 'worker_type', '') != 'owner':
-        return ''
-    jobs = Path(args.jobs_path)
-    index = source_reservation(jobs, prior)
-    if not index:
-        return ''
-    record = _check_record(_read(_record_path(jobs, index['family_id'])),index['family_id'])
-    if record['replacement_attempt_id'] != args.attempt_id:
-        raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
+    record = None
+    if prior:
+        jobs = Path(args.jobs_path)
+        index = source_reservation(jobs, prior)
+        if index:
+            record = _check_record(_read(_record_path(jobs, index['family_id'])),index['family_id'])
+            if record['replacement_attempt_id'] != args.attempt_id:
+                raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
+            # The caller's environment is transient; replay guidance from the
+            # original digest-checked input, just like its raw task.
+            source = _rows(jobs.read_text().splitlines())[prior][1]
+            brief = launch_input(jobs, prior, source).get('retry_brief', brief)
+    args.replacement_retry_brief = brief
+    retry_context = ('\n\n## Partial-group retry brief\n' + brief + '\n') if brief else ''
+    if not record or getattr(args, 'worker_type', '') != 'owner':
+        return retry_context
     completed = ', '.join(str(row['node']) for row in record['reuse']['completed']) or '(none)'
     kind = (record.get('proof') or {}).get('death_kind')
     fix = kind == CORRECTED and (record.get('proof') or {}).get('source_result') == 'FAIL'
@@ -1879,7 +1889,7 @@ def recovery_instructions(args):
                 text += (f'The owner {answered} ended BLOCKED and a person has answered it; '
                          'that answer is for this work.\n')
             text += _correction_context(jobs, answered, proof)
-    return text + CONTINUATION_WAIT_NOTE
+    return text + CONTINUATION_WAIT_NOTE + retry_context
 
 
 def _gate_context(jobs, record):

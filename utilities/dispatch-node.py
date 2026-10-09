@@ -952,8 +952,15 @@ def main():
   if review_candidate is not None: a.reviewed_evidence=review_candidate["path"]
  except DispatchContractError as e:
   print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)
- prompt_text=(original_task if original_task is not None else
-              a.prompt_text+round_protocol_block(round_budget,prior_rounds,worker_type,node["id"]))
+ round_context=round_protocol_block(round_budget,prior_rounds,worker_type,node["id"])
+ if original_task is None and group and os.environ.get(GOVERNOR_RESERVATION_ENV):
+  # The reservation seals the raw group assignment, including on a later
+  # round. Round guidance is recovery context, just like a partial retry brief.
+  if round_context:
+   os.environ["AGENT_DISPATCH_RETRY_BRIEF"]=os.environ.get("AGENT_DISPATCH_RETRY_BRIEF", "")+round_context
+  prompt_text=a.prompt_text
+ else:
+  prompt_text=original_task if original_task is not None else a.prompt_text+round_context
  if round_budget.correction_round: print(f"correction_round={round_budget.correction_round}")
  argv=[sys.executable,str(wrapper),"--"+a.action,"--worktree",launch_worktree,"--slug",a.slug,"--capability",route["capability"],"--capability-mode",route["capability_mode"],"--intensity",route["effective_intensity"],"--dispatch-depth",str(node.get("dispatch_depth",1)),"--worker-type",worker_type,"--unit",node.get("unit",""),"--assigned-contract",contract,"--owner",route["capability"],"--route-file",str(Path(a.route).resolve()),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node",node["id"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--jobs",str(registry.path),"--prompt-text",prompt_text]
  if a.reviewed_evidence: argv += ["--reviewed-evidence",a.reviewed_evidence]
