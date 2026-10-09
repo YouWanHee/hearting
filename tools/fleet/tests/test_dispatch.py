@@ -2489,7 +2489,8 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
         self.assertNotIn("drill:g9", text)
         self.assertNotIn(" main", text)
 
-    def test_unparented_drill_temp_job_groups_under_fixture(self):
+    @mock.patch("fleet.model.gitinfo.resolve_gitdir", return_value=(None, None))
+    def test_unparented_drill_temp_job_groups_under_fixture(self, _gitdir):
         job = DispatchJob(key="drill", slug="drill-g9", cwd="/tmp/drill-g9-abcd/repo",
                           harness="codex", mode="loop/drill", qa="quick", qa_source="jobslog",
                           liveness="working", worker_role="g9_cross_harness_depth2_dispatch")
@@ -2500,7 +2501,8 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
         self.assertIn("drill:g9/", text)
         self.assertNotIn("loops/", text)
 
-    def test_drill_case_code_owner_is_group_root_not_orphan(self):
+    @mock.patch("fleet.model.gitinfo.resolve_gitdir", return_value=(None, None))
+    def test_drill_case_code_owner_is_group_root_not_orphan(self, _gitdir):
         # 2026-07-24 (user "orphan으로 잡히고 메인 세션은 연결도 안되고"): a non-LOOPS `code` owner
         # spawned INSIDE a drill fixture carries the harness's sentinel parent
         # (`drill-<h>-parent-session`, unresolvable by design). It must render as the drill:<case>
@@ -3000,9 +3002,10 @@ class FastFirstPublicationTest(unittest.TestCase):
 
     ``fast_first`` keeps exact PID/start, registry tuples, and every field the
     single classifier reads (runtime session/activity association), while
-    display-only fills (sidecar titles/summaries, rollout fallback, sub-agent
-    scans) stay empty the way unscanned attempts already look. The next full
-    snapshot fills them; ``--once``/JSON always takes the full pass.
+    display-only fills (sidecar titles, rollout fallback, sub-agent scans)
+    stay empty the way unscanned attempts already look. The next full
+    snapshot fills them; cheap exact sidecar NOW remains in both passes.
+    ``--once``/JSON always takes the full pass.
     """
 
     ATTEMPT = "att-fastfirst-1"
@@ -3085,11 +3088,12 @@ class FastFirstPublicationTest(unittest.TestCase):
             self.assertEqual(full._runtime_activity["thread_id"], self.THREAD)
             self.assertEqual(fast._transcript_path, full._transcript_path)
             self.assertIsNotNone(fast._transcript_path)
-            # Display-only fills stay empty on the fast pass and arrive full.
+            # Titles defer, but exact cheap NOW is basic observed state.
             self.assertIsNone(fast.title)
             self.assertEqual(full.title, "Fixture Title")
-            self.assertIsNone(fast.summary)
+            self.assertEqual(fast.summary, "Fixture Summary")
             self.assertEqual(full.summary, "Fixture Summary")
+            self.assertEqual(fast.summary_ts, full.summary_ts)
             # Attempt-log telemetry is free math: identical in both passes.
             self.assertEqual((fast.active_context_tokens,
                               full.active_context_tokens), (4000, 4000))

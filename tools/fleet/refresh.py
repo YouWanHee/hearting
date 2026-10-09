@@ -43,6 +43,7 @@ class LiveSnapshot:
     resources: list = field(default_factory=list)
     usage_snapshots: dict = field(default_factory=dict)
     malformed: int = 0
+    node_evidence: dict = field(default_factory=dict)
     memory: object = None
     governor: object = None
     hearting: dict = None
