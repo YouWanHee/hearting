@@ -434,6 +434,14 @@ accumulation. Stale, foreign, reused-PID, changed-command, malformed, or expired
 leases fall back to ordinary no-progress handling, and the runner removes the
 lease when the command exits.
 
+Partial-group continuation launches retain the sealed source request as the
+raw assignment checked by every adapter. A changed retry brief is appended to
+the worker's recovery context, along with later-round guidance, without changing
+that assignment or its digest.
+The replacement manifest binds the current owner attempt; successful peers keep
+their original owner and completion evidence. Launch refusals retain their
+field-level detail in both the batch receipt and its diagnostic ledger.
+
 Normal and capacity fallback attempt hashes include the exact
 `parent_attempt_id`. Retries under one parent remain idempotent; a successor
 owner generation receives a distinct attempt even when it reuses the same slug.

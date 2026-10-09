@@ -1822,13 +1822,15 @@ def validate_attention(jobs, attention, *, allowed_attempts=None):
 
 def recovery_instructions(args):
     """Fresh rendering adds resume context without modifying the sealed raw task."""
+    brief = os.environ.pop('AGENT_DISPATCH_RETRY_BRIEF', '')
+    retry_context = ('\n\n## Partial-group retry brief\n' + brief + '\n') if brief else ''
     prior = getattr(args, 'automatic_retry_of', None)
     if not prior or getattr(args, 'worker_type', '') != 'owner':
-        return ''
+        return retry_context
     jobs = Path(args.jobs_path)
     index = source_reservation(jobs, prior)
     if not index:
-        return ''
+        return retry_context
     record = _check_record(_read(_record_path(jobs, index['family_id'])),index['family_id'])
     if record['replacement_attempt_id'] != args.attempt_id:
         raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
@@ -1879,7 +1881,7 @@ def recovery_instructions(args):
                 text += (f'The owner {answered} ended BLOCKED and a person has answered it; '
                          'that answer is for this work.\n')
             text += _correction_context(jobs, answered, proof)
-    return text + CONTINUATION_WAIT_NOTE
+    return text + CONTINUATION_WAIT_NOTE + retry_context
 
 
 def _gate_context(jobs, record):
