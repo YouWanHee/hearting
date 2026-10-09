@@ -89,12 +89,21 @@ def resource_body_digest(row):
     return RESUME.row_digest(body)
 
 
+def resource_execution_finished(row):
+    """A terminal payload, successful or failed, can precede another run."""
+    from resource_run_registry import classify_identity
+    if (row.get("status") == "launching" or row.get("cancel_requested")
+            or row.get("parent_close_requested") or classify_identity(row)[0] != "exited"):
+        return False
+    code = supervisor().runner().read_sentinel(row.get("sentinel"))
+    return (code is not None and row.get("exit_code", code) == code
+            and not (row.get("status") == "failed" and code == 0)
+            and not (row.get("status") == "succeeded" and code != 0))
+
+
 def resource_execution_succeeded(row):
     """A past status word cannot substitute for the exact exit and sentinel."""
-    from resource_run_registry import classify_identity
-    return (row.get("status") not in {"launching", "failed"}
-            and not row.get("cancel_requested") and not row.get("parent_close_requested")
-            and classify_identity(row)[0] == "exited"
+    return (resource_execution_finished(row)
             and supervisor().runner().read_sentinel(row.get("sentinel")) == 0)
 
 

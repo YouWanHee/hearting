@@ -851,6 +851,14 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
+A resource that has verifiably exited, including a nonzero guard exit that
+saved a checkpoint, may be followed by a new run ID on the same route and
+node. Registration and supervisor arming use the same terminal-execution
+judgment; they preserve the old row and journal its predecessor binding.
+An active or unobservable execution cannot be replaced, and evidence paths
+cannot overlap any prior run. Only the failed resource stage returns to
+running; unrelated failures and already claimed successors are preserved.
+
 The existing owner input state receives the verified native session identity
 as soon as the transport binds it, including during the first model turn.
 A registered resource launched in that turn uses the same live supervisor and
@@ -862,7 +870,8 @@ payload. The same route's normal `start` is the claimed successor: before the
 resource succeeds it reports resource readiness/liveness, and afterwards it
 starts only the independent verifier. The receipt distinguishes the resource,
 watch and verification identities. A repeated exact launch returns the existing
-run; a changed launch or another run for that route/node cannot duplicate it.
+run; a changed body under that run ID is refused, and another run ID cannot
+duplicate an active execution on that route/node.
 Exit failure, a missing sentinel or unverifiable identity starts no verifier.
 Verification completion retains the existing parent-delivery receipt and its
 supported fallback; watch startup or queue acceptance alone is not receipt.
