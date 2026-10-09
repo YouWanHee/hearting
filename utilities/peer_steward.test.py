@@ -4629,6 +4629,31 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                     ["herdr", "pane", "close", "w1:pOld"],
                 ])
 
+    def test_finalizing_retire_is_accepted_then_resumed_once(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                world = _RetireWorld(harness=harness, status="finalizing")
+                rc, line = self.retire(world)
+                self.assertEqual(rc, 0)
+                self.assertIn("reason=agent-finalizing", line)
+                self.assertIn("pending=true", line)
+                self.assertEqual(world.actions(), [])
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty = store.list()[0]
+                self.assertEqual(duty["state"], "pending")
+                world.status = "idle"
+                self._run_retire_runner(world)
+                settled = store.get(duty["id"])
+                self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                                 ("complete", "normal-exit", "complete"))
+                exits = ([
+                    ["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+                    ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+                ] if harness == "claude" else [
+                    ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+                ])
+                self.assertEqual(world.actions(), exits + [["herdr", "pane", "close", "w1:pOld"]])
+
     def test_idle_retire_with_bound_pending_or_unknown_work_sends_no_exit(self):
         from dispatch_contract import ObservedAttemptLiveness
         meta = ("attempt_id=att-bound,parent_sid=old-sid,parent_pane=w1:pOld,"

@@ -443,7 +443,7 @@ def _run_herdr_wait(target, until, timeout_ms):
     return None
 
 
-_AGENT_STATES = ("idle", "done", "blocked", "working", "unknown")
+_AGENT_STATES = ("idle", "done", "blocked", "working", "finalizing", "unknown")
 _LAST_HERDR_EXIT = None          # real `herdr agent wait` return code of the last call (m3)
 _HERDR_GET_TIMEOUT_SECONDS = 15  # `watch` pre-check must never hang the caller (M3)
 _CLAIM_TIMEOUT_MS = 15_000       # dedupe claim acquisition bound (M3)
