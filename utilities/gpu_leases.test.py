@@ -142,7 +142,7 @@ class LeasesTest(unittest.TestCase):
         spec.loader.exec_module(runner)
         route = self.root / "route.json"
         route.write_text(json.dumps({"capability": "autopilot-lab", "artifact_root": str(self.root),
-            "nodes": [{"id": "gpu", "kind": "resource-runner", "resource_class": "gpu",
+            "nodes": [{"id": "full-run", "kind": "resource-runner", "resource_class": "long-running",
                        "resource_transport": "detached-process"}]}))
         registry, log = self.root / "runs.json", self.root / "resource.log"
         output, children = io.StringIO(), []
@@ -156,7 +156,7 @@ class LeasesTest(unittest.TestCase):
              mock.patch.object(runner.subprocess, "run"), mock.patch.object(runner, "register_registry"), \
              mock.patch.object(runner.subprocess, "Popen", side_effect=spawn), mock.patch("sys.stdout", output):
             runner.main(["--registry", str(registry), "start", "--run-id", "local", "--cwd", str(self.root),
-                         "--log", str(log), "--route", str(route), "--node", "gpu", "--smoke-attestation", "unused",
+                         "--log", str(log), "--route", str(route), "--node", "full-run", "--smoke-attestation", "unused",
                          "--", sys.executable, "-c", "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])"])
             children[0].wait(timeout=5)
         row = json.loads(output.getvalue())
@@ -164,6 +164,102 @@ class LeasesTest(unittest.TestCase):
         self.assertEqual(log.read_text().strip(), "0")
         self.assertEqual(Path(row["sentinel"]).read_text(), "0")
         self.assertEqual(G.snapshot(self.state), [])
+
+    def test_shared_state_separates_hosts_and_never_prunes_foreign_host_pids(self):
+        first = self.acquire(requested="0")
+        with G.locked(self.state) as data:
+            data["leases"][first["token"]]["host"] = "another-host"
+            data["leases"][first["token"]]["starttime"] = "0"
+        second = self.acquire(requested="0")
+        self.assertEqual(second["gpus"], ["0"])
+        with G.locked(self.state) as data:
+            self.assertIn(first["token"], data["leases"])
+        self.assertEqual([row["token"] for row in G.snapshot(self.state)], [second["token"]])
+
+    def test_supervised_full_run_uses_existing_gpu_scope_before_releasing_payload(self):
+        import artifact_producer
+        spec = importlib.util.spec_from_file_location("_gpu_verified_runner", Path(G.__file__).with_name("resource-runner.py"))
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        jobs = self.state.parent / "jobs.log"
+        jobs.parent.mkdir(parents=True)
+        jobs.write_text("")
+        route_file, registry, log = self.root / "verified-route.json", self.root / "verified-runs.json", self.root / "verified.log"
+        route = {"route_id": "rt-gpu-scope", "route_hash": "sha256:fixture", "capability": "autopilot-lab",
+                 "nodes": [{"id": "full-run", "kind": "resource-runner", "resource_class": "long-running"}]}
+        placeholder = {"run_id": "supervised", "cwd": str(self.root), "log": str(log),
+            "route": str(route_file), "node": "full-run", "status": "launching", "sentinel": str(log) + ".exit",
+            "progress_file": str(log) + ".progress", "owner_wait": {"session_id": "fixture"},
+            "command": [sys.executable, "-c", "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])"]}
+        children, output = [], io.StringIO()
+        real_popen = subprocess.Popen
+        def spawn(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            children.append(proc)
+            return proc
+        with mock.patch.object(G, "local_observation", return_value=OBS), \
+             mock.patch.object(runner, "register_registry"), \
+             mock.patch.object(artifact_producer, "prepare_route_artifact_env", return_value={"AGENT_ARTIFACT_OUTPUT_DIR": str(self.root)}), \
+             mock.patch.object(runner, "start_watch", return_value=(mock.Mock(), runner.proc_identity(os.getpid()))), \
+             mock.patch.object(runner.subprocess, "run"), \
+             mock.patch.object(runner.subprocess, "Popen", side_effect=spawn), mock.patch("sys.stdout", output):
+            runner.start_verified(registry, SimpleNamespace(jobs=str(jobs), run_id="supervised", node="full-run"),
+                                  route, route_file, placeholder)
+            children[0].wait(timeout=5)
+        self.assertEqual(json.loads(output.getvalue())["gpus"], "0")
+        self.assertEqual(log.read_text().strip(), "0")
+        self.assertEqual(G.snapshot(self.state), [])
+
+    def test_inline_cuda_choice_is_honored_and_suggestions_exclude_reservations(self):
+        self.assertEqual(G.requested_devices(["env", "CUDA_VISIBLE_DEVICES=1", "python", "train.py"]), "1")
+        tool_spec = importlib.util.spec_from_file_location("_gpu_suggest_compute", Path(G.__file__).with_name("compute-hosts.py"))
+        tool = importlib.util.module_from_spec(tool_spec)
+        tool_spec.loader.exec_module(tool)
+        observation = json.loads(json.dumps(OBS))
+        observation["gpus"][0]["reservations"] = [{"token": "busy"}]
+        with mock.patch.object(tool, "probe_host", return_value=observation):
+            self.assertEqual(tool._run_gpu_observation("here", {})["suggested_gpu"], 1)
+
+    def test_compute_cmd_run_auto_selects_and_refuses_busy_explicit_device_end_to_end(self):
+        spec = importlib.util.spec_from_file_location("_gpu_end_to_end_compute", Path(G.__file__).with_name("compute-hosts.py"))
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        finish = self.root / "finish"
+        code = ("import os,time; from pathlib import Path; print(os.environ['CUDA_VISIBLE_DEVICES'],flush=True); "
+                "end=time.monotonic()+10; p=Path(%r); "
+                "exec('while not p.exists() and time.monotonic()<end: time.sleep(.02)')" % str(finish))
+        args = SimpleNamespace(host="fixture", command=[sys.executable, "-c", code], name="managed-fixture",
+                               cwd=None, env=None, gpus=None, share=False, dry_run=False, json=True)
+        real_run = subprocess.run
+        def local_remote(_host, script, **kwargs):
+            return real_run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+        output, warning = io.StringIO(), io.StringIO()
+        with mock.patch.object(tool, "load_config", return_value={"run_root": self.root / "managed-runs",
+                         "hosts": {"fixture": {"ssh_host": "local"}}}), \
+             mock.patch.object(G, "state_path", return_value=self.state), \
+             mock.patch.object(tool, "_run_gpu_observation", return_value=OBS), \
+             mock.patch.object(tool, "_launcher_session_owner", return_value=None), \
+             mock.patch.object(tool, "_launcher_provenance", return_value={}), \
+             mock.patch.object(tool, "_launcher_route", return_value=None), \
+             mock.patch.object(tool, "_spawn_completion_watch", return_value=False), \
+             mock.patch.object(tool, "remote", side_effect=local_remote), \
+             mock.patch("sys.stdout", output), mock.patch("sys.stderr", warning):
+            try:
+                self.assertEqual(tool.cmd_run(args), 0)
+                receipt = json.loads(output.getvalue())
+                self.assertEqual(receipt["gpus"], "0")
+                self.assertTrue(receipt["gpu_lease"]["token"])
+                args.gpus = "0"
+                self.assertEqual(tool.cmd_run(args), 1)
+                self.assertIn("GPU in use", warning.getvalue())
+                self.assertIn("free GPUs: gpu1", warning.getvalue())
+            finally:
+                finish.write_text("done")
+        deadline = time.monotonic() + 5
+        while G.snapshot(self.state) and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertEqual(G.snapshot(self.state), [])
+        self.assertEqual((self.root / "managed-runs" / receipt["run_id"] / "log").read_text().strip(), "0")
 
     def test_composed_probe_script_compiles_without_changing_early_exit_indentation(self):
         spec = importlib.util.spec_from_file_location("_gpu_test_compute", Path(G.__file__).with_name("compute-hosts.py"))

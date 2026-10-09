@@ -1435,7 +1435,7 @@ def probe_host(name, host, owner_claims=None, ssh_session_bridges=None):
            "swap_total_mib": payload.get("swap_total_mib"),
            "swap_used_mib": payload.get("swap_used_mib"),
            "gpus": gpus, "observed_at": payload.get("observed_at") or observed_at,
-            "unmatched_processes": payload.get("unmatched_processes") or []}
+           "unmatched_processes": payload.get("unmatched_processes") or []}
     if payload.get("reservation_detail"):
         row["reservation_detail"] = payload["reservation_detail"]
     if payload.get("gpu_error"):
@@ -1510,7 +1510,7 @@ def cmd_list(args):
         cpu = row.get("cpu_utilization_pct")
         cpu_text = "%s%%" % cpu if isinstance(cpu, int) else "—"
         print(f" {here}{row['host']:<10} up   cpu {cpu_text:<4} "
-               f"load {row.get('load', '?')}  | {summary}")
+              f"load {row.get('load', '?')}  | {summary}")
         import gpu_leases
         for gpu in row["gpus"]:
             for lease in gpu.get("reservations", []):
@@ -1655,18 +1655,19 @@ def _run_gpu_observation(name, host):
         row = {"reachable": False, "detail": str(exc)[:120], "gpus": [],
                "observed_at": datetime.datetime.now().timestamp()}
     gpus = [{key: gpu.get(key) for key in
-              ("index", "uuid", "name", "free_mib", "total_mib", "utilization_gpu_pct", "processes", "reservations")}
+             ("index", "uuid", "name", "free_mib", "total_mib", "utilization_gpu_pct", "processes", "reservations")}
             for gpu in row.get("gpus", [])]
     idle = [gpu for gpu in row.get("gpus", [])
-            if row.get("reachable") and not row.get("process_detail")
+            if row.get("reachable") and not row.get("process_detail") and not row.get("reservation_detail")
             and gpu.get("utilization_gpu_pct") == 0
             and gpu.get("processes") == []
+            and not gpu.get("reservations")
             and type(gpu.get("free_mib")) is int and gpu["free_mib"] > 0]
     suggested = max(idle, key=lambda gpu: (gpu["free_mib"], -gpu["index"]),
                     default=None)
     return {"observed_at": row.get("observed_at"),
             "reachable": row.get("reachable"), "detail": row.get("detail"),
-             "process_detail": row.get("process_detail"), "gpus": gpus,
+            "process_detail": row.get("process_detail"), "gpus": gpus,
             "reservation_detail": row.get("reservation_detail"),
             "suggested_gpu": suggested["index"] if suggested is not None else None}
 

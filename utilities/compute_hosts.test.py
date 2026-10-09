@@ -215,9 +215,9 @@ class RunGPUObservationTest(unittest.TestCase):
         for key, _harness in self.module.SESSION_ENV_KEYS:
             self.assertNotIn("export " + key + "=", launch)
 
-    def run_receipt(self, row, *, dry_run=False, json_output=False):
+    def run_receipt(self, row, *, dry_run=False, json_output=False, cpu=False):
         args = SimpleNamespace(host="here", command=["true"], name="headroom",
-                               cwd=None, env=None, gpus=None, dry_run=dry_run,
+                               cwd=None, env=None, gpus="" if cpu else None, dry_run=dry_run,
                                json=json_output)
         output = io.StringIO()
         with mock.patch.object(self.module, "load_config", return_value=self.config), \
@@ -267,11 +267,11 @@ class RunGPUObservationTest(unittest.TestCase):
         launch.assert_not_called()
         self.assertFalse(self.run_root.exists())
 
-    def test_failed_probe_preserves_launch_and_unknown_receipt(self):
+    def test_failed_probe_preserves_explicit_cpu_launch_and_unknown_receipt(self):
         for row in ({"reachable": False, "observed_at": 1728000000,
                      "detail": "timed out", "gpus": []}, OSError("probe unavailable")):
             with self.subTest(row=row):
-                text, launch = self.run_receipt(row)
+                text, launch = self.run_receipt(row, cpu=True)
                 self.assertIn("started ", text)
                 self.assertIn("GPU headroom: unknown", text)
                 self.assertNotIn("suggested:", text)
@@ -282,7 +282,7 @@ class RunGPUObservationTest(unittest.TestCase):
                "process_detail": "compute process query unavailable", "gpus": [
                    {"index": 0, "free_mib": 8000, "utilization_gpu_pct": 0,
                     "processes": []}]}
-        text, _ = self.run_receipt(row, json_output=True)
+        text, _ = self.run_receipt(row, json_output=True, cpu=True)
         self.assertIsNone(json.loads(text)["gpu_observation"]["suggested_gpu"])
 
 

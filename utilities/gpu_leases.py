@@ -58,6 +58,8 @@ def identity(pid):
 
 def living(record):
     """False is proven death; unreadable/foreign namespace stays occupied."""
+    if record.get("host") != socket.gethostname().lower().split(".")[0]:
+        return None
     if record.get("pid_namespace") != os.readlink("/proc/self/ns/pid"):
         return None
     try:
@@ -110,7 +112,8 @@ def snapshot(path):
     if not Path(path).exists():
         return []
     with locked(path) as data:
-        return list(data["leases"].values())
+        host = socket.gethostname().lower().split(".")[0]
+        return [row for row in data["leases"].values() if row.get("host") == host]
 
 
 def owner_label(owner):
@@ -175,7 +178,9 @@ def select(observation, leases, requested=None, share=False):
 
 def acquire(path, observation, *, requested=None, share=False, owner=None, task="", run_id=""):
     with locked(path) as data:
-        devices = select(observation, list(data["leases"].values()), requested, share)
+        host = socket.gethostname().lower().split(".")[0]
+        leases = [row for row in data["leases"].values() if row.get("host") == host]
+        devices = select(observation, leases, requested, share)
         if not devices:
             return None
         token = uuid.uuid4().hex
@@ -265,10 +270,10 @@ def local_observation():
     return tool._run_gpu_observation(socket.gethostname(), {"ssh_host": "local"})
 
 
-def resource_admission(node, command, *, share=False, jobs=None, run_id=""):
+def resource_admission(node, command, *, gpu_scoped=False, share=False, jobs=None, run_id=""):
     """Use the route's GPU declaration and the existing CUDA environment choice."""
     requested = requested_devices(command, os.environ.get("CUDA_VISIBLE_DEVICES"))
-    if requested == "" or (requested is None and node.get("resource_class") != "gpu"):
+    if requested == "" or (requested is None and node.get("resource_class") != "gpu" and not gpu_scoped):
         return None, None, {}
     observation = local_observation()
     path = state_path({**os.environ, **({"AGENT_DISPATCH_JOBS": str(jobs)} if jobs else {})})

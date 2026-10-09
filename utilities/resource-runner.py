@@ -5,6 +5,7 @@ from pathlib import Path
 import resource_resume as RESOURCE_RESUME
 from resource_progress import environment as progress_environment
 import gpu_leases
+from gpu_execution_sandbox import gpu_resource_nodes
 from resource_run_registry import (
     classify_identity,
     is_alive,
@@ -242,7 +243,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             return
         node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
         lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
-            node, placeholder["command"], share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
+            node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
+            share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
         watch, supervision = start_watch(route_file, jobs, placeholder["cwd"], runtime)
         log = Path(placeholder["log"])
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -457,7 +459,8 @@ def main(argv=None, *, controller=None):
         lease_path, gpu_lease, gpu_env = None, None, {}
         try:
             lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
-                node, command, share=args.share, jobs=args.jobs, run_id=args.run_id)
+                node, command, gpu_scoped=args.node in gpu_resource_nodes(route),
+                share=args.share, jobs=args.jobs, run_id=args.run_id)
         except Exception:
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             raise
@@ -505,6 +508,10 @@ def main(argv=None, *, controller=None):
             os.write(release, b"start\n")
         except Exception:
             gpu_leases.release(lease_path, gpu_lease)
+            def discard_own(data):
+                if data["runs"].get(args.run_id) in (placeholder, run):
+                    data["runs"].pop(args.run_id)
+            locked_update(registry, discard_own)
             raise
         finally:
             os.close(release)
