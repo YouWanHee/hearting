@@ -908,9 +908,9 @@ def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[
 def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
     """A closed, unused candidate cannot take an executed predecessor's cycle.
 
-    Audit bindings are history, not execution evidence. Read the exact sealed
-    route's registry and marker directory afresh; missing or unreadable evidence
-    is unknown. Any attempt, marker, or descendant keeps the route attached.
+    Audit bindings and unconsumed registrations are history, not execution.
+    Read the exact route registry and markers afresh; missing or unreadable
+    evidence stays unknown. Started or unresolved launches stay attached.
     """
     outcome = _read_json(route_lineage.canonical_route_path(root, route["route_id"]).with_suffix(".outcome.json"))
     if (not isinstance(outcome, dict)
@@ -942,7 +942,9 @@ def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> boo
                 return False
             meta = dispatch_contract.parse_registry_metadata(fields[5])
             if route["route_id"] in {meta.get("route_id"), meta.get("route"), meta.get("owner_route_id")}:
-                return False
+                from route_authority import continuation_attempt_state
+                if continuation_attempt_state(meta) != "unstarted":
+                    return False
         markers = module.completion_dir(route["route_id"], jobs=jobs)
         if markers.exists() and any(markers.iterdir()):
             return False

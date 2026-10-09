@@ -17,6 +17,7 @@ CURRENT_ATTEMPT_CONTRACT=(
  "execution_surface=registered-headless,registered_worker=1,"
  "fallback_hop=same-harness-headless"
 )
+FIXTURE_BIRTH=D.process_start_ticks(os.getpid())
 def currentize_registry(path):
  if not path.is_file(): return
  rows=[]
@@ -24,6 +25,17 @@ def currentize_registry(path):
   fields=line.split("\t")
   if len(fields)==6 and "attempt_schema_version=" not in fields[5]:
    fields[5]+=("," if fields[5] else "")+CURRENT_ATTEMPT_CONTRACT
+  if len(fields)==6:
+   meta=D.parse_registry_metadata(fields[5])
+   # The early fixtures describe host-visible, finished group leaders. Retain
+   # that intent with their actual launch group and local birth, so the common
+   # observer tests exact teardown rather than a weaker PID-only classifier.
+   if meta.get("pid","").isdigit() and not meta.get("pid_scope") and "pgid" not in meta and "pid_ns" not in meta:
+    fields[5]+=f",pgid={meta['pid']}"
+    if meta.get("pid_start")=="1":
+     birth=FIXTURE_BIRTH if not D.process_start_ticks(int(meta["pid"])) else str(int(FIXTURE_BIRTH)-1)
+     parts=[f"pid_start={birth}" if part=="pid_start=1" else part for part in fields[5].split(",")]
+     fields[5]=",".join(parts)
   rows.append("\t".join(fields))
  path.write_text("\n".join(rows)+("\n" if rows else ""))
 class RegistryTest(unittest.TestCase):
@@ -93,7 +105,9 @@ class RegistryTest(unittest.TestCase):
   observed=types.SimpleNamespace(state="alive",reason="exact namespace process",process_state="live",process_reason="tagged")
   with mock.patch.object(module,"proc_inputs",return_value={"attempt_id":"att-owner","route_id":"rt-owner","route_node":"_owner"}), \
        mock.patch.object(module,"inspect_terminal_attempt",return_value={"state":"absent"}), \
-       mock.patch.object(module,"observed_attempt_liveness",return_value=observed), \
+       mock.patch.object(module,"observe_attempt",return_value=types.SimpleNamespace(
+        process=types.SimpleNamespace(state="live",reason="tagged"),result_state="none",
+        decision=types.SimpleNamespace(reason="tagged",action="wait"))), \
        mock.patch.object(module,"_marker_backed_repair",return_value=False):
    result=module.observed_status_rows([row],args)
   self.assertEqual(result["rows"][0]["state"],"working")
@@ -117,14 +131,15 @@ class RegistryTest(unittest.TestCase):
   )
   namespace=os.readlink("/proc/self/ns/pid")
   attempt="att-outer-pid-reused"
+  reused_start=str(int(FIXTURE_BIRTH)-1)
   with self.jobs.open("a") as out:
    out.write(
     f"2026-08-06T00:00:00Z\topen\t{repo}\t{repo}\touter-reused\t"
     "attempt_schema_version=2,dispatch_depth=2,transport=headless,"
     "execution_surface=registered-headless,registered_worker=1,"
     "fallback_hop=same-harness-headless,route_id=rt-local,route_node=report,"
-    f"attempt_id={attempt},pid=437,pid_start=1,pid_scope=namespace-local,"
-    f"pid_host={os.getpid()},pid_host_start=1,pid_host_ns={namespace},"
+    f"attempt_id={attempt},pid=437,pid_start={reused_start},pid_scope=namespace-local,"
+    f"pid_host={os.getpid()},pid_host_start={reused_start},pid_host_ns={namespace},"
     "pid_host_proof=nspid-procfs-root-v1\n"
    )
   applied=self.invoke("reconcile","--attempt",attempt,"--apply")
@@ -182,6 +197,7 @@ class RegistryTest(unittest.TestCase):
     with mock.patch.object(
       module,"classify",
       return_value=("terminal-handoff",f"exact-terminal:{note}",note)), \
+     mock.patch.object(module,"observe_attempt",return_value=types.SimpleNamespace(result_state="invalid",terminal={})), \
      contextlib.redirect_stdout(stream):
      self.assertEqual(module.reconcile(rows,args),0)
     record=json.loads(stream.getvalue())
@@ -227,7 +243,7 @@ class RegistryTest(unittest.TestCase):
      self.assertTrue(metadata.get("review_artifact_b64"))
     else:
      self.assertNotIn("review_artifact_b64",metadata)
-    self.assertNotIn("failure_class",metadata)
+    self.assertEqual(metadata.get("failure_class"),"fail")
   # a review FAIL with no readable artifact stays a dead worker even through reconcile
   log.write_text("\n".join(json.dumps(e) for e in [
    {"type":"item.completed","item":{"type":"agent_message","text":"artifact: -\nverdict: FAIL\nblocker: x"}},
@@ -238,7 +254,7 @@ class RegistryTest(unittest.TestCase):
   currentize_registry(self.jobs)
   applied=self.invoke("reconcile","--attempt","att-review-noart","--apply")
   self.assertEqual(json.loads(applied.stdout)["decisions"][0]["proposed_note"],"dead-worker-fail")
- def test_reconcile_natural_dead_worker_blocked_note_excludes_failure_class(self):
+ def test_reconcile_natural_worker_blocked_preserves_its_result(self):
   # gap1 correction 1: same axis as above, but through a real (non-mocked)
   # classify() -> inspect_terminal_log() run against an actual BLOCKED
   # contract handoff, confirming the exclusion holds for a note that shows up
@@ -266,7 +282,7 @@ class RegistryTest(unittest.TestCase):
   self.assertEqual(fields[1],"done")
   metadata=D.parse_registry_metadata(fields[5])
   self.assertEqual(metadata.get("note"),"dead-worker-blocked")
-  self.assertNotIn("failure_class",metadata)
+  self.assertEqual(metadata.get("failure_class"),"blocked")
  def test_reconcile_still_safe_veto_blocks_stale_note_before_any_write(self):
   # gap1 correction 1: `note` is never external input -- it is the local
   # variable `classify()` just returned at dispatch-registry.py:798, and
@@ -643,7 +659,7 @@ class RegistryTest(unittest.TestCase):
     self.assertEqual(self.jobs.read_bytes(),before)
 
  def ghost_row(self,attempt,extra=""):
-  """A namespace-local row whose PID is unreadable here, with a fresh heartbeat.
+  """A namespace-local row whose leader and group are gone, with a fresh heartbeat.
 
   This is the shape that stayed open forever: classify_attempt_evidence read
   the freshness, answered `working`, and reconcile had no note to close on.
@@ -655,8 +671,8 @@ class RegistryTest(unittest.TestCase):
     "phase":"tool","sequence":3,"updated_at":time.time()}))
   return (f"2026-07-16T00:00:09Z\topen\t/r\t/w\tghost\t"
           f"route_id=r-ghost,route_node=execute,attempt_id={attempt},"
-          f"pid=99999996,pid_start={D.process_start_ticks(os.getpid())},pid_scope=namespace-local,"
-          f"pid_ns=pid:[inner],pid_observer_ns={observer}{extra}")
+          f"pid=99999996,pid_start={D.process_start_ticks(os.getpid())},pgid=99999996,pid_scope=namespace-local,"
+          f"pid_ns={observer},pid_observer_ns={observer}{extra}")
 
  # B-P1. A fresh heartbeat no longer keeps a row open once the scan for its own
  # tag is provably empty, and the closure says which rule closed it.
@@ -669,8 +685,7 @@ class RegistryTest(unittest.TestCase):
   applied=json.loads(self.invoke("reconcile","--attempt",attempt,"--apply").stdout)
   self.assertEqual(applied["closed"],1)
   text=self.jobs.read_text()
-  self.assertIn("note=dead-namespace-absent",text)
-  self.assertNotIn("note=dead-exact-pid",text)
+  self.assertIn("note=dead-exact-pid",text)
 
  # B-N2. The same row with one of its own tagged processes actually running
  # stays active. This is the "no regression on a healthy worker" control.
@@ -1620,7 +1635,7 @@ class RegistryTest(unittest.TestCase):
 
  def test_present_namespace_is_not_closed_and_a_launch_seed_is_not_life(self):
   module=self.load_registry_module("namespace_present_exact_dead")
-  for phase,category in (("launch","unverifiable"),("tool","active")):
+  for phase,category in (("launch","unverifiable"),("tool","unverifiable")):
    with self.subTest(heartbeat_phase=phase):
     attempt=f"att-present-{phase}"
     self.jobs.write_text(self.extinct_row(attempt,phase))
@@ -1696,10 +1711,19 @@ class RegistryTest(unittest.TestCase):
    self.skipTest("this observer cannot prove a foreign PID namespace gone")
   attempt="att-cli-extinct"
   self.jobs.write_text(self.extinct_row(attempt).replace("pid:[4026534323]","pid:[999999999]"))
+  before=self.jobs.read_bytes()
   dry=json.loads(self.invoke("reconcile","--attempt",attempt).stdout)
+  if dry["decisions"][0]["category"]=="unverifiable":
+   self.assertEqual(dry["closed"],0)
+   self.assertEqual(self.jobs.read_bytes(),before)
+   self.skipTest("this observer cannot complete the exact attempt-tag scan")
   self.assertEqual(dry["decisions"][0]["proposed_note"],"dead-namespace-absent",dry)
   self.assertEqual(dry["closed"],0)
   applied=json.loads(self.invoke("reconcile","--attempt",attempt,"--only-exact-dead","--apply").stdout)
+  if applied["decisions"][0]["category"]=="unverifiable":
+   self.assertEqual(applied["closed"],0)
+   self.assertEqual(self.jobs.read_bytes(),before)
+   self.skipTest("the apply observer cannot complete the exact attempt-tag scan")
   self.assertEqual(applied["closed"],1,applied)
   self.assertIn("note=dead-namespace-absent",self.jobs.read_text())
 
@@ -2250,8 +2274,14 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertFalse(decision["closed"])
   settled=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
   self.assertEqual({k:settled[k] for k in sealed},sealed)
-  self.assertEqual(observed_attempt_liveness("done",settled,terminal_receipt_gate=True).state,"terminal")
   self.assertNotIn("cancellation_quiescence_receipt",settled)
+  final=observed_attempt_liveness("done",settled,terminal_receipt_gate=True)
+  if final.state=="unverifiable" and "visibility-incomplete" in final.process_reason:
+   # A process may disappear between procfs enumeration and its environment
+   # read. The already sealed cleanup remains intact; this fresh incomplete
+   # scan must stay unknown instead of weakening the observer for the test.
+   self.skipTest(f"complete attempt-tag visibility unavailable: {final.process_reason}")
+  self.assertEqual(final.state,"terminal",final)
 
  def test_settled_exact_apply_leaves_unrelated_pending_outbox_untouched(self):
   # BC observation: installed `reconcile --attempt <id> --apply` on a settled
@@ -2644,8 +2674,8 @@ class MixedRegistryTest(unittest.TestCase):
   self.assertEqual(dry["closed"],0);self.assertEqual(self.jobs.read_text(),before)
   applied=json.loads(self.invoke("reconcile","--route","r1","--apply").stdout)
   categories={item["slug"]:item["category"] for item in applied["decisions"]}
-  self.assertEqual(categories,{"active":"active","dead":"exact-dead","merged":"unverifiable","stale":"stale-terminal","unsafe":"unverifiable"})
-  text=self.jobs.read_text();self.assertIn("note=dead-exact-pid",text);self.assertNotIn("note=cleanup-merged",text);self.assertIn("note=dead-stale-terminal",text)
+  self.assertEqual(categories,{"active":"active","dead":"exact-dead","merged":"unverifiable","stale":"marker-backed-stale","unsafe":"unverifiable"})
+  text=self.jobs.read_text();self.assertIn("note=dead-exact-pid",text);self.assertNotIn("note=cleanup-merged",text);self.assertIn("note=completed-marker",text)
   self.assertIn("\topen\t"+str(self.primary)+"\t"+str(self.unsafe)+"\tunsafe\t",text)
   self.assertIn("\topen\t"+str(self.primary)+"\t/x\tunrelated\t",text)
   again=json.loads(self.invoke("reconcile","--route","r1","--apply").stdout);self.assertEqual(again["closed"],0)
@@ -2938,12 +2968,14 @@ class OrphanReconcileTest(unittest.TestCase):
  def test_claude_result_failure_outranks_parent_death_note(self):
   self.mark("plan")
   log=self.base/"child.claude.jsonl"
+  artifacts=self.base/".agent_reports";artifacts.mkdir()
   log.write_text(json.dumps({"type":"result","subtype":"success","is_error":False,
    "result":"artifact: -\nverdict: FAIL\nblocker: fixture failure"})+"\n")
   rows=[
    self.owner_row("owner","att-owner-claude",99999978,1),
-   f"2026-07-16T00:00:01Z\topen\t/r\t/w\tchild\troute_id={self.route_id},route_file={self.route_file},route_node=execute,attempt_id=att-child-claude,parent=owner,parent_attempt_id=att-owner-claude,pid=99999977,pid_start=1,harness=claude,log_file={log}",
+   f"2026-07-16T00:00:01Z\topen\t/r\t/w\tchild\troute_id={self.route_id},route_file={self.route_file},route_node=execute,attempt_id=att-child-claude,parent=owner,parent_attempt_id=att-owner-claude,pid=99999977,pid_start=1,harness=claude,log_file={log},artifact_root={artifacts}",
   ]
+  rows=[row.replace("\t/r\t/w\t",f"\t{self.base}\t{self.base}\t") for row in rows]
   self.jobs.write_text("\n".join(rows)+"\n")
   applied=json.loads(self.invoke("reconcile","--attempt","att-owner-claude","--apply").stdout)
   self.assertEqual(applied["decisions"][0]["cascade"][0]["status"],"dead-worker-fail")

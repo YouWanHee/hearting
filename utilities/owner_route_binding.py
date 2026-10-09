@@ -664,7 +664,10 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
     )
     if advance_status in {"owner-route-advance-current"}:
         return current, advance_status
-    return current, anchor_status if advance_status == "owner-route-advance-absent" else advance_status
+    # A prepared successor is still a candidate. It neither moves authority
+    # nor makes the already adopted current route ambiguous.
+    return current, anchor_status if advance_status in {
+        "owner-route-advance-absent", "owner-route-advance-pending"} else advance_status
 
 
 def default_owner_route_file(jobs: str | Path | None = None, environ=None) -> str:
@@ -673,8 +676,7 @@ def default_owner_route_file(jobs: str | Path | None = None, environ=None) -> st
     That is the launch binding or post-launch attachment, followed through
     child-adopted advances -- not `AGENT_OWNER_ROUTE_FILE`, which keeps the
     launch route after the owner moves to a continuation. A successor that is
-    compiled but adopted by no child yet leaves the meaning open, so it raises
-    like any other unresolved state and the caller names `--route`.
+    compiled but adopted by no child yet leaves the current binding in force.
     """
     environ = os.environ if environ is None else environ
     owner_attempt_id = environ.get("AGENT_DISPATCH_ATTEMPT_ID") or ""
@@ -685,10 +687,6 @@ def default_owner_route_file(jobs: str | Path | None = None, environ=None) -> st
     if current is None or status not in {"owner-route-launch-binding", "owner-route-post-launch-attachment",
                                          "owner-route-advance-current"}:
         raise OwnerRouteBindingError(f"owner-route-default-unresolved:{status}")
-    pending = _advance_root(Path(registry).expanduser().resolve(strict=False)) / _advance_key(
-        owner_attempt_id, current.route_id, current.route_hash)
-    if pending.is_dir() and any(pending.glob("*.json")):
-        raise OwnerRouteBindingError("owner-route-default-unresolved:successor-not-adopted")
     return current.route_file
 
 
@@ -741,7 +739,8 @@ def _candidate_started_by_owner(
             raise OwnerRouteBindingError(
                 "owner-route-advance-child-evidence-invalid"
             )
-    return any(meta.get("launch_started") == "1" for _fields, meta in relevant)
+    from route_authority import continuation_attempt_state
+    return any(continuation_attempt_state(meta) == "started" for _fields, meta in relevant)
 
 
 def resolve_owner_route_advance(

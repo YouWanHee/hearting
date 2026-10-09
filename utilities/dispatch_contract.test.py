@@ -3743,12 +3743,19 @@ class DispatchContractTest(unittest.TestCase):
       route,"plan-check","auxiliary-arbiter-ambiguous:plan-check:a,b")["reason"],
      "auxiliary-arbiter-unresolved")
 
- # A row that never recorded a governed process cannot have leaked one, and
- # judging it unverifiable would wedge the node permanently.
- def test_sibling_row_without_a_recorded_process_is_not_a_claimant(self):
+ # The durable untouched-claim fence proves no process was started. A missing
+ # PID alone remains unknown, including on a legacy row already marked done.
+ def test_sibling_row_with_durable_never_started_fence_is_not_a_claimant(self):
   with tempfile.TemporaryDirectory() as td:
    self.sibling_gate_case(td,"dead-claim-abandoned",
-                          {"attempt_id":"att-never-launched-fixture"})
+                          {"attempt_id":"att-never-launched-fixture","launch_claimed":"0"})
+
+ def test_sibling_missing_process_identity_without_fence_remains_unknown(self):
+  with tempfile.TemporaryDirectory() as td:
+   with self.assertRaises(D.DispatchContractError) as caught:
+    self.sibling_gate_case(td,"dead-claim-abandoned",
+                           {"attempt_id":"att-unknown-launch-fixture"})
+   self.assertEqual(caught.exception.reason,"prior-attempt-unverifiable")
 
  # D-1. A legacy row carries no attempt id, so there is nothing to scan for and
  # its existing verdict is left exactly as it was.

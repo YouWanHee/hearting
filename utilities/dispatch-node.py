@@ -700,17 +700,10 @@ def replacement_task(args, route, node, jobs):
   if not reservation: return None  # Existing non-SD157 retry semantics are unchanged.
   record=replacement._read(replacement._record_path(jobs,reservation['family_id']))
   _fields,source,replay=replacement.validate_claim_source(jobs,lines,record)
-  if (record['replacement_attempt_id']!=args.attempt_id
-      or record['original_attempt_id']!=values[0]
-      or record['route_id']!=route['route_id']
-      or record['route_hash']!=route['route_hash']
-      or source.get('route_node')!=node['id']
-      or source.get('harness')!=args.adapter
-      or (source.get('parent')!=args.parent and not (
-          source.get('dispatch_depth')=='1'
-          and ROUTE_AUTHORITY.owns(source,ROUTE_AUTHORITY.default_parent_session_id(),jobs)))):
-   raise DispatchContractError('replacement-launch-binding-mismatch')
-  return replay['task']
+  return ROUTE_AUTHORITY.recovery_node_task(
+      record,source,replay,attempt_id=args.attempt_id,route=route,node=node,
+      harness=args.adapter,parent=args.parent,jobs=jobs)
+
 
 
 def main():

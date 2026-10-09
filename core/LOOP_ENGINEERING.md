@@ -136,6 +136,14 @@ observation step fails. A retry, replacement, continuation, or resume accepts
 these changes through one shared lineage rule. It does not rebuild the original
 record from current values and refuse at the first difference.
 
+The shared recovery judgment reads stored inputs before reconstructing missing
+legacy inputs from their original sealed route and exact original rows. Current
+selection and authority are checked afresh at registration and launch. Work,
+review subject, fixed inputs, session scope and granted addresses remain bound;
+parent, owner and runtime selection follow their recorded lineage. A claim alone
+does not adopt a continuation. Process quiescence and terminal result availability
+are separate observations consumed by resume, reconciliation and settlement alike.
+
 Exact comparison protects sealed evidence from tampering; it is not a reason to
 refuse the normal ways work moves. When a recovery path still refuses, the
 refusal names what differs and the supported next step. A state with no

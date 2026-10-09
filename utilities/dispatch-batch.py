@@ -327,7 +327,7 @@ def partial_source_assignments(
     partial: dict[str, object],
     parent_identity: dict[str, str],
 ) -> list[tuple[dict[str, object], str, str, int]]:
-    """Recover the original sealed adapter tuple instead of reallocating a retry."""
+    """Reuse source placement and admit its tuple against the current parent."""
 
     try:
         with Path(f"{jobs}.lock").open("a", encoding="utf-8") as lock:
@@ -342,8 +342,6 @@ def partial_source_assignments(
         try:
             validate_attempt_metadata(metadata)
             adapter = metadata.get("batch_harness") or metadata["harness"]
-            hop = metadata["batch_fallback_hop"]
-            ordinal = int(metadata["batch_fallback_ordinal"])
             selected = DISPATCH_NODE.resolve_checked_tuple(
                 route, node, adapter, parent_identity=parent_identity
             )
@@ -357,109 +355,35 @@ def partial_source_assignments(
                 "partial-continuation-source-assignment-invalid",
                 f"node={node_id}:{exc}",
             ) from exc
-        if selected.fallback_hop != hop or selected.ordinal != ordinal:
-            raise BatchError(
-                "partial-continuation-source-assignment-drift",
-                f"node={node_id}",
-            )
-        assignments.append((node, adapter, hop, ordinal))
+        # Original tuple integrity belongs to the history reader.  A current
+        # parent can legitimately realize a different same/cross-harness hop.
+        assignments.append((node, adapter, selected.fallback_hop, selected.ordinal))
     return assignments
 
 
 def registry_batch_input(rows: list[dict], route: dict, nodes: list[dict], group: str,
                          parent_attempt: str, prompt: str | None):
-    """Prove a pre-SD-157 whole manifest from all exact original rows.
-
-    A missing member cannot be inferred from current capacity or a display
-    prefix. Such a partial registration requires the immutable launch input.
-    """
-    by_node = {node["id"]: node for node in nodes}
-    if (len(rows) != len(nodes) or {row.get("batch_route_node") for row in rows} != set(by_node)
-            or len({row.get("attempt_id") for row in rows}) != len(nodes)):
-        raise BatchError("batch-prior-manifest-proof-missing", group)
-    members = []
-    assignment = ("sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-                  if prompt is not None else rows[0].get("batch_assignment_sha256"))
+    """Compatibility entry for the common historical reader."""
+    from recovery_history import RecoveryHistoryError, reconstruct_batch_input
     try:
-        for row in rows:
-            validate_attempt_metadata(row)
-            node = by_node[row["batch_route_node"]]
-            if (row.get("route_hash", route["route_hash"]) != route["route_hash"]
-                    or row.get("batch_route_id") != route["route_id"]
-                    or row.get("batch_parent_attempt_id") != parent_attempt
-                    or row.get("batch_attempt_id") != row["attempt_id"]
-                    or row.get("route_node") != node["id"]
-                    or row.get("batch_declared_size") != str(len(nodes))
-                    or row.get("batch_assignment_sha256") != assignment
-                    or row.get("batch_harness") != row.get("harness")
-                    or row.get("batch_fallback_hop") != row.get("fallback_hop")
-                    or row.get("batch_fallback_ordinal") != row.get("fallback_ordinal")
-                    or row.get("batch_model_profile") != str(node.get("model_profile"))
-                    or row.get("batch_perspective") != str(node.get("perspective"))
-                    or row.get("batch_parallel_leg_index") != str(node.get("parallel_leg_index"))):
-                raise BatchError("batch-prior-binding-drift", str(node["id"]))
-            leg_class = row.get("batch_leg_class", "peer")
-            if leg_class != node.get("leg_class", "peer"):
-                raise BatchError("batch-prior-binding-drift", str(node["id"]))
-            member = {
-                "assignment_sha256": assignment, "attempt_id": row["attempt_id"],
-                "route_node": node["id"], "harness": row["batch_harness"],
-                "fallback_hop": row["batch_fallback_hop"],
-                "fallback_ordinal": int(row["batch_fallback_ordinal"]),
-                "model_profile": row["batch_model_profile"], "perspective": row["batch_perspective"],
-                "parallel_leg_index": int(row["batch_parallel_leg_index"]), "leg_class": leg_class,
-            }
-            if leg_class == "auxiliary":
-                member["auxiliary_check"] = row["batch_auxiliary_check"]
-                if member["auxiliary_check"] != node.get("auxiliary_check"):
-                    raise BatchError("batch-prior-binding-drift", str(node["id"]))
-            if "profile_selection" in node:
-                member.update({key: node[key] for key in ("profile_selection", "profile_demand")})
-            members.append(member)
-        declared = list(nodes[0].get("parallel_independence_axes", ["cross-harness"]))
-        realized = []
-        if len({member["harness"] for member in members}) >= 2:
-            realized.append("cross-harness")
-        if len({member["model_profile"] for member in members}) >= 2:
-            realized.append("model-profile")
-        if len({member["perspective"] for member in members}) == len(members):
-            realized.append("perspective")
-        manifest, digest, leg_digests = source_manifest_for_digest(dict(
-            parallel_group=group, route_id=route["route_id"], parent_attempt_id=parent_attempt,
-            required_independence_axes=declared, realized_independence_axes=realized,
-            members=members), rows[0]["batch_manifest_sha256"])
-        if any(row.get("batch_independence") != manifest["independence"]
-               or row.get("batch_leg_sha256") != leg_digests[row["attempt_id"]] for row in rows):
-            raise BatchError("batch-prior-binding-drift", group)
-        return {"manifest": manifest, "manifest_digest": digest, "route_hash": route["route_hash"],
-                "options": {"prompt_text": prompt}, "source": "registry-manifest-proof"}
-    except (DispatchContractError, ReplicaBatchContractError, KeyError, TypeError, ValueError) as exc:
-        raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
+        return reconstruct_batch_input(rows, route, group, prompt)
+    except RecoveryHistoryError as exc:
+        raise BatchError(exc.reason, exc.detail) from exc
 
 
 def partial_batch_input(jobs: Path, route: dict, nodes: list[dict], partial: dict):
-    """Recover historical source bytes independently of the current retry brief."""
-    from dispatch_replacement_batch import _input, _input_path
+    """Read the source payload/rows without rebuilding from today's retry route."""
+    from recovery_history import RecoveryHistoryError, read_batch_input
     rows = partial_source_rows(jobs, partial)
-    metadata = [rows[node["id"]][1] for node in nodes]
-    digest = str(partial.get("source_batch_manifest_digest", ""))
     try:
-        if any(row.get("batch_manifest_sha256") != digest for row in metadata):
+        metadata = [rows[node["id"]][1] for node in nodes]
+        if any(row.get("batch_manifest_sha256") != partial.get("source_batch_manifest_digest")
+               for row in metadata):
             raise BatchError("partial-continuation-source-manifest-drift")
-        # This also proves the complete row census against the current sealed
-        # route, including the original parent, profile, persona and leg hashes.
-        reconstructed = registry_batch_input(
-            metadata, route, nodes, str(partial["source_group_id"]),
-            metadata[0]["batch_parent_attempt_id"], None)
-        input_path = _input_path(jobs, digest)
-        if not input_path.exists() and not input_path.is_symlink():
-            return reconstructed
-        payload = _input(jobs, metadata[0])
-        if (payload.get("route_hash") != route.get("route_hash")
-                or payload["manifest"] != reconstructed["manifest"]):
-            raise BatchError("partial-continuation-source-manifest-drift")
-        return payload
-    except (DispatchContractError, ReplicaBatchContractError, KeyError) as exc:
+        return read_batch_input(jobs, metadata, source_route=route,
+            group=str(partial["source_group_id"]), complete=True,
+            node_ids={node["id"] for node in nodes})
+    except (DispatchContractError, RecoveryHistoryError, KeyError) as exc:
         raise BatchError("partial-continuation-source-manifest-invalid", str(exc)) from exc
 
 
@@ -475,7 +399,7 @@ def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
     """
     if not parent_attempt or not jobs.exists():
         return None
-    from dispatch_replacement_batch import _input, _input_path
+    from recovery_history import RecoveryHistoryError, read_batch_input
     candidates = []
     for line in jobs.read_text(encoding="utf-8").splitlines():
         fields = line.split("\t")
@@ -493,18 +417,12 @@ def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
     digests = {meta["batch_manifest_sha256"] for meta in candidates}
     if len(digests) != 1:
         raise BatchError("batch-prior-binding-ambiguous", group)
-    first = candidates[0]
     try:
-        if not _input_path(jobs, first["batch_manifest_sha256"]).is_file():
-            return registry_batch_input(candidates, route, nodes, group, parent_attempt, prompt)
-        payload = _input(jobs, first)
-        manifest = payload["manifest"]
-        if (payload.get("route_hash") != route.get("route_hash")
-                or payload["options"].get("prompt_text") != prompt
-                or {m["route_node"] for m in manifest["members"]} != {n["id"] for n in nodes}):
-            raise BatchError("batch-prior-binding-drift", group)
-        return payload
-    except (DispatchContractError, ReplicaBatchContractError) as exc:
+        return read_batch_input(jobs, candidates, source_route=route, group=group,
+                                prompt=prompt, node_ids={node["id"] for node in nodes})
+    except RecoveryHistoryError as exc:
+        raise BatchError(exc.reason, exc.detail) from exc
+    except DispatchContractError as exc:
         raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
 
 
@@ -516,9 +434,7 @@ def prior_batch_assignments(payload: dict, route: dict, nodes: list[dict], paren
         selected = DISPATCH_NODE.resolve_checked_tuple(
             route, node, member["harness"], parent_identity=parent_identity)
         if (selected.fallback_hop != member["fallback_hop"]
-                or selected.ordinal != member["fallback_ordinal"]
-                or str(node.get("model_profile")) != member["model_profile"]
-                or str(node.get("perspective")) != member["perspective"]):
+                or selected.ordinal != member["fallback_ordinal"]):
             raise BatchError("batch-prior-binding-drift", str(node["id"]))
         assignments.append((node, member["harness"], selected.fallback_hop, selected.ordinal))
     return assignments
@@ -1097,23 +1013,9 @@ def manifest_members(legs: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 def source_manifest_for_digest(kwargs: dict, expected_digest: str):
-    """Rebuild immutable source evidence, including pre-SD-160 manifests.
-
-    The sealed digest decides which historical encoding is authoritative.
-    Current successor manifests always use persona independence.
-    """
-    for independence, reason in (
-        ("persona", ""), ("cross-harness", ""),
-        ("degraded-same-harness", "cross-harness-unavailable-user-allowed"),
-    ):
-        try:
-            result = build_manifest(**kwargs, independence=independence,
-                                    degradation_reason=reason)
-        except ReplicaBatchContractError:
-            continue
-        if result[1] == expected_digest:
-            return result
-    raise ReplicaBatchContractError("sealed source manifest digest mismatch")
+    """Compatibility entry for immutable historical schema/encoding reads."""
+    from recovery_history import source_manifest_for_digest as read_source_manifest
+    return read_source_manifest(kwargs, expected_digest)
 
 
 def _write_once_json(path: Path, payload: dict[str, object]) -> None:
@@ -2604,6 +2506,17 @@ def main(argv: list[str] | None = None) -> int:
         }
         if "profile_selection" in node:
             leg.update({key: node[key] for key in ("profile_demand", "profile_selection")})
+        if prior_input is not None:
+            # Preserve the sealed assignment/model/persona record.  The live
+            # tuple was separately admitted by prior_batch_assignments.
+            member = next(member for member in prior_input["manifest"]["members"]
+                          if member["route_node"] == node_id)
+            for key in ("assignment_sha256", "model_profile", "perspective", "parallel_leg_index",
+                        "leg_class", "auxiliary_check", "profile_selection", "profile_demand"):
+                if key in member:
+                    leg[key] = member[key]
+                elif key in ("profile_selection", "profile_demand"):
+                    leg.pop(key, None)
         if manifest_sessions is not None:
             # G7: consume the validated SD-103 subdivision manifest instead of
             # discarding it -- each leg carries the exact sub-session identity
@@ -2693,24 +2606,21 @@ def main(argv: list[str] | None = None) -> int:
                 return fail("replacement-source-missing", 65, admitted=0, spawned=0)
             gap_leg["slug"] = source_row[0][4]
 
-    manifest, manifest_digest, leg_digests = build_manifest(
-        parallel_group=args.parallel_group,
-        route_id=str(route["route_id"]),
-        parent_attempt_id=parent_attempt,
-        independence=independence,
-        required_independence_axes=required_axes,
-        realized_independence_axes=realized_axes,
-        degradation_reason=degradation_reason,
-        members=manifest_members(legs),
-    )
-
     if prior_input is not None:
-        original_manifest = prior_input["manifest"]
-        if manifest_members(legs) != original_manifest["members"]:
-            return fail("batch-prior-binding-drift", 65, admitted=0, spawned=0)
-        manifest, manifest_digest, leg_digests = verify_manifest(original_manifest)
+        manifest, manifest_digest, leg_digests = verify_manifest(prior_input["manifest"])
         for leg in legs:
             leg["independence"] = str(manifest["independence"])
+    else:
+        manifest, manifest_digest, leg_digests = build_manifest(
+            parallel_group=args.parallel_group,
+            route_id=str(route["route_id"]),
+            parent_attempt_id=parent_attempt,
+            independence=independence,
+            required_independence_axes=required_axes,
+            realized_independence_axes=realized_axes,
+            degradation_reason=degradation_reason,
+            members=manifest_members(legs),
+        )
 
     if args.action != "start":
         try:

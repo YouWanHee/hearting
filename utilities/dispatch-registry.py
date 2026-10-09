@@ -85,6 +85,7 @@ from codex_dispatch_terminal import (  # noqa: E402
     inspect_terminal_log,
 )
 from route_identity import route_hash  # noqa: E402
+from recovery_evidence import observe_attempt  # noqa: E402
 from dispatch_completion_join import (  # noqa: E402
     ChildRow,
     JoinContractError,
@@ -922,105 +923,60 @@ def classify(row, args, newest_orders, rows=None, *, expected_binding=None):
                 quiescence=process,
             )
             return classification.as_registry_tuple()
-    # OPERATIONS §5.10: every post-hoc carrier classifies the exact log through
-    # the shared helper, so a reviewer whose FAIL names a readable in-root
-    # artifact is booked `completed-review-blocking` here exactly as the
-    # wrapper tail, the supervisor join, and the progress watchdog book it.
+    terminal_view = inspect_terminal_attempt(
+        meta.get("log_file"), worktree=row.get("worktree"),
+        artifact_root_metadata=meta.get("artifact_root"), worker_type=meta.get("worker_type"),
+    )
+    evidence = observe_attempt(
+        row["status"], meta, worktree=row.get("worktree"), repo=row.get("repo"),
+        artifact_root=meta.get("artifact_root"), terminal=terminal_view,
+        registry_rows=(item["raw"] for item in rows) if rows is not None else None,
+    )
+    process, terminal_view = evidence.process, evidence.terminal
+    if evidence.decision.action in {"cancel", "settle-cancellation"}:
+        return "terminal-pending", "cancellation-settlement-required", None
+    # These are existing result commits, separate from the process cleanup
+    # obligation. Settling them cannot authorize a new launch; resume consumes
+    # the same evidence and still refuses a live/unobservable process.
+    if _marker_backed_repair(row, args.agent_home, args.jobs):
+        return "marker-backed-stale", "completed-marker-linkage", "completed-marker"
     terminal, _ = carrier_terminal(row)
-    if (
-        meta.get("attempt_id")
-        and meta.get("route_id")
-        and meta.get("route_node")
-        and terminal
-    ):
+    if evidence.result_state == "settleable" and terminal and terminal.get("failure_note"):
+        return "terminal-handoff", f"{terminal['terminal_event']}:{terminal['verdict']}", terminal["failure_note"]
+    if evidence.result_state == "settleable" and terminal is None:
+        return "terminal-pending", "terminal-handoff-settlement-required", None
+    if (process.state == "quiescent" and rows is not None
+            and meta.get("worker_type") == "owner" and not meta.get("route_node")):
+        incomplete, record_status = route_incomplete(row, args.agent_home, rows, args.jobs)
+        if record_status == "ok" and incomplete and has_orphaned_dependents(row, rows, incomplete, args):
+            return "orphan", "dead-parent-orphaned", "dead-parent-orphaned"
+    if evidence.decision.action == "wait":
+        category = "terminal-draining" if evidence.result_state in {"settleable", "invalid"} else "active"
+        return category, process.reason, None
+    if evidence.decision.action == "recover":
+        category = "terminal-draining" if evidence.result_state in {"settleable", "invalid"} else "unverifiable"
+        return category, evidence.decision.reason, None
+    if evidence.result_state == "invalid":
+        return "terminal-handoff", str(terminal_view.get("reason", "terminal-invalid")), str(
+            terminal_view.get("failure_note") or "dead-invalid-envelope"
+        )
+    # Every carrier books a root-bound review FAIL through the same inspector.
+    # A missing/incomplete log has no result to settle; a launch claim supplies
+    # no contrary execution evidence. The same policy is re-read at closure.
+    if terminal:
         reason = f"{terminal['terminal_event']}:{terminal['verdict']}"
         if terminal.get("failure_note"):
             return "terminal-handoff", reason, terminal["failure_note"]
-        # SD-70: a route-bound PASS completes only through its completion
-        # marker. The envelope alone never proves completion, so a marker-less
-        # PASS row is either a still-draining worker or a typed worker death —
-        # never `completed-*`.
-        if _marker_backed_repair(row, args.agent_home, args.jobs):
-            return "marker-backed-stale", "completed-marker-linkage", "completed-marker"
-        observed = observed_attempt_liveness(
-            row["status"], meta, terminal_envelope=True
-        )
-        if observed.state == "alive":
-            return "active", observed.reason, None
-        if observed.state == "reconcile-needed":
-            attempt_view = inspect_terminal_attempt(
-                meta.get("log_file"),
-                worktree=row.get("worktree"),
-                artifact_root_metadata=meta.get("artifact_root"),
-            )
-            if (meta.get("worker_type") == "stage"
-                    and meta.get("dispatch_depth") == "2"
-                    and meta.get("launch_lifecycle") == "foreground-scoped"
-                    and post_exit_receipt_reason(meta)
-                    and _foreground_stage_terminal(row)):
-                # The group receipt is process evidence, not a completion
-                # marker. A parked owner's existing terminal writer must still
-                # commit the marker; another reconcile must not turn its
-                # pending PASS into a synthetic dead-missing-marker failure.
-                return "terminal-pending", "terminal-commit-required", None
-            note = (
-                "dead-missing-marker"
-                if attempt_view.get("artifact_state") == "readable"
-                else "dead-invalid-envelope"
-            )
-            return "terminal-handoff", f"{reason}:marker-missing", note
-        return "terminal-draining", f"{reason}:marker-missing-{observed.reason}", None
-    if getattr(args, "only_exact_dead", False):
-        # Silent-exit recovery cannot replace a pending result with generic
-        # PID death. This also runs under the closure lock, so a handoff that
-        # arrives after the first observation retains its settlement path.
-        attempt_view = inspect_terminal_attempt(
-            meta.get("log_file"), worktree=row.get("worktree"),
-            artifact_root_metadata=meta.get("artifact_root"),
-        )
-        if attempt_view.get("state") != "absent":
-            return "terminal-pending", "terminal-handoff-settlement-required", None
-    exact = classify_attempt_evidence(
-        proc_inputs(row, args.agent_home, args.jobs, rows, args),
-        getattr(args, "now", time.time()),
-    )
-    if exact and exact["state"] == "working": return "active", exact["rule"], None
-    if exact and exact["state"] == "done":
-        if _marker_backed_repair(row, args.agent_home, args.jobs):
-            return "marker-backed-stale", "completed-marker-linkage", "completed-marker"
-        return "terminal-pending", "terminal-commit-required", None
-    if exact and exact["state"] == "dead":
-        if _marker_backed_repair(row, args.agent_home, args.jobs):
-            return "marker-backed-stale", "completed-marker-linkage", "completed-marker"
-        if (rows is not None and meta.get("worker_type") == "owner"
-                and not meta.get("route_node")):
-            incomplete, record_status = route_incomplete(row, args.agent_home, rows, args.jobs)
-            if record_status == "ok" and incomplete and has_orphaned_dependents(row, rows, incomplete, args):
-                return "orphan", "dead-parent-orphaned", "dead-parent-orphaned"
-        # Same closure, distinguishable cause: this row died with a fresh
-        # heartbeat and no recorded PID we could read, so an audit that sees
-        # `dead-exact-pid` would go looking for a PID that never meant anything.
-        if exact["source"] == "parent":
-            return "exact-dead", exact["rule"], "dead-parent-terminated"
-        if exact["source"] == "namespace":
-            return "exact-dead", exact["rule"], "dead-namespace-absent"
-        return "exact-dead", exact["rule"], "dead-exact-pid"
-    key = fold_key(meta)
-    if all(key[:2]) and newest_orders.get(key) == row["order"]:
-        proven, reason = terminal_marker(row, args.agent_home, args.jobs)
-        if proven: return "stale-terminal", reason, "dead-stale-terminal"
-    # A shared dirty worktree and its live owner say nothing about this
-    # registered attempt's life. Cleanup eligibility belongs to folder removal,
-    # never to settling a worker row (2026-09-27 silent stage exit).
-    if meta.get("registered_worker") == "1" or getattr(args, "only_exact_dead", False):
-        return "unverifiable", "attempt-process-unverifiable", None
-    worktree = Path(row["worktree"])
-    if worktree.is_absolute() and worktree.is_dir():
-        try: verdict = cleanup.evaluate(worktree.resolve(), args.jobs, args.integration_ref)
-        except (OSError, RuntimeError): verdict = None
-        if verdict and verdict.eligible: return "merged", "sd29-safety-approved", "cleanup-merged"
-        if verdict and verdict.reasons: return "unsafe", ",".join(verdict.reasons), None
-    return "unsafe", "legacy-weak-or-unverifiable", None
+        if (meta.get("worker_type") == "stage"
+                and meta.get("dispatch_depth") == "2"
+                and meta.get("launch_lifecycle") == "foreground-scoped"
+                and post_exit_receipt_reason(meta)
+                and _foreground_stage_terminal(row)):
+            return "terminal-pending", "terminal-commit-required", None
+        note = ("dead-missing-marker" if terminal_view.get("artifact_state") == "readable"
+                else "dead-invalid-envelope")
+        return "terminal-handoff", f"{reason}:marker-missing", note
+    return "exact-dead", process.reason, evidence.death_note
 
 
 def emit_current(rows, args):
@@ -1068,14 +1024,13 @@ def observed_status_rows(rows, args):
             inputs = proc_inputs(row, args.agent_home, args.jobs, rows, args)
             terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=row.get("worktree"),
                                                 artifact_root_metadata=meta.get("artifact_root"))
-            observed = observed_attempt_liveness(row["status"], meta,
-                terminal_envelope=terminal.get("state") == "valid")
-            inputs["observed_liveness"] = {"state": observed.state, "reason": observed.reason}
-            verdict = classify_attempt_evidence(inputs, time.time()) or {"state": "unknown", "rule": "exact identity unavailable"}
+            evidence = observe_attempt(row["status"], meta, repo=row.get("repo"),
+                                       worktree=row.get("worktree"), artifact_root=meta.get("artifact_root"),
+                                       terminal=terminal, registry_rows=(item["raw"] for item in rows if item.get("raw")))
             completed = _marker_backed_repair(row, args.agent_home, args.jobs)
-            state = verdict["state"]
-            if state == "done" and not completed:
-                state = "exited"
+            state = ("working" if evidence.process.state == "live" else
+                     "done" if completed and evidence.process.state == "quiescent" else
+                     "exited" if evidence.process.state == "quiescent" else "unknown")
             try:
                 log = Path(meta.get("log_file") or "")
                 log_mtime = log.stat().st_mtime if log.is_file() else None
@@ -1083,9 +1038,10 @@ def observed_status_rows(rows, args):
                 log_mtime = None
             result.append({"attempt_id": meta.get("attempt_id"),
                 "route_id": meta.get("route_id") or meta.get("owner_route_id"),
-                "registry_status": row["status"], "state": state, "reason": verdict["rule"],
+                "registry_status": row["status"], "state": state, "reason": evidence.decision.reason,
                 "pid_identity": {k: inputs.get(k) for k in ("pid", "proc_start", "actual_proc_start", "proc_start_match", "pid_authoritative")},
-                "process": observed.process_state, "process_reason": observed.process_reason,
+                "process": evidence.process.state, "process_reason": evidence.process.reason,
+                "result": evidence.result_state, "action": evidence.decision.action,
                 "sentinel": inputs.get("terminal_observation"), "terminal_event": terminal.get("terminal_event"),
                 "log_mtime": log_mtime, "artifact_state": terminal.get("artifact_state", "unknown"),
                 "completion": "verified-marker" if completed else "unverified"})
@@ -1504,7 +1460,6 @@ def reconcile(rows, args):
             })
             continue
         review_failure = (exact_selection and not only_exact_dead
-                          and category == "terminal-handoff"
                           and _untrusted_foreground_review_failure(row))
         if review_failure:
             failure = _same_host_foreground_review_failure(row)
@@ -1705,7 +1660,19 @@ def reconcile(rows, args):
                     expected_binding=selected_binding,
                 )
                 fresh_decision.update(category=fresh_category, reason=fresh_reason, note=fresh_note)
-                return fresh_note == note and fresh_category == category
+                if fresh_note != note or fresh_category != category or fresh_reason != reason:
+                    return False
+                if fresh_category == "terminal-handoff" and note != "dead-invalid-envelope":
+                    view = observe_attempt(
+                        fresh["status"], fresh["meta"], worktree=fresh.get("worktree"),
+                        artifact_root=fresh["meta"].get("artifact_root"),
+                    )
+                    if view.result_state not in {"settleable", "invalid"}:
+                        return False
+                    for key in ("failure_class", "terminal_event", "quota_window", "quota_reset_epoch", "quota_model_scope"):
+                        if view.terminal.get(key):
+                            reconcile_evidence[key] = str(view.terminal[key])
+                return True
 
             reconcile_evidence = {"classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
                                   "reconcile_reason": reason}
@@ -1725,6 +1692,13 @@ def reconcile(rows, args):
             )
             revalidated = bool(closed)
             if closed:
+                if category == "exact-dead":
+                    # Reuse the existing automatic cleanup writer. Otherwise
+                    # a receiptless open attempt would close from exact proof
+                    # and immediately become unobservable to its successor.
+                    terminal_cleanup = resolve_attempt_cleanup(
+                        args.jobs, row["meta"]["attempt_id"], apply=True,
+                    )
                 materialize_after_terminal_close(args.jobs, row["meta"]["attempt_id"])
             if not closed and fresh_decision:
                 reason = f"revalidation-veto:{fresh_decision.get('category')}:{fresh_decision.get('reason')}"

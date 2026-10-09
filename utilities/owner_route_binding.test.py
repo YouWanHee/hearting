@@ -699,7 +699,7 @@ class OwnerRouteLifecycleTest(unittest.TestCase):
                     jobs, owner_attempt_id=self.ATTEMPT
                 )
             self.assertEqual((before.route_id, before_status),
-                             ("rt-r0", "owner-route-advance-pending"))
+                             ("rt-r0", "owner-route-post-launch-attachment"))
             self.assertEqual((after.route_id, after_status),
                              ("rt-active", "owner-route-advance-current"))
 
@@ -772,7 +772,7 @@ class OwnerRouteLifecycleTest(unittest.TestCase):
                     writer.result()
                 final = resolve_once(99)
             allowed = {
-                ("rt-r0", "owner-route-advance-pending"),
+                ("rt-r0", "owner-route-post-launch-attachment"),
                 ("rt-r1", "owner-route-advance-current"),
             }
             self.assertTrue(set(observed) <= allowed, observed)
@@ -1051,7 +1051,7 @@ class DefaultOwnerRouteTest(unittest.TestCase):
                 with self.subTest(status=status), mock.patch.object(
                         M, "resolve_owner_route_lifecycle", return_value=(current, status)):
                     self.assertEqual(M.default_owner_route_file(environ=env), current.route_file)
-            for status in ("owner-route-advance-pending", "owner-route-binding-absent"):
+            for status in ("owner-route-binding-absent",):
                 with self.subTest(status=status), mock.patch.object(
                         M, "resolve_owner_route_lifecycle", return_value=(current, status)), \
                         self.assertRaisesRegex(M.OwnerRouteBindingError, "owner-route-default-unresolved"):
@@ -1060,9 +1060,8 @@ class DefaultOwnerRouteTest(unittest.TestCase):
             pending.mkdir(parents=True)
             (pending / "candidate.json").write_text("{}")
             with mock.patch.object(M, "resolve_owner_route_lifecycle",
-                                   return_value=(current, "owner-route-advance-current")), \
-                    self.assertRaisesRegex(M.OwnerRouteBindingError, "successor-not-adopted"):
-                M.default_owner_route_file(environ=env)
+                                   return_value=(current, "owner-route-advance-current")):
+                self.assertEqual(M.default_owner_route_file(environ=env), current.route_file)
             with self.assertRaisesRegex(M.OwnerRouteBindingError, "outside-owner"):
                 M.default_owner_route_file(environ={})
 

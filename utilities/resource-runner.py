@@ -181,10 +181,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             if any(current.get(k) != placeholder.get(k) for k in keys):
                 raise ValueError("resource-route-body-conflict")
             return False, current
-        if any(not OWNER_RESOURCE.resource_execution_finished(row)
-               or OWNER_RESOURCE.resource_evidence_paths_conflict(row, placeholder)
-               for row in [*matches, *history]):
-            raise ValueError("resource-route-body-conflict")
+        from route_authority import require_resource_predecessors
+        require_resource_predecessors([*matches, *history], placeholder)
         data["runs"][args.run_id] = placeholder
         return True, placeholder
     with ledger.lock() if ledger else contextlib.nullcontext():
