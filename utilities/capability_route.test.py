@@ -5838,12 +5838,13 @@ class SourceCensusTest(unittest.TestCase):
  # no completion marker file at all (`_owner_terminal_observation`), a
  # review-artifact provenance sha for an owner-closure proof
  # (`continuation_owner_closure_plan`/`_continuation_closure_marker_compatible`),
+ # an exact markerless terminal review artifact (`observe_terminal_review_failure`),
  # and `source_evidence_digest` (route-reuse's own named exception). None of
  # these ever duplicated the completion-marker recompute B-1/A-2 unified --
  # each is the one place ITS OWN schema is hashed.
  _EVIDENCE_DIGEST_ALLOWED_FUNCTIONS=frozenset({
   # dispatch_contract.py
-  "gate_currency","evidence_currency",
+  "gate_currency","evidence_currency","observe_terminal_review_failure",
   # capability-route.py -- completion-marker writers
   "_completion_marker_replay","write_completion_marker",
   "_publish_completion_locked","_producer_revision_plan",

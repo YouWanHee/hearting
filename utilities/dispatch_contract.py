@@ -7349,7 +7349,7 @@ def owner_closure_shape(metadata: Mapping[str, object]) -> str | None:
 
 def _marker_schema_identity_ok(
     route: dict[str, object], node: dict[str, object], marker: dict[str, object],
-    marker_path: Path,
+    marker_path: Path, *, observe: bool = False,
 ) -> tuple[bool, Path | None]:
     """Schema/identity/history-byte checks shared by every marker generation
     (an ordinary marker, and -- recursively, SD-154 I-4 -- the marker a
@@ -7369,7 +7369,7 @@ def _marker_schema_identity_ok(
         "completion_gate": node.get("completion_gate"),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
-        if gates_on() or any(key not in marker for key in expected):
+        if observe or gates_on() or any(key not in marker for key in expected):
             return False, None
         same_work_or_refuse("completion-marker-identity-mismatch", node_id)
     history_path = marker_path.parent / f"{node_id}.{sequence}.json"
@@ -7378,7 +7378,7 @@ def _marker_schema_identity_ok(
     except (OSError, ValueError):
         return False, None
     if history != marker:
-        if gates_on() or not isinstance(history, dict):
+        if observe or gates_on() or not isinstance(history, dict):
             return False, None
         same_work_or_refuse("completion-marker-history-changed", node_id)
     return True, history_path
@@ -7644,8 +7644,12 @@ def evidence_currency(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
+    *, observe: bool = False,
 ) -> GateCurrency:
     """The schema/identity/tombstone/evidence-digest half of `gate_currency`.
+
+    ``observe=True`` reads integrity without gates-off execution relaxation.
+    It never changes gate settings or adds execution requirements.
 
     Deliberately stops short of the attempt-link/shape proof
     (`_marker_link_current`) -- `_marker_identity_row`'s own `passed` field
@@ -7660,7 +7664,7 @@ def evidence_currency(
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
     try:
-        schema_ok, _history_path = _marker_schema_identity_ok(route, node, marker, marker_path)
+        schema_ok, _history_path = _marker_schema_identity_ok(route, node, marker, marker_path, observe=observe)
     except (KeyError, TypeError, ValueError):
         schema_ok = False
     if not schema_ok:
@@ -7675,7 +7679,7 @@ def evidence_currency(
         )
         if detail != node.get("id"):
             action += f" (upstream revision {detail})"
-        if gates_on():
+        if observe or gates_on():
             return GateCurrency("superseded", "completion-evidence-superseded", action)
         same_work_or_refuse("completion-evidence-superseded", str(detail))
     evidence_record = marker.get("evidence")
@@ -7702,7 +7706,7 @@ def evidence_currency(
         try:
             marker_stat = marker_path.lstat()
             recorded_sha = evidence_record.get("sha256")
-            if (not gates_on() and stat.S_ISREG(marker_stat.st_mode)
+            if (not observe and not gates_on() and stat.S_ISREG(marker_stat.st_mode)
                     and isinstance(recorded_sha, str)
                     and re.fullmatch(r"[0-9a-f]{64}", recorded_sha)):
                 return GateCurrency("current", "completion-evidence-recorded-missing",
@@ -7718,7 +7722,7 @@ def evidence_currency(
         return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
     if digest != evidence_record.get("sha256"):
         node_id = str(node.get("id"))
-        if not gates_on():
+        if not observe and not gates_on():
             # Gates off an edit is not a refusal (nor a warning line). This read
             # stays a read: the operations that proceed on the marker keep the
             # edit as history (`note_evidence_change`).
@@ -7736,6 +7740,7 @@ def gate_currency(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
+    *, observe: bool = False,
 ) -> GateCurrency:
     """Prove one completion marker current, superseded, or needing `revise`.
 
@@ -7755,7 +7760,7 @@ def gate_currency(
         marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
-    base = evidence_currency(route, node, marker_path, marker)
+    base = evidence_currency(route, node, marker_path, marker, observe=observe)
     if base.state not in {"current", "revised-unrecorded"}:
         return base
     node_id = str(node.get("id"))
@@ -7810,7 +7815,7 @@ def gate_currency(
             return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
         try:
             prior_marker = json.loads(prior_bytes)
-            prior_schema_ok, _ = _marker_schema_identity_ok(route, node, prior_marker, prior_path)
+            prior_schema_ok, _ = _marker_schema_identity_ok(route, node, prior_marker, prior_path, observe=observe)
         except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
             prior_schema_ok = False
             prior_marker = {}
@@ -7818,6 +7823,66 @@ def gate_currency(
             return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-identity-invalid")
         current, current_path = prior_marker, prior_path
     return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
+
+
+def observe_terminal_review_failure(
+    route: dict[str, object], node: dict[str, object], attempt_id: str,
+    evidence_path: Path, evidence_sha256: str, registry_lines: list[str],
+) -> dict[str, object]:
+    """Read an exact finished FAIL without requiring a PASS stage marker.
+
+    Input digests remain the subject reader's responsibility. This observation
+    binds the governed attempt, terminal log and readable evidence bytes; it
+    grants neither execution nor stage completion authority.
+    """
+    from codex_dispatch_terminal import inspect_terminal_attempt
+
+    exact = []
+    for line in registry_lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("attempt_id") == attempt_id:
+            exact.append((fields, metadata))
+        elif fields[1] in {"open", "running"}:
+            try:
+                identity = registered_node_identity(metadata, node)
+            except ValueError:
+                # A node-less owner belongs to its terminal owner node, not
+                # this review. Match readiness's handling of unrelated rows.
+                continue
+            if identity == (route.get("route_id"), route.get("route_hash"), node.get("id")):
+                raise ValueError("conflicting-active-retry")
+    if not attempt_id or len(exact) != 1:
+        raise ValueError("terminal-review-attempt-not-unique")
+    fields, metadata = exact[0]
+    if (registered_node_identity(metadata, node) !=
+            (route.get("route_id"), route.get("route_hash"), node.get("id"))
+            or node.get("kind") != "review-worker"
+            or committed_outcome(fields[1], metadata) != "review-blocked"
+            or metadata.get("worker_type") != "review"
+            or metadata.get("artifact_root") != route.get("artifact_root")
+            or fields[3] != route.get("cwd")
+            or verdict_pass(metadata) or terminal_conflict_pending(metadata)):
+        raise ValueError("terminal-review-binding-conflict")
+    validate_attempt_metadata(metadata)
+    if attempt_process_quiescence(metadata, terminal_receipt=True).state != "quiescent":
+        raise ValueError("terminal-review-not-quiescent")
+    terminal = inspect_terminal_attempt(
+        metadata.get("log_file"), worktree=fields[3],
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type="review")
+    if (terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL"
+            or terminal.get("artifact_state") != "readable"
+            or terminal.get("failure_note") != "completed-review-blocking"
+            or terminal.get("review_verdict_conflict")):
+        raise ValueError("terminal-review-failure-unverified")
+    encoded = str(terminal.get("artifact_path_b64", ""))
+    path = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+    if (path.resolve() != evidence_path.resolve()
+            or evidence_digest(path) != evidence_sha256):
+        raise ValueError("terminal-review-evidence-conflict")
+    return terminal
 
 
 def completion_marker_is_current(
@@ -7882,8 +7947,13 @@ def completion_attempt_readiness(
     jobs: Path,
     *,
     registry_lines: list[str] | None = None,
+    observe: bool = False,
 ) -> AttemptReadiness:
-    """Combine a current semantic marker with its exact governed process state."""
+    """Combine a current semantic marker with its exact governed process state.
+
+    ``observe=True`` retains route hash conflicts independently of execution
+    compatibility; it does not change launch or completion policy.
+    """
 
     if owner_closure_shape(marker) == "continuation":
         try:
@@ -7935,7 +8005,7 @@ def completion_attempt_readiness(
         # depth, just as registered complete does.
         if row_hash != str(route.get("route_hash") or ""):
             if metadata.get("attempt_id") == attempt_id:
-                if gates_on():
+                if observe or gates_on():
                     return AttemptReadiness("unverifiable", "attempt-route-hash-mismatch", attempt_id)
                 same_work_or_refuse("attempt-route-hash-mismatch", attempt_id)
             else:

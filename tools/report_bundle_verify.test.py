@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import base64
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -28,19 +30,61 @@ def corrupt_ogg_audio_pages(path):
         segments = payload[offset + 26]; table_end = offset + 27 + segments
         size = sum(payload[offset + 27:table_end]); page_end = table_end + size
         serial = int.from_bytes(payload[offset + 14:offset + 18], "little")
-        body = bytes(payload[table_end:page_end]); pages.append((serial, table_end, page_end, body))
+        body = bytes(payload[table_end:page_end]); pages.append((offset, serial, table_end, page_end, body))
         if body.startswith(b"\x01vorbis"): audio_serial = serial
         offset = page_end
     if audio_serial is None: raise AssertionError("fixture has no Vorbis stream")
     changed = 0
-    for serial, start, end, body in pages:
-        if serial == audio_serial and not body.startswith((b"\x01vorbis", b"\x03vorbis", b"\x05vorbis")) and end > start:
-            payload[start] ^= 0xFF; changed += 1
-    if not changed: raise AssertionError("fixture has no audio data page")
+    for page, serial, start, end, body in pages:
+        setup = body.find(b"\x05vorbis")
+        if serial != audio_serial or setup < 0:
+            continue
+        # Keep the container readable so FFmpeg reaches the damaged audio
+        # setup instead of silently dropping a page with a bad checksum.
+        payload[start + setup + 7:end] = bytes(end - start - setup - 7)
+        payload[page + 22:page + 26] = bytes(4)
+        checksum = 0
+        for value in payload[page:end]:
+            checksum ^= value << 24
+            for _ in range(8):
+                checksum = ((checksum << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if checksum & 0x80000000 else (checksum << 1) & 0xFFFFFFFF
+        payload[page + 22:page + 26] = checksum.to_bytes(4, "little")
+        changed += 1
+    if not changed: raise AssertionError("fixture has no Vorbis setup page")
     path.write_bytes(payload)
 
 
 class BundleV2Tests(unittest.TestCase):
+    def test_report_status_and_read_are_read_only_display_entrypoints(self):
+        payload = {
+            "verification": {"verdict": "PASS", "peers": [], "history": []},
+            "completion": {"state": "complete"},
+            "required_input_observation": {"state": "confirmed", "reasons": []},
+            "display": {"verification_label": "검증 통과", "completion_label": "작업 완료",
+                        "required_input_label": "필수 입력 확인", "limitations": [],
+                        "entrypoints": [{"label": "보고서 HTML", "href": "file:///report/index.html"}]},
+            "entrypoints": [{"label": "보고서 HTML", "path": "index.html",
+                             "href": "file:///report/index.html"}],
+        }
+        source = "/tmp/report-source"
+        with mock.patch.object(B.REPORT_PROJECTION, "project_report", return_value=payload) as project, \
+                mock.patch("webbrowser.open") as browser:
+            for command in ("status", "read"):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(B.main([command, "--source", source, "--json"]), 0)
+                self.assertEqual(json.loads(output.getvalue()), payload)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(B.main(["read", "--source", source, "--format", "html"]), 0)
+            self.assertIn("검증 통과", output.getvalue())
+            self.assertIn("file:///report/index.html", output.getvalue())
+            self.assertNotIn("<script", output.getvalue().lower())
+            self.assertEqual(project.call_count, 3)
+            browser.assert_not_called()
+            with self.assertRaisesRegex(B.BundleError, "cannot be combined"):
+                B.main(["read", "--source", source, "--json", "--format", "html"])
+
     def test_cross_repo_v2_golden_shapes_are_exact(self):
         link = json.loads((HERE.parent / "capabilities/report-bundle-link-existing.request.example.json").read_text())
         receipt = json.loads((HERE.parent / "capabilities/report-bundle-receipt.v2.example.json").read_text())

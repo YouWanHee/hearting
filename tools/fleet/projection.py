@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -1728,6 +1729,7 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     round_token = _ROUND_SCOPE.set(
         route.RoundScope(route_records, node_evidence or {}, tuple(jobs))
     )
+    report_verification_cache = {}
     try:
         for entity in all_entities:
             entity.work_projection = resolve_work_projection(
@@ -1736,6 +1738,31 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                 spec_markers=spec_markers,
                 cap_grounding=(entity.cap_grounding if isinstance(entity, Session) else None),
                 degradations=degradations)
+            work = entity.work_projection
+            route_view = getattr(work, "_route_view", None) or {}
+            route_record = route_view.get("record") if isinstance(route_view, dict) else None
+            if (work.source == "route-exact" and not work.ambiguity
+                    and work.route_id and work.route_hash and isinstance(route_record, dict)
+                    and route_record.get("route_id") == work.route_id
+                    and route_record.get("route_hash") == work.route_hash):
+                root = (_field(entity, "artifact_root") or route_record.get("artifact_root")
+                        or artifact_root)
+                launch = route_record.get("launch_compatibility_tuple") or {}
+                jobs_binding = launch.get("jobs_path") or {}
+                jobs_path = (os.environ.get("AGENT_DISPATCH_JOBS")
+                             or (jobs_binding.get("path") if isinstance(jobs_binding, dict) else None))
+                if root:
+                    cache_key = (str(root), work.route_id, work.route_hash, str(jobs_path or ""))
+                    if cache_key not in report_verification_cache:
+                        try:
+                            from utilities.report_verification_projection import project_route
+                            report_verification_cache[cache_key] = project_route(
+                                root, work.route_id, work.route_hash, jobs=jobs_path)
+                        except Exception:
+                            report_verification_cache[cache_key] = None
+                    if report_verification_cache[cache_key] is not None:
+                        entity.work_projection = replace(
+                            work, report_verification=report_verification_cache[cache_key])
             entity.stage = (entity.work_projection.stage_label
                             if isinstance(entity, DispatchJob) else getattr(entity, "stage", None))
             if isinstance(entity, DispatchJob):

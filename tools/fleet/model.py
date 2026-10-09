@@ -190,9 +190,12 @@ class WorkProjection:
     scope_node_ids: Optional[tuple] = None
     ambiguity: Optional[str] = None
     _route_view: Optional[dict] = field(default=None, repr=False, compare=False)
+    report_verification: Optional[dict] = field(default=None, compare=False)
 
     def to_dict(self):
         payload = _public_value(self)
+        if payload.get("report_verification") is None:
+            payload.pop("report_verification", None)
         # Public v16 shape is an array so future resolver diagnostics can be
         # additive without changing the JSON type.  Keep the scalar internal
         # storage compatible with existing constructors and comparisons.
