@@ -3240,18 +3240,20 @@ def _prompt_form_open(target, state_before):
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None):
     """Use the shared projection with exact native identity and registered bindings.
 
-    A pane whose harness has not assigned a session yet (a fresh Codex before
-    its first input: herdr reports none and its process proves none) is exact
-    by pane and shell birth: nothing can be bound to it, so its native turn
-    decides. A caller holding a session still needs it."""
+    Before a harness's first input herdr reports no session. The session the
+    pane's foreground process proves is then the pane's own (Codex 0.162 opens
+    its thread at start) and keeps the bound-work checks; a pane with neither
+    is exact by pane and shell birth: nothing can be bound to it, so its native
+    turn decides. A caller holding a session still needs it."""
     try:
         observed_state, ident, _code, _reason = _retire_target(target)
         harness, sid, pane = ident.get("harness"), ident.get("session_id"), ident.get("pane")
         info = _retire_pane_info(pane) if pane and pane != "-" else None
-        # herdr's silence alone is not freshness: a session the process proves
-        # (herdr not told yet) keeps the exact-session checks.
-        unbound = (sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict)
-                   and _proven_session(info["foreground_processes"], harness) is None)
+        if sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict):
+            proven = _proven_session(info["foreground_processes"], harness)
+            if proven:
+                sid, expected_sid = proven, None
+        unbound = sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict)
         shell_start = (_proc_start_ticks(info.get("shell_pid"))
                        if isinstance(info, dict) else None)
         birth = (f"{info['shell_pid']}:{shell_start}"

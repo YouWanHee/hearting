@@ -1684,7 +1684,9 @@ followed by an explicit new watch. A tab is a location hint, not identity.
 A target with no session yet (a Codex before its first input) is held by server
 and pane, and the observer continues on the first session that pane reports;
 `prompt` types into such a pane and `retire` exits it on its native turn and
-screen alone, since nothing can be bound to it yet.
+screen alone, since nothing can be bound to it yet. A session its foreground
+process already proves (Codex 0.162 opens one at start) is that pane's session
+until herdr reports one: registered work bound to it still withholds input.
 Watcher, lock, receipt, and available wake carriers are runtime-owned
 (`core/ADAPTATION.md §7.3`).
 
