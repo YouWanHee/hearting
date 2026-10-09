@@ -1681,6 +1681,10 @@ times out, loses herdr, or exits; the existing startup/reconnect path replaces
 only that observer and continues the same watch id. `join`/`status`/`ack` report
 the stored obligation and its current observation; a fulfilled duty may be
 followed by an explicit new watch. A tab is a location hint, not identity.
+A target with no session yet (a Codex before its first input) is held by server
+and pane, and the observer continues on the first session that pane reports;
+`prompt` types into such a pane and `retire` exits it on its native turn and
+screen alone, since nothing can be bound to it yet.
 Watcher, lock, receipt, and available wake carriers are runtime-owned
 (`core/ADAPTATION.md §7.3`).
 

@@ -268,7 +268,12 @@ def completion_readiness(
     provenance = (("native_turn", observation.native_turn),
                   ("bindings_state", observation.bindings_state),
                   *observation.provenance)
-    if (not observation.identity_verified or any(not value for _, value in identity)):
+    # A harness that has not assigned a session yet (a fresh Codex before its
+    # first input) is identified by server, pane and shell birth alone; no
+    # registered work can be bound to it.
+    required = (identity if observation.session_id or observation.bound_work
+                else tuple(pair for pair in identity if pair[0] != "session_id"))
+    if (not observation.identity_verified or any(not value for _, value in required)):
         return CompletionReadiness("unknown", "native-turn", None, "observe-identity",
                                    "pane-identity-unverified", provenance, identity,
                                    observation.form_state, observation.draft_state)

@@ -1874,9 +1874,11 @@ def cmd_retire(args):
                 print(f"retired=true reason=already-complete agent={harness} "
                       f"name={ident['name']} pane={pane}")
                 return 0
-            return finish("retire-already-pending", pending=True)
-        store, duty = _retire_request(target, ident)
-        duty_id = duty["id"]
+            # A repeated request retries a still-waiting duty now; the phase
+            # claim below keeps the exit key single with the background runner.
+        else:
+            store, duty = _retire_request(target, ident)
+            duty_id = duty["id"]
     else:
         duty_id = duty["id"]
     phase = (duty.get("observation") or {}).get("phase", "waiting")
@@ -2294,6 +2296,38 @@ def _run_herdr_get(target):
     return None
 
 
+def _watch_identity_matches(expected, observed):
+    """Exact harness and pane, and the session -- except that a watch armed
+    before its target had one (a fresh Codex) takes the first session the pane
+    reports; `expected` keeps it, so every later check needs that session."""
+    if any(expected.get(key) in {None, "", "-"} or observed.get(key) != expected[key]
+           for key in ("harness", "pane")):
+        return False
+    if expected.get("session_id") == "-" and observed.get("session_id") not in {None, "", "-"}:
+        expected["session_id"] = observed["session_id"]
+    return observed.get("session_id") == expected.get("session_id")
+
+
+def _persist_watch_session(args, paths, server, session_id):
+    """Write the session a pane-armed watch took into its arm, under the arm
+    claim, so dedupe and a restarted observer hold that session from now on."""
+    claim = paths.arm.parent / f"{_dedupe_key(args.steward_session_id, args.target, list(args.until or []), server)}.arm"
+    try:
+        claim_fd = _open_lock(claim)
+    except OSError:
+        return False
+    try:
+        if not _acquire_bounded(claim_fd, _CLAIM_TIMEOUT_MS):
+            return False
+        arm = _read_json(paths.arm)
+        agent = arm.get("agent") if isinstance(arm, dict) else None
+        if isinstance(agent, dict) and agent.get("session_id") == "-":
+            _write_json_atomic(paths.arm, {**arm, "agent": {**agent, "session_id": session_id}})
+        return True
+    finally:
+        os.close(claim_fd)
+
+
 def cmd_watch(args):
     root = _watch_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -2350,7 +2384,9 @@ def cmd_watch(args):
             return 2
         if reason is not None:
             return _unavailable(reason)
-        if any(agent.get(key) in {None, "", "-"} for key in ("harness", "session_id", "pane")):
+        # The session may not exist yet (a fresh Codex before its first input):
+        # the watcher then follows the pane and takes the first session it reports.
+        if any(agent.get(key) in {None, "", "-"} for key in ("harness", "pane")):
             return _unavailable("watch-identity-unverified")
 
         if existing_id:
@@ -2358,8 +2394,7 @@ def cmd_watch(args):
             existing_arm = _read_json(existing_paths.arm)
             if (not existing_paths.receipt.exists() and isinstance(existing_arm, dict)
                     and (existing_arm.get("server") or "default") == server
-                    and all((existing_arm.get("agent") or {}).get(key) == agent[key]
-                            for key in ("harness", "session_id", "pane"))):
+                    and _watch_identity_matches(dict(existing_arm.get("agent") or {}), agent)):
                 if not _watcher_present(existing_arm):
                     _spawn_watch_observer(existing_id, existing_arm)
                     existing_arm = _read_json(existing_paths.arm) or existing_arm
@@ -2563,16 +2598,18 @@ def cmd_watch_run(args):
     checkpoint_ms = args.timeout if args.timeout is not None else _WATCH_OBSERVER_TIMEOUT_MS
     checkpoint_ms = min(600_000, max(500, int(checkpoint_ms)))
     backoff = 1.0
+    unbound = expected["session_id"] == "-"
     while True:
         resolved, current, _code, reason = _interpret_payload(_run_herdr_get(args.target), args.target)
         exact = (reason is None and resolved not in {"agent-not-found", "herdr-unavailable"}
-                 and all(expected[key] not in {"", "-"} and current.get(key) == expected[key]
-                         for key in expected))
+                 and _watch_identity_matches(expected, current))
+        if unbound and expected["session_id"] != "-":
+            unbound = not _persist_watch_session(args, paths, server, expected["session_id"])
         if exact:
             payload = _run_herdr_wait(args.target, args.until, checkpoint_ms)
             state, agent, _code, reason = _interpret_payload(payload, args.target)
             if (reason is None and state not in {"timeout", "agent-not-found", "herdr-unavailable"}
-                    and all(agent.get(key) == expected[key] for key in expected)):
+                    and _watch_identity_matches(expected, agent)):
                 if state in {"idle", "done"}:
                     readiness = _pane_readiness(
                         args.target, state, expected_harness=expected["harness"],
@@ -2765,8 +2802,9 @@ def _spawn_watch_observer(watch_id, arm):
     if paths.receipt.exists() or _watcher_present(arm):
         return True
     agent = arm.get("agent") or {}
-    if any(not isinstance(agent.get(key), str) or agent.get(key) in {"", "-"}
-           for key in ("harness", "session_id", "pane")):
+    if (any(not isinstance(agent.get(key), str) or agent.get(key) in {"", "-"}
+            for key in ("harness", "pane"))
+            or not isinstance(agent.get("session_id"), str) or not agent["session_id"]):
         _write_json_atomic(paths.observation, {
             "schema_version": _WATCH_SCHEMA, "watch_id": watch_id,
             "state": "unknown", "reason": "legacy-watch-identity-unavailable",
@@ -2822,7 +2860,9 @@ def _spawn_watch_observer(watch_id, arm):
             )
         finally:
             os.close(log_fd)
-        updated = dict(arm)
+        # Re-read: the observer may have written the session it took meanwhile.
+        current_arm = _read_json(paths.arm)
+        updated = dict(current_arm if isinstance(current_arm, dict) else arm)
         updated["observer_generation"] = int(arm.get("observer_generation", 1)) + 1
         updated["rearm_count"] = int(arm.get("rearm_count", 0)) + 1
         updated["watcher"] = {"pid": proc.pid, "pid_start": process_start_ticks(proc.pid) or ""}
@@ -3198,11 +3238,20 @@ def _prompt_form_open(target, state_before):
 
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None):
-    """Use the shared projection with exact native identity and registered bindings."""
+    """Use the shared projection with exact native identity and registered bindings.
+
+    A pane whose harness has not assigned a session yet (a fresh Codex before
+    its first input: herdr reports none and its process proves none) is exact
+    by pane and shell birth: nothing can be bound to it, so its native turn
+    decides. A caller holding a session still needs it."""
     try:
         observed_state, ident, _code, _reason = _retire_target(target)
         harness, sid, pane = ident.get("harness"), ident.get("session_id"), ident.get("pane")
         info = _retire_pane_info(pane) if pane and pane != "-" else None
+        # herdr's silence alone is not freshness: a session the process proves
+        # (herdr not told yet) keeps the exact-session checks.
+        unbound = (sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict)
+                   and _proven_session(info["foreground_processes"], harness) is None)
         shell_start = (_proc_start_ticks(info.get("shell_pid"))
                        if isinstance(info, dict) else None)
         birth = (f"{info['shell_pid']}:{shell_start}"
@@ -3210,18 +3259,18 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
         exact = (
             observed_state not in {"herdr-unavailable", "agent-not-found", "unknown"}
             and harness in {"claude", "codex", "opencode"}
-            and isinstance(sid, str) and sid and sid != "-"
+            and (unbound or (isinstance(sid, str) and sid and sid != "-"))
             and isinstance(pane, str) and pane and pane != "-"
             and bool(birth)
             and (expected_harness is None or harness == expected_harness)
             and (expected_sid is None or sid == expected_sid)
             and (expected_pane is None or pane == expected_pane)
         )
-        bound, binding_state = peer_obligations.bound_work_for_pane(
-            pane or "", harness or "", sid or "")
+        bound, binding_state = (((), "observed") if unbound else
+                                peer_obligations.bound_work_for_pane(pane or "", harness or "", sid or ""))
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
-            harness=harness or "", session_id=sid or "", pid_birth=birth,
+            harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
             identity_verified=exact, native_turn=observed_state,
             bound_work=bound, bindings_state=binding_state,
             provenance=(("target", target), ("observed_state", observed_state)),
@@ -3718,6 +3767,11 @@ def cmd_prompt(args):
     except (OSError, ValueError):
         print("prompted=unverified reason=peer-pending-unavailable")
         return 5
+    if pending and not t_sid and not input_reason:
+        # Private delivery is SID-bound: a receivable target with no session
+        # yet (a fresh Codex before its first input) takes the typed send, even
+        # when a retry reused a row an earlier deferral left unaddressable.
+        pending = None
     surface = "herdr"
     claimed = None
     if pending and t_harness != "codex" and not input_reason:
@@ -4016,6 +4070,14 @@ def _process_session(pane, harness):
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
         payload = json.loads(proc.stdout or "")
         processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
+    except Exception:
+        return None
+    return _proven_session(processes, harness)
+
+
+def _proven_session(processes, harness):
+    """The session one of these foreground processes proves (`fleet.process_identity`), or None."""
+    try:
         tools_dir = Path(__file__).resolve().parent.parent / "tools"
         if tools_dir.is_dir() and str(tools_dir) not in sys.path:
             sys.path.insert(0, str(tools_dir))

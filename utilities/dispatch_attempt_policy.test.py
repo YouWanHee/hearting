@@ -151,6 +151,23 @@ class CompletionReadinessProjectionTest(unittest.TestCase):
         self.assertEqual(result.state, "unknown")
         self.assertEqual(result.reason, "pane-identity-unverified")
 
+    def test_pane_before_its_first_session_is_judged_by_its_native_turn(self):
+        fresh = POLICY.completion_readiness(self.pane(harness="codex", session_id=""))
+        self.assertEqual((fresh.state, fresh.reason), ("ready", "native-turn-ready"))
+        busy = POLICY.completion_readiness(self.pane(session_id="", native_turn="working"))
+        self.assertEqual((busy.state, busy.reason), ("pending", "native-turn-busy"))
+        for changes in ({"identity_verified": False}, {"pid_birth": ""}, {"pane": ""}):
+            with self.subTest(changes=changes):
+                result = POLICY.completion_readiness(self.pane(session_id="", **changes))
+                self.assertEqual((result.state, result.reason), ("unknown", "pane-identity-unverified"))
+        bound = POLICY.RegisteredWorkObservation(
+            "att-open",
+            POLICY.AttemptDecision("pending", "wait", "execution-boundary", "process-alive"),
+            "live", "unsettled",
+        )
+        result = POLICY.completion_readiness(self.pane(session_id="", bound_work=(bound,)))
+        self.assertEqual((result.state, result.reason), ("unknown", "pane-identity-unverified"))
+
     def test_registered_work_overrides_optimistic_idle(self):
         unfinished = POLICY.RegisteredWorkObservation(
             "att-open",
