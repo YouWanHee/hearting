@@ -70,6 +70,14 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertEqual((ready.state, ready.scope, ready.outcome),
                          ("ready", "native-turn", None))
 
+    def test_observer_error_after_fulfillment_cannot_reopen_duty(self):
+        self.store.create("retire-done", "retire", {"pane": "w1:p1"},
+                          {"target": "worker"})
+        done = self.store.update("retire-done", state="complete", result="normal-exit",
+                                 observation={"phase": "complete"}, cleanup="complete")
+        after_error = self.store.update("retire-done", observer_error="observer-unavailable")
+        self.assertEqual(after_error, done)
+
     def test_unreadable_binding_source_is_unknown(self):
         jobs = self.root / "not-a-file"
         jobs.mkdir()

@@ -164,7 +164,8 @@ class ObligationStore:
 
     def update(self, duty_id: str, *, state: str | None = None,
                observation: dict | None = None, result: str | None = None,
-               delivery: str | None = None, cleanup: str | None = None) -> dict:
+               delivery: str | None = None, cleanup: str | None = None,
+               observer_error: str | None = None) -> dict:
         if state is not None and state not in _PENDING_STATES | {"complete", "cancelled"}:
             raise ObligationError("peer-obligation-state-invalid")
         path = self._record_path(duty_id)
@@ -173,6 +174,14 @@ class ObligationStore:
             record = _read_record(path)
             if record is None:
                 raise ObligationError("peer-obligation-missing")
+            if observer_error is not None:
+                # Error observation cannot undo a claimed side effect or reopen
+                # a fulfilled duty. Merge the checkpoint under the same lock.
+                if record.get("state") in {"complete", "cancelled"}:
+                    return record
+                state = "unknown"
+                observation = {**(record.get("observation") or {}),
+                               "reason": observer_error}
             if result is not None and record.get("result") not in {None, result}:
                 raise ObligationError("peer-obligation-result-conflict")
             if state is not None:

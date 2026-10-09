@@ -7,6 +7,7 @@ pre-SD-122 board.
 """
 import glob
 import importlib.util
+from itertools import islice
 import json
 import os
 import re
@@ -161,6 +162,20 @@ def _parse_ts(ts):
         return None
 
 
+def _bounded_duty_paths(root, limit):
+    """Bound directory enumeration as well as file reads; this is a preview."""
+    if limit <= 0:
+        return []
+    try:
+        with os.scandir(root) as entries:
+            # Allow room for sidecar locks, then sort only this bounded sample.
+            paths = [Path(entry.path) for entry in islice(entries, limit * 4)
+                     if entry.name.endswith(".json")]
+        return sorted(paths)[:limit]
+    except OSError:
+        return []
+
+
 def _pending_obligations(roots, now):
     """Read a bounded, body-free view of accepted peer follow-through."""
     by_session = {}
@@ -181,10 +196,7 @@ def _pending_obligations(roots, now):
         if examined >= _MAX_PENDING_DUTIES:
             break
         obligation_root = Path(state_root) / "peer-steward" / "obligations"
-        try:
-            paths = sorted(obligation_root.glob("*.json"))[:_MAX_PENDING_DUTIES - examined]
-        except OSError:
-            paths = []
+        paths = _bounded_duty_paths(obligation_root, _MAX_PENDING_DUTIES - examined)
         for path in paths:
             examined += 1
             try:
@@ -199,8 +211,8 @@ def _pending_obligations(roots, now):
             if not isinstance(duty_id, str) or duty_id in seen:
                 continue
             seen.add(duty_id)
-            identity = duty.get("identity") or {}
             intent = duty.get("intent") or {}
+            identity = intent.get("identity") or duty.get("identity") or {}
             kind = (intent.get("kind") or duty.get("kind") or "").lower()
             if kind == "message":
                 target = intent.get("to") or identity
@@ -219,10 +231,7 @@ def _pending_obligations(roots, now):
             add(key, label, duty.get("state"), created, ref)
 
         watch_root = Path(state_root) / "peer-watches"
-        try:
-            arms = sorted(watch_root.glob("*.json"))[:_MAX_PENDING_DUTIES - examined]
-        except OSError:
-            arms = []
+        arms = _bounded_duty_paths(watch_root, _MAX_PENDING_DUTIES - examined)
         for path in arms:
             if examined >= _MAX_PENDING_DUTIES:
                 break

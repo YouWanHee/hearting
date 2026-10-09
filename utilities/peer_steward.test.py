@@ -2898,6 +2898,24 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     def prompt(self, body="peer body"):
         return peer_steward.main(["prompt", "child", body])
 
+    def test_idle_prompt_with_bound_pending_or_unknown_work_sends_no_input(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        meta = ("attempt_id=att-bound,parent_sid=sid-child,parent_pane=w1:pX,"
+                "parent_harness=claude")
+        self.jobs_path.write_text(f"2026-10-09T00:00:00Z\topen\trepo\t-\tslug\t{meta}\n")
+        for state, reason in (("live", "bound-registered-work-pending"),
+                              ("unverifiable", "bound-registered-work-unknown")):
+            with self.subTest(process_state=state), mock.patch(
+                    "dispatch_contract.observed_attempt_liveness",
+                    return_value=ObservedAttemptLiveness(
+                        "alive" if state == "live" else "unverifiable", "fixture", state, "fixture")):
+                self.assertEqual(self.prompt("preserve until bound work settles: " + state), 3)
+                self.assertEqual(self.messages, [])
+                self.assertEqual(self.keys, [])
+                ref = self._all_records()[-1]["transfer_ref"]
+                pending = peer_steward.peer_message._read_pending(ref)
+                self.assertEqual(pending["receipt"], reason)
+
     def idle(self):
         # Run the actual existing receive callback entry, with native identity
         # isolated to this fixture. Its internal claims/acks are not mocked.
@@ -4543,6 +4561,92 @@ class _RetireWorld:
 
 
 class RetireTest(_TmpRootMixin, unittest.TestCase):
+    def _run_retire_runner(self, world, crash_phase=None):
+        store = peer_steward.peer_obligations.ObligationStore()
+        lock_fd = os.open(store.root / "runner.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        original_stat = os.stat
+        clock = iter(range(100))
+
+        def stat(path, *args, **kwargs):
+            if str(path) == "/proc/4242":
+                if world.sent and world.exits:
+                    raise FileNotFoundError(path)
+                return object()
+            return original_stat(path, *args, **kwargs)
+
+        def run(argv, **kwargs):
+            if crash_phase == "exit-requested" and world.sent and argv[:3] == ["herdr", "pane", "process-info"]:
+                raise RuntimeError("fixture observation interrupted after exit send")
+            if crash_phase == "shell-returned" and argv[:3] == ["herdr", "pane", "close"]:
+                raise RuntimeError("fixture cleanup observation interrupted")
+            return world.run(argv, **kwargs)
+
+        try:
+            with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+                 mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+                 mock.patch.object(peer_steward, "_retire_process_record",
+                                   return_value={"start": "800", "group": 4242, "argv": [world.harness]}), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks",
+                                   side_effect=lambda pid: "700" if pid == 101 else "800"), \
+                 mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
+                 mock.patch.object(peer_steward, "_seat_handover", return_value=None), \
+                 mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
+                 mock.patch.object(peer_steward.time, "sleep",
+                                   side_effect=InterruptedError("fixture runner stopped") if crash_phase else None), \
+                 mock.patch("builtins.print"):
+                if crash_phase:
+                    with self.assertRaises(InterruptedError):
+                        peer_steward.cmd_obligation_runner(
+                            SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd))
+                else:
+                    self.assertEqual(peer_steward.cmd_obligation_runner(
+                        SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd)), 0)
+        finally:
+            os.close(lock_fd)
+
+    def test_observer_error_preserves_exit_phase_and_restart_only_finishes_cleanup(self):
+        for phase in ("exit-requested", "shell-returned"):
+            with self.subTest(phase=phase):
+                world = _RetireWorld(status="working")
+                rc, _line = self.retire(world)
+                self.assertEqual(rc, 0)
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty_id = store.list()[0]["id"]
+                world.status = "idle"
+                self._run_retire_runner(world, crash_phase=phase)
+                interrupted = store.get(duty_id)
+                self.assertEqual(interrupted["state"], "unknown")
+                self.assertEqual(interrupted["observation"]["phase"], phase)
+                self.assertEqual(interrupted["observation"]["foreground"]["pid"], 4242)
+                self.assertEqual(interrupted["observation"]["reason"], "observer-unavailable")
+                self._run_retire_runner(world)
+                settled = store.get(duty_id)
+                self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                                 ("complete", "normal-exit", "complete"))
+                self.assertEqual(world.actions(), [
+                    ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+                    ["herdr", "pane", "close", "w1:pOld"],
+                ])
+
+    def test_idle_retire_with_bound_pending_or_unknown_work_sends_no_exit(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        meta = ("attempt_id=att-bound,parent_sid=old-sid,parent_pane=w1:pOld,"
+                "parent_harness=codex")
+        self.jobs_path.write_text(f"2026-10-09T00:00:00Z\topen\trepo\t-\tslug\t{meta}\n")
+        for state, reason in (("live", "bound-registered-work-pending"),
+                              ("unverifiable", "bound-registered-work-unknown")):
+            with self.subTest(process_state=state), mock.patch(
+                    "dispatch_contract.observed_attempt_liveness",
+                    return_value=ObservedAttemptLiveness(
+                        "alive" if state == "live" else "unverifiable", "fixture", state, "fixture")):
+                world = _RetireWorld(status="idle")
+                rc, line = self.retire(world)
+                self.assertEqual(rc, 0)
+                self.assertIn("reason=" + reason, line)
+                self.assertIn("pending=true", line)
+                self.assertEqual(world.actions(), [])
+
     def retire(self, world, record=None, *, clear_existing=True):
         printed = []
         store = peer_steward.peer_obligations.ObligationStore()

@@ -7,7 +7,9 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -60,6 +62,50 @@ def _rec(from_sid, to_sid=None, to_name=None, kind="steer", summary="hi",
 
 
 class CollectorTest(unittest.TestCase):
+    def test_persisted_retire_identity_reaches_session_display_without_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = peer_steward.peer_obligations.ObligationStore(tmp)
+            store.create("retire-persisted", "retire",
+                         {"server": "fixture", "pane": "w1:p1", "harness": "codex",
+                          "session_id": "thread-retiring"},
+                         {"target": "worker", "body": "PRIVATE_RETIRE_SENTINEL"})
+            path = store._record_path("retire-persisted")
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            result = peer_messages.collect(state_roots=[tmp])
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        pending = result["by_session"][("codex", "thread-retiring")]["pending_obligations"]
+        self.assertEqual([(row["kind"], row["state"]) for row in pending], [("retire", "pending")])
+        self.assertNotIn("PRIVATE_RETIRE_SENTINEL", json.dumps(pending))
+        session = Session(harness="codex", pid=1, session_id="thread-retiring")
+        collectors.apply_peer_rows([session], result["by_session"])
+        rendered = "".join(text for text, _ in render._peer_obligation_strip(
+            session.peer_obligations, term_width=120)[0])
+        self.assertIn("retire 1", rendered)
+
+    def test_duty_scan_stops_before_enumerating_large_completed_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = peer_steward.peer_obligations.ObligationStore(tmp)
+            identity = {"harness": "claude", "session_id": "sid-a"}
+            store.create("completed", "retire", identity, {"target": "old"})
+            store.update("completed", state="complete")
+            store.create("000-pending", "retire", identity, {"target": "current"})
+            examined = []
+
+            def entries():
+                # Pending is behind many complete records in a much larger directory.
+                for i in range(10000):
+                    if i >= peer_messages._MAX_PENDING_DUTIES * 4:
+                        self.fail("collector enumerated beyond its directory budget")
+                    examined.append(i)
+                    path = store._record_path("000-pending" if i == 64 else "completed")
+                    yield SimpleNamespace(name=path.name, path=str(path))
+
+            with mock.patch.object(peer_messages.os, "scandir",
+                                   return_value=nullcontext(entries())):
+                result = peer_messages._pending_obligations([tmp], time.time())
+        self.assertEqual(len(examined), peer_messages._MAX_PENDING_DUTIES * 4)
+        self.assertEqual([row["kind"] for row in result[("claude", "sid-a")]], ["retire"])
+
     def test_pending_duties_are_read_only_bounded_and_body_free(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

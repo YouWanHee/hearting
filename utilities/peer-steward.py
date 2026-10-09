@@ -3549,8 +3549,7 @@ def cmd_obligation_runner(args):
                     _resume_retire_obligation(duty, store)
             except Exception:
                 try:
-                    store.update(duty["id"], state="unknown",
-                                 observation={"reason": "observer-unavailable"})
+                    store.update(duty["id"], observer_error="observer-unavailable")
                 except Exception:
                     pass
         time.sleep(delay)
