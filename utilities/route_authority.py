@@ -820,10 +820,11 @@ def granted_permissions(applied, launch_home=None) -> dict:
 # managed release copy (`release_moved`). The launcher's location is `LAUNCH_LOCATION_VALUES`; the
 # process table yields to the drain receipt its watcher sealed
 # (`dispatch_contract._denied_process_outside_attempt`). The work, the permissions granted to
-# it and the route's own seal are still compared.
+# it and the route's own seal are still compared. The portable model profile
+# is approved work quality, not a value derived from the release.
 RELEASE_DERIVED_VALUES = frozenset({
     "model", "reasoning", "resolved_model_settings", "resolved_completion_delivery",
-    "parent_completion_delivery", "execution_surface", "fallback_hop", "model_role", "model_profile"})
+    "parent_completion_delivery", "execution_surface", "fallback_hop", "model_role"})
 RELEASE_LAUNCH_ROOTS = frozenset({"registry_root", "launch_home", "runtime_root", "wrapper_root"})
 _RELEASE_IDENTITY_FIELDS = frozenset({"release_id", "content_digest", "binding_digest"})
 _MANAGED_RELEASE_ID = re.compile(r"release:[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[0-9a-f]{12}")

@@ -70,6 +70,17 @@ class RecoveryAuthorityTest(unittest.TestCase):
                 spawn += 1
             self.assertEqual(spawn, 0)
 
+    def test_release_move_preserves_portable_profile_and_allows_declared_transition(self):
+        candidate = copy.deepcopy(self.history)
+        candidate["launch_home"] = str(self.root / "new-release")
+        candidate["resolved"].update(model="current-model", model_profile="balanced")
+        before = json.dumps(self.history, sort_keys=True)
+        with self.assertRaises(DispatchContractError):
+            AUTHORITY.require_recovery_work(candidate, self.history, route=self.route, worker_type="owner")
+        AUTHORITY.require_recovery_work(candidate, self.history, route=self.route, worker_type="owner",
+                                        transition={"from": "deep", "to": "balanced"})
+        self.assertEqual(json.dumps(self.history, sort_keys=True), before)
+
     def test_cross_harness_legacy_network_and_claude_unbounded_tools_are_rejected(self):
         candidate = copy.deepcopy(self.history); candidate["harness"] = "claude"
         grants = [{"execution_access": {"network": "granted-unenforced"}},
@@ -166,6 +177,19 @@ GROUPS = (
     ("capability_route.test.py", ("TestContinuation", "FrameSummaryContractTest",)),
     ("dispatch_contract.test.py", ()),
     ("dispatch_registry.test.py", ()),
+    ("capacity_resume.test.py", ()),
+    ("review_input_preview.test.py", ()),
+    ("dispatch_harvest.test.py", ()),
+    ("dispatch_liveness_matrix.test.py", ()),
+    ("dispatch_completion_marker.test.py", (
+        "CompletionMarkerTest.test_a_sd154_dry_run_previews_auto_revision_without_mutation",
+        "CompletionMarkerTest.test_a_sd154_dry_run_unobserved_review_preserves_marker_and_row",
+        "CompletionMarkerTest.test_complete_unwritable_jobs_marker_preserved_then_reconcile_repairs")),
+    ("stage_dispatch_fallback.test.py", (
+        "FallbackTest.test_registry_prevents_explicitly_classified_tuple_retry",
+        "FallbackTest.test_registry_worker_deaths_do_not_spend_a_launch_tuple",
+        "FallbackTest.test_review_round_cap_correction_round_attaches_protocol_block_to_prompt_file")),
+    ("../tools/fleet/tests/test_f28_route.py", ("OrphanConductorAnnotationTest",)),
 )
 
 
@@ -181,7 +205,7 @@ path=Path(sys.argv[1]); sys.path.insert(0,str(path.parent))
 spec=importlib.util.spec_from_file_location('lineage_group',path)
 module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
 loader=unittest.defaultTestLoader
-suite=unittest.TestSuite(loader.loadTestsFromTestCase(getattr(module,name)) for name in sys.argv[2:]) if len(sys.argv)>2 else loader.loadTestsFromModule(module)
+suite=unittest.TestSuite(loader.loadTestsFromName(name,module) for name in sys.argv[2:]) if len(sys.argv)>2 else loader.loadTestsFromModule(module)
 result=unittest.TextTestRunner(verbosity=1).run(suite)
 sys.exit(not result.wasSuccessful())
 """

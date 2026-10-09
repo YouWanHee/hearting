@@ -1883,17 +1883,10 @@ class RegistryTest(RegistryFixtureTestCase):
   self.jobs.write_text(self.extinct_row(attempt).replace("pid:[4026534323]","pid:[999999999]"))
   before=self.jobs.read_bytes()
   dry=json.loads(self.invoke("reconcile","--attempt",attempt).stdout)
-  if dry["decisions"][0]["category"]=="unverifiable":
-   self.assertEqual(dry["closed"],0)
-   self.assertEqual(self.jobs.read_bytes(),before)
-   self.skipTest("this observer cannot complete the exact attempt-tag scan")
   self.assertEqual(dry["decisions"][0]["proposed_note"],"dead-namespace-absent",dry)
   self.assertEqual(dry["closed"],0)
+  self.assertEqual(self.jobs.read_bytes(),before)
   applied=json.loads(self.invoke("reconcile","--attempt",attempt,"--only-exact-dead","--apply").stdout)
-  if applied["decisions"][0]["category"]=="unverifiable":
-   self.assertEqual(applied["closed"],0)
-   self.assertEqual(self.jobs.read_bytes(),before)
-   self.skipTest("the apply observer cannot complete the exact attempt-tag scan")
   self.assertEqual(applied["closed"],1,applied)
   self.assertIn("note=dead-namespace-absent",self.jobs.read_text())
 
@@ -2446,11 +2439,6 @@ class ArtifactProofReceiptSealTest(RegistryFixtureTestCase):
   self.assertEqual({k:settled[k] for k in sealed},sealed)
   self.assertNotIn("cancellation_quiescence_receipt",settled)
   final=observed_attempt_liveness("done",settled,terminal_receipt_gate=True)
-  if final.state=="unverifiable" and "visibility-incomplete" in final.process_reason:
-   # A process may disappear between procfs enumeration and its environment
-   # read. The already sealed cleanup remains intact; this fresh incomplete
-   # scan must stay unknown instead of weakening the observer for the test.
-   self.skipTest(f"complete attempt-tag visibility unavailable: {final.process_reason}")
   self.assertEqual(final.state,"terminal",final)
 
  def test_settled_exact_apply_leaves_unrelated_pending_outbox_untouched(self):

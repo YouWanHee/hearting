@@ -628,13 +628,18 @@ class HarvestTest(unittest.TestCase):
             env=self.env(),
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("handoff_state=error", result.stdout)
+        # The settled runtime failure belongs to the registry outcome. Its
+        # missing log is absent evidence, distinct from an unreadable log.
+        self.assertIn("handoff_state=absent", result.stdout)
+        self.assertIn("handoff_source=none", result.stdout)
+        self.assertIn("failure_class=runtime,note=dead-runtime-exit", result.stdout)
         self.assertIn("parent_completion_receipt=consumed", result.stdout)
         self.assertFalse(state.exists())
         self.assertIn(
             "parent_completion_harvested=1",
             jobs.read_text(encoding="utf-8"),
         )
+        self.assertIn("failure_class=runtime,note=dead-runtime-exit", jobs.read_text(encoding="utf-8"))
 
     def test_legacy_pending_receipt_is_recovered_only_after_exact_done_harvest(self):
         attempt = "att-native-stop-pending"

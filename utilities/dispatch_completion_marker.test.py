@@ -886,13 +886,40 @@ class CompletionMarkerTest(unittest.TestCase):
         self.assertEqual(admission.auto_revisions, ())
         self.assertEqual(admission.planned_revision_nodes, frozenset({"plan"}))
         self.assertEqual(admission.budget.round_kind, "closure-check")
-        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+        # The preview fixture models a finished review but stores no process
+        # identity. Supply that observation at the common reader, without
+        # inventing launch/namespace fields in the historical row.
+        with mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                mock.patch.object(D, "attempt_process_quiescence", return_value=
+                                  D.ProcessQuiescence("quiescent", "controlled-review-exit")) as process:
             D.completion_marker_gate(
                 str(route_path), "plan-check", "dry-run", self.agent_home, self.jobs,
                 planned_revision_nodes=admission.planned_revision_nodes,
             )
+        self.assertEqual(process.call_args.args[0]["attempt_id"], "att-plancheck-1")
         self.assertEqual(plan_marker_path.read_bytes(), before_marker)
         self.assertEqual(self.jobs.read_bytes(), before_jobs)
+        self.assertFalse((canonical_dir / "plan.2.json").exists())
+
+    def test_a_sd154_dry_run_unobserved_review_preserves_marker_and_row(self):
+        route, plan_check_node = self._a_sd154_10_fixture("route-a10-unknown.json")
+        route_path = self.base / "route-a10-unknown.json"
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        marker = canonical_dir / "plan.json"
+        before_marker, before_jobs = marker.read_bytes(), self.jobs.read_bytes()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+            admission = DISPATCH_NODE.admit_round(
+                route, plan_check_node, self.jobs, owner_attempt_id="att-owner-dry",
+                record_auto_revisions=False,
+            )
+            with self.assertRaises(D.DispatchContractError) as caught:
+                D.completion_marker_gate(
+                    str(route_path), "plan-check", "dry-run", self.agent_home, self.jobs,
+                    planned_revision_nodes=admission.planned_revision_nodes,
+                )
+        self.assertEqual(caught.exception.reason, "prior-attempt-unverifiable")
+        self.assertIn("process-identity-missing", caught.exception.detail)
+        self.assertEqual((marker.read_bytes(), self.jobs.read_bytes()), (before_marker, before_jobs))
         self.assertFalse((canonical_dir / "plan.2.json").exists())
 
     def test_a_sd154_10_tampered_history_records_nothing(self):
@@ -1388,12 +1415,35 @@ class CompletionMarkerTest(unittest.TestCase):
             category, reason, note = registry.classify(current_row, args, newest, rows)
         self.assertEqual(note, "completed-marker")
         self.assertEqual(category, "marker-backed-stale")
-        # The unrelated dead attempt has no marker linkage, so it still
-        # falls through to the pre-existing generic dead-exact-pid path
-        # rather than being folded into the SD-70 completed-marker repair.
+        # The weak unrelated row has no group identity or marker linkage.
+        # Actual unknown observation must keep it open, even when applying
+        # exact-death reconciliation beside the valid marker repair.
         unrelated_row = next(r for r in rows if r["meta"].get("attempt_id") == "att-unrelated")
         with self.stable_root_env():
+            unrelated_category, _, unrelated_note = registry.classify(unrelated_row, args, newest, rows)
+        self.assertEqual((unrelated_category, unrelated_note), ("unverifiable", None))
+        before_jobs = self.jobs.read_bytes()
+        args.attempt = "att-unrelated"
+        args.session = args.route = args.node = args.job = None
+        args.all = False
+        args.apply = True
+        args.only_exact_dead = True
+        args.audit = args.integration_ref = None
+        args.cascade_grace = args.cascade_kill_wait = 0
+        output = io.StringIO()
+        with self.stable_root_env(), contextlib.redirect_stdout(output):
+            registry.reconcile(rows, args)
+        reconciled = json.loads(output.getvalue())
+        self.assertEqual(reconciled["closed"], 0)
+        self.assertEqual(self.jobs.read_bytes(), before_jobs)
+
+        # A controlled quiescent observation still proposes generic death,
+        # rather than borrowing the other attempt's completed marker.
+        with self.stable_root_env(), \
+                mock.patch.object(D, "attempt_process_quiescence", return_value=
+                                  D.ProcessQuiescence("quiescent", "controlled-process-exit")) as process:
             _, _, unrelated_note = registry.classify(unrelated_row, args, newest, rows)
+        self.assertEqual(process.call_args.args[0]["attempt_id"], "att-unrelated")
         self.assertEqual(unrelated_note, "dead-exact-pid")
         self.assertNotEqual(unrelated_note, "completed-marker")
 

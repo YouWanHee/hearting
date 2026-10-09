@@ -202,6 +202,37 @@ class FallbackTest(unittest.TestCase):
   env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",**envkw}
   return subprocess.run(cmd,text=True,capture_output=True,env=env)
  @contextlib.contextmanager
+ def prior_process_observation(self,attempts,*,state="quiescent"):
+  """Model only a prior row's process dependency, without changing its payload.
+
+  Dry-run wrappers run their real main in this process so every consumer
+  receives this same observation. All other process identities use procfs.
+  """
+  import dispatch_contract as DC
+  original=DC.attempt_process_quiescence
+  def observe(meta,**kwargs):
+   if meta.get("attempt_id") in attempts:
+    return DC.ProcessQuiescence(state,"fixture-group-empty" if state=="quiescent" else "process-identity-missing")
+   return original(meta,**kwargs)
+  def wrapper(args,command):
+   self.assertIn("--dry-run",command)
+   spec=importlib.util.spec_from_file_location("observed_fallback_wrapper",command[1])
+   module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+   out=io.StringIO();err=io.StringIO()
+   with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+    code=module.main(command[1:])
+   return SimpleNamespace(returncode=code,stdout=out.getvalue(),stderr=err.getvalue())
+  with mock.patch.object(DC,"attempt_process_quiescence",side_effect=observe), \
+       mock.patch.object(F,"attempt_process_quiescence",side_effect=observe), \
+       mock.patch.object(F,"run_wrapper",side_effect=wrapper):
+   yield
+ def run_observed_chain(self,path,attempts,*,state="quiescent"):
+  with self.dispatch_env(),self.prior_process_observation(attempts,state=state):
+   out=io.StringIO();err=io.StringIO()
+   with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+    code=self.run_inline_main(path)
+   return SimpleNamespace(returncode=code,stdout=out.getvalue(),stderr=err.getvalue())
+ @contextlib.contextmanager
  def dispatch_env(self,**envkw):
   """The same env `run_chain` injects into its subprocess, applied to THIS
   process instead (B47-1/2/5/6/7/10 fixtures). Must wrap both the route
@@ -733,7 +764,7 @@ class FallbackTest(unittest.TestCase):
          "--parent","owner","--capability-mode","dev","--worker-mode","qa/plan-review",
          "--model-role","fast reviewer","--jobs",str(self.jobs),
          "--prompt-file",str(prompt_file),"--dry-run"]
-   with mock.patch.object(sys,"argv",argv):
+   with self.prior_process_observation({"att-plan-check-round-1"}),mock.patch.object(sys,"argv",argv):
     observation=F.LAUNCH_TUPLE.ReportOnlyObservation()
     code=F._dispatch(observation)
    node=next(n for n in route["nodes"] if n["id"]=="plan-check")
@@ -1317,7 +1348,13 @@ class FallbackTest(unittest.TestCase):
   path=self.route(same_status="supported"); route=json.loads(path.read_text())
   pipe=f"capability=autopilot-code,route_id={route['route_id']},route_node=plan,parent=owner,attempt_id=att-prior000000,parent_harness=codex,parent_transport=headless,parent_sandbox=workspace-write,child_harness=codex,launch_authority=conductor,note=dead-launch-error,failure_class=launch-tuple"
   self.jobs.write_text(f"2026-07-16T00:00:00Z\tdone\t/repo\t{self.repo}\tfallback-plan\t{pipe}\n")
-  result=self.run_chain(path); self.assertEqual(result.returncode,0,result.stdout+result.stderr); self.assertIn("selected_hop=cross-harness-headless",result.stdout); self.assertIn("skipped-prior-unchanged-failure",result.stdout)
+  result=self.run_observed_chain(path,{"att-prior000000"}); self.assertEqual(result.returncode,0,result.stdout+result.stderr); self.assertIn("selected_hop=cross-harness-headless",result.stdout); self.assertIn("skipped-prior-unchanged-failure",result.stdout)
+  before=self.jobs.read_bytes()
+  unknown=self.run_observed_chain(path,{"att-prior000000"},state="unverifiable")
+  self.assertEqual(unknown.returncode,78,unknown.stdout+unknown.stderr)
+  self.assertIn("prior-attempt-unverifiable",unknown.stdout)
+  self.assertIn("child_spawned=0",unknown.stdout)
+  self.assertEqual(self.jobs.read_bytes(),before)
  def test_registry_worker_deaths_do_not_spend_a_launch_tuple(self):
   path=self.route(same_status="supported"); route=json.loads(path.read_text())
   base=(f"capability=autopilot-code,route_id={route['route_id']},route_node=plan,"
@@ -1330,10 +1367,16 @@ class FallbackTest(unittest.TestCase):
    f"{base},attempt_id=att-worker-dead,note=dead-exact-pid\n",
    encoding="utf-8")
   self.assertEqual(F.registry_failures(self.jobs,route["route_id"],"plan"),{})
-  result=self.run_chain(path)
+  result=self.run_observed_chain(path,{"att-worker-fail","att-worker-dead"})
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   self.assertRegex(result.stdout,r"selected_hop=(same|cross)-harness-headless")
   self.assertNotIn("skipped-prior-unchanged-failure",result.stdout)
+  before=self.jobs.read_bytes()
+  unknown=self.run_observed_chain(path,{"att-worker-fail","att-worker-dead"},state="unverifiable")
+  self.assertEqual(unknown.returncode,78,unknown.stdout+unknown.stderr)
+  self.assertIn("prior-attempt-unverifiable",unknown.stdout)
+  self.assertIn("child_spawned=0",unknown.stdout)
+  self.assertEqual(self.jobs.read_bytes(),before)
  def test_invalid_model_role_is_structured_and_preserved(self):
   path=self.route(same_status="supported")
   cross="codex/headless/workspace-write/claude/conductor"
