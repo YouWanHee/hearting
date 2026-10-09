@@ -2377,19 +2377,24 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
     def test_codex_before_its_first_session_takes_the_typed_send(self):
         """2026-10-10 regression: a fresh Codex has no session until its first
         input, and the readiness gate parked every prompt in the SID-bound native
-        queue (`peer-endpoint-unverified`), so the first input never arrived."""
+        queue (`peer-endpoint-unverified`), so the first input never arrived.
+        Codex 0.162 already holds a session its process proves before that
+        input; herdr still reports none, and the send is the same."""
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
         # The row an earlier parked attempt left behind must not capture the retry.
         peer_steward.peer_message.prepare_peer_message(
             "first brief", {"harness": "claude", "session_id": "sid-steward", "name": None},
             {"harness": "codex", "session_id": None, "name": "fresh"},
             defer=True, receipt="pane-identity-unverified")
-        for status, outcome in (("idle", "true"), ("blocked", "unverified")):
-            with self.subTest(status=status):
+        for proven, status, outcome in ((None, "idle", "true"), (None, "blocked", "unverified"),
+                                        ("thread-real", "idle", "true"),
+                                        ("thread-real", "blocked", "unverified")):
+            with self.subTest(proven=proven, status=status):
                 calls = []
                 with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
                      mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(
                          _agent_json("codex", None, "fresh", status=status), calls=calls)), \
+                     mock.patch.object(peer_steward, "_proven_session", return_value=proven), \
                      mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
                                        return_value={"status": "unverified",
                                                      "reason": "peer-endpoint-unverified"}) as queue, \
@@ -4993,15 +4998,34 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(world.actions(), before)
 
     def test_pane_before_its_first_session_retires_by_its_pane(self):
-        """2026-10-10 regression: a Codex that never took input has no session,
-        and its retire stayed `pane-identity-unverified` for good."""
+        """2026-10-10 regression: a Codex that never took input has no session
+        in herdr, and its retire stayed `pane-identity-unverified` for good."""
         world = _RetireWorld(sid=None)
-        # herdr not told yet: a session its process proves keeps the exact checks.
-        with mock.patch.object(peer_steward, "_proven_session", return_value="thread-real"):
+        with mock.patch.object(peer_steward, "_proven_session", return_value=None):
             rc, line = self.retire(world)
-        self.assertIn("retired=false reason=pane-identity-unverified", line)
+        self.assertEqual((rc, line), (0, "retired=true reason=normal-exit agent=codex name=old pane=w1:pOld"))
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+
+    def test_pane_whose_process_proves_a_session_herdr_lacks_retires_by_that_session(self):
+        """2026-10-10 recurrence: Codex 0.162 opens its thread before any input,
+        so the process proves a session herdr was not told yet. That session is
+        the pane's own: retire proceeds, and work bound to it still holds it."""
+        from dispatch_contract import ObservedAttemptLiveness
+        meta = "attempt_id=att-bound,parent_sid=thread-real,parent_harness=codex"
+        self.jobs_path.write_text(f"2026-10-09T00:00:00Z\topen\trepo\t-\tslug\t{meta}\n")
+        world = _RetireWorld(sid=None)
+        with mock.patch.object(peer_steward, "_proven_session", return_value="thread-real"), \
+             mock.patch("dispatch_contract.observed_attempt_liveness",
+                        return_value=ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
+            rc, line = self.retire(world)
+        self.assertIn("retired=false reason=bound-registered-work-pending", line)
         self.assertEqual(world.actions(), [])
-        rc, line = self.retire(world, clear_existing=False)
+        self.jobs_path.write_text("")
+        with mock.patch.object(peer_steward, "_proven_session", return_value="thread-real"):
+            rc, line = self.retire(world, clear_existing=False)
         self.assertEqual((rc, line), (0, "retired=true reason=normal-exit agent=codex name=old pane=w1:pOld"))
         self.assertEqual(world.actions(), [
             ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
