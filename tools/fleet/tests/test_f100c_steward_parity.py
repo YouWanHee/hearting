@@ -27,7 +27,7 @@ from fleet.collectors import steward                              # noqa: E402
 
 
 def _text(segs):
-    return "".join(t for t, _k in segs)
+    return render._plain(segs)
 
 
 class StewardChipTest(unittest.TestCase):
@@ -36,6 +36,10 @@ class StewardChipTest(unittest.TestCase):
                     elapsed_min=1)
         base.update(over)
         return Session(**base)
+
+    def _rows(self, session, width=168):
+        return [row for row in render._build_lines([session], [], "fleet", False, 0,
+                                   layout=render._layout_mode(width), term_width=width) if row]
 
     def test_steward_tag_is_bold_pink_text_and_keeps_the_slot_width(self):
         segs = render._session_tag_chip(self._s(session_tag="46", steward=True))
@@ -74,7 +78,8 @@ class StewardChipTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 segs = render._session_tag_chip(self._s(harness=harness, steward=True))
                 self.assertEqual(segs, [(" " * render._TAG_W, None)])
-                self.assertEqual(_text(render._session_row(self._s(harness=harness, steward=True), narrow=False)).count("⚑"), 1)
+                rows = self._rows(self._s(harness=harness, steward=True))
+                self.assertEqual(sum(_text(row).count("⚑") for row in rows), 1)
                 self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
                 self.assertNotIn("*", "".join(t for t, _k in segs))
 
@@ -87,25 +92,23 @@ class StewardChipTest(unittest.TestCase):
                                         dim=True)
         self.assertEqual(segs[1], ("46", "tag_dim"))
 
-    def test_model_flag_follows_effort_for_all_harnesses_and_layouts(self):
+    def test_flag_starts_under_id_for_all_harnesses_and_layouts(self):
         for harness, model in (("claude", "claude-opus-5.5"),
                                ("codex", "gpt-6.1-sol"),
                                ("opencode", "openai/gpt-6.1-sol")):
             s = self._s(harness=harness, model=model, effort="xhigh",
                         session_tag="46", steward=True)
-            for layout in ("wide", "narrow", "stack"):
-                with self.subTest(harness=harness, layout=layout):
-                    if layout == "wide":
-                        row = render._session_row(s, narrow=False)
-                    elif layout == "narrow":
-                        row = render._session_row_2line(s, term_width=100)[1]
-                    else:
-                        row = render._session_row_stack(s, term_width=60)[1]
-                    self.assertIn(") ⚑", _text(row))
-                    self.assertEqual(_text(row).count("⚑"), 1)
-                    self.assertIn((" ⚑", "tag_steward"), row)
+            for width in (168, 100, 60):
+                with self.subTest(harness=harness, width=width):
+                    rows = self._rows(s, width)
+                    identity = next(i for i, row in enumerate(rows) if "[46]" in _text(row))
+                    self.assertNotIn("⚑", _text(rows[identity]))
+                    self.assertEqual(_text(rows[identity + 1])[render._STEWARD_LINE_COL], "⚑")
+                    self.assertIn(("⚑", "tag_steward"), rows[identity + 1])
+                    self.assertEqual(sum(_text(row).count("⚑") for row in rows), 1)
+                    self.assertFalse(any("┆" in _text(row) for row in rows))  # off-screen target
 
-    def test_model_flag_keeps_the_following_columns_fixed(self):
+    def test_role_keeps_model_and_following_columns_fixed(self):
         for harness, model in (("claude", "claude-opus-5.5"),
                                ("codex", "gpt-6.1-sol"),
                                ("opencode", "provider/a-very-long-model-name")):
@@ -124,14 +127,25 @@ class StewardChipTest(unittest.TestCase):
                                      sum(render._dw(t) for t, _ in marked_l2))
                     stage_col = render._NARROW_L2_STAGE_COL
                     self.assertEqual(_text(plain_l2)[stage_col:], _text(marked_l2)[stage_col:])
-                    self.assertIn("⚑", _text(marked_l2)[:stage_col])
+                    self.assertNotIn("⚑", _text(marked_l2))
 
-    def test_model_flag_uses_the_existing_dim_role_color(self):
+    def test_flag_uses_the_existing_dim_role_color(self):
         s = self._s(model="claude-opus-5.5", effort="xhigh", steward=True,
                     session_tag="46", liveness="stale")
-        for row in (render._session_row(s, narrow=False),
-                    render._session_row_2line(s, term_width=100)[1]):
-            self.assertIn((" ⚑", "tag_dim"), row)
+        with mock.patch.object(render, "_SHOW_ALL", True):
+            for width in (168, 100):
+                rows = self._rows(s, width)
+                self.assertTrue(any(("⚑", "tag_dim") in row for row in rows))
+
+    def test_flag_width_preserves_following_anchors(self):
+        original = [(" " * 8, None), ("anchor", "dim")]
+        self.assertEqual(render._dw("⚑"), 1)
+        measure = render._dw
+        for width in (1, 2):
+            with mock.patch.object(render, "_dw", side_effect=lambda text: width if text == "⚑" else measure(text)):
+                marked = render._under_id_connector(original, "⚑", "tag_steward")
+                self.assertEqual(sum(render._dw(t) for t, _ in marked[:-1]), 8)
+                self.assertEqual(sum(render._dw(t) for t, _ in marked), 14)
 
     def test_regular_session_model_has_no_role_flag(self):
         s = self._s(model="claude-opus-5.5", effort="xhigh", session_tag="46")

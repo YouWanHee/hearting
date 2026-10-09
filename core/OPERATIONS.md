@@ -1548,13 +1548,16 @@ refusal or marker rewrite. Supervisor groups share one connector column under
 the first character inside `[id]`, drawn as a dashed `┆` on every row rather than
 a box border. Session detail text and box left edges clear that
 column by two spaces, even without a connector; model, routing, NOW and box
-right-edge anchors stay fixed. The supervisor flag appears once after the model
-and effort. Resource-waiting owners share a NOW projection across harnesses with
+right-edge anchors stay fixed. The supervisor flag appears once on the first row
+below its ID, in the connector column; subsequent rows use `┆`. A supervisor with
+no visible target keeps only that flag. Resource-waiting owners share a NOW projection across harnesses with
 the exact resource's node and command, observed host/GPU, declared counters
 when available, elapsed time and last-log age. Missing observations remain named
 (`대기`, `로그 없음`, or unknown host/GPU), without borrowed session activity or
 changes to resource liveness. Runtime maintenance in a private snapshot
 repository is plumbing, not a user tool call.
+After a resource exits, an owner without a current model summary or tool shows
+the last resource result and log age in NOW.
 Depth-1 frame cards use the owner model/gauge,
 routing and close-rail status layout on every harness; worker layouts retain
 their existing columns. Fleet ignores a marker whose entries carry no role source;
