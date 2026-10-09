@@ -1775,6 +1775,7 @@ def _resume_retire_obligation(duty, store):
                     _finish_retire_cleanup(store, claimed, ident, foreground)
             else:
                 store.update(duty["id"], state="pending",
+                             expected_phases={"exit-requested"},
                              observation={**observation, "reason": "exit-result-unobserved"})
         finally:
             _HERDR_SESSION = old_server
@@ -1788,6 +1789,7 @@ def _resume_retire_obligation(duty, store):
                 or observed.get("session_id") != ident.get("session_id")
                 or observed.get("pane") != ident.get("pane")):
             store.update(duty["id"], state="unknown",
+                         expected_phases={"waiting"},
                          observation={"phase": "waiting", "reason": reason or "target-identity-changed"})
             return
         readiness = _pane_readiness(target, state,
@@ -1795,6 +1797,7 @@ def _resume_retire_obligation(duty, store):
                                     expected_sid=ident["session_id"])
         if readiness.state != "ready":
             store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
+                         expected_phases={"waiting"},
                          observation={"phase": "waiting", "reason": readiness.reason,
                                       "state": readiness.state})
             return
@@ -1834,6 +1837,7 @@ def cmd_retire(args):
                                           "reason": reason}, cleanup="pending")
             elif pending:
                 store.update(duty["id"], state="unknown" if reason.endswith("unknown") else "pending",
+                             expected_phases={observation.get("phase", "waiting")},
                              observation={**observation, "reason": reason})
         _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
                 to_session_id=ident["session_id"], to_pane=ident["pane"],
@@ -2336,16 +2340,6 @@ def cmd_watch(args):
             existing_id = claim.read_text(encoding="utf-8").strip()
         except OSError:
             pass
-        if existing_id:
-            existing_paths = _watch_paths(existing_id, root)
-            existing_arm = _read_json(existing_paths.arm)
-            if not existing_paths.receipt.exists() and isinstance(existing_arm, dict):
-                if not _watcher_present(existing_arm):
-                    _spawn_watch_observer(existing_id, existing_arm)
-                    existing_arm = _read_json(existing_paths.arm) or existing_arm
-                print(_already_armed_line(existing_id, existing_arm, existing_paths))
-                return 0
-
         # herdr pre-checks. Nothing beyond the claim exists yet, so an early
         # return leaves no watch state behind.
         if _herdr_missing():
@@ -2358,6 +2352,19 @@ def cmd_watch(args):
             return _unavailable(reason)
         if any(agent.get(key) in {None, "", "-"} for key in ("harness", "session_id", "pane")):
             return _unavailable("watch-identity-unverified")
+
+        if existing_id:
+            existing_paths = _watch_paths(existing_id, root)
+            existing_arm = _read_json(existing_paths.arm)
+            if (not existing_paths.receipt.exists() and isinstance(existing_arm, dict)
+                    and (existing_arm.get("server") or "default") == server
+                    and all((existing_arm.get("agent") or {}).get(key) == agent[key]
+                            for key in ("harness", "session_id", "pane"))):
+                if not _watcher_present(existing_arm):
+                    _spawn_watch_observer(existing_id, existing_arm)
+                    existing_arm = _read_json(existing_paths.arm) or existing_arm
+                print(_already_armed_line(existing_id, existing_arm, existing_paths))
+                return 0
 
         armed_ts = _utc_now()
         watch_id = _new_watch_id(steward_sid, target, armed_ts, os.urandom(8).hex())
@@ -2566,7 +2573,15 @@ def cmd_watch_run(args):
             state, agent, _code, reason = _interpret_payload(payload, args.target)
             if (reason is None and state not in {"timeout", "agent-not-found", "herdr-unavailable"}
                     and all(agent.get(key) == expected[key] for key in expected)):
-                break
+                if state in {"idle", "done"}:
+                    readiness = _pane_readiness(
+                        args.target, state, expected_harness=expected["harness"],
+                        expected_sid=expected["session_id"], expected_pane=expected["pane"])
+                    if readiness.state == "ready":
+                        break
+                    reason = readiness.reason
+                else:
+                    break
             reason = reason or state
         elif reason is None:
             reason = "target-identity-changed"
@@ -3182,7 +3197,7 @@ def _prompt_form_open(target, state_before):
     return _bottom_form_tokens(target)
 
 
-def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None):
+def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None):
     """Use the shared projection with exact native identity and registered bindings."""
     try:
         observed_state, ident, _code, _reason = _retire_target(target)
@@ -3200,6 +3215,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None):
             and bool(birth)
             and (expected_harness is None or harness == expected_harness)
             and (expected_sid is None or sid == expected_sid)
+            and (expected_pane is None or pane == expected_pane)
         )
         bound, binding_state = peer_obligations.bound_work_for_pane(
             pane or "", harness or "", sid or "")
@@ -3484,45 +3500,46 @@ def _resume_message_obligation(duty, store):
     _HERDR_SESSION = None if server == "default" else server
     try:
         state, ident, _code, reason = _retire_target(target or recipient.get("name") or "")
+        expected_pane = identity.get("pane") or ""
+        if (reason or ident.get("harness") != recipient.get("harness")
+                or ident.get("session_id") != recipient.get("session_id")
+                or (expected_pane and ident.get("pane") != expected_pane)):
+            store.update(duty["id"], state="unknown",
+                         observation={"ref": ref, "reason": reason or "target-identity-changed",
+                                      "observed_pane": ident.get("pane", "")})
+            return
+        readiness = _pane_readiness(target, state,
+                                    expected_harness=recipient.get("harness"),
+                                    expected_sid=recipient.get("session_id"))
+        if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
+            if readiness.state != "ready":
+                store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
+                             observation={"ref": ref, "reason": readiness.reason,
+                                          "state": readiness.state})
+                return
+        if recipient.get("harness") == "codex":
+            peer_message.deliver_pending_codex(ref, timeout=0.25)
+        elif state in {"idle", "done", "working"}:
+            _flush_pending_for_target(target, recipient["harness"], recipient["session_id"],
+                                      state, expected_pane=expected_pane or None)
+        try:
+            current = peer_message._read_pending(ref)
+        except (OSError, ValueError):
+            current = None
+        if current and current.get("state") == "received":
+            store.update(duty["id"], state="complete", result="received",
+                         delivery="acknowledged", cleanup="complete",
+                         observation={"ref": ref, "reason": "exact-peer-ref"})
+        else:
+            age = max(0.0, time.time() - float((current or row).get("created") or time.time()))
+            if age >= _FLUSH_STUCK_HOURS * 3600:
+                _ensure_sender_delay_notice(current or row)
+            store.update(duty["id"], state="pending",
+                         observation={"ref": ref, "state": (current or row).get("state"),
+                                      "reason": (current or row).get("receipt", "awaiting-receipt")})
+
     finally:
         _HERDR_SESSION = old_server
-    expected_pane = identity.get("pane") or ""
-    if (reason or ident.get("harness") != recipient.get("harness")
-            or ident.get("session_id") != recipient.get("session_id")
-            or (expected_pane and ident.get("pane") != expected_pane)):
-        store.update(duty["id"], state="unknown",
-                     observation={"ref": ref, "reason": reason or "target-identity-changed",
-                                  "observed_pane": ident.get("pane", "")})
-        return
-    readiness = _pane_readiness(target, state,
-                                expected_harness=recipient.get("harness"),
-                                expected_sid=recipient.get("session_id"))
-    if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
-        if readiness.state != "ready":
-            store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
-                         observation={"ref": ref, "reason": readiness.reason,
-                                      "state": readiness.state})
-            return
-    if recipient.get("harness") == "codex":
-        peer_message.deliver_pending_codex(ref, timeout=0.25)
-    elif state in {"idle", "done", "working"}:
-        _flush_pending_for_target(target, recipient["harness"], recipient["session_id"],
-                                  state, expected_pane=expected_pane or None)
-    try:
-        current = peer_message._read_pending(ref)
-    except (OSError, ValueError):
-        current = None
-    if current and current.get("state") == "received":
-        store.update(duty["id"], state="complete", result="received",
-                     delivery="acknowledged", cleanup="complete",
-                     observation={"ref": ref, "reason": "exact-peer-ref"})
-    else:
-        age = max(0.0, time.time() - float((current or row).get("created") or time.time()))
-        if age >= _FLUSH_STUCK_HOURS * 3600:
-            _ensure_sender_delay_notice(current or row)
-        store.update(duty["id"], state="pending",
-                     observation={"ref": ref, "state": (current or row).get("state"),
-                                  "reason": (current or row).get("receipt", "awaiting-receipt")})
 
 
 def cmd_obligation_runner(args):

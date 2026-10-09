@@ -165,7 +165,8 @@ class ObligationStore:
     def update(self, duty_id: str, *, state: str | None = None,
                observation: dict | None = None, result: str | None = None,
                delivery: str | None = None, cleanup: str | None = None,
-               observer_error: str | None = None) -> dict:
+               observer_error: str | None = None,
+               expected_phases: set[str] | None = None) -> dict:
         if state is not None and state not in _PENDING_STATES | {"complete", "cancelled"}:
             raise ObligationError("peer-obligation-state-invalid")
         path = self._record_path(duty_id)
@@ -174,6 +175,11 @@ class ObligationStore:
             record = _read_record(path)
             if record is None:
                 raise ObligationError("peer-obligation-missing")
+            if expected_phases is not None and (
+                    record.get("state") in {"complete", "cancelled"}
+                    or (record.get("observation") or {}).get("phase", "waiting")
+                    not in expected_phases):
+                return record
             if observer_error is not None:
                 # Error observation cannot undo a claimed side effect or reopen
                 # a fulfilled duty. Merge the checkpoint under the same lock.
@@ -211,6 +217,8 @@ class ObligationStore:
         try:
             record = _read_record(path)
             if record is None:
+                return None
+            if record.get("state") in {"complete", "cancelled"}:
                 return None
             observation = record.get("observation") or {}
             if observation.get("phase", "waiting") not in expected:
@@ -290,7 +298,7 @@ def pane_readiness(
 
 def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
                         jobs: str | Path | None = None) -> tuple[tuple[RegisteredWorkObservation, ...], str]:
-    """Read exact session/pane-owned attempts; empty is valid only after a successful scan."""
+    """Read registered-parent or handed-over attempts; an observed empty scan is valid."""
     from dispatch_contract import (
         observed_attempt_liveness,
         parse_registry_metadata,
@@ -298,6 +306,8 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
         resolve_dispatch_state_root,
     )
     from dispatch_terminal_commit import owner_completion_state
+    from route_authority import owns
+    from dispatch_seat_handover import effective_parent_harness
 
     if jobs is None:
         state_root = resolve_dispatch_state_root(resolve_agent_home())
@@ -316,9 +326,9 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             return (), "unknown"
         status = fields[1]
         metadata = parse_registry_metadata(fields[5])
-        if (metadata.get("parent_sid") != session_id
-                or metadata.get("parent_pane") != pane
-                or metadata.get("parent_harness") not in {None, "", harness}):
+        if (not owns(metadata, session_id, jobs_path)
+                or (metadata.get("parent_harness") if metadata.get("parent_sid") == session_id
+                    else effective_parent_harness(metadata, jobs_path)) not in {None, "", harness}):
             continue
         attempt_id = metadata.get("attempt_id", "")
         if not attempt_id:

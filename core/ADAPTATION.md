@@ -576,8 +576,9 @@ stamp path in `core/HOOKS.md`.
 
 **Detached watch realization.** `peer-steward.py watch <target>` persists one logical
 obligation with exact herdr server, pane, harness, session and until-set identity before
-starting its bounded observer. The observer records observations and exits at its finite
-wait budget; timeout and unavailable are checkpoints, not fulfillment. Existing command,
+starting its observer. Each herdr wait has a finite budget; timeout and unavailable
+are checkpoints, not fulfillment. The existing observer continues after those checkpoints
+with capped backoff until the exact condition is met or the process stops. Existing command,
 session-start and reconnect paths claim the same duty and replace only observer identity,
 so tab moves do not require manual rearm and same-name pane/session reuse cannot inherit
 the old duty. A tab is a current location hint. The duty remains pending until its exact
@@ -585,7 +586,15 @@ observable condition is satisfied, explicitly canceled, or safely handed through
 recorded identity lineage. `join`, `status`, and Fleet report the duty separately from an
 observer receipt. Wake remains adapter-specific and any unmeasured native receipt remains
 unmeasured; no always-on daemon or model polling loop is introduced. Watch observations
-continue to use bounded herdr calls and the shared completion-readiness policy.
+continue to use bounded herdr calls. Idle/done receipts require the shared
+completion-readiness policy: exact registered-parent session or confirmed handover
+bindings take precedence over native idle, without requiring a parent-pane field.
+Non-completion conditions such as working retain their native watch meaning.
+Duplicate watch requests resolve the current server/pane/harness/session before
+reusing a duty; a new session gets a separate duty while the old one is preserved.
+Message observation and transport keep the accepted server selected throughout.
+Retire observations update only their current phase under the existing duty lock;
+stale observations cannot undo an exit claim or reopen a completed/cancelled duty.
 
 On Claude, `PostToolUse(Bash)` `asyncRewake` hook `peer-steward-rewake.py` arms only from a
 same-session armed line with `wake=hook` whose receipt sits under the canonical state root,

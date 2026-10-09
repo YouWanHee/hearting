@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import peer_obligations as obligations
 
@@ -78,6 +79,19 @@ class ObligationStoreTest(unittest.TestCase):
         after_error = self.store.update("retire-done", observer_error="observer-unavailable")
         self.assertEqual(after_error, done)
 
+    def test_conditional_observation_preserves_claim_and_terminal_cancellation(self):
+        self.store.create("retire-race", "retire", {"pane": "w1:p1"}, {"target": "peer"})
+        claimed = self.store.claim_phase("retire-race", {"waiting"}, "exit-requested",
+                                        extra={"foreground": {"pid": 42}})
+        stale = self.store.update("retire-race", state="pending", expected_phases={"waiting"},
+                                  observation={"phase": "waiting", "reason": "stale"})
+        self.assertEqual(stale, claimed)
+        cancelled = self.store.update("retire-race", state="cancelled",
+                                      observation={"phase": "waiting", "reason": "cancelled"})
+        self.assertEqual(self.store.update("retire-race", state="unknown", expected_phases={"waiting"},
+                                          observation={"phase": "waiting"}), cancelled)
+        self.assertIsNone(self.store.claim_phase("retire-race", {"waiting"}, "exit-requested"))
+
     def test_unreadable_binding_source_is_unknown(self):
         jobs = self.root / "not-a-file"
         jobs.mkdir()
@@ -104,6 +118,12 @@ info = {"result": {"agent": {"agent": "claude", "agent_session": {"value": "sid-
         "window_id": os.environ.get("FAKE_HERDR_WINDOW_ID", "window-fixture")},
         "type": "agent_info"}}
 verb = argv[1] if len(argv) > 1 else ""
+if verb == "process-info":
+    print(json.dumps({"result": {"process_info": {
+        "pane_id": argv[-1], "shell_pid": os.getppid(),
+        "foreground_process_group_id": os.getppid(),
+        "foreground_processes": [{"pid": os.getppid(), "argv": ["zsh"]}]}}}))
+    sys.exit(0)
 if verb == "wait" and mode == "held":
     with open(os.environ["FAKE_HERDR_FIFO"], "r") as fh:
         fh.read()
@@ -278,23 +298,41 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         self._children.remove(pid)
 
     def test_bound_registered_row_overrides_idle_pane_through_real_jobs(self):
-        meta = ",".join([
-            "attempt_id=att-fixture-1", "parent_sid=sid-1", "parent_pane=w1:p4",
-            "parent_harness=codex",
-        ])
-        with open(self.jobs, "a", encoding="utf-8") as handle:
-            handle.write(f"2026-10-09T00:00:00Z\topen\trepo\t-\tslug\t{meta}\n")
-        work, state = obligations.bound_work_for_pane(
-            "w1:p4", "codex", "sid-1", jobs=self.jobs)
-        self.assertEqual(state, "observed")
-        self.assertEqual(len(work), 1)
-        ready = obligations.pane_readiness(
-            server="fixture-server", pane="w1:p4", harness="codex",
-            session_id="sid-1", pid_birth="pid:9@start:4",
-            identity_verified=True, native_turn="idle",
-            bound_work=work, bindings_state=state)
-        self.assertNotEqual(ready.state, "ready")
-        self.assertIsNone(ready.outcome, "idle never invents a work result")
+        from dispatch_contract import (ATTEMPT_SCHEMA_VERSION, claim_attempt_row,
+                                       process_launch_identity, ObservedAttemptLiveness)
+        metadata = {"attempt_schema_version": str(ATTEMPT_SCHEMA_VERSION),
+                    "dispatch_depth": "1", "transport": "headless",
+                    "execution_surface": "registered-headless", "registered_worker": "1",
+                    "fallback_hop": "same-harness-headless", "harness": "codex",
+                    "attempt_id": "att-fixture-1", "parent_sid": "sid-1",
+                    "parent_harness": "codex", **process_launch_identity(os.getpid())}
+        self.assertNotIn("parent_pane", metadata)
+        row = "2026-10-09T00:00:00Z\topen\trepo\t-\tslug\t" + ",".join(
+            f"{key}={value}" for key, value in metadata.items())
+        self.assertTrue(claim_attempt_row(self.jobs, "att-fixture-1", row, launch=True))
+        for process_state, expected in (("live", "pending"), ("unverifiable", "unknown")):
+            with self.subTest(process_state=process_state), mock.patch(
+                    "dispatch_contract.observed_attempt_liveness", return_value=ObservedAttemptLiveness(
+                        "alive" if process_state == "live" else "unverifiable",
+                        "fixture", process_state, "fixture")):
+                work, state = obligations.bound_work_for_pane(
+                    "w1:p4", "codex", "sid-1", jobs=self.jobs)
+                self.assertEqual((len(work), state), (1, "observed"))
+                ready = obligations.pane_readiness(
+                    server="fixture-server", pane="w1:p4", harness="codex",
+                    session_id="sid-1", pid_birth="pid:9@start:4",
+                    identity_verified=True, native_turn="idle", bound_work=work,
+                    bindings_state=state)
+                self.assertEqual(ready.state, expected)
+                self.assertIsNone(ready.outcome)
+        for harness, sid in (("codex", "unrelated"), ("claude", "sid-1")):
+            self.assertEqual(obligations.bound_work_for_pane(
+                "w1:p4", harness, sid, jobs=self.jobs), ((), "observed"))
+        with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor"), \
+             mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="claude"):
+            work, state = obligations.bound_work_for_pane(
+                "w2:p7", "claude", "successor", jobs=self.jobs)
+            self.assertEqual((len(work), state), (1, "observed"))
 
 
 if __name__ == "__main__":
