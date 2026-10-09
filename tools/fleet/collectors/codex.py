@@ -1214,7 +1214,7 @@ def _mutual_fallback_rollout(pid, sessions, home, paths, claimed):
         if (rival is sess or getattr(rival, "harness", None) != "codex"
                 or getattr(rival, "cwd", None) != sess.cwd or rival.pid in paths):
             continue
-        if candidates[0] in _fallback_candidates(rival, home, claimed, now):
+        if candidates[0] in _fallback_candidates(rival, home, claimed, now, rival=True):
             return None
     return candidates[0]
 
@@ -1539,17 +1539,23 @@ def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
             claimed.update(assigned_sids)
 
 
-def _fallback_candidates(sess, home, claimed, now):
+def _fallback_candidates(sess, home, claimed, now, *, rival=False):
     """Unclaimed same-cwd root rollouts created since this process started.
 
-    A rollout older than the process is never its own: a closed window's thread
+    A rollout older than the process is not its own: a closed window's thread
     in the same cwd is unclaimed, and a 300 s slack once handed it to the fresh
     Codex started 61 s later (2026-10-10). The exact /proc start keeps the start
     match's tolerance; without it, whole-minute `etime` widens by its rounding only.
+    A `rival` keeps the former slack: a resumed Codex holds no rollout fd and may
+    own an older thread, so it still makes a match ambiguous.
     """
     started = _process_started_at(sess)
-    earliest = (started - _START_MATCH_BEFORE_SEC if started is not None
-                else now - (max(0, sess.elapsed_min) + 1) * 60)
+    if rival:
+        earliest = now - max(0, sess.elapsed_min) * 60 - 300
+    elif started is not None:
+        earliest = started - _START_MATCH_BEFORE_SEC
+    else:
+        earliest = now - (max(0, sess.elapsed_min) + 1) * 60
     candidates = []
     for path in _index(home).get(sess.cwd, []):
         sid = _sid(path)
