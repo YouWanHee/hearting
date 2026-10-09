@@ -214,28 +214,29 @@ def _prepare_directory(directory):
     os.makedirs(directory, mode=0o700, exist_ok=True)
     meta = os.lstat(directory)
     if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.getuid():
-        raise OSError("route-chain directory must be an owner directory")
+        raise OSError(f"route-chain directory must be an owner directory: {directory} uid={meta.st_uid} expected={os.getuid()}")
     try:
         os.chmod(directory, 0o700)
     except OSError:
         pass
 
 
-def append(harness, session_id, line):
+def append(harness, session_id, line, *, on_error=None):
     """Single `os.write` under O_APPEND — ext4-local atomic per-line write (K-11). Never raises."""
     try:
         path = ledger_path(harness, session_id)
         payload = (json.dumps(line, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
         if len(payload) > MAX_LINE_BYTES + 1:
-            return False
+            raise ValueError("route-chain-line-too-large")
         _prepare_directory(os.path.dirname(path))
         is_new = not os.path.exists(path)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             meta = os.fstat(fd)
             if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid():
-                return False
-            os.write(fd, payload)
+                raise OSError(f"route-chain file must be an owner regular file: {path}")
+            if os.write(fd, payload) != len(payload):
+                raise OSError(f"route-chain short write: {path}")
         finally:
             os.close(fd)
         if is_new:
@@ -244,7 +245,12 @@ def append(harness, session_id, line):
             except Exception:
                 pass
         return True
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        if on_error is not None:
+            try:
+                on_error(f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
         return False
 
 
@@ -583,9 +589,11 @@ def current_capability(chain, marker_fields, *, session_start, slack):
     return marker_fields
 
 
-def enrich(sessions, jobs=(), node_evidence=None, now=None):
+def enrich(sessions, jobs=(), node_evidence=None, now=None, fast_first=False):
     """Attach `session.route_chain` to every eligible session (env-writer harness, not a
     dispatch child, not an app-server row, with a session id). Exceptions are per-session."""
+    if fast_first:
+        return  # route/outcome and ledger reads belong to the next detail tick
     from . import route as _route
 
     node_evidence = node_evidence or {}

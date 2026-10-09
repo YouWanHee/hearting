@@ -507,7 +507,7 @@ OPENCODE_MESSAGE_TABLES = ("part", "message", "session_message")
 # Event types that carry no conversational text. Only the inner part types are listed:
 # the JSONL stream's outer envelope (`tool_use`, `step_finish`, …) is filtered by the part
 # it wraps, so an envelope kind never needs its own entry here.
-_OPENCODE_SKIP_TYPES = {"tool", "system", "internal", "patch", "step-start", "step-finish"}
+_OPENCODE_SKIP_TYPES = {"tool", "system", "internal", "patch", "reasoning", "step-start", "step-finish"}
 
 
 def _opencode_signature(path):
@@ -527,10 +527,12 @@ def _opencode_source_signatures(db_path):
     }
 
 
-def _copy_opencode_file(source, target):
+def _copy_opencode_file(source, target, max_bytes=None):
     """Copy privately, preferring Linux FICLONE and falling back to streaming."""
     os.makedirs(os.path.dirname(target), exist_ok=True)
     source_info = os.stat(source)
+    if max_bytes is not None and source_info.st_size > max_bytes:
+        raise OSError("OpenCode snapshot exceeds byte budget")
     cloned = False
     if fcntl is not None and sys.platform.startswith("linux"):
         try:
@@ -544,18 +546,25 @@ def _copy_opencode_file(source, target):
                 pass
     if not cloned:
         with open(source, "rb") as source_stream, open(target, "wb") as target_stream:
+            copied = 0
             while True:
-                block = source_stream.read(1024 * 1024)
+                room = 1024 * 1024 if max_bytes is None else min(1024 * 1024, max_bytes - copied + 1)
+                block = source_stream.read(room)
                 if not block:
                     break
+                copied += len(block)
+                if max_bytes is not None and copied > max_bytes:
+                    raise OSError("OpenCode source grew beyond snapshot budget")
                 target_stream.write(block)
             target_stream.flush()
             os.fsync(target_stream.fileno())
+    if max_bytes is not None and os.path.getsize(target) > max_bytes:
+        raise OSError("OpenCode clone exceeds snapshot budget")
     os.chmod(target, stat.S_IMODE(source_info.st_mode))
 
 
 @contextlib.contextmanager
-def _opencode_snapshot(db_path):
+def _opencode_snapshot(db_path, max_bytes=None):
     """Yield a private, WAL-aware SQLite connection or fail closed.
 
     Only the database and an already-present WAL are copied.  The source SHM and
@@ -565,11 +574,17 @@ def _opencode_snapshot(db_path):
     before = _opencode_source_signatures(source)
     if before[""] is None or before["-journal"] is not None:
         raise OSError("OpenCode source is unavailable or has an active journal")
+    if max_bytes is not None and sum(info[2] for suffix, info in before.items()
+                                    if info and suffix in ("", "-wal")) > max_bytes:
+        raise OSError("OpenCode snapshot exceeds byte budget")
     with tempfile.TemporaryDirectory(prefix="fleet-opencode-") as tmp:
         snapshot = os.path.join(tmp, os.path.basename(source))
-        _copy_opencode_file(source, snapshot)
+        limits = {"max_bytes": max_bytes} if max_bytes is not None else {}
+        _copy_opencode_file(source, snapshot, **limits)
         if before["-wal"] is not None:
-            _copy_opencode_file(source + "-wal", snapshot + "-wal")
+            if max_bytes is not None:
+                limits["max_bytes"] = max_bytes - os.path.getsize(snapshot)
+            _copy_opencode_file(source + "-wal", snapshot + "-wal", **limits)
         after = _opencode_source_signatures(source)
         if before != after:
             raise OSError("OpenCode source changed during private snapshot")
@@ -628,6 +643,70 @@ def _opencode_text(value):
     if isinstance(value, list):
         return "\n".join(filter(None, (_opencode_text(item) for item in value)))
     return ""
+
+
+def read_opencode_activity(connection, session_id):
+    """Bounded public text and unfinished tool state from one exact native session.
+
+    The caller supplies a private snapshot. Message metadata proves assistant
+    authorship; tool outputs, reasoning and neighbouring sessions are excluded.
+    """
+    messages = connection.execute(
+        "SELECT id, substr(data,1,16384), time_updated FROM message "
+        "WHERE session_id=? ORDER BY time_created DESC, rowid DESC LIMIT 12",
+        (session_id,)).fetchall()
+    assistants = {}
+    for mid, raw, stamp in messages:
+        try:
+            value = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, dict) and value.get("role") == "assistant":
+            assistants[mid] = (value, stamp)
+    latest = messages[0][0] if messages else None
+    rows = connection.execute(
+        "SELECT message_id, substr(data,1,16384), time_updated FROM part "
+        "WHERE session_id=? ORDER BY time_updated DESC, rowid DESC LIMIT 64",
+        (session_id,)).fetchall()
+    result = {"summary": None, "summary_ts": None, "tool": None}
+    for mid, raw, stamp in rows:
+        if mid not in assistants:
+            continue
+        try:
+            part = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text" and not part.get("synthetic") and result["summary"] is None:
+            text = part.get("text")
+            if not isinstance(text, str):
+                continue
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if lines == ["WAITING_FOR_RUNTIME"]:
+                preview = "런타임 대기"
+            else:
+                # The owner's terminal protocol is public status, not prose.
+                status = [line for line in lines if line.startswith(("verdict:", "blocker:"))]
+                preview = " · ".join(line.split(":", 1)[1].strip() for line in status)
+                if not preview:
+                    preview = next((line for line in lines if not line.startswith("artifact:")), "")
+            preview = "".join(ch for ch in preview if ch.isprintable())[:120]
+            if preview:
+                result.update(summary=preview, summary_ts=float(stamp) / 1000)
+        elif part.get("type") == "tool" and mid == latest and result["tool"] is None:
+            state = part.get("state")
+            message = assistants[mid][0]
+            native_time = message.get("time")
+            if (isinstance(state, dict) and state.get("status") in ("pending", "running")
+                    and isinstance(native_time, dict) and not native_time.get("completed")):
+                result["tool"] = {"name": part.get("tool"), "input": state.get("input")}
+    if not result["summary"] and latest in assistants:
+        message, stamp = assistants[latest]
+        native_time = message.get("time")
+        if isinstance(native_time, dict) and not native_time.get("completed"):
+            result.update(summary="모델 응답 중", summary_ts=float(stamp) / 1000)
+    return result
 
 
 def _read_opencode_anchor(connection, table, data_col, session_id):
@@ -1671,7 +1750,7 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
     now = time.time() if now is None else now
     previous = titles.read(sid, harness=harness) or {}
     anchor = anchor_text or (read_prompt_anchor(prompt_path) if prompt_path else "")
-    if not anchor and transcript and previous.get("title"):
+    if not anchor and transcript and source_kind != "opencode-db" and previous.get("title"):
         anchor = read_origin(transcript, harness)
     language_changed = not _title_language_matches(previous.get("title"), _title_lang(anchor))
     ts = previous.get("ts") if isinstance(previous.get("ts"), (int, float)) else 0
@@ -1680,7 +1759,11 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
     if ts and now - ts <= retry_delay and not language_changed:
         return False
     try:
-        transcript_mtime = os.path.getmtime(transcript) if transcript else now
+        if source_kind == "opencode-db":
+            signatures = _opencode_source_signatures(refresh_source["db_path"])
+            transcript_mtime = max((info[4] / 1e9 for info in signatures.values() if info), default=0)
+        else:
+            transcript_mtime = os.path.getmtime(transcript) if transcript else now
     except OSError:
         return False
     if ts and transcript_mtime <= ts and not failures and not language_changed:
@@ -1753,7 +1836,8 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         sid,
     ]
     if source_kind == "opencode-db":
-        argv += ["--opencode-db", refresh_source["db_path"], "--opencode-session", sid]
+        argv += ["--opencode-db", refresh_source["db_path"], "--opencode-session",
+                 refresh_source.get("session_id") or sid]
     else:
         argv += ["--transcript", transcript]
     if prompt_path:

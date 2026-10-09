@@ -210,6 +210,15 @@ class BuildLineTest(EnvTmpTestCase):
 
 
 class AppendTest(EnvTmpTestCase):
+    def test_append_reports_the_underlying_error_to_its_caller(self):
+        errors = []
+        denied = PermissionError(13, "Permission denied", "/state/route-chains/claude")
+        with mock.patch.object(route_chain, "_prepare_directory", side_effect=denied):
+            self.assertFalse(route_chain.append("claude", "sess-denied", {"v": 1}, on_error=errors.append))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("PermissionError", errors[0])
+        self.assertIn("/state/route-chains/claude", errors[0])
+
     def test_append_creates_0700_dir_and_0600_file_single_write(self):
         line = {"v": 1, "route_id": "rt-1"}
         with mock.patch("os.write", side_effect=os.write) as spy:

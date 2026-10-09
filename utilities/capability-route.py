@@ -9823,9 +9823,10 @@ def prepare_isolated_worktree(cwd, slug):
     """The isolated worktree a source-changing route runs in, when `cwd` is a primary checkout.
 
     `<repo>-wt/<slug>` (OPERATIONS §5.9 naming) on a new branch `<slug>` from the latest
-    `origin/<default>`, or the existing worktree at that path, reused as it is. Returns
+    `origin/<default>` (the primary's current HEAD when it has local work), or
+    the existing worktree at that path, reused as it is. Returns
     `{state: created|reused, path, cwd, branch, base}`, or `{state: skipped, reason}` when the
-    caller's cwd stays the route cwd (not a primary checkout, local work the base lacks, or the path
+    caller's cwd stays the route cwd (not a primary checkout, or the path
     or branch is taken).
     Nothing here refuses: a skipped preparation leaves the work where it was asked to run."""
     if OWNER_WRITE_ADVISORY.git_topology(cwd) != "primary":
@@ -9845,11 +9846,12 @@ def prepare_isolated_worktree(cwd, slug):
     default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
     _git(top, "fetch", "-q", "origin", default)
     base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
-    # Work in progress in the checkout (uncommitted or new files, or commits the base lacks) is what the
-    # work may build on; a worktree from the base would leave it behind, so the cwd stays as asked.
+    # Local work must not pin a source-changing owner to the shared primary.
+    # Keep its committed baseline, without copying or changing uncommitted files.
+    # The prepared cwd is sealed before launch, so every stage shares it naturally.
     if (_git(top, "status", "--porcelain") != ""
             or _git(top, "merge-base", "--is-ancestor", "HEAD", base) is None):
-        return {"state": "skipped", "reason": "primary-has-local-work"}
+        base = _git(top, "rev-parse", "HEAD") or "HEAD"
     if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
         made = _git(top, "worktree", "add", str(path), slug)
     else:
@@ -10120,7 +10122,7 @@ def _continue_after_answer(jobs, attempt_id, correction):
 
 
 def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None):
-    """Append one route-chain ledger line. Every failure is silent — route creation/start
+    """Append one route-chain ledger line. Failures report their cause — route creation/start
     must never fail because of this sidecar (plan §3 B-1.3). Success/failure is only
     ever observable on stderr."""
     try:
@@ -10150,10 +10152,12 @@ def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None
             route, event=event, harness=harness, session_id=sid, route_file=route_file,
             plan=plan, plan_source=plan_source, dispatch_depth=depth, by_attempt=by_attempt,
         )
-        if rc.append(harness, sid, line):
+        append_errors = []
+        if rc.append(harness, sid, line, on_error=append_errors.append):
             print(f"route_chain_written=1 harness={harness}", file=sys.stderr)
         else:
-            print("route_chain_written=0 reason=append-failed", file=sys.stderr)
+            detail = append_errors[0] if append_errors else "unknown"
+            print(f"route_chain_written=0 reason=append-failed detail={detail}", file=sys.stderr)
     except Exception as exc:
         try:
             print(f"route_chain_written=0 reason={exc}", file=sys.stderr)
@@ -10929,11 +10933,10 @@ def main():
         # which is honest — nothing here claims progress the owner has not proven).
         if os.environ.get("AGENT_DISPATCH_DEPTH") != "1" or advance is not None:
             _record_route_chain(route, str(output_path.resolve()), "continuation")
-        # D-120: the source's open cycle, if any, extends to this continuation.
-        cycle_bind=bind_continuation_cycle(artifact,source,route)
-        print(f"cycle_binding_bound={1 if cycle_bind['bound'] else 0}",file=sys.stderr)
-        if cycle_bind.get("advisory"):
-            print(f"cycle_binding_advisory={cycle_bind['advisory']}",file=sys.stderr)
+        # Publication is a candidate. The existing producer begin path records
+        # cycle admission when execution enters it; a refused batch never
+        # transfers the predecessor's closing responsibility.
+        print("cycle_binding_bound=0 cycle_binding_deferred=1 basis=execution-begin",file=sys.stderr)
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":

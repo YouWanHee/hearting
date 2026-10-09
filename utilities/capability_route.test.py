@@ -3539,15 +3539,10 @@ class TestContinuation(unittest.TestCase):
     if previous_jobs is None: os.environ.pop("AGENT_DISPATCH_JOBS",None)
     else: os.environ["AGENT_DISPATCH_JOBS"]=previous_jobs
 
- def test_continuation_cli_prints_cycle_binding_and_fork_advisory(self):
-  # SD-155/D-120, P2 결함 note: the continuation CLI's `cycle_binding_bound`/
-  # `cycle_binding_advisory` stderr fields (capability-route.py :7259-7261)
-  # were only ever exercised by calling `bind_continuation_cycle` directly in
-  # artifact_producer.test.py -- never through the actual CLI subprocess a
-  # real owner runs. This proves the CLI-level wiring end to end: a first
-  # continuation off an open-cycle source binds silently, a sibling fork off
-  # the same source prints the D-120 "분기의 정직 표기" advisory without
-  # blocking publication.
+ def test_continuation_cli_defers_cycle_binding_until_begin(self):
+  # Publication leaves the existing cycle untouched. Execution's existing
+  # begin path records the admitted lineage; publishing a sibling still
+  # leaves that audit alone and write-time fork protection remains intact.
   import subprocess,sys
   with tempfile.TemporaryDirectory() as tmp:
    previous_home=os.environ.get("AGENT_HOME")
@@ -3567,8 +3562,10 @@ class TestContinuation(unittest.TestCase):
     # copy too, exactly as a real compile+publish would leave one.
     R.write_once(R.canonical_route_path(artifact,source["route_id"]),source)
     import artifact_producer as AP
-    AP.begin(artifact,route_file=source_path,capability=source["capability"],
+    begun=AP.begin(artifact,route_file=source_path,capability=source["capability"],
              intensity=source["effective_intensity"])
+    record_path=AP.cycle_record_path(artifact,begun["cycle_id"])
+    before_publish=record_path.read_bytes()
     env=os.environ.copy()
     def continuation_command(reason):
      return [
@@ -3578,12 +3575,23 @@ class TestContinuation(unittest.TestCase):
      ]
     first=subprocess.run(continuation_command("cycle-fixture-b"),capture_output=True,text=True,cwd=str(R.ROOT),env=env)
     self.assertEqual(first.returncode,0,first.stderr)
-    self.assertIn("cycle_binding_bound=1",first.stderr)
-    self.assertNotIn("cycle_binding_advisory=",first.stderr)
+    self.assertIn("cycle_binding_bound=0 cycle_binding_deferred=1",first.stderr)
+    self.assertEqual(record_path.read_bytes(),before_publish)
+    first_route=json.loads(first.stdout)
+    resumed=AP.begin(artifact,route_file=R.canonical_route_path(artifact,first_route["route_id"]),
+                     capability=source["capability"],intensity=source["effective_intensity"])
+    self.assertEqual(resumed["cycle_id"],begun["cycle_id"])
+    self.assertEqual(AP.read_cycle_record(artifact,begun["cycle_id"])["route_bindings"][-1]["route_id"],first_route["route_id"])
+    after_begin=record_path.read_bytes()
     second=subprocess.run(continuation_command("cycle-fixture-b-prime"),capture_output=True,text=True,cwd=str(R.ROOT),env=env)
     self.assertEqual(second.returncode,0,second.stderr)
     self.assertIn("cycle_binding_bound=0",second.stderr)
-    self.assertIn("cycle_binding_advisory=cycle-lineage-fork",second.stderr)
+    self.assertIn("cycle_binding_deferred=1",second.stderr)
+    self.assertEqual(record_path.read_bytes(),after_begin)
+    second_route=json.loads(second.stdout)
+    with self.assertRaisesRegex(AP.ProducerError,"lineage-fork"):
+     AP.begin(artifact,route_file=R.canonical_route_path(artifact,second_route["route_id"]),
+              capability=source["capability"],intensity=source["effective_intensity"])
    finally:
     if previous_home is None: os.environ.pop("AGENT_HOME",None)
     else: os.environ["AGENT_HOME"]=previous_home
@@ -5778,66 +5786,13 @@ class SourceCensusTest(unittest.TestCase):
     hits.append(relative)
   self.assertEqual(hits,["utilities/capability-route.py"],hits)
 
- # SD-155/D-120, A-25.7: cycle ownership is judged in exactly one place
- # (`cycle_route_admission`/`route_cycle_for`); lineage is walked in exactly
- # one place (`verified_route_lineage`); the audit copy (`route_bindings[]`)
- # is written only by `bind_cycle_route` and read only there plus read
- # surfaces -- never by admission, finalize or manifest building.
- _CYCLE_OWNERSHIP_ALLOWED_FUNCTIONS=frozenset({
-  "route_cycle_for","cycle_route_admission","_finalize_route","require_cycle_output",
-  # Resolving one manifest's sealed route file checks its canonical id/hash;
-  # this identity comparison does not select an owning cycle.
-  "resolve_cycle_manifest_route",
-  # Self-consistency, not cycle ownership (plan A-4 "비대상" list): route
-  # id/hash derivation, the `rebound` display flag, the reservation ledger's
-  # own identity check, and review-output-binding's capability/route parity.
-  "load_route","_begin_cycle_record","read_interim_reservation","prepare_review_output_binding",
-  # Inline finish's exact-cycle binding validates the already-admitted route
-  # tuple; it does not choose which cycle the route owns.
-  "finalize_exact_cycle",
-  # Read-only proof of an already-bound checkpoint move checks the route ID in
-  # the cycle record, checkpoint and manifest; it never selects cycle ownership.
-  "placed_output_proof",
-  # The producer's inline binding check calls cycle_route_admission above,
-  # then compares the pending finish intent's route ID with that admitted
-  # binding. This is finish-tuple integrity, not another cycle selection.
-  "_inline_producer_binding_check","_provisional_completion_projection","_provisional_completion_context",
-  # The shared helper `_finalize_route` and `cycle_route_admission` consult
-  # before a lineage-fork/superseded refusal. Its route-id comparison is a
-  # visited-set guard so a lineage loop never reads as closed; it selects no
-  # cycle for a live route.
-  "closed_lineage_handover",
- })
-
- def test_a25_7_cycle_ownership_and_lineage_single_site(self):
+ # SD-155/D-120, A-25.7: the ancestor walk and audit-binding writer
+ # remain shared. Route-ID comparisons also validate execution evidence and
+ # identity, so a function-name whitelist is not a cycle-ownership test.
+ def test_a25_7_lineage_and_binding_writer_single_site(self):
   import ast
   producer_path=P.parents[1]/"utilities"/"artifact_producer.py"
   tree=ast.parse(producer_path.read_text(encoding="utf-8"))
-
-  def is_route_id_field(node):
-   if (isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute)
-       and node.func.attr=="get" and node.args
-       and isinstance(node.args[0],ast.Constant) and node.args[0].value=="route_id"):
-    return True
-   if isinstance(node,ast.Subscript):
-    sl=node.slice
-    if isinstance(sl,ast.Constant) and sl.value=="route_id": return True
-   return False
-
-  class OwnershipCompareVisitor(ast.NodeVisitor):
-   def __init__(self):
-    self.stack=[]; self.hits=[]
-   def visit_FunctionDef(self,node):
-    self.stack.append(node.name); self.generic_visit(node); self.stack.pop()
-   def visit_Compare(self,node):
-    sides=[node.left,*node.comparators]
-    if any(is_route_id_field(s) for s in sides):
-     self.hits.append((self.stack[-1] if self.stack else "<module>",node.lineno))
-    self.generic_visit(node)
-
-  visitor=OwnershipCompareVisitor(); visitor.visit(tree)
-  offenders=[(fn,ln) for fn,ln in visitor.hits if fn not in self._CYCLE_OWNERSHIP_ALLOWED_FUNCTIONS]
-  self.assertEqual(offenders,[],offenders)
 
   class LineageWalkVisitor(ast.NodeVisitor):
    """`continuation_contract_version`-driven ancestor walks (a `while`
@@ -8150,14 +8105,24 @@ class ComposeRouteTest(TestRoute):
    self.assertEqual(R.prepare_isolated_worktree(primary,"taken")["reason"],"path-occupied")
    self.assertEqual(R.prepare_isolated_worktree(Path(tmp),"x")["reason"],"not-primary-checkout")
    (primary/"new.txt").write_text("new\n")                     # a new file not yet added is work in progress too
-   self.assertEqual(R.prepare_isolated_worktree(primary,"z")["reason"],"primary-has-local-work")
+   made=R.prepare_isolated_worktree(primary,"z")
+   self.assertEqual(made["state"],"created")
+   self.assertEqual(made["base"],git(primary,"rev-parse","HEAD"))
+   self.assertEqual((primary/"new.txt").read_text(),"new\n")
+   self.assertFalse((Path(made["path"])/"new.txt").exists())
    (primary/"new.txt").unlink()
-   # work in progress stays where it is: an uncommitted change, or a commit the base lacks
+   # Dirty files stay in primary; the owner gets a clean tree at the current committed baseline.
    (primary/"a.txt").write_text("changed\n")
-   self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
+   made=R.prepare_isolated_worktree(primary,"y")
+   self.assertEqual(made["state"],"created")
+   self.assertEqual((primary/"a.txt").read_text(),"changed\n")
+   self.assertEqual((Path(made["path"])/"a.txt").read_text(),"a\n")
    git(primary,"switch","-q","-c","feature-x"); (primary/"b.txt").write_text("b\n"); git(primary,"add","b.txt","a.txt"); commit("-m","wip")
-   self.assertEqual(R.prepare_isolated_worktree(primary,"y")["reason"],"primary-has-local-work")
-   self.assertFalse((Path(tmp)/"repo-wt"/"y").exists())
+   made=R.prepare_isolated_worktree(primary,"local-commit")
+   self.assertEqual(made["state"],"created")
+   self.assertEqual(made["base"],git(primary,"rev-parse","HEAD"))
+   self.assertEqual(git(Path(made["path"]),"rev-parse","HEAD"),git(primary,"rev-parse","HEAD"))
+   self.assertEqual((Path(made["path"])/"b.txt").read_text(),"b\n")
    # the route compose moved into that worktree is found from the primary checkout after /clear
    routes=Path(tmp)/"reports"; R.canonical_routes_dir(routes).mkdir(parents=True)
    path=R.canonical_routes_dir(routes)/("rt-"+"f"*16+".json")

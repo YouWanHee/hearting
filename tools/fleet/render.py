@@ -4748,6 +4748,11 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     resource_now = _resource_now_text(entity)
     if resource_now is not None:
         now_text = resource_now
+    elif (not now_text and getattr(entity, "_details_pending", False)
+          and not _exec_detail_segs(entity)):
+        # A basic observation is real state, but missing detail is not an idle
+        # verdict or an empty NOW. Never invent a command/model turn here.
+        now_text = "확인 중"
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
@@ -6220,11 +6225,15 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
     if term_width is not None:
         fixed_w = _dw("  " + arrow + " ") + _dw("[%s] " % tag) + _dw(" — no route record")
         slug = _clip_w(slug, max(4, term_width - fixed_w))
+    pending = getattr(job, "_details_pending", False)
+    label = " — route 확인 중" if pending else " — no route record"
     l1 = [("  " + arrow + " ", "dim"), ("[%s] " % tag, "name_dim"),
-          (slug, "dim"), (" — no route record", "dim")]
+          (slug, "dim"), (label, "dim")]
     out = [l1]
     if folded:
         return out, {"card_key": card_key, "fold_line": 0, "job_rows": [], "folded": folded}
+    if pending:
+        out.append(_route_job_row(job, max_width=term_width))
     breadcrumb = _stage_segs(job.key, _projection_stage_for_dispatch(job), working=(job.liveness == "working"),
                              max_width=_STAGE_ZONE_MAX)
     out.append([("    ", None)] + breadcrumb)
@@ -6302,6 +6311,16 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
             if parent:
                 covered_slugs.add(parent)
     degrade_jobs = _degrade_candidates(jobs, covered_slugs)
+    # Basic rows already have exact identity/liveness/NOW, while route records
+    # are still pending. Show those rows even for depth-2 route-bound workers;
+    # no DAG, empty progress, or completed/idle claim can be inferred yet.
+    pending_jobs = [j for j in jobs if getattr(j, "_details_pending", False)
+                    and not getattr(getattr(j, "work_projection", None), "_route_view", None)
+                    and (getattr(j, "route_id", None) or getattr(j, "owner_route_id", None))
+                        not in route_views_by_id
+                    and not _is_plugin_agent(j) and (j.liveness != "dead" or _SHOW_ALL)
+                    and j not in degrade_jobs]
+    degrade_jobs.extend(pending_jobs)
 
     # F-29/F-73 — plain top-level sessions owning native or plugin sub-agents. Process view is
     # route-centric and emits no plain-session row, so collect one minimal owner anchor here.
@@ -8784,45 +8803,49 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     live_order = _LiveOrderState()
     _configure_input(curses, os.environ)
 
-    first_snapshot = True
+    from . import details
+    latest_basic = [None]
+    detail_generation = 0
 
     def collect_snapshot():
-        nonlocal first_snapshot
-        governor_read = background_read(_collect_governor)
-        try:
-            sessions, jobs = collect_all(harness_filter=hfilter,
-                                         **({"fast_first": True} if first_snapshot else {}))
-        except BaseException:
-            try:
-                governor_read.result()
-            except BaseException:
-                pass
-            raise
-        else:
-            governor_snapshot = governor_read.result()
-        # Only the first publication is fast: every later tick (the existing
-        # background refresh) runs the full pass, filling the details the
-        # first snapshot honestly left empty. --once/JSON never sets the flag.
-        first_snapshot = False
-        sessions, jobs = list(sessions), list(jobs)
-        gitinfo.enrich_entities(sessions + jobs, schedule_ahead=True)
-        hearting = _HEARTING
-        hearting_refresh = getattr(collect_all, "hearting_refresh", None)
-        if callable(hearting_refresh):
-            try:
-                hearting = hearting_refresh()
-            except Exception:
-                pass
-        return LiveSnapshot(
-            sessions=sessions,
-            jobs=jobs,
+        sessions, jobs = collect_all(harness_filter=hfilter, fast_first=True)
+        from .collectors import dispatch
+        snapshot = LiveSnapshot(
+            sessions=list(sessions), jobs=list(jobs),
             resources=list(getattr(collect_all, "last_resource_jobs", [])),
             usage_snapshots=dict(getattr(collect_all, "last_usage_snapshots", {})),
             malformed=_malformed(),
-            memory=_collect_memory(),
-            governor=governor_snapshot,
-            hearting=dict(hearting) if isinstance(hearting, dict) else None,
+            node_evidence=getattr(dispatch.collect, "last_route_nodes", None) or {},
+            hearting=dict(_HEARTING) if isinstance(_HEARTING, dict) else None,
         )
+        # Publication makes these rows immutable to the detail worker. Every
+        # basic tick stays cheap even while that worker is delayed on NAS.
+        latest_basic[0] = snapshot
+        return snapshot
+
+    def collect_details():
+        source = latest_basic[0]
+        governor = _collect_governor()
+        detail_refresh = getattr(collect_all, "detail_refresh", None)
+        if source is None:
+            value = LiveSnapshot()
+            result = details.DetailSnapshot(None, value)
+        elif callable(detail_refresh):
+            result = detail_refresh(source)
+            value = result.snapshot
+        else:
+            import copy
+            value = copy.deepcopy(source)
+            result = details.DetailSnapshot(details.state_key(source), value)
+        gitinfo.enrich_entities(value.sessions + value.jobs, schedule_ahead=True)
+        value.memory, value.governor = _collect_memory(), governor
+        hearting_refresh = getattr(collect_all, "hearting_refresh", None)
+        if callable(hearting_refresh):
+            try:
+                value.hearting = hearting_refresh()
+            except Exception:
+                pass
+        return result
 
     # Draw a loading frame until the first complete snapshot is adopted. Empty
     # sessions here are unobserved, not a successful census with zero sessions.
@@ -8830,6 +8853,11 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     generation = 0
     pump = RefreshPump(collect_snapshot, interval)
     pump.start()
+    # Existing coalescing/last-good semantics, independent of basic refresh.
+    detail_pump = RefreshPump(collect_details, interval, name="fleet-detail-refresh")
+    detail_pump.start()
+    basic_snapshot = snapshot
+    latest_detail = None
     compute_host_refresh = getattr(collect_all, "compute_hosts_refresh", None)
     compute_host_generation = 0
     compute_host_pump = None
@@ -8867,6 +8895,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             now = time.time()
             now_mono = time.monotonic()
             pump.request_due(now=now_mono)
+            detail_pump.request_due(now=now_mono)
             if compute_host_pump is not None:
                 compute_host_pump.request_due(now=now_mono)
             set_refresh_health(
@@ -8875,7 +8904,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                                if compute_host_pump is not None else None))
             update = pump.poll(generation)
             if update is not None:
-                generation, snapshot = update
+                generation, basic_snapshot = update
+                if generation == 1:
+                    detail_pump.request(force=True)
+            detail_update = detail_pump.poll(detail_generation)
+            if detail_update is not None:
+                detail_generation, latest_detail = detail_update
+            if update is not None or detail_update is not None:
+                snapshot = details.merge(basic_snapshot, latest_detail)
                 sessions, jobs = snapshot.sessions, snapshot.jobs
                 resources = snapshot.resources
                 usage_snapshots = snapshot.usage_snapshots
@@ -8942,6 +8978,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
 
             if ch in (ord("r"), ord("R")):
                 pump.request(force=True)
+                detail_pump.request(force=True)
                 if compute_host_pump is not None:
                     compute_host_pump.request(force=True)
             _poll_pending_kill()     # F-27 grace window — non-blocking; may raise a re-prompt
@@ -8951,6 +8988,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                   governor=governor_snapshot, loading=(generation == 0))
     finally:
         pump.stop(join_timeout=1.0)
+        detail_pump.stop(join_timeout=1.0)
         if compute_host_pump is not None:
             compute_host_pump.stop(join_timeout=1.0)
 

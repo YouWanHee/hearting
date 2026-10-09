@@ -4322,6 +4322,30 @@ class SlicesOneCommandTest(unittest.TestCase):
         self.assertIn(f"--subsession-manifest {manifest_path}", receipt["next_command"])
         self.assertIn("--node execute", receipt["next_command"])
 
+    def test_next_literal_paths_reach_batch_admission_and_true_globs_do_not(self):
+        names = ["app/trips/[id]/page.tsx", "app/[...slug]/page.tsx", "app/(group)/page.tsx"]
+        for name in names:
+            path = self.primary / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("page\n")
+        slices = [{"id": "a", "files": names[:2], "verify": "true"},
+                  {"id": "b", "files": names[2:], "verify": "true"}]
+        admitted = SimpleNamespace(reservation_identity="r" * 8, sessions=[{}, {}])
+        rc, out = self.run_slices(self.plan(json.dumps(slices)), action="start",
+                                 admit=lambda **kw: admitted,
+                                 start=lambda *a, **kw: [{"started": 1}, {"started": 1}])
+        self.assertEqual(rc, 0, out)
+        receipt = json.loads(out)
+        self.assertEqual(receipt["state"], "subdivision-batch-started")
+        from stage_session_contract import load_manifest
+        manifest = load_manifest(receipt["chain_manifest"], route=self.route, node=self.route["nodes"][0])
+        self.assertEqual(manifest["sessions"][0]["fixed_files"],
+                         sorted(str(self.primary / name) for name in names[:2]))
+        slices[0]["files"] = ["app/*/page.tsx"]
+        rc, out = self.run_slices(self.plan(json.dumps(slices)))
+        self.assert_single_session(rc, out, "subdivision-disjointness-unproven", ledger=True)
+        self.assertIn("fixed-file-must-be-exact", json.loads(out)["detail"])
+
 class PlainSlotReservationTest(unittest.TestCase):
     """F12: a subdivision reserves N plain slots from the real governor, all or none."""
 
