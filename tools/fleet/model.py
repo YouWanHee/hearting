@@ -620,6 +620,7 @@ class ResourceJob:
     # to non-self compute hosts by host-qualified identity, never consumed as
     # local proof. Emitted by the registry scanner, hence a pinned field.
     remote_training: Optional[list] = None
+    local_placement: Optional[dict] = None  # exact local descendants; selection is not GPU use
     # Tracked-workflow projection (OPERATIONS §5.12): a resource row exposes why it
     # ended, which registered attempt owns it, and what the workflow thinks it is.
     workflow_state: Optional[str] = None

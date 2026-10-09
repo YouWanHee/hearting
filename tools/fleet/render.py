@@ -4381,6 +4381,9 @@ def _resource_gpu_resources(child, snapshot, commands=False, excluded_processes=
     exact = {(pid, start) for pid, start in exact if start.isdigit()}
     if type(child.pid) is int and child.pid > 0 and str(child.starttime).isdigit():
         exact.add((child.pid, str(child.starttime)))
+    for process in (getattr(child, "local_placement", None) or {}).get("processes", ()):
+        if type(process.get("pid")) is int and str(process.get("starttime", "")).isdigit():
+            exact.add((process["pid"], str(process["starttime"])))
     resources = []
     for host in snapshot.get("hosts") or ():
         if not isinstance(host, dict) or host.get("reachable") is not True:
@@ -4671,6 +4674,31 @@ def _resource_now_text(entity, room=None):
                     and not getattr(child, "remote_training", None))
         where = ("%s:CPU" % _gpu_safe_text(local["host"])
                  if local and cpu_only else "호스트/GPU 미확인")
+        placement = getattr(child, "local_placement", None) or {}
+        requested = placement.get("requested_devices") or []
+        if requested:
+            host = _gpu_safe_text(local["host"] if local else placement.get("hostname") or "?")
+            devices = []
+            for device in requested:
+                matches = [g for g in (local or {}).get("gpus", ())
+                           if isinstance(g.get("uuid"), str) and g["uuid"].startswith(device)]
+                gpu = matches[0] if len(matches) == 1 else None
+                devices.append(str(gpu["index"]) if gpu else _gpu_safe_text(device))
+            checked = (local and local.get("gpus") and not local.get("detail")
+                       and not local.get("process_detail") and not local.get("gpu_error")
+                       and not local.get("process_error") and placement.get("complete", True))
+            exact = {(p["pid"], str(p["starttime"]))
+                     for p in placement.get("processes", ())}
+            pids = {pid for pid, _ in exact}
+            uncertain = any(p.get("pid") in pids
+                            and (p["pid"], str(p.get("proc_start"))) not in exact
+                            for g in (local or {}).get("gpus", ())
+                            for p in g.get("processes", ()))
+            checked = checked and not uncertain
+            state = "GPU 사용 전" if checked else "GPU 사용 미관측"
+            where = "%s:%s 지정 · %s" % (host, ",".join(devices), state)
+            if placement.get("io_wait"):
+                where += " · 입출력 대기"
     node = _gpu_safe_text(child.route_node or child.node or child.run_id)
     command = _resource_command_label(getattr(child, "command", None))
     if resources:
