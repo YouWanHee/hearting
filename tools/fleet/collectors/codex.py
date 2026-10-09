@@ -1540,8 +1540,16 @@ def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
 
 
 def _fallback_candidates(sess, home, claimed, now):
-    """Unclaimed same-cwd root rollouts created since this process started."""
-    process_started = now - max(0, sess.elapsed_min) * 60
+    """Unclaimed same-cwd root rollouts created since this process started.
+
+    A rollout older than the process is never its own: a closed window's thread
+    in the same cwd is unclaimed, and a 300 s slack once handed it to the fresh
+    Codex started 61 s later (2026-10-10). The exact /proc start keeps the start
+    match's tolerance; without it, whole-minute `etime` widens by its rounding only.
+    """
+    started = _process_started_at(sess)
+    earliest = (started - _START_MATCH_BEFORE_SEC if started is not None
+                else now - (max(0, sess.elapsed_min) + 1) * 60)
     candidates = []
     for path in _index(home).get(sess.cwd, []):
         sid = _sid(path)
@@ -1551,7 +1559,7 @@ def _fallback_candidates(sess, home, claimed, now):
         if _is_subagent(meta):
             continue
         created = _session_created(meta)
-        if created is not None and process_started - 300 <= created <= now + 300:
+        if created is not None and earliest <= created <= now + 300:
             candidates.append(path)
     return candidates
 

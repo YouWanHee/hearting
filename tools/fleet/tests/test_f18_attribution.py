@@ -146,6 +146,28 @@ class CodexRolloutAttributionTest(unittest.TestCase):
             codex._FALLBACK_CLAIMS.update(ts=0, sids=set())
             self.assertEqual([codex._fallback_rollout(s, "/home/codex") for s in sessions], [None, None])
 
+    def test_fallback_never_takes_a_rollout_older_than_the_process(self):
+        """2026-10-10: a closed window's same-cwd thread (01a12206, unclaimed once
+        its process exited) was taken for the fresh Codex started 61 s later,
+        whose own thread was 01a12207. Only a rollout since its start fits."""
+        started = 1791572304.0                       # 2026-10-09T18:58:24Z
+        times = {"/r/old": "2026-10-09T18:57:23Z", "/r/own": "2026-10-09T18:59:00Z"}
+        sess = Session(harness="codex", pid=7, cwd="/work/repo", elapsed_min=1, proc_start="1")
+
+        def fallback(paths, process_started):
+            with mock.patch.object(codex, "_index", return_value={"/work/repo": paths}), \
+                 mock.patch.object(codex, "_sid", side_effect=lambda p: p.rsplit("/", 1)[-1]), \
+                 mock.patch.object(codex, "_rollout_meta", side_effect=lambda p: {"timestamp": times[p]}), \
+                 mock.patch.object(codex, "_process_started_at", return_value=process_started), \
+                 mock.patch.object(codex.time, "time", return_value=started + 100):
+                codex._FALLBACK_CLAIMS.update(ts=0, sids=set())
+                return codex._fallback_rollout(sess, "/home/codex")
+
+        for process_started in (started, None):     # exact /proc start, then whole-minute etime
+            with self.subTest(process_started=process_started):
+                self.assertIsNone(fallback(["/r/old"], process_started))
+                self.assertEqual(fallback(["/r/own", "/r/old"], process_started), "/r/own")
+
     def test_prepare_tick_reserves_owned_rollout_before_pid_ordered_fallback(self):
         older = Session(harness="codex", pid=10, cwd="/work/repo", elapsed_min=1)
         owner = Session(harness="codex", pid=20, cwd="/work/repo", elapsed_min=1)
