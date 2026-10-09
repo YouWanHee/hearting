@@ -29,4 +29,4 @@
 ▍ ⠋ [bb] codex (gpt-6.1-sol·medium)         bb (—)                                                     -  3h 00m
 ▍                   ────────────────   —
 
-  ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch   
+  ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch

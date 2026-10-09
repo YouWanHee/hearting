@@ -9,7 +9,7 @@
          ⠋ 0: UTIL    —  VRAM ────      —/—GB ▸ 1
 ─────
 
-  SESSIONS   stack · press w to cycle  
+  SESSIONS   stack · press w to cycle
 ● bundle/
 ▍ ⠋ [aa] claude     aa ▾4
 ▍    ⚑  3h 00m      Opus (high)              -

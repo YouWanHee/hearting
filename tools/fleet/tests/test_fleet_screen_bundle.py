@@ -215,7 +215,8 @@ class BundleTest(unittest.TestCase):
                 {"pid": 123, "proc_start": "456", "command": "python train.py",
                  "owner": {"kind": "run", "id": "golden-gpu"}}]}]}]})
         with mock.patch("time.time", return_value=1700000000.0):
-            return "\n".join(text(self.build([main, child], owners, width))) + "\n"
+            return "\n".join(row.rstrip() for row in
+                             text(self.build([main, child], owners, width))) + "\n"
 
     def test_stage_divider_screen_matches_wide_and_narrow_goldens(self):
         for width in (60, 100, 168):

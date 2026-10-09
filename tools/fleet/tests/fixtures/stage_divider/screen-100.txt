@@ -9,7 +9,7 @@
          ⠋ 0: working  —                   UTIL    —  VRAM ────────      —/—GB ▸ 1
 ─────
 
-  SESSIONS   narrow · press w to cycle  
+  SESSIONS   narrow · press w to cycle
 ● bundle/
 ▍ ⠋ [aa] claude     aa ▾4
 ▍    ⚑  3h 00m      Opus (high)              -
@@ -36,4 +36,4 @@
 ▍       3h 00m      gpt-6.1-sol (medium)     -
 ▍                   ────────────────   —
 
-  ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch   
+  ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch
