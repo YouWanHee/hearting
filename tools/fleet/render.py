@@ -4316,6 +4316,28 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
                         summary_ts=getattr(job, "summary_ts", None))
 
 
+def _report_verification_detail_row(job, depth=1, term_width=None):
+    """Render only the read-time payload attached by the detail collector."""
+    projection = getattr(job, "work_projection", None)
+    payload = getattr(projection, "report_verification", None)
+    if not isinstance(payload, dict):
+        return []
+    display = payload.get("display") or {}
+    verification = payload.get("verification") or {}
+    required = payload.get("required_input_observation") or {}
+    text = ("  " * max(1, int(depth)) + "↳ 보고서 · "
+            + str(display.get("verification_label", "검증 미확정")) + " · "
+            + str(display.get("completion_label", "완료 미확정")) + " · "
+            + str(display.get("required_input_label", "필수 입력 미확정")))
+    reasons = required.get("reasons") or []
+    reason = (reasons[0] if reasons else verification.get("reason"))
+    if reason:
+        text += " · " + str(reason)
+    if term_width:
+        text = _clip_w(text, max(1, term_width - 2))
+    return [[(text, "dim")]]
+
+
 def _resource_progress_tail(child, room=None):
     """Format only the shared reader's normalized counters, on the existing row."""
     progress = getattr(child, "progress", None)
@@ -7445,6 +7467,11 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 orphan=orphan, in_card=in_card)
             if detail:
                 lines.extend(detail)
+            report_detail = _report_verification_detail_row(
+                job, depth=max(1, int(getattr(job, "depth", 1) or 1)),
+                term_width=term_width)
+            if report_detail:
+                lines.extend(report_detail)
             # F-29 — the child session's own sub-agents, one strip directly under the
             # dispatch row that represents it (depth-indented; active always, completed
             # only with `a` — the same convention as session-owned strips above).

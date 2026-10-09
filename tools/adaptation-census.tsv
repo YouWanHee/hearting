@@ -52,6 +52,7 @@ shared-utility-deferred	gpu_execution_sandbox.py
 shared-utility-deferred	prd_readability.py
 shared-utility-deferred	recovery_evidence.py
 shared-utility-deferred	recovery_history.py
+shared-utility-deferred	report_verification_projection.py
 shared-utility-deferred	resource_resume.py
 shared-utility-deferred	review_input.py
 shared-utility-deferred	review_watchdog.py

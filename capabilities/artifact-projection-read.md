@@ -31,6 +31,16 @@ It has no write, ingest, apply, activate, deactivate, migrate, or namespace
 switch operation and never accepts a database URL. Missing or mismatched W3a
 sources fail closed using W3a's imported contract errors.
 
+Hearting may add a separate `hearting_verification_display` field to a
+successful read response. It joins only exact stable IDs and locally verified
+artifact revisions, and it preserves every W3a request, cursor, authorization,
+row, and error result. Verification verdict, operational completion, and
+required-input observation remain distinct. Missing or stale local evidence
+is displayed as unresolved while the successful remote read stays successful.
+This field is a read-time projection: it does not create a new input, gate,
+service, verification round, or durable sidecar, and it never changes source
+report or verdict bytes.
+
 ## Artifact Ownership
 
 The command is read-only and owns no artifact mutation. Generated runtime

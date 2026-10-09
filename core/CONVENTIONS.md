@@ -315,6 +315,19 @@ and inventory-bound hashes. Publisher and dry-run backfill receive explicit
 project, experiment, and version values and never infer version from paths or
 timestamps.
 
+Read-only report status is a separate projection over recorded evidence. It
+keeps scientific verification (`PASS`, `FAIL`, or unresolved), operational
+completion (complete, pending, blocked, unknown, or not applicable), and
+required-input observation (confirmed, failed, or unresolved) as independent
+axes. A current authoritative `FAIL` remains `FAIL` when work completed or
+resources ran successfully. Missing, stale, malformed, conflicting, or
+wrongly bound evidence cannot produce `PASS`; prior verdicts and report bytes
+remain unchanged. Bind every displayed judgment to the exact selected report
+artifact revision and input digests through existing lineage and currency
+readers. A status query reads existing completion and obligation state without
+creating a verification round, route, proof, input, publication, or durable
+display record.
+
 Schema v2 stays exact: experiment logs, report documents, and media are ordinary
 members of `files[]`; adding them never adds manifest properties or creates a
 new schema version. A publishable experiment bundle keeps original logs under
