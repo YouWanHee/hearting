@@ -78,6 +78,29 @@ class FallbackTest(unittest.TestCase):
   return {"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
           "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),
           "AGENT_DISPATCH_JOBS":str(self.jobs)}
+ def test_dirty_primary_prepares_the_cwd_that_every_stage_adapter_uses(self):
+  primary=self.repo
+  head=subprocess.run(["git","-C",str(primary),"rev-parse","HEAD"],check=True,capture_output=True,text=True).stdout.strip()
+  (primary/"x").write_text("uncommitted\n")
+  prepared=R.prepare_isolated_worktree(primary,"owner-task")
+  self.assertEqual(prepared["state"],"created")
+  self.repo=Path(prepared["cwd"])
+  self.assertNotEqual(self.repo,primary)
+  self.assertEqual(prepared["base"],head)
+  self.assertEqual((primary/"x").read_text(),"uncommitted\n")
+  self.assertEqual((self.repo/"x").read_text(),"x")
+  route_path=self.route(same_status="supported")
+  with mock.patch.dict(os.environ,self.launch_roots_env()):
+   route,node=F.load_node(route_path,"execute","dry-run")
+  self.assertEqual(route["cwd"],str(self.repo))
+  args=SimpleNamespace(action="dry-run",slug="owner-execute",parent="owner",route=route_path,
+                       jobs=self.jobs,qa=None,worker_role=None,prompt_file=None)
+  for harness in ("claude","codex","opencode"):
+   with self.subTest(harness=harness):
+    row={**self.tuple(harness,"supported"),"child_harness":harness}
+    command=F.wrapper_command(args,route,node,row,1,"att-stage-fixture")
+    self.assertEqual(command[command.index("--worktree")+1],str(self.repo))
+  self.assertEqual((primary/"x").read_text(),"uncommitted\n")
  def route(self,native="unsupported",same_status="unsupported",intensity="strong"):
   """Compile the fixture route under the SAME runtime root the launch uses.
 
