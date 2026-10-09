@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import contextlib, hashlib, importlib.util, io, json, os, subprocess, sys, tempfile, time, types, unittest
+import contextlib, dataclasses, hashlib, importlib.util, io, json, os, re, subprocess, sys, tempfile, time, types, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +18,160 @@ CURRENT_ATTEMPT_CONTRACT=(
  "fallback_hop=same-harness-headless"
 )
 FIXTURE_BIRTH=D.process_start_ticks(os.getpid())
+
+@contextlib.contextmanager
+def fixture_process_scope(jobs):
+ """Model a complete namespace of the fixture's controlled actors.
+
+ Keep readable live PID/group/tag entries and errors on a controlled PID.
+ Unrelated host procfs failures are outside this modeled namespace. Raw
+ procfs behavior is tested separately; production commands never use this.
+ """
+ raw_scan=D.scan_process_table; raw_context=D._PROCESS_TABLE_SCAN
+ def snapshot():
+  scan=raw_scan(); controlled=set()
+  path=jobs() if callable(jobs) else jobs
+  if path and Path(path).is_file():
+   for line in Path(path).read_text().splitlines():
+    fields=line.split("\t")
+    if len(fields)!=6: continue
+    metadata=D.parse_registry_metadata(fields[5])
+    for key in ("pid","pid_host","pgid","parent_pid","parent_pid_host"):
+     if metadata.get(key,"").isdigit(): controlled.add(int(metadata[key]))
+  def outside(reason):
+   match=re.match(r"procfs-(?:member|environ):(\d+):",reason)
+   return bool(match and int(match.group(1)) not in controlled)
+  return dataclasses.replace(scan,
+   incomplete_reason="" if outside(scan.incomplete_reason) else scan.incomplete_reason,
+   group_errors=tuple(error for error in scan.group_errors if not outside(error[2])),
+   tag_access_errors=tuple(error for error in scan.tag_access_errors if error[0] in controlled))
+ class Context:
+  def get(self,*args): return raw_context.get(*args) or snapshot()
+  def set(self,value): return raw_context.set(value)
+  def reset(self,token): return raw_context.reset(token)
+ with mock.patch.object(D,"scan_process_table",side_effect=snapshot), \
+      mock.patch.object(D,"_PROCESS_TABLE_SCAN",Context()):
+  yield
+
+FIXTURE_CLI="""import importlib.util,runpy,sys
+from pathlib import Path
+program=Path(sys.argv[1]); args=sys.argv[2:]
+helper=program.parents[1]/'utilities/dispatch_registry.test.py'
+if not helper.is_file(): helper=program.parents[3]/'utilities/dispatch_registry.test.py'
+spec=importlib.util.spec_from_file_location('registry_fixture_helper',helper)
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+jobs=Path(args[args.index('--jobs')+1]) if '--jobs' in args else Path(args[0])
+sys.argv=[str(program),*args];sys.path.insert(0,str(program.parent))
+with module.fixture_cli_scope(jobs): runpy.run_path(str(program),run_name='__main__')
+"""
+
+@contextlib.contextmanager
+def fixture_cli_scope(jobs):
+ """Keep nested liveness -> registry reads in the same fixture namespace."""
+ original=subprocess.run
+ def invoke(command,*args,**kwargs):
+  if (isinstance(command,(list,tuple)) and len(command)>1
+      and command[0]==sys.executable
+      and Path(str(command[1])).name in {"dispatch-registry.py","dispatch-liveness.py"}):
+   command=[command[0],"-c",FIXTURE_CLI,*command[1:]]
+  return original(command,*args,**kwargs)
+ with fixture_process_scope(jobs), mock.patch.object(subprocess,"run",side_effect=invoke):
+  yield
+
+class RegistryFixtureTestCase(unittest.TestCase):
+ """Consumer fixtures share one controlled namespace instead of host noise."""
+ def run(self,result=None):
+  with fixture_cli_scope(lambda:getattr(self,"jobs",None)):
+   return super().run(result)
+
+class FixtureNamespaceScopeTest(unittest.TestCase):
+ def test_controlled_procfs_errors_and_live_tags_are_retained(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log"
+   jobs.write_text("0\topen\t/r\t/w\tfixture\tattempt_id=att-controlled,pid=300,pgid=300\n")
+   controlled="procfs-environ:300:same-uid-unobservable"
+   unrelated="procfs-environ:400:same-uid-unobservable"
+   scan=D.ProcessTableScan({"att-visible":((500,"10","S"),)}, {},
+        incomplete_reason=unrelated,
+        group_errors=((0,None,controlled),(1,None,unrelated)),
+        tag_access_errors=((300,"",controlled),(400,"",unrelated)))
+   with mock.patch.object(D,"scan_process_table",return_value=scan), fixture_process_scope(jobs):
+    snapshot=D._PROCESS_TABLE_SCAN.get()
+    self.assertEqual(snapshot.members_by_attempt,scan.members_by_attempt)
+    self.assertEqual(snapshot.group_errors,((0,None,controlled),))
+    self.assertEqual(snapshot.tag_access_errors,((300,"",controlled),))
+    self.assertEqual(snapshot.incomplete_reason,"")
+    self.assertEqual(D.process_group_observation(300).state,"unverifiable")
+
+ def test_enumeration_failure_is_never_modelled_as_empty(self):
+  scan=D.ProcessTableScan({}, {},error="procfs-enumeration:13")
+  with mock.patch.object(D,"scan_process_table",return_value=scan), fixture_process_scope(None):
+   self.assertEqual(D._PROCESS_TABLE_SCAN.get().error,"procfs-enumeration:13")
+
+class RawProcfsRegistryTest(unittest.TestCase):
+ """The normal CLI retains live and unknown evidence on the actual host."""
+ def test_unknown_attempt_keeps_raw_row_and_unrelated_process_alive(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";attempt="att-raw-unknown-"+base.name
+   env={key:value for key,value in os.environ.items()
+        if key not in {"AGENT_ARTIFACT_ROOT","AGENT_DISPATCH_ATTEMPT_ID",D.ATTEMPT_DESCENDANT_ENV}}
+   unrelated=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"],
+                               start_new_session=True,env=env)
+   try:
+    jobs.write_text("0\topen\t"+str(base)+"\t"+str(base)+"\tunknown\t"+
+      CURRENT_ATTEMPT_CONTRACT+",attempt_id="+attempt+
+      ",pid=99999990,pid_start=1,pid_scope=namespace-local,pid_ns=pid:[401],"
+      "pid_observer_ns=pid:[elsewhere],launch_claimed=1,launch_started=1,"
+      "route_id=rt-raw-unknown,route_node=eval-smoke,worker_type=review\n")
+    before=jobs.read_bytes()
+    command=[sys.executable,str(SCRIPT),"reconcile","--jobs",str(jobs),
+             "--agent-home",str(base),"--attempt",attempt,"--only-exact-dead","--apply"]
+    observed=subprocess.run(command,capture_output=True,text=True,env=env)
+    self.assertEqual(observed.returncode,0,observed.stdout+observed.stderr)
+    result=json.loads(observed.stdout)
+    self.assertEqual(result["closed"],0)
+    self.assertEqual(result["decisions"][0]["category"],"unverifiable",result)
+    self.assertEqual(jobs.read_bytes(),before)
+    self.assertIsNone(unrelated.poll())
+   finally:
+    unrelated.terminate();unrelated.wait(timeout=5)
+
+ def test_live_then_stopped_attempt_observes_real_procfs_without_fixture_context(self):
+  with tempfile.TemporaryDirectory() as td:
+   base=Path(td);jobs=base/"jobs.log";attempt="att-raw-"+base.name
+   proc=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"],
+                          start_new_session=True,env={**os.environ,D.ATTEMPT_DESCENDANT_ENV:attempt})
+   try:
+    metadata={**D.process_launch_identity(proc.pid),"attempt_id":attempt,
+              "launch_claimed":"1","launch_started":"1","worker_type":"review",
+              "route_id":"rt-raw-fixture","route_node":"eval-smoke",
+              "log_file":str(base/"absent.codex.jsonl")}
+    fields=["0","open",str(base),str(base),"raw",CURRENT_ATTEMPT_CONTRACT+","+
+            ",".join(f"{key}={value}" for key,value in metadata.items())]
+    jobs.write_text("\t".join(fields)+"\n");before=jobs.read_bytes()
+    env={key:value for key,value in os.environ.items()
+         if key not in {"AGENT_ARTIFACT_ROOT","AGENT_DISPATCH_ATTEMPT_ID"}}
+    command=[sys.executable,str(SCRIPT),"reconcile","--jobs",str(jobs),
+             "--agent-home",str(base),"--attempt",attempt,"--only-exact-dead","--apply"]
+    live=subprocess.run(command,capture_output=True,text=True,env=env)
+    self.assertEqual(live.returncode,0,live.stdout+live.stderr)
+    self.assertEqual(json.loads(live.stdout)["closed"],0)
+    self.assertEqual(jobs.read_bytes(),before)
+    self.assertIsNone(proc.poll())
+    proc.terminate();proc.wait(timeout=5)
+    stopped=subprocess.run(command,capture_output=True,text=True,env=env)
+    self.assertEqual(stopped.returncode,0,stopped.stdout+stopped.stderr)
+    result=json.loads(stopped.stdout)
+    if result["closed"]:
+     self.assertIn("\tdone\t",jobs.read_text())
+     self.assertIn("note=dead-exact-pid",jobs.read_text())
+     self.assertNotIn("completed-marker",jobs.read_text())
+    else:
+     self.assertEqual(result["decisions"][0]["category"],"unverifiable",result)
+     self.assertEqual(jobs.read_bytes(),before)
+   finally:
+    if proc.poll() is None:proc.kill()
+    proc.wait()
 def currentize_registry(path):
  if not path.is_file(): return
  rows=[]
@@ -38,7 +192,7 @@ def currentize_registry(path):
      fields[5]=",".join(parts)
   rows.append("\t".join(fields))
  path.write_text("\n".join(rows)+("\n" if rows else ""))
-class RegistryTest(unittest.TestCase):
+class RegistryTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory(); self.base=Path(self.tmp.name); self.jobs=self.base/"jobs.log"
   self.proc=subprocess.Popen(["sleep","60"]); start=(Path("/proc")/str(self.proc.pid)/"stat").read_text().split()[21]
@@ -682,17 +836,7 @@ class RegistryTest(unittest.TestCase):
   dry=json.loads(self.invoke("reconcile","--attempt",attempt).stdout)
   self.assertEqual(dry["closed"],0)
   self.assertEqual(dry["decisions"][0]["category"],"exact-dead")
-  before=self.jobs.read_bytes()
   applied=json.loads(self.invoke("reconcile","--attempt",attempt,"--apply").stdout)
-  if not applied["closed"] and applied["decisions"][0]["category"]=="unverifiable":
-   self.assertEqual(self.jobs.read_bytes(),before)
-   applied=json.loads(self.invoke("reconcile","--attempt",attempt,"--apply").stdout)
-   if not applied["closed"]:
-    metadata=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
-    probe=D.attempt_tagged_descendants(metadata)
-    if probe.state=="unverifiable" and probe.reason.startswith("procfs-"):
-     self.assertEqual(self.jobs.read_bytes(),before)
-     self.skipTest(f"complete exact-dead scan unavailable: {probe.reason}")
   self.assertEqual(applied["closed"],1)
   text=self.jobs.read_text()
   self.assertIn("note=dead-exact-pid",text)
@@ -1714,7 +1858,7 @@ class RegistryTest(unittest.TestCase):
   self.assertEqual(self.jobs.read_bytes(),before)
 
  def test_cli_closes_a_really_extinct_namespace_and_leaves_a_live_one(self):
-  # Real procfs, no mocks: pid:[999999999] is not a namespace on this host.
+  # Namespace existence uses real procfs; actor scans use the common fixture.
   metadata={"pid_observer_ns":"pid:[999999999]","pid_ns":"pid:[999999999]",
             "pid_scope":"namespace-local","registered_worker":"1"}
   if D.namespace_gone(metadata)!="extinct":
@@ -1738,7 +1882,7 @@ class RegistryTest(unittest.TestCase):
   self.assertIn("note=dead-namespace-absent",self.jobs.read_text())
 
 
-class SameHostForegroundStageReceiptTest(unittest.TestCase):
+class SameHostForegroundStageReceiptTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
   self.repo=self.base/"repo";self.repo.mkdir()
@@ -1786,47 +1930,19 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   return json.loads(result.stdout)["decisions"][0]
 
- def positive_decision(self,*args,initial=None,before=None):
-  """Exercise receipt progress without mistaking an incomplete real scan for failure.
-
-  These fixtures start no worker. The real host can lose procfs visibility
-  between the dry read and the existing CAS revalidation. One fresh invocation
-  may observe it completely; persistent procfs unavailability is an explicit
-  environment skip, after proving that the refused write changed no row.
-  """
-  before=self.jobs.read_bytes() if before is None else before
-  expected="terminal-receipt-sealed" if "--apply" in args else "terminal-receipt-ready"
-  for turn in range(2):
-   actual=initial if turn==0 and initial is not None else self.decision(*args)
-   if actual["category"]==expected:
-    return actual
-   if actual["category"] not in {"terminal-draining","terminal-receipt-revalidation-veto"}:
-    break
-   self.assertEqual(self.jobs.read_bytes(),before,actual)
-  metadata=parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
-  probe=D.attempt_tagged_descendants(metadata)
-  group=D.process_group_observation(int(metadata["pgid"]))
-  unavailable=next((view.reason for view in (probe,group)
-                    if view.state=="unverifiable" and view.reason.startswith("procfs-")),"")
-  if unavailable:
-   self.assertEqual(self.jobs.read_bytes(),before)
-   self.skipTest(f"complete receipt scan unavailable: {unavailable}")
-  self.assertEqual(actual["category"],expected,actual)
-  return actual
-
  def assert_receipt_refused(self):
   self.assertFalse(self.decision()["category"].startswith("terminal-receipt-"))
   self.assertNotIn("group_reap_proof",self.jobs.read_text())
 
  def test_dry_run_then_apply_seals_only_process_receipt(self):
   before=self.jobs.read_bytes()
-  self.assertEqual(self.positive_decision()["category"],"terminal-receipt-ready")
+  self.assertEqual(self.decision()["category"],"terminal-receipt-ready")
   self.assertEqual(self.jobs.read_bytes(),before)
   result=self.invoke("--apply")
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   record=json.loads(result.stdout)
   self.assertEqual(record["pending_delivery"],{"skipped":"exact-attempt-only"})
-  applied=self.positive_decision("--apply",initial=record["decisions"][0],before=before)
+  applied=record["decisions"][0]
   self.assertEqual(applied["category"],"terminal-receipt-sealed")
   self.assertTrue(applied["revalidated"])
   line=self.jobs.read_text()
@@ -1866,12 +1982,12 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
  def test_claude_complete_recovers_and_receipt_writer_reentry_is_idempotent(self):
   self.claude_log()
   original=self.jobs.read_bytes()
-  self.assertEqual(self.positive_decision()['category'],'terminal-receipt-ready')
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
   self.assertEqual(self.jobs.read_bytes(),original)
-  first=self.positive_decision('--apply')
+  first=self.decision('--apply')
   self.assertEqual(first['category'],'terminal-receipt-sealed')
   sealed=self.jobs.read_bytes()
-  self.assertEqual(self.positive_decision('--apply')['category'],'terminal-receipt-sealed')
+  self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
   self.assertEqual(self.jobs.read_bytes(),sealed)
   self.assertNotIn('failure_class=pass',self.jobs.read_text())
 
@@ -1882,12 +1998,12 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
               'session_id':'claude-fixture-session'}
   self.log.write_text(self.log.read_text()+json.dumps(suggestion)+'\n')
   before=self.jobs.read_bytes()
-  self.assertEqual(self.positive_decision()['category'],'terminal-receipt-ready')
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
   self.assertEqual(self.jobs.read_bytes(),before)
-  self.assertEqual(self.positive_decision('--apply')['category'],'terminal-receipt-sealed')
+  self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
   sealed=self.jobs.read_bytes()
-  self.assertEqual(self.positive_decision()['category'],'terminal-receipt-ready')
-  self.assertEqual(self.positive_decision('--apply')['category'],'terminal-receipt-sealed')
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
+  self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
   self.assertEqual(self.jobs.read_bytes(),sealed)
 
  def test_claude_unrecognized_tail_never_recovers_or_reenters_completion_writer(self):
@@ -1908,7 +2024,7 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
    with self.subTest(tail=tail):
     self.claude_log();body=self.log.read_text()
     self.log.write_text(body+tail+'\n');self.assert_receipt_refused()
-    self.claude_log();self.assertEqual(self.positive_decision('--apply')['category'],'terminal-receipt-sealed')
+    self.claude_log();self.assertEqual(self.decision('--apply')['category'],'terminal-receipt-sealed')
     sealed=self.jobs.read_bytes();self.log.write_text(body+tail+'\n')
     self.assertFalse(self.decision()['category'].startswith('terminal-receipt-'))
     self.assertEqual(self.jobs.read_bytes(),sealed)
@@ -1931,7 +2047,7 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
 
  def test_legacy_claude_optional_none_contract_and_harness_identity(self):
   self.claude_log(subtype=None,is_error=None,terminal_reason=None,stop_reason=None)
-  self.assertEqual(self.positive_decision()['category'],'terminal-receipt-ready')
+  self.assertEqual(self.decision()['category'],'terminal-receipt-ready')
   self.write_row(extra=',harness=codex');self.assert_receipt_refused()
 
  def test_claude_receipt_CAS_rechecks_terminal_and_owned_descendants(self):
@@ -2016,7 +2132,7 @@ class SameHostForegroundStageReceiptTest(unittest.TestCase):
   self.assertEqual(self.jobs.read_bytes(),original)
 
 
-class SameHostForegroundReviewFailureTest(unittest.TestCase):
+class SameHostForegroundReviewFailureTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
   self.repo=self.base/"repo";self.repo.mkdir()
@@ -2194,7 +2310,7 @@ class SameHostForegroundReviewFailureTest(unittest.TestCase):
   return module
 
 
-class ArtifactProofReceiptSealTest(unittest.TestCase):
+class ArtifactProofReceiptSealTest(RegistryFixtureTestCase):
  """A PASS worker whose post-exit receipt can never be issued must be recoverable.
 
  The detached drain receipt needs `attempt-tagged-empty-v1`. One process that
@@ -2469,7 +2585,7 @@ class ArtifactProofReceiptSealTest(unittest.TestCase):
   self.assertIn("receipt-recovery-mode-conflict",result.stdout)
 
 
-class ExactAttemptDeliveryBackstopTest(unittest.TestCase):
+class ExactAttemptDeliveryBackstopTest(RegistryFixtureTestCase):
  """Normal exact --attempt --apply repairs its target's own backstop only.
 
  Crash-window shape (proven by ReconcilePendingDeliveryTest): the row is
@@ -2553,7 +2669,7 @@ class ExactAttemptDeliveryBackstopTest(unittest.TestCase):
    self.assertEqual(tomb.read_bytes(),before_tomb)
 
 
-class DetachedResidueDrainReconcileTest(unittest.TestCase):
+class DetachedResidueDrainReconcileTest(RegistryFixtureTestCase):
  """stale-residue-1002: a residue seal whose survivors are gone must not stay `terminal-draining`."""
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -2647,7 +2763,7 @@ class DetachedResidueDrainReconcileTest(unittest.TestCase):
   self.assertIn("--route-file",out.getvalue())
 
 
-class MixedRegistryTest(unittest.TestCase):
+class MixedRegistryTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name);self.home=self.base/"home";self.jobs=self.base/"jobs.log"
   bare=self.base/"remote.git";subprocess.run(["git","init","--bare","-q",str(bare)],check=True)
@@ -2741,7 +2857,7 @@ class MixedRegistryTest(unittest.TestCase):
   self.assertEqual(sum(result["closed"] for result in results),1)
   self.assertEqual(self.jobs.read_text().count("att-race-mixed"),1)
   self.assertEqual(self.jobs.read_text().count("note=dead-exact-pid"),1)
-class OrphanReconcileTest(unittest.TestCase):
+class OrphanReconcileTest(RegistryFixtureTestCase):
  """SD-64/71 post-exit orphan-conductor reconcile classification."""
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name);self.home=self.base/"home";self.jobs=self.base/"jobs.log"
@@ -2846,15 +2962,6 @@ class OrphanReconcileTest(unittest.TestCase):
   self.assertIn("resume_boundary=execute",status.stdout)
   scan=self.invoke("orphan-scan")
   self.assertEqual(scan.returncode,0,scan.stdout+scan.stderr)
-  if "orphaned_conductor_jobs=0" in scan.stdout:
-   before=self.jobs.read_bytes()
-   scan=self.invoke("orphan-scan")
-   self.assertEqual(self.jobs.read_bytes(),before)
-   if "orphaned_conductor_jobs=0" in scan.stdout:
-    metadata=parse_registry_metadata(self.jobs.read_text().splitlines()[0].split("\t",5)[5])
-    probe=D.attempt_tagged_descendants(metadata)
-    if probe.state=="unverifiable" and probe.reason.startswith("procfs-"):
-     self.skipTest(f"complete orphan scan unavailable: {probe.reason}")
   self.assertIn("orphaned_conductor_jobs=1",scan.stdout)
   applied=json.loads(self.invoke("reconcile","--attempt","att-owner-derived","--apply").stdout)
   self.assertEqual(applied["decisions"][0]["category"],"orphan")
@@ -2930,23 +3037,9 @@ class OrphanReconcileTest(unittest.TestCase):
     f"2026-07-16T00:00:01Z\topen\t/r\t/w\tchild\troute_id={self.route_id},route_file={self.route_file},route_node=execute,attempt_id=att-child-reuse,parent=owner,parent_attempt_id=att-owner-reuse,pid={unrelated.pid},pid_start={wrong}",
    ]
    self.jobs.write_text("\n".join(rows)+"\n")
-   currentize_registry(self.jobs)
-   before=self.jobs.read_bytes()
-   child_before=before.splitlines()[1]
    applied=json.loads(self.invoke("reconcile","--attempt","att-owner-reuse","--apply").stdout)
-   cascade=applied["decisions"][0]["cascade"]
-   if not cascade:
-    self.assertEqual(applied["decisions"][0]["category"],"unverifiable",applied)
-    self.assertEqual(applied["closed"],0)
-    self.assertEqual(self.jobs.read_bytes(),before)
-   else:
-    child=cascade[0]
-    self.assertIn(child["status"],{"dead-parent-exited","scope-unverifiable"},applied)
-    if child["status"]=="scope-unverifiable":
-     self.assertFalse(child["closed"])
-     self.assertEqual(self.jobs.read_bytes().splitlines()[1],child_before)
-    else:
-     self.assertIn("note=dead-parent-exited",self.jobs.read_text())
+   self.assertEqual(applied["decisions"][0]["cascade"][0]["status"],"dead-parent-exited")
+   self.assertIn("note=dead-parent-exited",self.jobs.read_text())
    self.assertIsNone(unrelated.poll())
   finally:
    if unrelated.poll() is None:unrelated.kill()
@@ -3017,20 +3110,10 @@ class OrphanReconcileTest(unittest.TestCase):
     "pid_host_proof=nspid-procfs-root-v1",
    ]
    self.jobs.write_text("\n".join(rows)+"\n")
-   currentize_registry(self.jobs)
-   before=self.jobs.read_bytes()
-   child_before=before.splitlines()[1]
    applied=json.loads(self.invoke(
     "reconcile","--attempt","att-owner-remounted","--apply").stdout)
    cascade=applied["decisions"][0]["cascade"]
-   if cascade:
-    self.assertEqual(cascade[0]["status"],"scope-unverifiable")
-    self.assertFalse(cascade[0]["closed"])
-   else:
-    self.assertEqual(applied["decisions"][0]["category"],"unverifiable",applied)
-    self.assertEqual(applied["closed"],0)
-    self.assertEqual(self.jobs.read_bytes(),before)
-   self.assertEqual(self.jobs.read_bytes().splitlines()[1],child_before)
+   self.assertEqual(cascade[0]["status"],"scope-unverifiable")
    self.assertIn("\topen\t/r\t/w\tchild\t",self.jobs.read_text())
    self.assertIsNone(unrelated.poll())
   finally:
@@ -3088,7 +3171,7 @@ class OrphanReconcileTest(unittest.TestCase):
   self.assertNotEqual(applied["decisions"][0]["category"],"orphan")
 
 
-class ResolveOwnerRouteAdvanceTest(unittest.TestCase):
+class ResolveOwnerRouteAdvanceTest(RegistryFixtureTestCase):
  def setUp(self):
   spec=importlib.util.spec_from_file_location("dispatch_registry_advance",SCRIPT)
   self.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.module)
@@ -3139,7 +3222,7 @@ class ResolveOwnerRouteAdvanceTest(unittest.TestCase):
   self.assertEqual((route_id,route_file,status),("rt-legacy","/legacy.json","ok"))
 
 
-class ForegroundRegistryContractTest(unittest.TestCase):
+class ForegroundRegistryContractTest(RegistryFixtureTestCase):
  def test_classifier_has_no_row_derived_binding_fallback_and_refreshes_before_probe(self):
   source=SCRIPT.read_text(encoding="utf-8")
   self.assertNotIn("expected_binding or _foreground_binding", source)
@@ -3158,7 +3241,7 @@ class ForegroundRegistryContractTest(unittest.TestCase):
   self.assertEqual(tuple(module.ROUTE_IDENTITY_METADATA_KEYS), tuple(D.ROUTE_IDENTITY_METADATA_KEYS))
 
 
-class ClosedUnclaimedOwnerTest(unittest.TestCase):
+class ClosedUnclaimedOwnerTest(RegistryFixtureTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
   self.jobs=self.base/"jobs.log";self.jobs.write_text("")
