@@ -286,6 +286,16 @@ These advisory points add no prerequisite or required stage:
   Reuse sufficient existing results. For a new measurement, include a node whose
   inputs and sealed `write_scope` cover it; the lab `metrics` node writes only
   `metrics.jsonl` and `summary-stats.json`, so it cannot create new raw results.
+- Keep wording, labels, and layout corrections inside the already-approved work
+  with its existing artifact owner and cycle, using only the checks the change
+  needs. Preserve lab verification for scientific changes and spec sync
+  for requirement or evaluation-policy changes; a separate document goal still
+  follows §0.2. Name the decided capability explicitly: the ordinary
+  `autopilot-code` default does not classify the request.
+- In a fresh frameless graph, campaign history can still supply ordinary partial
+  outputs, but it does not supply frame briefs. Reuse frame briefs through an
+  explicitly selected parent or `--route-plan` proposal; the owner continues to
+  judge whether that frame's scope covers the work.
 - Choose `--intensity` for the work's purpose and, when needed,
   `--explicit-profiles` for judgment or verification nodes. Check the selection
   reasons and actual node/leg profiles in the compose output.
