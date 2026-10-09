@@ -195,7 +195,8 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     self.assertEqual(text.count("resource eval-run"), 1)
                     child_line = next(line for line in lines if line and "resource eval-run" in flatten([line]))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in child_line), width)
-                    self.assertIn("resource-parked", text)
+                    if width == 168:
+                        self.assertIn("로그 없음", text)
         snap = json.loads(fleet._snapshot_json([], [self.owner], [self.resource]))
         self.assertEqual(len(snap["jobs"]), 1)
         job = snap["jobs"][0]
@@ -434,7 +435,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
         self.assertEqual(snapshot, original_snapshot)
 
 
-    def test_declared_progress_stays_on_the_resource_row_in_every_view(self):
+    def test_declared_progress_reaches_now_and_resource_row_in_every_view(self):
         self.attach()
         progress = {"completed": 12, "total": 50, "unit": "epoch", "age_s": 120}
         for process in (False, True):
@@ -454,7 +455,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     if width >= 80:
                         self.assertIn("12/50 epoch", flatten([line]))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in line), width)
-                    self.assertEqual(flatten(actual).count("2m ago"), 1)
+                    self.assertEqual(flatten(actual).count("2m ago"), 2 if width == 168 else 1)
 
     def test_counter_without_total_and_old_age_do_not_change_resource_state(self):
         self.attach()

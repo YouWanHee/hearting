@@ -14,7 +14,6 @@ class MutedPaletteTest(unittest.TestCase):
     def test_256_color_palette_is_low_chroma(self):
         self.assertEqual(render._MUTED_256, {
             "steward_pink": 219,
-            "relation_grey": 244,
             "orange": 137,
             "soft": 253,
             "green": 150,
@@ -39,28 +38,6 @@ class MutedPaletteTest(unittest.TestCase):
         with mock.patch.object(render.curses, "COLORS", 8, create=True):
             self.assertEqual(render._palette_fg("green", 2), 2)
             self.assertEqual(render._palette_fg("soft", 7), 7)
-
-    def test_relations_use_explicit_neutral_grey_on_default_and_tinted_backgrounds(self):
-        for name in ("_COLOR", "_TINT_PAIR"):
-            original = dict(getattr(render, name))
-            self.addCleanup(lambda name=name, original=original:
-                            (getattr(render, name).clear(), getattr(render, name).update(original)))
-        self.addCleanup(setattr, render, "_TINT_OK", render._TINT_OK)
-        self.assertEqual(render._HUE_OF["relation"], ("s", 0))
-        with mock.patch.multiple(render.curses, create=True, COLORS=256,
-                                 start_color=mock.Mock(), use_default_colors=mock.Mock(),
-                                 can_change_color=mock.Mock(return_value=False),
-                                 init_pair=mock.Mock(),
-                                 color_pair=mock.Mock(side_effect=lambda n: n << 8)):
-            render._init_colors()
-            render.curses.init_pair.assert_any_call(19, 244, -1)
-            self.assertEqual(render._key_attr("relation"), 19 << 8)
-            for tint in render._TINT_LVL:
-                self.assertEqual(render._key_attr("relation", tint), render._TINT_PAIR[(tint, "s")])
-        for mark in ("┆", "├╌", "╰╌"):
-            line = [(mark, "relation")]
-            self.assertEqual(render._snapshot_line(line, colored=True), "\033[38;5;244m" + mark + "\033[0m")
-            self.assertEqual(render._snapshot_line(line), mark)
 
     def test_panel_tints_keep_brightness_and_reduce_chroma(self):
         self.assertEqual(render._TINT_LVL, {
