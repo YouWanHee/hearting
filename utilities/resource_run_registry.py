@@ -323,10 +323,13 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
     elapsed_min = max(0, int((float(end) - started_at) / 60)) if started_at and end else None
     training_progress = None
     remote_training = []
+    local_placement = None
     from resource_progress import read_progress
     progress = read_progress({**run, "run_id": str(run_id)}, now)
     if liveness == "working":
         from resource_progress import collect as collect_progress, remote_candidates
+        from resource_placement import observe as observe_placement
+        local_placement = observe_placement({**run, "run_id": str(run_id)})
         training_progress = collect_progress(run, registry, now)
         remote_training = remote_candidates(run, registry, now)
     return {
@@ -352,6 +355,7 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "training_progress": training_progress,
         "progress_file": run.get("progress_file"), "progress": progress,
         "remote_training": remote_training,
+        "local_placement": local_placement,
         # Tracked-workflow projection (OPERATIONS §5.12): a resource row must expose why
         # it ended and who owns it, not just whether a PID is still there.
         "workflow_state": run.get("workflow_state"),

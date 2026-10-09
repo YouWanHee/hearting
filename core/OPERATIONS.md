@@ -1558,6 +1558,12 @@ changes to resource liveness. Runtime maintenance in a private snapshot
 repository is plumbing, not a user tool call.
 After a resource exits, an owner without a current model summary or tool shows
 the last resource result and log age in NOW.
+For a live local resource, bounded reads of its exact process and descendants
+may show GPU selection separately from use: `moving4:1 지정 · GPU 사용 전`.
+Observed GPU use takes precedence; selection alone never creates a GPU usage
+row or memory total. The same NOW path serves every harness. Existing process
+state may add `입출력 대기`; this observation never scans all of procfs, queries
+another device, or changes the resource lifecycle.
 Depth-1 frame cards use the owner model/gauge,
 routing and close-rail status layout on every harness; worker layouts retain
 their existing columns. Fleet ignores a marker whose entries carry no role source;
