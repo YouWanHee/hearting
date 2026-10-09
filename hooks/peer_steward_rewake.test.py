@@ -29,6 +29,12 @@ target = argv[2] if len(argv) > 2 else "-"
 info = {"result": {"agent": {"agent": "claude", "agent_session": {"value": "sid-fake"},
         "agent_status": "idle", "name": target, "pane_id": "w1:p9"}, "type": "agent_info"}}
 verb = argv[1] if len(argv) > 1 else ""
+if argv[:2] == ["pane", "process-info"]:
+    print(json.dumps({"result": {"process_info": {
+        "pane_id": argv[-1], "shell_pid": os.getppid(),
+        "foreground_process_group_id": os.getppid(),
+        "foreground_processes": [{"pid": os.getppid(), "argv": ["zsh"]}]}}}))
+    sys.exit(0)
 if verb == "wait" and mode == "held":
     with open(os.environ["FAKE_HERDR_FIFO"], "r") as fh:
         fh.read()
