@@ -94,7 +94,7 @@ class BundleTest(unittest.TestCase):
                             continue
                         pos = 0
                         for value, key in row:
-                            if value in ("개발", "실험", "작성") and key == "name_dim":
+                            if value in ("code", "lab", "draft") and key == "name_dim":
                                 starts.append(pos)
                             if not render._is_fill(value):
                                 pos += render._dw(value)
@@ -135,7 +135,7 @@ class BundleTest(unittest.TestCase):
             l2 = render._plain(render._dispatch_row_2line(worker, in_card=True)[1])
             self.assertEqual(l2.index("17m"), 4)
             self.assertEqual(l2.index("gpt-6.1-sol"), 20)
-            self.assertEqual(render._dw(l2[:l2.index("구현")]), 47)
+            self.assertEqual(render._dw(l2[:l2.index("code-execute")]), 47)
 
     def test_owner_close_rail_preserves_residue_and_dead_resume_evidence(self):
         owner = DispatchJob(key="code", slug="owner", harness="codex", cwd="/work/bundle",
@@ -318,7 +318,7 @@ class BundleTest(unittest.TestCase):
             render._handle_base_key(ord("c"), 20)
             self.assertTrue(all(render._gpu_commands_folded("gpu", i) for i in (0, 1)))
         self.assertEqual(render._COMPUTE_HOSTS, original)
-        self.assertIn("c:명령", render._plain(render._footer_segs(False, [], 168)))
+        self.assertIn("c GPU cmd", render._plain(render._footer_segs(False, [], 168)))
         fake = mock.Mock()
         render._configure_input(fake, {})
         fake.mousemask.assert_not_called()
@@ -437,7 +437,7 @@ class BundleTest(unittest.TestCase):
                 position = 0
                 starts = []
                 for value, key in row:
-                    if value in ("개발", "실험", "작성") and key == "name_dim":
+                    if value in ("code", "lab", "draft") and key == "name_dim":
                         starts.append(position)
                     if not render._is_fill(value):
                         position += render._dw(value)
@@ -461,9 +461,9 @@ class BundleTest(unittest.TestCase):
         child = session("bb", model="MODEL", effort="high", herdr_attached=True, summary="NOWTEXT")
         for width in (60, 100, 168):
             rows = text(self.build([parent, child], width=width))
-            where = [row for row in rows if "herdr" in row and "문맥" in row and "작업 중" in row]
+            where = [row for row in rows if "herdr" in row and "마지막 요약" in row]
             self.assertEqual([row.index("herdr") for row in where], [render._SESSION_DETAIL_COL] * 2)
-            self.assertEqual([render._dw(row[:row.index("작업 중")]) for row in where],
+            self.assertEqual([render._dw(row[:row.index("마지막 요약")]) for row in where],
                              [render._NAME_COL] * 2)
             self.assertEqual(where[0][render._STEWARD_LINE_COL], "⚑" if width == 168 else "┆")
             self.assertEqual(where[1][render._STEWARD_LINE_COL], " ")
@@ -505,7 +505,7 @@ class BundleTest(unittest.TestCase):
                 for row in lines:
                     pos = 0
                     for value, key in row or ():
-                        if key == "name_dim" and value in ("개발", "방향 검토"):
+                        if key == "name_dim" and value in ("code", "route-frame"):
                             starts.append(pos)
                         if not render._is_fill(value):
                             pos += render._dw(value)

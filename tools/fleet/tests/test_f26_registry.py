@@ -232,7 +232,7 @@ class UnusedRowRenderTest(unittest.TestCase):
     def test_badge_shows_state_and_age(self):
         txt = self._row(name_width=40)
         self.assertIn("agent-setting-17", txt)
-        self.assertIn("미사용", txt)
+        self.assertIn("unused", txt)
         self.assertIn("3h 45m", txt)             # 225 min
 
     def test_glyph_is_the_unused_glyph(self):
@@ -248,7 +248,7 @@ class UnusedRowRenderTest(unittest.TestCase):
 
     def test_idle_row_has_no_unused_badge(self):
         txt = self._row(name_width=40, liveness="idle")
-        self.assertNotIn("미사용", txt)
+        self.assertNotIn("unused", txt)
 
     def test_two_line_row_keeps_badge_parity(self):
         s = Session(harness="claude", pid=1168514, cwd="/home/alice/agent_setting",
@@ -257,7 +257,7 @@ class UnusedRowRenderTest(unittest.TestCase):
         l1, _l2 = render._session_row_2line(s, term_width=120)
         txt = "".join(t for t, _k in l1)
         self.assertIn("agent-setting-17", txt)
-        self.assertIn("미사용", txt)
+        self.assertIn("unused", txt)
         self.assertIn("◌", txt)
 
     def test_narrow_row_drops_provenance_rather_than_starving_the_name(self):
@@ -269,7 +269,7 @@ class UnusedRowRenderTest(unittest.TestCase):
         l1, _l2 = render._session_row_2line(s, term_width=60)
         txt = "".join(t for t, _k in l1)
         self.assertNotIn("terminal", txt)        # dropped
-        self.assertIn("미사용", txt)             # the F-26 signal survives
+        self.assertIn("unused", txt)             # the F-26 signal survives
 
 
 class DegradationLadderTest(unittest.TestCase):
@@ -303,7 +303,7 @@ class DegradationLadderTest(unittest.TestCase):
         txt = "".join(t for t, _k in render._session_row(
             s, narrow=False, name_width=render._wide_name_width(168)))
         self.assertIn(name, txt)                     # full name — never anonymous
-        self.assertIn("미사용 3h 45m", txt)         # full badge — same state/age cells
+        self.assertIn("unused 3h 45m", txt)         # full badge — same state/age cells
         self.assertNotIn("terminal", txt)           # provenance yielded first
 
     def test_badge_age_yields_before_the_name(self):
@@ -326,7 +326,7 @@ class DegradationLadderTest(unittest.TestCase):
                                    name_width=render._wide_name_width(168))
         # The badge has its own color key (g_unused_b); the glyph keeps the dim g_unused.
         badge = next(t for t, k in segs if k == "g_unused_b")
-        self.assertEqual(badge, " 미사용")           # age shed from the BADGE...
+        self.assertEqual(badge, " unused")           # age shed from the BADGE...
         txt = "".join(t for t, _k in segs)
         self.assertIn(name, txt)                     # ...so the name stays whole
         self.assertIn("3h 45m", txt)                 # age still on the row, in the time cell
@@ -337,14 +337,14 @@ class DegradationLadderTest(unittest.TestCase):
         segs = render._session_row(s, narrow=False,
                                    name_width=render._wide_name_width(168))
         badge = next(t for t, k in segs if k == "g_unused_b")
-        self.assertEqual(badge, " 미사용 3h 45m")
+        self.assertEqual(badge, " unused 3h 45m")
 
     def test_name_clips_only_when_nothing_else_is_left_to_shed(self):
         s = self._ghost(registry_name="z" * 90, provenance=None)
         txt = "".join(t for t, _k in render._session_row(
             s, narrow=False, name_width=render._wide_name_width(168)))
         self.assertIn("…", txt)                     # last resort
-        self.assertIn("미사용", txt)                # the F-26 signal still survives
+        self.assertIn("unused", txt)                # the F-26 signal still survives
 
     def test_wide_row_keeps_one_fixed_session_branch_column(self):
         """The integrated title + ``(branch)`` cell keeps its fixed combined width."""
@@ -408,12 +408,12 @@ class UnusedVisibilityTest(unittest.TestCase):
         self.assertIn("agent-setting-17", self._render())
 
     def test_pulse_counts_unused(self):
-        self.assertIn("1 미사용", self._render())
+        self.assertIn("1 unused", self._render())
 
     def test_legend_shows_unused_when_present(self):
         out = self._render()
         self.assertIn("◌", out)
-        self.assertIn("◌ 미사용", out)
+        self.assertIn("◌ unused", out)
 
     def test_unused_and_detached_glyphs_are_distinguishable_side_by_side(self):
         """design_critic_step2 §4 — the live captures never had a detached session, so ◌ next
@@ -432,11 +432,11 @@ class UnusedVisibilityTest(unittest.TestCase):
         self.assertIn("○", out)
         self.assertNotEqual(render._LIVE_GLYPH["unused"], render._DETACHED_GLYPH)
         # Neither glyph is ever asked to carry the meaning alone — each has its word beside it.
-        self.assertIn("1 미사용", out)
-        self.assertIn("1 분리됨", out)
-        pulse = next(l for l in out.splitlines() if "미사용" in l and "분리됨" in l)
-        self.assertIn("◌ 1 미사용", pulse)
-        self.assertIn("○ 1 분리됨", pulse)
+        self.assertIn("1 unused", out)
+        self.assertIn("1 detached", out)
+        pulse = next(l for l in out.splitlines() if "unused" in l and "detached" in l)
+        self.assertIn("◌ 1 unused", pulse)
+        self.assertIn("○ 1 detached", pulse)
 
     def test_legend_stays_quiet_when_no_unused_row(self):
         """F-12: a healthy board says nothing about states it does not have."""
@@ -444,7 +444,7 @@ class UnusedVisibilityTest(unittest.TestCase):
                        liveness="working", title="Live work")
         out = _flatten(render._build_lines([live], [], section="fleet", narrow=False,
                                            malformed=0, term_width=168))
-        self.assertNotIn("미사용", out)
+        self.assertNotIn("unused", out)
 
 
 if __name__ == "__main__":
