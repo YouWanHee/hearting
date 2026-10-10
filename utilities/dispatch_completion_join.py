@@ -4213,11 +4213,13 @@ def settle_exited_owner_terminal(row: ChildRow, *, jobs: str | Path) -> str | No
     Their exact log and process observation are the same evidence the
     post-exit watcher consumes; no new recovery record is needed.
     """
-    from dispatch_contract import supervisor_lease_is_held
+    from dispatch_contract import SUPERVISOR_LEASE_KIND, supervisor_lease_is_held
     from dispatch_supervisor_terminal import classify_supervisor_log
 
     meta = row.metadata
     if (row.status not in OPEN_STATES or meta.get("worker_type") != "owner"
+            or meta.get("supervisor_lease") != SUPERVISOR_LEASE_KIND
+            or not meta.get("supervisor_lease_file")
             or meta.get("registered_worker") != "1" or meta.get("launch_started") != "1"
             or not meta.get("pid_start") or not meta.get("pid") or not meta.get("log_file")):
         return None

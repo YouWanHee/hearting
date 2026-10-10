@@ -748,9 +748,12 @@ for a second entry approval. Older sealed quick routes retain their
 `preview-disposition` release and current-preview digest checks;
 `capabilities/autopilot-refine.md` owns the commands.
 
-An open registered owner whose supervisor failed terminal settlement remains
+An open registered supervised owner whose terminal settlement failed remains
 an unfinished settlement duty. Ordinary join, start, correction and session
 reconnection retry the same terminal writer after storage becomes writable.
+The writer retains its exact result in the existing log before settlement;
+recovery reads only the latest turn, including after finalization errors.
+Reconnection writes the canonical registry only; legacy roots remain read-only.
 They use the exact PID/start, group and tagged-descendant observation, preserve
 committed results and completed stage markers, and retain corrections for the
 same route's continuation. Live or unobservable processes retain protection

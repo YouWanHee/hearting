@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 import re
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import opencode_server_log
 from dispatch_contract import reconcile_attempt_terminal
@@ -470,12 +470,19 @@ def reconcile_supervisor_terminal(
     jobs: str | Path,
     attempt_id: str,
     terminal: SupervisorTerminal,
+    *,
+    emit: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     # SD-111 P2 trigger 1: this module cannot import
     # dispatch_completion_join.materialize_after_terminal_close (circular --
     # dispatch_completion_join -> codex_dispatch_terminal ->
     # dispatch_supervisor_terminal), so every caller of this function must
     # call it itself when the return value is "closed".
+    # Retain the exact writer input before a storage operation can fail.
+    # Session drivers emit their final result only after this commit; native
+    # turn output can also precede route/child checks or envelope conversion.
+    if emit is not None:
+        emit({"type": "dispatch.supervisor.terminal", "terminal": asdict(terminal)})
     return reconcile_attempt_terminal(
         Path(jobs),
         attempt_id,
@@ -568,6 +575,20 @@ def opencode_truncation_evidence(raw_lines: list[str]) -> str:
     return ""
 
 
+def supervisor_terminal_from_event(row: dict[str, Any]) -> SupervisorTerminal | None:
+    """Read the existing writer's retained input, never model result text."""
+    if row.get("type") != "dispatch.supervisor.terminal":
+        return None
+    value = row.get("terminal")
+    if not isinstance(value, dict):
+        return None
+    try:
+        terminal = SupervisorTerminal(**value)
+    except TypeError:
+        return None
+    return terminal if all(isinstance(field, str) for field in asdict(terminal).values()) else None
+
+
 def classify_supervisor_log(path: str | Path | None, harness: str) -> SupervisorTerminal:
     """Classify a finished owner's exact log for the post-exit watcher."""
 
@@ -577,6 +598,26 @@ def classify_supervisor_log(path: str | Path | None, harness: str) -> Supervisor
         rows, _raw_lines = _tail_rows(Path(path))
     except OSError:
         return classify_supervisor_error(harness, "terminal-log-unreadable")
+    # All runtime-specific scans belong to the latest turn. An old stop,
+    # failure, or result cannot finish a turn that started afterward.
+    for index in range(len(rows) - 1, -1, -1):
+        if rows[index].get("type") in {
+                "dispatch.supervisor.turn.started", "dispatch.supervisor.turn-started"}:
+            rows = rows[index + 1:]
+            for raw_index in range(len(_raw_lines) - 1, -1, -1):
+                try:
+                    raw_row = json.loads(_raw_lines[raw_index])
+                except ValueError:
+                    continue
+                if isinstance(raw_row, dict) and raw_row.get("type") in {
+                        "dispatch.supervisor.turn.started", "dispatch.supervisor.turn-started"}:
+                    _raw_lines = _raw_lines[raw_index + 1:]
+                    break
+            break
+    for row in reversed(rows):
+        terminal = supervisor_terminal_from_event(row)
+        if terminal is not None:
+            return terminal
     if harness == "opencode":
         # R1 (Gap 1): last step_finish.reason=="stop" is the exact opencode
         # success terminal. R1 must precede R2 (auto-reject) — once item 1(b)
@@ -622,9 +663,11 @@ def classify_supervisor_log(path: str | Path | None, harness: str) -> Supervisor
         if settlement_failure is not None and event in {
                 "dispatch.supervisor.turn.started", "dispatch.supervisor.turn-started"}:
             break  # an earlier turn's result cannot settle this failed turn
-        if event == "result":
-            return classify_claude_result(row, 0)
-        if event == "turn.completed":
+        if event == "result" and harness in {"claude", "opencode"}:
+            return classify_session_result(row, 0, runtime=harness)
+        if event == "dispatch.supervisor.turn.completed" and row.get("status") != "completed":
+            return classify_supervisor_error(harness, "app-server-turn-failed")
+        if event in {"turn.completed", "dispatch.supervisor.turn.completed"}:
             final_text = None
             for prior in range(index - 1, -1, -1):
                 item = rows[prior].get("item")
@@ -638,10 +681,11 @@ def classify_supervisor_log(path: str | Path | None, harness: str) -> Supervisor
             return classify_codex_result(final_text)
         if event == "dispatch.supervisor.error":
             reason = str(row.get("reason") or "supervisor-error")
-            if reason.startswith("terminal-reconcile-failed-"):
+            if reason.startswith(("terminal-reconcile-failed-", "supervisor-finalize-state-",
+                                  "supervisor-finalize-lease-")):
                 # Failure to persist a result does not replace that result.
                 # Retain the error only when no native terminal preceded it.
-                if settlement_failure is None:
+                if settlement_failure is None or reason.startswith("terminal-reconcile-failed-"):
                     settlement_failure = classify_supervisor_error(harness, reason)
                 continue
             return classify_supervisor_error(

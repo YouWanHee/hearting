@@ -209,8 +209,10 @@ def ensure_observers(jobs: str | Path | None = None) -> int:
     """Resume unfinished exact batches through the existing completion sidecar."""
     launched = 0
     script = Path(__file__).with_name("codex-managed-completion.py")
-    for jobs_path in _jobs_paths(jobs):
-        _resume_owner_settlements(jobs_path)
+    jobs_paths = _jobs_paths(jobs)
+    if jobs_paths:
+        _resume_owner_settlements(jobs_paths[0])
+    for jobs_path in jobs_paths:
         try:
             root = _root(jobs_path)
             records = sorted(root.glob("batch-*.json")) if root.is_dir() else []

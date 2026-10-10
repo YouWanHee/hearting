@@ -70,6 +70,8 @@ class DeadOwnerOSErrorTest(unittest.TestCase):
         for harness in ('codex', 'claude', 'opencode'):
             with self.subTest(harness=harness):
                 self.meta['harness'] = harness
+                self.meta['completion_delivery'] = ('app-server-supervised' if harness == 'codex'
+                                                    else 'session-resume-supervised')
                 self.write_row()
                 receipt = J.join_selected_attempts(jobs=self.jobs, expected_attempts={self.attempt})
                 row = J.exact_attempt_row(self.jobs, self.attempt)
@@ -100,6 +102,16 @@ class DeadOwnerOSErrorTest(unittest.TestCase):
         self.assertIn(answer, R._correction_context(self.jobs, self.attempt, proof))
         self.assertEqual(row.metadata['owner_route_id'], 'rt-preserved')
         self.assertEqual(self.route.read_bytes(), before_route)
+
+    def test_unsupervised_owner_keeps_its_existing_completion_path(self):
+        self.meta.pop('supervisor_lease')
+        self.meta.pop('supervisor_lease_file')
+        self.meta['completion_delivery'] = 'poll-fallback'
+        self.write_row()
+        before = self.jobs.read_bytes()
+        self.assertIsNone(J.settle_exited_owner_terminal(
+            J.exact_attempt_row(self.jobs, self.attempt), jobs=self.jobs))
+        self.assertEqual(self.jobs.read_bytes(), before)
 
     def test_unobservable_namespace_or_live_descendant_keeps_owner_open(self):
         for observation in (D.ProcessQuiescence('unverifiable', 'process-namespace-unverifiable'),
@@ -145,22 +157,78 @@ class DeadOwnerOSErrorTest(unittest.TestCase):
         text = f'artifact: {artifact}\nverdict: PASS\nblocker: none'
         for harness, native in (
             ('codex', [{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': text}},
-                       {'type': 'turn.completed'}]),
+                       {'type': 'dispatch.supervisor.turn.completed', 'status': 'completed'}]),
+            ('claude', []),
+            ('opencode', []),
+        ):
+            with self.subTest(harness=harness):
+                self.meta['harness'] = harness
+                self.meta['completion_delivery'] = ('app-server-supervised' if harness == 'codex'
+                                                    else 'session-resume-supervised')
+                self.write_row()
+                terminal = (T.classify_codex_result(text) if harness == 'codex' else
+                            T.classify_session_result({'is_error': False, 'result': text},
+                                                      0, runtime=harness))
+                with mock.patch.object(D, '_atomic_registry_replace',
+                                       side_effect=OSError(errno.ENOSPC, 'full')):
+                    with self.assertRaises(OSError):
+                        T.reconcile_supervisor_terminal(self.jobs, self.attempt, terminal,
+                                                        emit=native.append)
+                native.append({'type': 'dispatch.supervisor.error',
+                               'reason': 'terminal-reconcile-failed-OSError'})
+                native.append({'type': 'dispatch.supervisor.error',
+                               'reason': 'supervisor-finalize-state-OSError'})
+                self.log.write_text('\n'.join(json.dumps(row) for row in native) + '\n')
+                self.assertEqual(T.classify_supervisor_log(self.log, harness), terminal)
+                import dispatch_batch_obligations as obligations
+                obligations.ensure_observers(self.jobs)
+                row = J.exact_attempt_row(self.jobs, self.attempt)
+                self.assertEqual((row.status, row.metadata.get('failure_class')), ('done', 'pass'))
+
+    def test_old_codex_log_keeps_current_completed_turn_before_finalize_error(self):
+        text = f'artifact: {self.marker}\nverdict: PASS\nblocker: none'
+        rows = [{'type': 'dispatch.supervisor.turn.started', 'turn_id': 'current'},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': text}},
+                {'type': 'dispatch.supervisor.turn.completed', 'status': 'completed'},
+                {'type': 'dispatch.supervisor.error', 'reason': 'terminal-reconcile-failed-OSError'},
+                {'type': 'dispatch.supervisor.error', 'reason': 'supervisor-finalize-lease-OSError'}]
+        self.log.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        self.assertEqual(T.classify_supervisor_log(self.log, 'codex').failure_class, 'pass')
+        rows[2]['status'] = 'interrupted'
+        self.log.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+        self.assertEqual(T.classify_supervisor_log(self.log, 'codex').failure_class, 'runtime')
+
+    def test_previous_turn_terminal_does_not_finish_current_failed_turn(self):
+        text = f'artifact: {self.marker}\nverdict: PASS\nblocker: none'
+        for harness, prior in (
+            ('codex', [{'type': 'dispatch.supervisor.turn.failed',
+                        'codex_error_info': 'usageLimitExceeded'}]),
             ('claude', [{'type': 'result', 'is_error': False, 'result': text}]),
             ('opencode', [{'type': 'text', 'part': {'text': text}},
                          {'type': 'step_finish', 'part': {'reason': 'stop'}}]),
         ):
             with self.subTest(harness=harness):
-                self.meta['harness'] = harness
-                self.write_row()
-                native.append({'type': 'dispatch.supervisor.error',
-                               'reason': 'terminal-reconcile-failed-OSError'})
-                self.log.write_text('\n'.join(json.dumps(row) for row in native) + '\n')
-                self.assertEqual(T.classify_supervisor_log(self.log, harness).failure_class, 'pass')
-                import dispatch_batch_obligations as obligations
-                obligations.ensure_observers(self.jobs)
-                row = J.exact_attempt_row(self.jobs, self.attempt)
-                self.assertEqual((row.status, row.metadata.get('failure_class')), ('done', 'pass'))
+                start = ('dispatch.supervisor.turn.started' if harness == 'codex'
+                         else 'dispatch.supervisor.turn-started')
+                rows = prior + [{'type': start}, {'type': 'dispatch.supervisor.error',
+                                                'reason': 'terminal-reconcile-failed-OSError'}]
+                self.log.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
+                self.assertEqual(T.classify_supervisor_log(self.log, harness).reconcile_reason,
+                                 'terminal-reconcile-failed-OSError')
+
+    def test_reconnection_writes_only_the_canonical_registry(self):
+        import dispatch_batch_obligations as obligations
+        legacy = self.root / 'legacy'
+        legacy.mkdir()
+        legacy_jobs = legacy / 'jobs.log'
+        legacy_jobs.write_bytes(self.jobs.read_bytes())
+        before = legacy_jobs.read_bytes()
+        with mock.patch.object(D, 'dispatch_state_roots', return_value=(self.root, legacy)), \
+             mock.patch.object(obligations.subprocess, 'Popen') as launch:
+            self.assertEqual(obligations.ensure_observers(), 0)
+            launch.assert_not_called()
+        self.assertEqual(J.exact_attempt_row(self.jobs, self.attempt).status, 'done')
+        self.assertEqual(legacy_jobs.read_bytes(), before)
 
 
 if __name__ == '__main__':
