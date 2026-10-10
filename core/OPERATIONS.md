@@ -905,6 +905,25 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
+The resource runtime owns deterministic execution evidence at
+`artifact_base/run.json`: exact PID/start/command identity, sentinel exit code,
+log, declared output paths and observed start/end times. Arming validates the
+known output directory before launch and returns these expected paths; launch
+receipts carry the same paths without new inputs. Runtime-authored documents
+put facts in a Hearting namespace; an existing owner document retains its
+bytes and is consumed after rechecking the runtime execution. An existing
+completion marker's evidence bytes are preserved. A runtime-only document
+proves execution, distinct from scientific verification. For a supervised owner it
+retains the existing next-resource wait until owner terminal settlement, so
+sequential runs stay possible without another owner-written run.json.
+
+A missing output after an exact successful resource exit is re-observed by
+poll. When the same execution and sentinel remain proven and the output arrives,
+the existing retry transitions append a new observation and advance once.
+Earlier FAIL journal entries survive; execution failure, cancellation and
+unknown identity remain unproven after a late file. Owner settlement uses
+the same resource output reconciliation without payload replay.
+
 Registration and supervisor arming share the terminal-execution judgment for
 same-route/node retries. They retain the old row and predecessor binding;
 only that resource's failed/retryable state returns to running.
@@ -1418,9 +1437,14 @@ two side-by-side panes split the right column down, and three panes split the
 remaining full column down. Each split uses ratio 0.5. Existing horizontal
 rows fill the equivalent grid by splitting right. `--beside` selects the reference
 tab/pane, not the direction; `--pane` retains explicit reuse. Placement in a full
-or irregular tab reuses an agent-free foreground shell with an empty visible
-prompt or creates a tab in the same workspace, without subdivision. Concurrent starts serialize placement
+or irregular tab first reuses an agent-free foreground shell with an empty visible
+prompt there, then checks the other tabs in the same workspace, newest first,
+using the same grid-split and empty-shell decision. Only when none has room does
+it create a tab. Existing tab names and layouts are preserved apart from filling
+an available grid cell. Concurrent starts serialize placement
 through launch so they cannot claim the same shell or subdivide a stale layout.
+Names longer than Herdr's 32-character limit are explained before any placement
+or launch action, so a refused name leaves no extra pane.
 The start completes placement without a post-start pane move. The new pane's
 split-cwd and launcher preparation finish under one fixed
 monotonic deadline, including a stable foreground-shell snapshot after bootstrap,

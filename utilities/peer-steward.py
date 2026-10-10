@@ -1238,43 +1238,97 @@ def _grid_split(layout):
     return None
 
 
+def _placement_result(*argv):
+    proc = subprocess.run(_herdr_argv(*argv), capture_output=True, text=True,
+                          timeout=_herdr_get_timeout())
+    payload = json.loads(proc.stdout or "")
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if proc.returncode or not isinstance(result, dict) or payload.get("error"):
+        return {}
+    return result
+
+
+def _start_layout(beside):
+    layout = _placement_result("pane", "layout", "--pane", beside).get("layout")
+    if not isinstance(layout, dict):
+        return None
+    panes, workspace = layout.get("panes"), layout.get("workspace_id")
+    if (not isinstance(workspace, str) or not workspace.strip()
+            or not isinstance(layout.get("tab_id"), str) or not isinstance(panes, list)
+            or not panes or any(not isinstance(p, dict) or not isinstance(p.get("pane_id"), str)
+                                or not p["pane_id"].strip() for p in panes)):
+        return None
+    ids = [p["pane_id"] for p in panes]
+    if (beside not in ids or len(ids) != len(set(ids))
+            or not layout["tab_id"].startswith(workspace + ":")
+            or any(not pane_id.startswith(workspace + ":") for pane_id in ids)):
+        return None
+    return layout
+
+
+def _tab_placement(layout):
+    """One grid/shell decision for both the caller tab and its workspace peers."""
+    split = _grid_split(layout)
+    if split:
+        return "split", split[0], split[1]
+    for pane in layout["panes"]:
+        pane_id = pane["pane_id"]
+        if (_pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None
+                and _wait_for_shell_prompt(pane_id, timeout_ms=1)
+                and _pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None):
+            return "reuse", pane_id, None
+    return None
+
+
 def _start_placement(beside):
-    """Choose a split, a safe shell, or a fresh tab from this tab's live layout."""
+    """Fill the caller tab, then the newest available tab in the same workspace."""
     try:
-        proc = subprocess.run(_herdr_argv("pane", "layout", "--pane", beside),
-                              capture_output=True, text=True, timeout=_herdr_get_timeout())
-        payload = json.loads(proc.stdout or "")
-        result = payload.get("result") if isinstance(payload, dict) else None
-        layout = result.get("layout") if isinstance(result, dict) else None
-        if (proc.returncode or not isinstance(payload, dict) or payload.get("error")
-                or not isinstance(layout, dict)):
+        layout = _start_layout(beside)
+        if layout is None:
             return None
-        panes, workspace = layout.get("panes"), layout.get("workspace_id")
-        if (not isinstance(workspace, str) or not workspace.strip()
-                or not isinstance(layout.get("tab_id"), str) or not isinstance(panes, list)
-                or not panes or any(not isinstance(p, dict) or not isinstance(p.get("pane_id"), str)
-                                    or not p["pane_id"].strip() for p in panes)):
+        placement = _tab_placement(layout)
+        if placement:
+            return placement
+        workspace = layout["workspace_id"]
+        tabs = _placement_result("tab", "list", "--workspace", workspace).get("tabs")
+        if not isinstance(tabs, list):
             return None
-        ids = [p["pane_id"] for p in panes]
-        if (beside not in ids or len(ids) != len(set(ids))
-                or not layout["tab_id"].startswith(workspace + ":")
-                or any(not pane_id.startswith(workspace + ":") for pane_id in ids)):
-            return None
-        split = _grid_split(layout)
-        if split:
-            return "split", split[0], split[1]
-        for pane in panes:
-            pane_id = pane["pane_id"]
-            if (_pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None
-                    and _wait_for_shell_prompt(pane_id, timeout_ms=1)
-                    and _pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None):
-                return "reuse", pane_id, None
+        others = []
+        for tab in tabs:
+            if (not isinstance(tab, dict) or tab.get("workspace_id") != workspace
+                    or not isinstance(tab.get("tab_id"), str)
+                    or not tab["tab_id"].startswith(workspace + ":")
+                    or type(tab.get("number")) is not int):
+                return None
+            if tab["tab_id"] != layout["tab_id"]:
+                others.append(tab)
+        if others:
+            panes = _placement_result("pane", "list", "--workspace", workspace).get("panes")
+            if not isinstance(panes, list):
+                return None
+            for tab in sorted(others, key=lambda t: t["number"], reverse=True):
+                pane_id = next((p.get("pane_id") for p in panes if isinstance(p, dict)
+                                and p.get("workspace_id") == workspace and p.get("tab_id") == tab["tab_id"]
+                                and isinstance(p.get("pane_id"), str)
+                                and p["pane_id"].startswith(workspace + ":")), None)
+                if pane_id is None:
+                    return None
+                other = _start_layout(pane_id)
+                if other is None or other["workspace_id"] != workspace or other["tab_id"] != tab["tab_id"]:
+                    return None
+                placement = _tab_placement(other)
+                if placement:
+                    return placement
         return "tab", workspace, None
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
 
 
 def cmd_start(args):
+    if len(args.name) > 32:
+        print(f"started=false reason=agent-name-too-long agent={args.kind} name={args.name} "
+              "max_length=32 detail=이름은 최대 32자까지 사용할 수 있습니다")
+        return 1
     beside = args.beside or (os.environ.get("HERDR_PANE_ID", "").strip() if not args.pane else None)
     if not beside:
         return _start_in_pane(args)
