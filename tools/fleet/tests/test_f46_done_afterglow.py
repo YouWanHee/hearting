@@ -148,7 +148,8 @@ class DoneAfterglowRenderTest(unittest.TestCase):
         live = model.DispatchJob(key="autopilot-code", slug="live", liveness="working",
                                  harness="claude")
         pulse = "".join(part for part, _key in render._pulse_segs([], [live, self._job()]))
-        self.assertIn("↳ 1 작업(1 실행)", pulse)
+        self.assertIn("↳ 1 jobs (", pulse)
+        self.assertRegex(pulse, r"jobs \([" + "".join(render._SPIN) + r"] 1\)$")
 
     def test_afterglow_alone_counts_as_zero_jobs(self):
         pulse = "".join(part for part, _key in render._pulse_segs([], [self._job()]))

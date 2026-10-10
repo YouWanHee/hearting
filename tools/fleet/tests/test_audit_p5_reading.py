@@ -112,7 +112,7 @@ class ReadingTest(unittest.TestCase):
         with mock.patch.object(render, "_ROUTE_FOLD", {"route": True}):
             for width in (80, 100, 168):
                 header = render._plain(render._route_card(view, {}, width, 0)[0][0])
-                self.assertIn("실패 단계", header)
+                self.assertIn("stage 실패", header)
                 self.assertLessEqual(render._dw(header), width)
 
     def test_r7_tinted_now_matches_actual_draw(self):
@@ -139,11 +139,11 @@ class ReadingTest(unittest.TestCase):
         self.assertEqual(render._INTERACTION_LABEL["decision"], "답변 필요")
         self.assertEqual(render._INTERACTION_LABEL["permission"], "승인 필요")
 
-    def test_r5_normal_chain_uses_korean_and_keeps_user_names(self):
+    def test_r5_normal_chain_keeps_identifiers_and_user_names(self):
         render.set_show_all(False)
         node = dict(label="route-frame", state="open", mode="debug", intensity="standard")
         text = render._plain(render._route_chain_node_segs(node, True, {}, True, True))
-        self.assertIn("방향 검토", text)
+        self.assertIn("route-frame", text)
         self.assertNotIn("debug", text)
         node["label"] = "AMI_8ch_fix_2spk_v3"
         self.assertIn(node["label"], render._plain(render._route_chain_node_segs(node, True, {})))
@@ -156,7 +156,10 @@ class ReadingTest(unittest.TestCase):
             for key in ("q", "r", "a", "c", "w", "p", "jk", "s", "g/G"):
                 self.assertIn(key, text)
             for word in ("선택", "이동", "갱신"):
-                self.assertIn(word, text)
+                self.assertNotIn(word, text)
+        text = render._plain(render._footer_segs(False, [], 168))
+        for word in ("select", "scroll", "refresh", "p process"):
+            self.assertIn(word, text)
 
     def test_r7_all_rows_fit_shared_width(self):
         sessions, jobs = demo.collect()
@@ -172,16 +175,20 @@ class ReadingTest(unittest.TestCase):
                 overflow = [render._plain(x) for x in lines if x and render._dw(render._plain(x)) > width]
                 self.assertEqual(overflow, [], (process, width, overflow))
 
-    def test_r8_context_named_and_process_legend_present(self):
+    def test_r8_context_unlabelled_and_symbol_legend_preserved(self):
         session = Session(harness="codex", pid=1, cwd="/work/a", session_id="s", ctx_pct=74,
                           liveness="working", summary="현재 작업")
-        self.assertIn("문맥", "\n".join(render._plain(x) for x in render._context_detail_row(session, term_width=80)))
+        detail = "\n".join(render._plain(x) for x in render._context_detail_row(session, term_width=80))
+        self.assertNotIn("문맥", detail)
+        self.assertNotIn("작업 중", detail)
+        self.assertIn("74%", detail)
         render.set_process_view(True)
         text = "\n".join(render._plain(x) for x in render._build_lines([], [], "both", False, 0, term_width=80))
-        for word in ("세션", "학습·장치", "단계"):
+        for word in ("session", "resource", "stage"):
             self.assertIn(word, text)
-        self.assertIn("프로젝트: ● 활동", text)
-        self.assertIn("↳ 전체 명령", text)
+        self.assertIn("project: ● 활동", text)
+        self.assertIn("↳ command", text)
+        self.assertNotIn("문맥", text)
         render.set_show_all(True)
         render.set_process_view(False)
         session.liveness, session.session_tag = "dead", "4d"
@@ -189,12 +196,12 @@ class ReadingTest(unittest.TestCase):
         for width in (80, 100):
             text = "\n".join(render._plain(x) for x in render._build_lines(
                 [session], [], "both", False, 0, term_width=width))
-            self.assertIn("0 작업 중", text)
-            self.assertIn("0 대기", text)
-            legend = text[text.index("세션:"):]
-            for word in ("종료", "[번호]", "감독", "좌석", "프로젝트: ● 활동", "↳ 전체 명령"):
+            self.assertIn("0 working", text)
+            self.assertIn("0 idle", text)
+            legend = text[text.index("session:"):]
+            for word in ("종료", "[id]", "steward", "pane", "project: ● 활동", "↳ command"):
                 self.assertIn(word, legend)
-            for word in (" dead ", " session ", " steward ", " pane "):
+            for word in ("문맥", "계획 검토", "좌석"):
                 self.assertNotIn(word, legend)
         sessions = [Session(harness="codex", pid=i, cwd="/work/a", liveness=state)
                     for i, state in ((1, "working"), (2, "unused"))]
@@ -202,9 +209,9 @@ class ReadingTest(unittest.TestCase):
                 for i in range(4)]
         lines = render._build_lines(sessions, jobs, "both", False, 0, term_width=60)
         pulse = next(render._plain(x) for x in lines if x and "  fleet " in render._plain(x))
-        self.assertIn("1 작업 중", pulse)
-        self.assertIn("◌ 1 미사용", pulse)
-        self.assertIn("↳ 4 작업(4 실행)", pulse)
+        self.assertIn("1 working", pulse)
+        self.assertIn("◌ 1 unused", pulse)
+        self.assertRegex(pulse, r"↳ 4 jobs \(\S+ 4\)")
         self.assertLessEqual(render._dw(pulse), 59)
 
     def test_h1_observation_links_only_confirmed_caller_continuity(self):
@@ -225,7 +232,7 @@ class ReadingTest(unittest.TestCase):
                               registered_worker=True, cwd="/work/a", liveness="working")
         parent = Session(harness="claude", pid=1, cwd=support.cwd, session_id="s", liveness="working")
         text = "\n".join(render._plain(x) for x in render._build_lines([parent], [support], "both", False, 0, term_width=100))
-        self.assertIn("프로젝트 지원 작업", text)
+        self.assertIn("project 지원 작업", text)
 
     def test_h1_runner_publishes_caller_as_observation(self):
         item = dict(harness="codex", sid="caller-sid", cwd="/work/a", seat=dict(kind="pane", pane="wB:p3N"))

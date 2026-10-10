@@ -1571,9 +1571,9 @@ def _subject_title(entity):
     if _is_plugin_agent(entity):
         return title
     ts = getattr(entity, "title_ts", None)
-    if titles.current_text(entity, ts):
-        return "제목 · " + title
-    return "이전 제목 · " + title
+    if titles.previous_title(entity, ts):
+        return "이전 제목 · " + title
+    return title
 
 
 def _projection_stage_text(entity, max_width=24):
@@ -1590,7 +1590,7 @@ def _projection_stage_text(entity, max_width=24):
     suffix = ""
     if progress is not None:
         suffix = " %d/%d" % (progress.done, progress.total)
-    return _clip_w("단계 %s%s" % (_user_label(label), suffix), max_width)
+    return _clip_w('stage %s%s' % (_user_label(label), suffix), max_width)
 
 
 def _spec_phase_seq(entity):
@@ -1922,8 +1922,8 @@ def _unused_badge(s, compact=False):
     already carries elapsed time in its own time cell — so it yields first, and only when the
     name would otherwise be clipped."""
     if compact:
-        return " 미사용"
-    return " 미사용 %s" % fmt_min(s.elapsed_min if s.elapsed_min is not None else None)
+        return ' unused'
+    return ' unused %s' % fmt_min(s.elapsed_min if s.elapsed_min is not None else None)
 
 
 def _interaction_badge(s):
@@ -2092,7 +2092,7 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
         age_min = int((time.time() - s.mtime) / 60) if s.mtime else (s.elapsed_min or 0)
         segs += [("  ", None), ("done %s" % fmt_min(age_min), "dim")]
     if s.app_server:
-        segs.append(("  " + ("app-server" if _SHOW_ALL else "앱 연결"), "dim"))
+        segs.append(("  app-server", "dim"))
     if s.orphan:
         segs.append(("  worktree-gone", "g_dead"))
 
@@ -2778,8 +2778,8 @@ def _opts_segs(j, max_width=None):
         # Keep internal mode/profile/shape contracts in the existing all/JSON
         # detail surfaces. The normal row says what the worker is doing.
         action = _user_label(_entry_skill(j) or getattr(j, "key", None))
-        owner = _is_owner_mode_row(j) and action != "담당"
-        suffix = " 담당" if owner else ""
+        owner = _is_owner_mode_row(j) and action != "owner"
+        suffix = " owner" if owner else ""
         if max_width is not None:
             action = _clip_w(action, max(1, max_width - _dw(suffix)))
             if _dw(action + suffix) > max_width:
@@ -3160,7 +3160,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     if not _split:
         suffix.extend(br_segs)
     if s.app_server:
-        suffix.append(("  " + ("app-server" if _SHOW_ALL else "앱 연결"), "dim"))
+        suffix.append(("  app-server", "dim"))
     if s.orphan:
         suffix.append(("  worktree-gone", "g_dead"))
     name_txt = _display_session_subject(s)
@@ -3388,7 +3388,7 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     by the header helper contract §5.2 asks for, instead of two independently-drifting copies."""
     if loading:
         spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
-        return [("  fleet ", "head"), (spin, "g_spin"), (" 세션 확인 중…", "dim")]
+        return [("  fleet ", "head"), (spin, "g_spin"), (' session 확인 중…', "dim")]
     _real = [s for s in sessions if not s.app_server and not getattr(s, "mem_worker", False)]
     n_wk = sum(1 for s in _real if s.liveness == "working")
     n_id = sum(1 for s in _real if s.liveness == "idle")
@@ -3403,20 +3403,20 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     jw = sum(1 for j in listed_jobs if j.liveness == "working")
     spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
     pulse = [("  fleet ", "head"),
-             (spin + " %d" % n_wk, "g_spin"), (" 작업 중  ", "dim"),
-             ("● %d" % n_id, "g_work_off"), (" 대기  ", "dim")]
+             (spin + " %d" % n_wk, "g_spin"), (' working  ', "dim"),
+             ("● %d" % n_id, "g_work_off"), (' idle  ', "dim")]
     # F-26: only when there IS one — a healthy board stays quiet (F-12 contract).
     if n_un:
-        pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (" 미사용  ", "dim")]
+        pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (' unused  ', "dim")]
     if n_dt:
-        pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (" 분리됨  ", "dim")]
+        pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (' detached  ', "dim")]
     if _jobs_unconfirmed(observations):
-        pulse += [("↳ 작업 목록 미확인", "lvl_y")]
+        pulse += [('↳ jobs.log 미확인', "lvl_y")]
         if listed_jobs:
             pulse += [(" (마지막 관측 %d개)" % len(listed_jobs), "dim")]
     elif listed_jobs:
         pulse += [("↳ %d" % len(listed_jobs), "dim"),
-                  (" 작업(%d 실행)" % jw, "dim")]
+                  (" jobs (", "dim"), (spin + " %d" % jw, "g_spin"), (")", "dim")]
     return pulse
 
 
@@ -3449,13 +3449,13 @@ def _mem_change_rows(events, sid_titles=None, limit=8, term_width=None):
     for event, count in _memory_event_groups(events)[:limit]:
         action = event.get("action")
         if action in ADDED_ACTIONS:
-            label, sign, color = "기억 저장", "+", "lvl_g"
+            label, sign, color = 'mem 저장', "+", "lvl_g"
         elif action in EXPIRED_ACTIONS or action in PRUNED_ACTIONS:
-            label, sign, color = "기억 정리", "−", "dim"
+            label, sign, color = 'mem 정리', "−", "dim"
         elif action == "decision-record":
-            label, sign, color = "기억 저장", "·", "dim"
+            label, sign, color = 'mem 저장', "·", "dim"
         else:
-            label, sign, color = "기억 변경", "·", "dim"
+            label, sign, color = 'mem 변경', "·", "dim"
         origin = event.get("cwd") or event.get("project")
         if not origin:
             origin = "공통" if event.get("scope") == "global" else "출처 미확인"
@@ -3511,18 +3511,18 @@ def _diagnostic_rows(diagnostics, malformed=0, term_width=None):
         rows.append([("  jobs.log · 형식이 잘못된 행 %d개 제외" % malformed, "dim")])
     labels = {
         "missing-registry": "과거 참조 파일 없음",
-        "malformed-registry": "기록 파일 형식 오류",
-        "malformed-run": "실행 기록 형식 오류",
-        "malformed-index": "색인 형식 오류",
-        "resource-row-projection": "실행 정보 표시 미확인",
+        "malformed-registry": 'registry 형식 오류',
+        "malformed-run": 'run 기록 형식 오류',
+        "malformed-index": 'index 형식 오류',
+        "resource-row-projection": 'resource 표시 미확인',
     }
     for diagnostic in diagnostics or []:
         past = diagnostic.get("kind") == "missing-registry" and diagnostic.get("blocking") is False
         if past and not _SHOW_ALL:
             continue
-        label = labels.get(diagnostic.get("kind"), "리소스 관측 미확인")
-        prefix = "  리소스 기록 · " + label if past else "  리소스 관측 미확인"
-        if not past and label != "리소스 관측 미확인":
+        label = labels.get(diagnostic.get("kind"), 'resource 관측 미확인')
+        prefix = '  resource · ' + label if past else '  resource 관측 미확인'
+        if not past and label != 'resource 관측 미확인':
             prefix += " · " + label
         source = str(diagnostic.get("path") or diagnostic.get("run_id") or "")
         if source:
@@ -3615,7 +3615,7 @@ def _group_last_result(sessions, jobs, resources):
     for child in children:
         if (child.liveness in ("exited", "dead") and type(child.exit_code) is int
                 and isinstance(child.ended_at, (int, float)) and not isinstance(child.ended_at, bool)):
-            candidates.append({"name": "자원 " + _resource_name(child),
+            candidates.append({"name": 'resource ' + _resource_name(child),
                                "result": "failure" if child.exit_code else "success",
                                "at": child.ended_at, "source": "resource-exit"})
     return max((value for value in candidates if isinstance(value, dict)
@@ -4189,10 +4189,10 @@ def _peer_obligation_strip(obligations=None, term_width=None, depth=0, in_card=F
             counts[kind] = counts.get(kind, 0) + 1
     if not counts:
         return []
-    labels = (("message", "메시지"), ("delay", "예약"),
-              ("retire", "정리"), ("watch", "관찰"))
+    labels = (("message", "msg"), ("delay", "delay"),
+              ("retire", "retire"), ("watch", "watch"))
     parts = [f"{label} {counts[kind]}" for kind, label in labels if counts.get(kind)]
-    segs = [(_conn_indent(depth, in_card), None), ("↻ 대기 ", "lvl_y")]
+    segs = [(_conn_indent(depth, in_card), None), ("↻ pending ", "lvl_y")]
     for index, part in enumerate(parts):
         if index:
             segs.append((" · ", "dim"))
@@ -4981,11 +4981,8 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         # A basic observation is real state, but missing detail is not an idle
         # verdict or an empty NOW. Never invent a command/model turn here.
         now_text = "확인 중"
-    if previous_summary and resource_now is None and not now_text:
-        now_text = {"working": "작업 중", "idle": "대기", "detached": "분리됨"}.get(
-            getattr(entity, "liveness", None), "상태 미확인")
     if previous_summary and resource_now is None:
-        now_text += " · " + previous_summary
+        now_text = " · ".join(part for part in (now_text, previous_summary) if part)
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
@@ -5010,13 +5007,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     if main_detail and not degrade:
         # MAIN, OWNER and FRAME gauges share the fixed model-column anchor;
         # the WHERE word sits at the shared detail inset, without moving NOW.
-        segs = _pad_to_column(segs, 4 + _HW - _dw("문맥"))
-    # Use the existing main-row padding so naming context does not move its
-    # measured track or NOW anchor. At very small widths the legend names it.
-    if main_detail and not degrade:
-        segs.append(("문맥", "dim"))
-    elif not degrade and getattr(entity, "herdr_attached", None) is None:
-        segs[1] = ("문맥" + " " * (_CTX_LABEL_W - _dw("문맥")), "dim")
+        segs = _pad_to_column(segs, 4 + _HW)
     segs.extend(_gauge_segs(shown_pct, gauge_width, track=track))
     if shown_pct is None:
         value_text = "—"
@@ -6339,7 +6330,7 @@ def _route_card_l1(tag_bits, rid, done, total, route_elapsed, any_failed, arrow,
     def build(tags, show_elapsed, show_failed):
         segs = [("  " + arrow + " ", "dim"), ("[%s] " % "·".join(tags), "name_dim"),
                 (rid, "lvl_r" if any_failed else "dim"),
-                (" — %d/%d 단계" % (done, total), "dim")]
+                (' — %d/%d stages' % (done, total), "dim")]
         if show_elapsed and route_elapsed is not None:
             # prd.md:307 wrote this as "<n/m nodes> ⏳<경과>", and the v10 critic's worry
             # was that a bare "  15m" reads as a stray number glued onto "n/m nodes".
@@ -6348,7 +6339,7 @@ def _route_card_l1(tag_bits, rid, done, total, route_elapsed, any_failed, arrow,
             # and `fmt_min`'s spaced units ("5h 20m") are what mark it as a duration.
             segs += [("  " + _ELAPSED_GLYPH, "dim"), (fmt_min(route_elapsed), "dim")]
         if show_failed and any_failed:
-            segs.append((" ⚠ 실패 단계", "lvl_r"))
+            segs.append((' ⚠ stage 실패', "lvl_r"))
         return segs
 
     ladder = [tag_bits]
@@ -6552,10 +6543,10 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
         fixed_w = _dw("  " + arrow + " ") + _dw("[%s] " % tag) + _dw(" — no route record")
         slug = _clip_w(slug, max(4, term_width - fixed_w))
     pending = getattr(job, "_details_pending", False)
-    label = " — 작업 연결 확인 중" if pending else " — 작업 연결 미확인"
+    label = ' — route 연결 확인 중' if pending else ' — route 연결 미확인'
     if job.registered_worker and job.worker_type == "support":
         tag = _user_project(job.caller_cwd or job.cwd)
-        label = " — 프로젝트 지원 작업"
+        label = ' — project 지원 작업'
     l1 = [("  " + arrow + " ", "dim"), ("[%s] " % tag, "name_dim"),
           (slug, "dim"), (label, "dim")]
     out = [l1]
@@ -6609,7 +6600,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if compute_rows:
         lines.append([(_HFILL, None)])
     lines.append(None)
-    lines.append([("  작업 보기", "head"), (_RFLUSH, None), ("p 프로젝트 보기  ", "head")])
+    lines.append([('  PROCESS VIEW', "head"), (_RFLUSH, None), ('p group view  ', "head")])
 
     session_by_identity = {(s.pid, getattr(s, "proc_start", None)): s
                            for s in sessions if s.pid is not None and s.proc_start is not None}
@@ -6678,7 +6669,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
             and not _orphan_resource_groups(resources, ())):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
-        message = ("  세션 확인 중…" if loading else "  작업 목록 미확인"
+        message = ('  session 확인 중…' if loading else '  jobs.log 미확인'
                    if _jobs_unconfirmed(observations) else "  관측된 실행 작업 없음")
         lines.append([(message, "dim")])
         lines.extend(_reading_legend(term_width))
@@ -7241,8 +7232,7 @@ def _observation_lines(observations, term_width=None):
     for source, health in (observations or {}).items():
         if health.get("state") not in ("failed", "stalled"):
             continue
-        name = {"jobs": "작업", "herdr": "pane 연결", "governor": "실행 용량",
-                "compute hosts": "연산 장치"}.get(source, source)
+        name = "jobs.log" if source == "jobs" else source
         age = health.get("age")
         if health.get("last_success_at") is not None:
             age = time.monotonic() - health["last_success_at"]
@@ -8036,7 +8026,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             if getattr(lj, "worker_type", None) == "support":
                 lines.append(None)
                 caller = (" · 호출 " + lj.caller_pane) if lj.caller_pane else ""
-                lines.append([("  프로젝트 지원 작업" + caller, "dim")])
+                lines.append([('  project 지원 작업' + caller, "dim")])
             _emit_dispatch_tree(lj, orphan=False)
         # F-80 L2c: a grace-held edge stays a standalone tree row in the SAME group, no
         # `(orphan)` marker, no divider — nesting under the parent is unavailable because
@@ -8097,9 +8087,9 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                       (names[:90] + ("…" if len(names) > 90 else ""), "dim")])
 
     if not order:
-        message = ("  세션 확인 중…" if loading else "  작업 목록 미확인"
+        message = ('  session 확인 중…' if loading else '  jobs.log 미확인'
                    if _jobs_unconfirmed(observations) else
-                   "  관측된 세션·작업 없음")
+                   '  관측된 session·job 없음')
         lines.append([(message, "dim")])
 
     diagnostic_rows = _diagnostic_rows(resource_diagnostics, malformed, term_width)
@@ -8112,46 +8102,46 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     # when this build actually used them (_seen_glyphs, tracked above — local, not global).
     lines.append(None)
     legend = [
-        ("  세션: ", None), ("⠹", "g_spin"), (" 작업 중   ", "dim"),
-        ("●", "g_work_off"), (" 대기   ", "dim"),
+        ('  session: ', None), ("⠹", "g_spin"), (' working   ', "dim"),
+        ("●", "g_work_off"), (' idle   ', "dim"),
     ]
     if "unused" in _seen_glyphs:
-        legend += [(_LIVE_GLYPH["unused"], "g_unused"), (" 미사용   ", "dim")]
+        legend += [(_LIVE_GLYPH["unused"], "g_unused"), (' unused   ', "dim")]
     if "detached" in _seen_glyphs:
-        legend += [(_DETACHED_GLYPH, "g_work_off"), (" 분리됨   ", "dim")]
+        legend += [(_DETACHED_GLYPH, "g_work_off"), (' detached   ', "dim")]
     if "stale" in _seen_glyphs:
         legend += [("·", "g_stale"), (" 오래된 관측   ", "dim")]
     if "dead" in _seen_glyphs:
         legend += [("✕", "g_dead"), (" 종료   ", "dim")]
     if "degraded" in _seen_glyphs:
-        legend += [("◐", "lvl_y"), (" 단계 관측 불완전   ", "dim")]
+        legend += [("◐", "lvl_y"), (' stage 관측 불완전   ', "dim")]
     if "recovering" in _seen_glyphs:
         legend += [("…", "lvl_y"), (" 복구 대기   ", "dim")]
     if "blocked" in _seen_glyphs:
         legend += [("◑", "g_blocked"), (" 입력 대기   ", "dim")]
     if "tag" in _seen_glyphs:
-        legend += [("[", "dim"), ("번호", "tag"), ("]", "dim"), (" 세션   ", "dim")]  # F-100a
+        legend += [("[", "dim"), ('id', "tag"), ("]", "dim"), (' session   ', "dim")]  # F-100a
     if "steward" in _seen_glyphs:
-        legend += [("[", "dim"), ("번호", "tag_steward"), ("]", "dim"), (" 감독   ", "dim")]  # F-100c
+        legend += [("[", "dim"), ('id', "tag_steward"), ("]", "dim"), (' steward   ', "dim")]  # F-100c
     if "herdr" in _seen_glyphs:
-        legend += [(_CTX_ON_TEXT, "herdr_on"), (" 좌석   ", "dim")]                  # F-100b
+        legend += [(_CTX_ON_TEXT, "herdr_on"), (' pane   ', "dim")]                  # F-100b
     if "tty" in _seen_glyphs:
-        legend += [(_CTX_OFF_TEXT, "dim"), (" 일반 터미널   ", "dim")]
+        legend += [(_CTX_OFF_TEXT, "dim"), (' plain terminal   ', "dim")]
     if "child" in _seen_glyphs:
-        legend += [("▾N", "dim"), (" 하위 작업   ", "dim")]
+        legend += [("▾N", "dim"), (' child jobs   ', "dim")]
     if "subagent" in _seen_glyphs:
-        legend += [(_ICON_SUBAGENT, "dim"), (" 도우미   ", "dim")]
+        legend += [(_ICON_SUBAGENT, "dim"), (' sub-agent   ', "dim")]
     if any(not _is_plugin_agent(job) for job in jobs):
-        legend += [("↳", "dim"), (" 위임   ", "dim")]
+        legend += [("↳", "dim"), (' dispatch   ', "dim")]
     if "wt" in _seen_glyphs:
-        legend += [("🚧 N", "dim"), (" 작업공간   ", "dim")]
+        legend += [("🚧 N", "dim"), (' worktrees   ', "dim")]
     if n_mem_total or "mem" in _seen_glyphs:
         # Always expose the board-wide memory total in the legend, even when memory-only groups fold.
-        legend += [("🧠 %d" % n_mem_total, "dim"), (" 기억   ", "dim")]
+        legend += [("🧠 %d" % n_mem_total, "dim"), (' mem   ', "dim")]
     if "loc_foreign" in _seen_glyphs:
-        legend += [("→", "loc_repo"), (" 다른 저장소   ", "dim")]
+        legend += [("→", "loc_repo"), (' foreign repo   ', "dim")]
     if "loc_wt" in _seen_glyphs:
-        legend += [("⌂wt", "loc_repo"), (" 연결 작업공간   ", "dim")]
+        legend += [("⌂wt", "loc_repo"), (' worktree   ', "dim")]
     # F-9(d) `~ derived/inherited value` retired with the marker itself (user 2026-07-16:
     # inherited effort now shows plain — the tilde read as noise).
     lines.extend(_wrap_legend(legend, term_width))
@@ -8163,10 +8153,10 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
 def _reading_legend(term_width, session=True):
     rows = []
     if session:
-        rows.extend(_wrap_legend([("  세션: ", "dim"), ("⠹ 작업 중  ● 대기  ◑ 입력 대기  ✕ 종료", "dim")], term_width))
-    for text in ("  프로젝트: ● 활동",
-                 "  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량 · ↳ 전체 명령",
-                 "  단계: ● 현재  ✓ 완료  ✕ 실패  ○ 예정 · 문맥 %는 대화 사용량"):
+        rows.extend(_wrap_legend([('  session: ', "dim"), ('⠹ working  ● idle  ◑ blocked  ✕ dead', "dim")], term_width))
+    for text in ('  project: ● 활동',
+                 '  resource: ● 실행 · UTIL/VRAM · ↳ command',
+                 "  stage: ● 현재  ✓ 완료  ✕ 실패  ○ 예정"):
         rows.extend(_wrap_route_node("", text, "dim", "", term_width, continuation="  "))
     return rows
 
@@ -9024,10 +9014,12 @@ _PROCESS_HINT_MIN_WIDTH = 80  # F-30 (v10) — the base footer is already tight 
 def _footer_segs(select_mode, parts, width=None):
     """Fit every keyboard control before optional layout/mouse/runtime detail."""
     if select_mode:
-        keys = [("↑↓/jk", "이동"), ("x", "종료"), ("Esc", "취소"), ("q", "닫기")]
+        keys = [("↑↓/jk", "move"), ("x", "kill"), ("Esc", "cancel"), ("q", "quit")]
     else:
-        keys = [("q", "닫기"), ("r", "갱신"), ("a", "전체"), ("c", "명령"),
-                ("w", "폭"), ("p", "보기"), ("jk", "이동"), ("s", "선택"), ("g/G", "끝")]
+        wlbl = "wide/narrow/stack" if _LAYOUT == "auto" else "%s!" % _LAYOUT
+        keys = [("q", "quit"), ("r", "refresh"), ("a", "all"), ("c", "GPU cmd"),
+                ("w", wlbl), ("p", "group" if _PROCESS_VIEW else "process"),
+                ("jk", "scroll"), ("s", "select"), ("g/G", "top/end")]
     budget = max(1, width - 1) if width else 200
     def build(labels=True):
         segs = [(" ", "hdr_bar")]
@@ -9036,12 +9028,12 @@ def _footer_segs(select_mode, parts, width=None):
                 segs.append((" ", "hdr_bar"))
             segs.append((key, "hdr_key"))
             if labels:
-                segs.append((":" + meaning, "hdr_bar"))
+                segs.append((" " + meaning, "hdr_bar"))
         return segs
     segs = build()
     if sum(_dw(t) for t, _k in segs) > budget:
         segs = build(False)
-    for extra in (["클릭 선택"] if width and width >= _MOUSE_HINT_MIN_WIDTH else []) + list(parts):
+    for extra in (["click row"] if width and width >= _MOUSE_HINT_MIN_WIDTH else []) + list(parts):
         text = " · " + str(extra)
         if sum(_dw(t) for t, _k in segs) + _dw(text) <= budget:
             segs.append((text, "hdr_bar"))

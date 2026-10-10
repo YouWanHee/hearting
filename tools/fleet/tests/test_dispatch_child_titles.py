@@ -298,7 +298,8 @@ class DispatchRowTitleTest(unittest.TestCase):
                           harness="claude", is_child=True, liveness="working",
                           title="Fix tests")
         text = _row_text(job)
-        self.assertIn("이전 제목 · Fix tests", text)
+        self.assertIn("Fix tests", text)
+        self.assertNotIn("제목 ·", text)
         self.assertNotIn("fix-x", text.split("⎇")[0] if "⎇" in text else text)
 
     def test_wide_row_falls_back_to_the_slug_without_a_title(self):
@@ -325,7 +326,8 @@ class DispatchRowTitleTest(unittest.TestCase):
                           title="Card")
         l1, l2 = render._dispatch_row_2line(job)
         text = "".join(part for part, _key in l1 + l2)
-        self.assertIn("이전 제목 · Card", text)
+        self.assertIn("Card", text)
+        self.assertNotIn("제목 ·", text)
 
 
 if __name__ == "__main__":

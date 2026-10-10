@@ -160,9 +160,9 @@ class StewardChipTest(unittest.TestCase):
             base.update(over)
             lines = render._build_lines([Session(**base)], [], "fleet", False, 0,
                                         layout="wide", term_width=168)
-            return "\n".join(_text(ln) for ln in lines if ln and any("세션: " in part for part, _key in ln))
-        self.assertNotIn("감독", legend(session_tag="46"))
-        self.assertIn("감독", legend(session_tag="46", steward=True))
+            return "\n".join(_text(ln) for ln in lines if ln and any("session: " in part for part, _key in ln))
+        self.assertNotIn("steward", legend(session_tag="46"))
+        self.assertIn("steward", legend(session_tag="46", steward=True))
 
 
 class StewardOrderTest(unittest.TestCase):

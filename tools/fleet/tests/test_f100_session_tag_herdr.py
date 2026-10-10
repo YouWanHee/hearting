@@ -150,15 +150,15 @@ class LegendTest(unittest.TestCase):
         base.update(over)
         lines = render._build_lines([Session(**base)], [], "fleet", False, 0,
                                     layout="wide", term_width=168)
-        return "\n".join(_text(ln) for ln in lines if ln and any("세션: " in part for part, _key in ln))
+        return "\n".join(_text(ln) for ln in lines if ln and any("session: " in part for part, _key in ln))
 
     def test_entries_appear_only_when_seen(self):
         plain = self._legend()
-        self.assertNotIn("[번호]", plain)
+        self.assertNotIn("[id]", plain)
         self.assertNotIn("herdr", plain)
         self.assertNotIn("tty", plain)
-        self.assertIn("[번호]", self._legend(session_tag="46"))
-        self.assertIn("herdr 좌석", self._legend(herdr_attached=True))
+        self.assertIn("[id]", self._legend(session_tag="46"))
+        self.assertIn("herdr pane", self._legend(herdr_attached=True))
         self.assertIn("tty", self._legend(herdr_attached=False))
 
 
