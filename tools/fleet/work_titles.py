@@ -97,11 +97,14 @@ def cycle_title(root, record, read_json):
     recorded = _text(record.get('title'), 120)
     if recorded in (record.get('slug'), record.get('locator')):
         recorded = ''
+    campaign_recorded = _text(campaign_record.get('title'), 120)
+    if campaign_recorded in (campaign_record.get('slug'), campaign_record.get('locator')):
+        campaign_recorded = ''
     return next((value for value in (
         _text(cycle.get('title'), 120), _text(cycle.get('summary')), declarations.get('cycle_id'),
         recorded, _text(campaign.get('title'), 120), _text(campaign.get('summary')),
         declarations.get('campaign_id'),
-        _text(campaign_record.get('title'), 120),
+        campaign_recorded,
         readable(record.get('slug') or record.get('title'))) if value), '')
 
 

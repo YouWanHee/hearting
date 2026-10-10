@@ -173,6 +173,16 @@ class WorkTitlesTest(unittest.TestCase):
             dict(present=True, match=True, terminal_gate_proven=True, closed_at='2026-10-10T00:00:00Z'))
         self.assertEqual(result['name'], 'fleet freshness p2')
 
+    def test_automatically_recorded_campaign_title_uses_cleaned_cycle_name(self):
+        self.meta_path.unlink()
+        campaign_path = self.meta_path.with_name('campaign.json')
+        campaign = json.loads(campaign_path.read_text())
+        campaign.update(title='2026-10-10_fleet-freshness-p2-1010',
+                        slug='2026-10-10_fleet-freshness-p2-1010')
+        campaign_path.write_text(json.dumps(campaign))
+        dispatch._campaign_labels([job := self.job()])
+        self.assertEqual(job.campaign_label, 'fleet freshness p2')
+
     def test_invalid_or_foreign_cycle_declaration_is_ignored(self):
         self.meta_path.unlink()
         identity = self.root / '.runtime/artifact-admission/v1/root-identity.json'
