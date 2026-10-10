@@ -173,6 +173,7 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
+    harness_source_read_roots,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,

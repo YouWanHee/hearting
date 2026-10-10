@@ -1255,6 +1255,7 @@ def contract_read_roots(agent_home: str | Path, route: dict | None = None) -> tu
     retains. A moving current pointer never replaces the route's contract
     source. These are read addresses, not additional task write grants.
     """
+    from execution_access import harness_source_read_roots
     homes = [Path(agent_home)]
     sealed = (route or {}).get("launch_compatibility_tuple") or {}
     identity = sealed.get("launch_home") if isinstance(sealed, dict) else None
@@ -1263,8 +1264,7 @@ def contract_read_roots(agent_home: str | Path, route: dict | None = None) -> tu
         homes.append(Path(value))
     roots = []
     for home in homes:
-        root = home / "capabilities"
-        roots.extend((root, root.resolve(strict=False)))
+        roots.extend(harness_source_read_roots(home))
     return tuple(dict.fromkeys(roots))
 
 

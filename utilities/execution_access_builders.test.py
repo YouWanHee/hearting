@@ -487,9 +487,13 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             self.assertEqual("deny", config["permission"]["edit"][f"{relative}/**"])
         self.assertEqual("ask", config["permission"]["edit"]["*"])
         self.assertEqual("deny", config["permission"]["edit"]["/keep/**"])
-        for directory in (alias, install, install / "core", install / "roles", install / "skills"):
+        for directory in (alias, install, install / "skills"):
             self.assertNotIn(str(directory), rules)
             self.assertNotIn(f"{directory}/**", rules)
+        for name in ("core", "utilities", "roles", "hooks", "tools"):
+            for directory in (alias / name, install / name):
+                self.assertEqual("allow", rules[str(directory)])
+                self.assertEqual("deny", config["permission"]["edit"][str(directory)])
         # A string/global deny remains the default for every other edit.
         with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": '{"permission":"deny"}'}):
             denied = json.loads(self.opencode.scoped_external_directory_config(

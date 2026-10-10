@@ -1179,5 +1179,82 @@ class DerivedAccessTest(unittest.TestCase):
             ("/h/보고서_v2초안", "read", "task"), ("/i/j", "read", "task")})
 
 
+    def inventory(self, roots):
+        path = self.home / ".local/share/reader/app-v1/ops/roots.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"roots": [{"artifact_root_path": str(p)} for p in roots],
+                                    "writable_roots": [str(self.elsewhere)]}), encoding="utf-8")
+        return path
+
+    def test_audit_inventory_reaches_every_root_without_writes(self):
+        roots = [self.other / f"project-{i}" / ".agent_reports" for i in range(20)]
+        for root in roots:
+            root.mkdir(parents=True)
+        missing = self.other / "missing" / ".agent_reports"
+        inventory = self.inventory([*roots, missing, self.home / ".ssh"])
+        route = self.route(f"입력: {inventory} 의 roots 전수 읽기", capability="audit")
+        path = prepare_task_request(route, self.jobs)
+        request, binding = self.prepared(path)
+        self.assertEqual(request["writable_roots"], [])
+        self.assertEqual(set(request["read_roots"]), {str(p) for p in (*roots, inventory.parent)})
+        self.assertEqual({r["reason"] for r in binding["derivation"]["skipped"]}, {"missing", "sensitive"})
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=self.root / "install")
+        loaded = load_request(path, context=context)
+        for runtime in ("codex-exec", "claude-cli", "opencode"):
+            grant = build_grant(loaded, runtime=runtime, default_writable_roots=(self.worktree,))
+            self.assertEqual(grant.unwritable_read_roots, loaded.read_roots)
+            self.assertEqual(grant.additional_writable_roots, ())
+
+    def test_inventory_exclusions_and_indirect_credentials_stay_out(self):
+        inventory = self.inventory([self.other, self.elsewhere])
+        excluded = self.route(f"Scope: {inventory} excluded\n입력: {inventory}")
+        self.assertIsNone(prepare_task_request(excluded, self.jobs))
+        link = self.other / "key-dir"
+        link.symlink_to(self.home / ".ssh", target_is_directory=True)
+        inventory = self.inventory([link, self.elsewhere])
+        request = self.prepared(prepare_task_request(self.route(f"입력: {inventory}"), self.jobs))[0]
+        self.assertNotIn(str(link), request["read_roots"])
+        self.assertNotIn(str(self.home / ".ssh"), request["read_roots"])
+        self.assertNotIn(str(self.elsewhere), request["writable_roots"])
+
+    def test_upgrade_adds_only_reads_and_keeps_old_request_and_later_snapshot(self):
+        inventory = self.inventory([self.elsewhere])
+        later_write = self.other / "future-output"
+        route = self.route(f"Scope: {self.other}/out write, {later_write} write\n입력: {inventory}")
+        with mock.patch.object(EA, "_root_inventory", return_value=()):
+            old = prepare_task_request(route, self.jobs)
+        binding = old.with_name("binding.json")
+        record = json.loads(binding.read_text())
+        record.pop("read_inputs_version")
+        binding.write_text(json.dumps(record))
+        before = old.read_bytes()
+        later_write.mkdir()
+        prepared = prepare_task_request(route, self.jobs)
+        self.assertNotEqual(prepared, old)
+        self.assertEqual(old.read_bytes(), before)
+        request = self.prepared(prepared)[0]
+        self.assertEqual(request["writable_roots"], [str(self.other / "out")])
+        self.assertIn(str(self.elsewhere), request["read_roots"])
+        self.assertNotIn(str(later_write), request["writable_roots"])
+        self.inventory([self.other / "data"])
+        self.assertEqual(prepare_task_request(route, self.jobs), prepared)
+        self.assertEqual(self.prepared(prepared)[0], request)
+
+    def test_source_contracts_read_without_runtime_state_or_write_derivation(self):
+        install = self.home / ".local/share/hearting/releases/v-test"
+        for name in ("utilities", "core", ".dispatch"):
+            (install / name).mkdir(parents=True)
+            (install / name / "source.py").write_text("pass\n")
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=install)
+        route = self.route(f"입력: {install}/utilities/source.py {install}/core/source.py {install}/.dispatch/source.py")
+        reads = EA.derive_task_access(route, context)
+        self.assertEqual(set(reads.read_roots), {install / "utilities", install / "core"})
+        self.assertEqual(reads.writable_roots, ())
+        writes = EA.derive_task_access(self.route(f"Scope: {install}/utilities write"), context)
+        self.assertEqual(writes.writable_roots, ())
+
+
 if __name__ == "__main__":
     unittest.main()
