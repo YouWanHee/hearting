@@ -281,15 +281,25 @@ def project_key_for(cwd) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class Seat:
-    kind: str            # "pane" | "project"
+    kind: str            # "pane" | "native" | "project"
     key: str             # hash used in file names
     pane: str = ""
     harness: str = ""
     project_key: str = ""
+    native: Optional[dict] = None
 
     def as_dict(self) -> dict:
-        return {"kind": self.kind, "key": self.key, "pane": self.pane,
-                "harness": self.harness, "project_key": self.project_key}
+        result = {"kind": self.kind, "key": self.key, "pane": self.pane,
+                  "harness": self.harness, "project_key": self.project_key}
+        if self.native is not None:
+            result["native"] = self.native
+        return result
+
+
+def seat_from_dict(data: dict) -> Seat:
+    return Seat(str(data.get("kind") or ""), str(data.get("key") or ""),
+                str(data.get("pane") or ""), str(data.get("harness") or ""),
+                str(data.get("project_key") or ""), data.get("native"))
 
 
 def seat_for_project(harness: str, project_key: str) -> Seat:
@@ -429,6 +439,11 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     pane = verified_pane(pane, harness, sid, executable=_herdr_executable())
     if pane:
         return Seat("pane", _digest("pane", pane), pane, harness or "", "")
+    from session_tidy_native import caller_target
+    native = caller_target(harness, env)
+    if native:
+        return Seat("native", _digest("native", harness, native["home"], native["job"], native["start"]),
+                    harness=harness or "", native=native)
     return seat_for_project(harness or "unknown", project_key_for(cwd))
 
 
@@ -830,7 +845,7 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
             continue
         replaced = bool(me) and me["first_seen"] > theirs["last_seen"]
         stale = now - theirs["last_seen"] > AUTHOR_STALE_SEC
-        if replaced and (seat.kind == "pane" or stale):
+        if replaced and (seat.kind in ("pane", "native") or stale):
             out.append(item)
     return out
 
@@ -905,14 +920,14 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                            cwd=cwd, now=now, bump_epoch=compacting)
         if event == "compact":
             return ""
-        if event == "start" and seat.kind == "pane":
+        if event == "start" and seat.kind in ("pane", "native"):
             with contextlib.suppress(BaseException):    # a hook never fails for the clear note
                 import session_tidy_clear
                 session_tidy_clear.note_start_locked(seat, harness, sid, now)
         # The one place a same-seat handover (A -> B) is recorded: B's confirmed start/first prompt.
         handed = None
         handover = None
-        if seat.kind == "pane" and event in ("start", "prompt"):
+        if seat.kind in ("pane", "native") and event in ("start", "prompt"):
             with contextlib.suppress(BaseException):    # a hook never fails for the handover
                 import dispatch_seat_handover as handover
                 handed = handover.record_locked(seat, harness, sid, event, source, now)
@@ -1024,10 +1039,20 @@ def _guess_seat_from_ledgers(cwd: str) -> tuple[Optional[Seat], Optional[dict]]:
 def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     """(seat, harness, session id) of the calling session; ids come from the arguments,
     the harness variables, then the seat ledger, and as a last resort a fresh ``unknown-`` id."""
+    explicit_sid = bool(sid)
     if not sid:
         harness, sid = session_from_env(harness)
     detected = harness or session_from_env(None)[0]
     seat = resolve_seat(detected, cwd, sid=sid)
+    if seat.native:
+        # The inherited Claude session variable can still name the previous
+        # conversation after /clear. This exact process declares the current id.
+        from session_tidy_native import live
+        record = live(seat.native)
+        if explicit_sid and (not record or record["sessionId"] != sid):
+            return None
+        if record and not explicit_sid:
+            sid = record["sessionId"]
     if not sid or not harness:
         ledger_row = latest_session(seat, harness)
         if ledger_row is None and seat.kind == "project" and not detected:

@@ -27,6 +27,18 @@ Clearing and continuing are part of the default flow. Inside herdr, `enqueue` al
 
 Running work follows the window. `enqueue` also snapshots the registered depth-1 owner/frame attempts the tidying session answers for (the runtime reads them from the dispatch registry; a card's text grants nothing). When the next session at the same herdr pane starts through a confirmed clear (a `clear` start source or the clear booking's own observation; for OpenCode, its first message in a new session), `session_tidy.py hook` appends one handover row (old session → new session, with the bindings) to the seat ledger. From then on the new session may resume those attempts (`work_start`, replacement authority, the Claude wake re-arm, the interactive frame handback) and receives their pending completions (Claude/Codex prompt sweeps, the Codex queue target), while the registry row keeps its registered `parent_sid`, receipt, digest and gate identity and the pending records stay stored, claimed and acked under that registered parent. One direction (old → new), the same pane and harness only, never old → two sessions at once; a further clear hands over only through the new session's own next tidy. The card carries the verified route and the existing resume command in one line. Without a handover every call behaves as before. OpenCode direct owners still complete through the poll fallback: the new session can resume them, but there is no turn carrier for their completion.
 
+An inherited pane label never grants access to that pane's card or input. A
+runtime that provides an exact, live native session target may instead keep a
+separate seat for that target and clear it through its official attachment
+command in a private terminal. The booking binds the runtime process, start
+time and native job identity; clear and continue revalidate those bindings,
+the prompt count, card generation, idle state and empty input. A confirmed new
+conversation at that same target receives the card and existing work handover.
+Other adapters use this same evidence rule: without an implemented exact
+target transport they keep their checked pane path and manual fallback.
+Claude's messaging inbox carries text, not new-conversation commands; an inbox
+message containing `/clear` is never evidence that the conversation cleared.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 ## Portable Procedure
@@ -67,7 +79,7 @@ Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concre
 Adapters must preserve the portable invariants relevant to this capability:
 
 - state lives under `${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/` (directories 0700, files 0600), never in the artifact root. The one exception is the memory worker's exchange folder `<artifact root>/.runtime/session-tidy/<batch>/` (0700; the input copy, the prompt and the one `actions.json` it writes): its sandbox allows the artifact root the checked wrapper launches it with and not the state folder. The runner reads that file back without following a link, checks it, copies the checked result into state and deletes the folder (a failed batch keeps only the worker's answer until it is pruned); sandboxes and permissions are never widened for it;
-- pane input goes only through `utilities/peer-steward.py` (the clear is its `clear` command and the continue prompt its `continue` command, each typed at most once and never retried);
+- terminal input goes only through `utilities/peer-steward.py` (the clear is its `clear` command and the continue prompt its `continue` command, each typed at most once and never retried); a native attachment addresses the booked session itself and never types into an inherited pane;
 - the memory worker never calls a memory write command; only `mem tidy-apply` writes, and it never deletes.
 
 ## Adapter Realization

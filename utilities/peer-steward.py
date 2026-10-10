@@ -4554,6 +4554,31 @@ def _clear_observe(target, req, request_path, before_threads=()):
     return None
 
 
+def _native_tidy_command(args, req, *, continuing):
+    """Keep the exact-job transport under the same peer-steward judgement ledger."""
+    from session_tidy_native import command
+    action, word = ("continue", "continued") if continuing else ("clear", "cleared")
+    started = time.monotonic()
+    verdict = command(req, args.request, args.nonce, continuing=continuing, screen_ready=_screen_ready)
+    outcome = verdict[word]
+    harness, old = req.get("harness"), req.get("sid")
+    new = verdict.get("new_session") or req.get("new_session")
+    target = f"native:{req['seat']['native']['job']}"
+    receipt = (f"action={action} {word}={outcome} harness={harness} old_session={old} "
+               f"new_session={new or '-'} verify=native ms={int((time.monotonic() - started) * 1000)}"
+               + (f" reason={verdict['reason']}" if verdict.get("reason") else ""))
+    try:
+        _record(to_harness=harness, to_name=target, kind="notice",
+                summary_text=f"[notice] action={action} {outcome}",
+                to_session_id=new if continuing else old, to_pane=None, ref=[],
+                status=_CLEAR_LEDGER_STATUS[outcome], receipt=receipt,
+                from_identity=(old, harness, _project_of(req.get("cwd"))), from_name=_from_name(harness, old))
+    except Exception:
+        pass
+    print(" ".join(f"{key}={value}" for key, value in verdict.items() if value))
+    return _CLEAR_EXIT[outcome]
+
+
 def cmd_clear(args):
     """session-tidy auto-clear: type the harness's own new-conversation command into `target`.
 
@@ -4578,6 +4603,9 @@ def cmd_clear(args):
     `action=clear` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
+    req, why = clear.validate_request(args.request, args.nonce)
+    if req and (req.get("seat") or {}).get("kind") == "native":
+        return _native_tidy_command(args, req, continuing=False)
     if _herdr_missing():
         print("cleared=failed reason=herdr-not-found")
         return _CLEAR_EXIT["failed"]
@@ -4749,6 +4777,9 @@ def cmd_continue(args):
     5 unverified. One ledger row (`kind=notice`, `action=continue` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
+    req, why = clear.validate_continue(args.request, args.nonce)
+    if req and (req.get("seat") or {}).get("kind") == "native":
+        return _native_tidy_command(args, req, continuing=True)
     if _herdr_missing():
         print("continued=failed reason=herdr-not-found")
         return _CLEAR_EXIT["failed"]

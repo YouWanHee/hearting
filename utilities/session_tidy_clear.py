@@ -79,6 +79,10 @@ REASON_TEXT = {
     "card-not-delivered": "새 세션이 카드를 받지 못했습니다",
     "card-taken": "카드가 이미 다른 세션에 전달됐습니다",
     "new-session-unknown": "새 세션을 확인하지 못했습니다",
+    "native-attach-unavailable": "세션 전용 연결을 열지 못했습니다",
+    "not-idle-native": "세션이 입력 대기 상태가 아닙니다",
+    "partial-send": "명령 입력이 끝났는지 확인하지 못했습니다",
+    "arrival-not-observed": "명령이 도착했는지 확인하지 못했습니다",
 }
 # Continue skips the person caused (or chose) themselves: no result line for these.
 CONTINUE_QUIET = frozenset({"new-input", "draft", "card-changed", "handed-off", "no-card", "superseded", "off"})
@@ -207,7 +211,8 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
     if opt_out:
         cancel(seat)
         return "clear=off"
-    if seat.kind != "pane" or not seat.pane or harness not in CLEAR_COMMAND or herdr_command() is None:
+    native = seat.kind == "native" and seat.native and harness == "claude"
+    if not native and (seat.kind != "pane" or not seat.pane or harness not in CLEAR_COMMAND or herdr_command() is None):
         cancel(seat)
         return f"clear=manual hint={hint}"
     with st.seat_lock(seat.key):
@@ -223,8 +228,7 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
         _write_reservation({
             "schema": SCHEMA, "nonce": nonce, "status": "reserved", "created": now,
             "deadline": now + _tunable("CLEAR_DEADLINE", CLEAR_DEADLINE_SEC),
-            "seat": {"kind": seat.kind, "key": seat.key, "pane": seat.pane,
-                     "harness": seat.harness, "project_key": seat.project_key},
+            "seat": seat.as_dict(),
             "harness": harness, "sid": sid, "cwd": cwd,
             "card_generation": int(card["generation"]) if card else 0, "prompt_seq": seq,
             "continue_off": bool(no_continue)})
@@ -291,8 +295,7 @@ def _booking_at(path: Path):
         in_place = False
     if not re.fullmatch(r"[0-9a-f]{8,64}", key) or path.name != f"{key}.json" or not in_place:
         return None, None, "request-unreadable"
-    seat = st.Seat(str(seat_fields.get("kind") or ""), key, str(seat_fields.get("pane") or ""),
-                   str(seat_fields.get("harness") or ""), str(seat_fields.get("project_key") or ""))
+    seat = st.seat_from_dict(seat_fields)
     return req, seat, ""
 
 
@@ -469,8 +472,7 @@ def _continue_notice_text(outcome: str, reason: str) -> str:
 
 def _booked_seat(req: dict, seat_key: str) -> "st.Seat":
     fields = req.get("seat") or {}
-    return st.Seat(str(fields.get("kind") or ""), seat_key, str(fields.get("pane") or ""),
-                   str(fields.get("harness") or ""), str(fields.get("project_key") or ""))
+    return st.seat_from_dict({**fields, "key": seat_key})
 
 
 def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observed: str = "") -> bool:
@@ -559,7 +561,11 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
     remaining = float(req.get("deadline", 0)) - st.now_epoch()
     if remaining <= 0:
         return "skipped" if _finish(seat_key, nonce, "skipped", "expired") else "superseded"
-    state = wait(pane, int(remaining * 1000))
+    if (req.get("seat") or {}).get("kind") == "native":
+        from session_tidy_native import wait_idle
+        state = wait_idle(req["seat"].get("native"), req["sid"], int(remaining * 1000))
+    else:
+        state = wait(pane, int(remaining * 1000))
     if state not in ("idle", "done"):
         reason = "timeout" if state.startswith(("timeout", "state-")) else state
         return "skipped" if _finish(seat_key, nonce, "skipped", reason) else "superseded"
