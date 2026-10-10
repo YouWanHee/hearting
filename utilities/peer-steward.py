@@ -3807,7 +3807,8 @@ def receiver_idle(recipient, pane, *, peer=True):
     state, _pane = _agent_state(pane)
     if (current_harness, current_sid) != (harness, sid) or state not in {"idle", "done"}:
         return
-    readiness = _pane_readiness(pane, state, expected_harness=harness, expected_sid=sid)
+    readiness = _pane_readiness(pane, state, expected_harness=harness, expected_sid=sid,
+                                purpose="input")
     if readiness.state != "ready":
         return
     with contextlib.redirect_stdout(sys.stderr):

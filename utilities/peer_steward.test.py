@@ -3172,6 +3172,30 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
             peer_steward.cmd_ensure_obligations(SimpleNamespace())
             self.assertEqual(len(self.messages), 1)
 
+    def test_install_during_form_then_idle_delivers_with_old_runner_lock_held(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        meta = "attempt_id=att-child,parent_sid=sid-child,parent_harness=claude"
+        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
+        store = peer_steward.peer_obligations.ObligationStore()
+        store.root.mkdir(parents=True)
+        with (store.root / "runner.lock").open("w") as lock, \
+             mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                        ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.screen = CLAUDE_FORM
+            self.assertEqual(self.prompt("late original body"), 3)
+            ref = self._all_records()[-1]["transfer_ref"]
+            peer_steward.cmd_ensure_obligations(SimpleNamespace())
+            self.assertEqual(self.messages, [])
+            self.screen = CLAUDE_EMPTY
+            self.idle()
+            self.assertEqual(len(self.messages), 1)
+            self.assertIn(ref, self.messages[0])
+            self.assertIn("late original body", self.messages[0])
+            self.assertEqual(peer_steward.peer_message._read_pending(ref)["state"], "received")
+            self.idle()
+            self.assertEqual(len(self.messages), 1)
+
     def idle(self):
         # Run the actual existing receive callback entry, with native identity
         # isolated to this fixture. Its internal claims/acks are not mocked.
