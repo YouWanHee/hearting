@@ -223,4 +223,3 @@ def refresh(sessions):
                               if (agent.get("agent"), (agent.get("agent_session") or {}).get("value")) in assigned])
     except (OSError, ValueError, TypeError, ImportError):
         pass  # observation must not block any session or consumer
-
