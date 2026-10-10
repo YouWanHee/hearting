@@ -932,6 +932,55 @@ def claim(jobs: Path, aid: str) -> dict:
         return record
 
 
+def _approved_fix_answers(record, jobs, rows=None):
+    """Read the FAILs an approved claim already pinned, including owner-closed reviews.
+
+    Older claims omitted those reviews because their completion note masked the FAIL.
+    Their exact reuse snapshot still binds the historical marker and verdict; it can
+    restore an admissible target without editing the claim or adopting any later failed round.
+    """
+    proof = record.get('proof') or {}
+    answers = list(proof.get('answers') or [])
+    if (proof.get('death_kind') != CORRECTED or proof.get('source_result') != 'FAIL'
+            or not (record.get('reuse') or {}).get('completed')):
+        return answers
+    try:
+        rows = _rows(Path(jobs).read_text().splitlines()) if rows is None else rows
+        source = rows[record['original_attempt_id']][1]
+        _, route = _route(jobs, record['original_attempt_id'], source)
+        eligible, _ = route_authority.fix_answers(route, ['\t'.join(fields) for fields, _ in rows.values() if fields[1] not in ('open', 'running')], jobs)
+    except (OSError, ValueError, KeyError, DC.DispatchContractError):
+        # Supplemental historical targets cannot break an existing approved claim.
+        return answers
+    import review_round_cap
+    directory = DC._route_module().completion_dir(record['route_id'], jobs=jobs)
+    for pin in (record.get('reuse') or {}).get('completed') or []:
+        attempt = pin.get('attempt_id')
+        if not attempt or attempt in answers or attempt not in eligible:
+            continue
+        fields, meta = rows[attempt]
+        if (meta.get('route_id') != record['route_id']
+                or meta.get('route_hash') != record['route_hash']
+                or meta.get('route_node') != pin.get('node')
+                or meta.get('worker_type') != 'review'
+                or not review_round_cap.last_verdict_blocking([(fields[1], meta)], 'review')):
+            continue
+        for path in directory.glob(f"{pin['node']}*.json"):
+            try:
+                marker = _read(path)
+            except DC.DispatchContractError:
+                continue
+            if (marker and _digest(marker) == pin.get('marker_digest')
+                    and marker.get('route_id') == record['route_id']
+                    and marker.get('route_hash') == record['route_hash']
+                    and marker.get('node_id') == pin['node']
+                    and marker.get('attempt_id') == attempt
+                    and DC.owner_closure_shape(marker) == 'registered-review'):
+                answers.append(attempt)
+                break
+    return answers
+
+
 def answered_fix_revisions(jobs, route_id):
     """The approved fixes that answer a route's failed checks: one revision-like entry per
     claim that continued a FAIL-ended owner of this route with a person's answer, naming the
@@ -942,15 +991,26 @@ def answered_fix_revisions(jobs, route_id):
     except OSError:
         return []
     found = []
+    rows = None
     for path in paths:
         try:
             record = _read(path)
+            if record:
+                _check_record(record, record.get('family_id'))
         except DC.DispatchContractError:
             continue
         proof = (record or {}).get('proof') or {}
         if (record and record.get('route_id') == route_id and proof.get('death_kind') == CORRECTED
-                and proof.get('source_result') == 'FAIL' and proof.get('answers')):
-            found.append({'basis': 'user-direction', 'answers': list(proof['answers']),
+                and proof.get('source_result') == 'FAIL'):
+            if rows is None:
+                try:
+                    rows = _rows(Path(jobs).read_text().splitlines())
+                except (OSError, DC.DispatchContractError):
+                    rows = {}  # Keep the claim's original answers when enrichment is unavailable.
+            answers = _approved_fix_answers(record, jobs, rows)
+            if not answers:
+                continue
+            found.append({'basis': 'user-direction', 'answers': answers,
                           'corrections': [item.get('id') for item in proof.get('corrections') or []],
                           'family_id': record.get('family_id')})
     return found
@@ -1781,7 +1841,8 @@ def recovery_instructions(args):
         opening = f'The previous attempt {prior} never started (its launcher stopped before spawning); this starts the same work on the existing route {record["route_id"]}.\n'
     else:
         opening = f'You replace exact-dead attempt {prior} once, on the existing route {record["route_id"]}.\n'
-    check_fix = fix and bool(record['proof'].get('answers'))
+    answers = _approved_fix_answers(record, jobs) if fix else []
+    check_fix = fix and bool(answers)
     rerun = ('Rerun the stage that makes the approved fix and every check after it; reuse everything '
              'else. ' if check_fix else
              'Continue only unfinished work. Do not rerun completed nodes, successful siblings, or completed prefixes. ')
@@ -1793,7 +1854,7 @@ def recovery_instructions(args):
             'Preserve the original failure and report any second failure as needs-attention.\n')
     if check_fix:
         text += ('The failed checks this fix answers ('
-                 + ', '.join(record['proof']['answers']) +
+                 + ', '.join(answers) +
                  ') each get one more verdict round (closure-check) once the fix is in; there is no '
                  'further round after it.\n')
     # A replacement that never started showed its answers and gate to no model,

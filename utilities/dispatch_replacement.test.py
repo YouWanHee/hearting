@@ -1643,6 +1643,192 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual((budget.state, budget.round_kind), ('admit', 'closure-check'))
         self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), (['att-test-2'], []))
 
+    def test_approved_fix_retains_owner_closed_review_and_repairs_old_claim_read_only(self):
+        import route_authority as RA
+        import review_round_cap as CAP
+        self._failed_owner()
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        closed = {'attempt_schema_version': '2', 'attempt_id': 'att-review-2',
+                  'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                  'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                  'note': 'completed-marker', 'failure_class': 'fail',
+                  'review_gate_closure': 'owner-closure', 'review_independence': 'owner-overridden'}
+        self.write({**closed, 'attempt_id': 'att-review-1', 'note': 'completed-review-blocking'}, append=True)
+        self.write(closed, append=True)
+        marker = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'node_id': 'impl-review',
+                  'attempt_id': 'att-review-2', 'review_gate_closure': 'owner-closure',
+                  'review_independence': 'owner-overridden', 'sequence': 1}
+        directory = D._route_module().completion_dir('rt-test', jobs=self.jobs)
+        directory.mkdir(parents=True)
+        (directory/'impl-review.1.json').write_text(json.dumps(marker))
+        (directory/'impl-review.json').write_text(json.dumps({**marker, 'state': 'superseded-by-upstream-revision'}))
+        pin = {'node': 'impl-review', 'attempt_id': 'att-review-2', 'marker_digest': R._digest(marker)}
+        R._reuse_snapshot.return_value['completed'] = [pin]
+        self.assertTrue(self._answer(text='approved fix: both failed checks', request_id='fix-1')['retained'])
+        # v3.27.5 omitted this completed-marker FAIL; preserve its immutable claim as written.
+        with mock.patch.object(RA, 'fix_answers', return_value=(['att-test-2'], [])):
+            record = self.claim()
+        self.assertEqual(record['proof']['answers'], ['att-test-2'])
+        before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertEqual(revisions[0]['answers'], ['att-test-2', 'att-review-2'])
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs),
+                         (['att-test-2', 'att-review-2'], []))
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('att-review-2', text)
+        self.assertIn('closure-check', text)
+        self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+        rows = R._rows(self.jobs.read_text().splitlines())
+        census = [(fields[1], meta) for fields, meta in rows.values() if meta.get('route_node') == 'impl-review']
+        budget = CAP.round_budget(self.route, node, census, revisions=revisions)
+        self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds), ('admit', 'closure-check', 2))
+        # Neither a foreign review, an unbound snapshot nor a new failed round gets this approval.
+        foreign = {**rows, 'att-review-2': (rows['att-review-2'][0], {**closed, 'route_id': 'rt-other'})}
+        self.assertEqual(R._approved_fix_answers(record, self.jobs, foreign), ['att-test-2'])
+        unbound = {**record, 'reuse': {**record['reuse'], 'completed': [{**pin, 'marker_digest': '0'*64}]}}
+        self.assertEqual(R._approved_fix_answers(unbound, self.jobs, rows), ['att-test-2'])
+        self.write({**closed, 'attempt_id': 'att-review-3', 'note': 'completed-review-blocking'}, append=True)
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertNotIn('att-review-3', revisions[0]['answers'])
+        rows = R._rows(self.jobs.read_text().splitlines())
+        census = [(fields[1], meta) for fields, meta in rows.values() if meta.get('route_node') == 'impl-review']
+        self.assertEqual(CAP.round_budget(self.route, node, census, revisions=revisions).state, 'exhausted')
+
+    def test_new_approved_claim_answers_owner_closed_fail_on_all_harnesses(self):
+        for harness in ('claude', 'codex', 'opencode'):
+            with self.subTest(harness=harness):
+                self.tearDown_case()
+                self.meta['harness'] = harness
+                self._failed_owner()
+                self.route['nodes'].append({'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'})
+                for number in (1, 2):
+                    self.write({'attempt_schema_version': '2', 'attempt_id': f'att-review-{number}',
+                                'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                                'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                                'note': 'completed-marker', 'failure_class': 'fail',
+                                'review_gate_closure': 'owner-closure', 'review_independence': 'owner-overridden'},
+                               append=True)
+                self.assertTrue(self._answer(text='approved fix: both checks', request_id='fix-1')['retained'])
+                record = self.claim()
+                self.assertEqual(record['proof']['answers'], ['att-test-2', 'att-review-2'])
+
+    def _legacy_closed_review_claim(self, verdicts=2, test_fails=0):
+        import route_authority as RA
+        self._failed_owner(test_fails=test_fails)
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        closed = {'attempt_schema_version': '2', 'attempt_id': f'att-review-{verdicts}',
+                  'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                  'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                  'note': 'completed-marker', 'failure_class': 'fail',
+                  'review_gate_closure': 'owner-closure', 'review_independence': 'owner-overridden'}
+        for number in range(1, verdicts):
+            self.write({**closed, 'attempt_id': f'att-review-{number}',
+                        'note': 'completed-review-blocking'}, append=True)
+        self.write(closed, append=True)
+        marker = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'node_id': 'impl-review',
+                  'attempt_id': closed['attempt_id'], 'review_gate_closure': 'owner-closure',
+                  'review_independence': 'owner-overridden', 'sequence': 1}
+        directory = D._route_module().completion_dir('rt-test', jobs=self.jobs)
+        directory.mkdir(parents=True)
+        (directory/'impl-review.json').write_text(json.dumps(marker))
+        R._reuse_snapshot.return_value['completed'] = [{'node': 'impl-review',
+            'attempt_id': closed['attempt_id'], 'marker_digest': R._digest(marker)}]
+        self.assertTrue(self._answer(text='approved fix: unfinished report', request_id='fix-1')['retained'])
+        with mock.patch.object(RA, 'fix_answers', return_value=(
+                [f'att-test-{test_fails}'] if test_fails else [], [])):
+            record = self.claim()  # A v3.27.5 claim that omitted the owner-closed review.
+        return record, node
+
+    def test_owner_closed_spent_review_does_not_block_an_approved_infra_or_report_fix(self):
+        import route_authority as RA
+        import review_round_cap as CAP
+        self._failed_owner(test_fails=0)
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        for number in (1, 2, 3):
+            self.write({'attempt_schema_version': '2', 'attempt_id': f'att-review-{number}',
+                        'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                        'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                        'note': 'completed-marker' if number == 3 else 'completed-review-blocking',
+                        'failure_class': 'fail', 'review_gate_closure': 'owner-closure',
+                        'review_independence': 'owner-overridden'}, append=True)
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), ([], []))
+        self.assertTrue(self._answer(text='approved fix: unfinished report', request_id='report-fix')['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        self.assertEqual(result['record']['proof']['answers'], [])
+        self.assertEqual(self.claim(), result['record'])
+        rows = R._rows(self.jobs.read_text().splitlines())
+        census = [(fields[1], meta) for fields, meta in rows.values() if meta.get('route_node') == 'impl-review']
+        budget = CAP.round_budget(self.route, node, census, revisions=[{'answers': ['att-review-3']}])
+        self.assertEqual((budget.state, budget.verdict_rounds), ('exhausted', 3))
+        self.assertEqual(rows['att-review-3'][1]['failure_class'], 'fail')
+
+    def test_old_claim_does_not_promise_a_closure_for_an_already_spent_owner_closed_review(self):
+        record, _ = self._legacy_closed_review_claim(verdicts=3)
+        before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        self.assertEqual(R.answered_fix_revisions(self.jobs, 'rt-test'), [])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('unfinished report', text)
+        self.assertNotIn('closure-check', text)
+        self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+
+    def test_old_claim_closure_admits_register_then_start_and_keeps_other_live_rounds_blocked(self):
+        record, node = self._legacy_closed_review_claim(test_fails=2)
+        spec = importlib.util.spec_from_file_location('registered_closure_dispatch_node',
+                                                      Path(__file__).with_name('dispatch-node.py'))
+        dispatch = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = dispatch
+        spec.loader.exec_module(dispatch)
+        registered = {'attempt_schema_version': '2', 'attempt_id': 'att-review-3',
+                      'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                      'worker_type': 'review', 'dispatch_depth': '2', 'launch_claimed': '0',
+                      'parent_attempt_id': record['replacement_attempt_id'], 'note': ''}
+        history = self.jobs.read_bytes()
+        # This isolated claim fixture has one route; use the real registry census and admission.
+        with mock.patch.object(dispatch.ROUTE, 'review_lineage_routes', return_value=[self.route]):
+            for status in ('open', 'running'):
+                with self.subTest(status=status):
+                    self.jobs.write_bytes(history)
+                    self.write(registered, status=status, append=True)
+                    before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+                    budget = dispatch.admit_round(self.route, node, self.jobs,
+                        exclude_attempt=registered['attempt_id'], record_auto_revisions=False).budget
+                    self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds, budget.next_round),
+                                     ('admit', 'closure-check', 2, 3))
+                    revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+                    self.assertEqual(revisions[0]['answers'], ['att-test-2', 'att-review-2'])
+                    budget = dispatch.admit_round(self.route, node, self.jobs,
+                                                   record_auto_revisions=False).budget
+                    self.assertEqual(budget.state, 'blocked-live')
+                    self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+            self.write({**registered, 'attempt_id': 'att-other-live'}, status='open', append=True)
+            budget = dispatch.admit_round(self.route, node, self.jobs,
+                exclude_attempt=registered['attempt_id'], record_auto_revisions=False).budget
+            self.assertEqual(budget.state, 'blocked-live')
+            self.jobs.write_bytes(history)
+            self.write({**registered, 'note': 'completed-review-blocking', 'failure_class': 'fail'}, append=True)
+            self.write({**registered, 'attempt_id': 'att-review-4'}, status='open', append=True)
+            budget = dispatch.admit_round(self.route, node, self.jobs,
+                exclude_attempt='att-review-4', record_auto_revisions=False).budget
+            self.assertEqual((budget.state, budget.verdict_rounds), ('exhausted', 3))
+
+    def test_unrelated_duplicate_registry_rows_keep_an_approved_claim_original_answers(self):
+        record, _ = self._legacy_closed_review_claim(test_fails=2)
+        foreign = {'attempt_id': 'att-foreign', 'route_id': 'rt-other', 'route_node': 'test',
+                   'worker_type': 'stage', 'note': 'completed-marker'}
+        self.write(foreign, append=True)
+        self.write(foreign, append=True)
+        before = self.jobs.read_bytes()
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertEqual([item['answers'] for item in revisions], [['att-test-2']])
+        self.assertEqual(R._approved_fix_answers(record, self.jobs), ['att-test-2'])
+        self.assertEqual(self.jobs.read_bytes(), before)
+
     def test_failed_owner_without_failed_checks_continues_once_per_answer(self):
         import dispatch_owner_input as I
         self._failed_owner(test_fails=0)

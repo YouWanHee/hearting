@@ -1114,8 +1114,9 @@ def fix_answers(route, lines, jobs=None) -> tuple[list[str], list[str]]:
     admits for a revision that answers its last FAIL, within the verdict ceiling cap + 1
     (SD-161). A node whose closure-check that answer would not admit (already at the ceiling,
     or bound by BLOCKED rounds without progress) is `spent` as `<node>:<state>`: the fix makes
-    no round for it."""
-    from dispatch_contract import parse_registry_metadata
+    no round for it. A review already disposed by owner-closure gets no further round,
+    but does not prevent an approved answer continuing other unfinished work."""
+    from dispatch_contract import parse_registry_metadata, owner_closure_shape
     answers, spent = [], []
     for node in route.get("nodes") or []:
         if not is_round_capped_node(node):
@@ -1140,7 +1141,8 @@ def fix_answers(route, lines, jobs=None) -> tuple[list[str], list[str]]:
         # what admits the closure-check round (not at cap + 1, not bound by BLOCKED rounds).
         budget = round_budget(route, node, rows, revisions=[{"answers": [failed]}])
         if not failed or budget.round_kind != "closure-check":
-            spent.append(f"{node.get('id')}:{budget.state}")
+            if owner_closure_shape(verdicts[-1]) != "registered-review":
+                spent.append(f"{node.get('id')}:{budget.state}")
             continue
         answers.append(failed)
     return answers, spent
