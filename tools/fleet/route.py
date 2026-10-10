@@ -50,10 +50,17 @@ import json
 import os
 import sys
 import time
-from .work_titles import readable
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if __package__:
+    from .work_titles import readable
+else:  # Existing file-path consumers load this module without a package.
+    tools_dir = str(Path(__file__).resolve().parents[1])
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from fleet.work_titles import readable
 
 _CACHE = {}          # {abspath: (mtime, size, record|None)}
 _OUTCOME_CACHE = {}  # {abspath: (mtime, size, outcome|None)} — F-<next> sidecar reader

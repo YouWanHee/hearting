@@ -38,7 +38,9 @@ class ResourceNowTest(unittest.TestCase):
                          mock.patch.object(render.time, "time", return_value=1791512200):
                         text = render._resource_now_text(owner)
                         now = render._plain(render._context_detail_row(owner, term_width=180)[0])
-                    self.assertIn(child.node, now)
+                    expected_name = {"full-run": "full run", "resume-run": "resume run",
+                                     "eval-run": "eval run"}[child.node]
+                    self.assertIn(expected_name, now)
                     location = ("moving4:0" if row["gpu"] == 0 else
                                 "moving4:CPU" if row["node"] == "eval-run" else
                                 "호스트/GPU 미확인")
@@ -110,7 +112,7 @@ class ResourceNowTest(unittest.TestCase):
                 owner.liveness, owner.resource_wait, owner.summary = "working", None, None
                 child.liveness, child.exit_code, child.ended_at = "exited", 1, 1791514929
                 now = render._resource_now_text(owner)
-                self.assertIn("마지막 eval-run eval_v54.py", now)
+                self.assertIn("마지막 eval run eval_v54.py", now)
                 self.assertIn("실패(exit 1)", now)
                 self.assertIn("로그 ", now)
                 owner.summary = "model handling the result"

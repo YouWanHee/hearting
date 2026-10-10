@@ -355,8 +355,7 @@ class F97cCampaignLabelTest(unittest.TestCase):
                 fh.write('{"route_id": "rt-abc", "title": "A very long campaign title indeed"}')
             job = DispatchJob(key="code", route_id="rt-abc", artifact_root=tmp)
             dispatch._campaign_labels([job])
-        self.assertIsNotNone(job.campaign_label)
-        self.assertLessEqual(len(job.campaign_label), 24)
+        self.assertEqual(job.campaign_label, "A very long campaign title indeed")
 
     def test_campaign_label_owner_route_id_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,7 +365,7 @@ class F97cCampaignLabelTest(unittest.TestCase):
                 fh.write('{"route_id": "rt-owner", "title": "peer-steward + fleet location"}')
             job = DispatchJob(key="owner", route_id=None, owner_route_id="rt-owner", artifact_root=tmp)
             dispatch._campaign_labels([job])
-        self.assertEqual(job.campaign_label, "peer-steward + fleet location"[:24])
+        self.assertEqual(job.campaign_label, "peer-steward + fleet location")
 
     def test_campaign_label_route_id_takes_precedence_over_owner_route_id(self):
         with tempfile.TemporaryDirectory() as tmp:
