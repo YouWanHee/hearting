@@ -260,7 +260,9 @@ def _resume_owner_settlements(jobs: Path) -> None:
     owners with no batch sidecar record. Storage failure keeps it open for
     the next existing callback; this never launches model work.
     """
-    from dispatch_contract import parse_registry_metadata, supervisor_lease_is_held
+    from dispatch_contract import (
+        SUPERVISOR_LEASE_KIND, parse_registry_metadata, supervisor_lease_is_held,
+    )
     from dispatch_completion_join import ChildRow, settle_finished_attempt
     try:
         lines = jobs.read_text().splitlines()
@@ -272,6 +274,8 @@ def _resume_owner_settlements(jobs: Path) -> None:
             continue
         meta = parse_registry_metadata(fields[5])
         if (meta.get("worker_type") != "owner" or meta.get("launch_started") != "1"
+                or meta.get("supervisor_lease") != SUPERVISOR_LEASE_KIND
+                or not meta.get("supervisor_lease_file")
                 or not meta.get("log_file") or not meta.get("attempt_id")):
             continue
         try:

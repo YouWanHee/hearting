@@ -111,6 +111,10 @@ class DeadOwnerOSErrorTest(unittest.TestCase):
         before = self.jobs.read_bytes()
         self.assertIsNone(J.settle_exited_owner_terminal(
             J.exact_attempt_row(self.jobs, self.attempt), jobs=self.jobs))
+        import dispatch_batch_obligations as obligations
+        with mock.patch.object(J, 'settle_finished_attempt') as settle:
+            obligations.ensure_observers(self.jobs)
+            settle.assert_not_called()
         self.assertEqual(self.jobs.read_bytes(), before)
 
     def test_unobservable_namespace_or_live_descendant_keeps_owner_open(self):
