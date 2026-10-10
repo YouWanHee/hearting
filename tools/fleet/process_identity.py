@@ -152,7 +152,7 @@ def pane_session_successors(harness, pane, cwd, *, claims=None):
     for row in starts:
         if row.get("source") == "clear" and same_repository(row):
             for older in folded:
-                last_seen = timestamp(older.get("ts"))
+                last_seen = timestamp((summary.get((harness, older["sid"])) or {}).get("last_seen"))
                 if (older["sid"] != row["sid"] and same_repository(older)
                         and last_seen is not None and last_seen < row["start_at"]):
                     edges.setdefault(older["sid"], set()).add(row["sid"])

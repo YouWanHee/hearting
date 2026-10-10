@@ -132,9 +132,7 @@ class CurrentSessionTest(unittest.TestCase):
         rows = [{"harness": "claude", "sid": "old", "event": "summary", "cwd": self.cwd, "ts": 1},
                 {"harness": "claude", "sid": "other-project", "event": "summary", "cwd": "/proj/z", "ts": 1},
                 {"harness": "claude", "sid": "current", "event": "start", "source": "clear", "cwd": self.cwd, "ts": 2}]
-        summary = {("claude", r["sid"]): r for r in rows}
         with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
-                mock.patch.object(session_tidy, "session_summary", return_value=summary), \
                 mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
             edges = process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
                                                            claims={"old", "current", "other-project"})
@@ -143,7 +141,6 @@ class CurrentSessionTest(unittest.TestCase):
         self.assertEqual(sid, "current")
         rows[-1]["source"] = "fork"
         with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
-                mock.patch.object(session_tidy, "session_summary", return_value=summary), \
                 mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
             self.assertEqual(process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
                                                                       claims={"old", "current"}), {})
@@ -151,10 +148,23 @@ class CurrentSessionTest(unittest.TestCase):
         for last_seen in (3, None):
             rows[0]["ts"] = last_seen
             with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
-                    mock.patch.object(session_tidy, "session_summary", return_value=summary), \
                     mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
                 self.assertEqual(process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
                                                                           claims={"old", "current"}), {})
+
+    def test_raw_activity_after_clear_keeps_legacy_identity_unresolved(self):
+        process_identity._record()
+        import session_tidy
+        rows = [{"harness": "claude", "sid": "old", "event": "summary", "cwd": self.cwd, "ts": 1},
+                {"harness": "claude", "sid": "current", "event": "start", "source": "clear", "cwd": self.cwd, "ts": 2},
+                {"harness": "claude", "sid": "old", "event": "prompt", "cwd": self.cwd, "ts": 3}]
+        with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
+                mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
+            edges = process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
+                                                           claims={"old", "current"})
+        sid, evidence = process_identity.resolve_session_claims({"registry": "current", "pane": "old"}, edges)
+        self.assertIsNone(sid)
+        self.assertEqual(evidence["verdict"], "conflict")
 
     def test_repeated_native_ledger_folding_preserves_clear_identity(self):
         process_identity._record()
