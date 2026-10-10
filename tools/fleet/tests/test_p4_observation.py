@@ -91,7 +91,7 @@ class ObservationTest(unittest.TestCase):
             rows = render._build_lines([], [], "both", False, 2,
                            term_width=80, resource_diagnostics=[missing, failure])
             text = flatten(rows)
-            for expected in ("jobs.log", "2", "과거 참조", "비차단", "리소스 관측 미확인", "PermissionError"):
+            for expected in ("jobs.log", "2", "과거 참조", "비차단", "resource 관측 미확인", "PermissionError"):
                 self.assertIn(expected, text)
             self.assertNotIn("malformed jobs.log", text)
             self.assertTrue(all(render._dw("".join(t for t, _ in r)) <= 80
@@ -117,7 +117,7 @@ class ObservationTest(unittest.TestCase):
         rows = render._mem_event_rows({"recent": events}, term_width=80)
         text = flatten(rows)
         self.assertEqual(len(rows), 2)
-        for value in ("/tmp/tmp-first", "/tmp/tmp-second", "기억 저장", "범위를 정해 주세요"):
+        for value in ("/tmp/tmp-first", "/tmp/tmp-second", "mem 저장", "범위를 정해 주세요"):
             self.assertIn(value, text)
         self.assertNotIn("tidy-applier", text)
         self.assertTrue(all(render._dw(flatten([row])) <= 80 for row in rows))
@@ -127,7 +127,7 @@ class ObservationTest(unittest.TestCase):
         event = {"id": "r1", "cwd": "/work/project", "snippet": "",
                  "action": "delete", "actor": "manual", "tier": "working", "type": "decision"}
         text = flatten(render._mem_event_rows({"recent": [event]}, term_width=80))
-        self.assertIn("기억 정리", text)
+        self.assertIn("mem 정리", text)
         self.assertIn("내용 미확인", text)
         self.assertIn("/work/project", text)
         self.assertNotIn("manual", text)

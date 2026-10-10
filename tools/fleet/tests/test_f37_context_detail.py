@@ -35,7 +35,7 @@ FULL, EMPTY = render._BAR_FULL, render._BAR_EMPTY
 # F-55 (v39): the lead cell was the padded state WORD. F-100b (2026-09-03): it is the WHERE
 # chip — ` herdr ` reversed for a session herdr lists — in a slot of the same width. The
 # fixtures below are herdr-attached so the lead stays a distinctive marker in the text.
-LEAD = render._CTX_ON_TEXT.ljust(4 + render._HW - render._CONTEXT_INDENT_W - 4) + "문맥"
+LEAD = render._CTX_ON_TEXT.ljust(4 + render._HW - render._CONTEXT_INDENT_W)
 # F-52b: no measured `context_window_tokens` on these fixtures → the 16-cell baseline track.
 BASE = render._CTX_TRACK_MAX
 # A context gauge is the only place a bar track is immediately followed by its right-justified
@@ -72,7 +72,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
             row = render._context_detail_row(self._idle(context=context, summary=now), term_width=168)
             expected = " " * render._CONTEXT_INDENT_W + context_text
             if now:
-                expected += " " * (render._NAME_COL - render._dw(expected)) + "대기 · 마지막 요약 · 시각 미확인 · " + now
+                expected += " " * (render._NAME_COL - render._dw(expected)) + "마지막 요약 · 시각 미확인 · " + now
             self.assertEqual(text(row), expected)
 
     def test_stale_and_dead_rows_suppress_cached_detail(self):
@@ -100,14 +100,14 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 visible = text(row)
                 self.assertIsNotNone(CTX_GAUGE_RE.search(visible))
                 self.assertIn("85%", visible)
-                self.assertEqual(render._dw(visible[:visible.index("작업 중")]), render._NAME_COL)
+                self.assertEqual(render._dw(visible[:visible.index("마지막 요약")]), render._NAME_COL)
                 self.assertLessEqual(render._dw(visible), width)
 
                 rendered = text(render._build_lines(
                     [], [job], "both", False, 0,
                     layout=layout, term_width=width))
                 self.assertIsNotNone(CTX_GAUGE_RE.search(rendered))
-                self.assertIn("작업 중", rendered)
+                self.assertIn("마지막 요약", rendered)
                 if width >= 100:
                     self.assertIn("NOW", rendered)
 
@@ -176,9 +176,9 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                               text(row)).group(0)
             self.assertEqual(len(track), BASE)
             self.assertIn(LEAD, text(row))
-            self.assertLess(text(row).index(LEAD), text(row).index("대기"))
+            self.assertLess(text(row).index(LEAD), text(row).index("마지막 요약"))
             self.assertNotIn(": ", text(row))
-            self.assertIn("   대기", text(row))
+            self.assertIn("   마지막 요약", text(row))
             if width >= 120:
                 self.assertIn("한글", text(row))
             row_text = text(row)
@@ -208,7 +208,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                     prefix = render._CONTEXT_INDENT_W + 2 * depth + render._CTX_LABEL_W \
                         + render._CTX_TRACK_MAX + render._CONTEXT_VALUE_W
                     self.assertEqual(
-                        render._dw(visible[:visible.index("대기")]),
+                        render._dw(visible[:visible.index("마지막 요약")]),
                         max(prefix + render._CONTEXT_NOW_GAP, render._NAME_COL))
                     track = re.search(r"[%s%s]+" % (re.escape(FULL), re.escape(EMPTY)),
                                       visible).group(0)
@@ -222,7 +222,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                                   summary="Doing work"), term_width=168)
                 visible = text(row)
                 self.assertNotIn(band, visible)
-                self.assertEqual(render._dw(visible[:visible.index("작업 중")]),
+                self.assertEqual(render._dw(visible[:visible.index("마지막 요약")]),
                                  render._NAME_COL)
                 self.assertNotIn(": ", visible)
 
@@ -290,7 +290,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 if width >= 120:
                     self.assertIn("review merge", visible)
                 else:
-                    self.assertIn("작업 중", visible)
+                    self.assertIn("마지막 요약", visible)
         # A genuinely wide terminal lends its slack to the breadcrumb: the whole
         # collapsed route stays visible instead of folding its early stages.
         wide = text(render._build_lines([session], [owner], "both", False, 0,
@@ -795,7 +795,7 @@ class ChildAssociationTest(unittest.TestCase):
         self.assertLess(visible.index("└▸🚀"), visible.index("NOW"))
         self.assertLess(visible.index("NOW"), visible.index("⚡tool"))
         now_line = next(line for line in visible.splitlines() if "NOW" in line)
-        self.assertEqual(render._dw(now_line[:now_line.index("작업 중")]), render._NAME_COL)
+        self.assertEqual(render._dw(now_line[:now_line.index("마지막 요약")]), render._NAME_COL)
 
 
 class CodexAttemptTelemetryTest(unittest.TestCase):
