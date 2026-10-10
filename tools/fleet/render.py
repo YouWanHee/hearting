@@ -1921,8 +1921,8 @@ def _unused_badge(s, compact=False):
     already carries elapsed time in its own time cell — so it yields first, and only when the
     name would otherwise be clipped."""
     if compact:
-        return " unused"
-    return " unused %s" % fmt_min(s.elapsed_min if s.elapsed_min is not None else None)
+        return " 미사용"
+    return " 미사용 %s" % fmt_min(s.elapsed_min if s.elapsed_min is not None else None)
 
 
 def _interaction_badge(s):
@@ -3402,20 +3402,20 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     jw = sum(1 for j in listed_jobs if j.liveness == "working")
     spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
     pulse = [("  fleet ", "head"),
-             (spin + " %d" % n_wk, "g_spin"), (" working   ", "dim"),
-             ("● %d" % n_id, "g_work_off"), (" idle   ", "dim")]
+             (spin + " %d" % n_wk, "g_spin"), (" 작업 중  ", "dim"),
+             ("● %d" % n_id, "g_work_off"), (" 대기  ", "dim")]
     # F-26: only when there IS one — a healthy board stays quiet (F-12 contract).
     if n_un:
-        pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (" unused   ", "dim")]
+        pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (" 미사용  ", "dim")]
     if n_dt:
-        pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (" detached   ", "dim")]
+        pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (" 분리됨  ", "dim")]
     if _jobs_unconfirmed(observations):
         pulse += [("↳ 작업 목록 미확인", "lvl_y")]
         if listed_jobs:
             pulse += [(" (마지막 관측 %d개)" % len(listed_jobs), "dim")]
     elif listed_jobs:
         pulse += [("↳ %d" % len(listed_jobs), "dim"),
-                  (" job%s (%d working)" % ("s" if len(listed_jobs) != 1 else "", jw), "dim")]
+                  (" 작업(%d 실행)" % jw, "dim")]
     return pulse
 
 
@@ -8041,42 +8041,42 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         ("●", "g_work_off"), (" 대기   ", "dim"),
     ]
     if "unused" in _seen_glyphs:
-        legend += [(_LIVE_GLYPH["unused"], "g_unused"), (" unused   ", "dim")]
+        legend += [(_LIVE_GLYPH["unused"], "g_unused"), (" 미사용   ", "dim")]
     if "detached" in _seen_glyphs:
-        legend += [(_DETACHED_GLYPH, "g_work_off"), (" detached   ", "dim")]
+        legend += [(_DETACHED_GLYPH, "g_work_off"), (" 분리됨   ", "dim")]
     if "stale" in _seen_glyphs:
-        legend += [("·", "g_stale"), (" stale   ", "dim")]
+        legend += [("·", "g_stale"), (" 오래된 관측   ", "dim")]
     if "dead" in _seen_glyphs:
-        legend += [("✕", "g_dead"), (" dead     ", "dim")]
+        legend += [("✕", "g_dead"), (" 종료   ", "dim")]
     if "degraded" in _seen_glyphs:
-        legend += [("◐", "lvl_y"), (" degraded node   ", "dim")]
+        legend += [("◐", "lvl_y"), (" 단계 관측 불완전   ", "dim")]
     if "recovering" in _seen_glyphs:
-        legend += [("…", "lvl_y"), (" recovery pending   ", "dim")]
+        legend += [("…", "lvl_y"), (" 복구 대기   ", "dim")]
     if "blocked" in _seen_glyphs:
-        legend += [("◑", "g_blocked"), (" blocked session   ", "dim")]
+        legend += [("◑", "g_blocked"), (" 입력 대기   ", "dim")]
     if "tag" in _seen_glyphs:
-        legend += [("[", "dim"), ("id", "tag"), ("]", "dim"), (" session   ", "dim")]  # F-100a
+        legend += [("[", "dim"), ("번호", "tag"), ("]", "dim"), (" 세션   ", "dim")]  # F-100a
     if "steward" in _seen_glyphs:
-        legend += [("[", "dim"), ("id", "tag_steward"), ("]", "dim"), (" steward   ", "dim")]  # F-100c
+        legend += [("[", "dim"), ("번호", "tag_steward"), ("]", "dim"), (" 감독   ", "dim")]  # F-100c
     if "herdr" in _seen_glyphs:
-        legend += [(_CTX_ON_TEXT, "herdr_on"), (" pane   ", "dim")]                  # F-100b
+        legend += [(_CTX_ON_TEXT, "herdr_on"), (" 좌석   ", "dim")]                  # F-100b
     if "tty" in _seen_glyphs:
-        legend += [(_CTX_OFF_TEXT, "dim"), (" plain terminal   ", "dim")]
+        legend += [(_CTX_OFF_TEXT, "dim"), (" 일반 터미널   ", "dim")]
     if "child" in _seen_glyphs:
-        legend += [("▾N", "dim"), (" child jobs   ", "dim")]
+        legend += [("▾N", "dim"), (" 하위 작업   ", "dim")]
     if "subagent" in _seen_glyphs:
-        legend += [(_ICON_SUBAGENT, "dim"), (" sub-agent   ", "dim")]
+        legend += [(_ICON_SUBAGENT, "dim"), (" 도우미   ", "dim")]
     if any(not _is_plugin_agent(job) for job in jobs):
-        legend += [("↳", "dim"), (" dispatch   ", "dim")]
+        legend += [("↳", "dim"), (" 위임   ", "dim")]
     if "wt" in _seen_glyphs:
-        legend += [("🚧 N", "dim"), (" worktrees   ", "dim")]
+        legend += [("🚧 N", "dim"), (" 작업공간   ", "dim")]
     if n_mem_total or "mem" in _seen_glyphs:
         # Always expose the board-wide memory total in the legend, even when memory-only groups fold.
-        legend += [("🧠 %d" % n_mem_total, "dim"), (" mem   ", "dim")]
+        legend += [("🧠 %d" % n_mem_total, "dim"), (" 기억   ", "dim")]
     if "loc_foreign" in _seen_glyphs:
-        legend += [("→", "loc_repo"), (" foreign repo   ", "dim")]
+        legend += [("→", "loc_repo"), (" 다른 저장소   ", "dim")]
     if "loc_wt" in _seen_glyphs:
-        legend += [("⌂wt", "loc_repo"), (" worktree   ", "dim")]
+        legend += [("⌂wt", "loc_repo"), (" 연결 작업공간   ", "dim")]
     # F-9(d) `~ derived/inherited value` retired with the marker itself (user 2026-07-16:
     # inherited effort now shows plain — the tilde read as noise).
     lines.extend(_wrap_legend(legend, term_width))
@@ -8088,8 +8088,9 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
 def _reading_legend(term_width, session=True):
     rows = []
     if session:
-        rows.extend(_wrap_legend([("  세션: ", "dim"), ("⠹ 작업 중  ● 대기  ◑ 입력 대기", "dim")], term_width))
-    for text in ("  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량",
+        rows.extend(_wrap_legend([("  세션: ", "dim"), ("⠹ 작업 중  ● 대기  ◑ 입력 대기  ✕ 종료", "dim")], term_width))
+    for text in ("  프로젝트: ● 활동",
+                 "  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량 · ↳ 전체 명령",
                  "  단계: ● 현재  ✓ 완료  ✕ 실패  ○ 예정 · 문맥 %는 대화 사용량"):
         rows.extend(_wrap_route_node("", text, "dim", "", term_width, continuation="  "))
     return rows
@@ -8105,7 +8106,12 @@ def _wrap_legend(legend, term_width):
     if not term_width or not legend:
         return [legend] if legend else []
     lead = legend[0]
-    pairs = [legend[i:i + 2] for i in range(1, len(legend), 2)]
+    pairs, i = [], 1
+    while i < len(legend):
+        # A Fleet-number label uses four color segments but remains one entry.
+        size = 4 if i + 3 < len(legend) and legend[i][0] == "[" and legend[i + 2][0] == "]" else 2
+        pairs.append(legend[i:i + size])
+        i += size
     wrapped = []
     current = [lead]
     current_w = _dw(lead[0])
