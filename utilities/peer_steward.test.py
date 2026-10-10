@@ -4336,7 +4336,10 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
             with self.subTest(first=first_session, second=second_session):
                 self.assert_serialized(first_session, second_session)
 
-    def assert_serialized(self, first_session, second_session):
+    def test_project_start_and_beside_start_share_the_same_workspace_claim(self):
+        self.assert_serialized(None, None, project=True)
+
+    def assert_serialized(self, first_session, second_session, project=False):
         import multiprocessing
         ctx = multiprocessing.get_context("fork")
         first_entered, release, second_entered = ctx.Event(), ctx.Event(), ctx.Event()
@@ -4348,11 +4351,15 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                 second_entered.set()
             return 0
         first_args = peer_steward.build_parser().parse_args(["start", "first", "--kind", "codex", "--beside", "w1:p0"])
+        if project:
+            first_args.beside = None
         second_args = peer_steward.build_parser().parse_args(["start", "second", "--kind", "claude", "--beside", "w1:p1"])
         def start(args, session):
             peer_steward._HERDR_SESSION = session
             peer_steward.cmd_start(args)
-        with mock.patch.object(peer_steward, "_start_in_pane", side_effect=launch):
+        with mock.patch.object(peer_steward, "_start_in_pane", side_effect=launch), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value=""), \
+             mock.patch.object(peer_steward, "_project_start_workspace", return_value="w1"):
             first = ctx.Process(target=start, args=(first_args, first_session))
             second = ctx.Process(target=start, args=(second_args, second_session))
             first.start()
@@ -4423,6 +4430,110 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                             self.assertEqual(create[create.index("--ratio") + 1], "0.5")
                         else:
                             self.assertEqual(create[create.index("--workspace") + 1], "w1")
+
+
+class ProjectStartTest(_TmpRootMixin, unittest.TestCase):
+    """An unattached caller can place a peer without claiming a terminal seat."""
+
+    def launch(self, kind="codex", *, free=None, foreign=False, missing=False):
+        calls, lines = [], []
+        pane = {"pane_id": "w1:pHint", "workspace_id": "w1",
+                "foreground_cwd": str(self.tmp_root / "other" if foreign else self.tmp_root)}
+        if foreign:
+            (self.tmp_root / "other").mkdir(exist_ok=True)
+        panes = [{"pane_id": "w1:pHint", "workspace_id": "w1"},
+                 {"pane_id": "w1:pEmpty", "workspace_id": "w1"}]
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            action = argv[1:3]
+            if action == ["agent", "get"]:
+                return _herdr_json({"result": {"agent": None if missing else pane}})
+            if action == ["pane", "list"]:
+                return _herdr_json({"result": {"panes": panes}})
+            if action == ["tab", "create"]:
+                return _herdr_json({"result": {"root_pane": {"pane_id": "w1:pNew", "focused": False}}})
+            if action == ["agent", "start"]:
+                return _herdr_json({"result": {"agent": {"agent": kind, "name": "project-peer"}}})
+            raise AssertionError(argv)
+
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pHint"}), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value=""), \
+             mock.patch.object(peer_steward.os, "getcwd", return_value=str(self.tmp_root)), \
+             mock.patch.object(peer_steward.INSTALL_PATHS, "primary_checkout", side_effect=lambda cwd: Path(cwd)), \
+             mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_pane_has_agent", side_effect=lambda p: None if p == free else "pane-occupied"), \
+             mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=True), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
+             mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
+             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch.object(peer_steward, "_mark_seat_successor") as successor, \
+             mock.patch("builtins.print", side_effect=lambda line: lines.append(line)):
+            rc = peer_steward.main(["start", "project-peer", "--kind", kind])
+        successor.assert_not_called()
+        return rc, calls, lines
+
+    def test_unproven_attachment_starts_in_an_unfocused_project_tab_on_every_harness(self):
+        for kind in ("claude", "codex", "opencode"):
+            with self.subTest(kind=kind):
+                rc, calls, lines = self.launch(kind)
+                self.assertEqual(rc, 0, lines)
+                create = next(a for a in calls if a[1:3] == ["tab", "create"])
+                self.assertEqual(create[create.index("--workspace") + 1], "w1")
+                self.assertIn("--no-focus", create)
+                self.assertEqual(create[create.index("--cwd") + 1], str(self.tmp_root))
+                self.assertFalse(any(a[1:3] == ["pane", "split"] for a in calls))
+                self.assertIn("placement=project-workspace", lines[-1])
+
+    def test_empty_shell_is_reused_without_touching_the_hinted_pane(self):
+        rc, calls, lines = self.launch(free="w1:pEmpty")
+        self.assertEqual(rc, 0, lines)
+        self.assertFalse(any(a[1:3] == ["tab", "create"] for a in calls))
+        start = next(a for a in calls if a[1:3] == ["agent", "start"])
+        self.assertEqual(start[start.index("--pane") + 1], "w1:pEmpty")
+
+    def test_foreign_or_missing_workspace_hint_never_allocates_or_types(self):
+        for options in ({"foreign": True}, {"missing": True}):
+            with self.subTest(options=options):
+                rc, calls, lines = self.launch(**options)
+                self.assertEqual(rc, 1, lines)
+                self.assertEqual([a[1:3] for a in calls], [["agent", "get"]])
+                self.assertIn("reason=pane-unknown", lines[-1])
+
+    def test_project_match_includes_a_real_linked_worktree_subdirectory(self):
+        primary, linked = self.tmp_root / "primary", self.tmp_root / "linked"
+        for argv in (["git", "init", "-q", str(primary)],
+                     ["git", "-C", str(primary), "-c", "user.name=Fixture", "-c",
+                      "user.email=fixture@example.invalid", "commit", "-q", "--allow-empty", "-m", "fixture"],
+                     ["git", "-C", str(primary), "worktree", "add", "-q", "-b", "linked", str(linked)]):
+            subprocess.run(argv, check=True, capture_output=True, text=True)
+        nested = linked / "nested"
+        nested.mkdir()
+        pane = {"pane_id": "w1:pHint", "workspace_id": "w1", "foreground_cwd": str(primary)}
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pHint"}), \
+             mock.patch.object(peer_steward.os, "getcwd", return_value=str(nested)), \
+             mock.patch.object(peer_steward, "_placement_result", return_value={"agent": pane}):
+            self.assertEqual(peer_steward._project_start_workspace(), "w1")
+            pane["foreground_cwd"] = str(self.tmp_root)
+            self.assertIsNone(peer_steward._project_start_workspace())
+            del pane["foreground_cwd"]
+            self.assertIsNone(peer_steward._project_start_workspace())
+
+    def test_unreadable_duplicate_or_foreign_workspace_inventory_never_allocates(self):
+        own = {"pane_id": "w1:pEmpty", "workspace_id": "w1"}
+        for panes in (None, [], [own, own], [{**own, "workspace_id": "w2"}], [{}]):
+            with self.subTest(panes=panes), \
+                 mock.patch.object(peer_steward, "_placement_result", return_value={"panes": panes}), \
+                 mock.patch.object(peer_steward, "_empty_shell_placement") as empty:
+                self.assertIsNone(peer_steward._start_workspace_placement("w1"))
+                empty.assert_not_called()
 
 
 class BesideStartTest(_TmpRootMixin, unittest.TestCase):

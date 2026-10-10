@@ -399,6 +399,13 @@ a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
 
+For an unproven background caller, default `peer-steward start` locates the
+inherited pane's workspace by its live foreground directory in the caller's
+repository (linked worktrees included). It reuses an observed empty shell or
+creates an unfocused tab, leaving existing panes and seat-successor records
+intact. Cards, watch and sender identity retain exact ownership checks; missing,
+foreign or unreadable hints leave placement unknown.
+
 An OpenCode child inside a Codex owner's workspace sandbox receives per-attempt
 XDG data/cache/state/config directories beneath the worktree. User configuration
 and existing authentication are linked for reading; generated dependency state
