@@ -1,12 +1,9 @@
-"""Universal backbone — enumerate every claude/codex/opencode session via the process table.
+"""Universal backbone — observe live runtime processes and their session/work roles.
 
-The only 100%-reliable tap (01_tap_mechanics.md §0): comm ∈ {claude,codex,opencode}
-+ /proc/<pid>/cwd + ps etime. Per-harness collectors enrich these rows afterward;
-a session's *existence* is decided here, never by enrichment success (PRD §1).
-
-One matched process = one Session (a lingering broker on a deleted worktree is a real
-process holding that cwd; the liveness layer paints it stale/dead — honest observation,
-no fragile broker-vs-leaf heuristics).
+A runtime name identifies a candidate process. The shared role judgment consumes
+terminal, native PID/start session and registered work ownership before producing
+session rows. Unbound services are not conversations. Failed observations keep an
+unknown row; later enrichment fills fields without deciding process existence.
 """
 import os
 from pathlib import Path
@@ -30,6 +27,46 @@ def _managed_dir(args):
     """Managed-codex session state dir from argv, else None (exact match only, no guessing)."""
     match = _MANAGED_DIR_RE.search(args or "")
     return match.group(1) if match else None
+
+
+# Native CLI command inventories translate argv to modes. The role judgment
+# consumes modes/ownership and has no daemon/proxy-name exclusion branches.
+_COMMANDS = {
+    "claude": set("agents auth daemon doctor install mcp plugin remote-control setup-token update upgrade".split()),
+    "codex": set("exec app-server exec-server login logout mcp completion features debug apply resume fork cloud agents remote-control update doctor sandbox queue archive delete migrate-rollouts unarchive help review plugin".split()),
+    "opencode": set("agent attach auth bench completion debug export github import models mcp run serve session stats tui upgrade web".split()),
+}
+_SESSION_COMMANDS = {"claude": set(), "codex": {"exec", "review", "resume", "fork"},
+                     "opencode": {"run", "attach", "tui"}}
+_VALUE_OPTIONS = set("--model -m --effort --config -c --enable --disable --remote --remote-auth-token-env --local-provider --profile -p --sandbox -s --add-dir --ask-for-approval -a --cd -C --image -i --session-id --resume -r --agent --permission-mode --allowedTools --disallowedTools --mcp-config --settings --append-system-prompt --system-prompt --cwd --port --hostname --log-level".split())
+_FLAG_OPTIONS = set("--oss --strict-config --approve-for-me --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --worktree --no-alt-screen --no-daemon --search --help -h --version -V --dangerously-skip-permissions --allow-dangerously-skip-permissions --verbose --debug --continue --no-session-persistence --print-logs".split())
+
+
+def invocation_mode(harness, argv):
+    """Native conversation/worker invocation, another CLI command, or unreadable."""
+    if not argv or os.path.basename(argv[0]) != harness:
+        return "unknown"
+    i = 1
+    while i < len(argv):
+        word = argv[i]
+        if word == "--":
+            return "session"
+        if harness == "claude" and word in {"-p", "--print"}:
+            return "session"
+        if word in _VALUE_OPTIONS:
+            if i + 1 >= len(argv):
+                return "unknown"
+            i += 2
+            continue
+        if word in _FLAG_OPTIONS or (word.startswith("--") and "=" in word):
+            i += 1
+            continue
+        if word.startswith("-"):
+            return "unknown"  # unknown arity must not turn an option value into a command
+        if word in _COMMANDS.get(harness, ()):
+            return "session" if word in _SESSION_COMMANDS.get(harness, ()) else "command"
+        return "session"  # positional prompt
+    return "session"
 
 
 def _shared_codex_daemon(args):
@@ -765,8 +802,6 @@ def scan(harness_filter=None):
             continue
         if harness_filter and comm not in harness_filter:
             continue
-        if comm == "codex" and _shared_codex_daemon(args):
-            continue
         try:
             pid = int(pid_s)
         except ValueError:
@@ -797,13 +832,14 @@ def scan(harness_filter=None):
         mem_worker = env.get("MEM_DISTILL") == "1" or env.get("FLEET_TITLE_REFRESH") == "1"
         detached = _is_detached(pid_tty.get(pid), app_server, det_ttys)
         proc_start = read_proc_start(pid)
+        managed_dir = _managed_dir(args) if comm == "codex" else None
         sess = Session(
             harness=comm,
             pid=pid,
             cwd=cwd,
             orphan=orphan,
             app_server=app_server,
-            managed_dir=_managed_dir(args) if comm == "codex" else None,
+            managed_dir=managed_dir,
             is_child=is_child,
             detached=detached,
             elapsed_min=etime_to_min(etime),
@@ -823,6 +859,8 @@ def scan(harness_filter=None):
                                    attempt_id=env.get("AGENT_DISPATCH_ATTEMPT_ID") or None)
                         if proc_start is not None else None),
         )
+        sess._tty = pid_tty.get(pid)
+        sess._invocation_mode = invocation_mode(comm, _read_argv(pid))
         sessions.append(sess)
         orca_sock = env.get("ORCA_RELAY_SOCKET_PATH")
         if orca_sock:

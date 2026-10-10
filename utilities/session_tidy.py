@@ -574,6 +574,11 @@ def _fold_ledger(seat: Seat) -> None:
         row["first_seen"] = min(row["first_seen"], item.get("first_seen", item.get("ts", 0)))
         row["ts"] = max(row["ts"], item.get("ts", 0))
         row["epoch"] = max(row["epoch"], int(item.get("epoch", 0) or 0))
+        start_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
+        start_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
+        if ("start_at" not in row and start_source in {"startup", "resume", "clear", "compact", "fork"}
+                and isinstance(start_at, (int, float)) and not isinstance(start_at, bool) and start_at > 0):
+            row.update(start_source=start_source, start_at=start_at)
         for field in ("transcript", "cwd"):
             if item.get(field):
                 row[field] = item[field]

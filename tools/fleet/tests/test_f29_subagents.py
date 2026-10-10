@@ -842,7 +842,7 @@ class CodexSubagentTest(unittest.TestCase):
              mock.patch("fleet.collectors.dispatch.collect", return_value=[]):
             fleet_collectors.collect_all()
         codex_enrich.assert_called_once_with(codex_session, tick=tick)
-        claude_enrich.assert_called_once_with(claude_session)
+        claude_enrich.assert_called_once_with(claude_session, tick={2: None})
 
 
 def _tool_use_line(tid, agent_type, ts="2026-07-15T10:00:00Z", name="Task"):
