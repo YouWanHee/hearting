@@ -949,21 +949,43 @@ def declared_subsession(args) -> bool:
     return True
 
 
-def retry_predecessor(prior_rows):
+def retry_predecessor(prior_rows, *, jobs=None, task=None):
     """The transport retry a new launch of this node continues, or "".
 
     Only a transport failure (a death, a runtime error) is retried in place.
     A worker's readable FAIL or BLOCKED is its result, on a capped node or
     not: the next launch is new work, so it never inherits a retry link and
     never spends the node's one replacement. Capped nodes still count it as a
-    round through the shared round admission. No original row is changed.
+    round through the shared round admission. A different explicit request on
+    an uncapped stage is also new work once the old execution is quiescent.
+    Callers keep capped rounds on their existing admission path. No original
+    row or automatic replacement allowance is changed.
     """
     if not prior_rows:
         return ""
     latest = prior_rows[-1]
     status = latest["_status"]
     if committed_outcome(status, latest) == "failed":
-        return "" if readable_result(latest) else latest.get("attempt_id", "")
+        if readable_result(latest):
+            return ""
+        if jobs is not None and isinstance(task, str) and task.strip():
+            from dispatch_contract import (
+                DispatchContractError, attempt_process_quiescence,
+                terminal_conflict_pending,
+            )
+            from dispatch_replacement import launch_input
+            try:
+                previous = launch_input(jobs, latest["attempt_id"], latest)["task"]
+                if (isinstance(previous, str) and previous.strip()
+                        and " ".join(previous.split()) != " ".join(task.split())
+                        and not terminal_conflict_pending(latest)
+                        and attempt_process_quiescence(
+                            latest, terminal_receipt=True).state == "quiescent"):
+                    return ""
+            except (DispatchContractError, OSError, ValueError, KeyError, TypeError):
+                # Missing history cannot manufacture a new request boundary.
+                pass
+        return latest.get("attempt_id", "")
     if status == "open" and latest.get("launch_claimed") == "0":
         # Register/start reuse the same unlaunched transport successor. A
         # semantic round has no such link and keeps its own round identity.

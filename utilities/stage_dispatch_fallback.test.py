@@ -691,6 +691,70 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"0"}]),"att-first")
   self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"1"}]),"")
 
+ def test_new_execute_gap_registers_after_transport_budget_was_spent(self):
+  import dispatch_contract as DC
+  import dispatch_replacement as REPLACEMENT
+  with self.dispatch_env():
+   path=self.route(same_status="supported",intensity="standard")
+   route=json.loads(path.read_text())
+   self.seed_parent()
+   self.seed_predecessor_markers(path,"execute")
+   args=SimpleNamespace(attempt_id="att-execute-gap-two",jobs_path=self.jobs,
+                        worktree=self.repo,replacement_input_argv=["--slug","gap-two"])
+   old_task="Close migration fixtures and import integration."
+   meta={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+         "execution_surface":"registered-headless","registered_worker":"1",
+         "fallback_hop":"same-harness-headless","worker_type":"stage","harness":"codex",
+         "attempt_id":args.attempt_id,"route_id":route["route_id"],"route_hash":route["route_hash"],
+         "route_node":"execute","parent_attempt_id":"att-fallback-parent",
+         "parent_sid":"fixture-native-parent","automatic_retry_of":"att-execute-gap-one",
+         "note":"dead-parent-terminated","failure_class":"runtime","launch_outcome":"never-launched"}
+   meta.update(DC.parse_registry_metadata(REPLACEMENT.seal_launch_input(args,"codex",old_task)))
+   with self.jobs.open("a") as handle:
+    handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tgap-two\t"+
+                 ",".join(f"{k}={v}" for k,v in meta.items())+"\n")
+   original=self.jobs.read_bytes()
+   prompt=self.art/"execute-gap-three.md"
+   prompt.write_text("Close historical/current conflict and actual DB parity.")
+   commands=[];real_run=subprocess.run
+   def wrapper(command,**kwargs):
+    if not any(str(part).endswith("/bin/dispatch-headless.py") for part in command):
+     return real_run(command,**kwargs)
+    aid=self.arg(command,"--attempt-id")
+    candidate={k:v for k,v in meta.items() if k not in
+               {"note","failure_class","launch_outcome","automatic_retry_of","replacement_input_digest"}}
+    candidate.update(attempt_id=aid,completion_gate="code-execute")
+    retry=self.arg(command,"--automatic-retry-of")
+    if retry:candidate["automatic_retry_of"]=retry
+    REPLACEMENT.admission(self.jobs,self.jobs.read_text().splitlines(),candidate)
+    if "--dry-run" in command:
+     return SimpleNamespace(returncode=0,stdout="check=ok\n",stderr="")
+    commands.append(command)
+    row=f"now\topen\t{self.repo}\t{self.repo}\tgap-three\t"+",".join(f"{k}={v}" for k,v in candidate.items())
+    started="--start" in command
+    self.assertTrue(DC.claim_attempt_row(self.jobs,aid,row,launch=started))
+    return SimpleNamespace(returncode=0,stdout=("check=ok\nregistered_worker=1\n"
+                          f"child_spawned={int(started)}\nattempt_id={aid}\n"),stderr="")
+   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","execute","--slug","gap-three",
+         "--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),
+         "--prompt-file",str(prompt),"--start"]
+   out=io.StringIO()
+   with mock.patch.object(sys,"argv",argv),self.compiled_order(), \
+        mock.patch.object(F.subprocess,"run",side_effect=wrapper), \
+        mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})), \
+        contextlib.redirect_stdout(out):
+    code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+   self.assertEqual(code,0,out.getvalue())
+   self.assertEqual(len(commands),1)
+   self.assertIn("registered_worker=1",out.getvalue())
+   self.assertIn("child_spawned=1",out.getvalue())
+   self.assertNotIn("--automatic-retry-of",commands[0])
+   self.assertTrue(self.jobs.read_bytes().startswith(original))
+   launched=F.registry_rows(self.jobs,route["route_id"],"execute")[-1]
+   self.assertEqual(launched["completion_gate"],"code-execute")
+   self.assertNotIn("automatic_retry_of",launched)
+   self.assertTrue(REPLACEMENT._budget_exhausted(self.jobs,meta))
+
  def test_a_readable_result_in_the_launch_window_is_reported_not_retried(self):
   for note,failure_class,verdict in (("dead-worker-fail","fail","FAIL"),("dead-worker-blocked","blocked","BLOCKED")):
    with self.subTest(verdict=verdict):

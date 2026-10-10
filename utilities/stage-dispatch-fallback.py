@@ -1910,7 +1910,14 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
 
     prior_failures = registry_failures(args.jobs, route["route_id"], node["id"])
     prior_rows = registry_rows(args.jobs, route["route_id"], node["id"])
-    args.automatic_retry_of = retry_predecessor(prior_rows)
+    # A fresh owner assignment is new work, not an automatic replay of the
+    # interrupted assignment. Capped rounds retain their admission above.
+    request_task = (args.prompt_file.read_text(encoding="utf-8")
+                    if args.prompt_file is not None
+                    and not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node)
+                    else None)
+    args.automatic_retry_of = retry_predecessor(
+        prior_rows, jobs=args.jobs, task=request_task)
     failed_tuples = set(args.failed_tuple) | set(prior_failures)
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
