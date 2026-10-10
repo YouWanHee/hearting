@@ -24,6 +24,43 @@ class ControlledConsumerTestCase(unittest.TestCase):
   with controlled_process_scope(lambda:getattr(self,"jobs",None)):
    return super().run(result)
 
+class PreviousBootQuiescenceTest(unittest.TestCase):
+ def test_exact_retained_identity_uses_shared_host_proof_before_pid_reuse(self):
+  import resource_run_registry as R
+  old='83f954bc-4963-4dfa-9f2f-c8f3597900a6'
+  current={'boot_id':'67138871-1a60-467f-b9dc-d46749025baa','boot_host':'local'}
+  with tempfile.TemporaryDirectory() as td:
+   metadata={'artifact_root':td,'pid':'123','pid_start':'456','pid_ns':'pid:[789]'}
+   state=Path(td)/'.runtime/model-worker-governor/state.json';state.parent.mkdir(parents=True)
+   identity={'pid':123,'starttime':'456','pid_namespace':789,'boot_id':old}
+   def write(value):state.write_text(json.dumps({'claims':{'token':{'claimant_identity':value}}}))
+   with mock.patch.object(R,'boot_identity',return_value=current), \
+     mock.patch.object(R,'local_boot_history',return_value={old,current['boot_id']}), \
+     mock.patch.object(D,'_attempt_process_quiescence_impl',side_effect=AssertionError('reused PID')):
+    write(identity)
+    result=D.attempt_process_quiescence(metadata)
+    self.assertEqual((result.state,result.reason),('quiescent','host-reboot'))
+    for value in ({**identity,'boot_host':'foreign'}, {**identity,'boot_id':'invalid'}):
+     write(value)
+     self.assertEqual(D.attempt_process_quiescence(metadata).state,'unverifiable')
+    write(identity)
+    with mock.patch.object(R,'local_boot_history',return_value={current['boot_id']}):
+     self.assertEqual(D.attempt_process_quiescence(metadata).state,'unverifiable')
+    for changes in ({'claimant_pid':124}, {'claimant_starttime':'wrong'},
+      {'claimant_witness':{'identity':{**identity,'boot_host':'foreign'}}}):
+     state.write_text(json.dumps({'claims':{'token':{'claimant_identity':identity,**changes}}}))
+     self.assertEqual(D.attempt_process_quiescence(metadata).state,'unverifiable')
+    state.write_text(json.dumps({'claims':{'old':{'claimant_identity':identity},
+      'current':{'claimant_identity':{**identity,'boot_id':current['boot_id']}}}}))
+    self.assertEqual(D.attempt_process_quiescence(metadata).state,'unverifiable')
+   write({**identity,**current})
+   expected=D.ProcessQuiescence('live','normal-current-boot')
+   with mock.patch.object(R,'boot_identity',return_value=current), \
+     mock.patch.object(D,'_attempt_process_quiescence_impl',return_value=expected) as normal:
+    self.assertEqual(D.attempt_process_quiescence(metadata),expected)
+    normal.assert_called_once_with(metadata)
+
+
 class RuntimeOwnerLaunchPredicateTest(unittest.TestCase):
  def test_workflow_receipt_uses_the_shared_exact_predicate(self):
   args=type("Args",(),dict(worker_type="owner",owner_route_binding=None,

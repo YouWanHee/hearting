@@ -66,6 +66,105 @@ def _legacy_migration_return(root):
     }
 
 
+class PreviousBootAdmissionTest(unittest.TestCase):
+    old = '83f954bc-4963-4dfa-9f2f-c8f3597900a6'
+
+    def seed(self, root, current):
+        old = {**current, 'boot_id': self.old}
+        def operation(data, now):
+            for index in range(10):
+                token = f'old-{index}'
+                data['claims'][token] = {'class': 'dispatch', 'claimed_at': now,
+                    'claimant_identity': old, 'claimant_pid': os.getpid(),
+                    'claimant_starttime': process_start_ticks(os.getpid())}
+                if index < 7:
+                    data['leases'][token] = {'class': 'dispatch', 'acquired_at': now,
+                        'pid': os.getpid(), 'starttime': process_start_ticks(os.getpid()),
+                        'claimant_identity': old}
+            for index in range(2):
+                data['leases'][f'current-{index}'] = {'class': 'dispatch',
+                    'acquired_at': now, 'claimant_identity': current}
+            for index in range(13):
+                data['reservations'][f'unknown-{index}'] = {'class': 'dispatch',
+                    'reserved_at': now, 'owner_pid': os.getpid(),
+                    'owner_starttime': process_start_ticks(os.getpid())}
+            data['reservations']['old-owner'] = {'class': 'dispatch',
+                'reserved_at': now, 'owner_identity': old}
+        GOVERNOR._state_change(root, operation)
+
+    def test_normal_admission_returns_local_past_boot_without_pid_or_witness_reclaim(self):
+        import resource_run_registry as R
+        current = {**GOVERNOR.capture_local_identity()}
+        # Match pre-host-field installed records through the local journal.
+        current.pop('boot_host')
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(R, 'local_boot_history', return_value={self.old, current['boot_id']}):
+            self.seed(root, current)
+            before = json.loads(Path(root, 'state.json').read_text())
+            with mock.patch.object(GOVERNOR, 'reclaim', side_effect=AssertionError('manual reclaim')):
+                tokens = GOVERNOR.reserve(root, 'dispatch', 2, total=24, budget=40)
+            after = json.loads(Path(root, 'state.json').read_text())
+            self.assertEqual(len(tokens), 2)
+            self.assertEqual(set(after['leases']), {'current-0', 'current-1'})
+            self.assertEqual(len(after['reservations']), 15)
+            for index in range(13):
+                token = f'unknown-{index}'
+                self.assertEqual(after['reservations'][token], before['reservations'][token])
+            for claim in after['claims'].values():
+                self.assertEqual(claim['reclaimed_by'], 'host-reboot')
+                self.assertFalse(claim['release_proven'])
+                self.assertEqual(claim['claimant_identity']['boot_id'], self.old)
+            GOVERNOR._state_change(root, lambda data, now: None)
+            self.assertEqual(json.loads(Path(root, 'state.json').read_text()), after)
+
+    def test_foreign_unknown_current_and_contradictory_records_are_preserved(self):
+        import resource_run_registry as R
+        current = GOVERNOR.capture_local_identity()
+        old = {**current, 'boot_id': self.old}
+        foreign = {**old, 'boot_host': 'another-host'}
+        unknown = {**old, 'boot_id': 'invalid'}
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(R, 'local_boot_history', return_value={self.old, current['boot_id']}):
+            def seed(data, now):
+                for token, identity in [('foreign', foreign), ('unknown', unknown), ('current', current), ('conflict', old)]:
+                    data['leases'][token] = {'class': 'dispatch', 'claimant_identity': identity}
+                    data['reservations'][token] = {'class': 'dispatch', 'owner_identity': identity}
+                    data['claims'][token] = {'class': 'dispatch', 'claimant_identity': identity}
+                data['claims']['conflict']['claimant_identity'] = current
+                data['reservations'].pop('conflict')
+                for token, changes in [('pid-mismatch', {'pid': os.getpid() + 1}),
+                        ('start-mismatch', {'starttime': 'wrong'}),
+                        ('witness-mismatch', {'claimant_witness': {'identity': current}})]:
+                    data['leases'][token] = {'class': 'dispatch', 'claimant_identity': old, **changes}
+                data['claims']['claim-pid-mismatch'] = {'claimant_identity': old, 'claimant_pid': os.getpid() + 1}
+                data['reservations']['owner-mismatch'] = {'owner_identity': old, 'owner_starttime': 'wrong'}
+                data['reservations']['owner-witness-mismatch'] = {'owner_identity': old, 'owner_witness': {'identity': current}}
+                data['leases']['different-claim'] = {'class': 'dispatch', 'claimant_identity': old}
+                data['claims']['different-claim'] = {'claimant_identity': {**old, 'pid': os.getpid() + 1}}
+            GOVERNOR._state_change(root, seed)
+            before = Path(root, 'state.json').read_bytes()
+            GOVERNOR._state_change(root, lambda data, now: None)
+            self.assertEqual(Path(root, 'state.json').read_bytes(), before)
+
+    def test_past_boot_return_does_not_refund_start_budget(self):
+        import resource_run_registry as R
+        current = GOVERNOR.capture_local_identity()
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(R, 'local_boot_history', return_value={self.old, current['boot_id']}):
+            def seed(data, now):
+                data['leases']['old'] = {'class': 'dispatch',
+                    'claimant_identity': {**current, 'boot_id': self.old}}
+                data['starts'] = [now]
+                data['start_records'] = [{'at': now, 'class': 'dispatch'}]
+            GOVERNOR._state_change(root, seed)
+            with self.assertRaises(GOVERNOR._StartBudgetReached):
+                GOVERNOR.reserve(root, 'dispatch', 1, total=24, budget=1)
+            GOVERNOR._state_change(root, lambda data, now: None)
+            after = json.loads(Path(root, 'state.json').read_text())
+            self.assertFalse(after['leases'])
+            self.assertEqual(len(after['starts']), 1)
+
+
 class GovernorTest(unittest.TestCase):
     def manifest(self, second_harness="claude"):
         return build_manifest(

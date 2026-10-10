@@ -90,7 +90,57 @@ def local_boot_history(current_boot: str) -> frozenset[str]:
         return frozenset()
 
 
-def legacy_resource_boot(run: dict) -> str | None:
+def previous_boot_evidence(identity: dict) -> dict | None:
+    """The shared owner/resource/governor proof of this host's past kernel."""
+    if not isinstance(identity, dict):
+        return None
+    current = boot_identity()
+    try:
+        old = str(uuid.UUID(identity['boot_id']))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return None
+    if not current or old == current['boot_id']:
+        return None
+    if 'boot_host' in identity:
+        if identity['boot_host'] != current['boot_host']:
+            return None
+    elif old not in local_boot_history(current['boot_id']):
+        return None
+    return {'previous_boot_id': old, **current}
+
+
+def recorded_governor_identity(worker: dict) -> dict | None:
+    """Read the exact worker's retained claim; ambiguous identities stay unknown."""
+    if not all(worker.get(key) for key in ('artifact_root', 'pid', 'pid_start', 'pid_ns')):
+        return None
+    try:
+        path = Path(worker['artifact_root']) / '.runtime/model-worker-governor/state.json'
+        state = json.loads(path.read_text())
+        identities = {}
+        for claim in state.get('claims', {}).values():
+            identity = claim.get('claimant_identity') or {}
+            if (str(identity.get('pid')) == worker['pid']
+                    and str(identity.get('starttime')) == worker['pid_start']
+                    and f"pid:[{identity.get('pid_namespace')}]" == worker['pid_ns']):
+                for field, key in (('claimant_pid', 'pid'), ('claimant_starttime', 'starttime')):
+                    if field in claim and str(claim[field]) != str(identity.get(key)):
+                        return {'boot_id': None}
+                witness = claim.get('claimant_witness')
+                if isinstance(witness, dict) and 'identity' in witness and witness['identity'] != identity:
+                    return {'boot_id': None}
+                try:
+                    boot = str(uuid.UUID(identity['boot_id']))
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    return {'boot_id': None}
+                identities[(boot, identity.get('boot_host'))] = {**identity, 'boot_id': boot}
+        if len(identities) > 1:
+            return {'boot_id': None}
+        return next(iter(identities.values())) if identities else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def legacy_resource_identity(run: dict) -> dict | None:
     """Use the exact recorded owner's governor identity for pre-UUID resources."""
     try:
         from dispatch_contract import parse_registry_metadata
@@ -116,18 +166,15 @@ def legacy_resource_boot(run: dict) -> str | None:
                 or owner.get('pid_start') != str(wait['owner_start'])
                 or owner.get('pid_ns') != run.get('pid_namespace')):
             return None
-        path = Path(owner['artifact_root']) / '.runtime/model-worker-governor/state.json'
-        state = json.loads(path.read_text())
-        boots = set()
-        for claim in state.get('claims', {}).values():
-            identity = claim.get('claimant_identity') or {}
-            if (str(identity.get('pid')) == owner['pid']
-                    and str(identity.get('starttime')) == owner['pid_start']
-                    and f"pid:[{identity.get('pid_namespace')}]" == owner['pid_ns']):
-                boots.add(str(uuid.UUID(identity['boot_id'])))
-        return boots.pop() if len(boots) == 1 else None
+        return recorded_governor_identity(owner)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def legacy_resource_boot(run: dict) -> str | None:
+    """Compatibility projection of the exact retained identity."""
+    identity = legacy_resource_identity(run)
+    return identity.get('boot_id') if identity else None
 
 
 def reboot_evidence(run: dict) -> dict | None:
@@ -138,14 +185,8 @@ def reboot_evidence(run: dict) -> dict | None:
     exact owner boot in this host's journal, prove a local previous-boot run.
     """
     if run.get('boot_id') or run.get('boot_host'):
-        current = boot_identity()
-        try:
-            old = str(uuid.UUID(run['boot_id']))
-        except (KeyError, ValueError, TypeError):
-            return None
-        if current and run.get('boot_host') == current['boot_host'] and old != current['boot_id']:
-            return {'previous_boot_id': old, **current}
-        return None
+        # Partial resource hints never replace its exact legacy owner binding.
+        return previous_boot_evidence(run) if run.get('boot_host') else None
     if (run.get('resource_policy') not in {'supervised-owner', 'verified-resume'}
             or not run.get('started_at') or not run.get('starttime') or not run.get('owner_wait')):
         return None
@@ -155,11 +196,9 @@ def reboot_evidence(run: dict) -> dict | None:
         start, launched = int(run['starttime']), float(run['started_at'])
         if (boot and 0 < launched < boot and start > uptime * os.sysconf('SC_CLK_TCK')
                 and run.get('pid_namespace') == os.readlink('/proc/self/ns/pid')):
-            current = boot_identity()
-            previous = legacy_resource_boot(run)
-            if (current and previous and previous != current['boot_id']
-                    and previous in local_boot_history(current['boot_id'])):
-                return {'previous_boot_id': previous, **current, 'reason': 'boot-clock-reset'}
+            proof = previous_boot_evidence(legacy_resource_identity(run))
+            if proof:
+                return {**proof, 'reason': 'boot-clock-reset'}
     except (OSError, KeyError, ValueError, TypeError, IndexError):
         pass
     return None
