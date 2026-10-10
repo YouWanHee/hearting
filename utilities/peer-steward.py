@@ -3285,9 +3285,9 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
             provenance=(("target", target),))
 
 
-def _prompt_input_reason(target, harness, state):
+def _prompt_input_reason(target, harness, state, *, expected_sid=None):
     """Withhold keyboard input when a form, draft or unreadable box is present."""
-    readiness = _pane_readiness(target, state, expected_harness=harness)
+    readiness = _pane_readiness(target, state, expected_harness=harness, expected_sid=expected_sid)
     if readiness.state == "unknown":
         return readiness.reason
     if readiness.reason.startswith("bound-registered-work") and readiness.state != "ready":
@@ -3603,7 +3603,7 @@ def _resume_registered_obligation(duty, store):
     from dispatch_completion_join import current_attempt_row, materialize_after_terminal_close
     from dispatch_notice_state import keep_claim
     import dispatch_pending_delivery as pending
-    from route_authority import owns
+    from dispatch_seat_handover import effective_parent
     spec = importlib.util.spec_from_file_location(
         "_retained_rewake", _UTILITIES_DIR.parent / "hooks/dispatch-owner-rewake.py")
     rewake = sys.modules.get(spec.name)
@@ -3618,24 +3618,35 @@ def _resume_registered_obligation(duty, store):
     row = current_attempt_row(jobs, identity["attempt_id"])
     if row is None:
         return
-    if not owns(row.metadata, identity["session_id"], jobs):
-        store.update(duty["id"], state="cancelled", delivery="handed-away", cleanup="complete")
-        return
+    # The duty follows confirmed handover; the signed queue stays under the
+    # registered parent, even when its current recipient is a successor.
+    recipient_sid = effective_parent(row.metadata, jobs)
+    storage_recipient = row.metadata.get("parent_sid", "")
     if row.status not in {"open", "running", "done"}:
         return
+    if row.status == "done":
+        if row.metadata.get("delivery_intent") != "1":
+            store.update(duty["id"], state="complete", delivery="not-required", cleanup="complete")
+            return
+        materialize_after_terminal_close(jobs, row.attempt_id)
+        delivery_id = row.metadata.get("delivery_id", "")
+        record = pending.read(jobs.parent, storage_recipient, delivery_id)
+        if record and record.get("state") in {"acked", "rejected", "expired"}:
+            store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
+            return
     old_server = _HERDR_SESSION
     globals()["_HERDR_SESSION"] = None if identity["server"] == "default" else identity["server"]
     try:
         result = subprocess.run(_herdr_argv("agent", "list"), capture_output=True, text=True, timeout=5)
         agents = (json.loads(result.stdout).get("result") or {}).get("agents") or []
         matches = [a for a in agents if a.get("agent") == "claude"
-                   and (a.get("agent_session") or {}).get("value") == identity["session_id"]]
+                   and (a.get("agent_session") or {}).get("value") == recipient_sid]
         if len(matches) != 1:
             return
         pane = matches[0]["pane_id"]
-        if _resolve_target(pane)[:2] != ("claude", identity["session_id"]):
+        if _resolve_target(pane)[:2] != ("claude", recipient_sid):
             return
-        launch = rewake.Launch(identity["attempt_id"], jobs, identity["session_id"])
+        launch = rewake.Launch(identity["attempt_id"], jobs, recipient_sid)
         win = None
         if row.status in {"open", "running"}:
             claims = []
@@ -3647,22 +3658,13 @@ def _resume_registered_obligation(duty, store):
                 return
             message = rewake.gate_wake_message(launch, notices)
         else:
-            if row.metadata.get("delivery_intent") != "1":
-                store.update(duty["id"], state="complete", delivery="not-required", cleanup="complete")
-                return
-            materialize_after_terminal_close(jobs, row.attempt_id)
-            delivery_id = row.metadata.get("delivery_id", "")
-            record = pending.read(jobs.parent, identity["session_id"], delivery_id)
-            if record and record.get("state") in {"acked", "rejected", "expired"}:
-                store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
-                return
             owner = "retained-rewake:" + duty["id"]
             if record and record.get("state") in {"claimed", "sent-ambiguous"}:
-                pending.reclaim(jobs.parent, identity["session_id"], delivery_id,
+                pending.reclaim(jobs.parent, storage_recipient, delivery_id,
                                 now_ns=time.monotonic_ns())
-            record = pending.claim(jobs.parent, identity["session_id"], delivery_id,
+            record = pending.claim(jobs.parent, storage_recipient, delivery_id,
                                    claim_owner=owner, lease_seconds=30, require_generation_proof=False)
-            if not keep_claim(jobs.parent, identity["session_id"], delivery_id, record, owner, jobs=jobs):
+            if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
                 return
             win = (delivery_id, owner)
             _state, message = rewake.classified_receipt(launch, "ready", "retained-carrier", rewake.agent_home())
@@ -3673,14 +3675,14 @@ def _resume_registered_obligation(duty, store):
             body.flush()
             args = build_parser().parse_args(["prompt", pane, "--body-file", body.name,
                                               "--ref", duty["id"]])
-            code = cmd_prompt(args)
+            code = cmd_prompt(args, expected_recipient=("claude", recipient_sid))
         if code in {0, 3}:
             if win:
-                pending.mark_sent_ambiguous(jobs.parent, identity["session_id"], win[0], claim_owner=win[1])
+                pending.mark_sent_ambiguous(jobs.parent, storage_recipient, win[0], claim_owner=win[1])
             store.update(duty["id"], state="complete" if win else "pending",
                          delivery="peer-courier", cleanup="complete" if win else "pending")
         elif win:
-            pending.release_claim(jobs.parent, identity["session_id"], win[0], claim_owner=win[1])
+            pending.release_claim(jobs.parent, storage_recipient, win[0], claim_owner=win[1])
     finally:
         globals()["_HERDR_SESSION"] = old_server
 
@@ -3775,7 +3777,7 @@ def _verify_after_send(target, first, t_harness, t_sid, sent_at):
     return "queued", "prompt-box", "prompt-box-residue"
 
 
-def cmd_prompt(args):
+def cmd_prompt(args, *, expected_recipient=None):
     """F-100c — the harness-neutral steward send: `herdr agent prompt <target> <body +
     trailer>`, recorded with the target's exact session id (herdr `agent get`) and the
     sender's name. The trailer lets the receiving harness write its own `notice`.
@@ -3807,7 +3809,8 @@ def cmd_prompt(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
     if args.body_file:
-        body = open(args.body_file, encoding="utf-8", errors="replace").read()
+        with open(args.body_file, encoding="utf-8", errors="replace") as handle:
+            body = handle.read()
     elif args.body_stdin:
         body = sys.stdin.read()
     else:
@@ -3820,13 +3823,17 @@ def cmd_prompt(args):
     from_identity = (from_sid, from_harness, _project_of(os.getcwd()))
     from_name = _from_name(from_harness, from_sid)
     t_harness, t_sid, _t_name = _resolve_target(args.target)
+    if expected_recipient is not None and (t_harness, t_sid) != expected_recipient:
+        print("prompted=false reason=target-identity-changed")
+        return 5
     transfer_ref = None
     state_before, target_pane = _agent_state(args.target)
     if not args.no_verify and state_before in {"working", "blocked"} and args.wait_idle_ms > 0:
         _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
         state_before, target_pane = _agent_state(args.target)
     flushed = 0
-    input_reason = _prompt_input_reason(args.target, t_harness, state_before)
+    input_options = {"expected_sid": t_sid} if expected_recipient is not None else {}
+    input_reason = _prompt_input_reason(args.target, t_harness, state_before, **input_options)
     if not input_reason:
         # Deferred rows go first: a target receivable now takes what an
         # earlier form-open verdict stranded (2026-10-07). Never raises and
@@ -3878,7 +3885,7 @@ def cmd_prompt(args):
             claimed = None
     if t_harness in {"claude", "opencode"} and not input_reason:
         # Preparation/claim may take time: the final read belongs after them.
-        input_reason = _prompt_input_reason(args.target, t_harness, state_before)
+        input_reason = _prompt_input_reason(args.target, t_harness, state_before, **input_options)
         if input_reason:
             if claimed is not None:
                 peer_message.release_unsent_herdr_claim(claimed, receipt=input_reason)

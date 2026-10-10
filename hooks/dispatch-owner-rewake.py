@@ -1524,7 +1524,7 @@ def _retain_completion(launch: Launch, claim: ArmClaim) -> None:
     """The existing outer task runner retains the wake if this native hook dies."""
     try:
         row = current_attempt_row(launch.jobs, launch.attempt_id)
-        if (row is None or row.metadata.get("parent_sid") != launch.session_id
+        if (row is None or seat_handover.effective_parent(row.metadata, launch.jobs) != launch.session_id
                 or row.metadata.get("parent_completion_delivery") != "claude-parent-runtime"):
             return
         identity = {"jobs": str(launch.jobs.resolve()), "attempt_id": launch.attempt_id,

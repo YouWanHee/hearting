@@ -73,6 +73,7 @@ class CarrierReleasePruneTest(unittest.TestCase):
                 newer = releases / "newer"
                 newer.mkdir()
                 (newer / "carrier.py").write_text("pass")
+                # destructive-ok: reason=rotate this test's temporary projection; boundary=projection under TemporaryDirectory
                 projection.unlink()
                 projection.symlink_to(newer)
                 (releases / "current").mkdir()

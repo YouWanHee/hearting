@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import fcntl
 import json
 import os
 import signal
@@ -70,6 +71,50 @@ class ObligationStoreTest(unittest.TestCase):
         )
         self.assertEqual((ready.state, ready.scope, ready.outcome),
                          ("ready", "native-turn", None))
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_unsupported_observer_releases_same_lock_without_losing_accepted_duties(self):
+        self._check_observer_handoff(supported=False)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_supported_observer_keeps_its_pid_and_same_lock(self):
+        self._check_observer_handoff(supported=True)
+
+    def _check_observer_handoff(self, supported):
+        duty = self.store.create("registered-batch-fixture", "registered-batch",
+                                 {"session_id": "parent"}, {"carrier": "claude-parent-runtime"})
+        prior = self.store.create("message-fixture", "message", {"session_id": "other"}, {"ref": "old"})
+        script = self.root / "peer-steward.py"
+        source = "import time\nprint('ready', flush=True)\ntime.sleep(30)\n"
+        if supported:
+            source = "def _resume_registered_obligation(): pass\n" + source
+        script.write_text(source)
+        lock_path = self.store.root / "runner.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        process = subprocess.Popen([sys.executable, str(script), "__obligation-runner",
+                                    "--state-root", str(self.root), "--lock-fd", str(fd)],
+                                   pass_fds=(fd,), stdout=subprocess.PIPE, text=True)
+        os.close(fd)
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            with mock.patch.object(obligations.subprocess, "Popen") as spawned, \
+                    mock.patch.object(obligations, "_RUNNERS", []):
+                self.assertTrue(obligations.ensure_runner(self.root))
+                if supported:
+                    self.assertIsNone(process.poll())
+                    spawned.assert_not_called()
+                else:
+                    self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+                    spawned.assert_called_once()
+                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
+            self.assertEqual(self.store.get(duty["id"]), duty)
+            self.assertEqual(self.store.get(prior["id"]), prior)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
 
     def test_observer_error_after_fulfillment_cannot_reopen_duty(self):
         self.store.create("retire-done", "retire", {"pane": "w1:p1"},

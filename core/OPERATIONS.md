@@ -726,6 +726,11 @@ the same current attempt and pending notice and hands it to the existing peer
 courier for the exact parent session. Native and recovery delivery share the
 notice claim; forms and busy turns use the courier's existing retained-message
 path. Codex and OpenCode keep their existing retained completion controllers.
+Confirmed session handover changes the recipient, while the signed notice stays
+under the registered parent's storage key. If an older outer observer cannot
+process this retained duty, its exact PID and existing lock identify a safe
+observer replacement: accepted records remain intact and the replacement takes
+the same lock. A supported observer and the native carrier stay alive.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
