@@ -131,7 +131,7 @@ def description(row):
 
 
 def select(observation, leases, requested=None, share=False):
-    if requested == "":
+    if requested in {"", "-1"}:
         return []  # explicit CPU-only
     if (not observation.get("reachable") or observation.get("detail")
             or observation.get("reservation_detail") or observation.get("gpu_status")
@@ -282,7 +282,7 @@ def local_observation():
 def resource_admission(node, command, *, gpu_scoped=False, share=False, jobs=None, run_id=""):
     """Use the route's GPU declaration and the existing CUDA environment choice."""
     requested = requested_devices(command, os.environ.get("CUDA_VISIBLE_DEVICES"))
-    if requested == "" or (requested is None and node.get("resource_class") != "gpu" and not gpu_scoped):
+    if requested in {"", "-1"} or (requested is None and node.get("resource_class") != "gpu" and not gpu_scoped):
         return None, None, {}
     observation = local_observation()
     path = state_path({**os.environ, **({"AGENT_DISPATCH_JOBS": str(jobs)} if jobs else {})})

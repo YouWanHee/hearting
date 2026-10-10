@@ -662,6 +662,10 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
             if getattr(entity, "work_projection", None) is None:
                 entity.work_projection = WorkProjection(source="none", ambiguity="projection-error")
 
+    if not fast_first:
+        from ..work_titles import annotate
+        annotate(sessions, jobs, resource_jobs)
+
     # F-98: read-only peer-message ledger projection. Additive and fail-soft — a missing
     # or unreadable ledger must leave every Session field at its default so the rendered
     # snapshot is byte-identical to a pre-SD-122 board.

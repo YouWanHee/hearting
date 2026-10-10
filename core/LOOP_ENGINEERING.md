@@ -185,6 +185,12 @@ Unknown observations stay unknown, and slow details must not stop basic refresh.
 Project activity includes running resources nested under an idle owner. A file
 update is labelled as a file update, never as completion. Recent results show
 the recorded task, result and event time; an unproven gate is not a failed task.
+Work names share one display rule across recent results, resource rows and GPU
+links: prefer the existing cycle easy title or one-line summary, then its
+recorded title and campaign title. Without a usable title, show a short readable
+name with locator dates and execution suffixes removed. Read titles in the
+existing detail pass; never wait for them before publishing basic observations.
+The name does not repeat the same command or execution identity on its line.
 Current execution or wait observations precede generated text. Older titles
 are labelled as previous subjects, and summaries as previous text with their
 own age, including sentences that say work is running or complete.
@@ -213,6 +219,8 @@ device and stage symbols separately. Names, current actions and controls share
 the terminal's width budget; internal identifiers belong in detail. Support
 work carries its caller's observed session/seat independently of execution and
 delivery authority, and is labelled project support when that link is unproven.
+Legends explain statuses and roles in the audience's language, including project
+activity and expanded GPU commands; a copied dot or arrow must retain its meaning.
 GPU owner labels add who is responsible, such as a verified Fleet session tag;
 they do not repeat the execution's run/job identifier beside its training name.
 Raw owner identifiers remain available in structured output.

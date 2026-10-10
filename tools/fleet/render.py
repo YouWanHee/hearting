@@ -41,6 +41,7 @@ from .display import label as _user_label, project as _user_project, gpu_owner a
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo, titles
+from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
 from .collectors import compute_hosts as _compute_hosts
 from .refresh import LiveSnapshot, RefreshPump, background_read, as_snapshot
 from .session_handle import sanitize_title as _sanitize_session_title
@@ -1921,8 +1922,8 @@ def _unused_badge(s, compact=False):
     already carries elapsed time in its own time cell — so it yields first, and only when the
     name would otherwise be clipped."""
     if compact:
-        return " unused"
-    return " unused %s" % fmt_min(s.elapsed_min if s.elapsed_min is not None else None)
+        return " 미사용"
+    return " 미사용 %s" % fmt_min(s.elapsed_min if s.elapsed_min is not None else None)
 
 
 def _interaction_badge(s):
@@ -3402,20 +3403,20 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     jw = sum(1 for j in listed_jobs if j.liveness == "working")
     spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
     pulse = [("  fleet ", "head"),
-             (spin + " %d" % n_wk, "g_spin"), (" working   ", "dim"),
-             ("● %d" % n_id, "g_work_off"), (" idle   ", "dim")]
+             (spin + " %d" % n_wk, "g_spin"), (" 작업 중  ", "dim"),
+             ("● %d" % n_id, "g_work_off"), (" 대기  ", "dim")]
     # F-26: only when there IS one — a healthy board stays quiet (F-12 contract).
     if n_un:
-        pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (" unused   ", "dim")]
+        pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (" 미사용  ", "dim")]
     if n_dt:
-        pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (" detached   ", "dim")]
+        pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (" 분리됨  ", "dim")]
     if _jobs_unconfirmed(observations):
         pulse += [("↳ 작업 목록 미확인", "lvl_y")]
         if listed_jobs:
             pulse += [(" (마지막 관측 %d개)" % len(listed_jobs), "dim")]
     elif listed_jobs:
         pulse += [("↳ %d" % len(listed_jobs), "dim"),
-                  (" job%s (%d working)" % ("s" if len(listed_jobs) != 1 else "", jw), "dim")]
+                  (" 작업(%d 실행)" % jw, "dim")]
     return pulse
 
 
@@ -3614,7 +3615,7 @@ def _group_last_result(sessions, jobs, resources):
     for child in children:
         if (child.liveness in ("exited", "dead") and type(child.exit_code) is int
                 and isinstance(child.ended_at, (int, float)) and not isinstance(child.ended_at, bool)):
-            candidates.append({"name": "자원 " + (child.node or child.run_id),
+            candidates.append({"name": "자원 " + _resource_name(child),
                                "result": "failure" if child.exit_code else "success",
                                "at": child.ended_at, "source": "resource-exit"})
     return max((value for value in candidates if isinstance(value, dict)
@@ -4516,7 +4517,7 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
         glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
         if child.liveness == "working":
             glyph, key = "●", "g_work" if _BLINK_ON else "g_work_off"
-        node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+        node = _gpu_safe_text(_resource_name(child))
         tail = ("  " + fmt_min(child.elapsed_min) if child.liveness == "working"
                 else "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min)))
         # Name and elapsed survive first; placement then counters yield as needed.
@@ -4543,11 +4544,28 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
 def _resource_gpu_suffix(children, room=None):
     """Resource identity once at the GPU line end; working is already implicit."""
     unique = {child.run_id: child for child in children}
+    title_groups = {}
+    for child in unique.values():
+        key = resource_title_key(child)
+        if key:
+            title_groups[key] = title_groups.get(key, 0) + 1
+    shown_titles = set()
     parts = []
     for child in unique.values():
-        node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+        node = _gpu_safe_text(_resource_name(child))
+        key = resource_title_key(child)
+        if title_groups.get(key, 0) > 1:
+            # A shared cycle title names the work once; each execution still
+            # keeps its own short node, state, elapsed time and counters.
+            short_node = _gpu_safe_text(_readable_name(child.route_node or child.node))
+            short_node = "" if short_node == node else short_node
+            if key not in shown_titles:
+                shown_titles.add(key)
+                node += " · " + short_node if short_node else ""
+            else:
+                node = short_node
         state = "" if child.liveness == "working" else " " + _gpu_safe_text(child.liveness)
-        parts.append([child, node + state + " " + fmt_min(child.elapsed_min)])
+        parts.append([child, (node + state + " " + fmt_min(child.elapsed_min)).strip()])
     base = "".join(" · " + text for _child, text in parts)
     extra = max(0, room - _dw(base)) if room is not None else None
     out = ""
@@ -4881,11 +4899,11 @@ def _resource_now_text(entity, room=None):
                     and type(getattr(child, "exit_code", None)) is int]
         if terminal:
             child = max(terminal, key=lambda c: getattr(c, "ended_at", None) or 0)
-            node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+            node = _gpu_safe_text(_resource_name(child))
             command = _resource_command_label(getattr(child, "command", None))
             state = "실패" if child.exit_code else "종료"
-            text = "마지막 %s%s · %s(exit %d) · %s" % (
-                node, " " + command if command else "", state, child.exit_code,
+            text = "마지막 %s · %s(exit %d) · %s" % (
+                subject_command(node, command), state, child.exit_code,
                 _resource_log_age(child))
             return _clip_w(text, room) if room is not None else text
     if not resource_context:
@@ -4895,7 +4913,7 @@ def _resource_now_text(entity, room=None):
     snapshot, _age = _fresh_compute_hosts()
     child = children[0]
     where, resources = _resource_location(child, snapshot)
-    node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+    node = _gpu_safe_text(_resource_name(child))
     command = _resource_command_label(getattr(child, "command", None))
     if resources:
         process = next((p for r in resources for p in r.get("processes", ())), None)
@@ -4907,7 +4925,7 @@ def _resource_now_text(entity, room=None):
     facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, log) if part)
     if len(children) > 1:
         facts += " · +%d" % (len(children) - 1)
-    label = node + (" " + command if command else "")
+    label = subject_command(node, command)
     if room is not None:
         budget = room - _dw(" · " + facts)
         if budget > 0:
@@ -5516,6 +5534,9 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
                 if _gpu_commands_folded(resource["host"], resource["index"]):
                     continue
                 name = _gpu_display_command(command)
+            if any(_resource_command_label(name).casefold() in _resource_name(child).casefold()
+                   for child in resource_children):
+                continue
             if name not in names:
                 names.append(name)
         labels[id(resource)] = ", ".join(names)
@@ -5896,7 +5917,7 @@ def _gpu_reservation_rows(leases, indent, width, unplaced=False):
         label = owner.get("label") or "%s:%s" % (owner.get("harness", "?"), str(owner.get("id", "unknown"))[:8])
         started = lease.get("started_at")
         when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
-        task = _gpu_safe_text(lease.get("task") or lease.get("run_id") or "?")
+        task = _gpu_safe_text(_readable_name(lease.get("task") or lease.get("run_id") or "?"))
         prefix = "GPU 예약 · 장치 위치 모름 · " if unplaced else "  reserved "
         row = [(indent + prefix, "lvl_y"), (_gpu_safe_text(label), "tag"),
                (" · " + when + " · " + task, "dim")]
@@ -8095,42 +8116,42 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         ("●", "g_work_off"), (" 대기   ", "dim"),
     ]
     if "unused" in _seen_glyphs:
-        legend += [(_LIVE_GLYPH["unused"], "g_unused"), (" unused   ", "dim")]
+        legend += [(_LIVE_GLYPH["unused"], "g_unused"), (" 미사용   ", "dim")]
     if "detached" in _seen_glyphs:
-        legend += [(_DETACHED_GLYPH, "g_work_off"), (" detached   ", "dim")]
+        legend += [(_DETACHED_GLYPH, "g_work_off"), (" 분리됨   ", "dim")]
     if "stale" in _seen_glyphs:
-        legend += [("·", "g_stale"), (" stale   ", "dim")]
+        legend += [("·", "g_stale"), (" 오래된 관측   ", "dim")]
     if "dead" in _seen_glyphs:
-        legend += [("✕", "g_dead"), (" dead     ", "dim")]
+        legend += [("✕", "g_dead"), (" 종료   ", "dim")]
     if "degraded" in _seen_glyphs:
-        legend += [("◐", "lvl_y"), (" degraded node   ", "dim")]
+        legend += [("◐", "lvl_y"), (" 단계 관측 불완전   ", "dim")]
     if "recovering" in _seen_glyphs:
-        legend += [("…", "lvl_y"), (" recovery pending   ", "dim")]
+        legend += [("…", "lvl_y"), (" 복구 대기   ", "dim")]
     if "blocked" in _seen_glyphs:
-        legend += [("◑", "g_blocked"), (" blocked session   ", "dim")]
+        legend += [("◑", "g_blocked"), (" 입력 대기   ", "dim")]
     if "tag" in _seen_glyphs:
-        legend += [("[", "dim"), ("id", "tag"), ("]", "dim"), (" session   ", "dim")]  # F-100a
+        legend += [("[", "dim"), ("번호", "tag"), ("]", "dim"), (" 세션   ", "dim")]  # F-100a
     if "steward" in _seen_glyphs:
-        legend += [("[", "dim"), ("id", "tag_steward"), ("]", "dim"), (" steward   ", "dim")]  # F-100c
+        legend += [("[", "dim"), ("번호", "tag_steward"), ("]", "dim"), (" 감독   ", "dim")]  # F-100c
     if "herdr" in _seen_glyphs:
-        legend += [(_CTX_ON_TEXT, "herdr_on"), (" pane   ", "dim")]                  # F-100b
+        legend += [(_CTX_ON_TEXT, "herdr_on"), (" 좌석   ", "dim")]                  # F-100b
     if "tty" in _seen_glyphs:
-        legend += [(_CTX_OFF_TEXT, "dim"), (" plain terminal   ", "dim")]
+        legend += [(_CTX_OFF_TEXT, "dim"), (" 일반 터미널   ", "dim")]
     if "child" in _seen_glyphs:
-        legend += [("▾N", "dim"), (" child jobs   ", "dim")]
+        legend += [("▾N", "dim"), (" 하위 작업   ", "dim")]
     if "subagent" in _seen_glyphs:
-        legend += [(_ICON_SUBAGENT, "dim"), (" sub-agent   ", "dim")]
+        legend += [(_ICON_SUBAGENT, "dim"), (" 도우미   ", "dim")]
     if any(not _is_plugin_agent(job) for job in jobs):
-        legend += [("↳", "dim"), (" dispatch   ", "dim")]
+        legend += [("↳", "dim"), (" 위임   ", "dim")]
     if "wt" in _seen_glyphs:
-        legend += [("🚧 N", "dim"), (" worktrees   ", "dim")]
+        legend += [("🚧 N", "dim"), (" 작업공간   ", "dim")]
     if n_mem_total or "mem" in _seen_glyphs:
         # Always expose the board-wide memory total in the legend, even when memory-only groups fold.
-        legend += [("🧠 %d" % n_mem_total, "dim"), (" mem   ", "dim")]
+        legend += [("🧠 %d" % n_mem_total, "dim"), (" 기억   ", "dim")]
     if "loc_foreign" in _seen_glyphs:
-        legend += [("→", "loc_repo"), (" foreign repo   ", "dim")]
+        legend += [("→", "loc_repo"), (" 다른 저장소   ", "dim")]
     if "loc_wt" in _seen_glyphs:
-        legend += [("⌂wt", "loc_repo"), (" worktree   ", "dim")]
+        legend += [("⌂wt", "loc_repo"), (" 연결 작업공간   ", "dim")]
     # F-9(d) `~ derived/inherited value` retired with the marker itself (user 2026-07-16:
     # inherited effort now shows plain — the tilde read as noise).
     lines.extend(_wrap_legend(legend, term_width))
@@ -8142,8 +8163,9 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
 def _reading_legend(term_width, session=True):
     rows = []
     if session:
-        rows.extend(_wrap_legend([("  세션: ", "dim"), ("⠹ 작업 중  ● 대기  ◑ 입력 대기", "dim")], term_width))
-    for text in ("  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량",
+        rows.extend(_wrap_legend([("  세션: ", "dim"), ("⠹ 작업 중  ● 대기  ◑ 입력 대기  ✕ 종료", "dim")], term_width))
+    for text in ("  프로젝트: ● 활동",
+                 "  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량 · ↳ 전체 명령",
                  "  단계: ● 현재  ✓ 완료  ✕ 실패  ○ 예정 · 문맥 %는 대화 사용량"):
         rows.extend(_wrap_route_node("", text, "dim", "", term_width, continuation="  "))
     return rows
@@ -8159,7 +8181,12 @@ def _wrap_legend(legend, term_width):
     if not term_width or not legend:
         return [legend] if legend else []
     lead = legend[0]
-    pairs = [legend[i:i + 2] for i in range(1, len(legend), 2)]
+    pairs, i = [], 1
+    while i < len(legend):
+        # A Fleet-number label uses four color segments but remains one entry.
+        size = 4 if i + 3 < len(legend) and legend[i][0] == "[" and legend[i + 2][0] == "]" else 2
+        pairs.append(legend[i:i + size])
+        i += size
     wrapped = []
     current = [lead]
     current_w = _dw(lead[0])

@@ -142,7 +142,7 @@ class FreshnessTest(unittest.TestCase):
         child = ResourceJob(run_id="run", node="full-run", liveness="exited",
                             exit_code=2, ended_at=self.now - 360)
         result = render._group_last_result([], [], [child])
-        self.assertEqual((result["name"], result["result"]), ("자원 full-run", "failure"))
+        self.assertEqual((result["name"], result["result"]), ("자원 full run", "failure"))
         child.ended_at = None
         self.assertIsNone(render._group_last_result([], [], [child]))
 

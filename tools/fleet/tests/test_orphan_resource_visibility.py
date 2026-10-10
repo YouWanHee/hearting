@@ -64,7 +64,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                        if row and "● GPU gpu-host:0" in render._plain(row)]
                 self.assertEqual(len(gpu), 1)
                 self.assertGreater(gpu[0][0], header)
-                for name in ("s_baseline", "s_strided", "full-run", "1d 3h"):
+                for name in ("s_baseline", "s_strided", "full run", "1d 3h"):
                     self.assertIn(name, gpu[0][1])
                 self.assertNotIn("미등록", gpu[0][1])
                 self.assertNotIn("att-ended-owner", output)
@@ -81,7 +81,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                 output = text(self.lines(sessions=[session]))
                 self.assertEqual(output.count("project/"), 1)
                 self.assertEqual(output.count("● GPU gpu-host:0"), 1)
-                self.assertIn("full-run", output)
+                self.assertIn("full run", output)
                 self.assertEqual(session.work_projection.source, "none")
                 self.assertFalse(getattr(session, "resource_children", None))
 
@@ -100,10 +100,10 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                     gpu_rows = [row for row in output.splitlines()
                                 if "● GPU gpu-host:0" in row]
                     self.assertEqual(len(gpu_rows), 1)
-                    self.assertIn("full-run", gpu_rows[0])
+                    self.assertIn("full run", gpu_rows[0])
                     self.assertIn("2 GB", gpu_rows[0])
                     now_rows = [row for row in output.splitlines()
-                                if "full-run" in row and "● GPU" not in row]
+                                if "full run" in row and "● GPU" not in row]
                     self.assertEqual(len(now_rows), 1)
                     self.assertIn("gpu-host:0", now_rows[0])
                     self.assertIn("로그 없음", now_rows[0])
@@ -116,8 +116,8 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                     render.set_compute_hosts(self.snapshot if expired else None)
                     with mock.patch.object(render, "_COMPUTE_HOSTS_SET_AT", time.monotonic() - 100):
                         output = text(self.lines(process=process))
-                    self.assertIn("resource full-run", output)
-                    self.assertIn("● resource full-run  1d 3h", output)
+                    self.assertIn("resource full run", output)
+                    self.assertIn("● resource full run  1d 3h", output)
                     self.assertNotIn("● GPU", output)
 
     def test_terminal_or_stale_identity_removes_resource_fallback(self):
@@ -127,15 +127,15 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                 with self.subTest(process=process, state=state):
                     output = text(self.lines(children=[replace(self.child, liveness=state)],
                                              process=process))
-                    self.assertNotIn("full-run", output)
+                    self.assertNotIn("full run", output)
                     self.assertNotIn("project/", output)
-        self.assertNotIn("full-run", text(self.lines(children=[])))
+        self.assertNotIn("full run", text(self.lines(children=[])))
 
     def test_gpu_pid_reuse_never_joins_the_resource_line(self):
         child = replace(self.child, pid=501, starttime="999", process_group=None)
         rows, resource_rows = render._gpu_and_resource_rows([child], commands=True)
         self.assertEqual(rows, [])
-        self.assertIn("resource full-run", text(resource_rows))
+        self.assertIn("resource full run", text(resource_rows))
 
     def test_remote_exact_parent_joins_once_without_a_live_owner(self):
         host = self.snapshot["hosts"][0]
@@ -146,7 +146,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
             with self.subTest(process=process):
                 output = text(self.lines(process=process))
                 self.assertEqual(output.count("● GPU gpu-host:0"), 1)
-                self.assertEqual(output.count("full-run"), 1)
+                self.assertEqual(output.count("full run"), 1)
         for process in host["gpus"][0]["processes"]:
             process["owner"]["id"] = "att-unrelated"
         self.assertEqual(render._resource_gpu_resources(self.child, self.snapshot), [])
@@ -156,8 +156,8 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
         output = text(self.lines(children=[self.child, second]))
         self.assertEqual(output.count("● GPU gpu-host:0"), 1)
         self.assertIn("2 GB", output)
-        self.assertIn("full-run", output)
-        self.assertIn("second-node", output)
+        self.assertIn("full run", output)
+        self.assertIn("second node", output)
         self.assertEqual(output.count("s_baseline"), 2)  # top command + project label
 
     def test_owner_session_gpu_overlap_keeps_only_unshown_fallback_processes(self):
@@ -178,13 +178,13 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                         output = text(self.lines(jobs=[owner], process=process))
                         rows = [row for row in output.splitlines() if "● GPU gpu-host:0" in row]
                         self.assertEqual(len(rows), 1 if complete else 2)
-                        self.assertEqual(output.count("full-run"), 1)
+                        self.assertEqual(output.count("full run"), 1)
                         if complete:
                             self.assertIn("2 GB", rows[0])
-                            self.assertIn("resource full-run", output)
+                            self.assertIn("resource full run", output)
                         else:
                             self.assertTrue(all("1 GB" in row for row in rows))
-                            fallback = next(row for row in rows if "full-run" in row)
+                            fallback = next(row for row in rows if "full run" in row)
                             self.assertIn("s_strided", fallback)
                             self.assertNotIn("s_baseline", fallback)
 
@@ -206,18 +206,18 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                                              process=process))
                     rows = [row for row in output.splitlines() if "● GPU gpu-host:0" in row]
                     self.assertEqual(len(rows), 1 if complete else 2)
-                    self.assertEqual(sum(row.count("owner-node") for row in rows), 1)
+                    self.assertEqual(sum(row.count("owner node") for row in rows), 1)
                     now_rows = [row for row in output.splitlines()
-                                if "owner-node" in row and "● GPU" not in row]
+                                if "owner node" in row and "● GPU" not in row]
                     self.assertEqual(len(now_rows), 1)
                     self.assertIn("gpu-host:0", now_rows[0])
-                    self.assertEqual(output.count("full-run"), 1)
+                    self.assertEqual(output.count("full run"), 1)
                     if complete:
-                        self.assertIn("resource full-run", output)
+                        self.assertIn("resource full run", output)
                         self.assertIn("2 GB", rows[0])
                     else:
                         self.assertTrue(all("1 GB" in row for row in rows))
-                        fallback = next(row for row in rows if "full-run" in row)
+                        fallback = next(row for row in rows if "full run" in row)
                         self.assertIn("s_strided", fallback)
                         self.assertNotIn("s_baseline", fallback)
 
@@ -229,8 +229,8 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                 output = text(self.lines(children=[self.child, other], process=process))
                 self.assertEqual(output.count("● GPU gpu-host:0"), 1)
                 self.assertEqual(output.count("2 GB"), 1)
-                self.assertEqual(output.count("full-run"), 1)
-                self.assertEqual(output.count("other-node"), 1)
+                self.assertEqual(output.count("full run"), 1)
+                self.assertEqual(output.count("other node"), 1)
                 self.assertEqual(output.count("resource "), 1)
 
     def test_resource_only_project_is_hot_unfolded_and_section_filtered(self):
@@ -239,8 +239,8 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
         emission = render._group_emission(group, True, True)
         self.assertFalse(emission["empty"])
         self.assertFalse(emission["fold"])
-        self.assertIn("full-run", text(self.lines(section="dispatch")))
-        self.assertNotIn("full-run", text(self.lines(section="fleet")))
+        self.assertIn("full run", text(self.lines(section="dispatch")))
+        self.assertNotIn("full run", text(self.lines(section="fleet")))
         self.assertFalse(render._orphan_resource_groups([replace(self.child, parent_attempt_id=None)], []))
 
     def test_fallback_rows_fit_each_supported_width(self):
@@ -251,7 +251,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                             if row and "● GPU" in render._plain(row)]
                     self.assertEqual(len(rows), 1)
                     self.assertLessEqual(render._dw(render._plain(rows[0])), width)
-                    self.assertIn("full-run", render._plain(rows[0]))
+                    self.assertIn("full run", render._plain(rows[0]))
 
 
 if __name__ == "__main__":

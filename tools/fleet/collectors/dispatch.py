@@ -3601,16 +3601,25 @@ _CYCLE_ROUTE_PATHS = {}       # (root, route id) -> exact observed cycle path
 
 
 def _campaign_labels(jobs):
+    if artifact_reader is None:
+        return _campaign_labels_read(jobs)
+    with artifact_reader.read_scope(_ARTIFACT_READ_CACHE):
+        return _campaign_labels_read(jobs)
+
+
+def _campaign_labels_read(jobs):
     """Read exact labels through the existing admission index or bounded cache.
 
     Open cycles may precede admission. Their fallback inventories names once,
     reads at most 200 records per pass, and continues on the next detail tick.
     Never stat every historical record merely to select that bounded batch.
     """
+    from ..work_titles import cycle_title
+    read_json = lambda path: _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
     by_root = {}
     for job in jobs:
         rid, root = _label_route_id(job), getattr(job, "artifact_root", None)
-        if rid and root:
+        if isinstance(rid, str) and rid and isinstance(root, str) and root:
             by_root.setdefault(root, set()).add(rid)
     titles = {}
     for root, route_ids in by_root.items():
@@ -3633,7 +3642,7 @@ def _campaign_labels(jobs):
             if path:
                 rec = _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
                 if isinstance(rec, dict) and rec.get("route_id") == rid:
-                    titles[(root, rid)] = str(rec.get("title") or "")[:24]
+                    titles[(root, rid)] = cycle_title(root, rec, read_json)
                     remaining.discard(rid)
                 else:
                     _CYCLE_ROUTE_PATHS.pop((root, rid), None)
@@ -3659,14 +3668,13 @@ def _campaign_labels(jobs):
                 rid = rec.get("route_id")
                 if rid in remaining:
                     _CYCLE_ROUTE_PATHS[(root, rid)] = path
-                    titles[(root, rid)] = str(rec.get("title") or "")[:24]
+                    titles[(root, rid)] = cycle_title(root, rec, read_json)
                     remaining.discard(rid)
         except (OSError, TypeError, ValueError):
             continue
     for job in jobs:
         key = (getattr(job, "artifact_root", None), _label_route_id(job))
-        if key in titles:
-            job.campaign_label = titles[key]
+        job.campaign_label = titles.get(key)
     # These are display caches, with the same bounded lifetime as record parsing.
     for cache in (_CYCLE_ROUTE_PATHS, _CYCLE_LABEL_INVENTORIES):
         while len(cache) > _STAT_MEMO_LIMIT:

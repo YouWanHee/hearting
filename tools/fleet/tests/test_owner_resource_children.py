@@ -174,7 +174,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
             rows = render._resource_child_rows(self.owner, term_width=width)
             self.assertLessEqual(sum(render._dw(t) for t, _ in rows[0]), width)
             if width >= 40:
-                self.assertIn("eval-run", flatten(rows))
+                self.assertIn("eval run", flatten(rows))
                 self.assertIn("6h 50m", flatten(rows))
         self.resource.local_placement = None
         self.assertNotIn("PID", flatten(render._resource_child_rows(self.owner, term_width=168)))
@@ -215,11 +215,11 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                                                 layout=layout, term_width=width,
                                                 resources=[self.resource], governor=None)
                     text = flatten(lines)
-                    self.assertIn("resource eval-run", text)
+                    self.assertIn("resource eval run", text)
                     self.assertIn("6h 50m", text)
                     self.assertNotIn("old model summary", text)
-                    self.assertEqual(text.count("resource eval-run"), 1)
-                    child_line = next(line for line in lines if line and "resource eval-run" in flatten([line]))
+                    self.assertEqual(text.count("resource eval run"), 1)
+                    child_line = next(line for line in lines if line and "resource eval run" in flatten([line]))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in child_line), width)
                     if width == 168:
                         self.assertIn("로그 없음", text)
@@ -286,7 +286,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                 gpu = [line for line in lines if line and "● GPU" in flatten([line])]
                 self.assertEqual(len(gpu), 1)
                 text = flatten(gpu)
-                self.assertEqual(text.count("eval-run 3h 23m"), 1)
+                self.assertEqual(text.count("eval run 3h 23m"), 1)
                 self.assertNotIn("working", text)
                 if width >= 80:
                     self.assertIn("2m ago", text)
@@ -294,14 +294,14 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     self.assertIn("12/50 epoch", text)
                     self.assertIn("GPU moving4:0", text)
                     self.assertIn("GPU moving4:1", text)
-                self.assertNotIn("resource eval-run", flatten(lines))
-                self.assertEqual(flatten(lines).count("resource eval-smoke"), 1)
+                self.assertNotIn("resource eval run", flatten(lines))
+                self.assertEqual(flatten(lines).count("resource eval smoke"), 1)
                 self.assertLessEqual(sum(render._dw(t) for t, _ in gpu[0]), width)
         self.assertEqual(snapshot, before)
         self.resource.liveness = "stale"
         rows, cpu_rows = render._owner_gpu_resource_rows(self.owner, {}, {}, 168)
-        self.assertIn("eval-run stale 3h 23m", flatten(rows))
-        self.assertNotIn("resource eval-run", flatten(cpu_rows))
+        self.assertIn("eval run stale 3h 23m", flatten(rows))
+        self.assertNotIn("resource eval run", flatten(cpu_rows))
 
     def test_remote_registered_run_matches_gpu_but_cwd_and_reused_pid_do_not(self):
         self.attach()
@@ -346,8 +346,8 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                         gpu = [line for line in lines if line and "● GPU" in flatten([line])]
                         self.assertEqual(len(gpu), 1)
                         self.assertIn("GPU xavier:0", flatten(gpu))
-                        self.assertIn("eval-run 12h", flatten(gpu))
-                        self.assertNotIn("resource eval-run", flatten(lines))
+                        self.assertIn("eval run 12h", flatten(gpu))
+                        self.assertNotIn("resource eval run", flatten(lines))
                         self.assertNotIn("job:", flatten(gpu))
                         self.assertNotIn("미등록", flatten(lines))
                         self.assertLessEqual(sum(render._dw(t) for t, _ in gpu[0]), width)
@@ -356,7 +356,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
             gpu["processes"] = []
         lines = render._build_lines([], [self.owner], "both", False, 0,
             term_width=168, resources=[self.resource], governor=None)
-        self.assertIn("resource eval-run", flatten(lines))
+        self.assertIn("resource eval run", flatten(lines))
 
     def test_remote_parent_match_requires_remote_host_and_exact_nonempty_attempt(self):
         process = {"pid": 900, "proc_start": 999, "pgid": 900,
@@ -398,7 +398,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                         term_width=168, resources=[self.resource], governor=None)
                     rows = [line for line in lines if line and "● GPU" in flatten([line])]
                     self.assertEqual(len(rows), 1)
-                    self.assertIn("eval-run", flatten(rows))
+                    self.assertIn("eval run", flatten(rows))
             extra = {"pid": 90, "proc_start": 456, "pgid": 90, "owner": claim,
                      "session_owner": claim, "used_memory_mib": 1024, "command": "python other.py"}
             gpu["processes"].append(extra)
@@ -409,7 +409,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     term_width=168, resources=[self.resource], governor=None)
                 rows = [line for line in lines if line and "● GPU" in flatten([line])]
                 self.assertEqual(len(rows), 2)
-                parent_rows = [line for line in rows if "eval-run" not in flatten([line])]
+                parent_rows = [line for line in rows if "eval run" not in flatten([line])]
                 self.assertIn("1 GB", flatten(parent_rows))
                 self.assertNotIn("7 GB", flatten(parent_rows))
             self.assertEqual(snapshot, before)
@@ -454,8 +454,8 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                 term_width=168, resources=[self.resource, second], governor=None)
             rows = [line for line in lines if line and "● GPU" in flatten([line])]
             self.assertEqual(len(rows), 2)
-            owner_rows = [line for line in rows if "eval-run" in flatten([line])]
-            parent_rows = [line for line in rows if "eval-run" not in flatten([line])]
+            owner_rows = [line for line in rows if "eval run" in flatten([line])]
+            parent_rows = [line for line in rows if "eval run" not in flatten([line])]
             self.assertIn("10 GB", flatten(owner_rows))
             self.assertIn("1 GB", flatten(parent_rows))
         self.assertEqual(snapshot, original_snapshot)
@@ -475,7 +475,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     actual = render._build_lines([], [self.owner], "both", width < 80, 0,
                         layout=layout, term_width=width, resources=[self.resource], governor=None)
                     self.assertEqual(len(actual), len(baseline))
-                    line = next(line for line in actual if line and "resource eval-run" in flatten([line]))
+                    line = next(line for line in actual if line and "resource eval run" in flatten([line]))
                     self.assertIn("2m ago", flatten([line]))
                     self.assertIn("6h 50m", flatten([line]))
                     if width >= 80:

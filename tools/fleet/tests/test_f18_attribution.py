@@ -251,7 +251,7 @@ class RenderMemExclusionTest(unittest.TestCase):
         lines = render._build_lines([mem, normal], [], section="fleet", narrow=False,
                                     malformed=0, layout="wide")
         text = self._text(lines)
-        self.assertIn("1 working", text)
+        self.assertIn("1 작업 중", text)
         self.assertIn("⚙ system", text)
         self.assertIn("distiller", text)
         self.assertIn("🧠", text)   # legend/group badge summary still present
