@@ -201,6 +201,13 @@ Diagnostics retain the reader's kind, source and blocking evidence. A missing
 historical resource reference is not a broken dispatch log or a current execution
 failure. Memory rows describe a stored change with its content and observed origin;
 storage classifications never impersonate a current user decision.
+A process name proves a runtime, not a conversation: one shared process-role
+observation distinguishes terminal sessions, registered workers and unbound services.
+Services produce no session row. Current session identity joins live PID/start,
+the pane selection and recorded conversation continuity once; title, state and
+context consume that same result. Conflicting identities and absent work bindings
+stay unknown rather than borrowing a neighboring transcript or artifact directory.
+Routine ledger folding preserves the recorded native transition direction.
 
 ## Basis and current scope
 

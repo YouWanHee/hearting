@@ -1343,6 +1343,9 @@ def process_rollouts(sessions, home):
         if getattr(sess, "harness", None) != "codex" or not getattr(sess, "cwd", None):
             continue
         path = _proc_rollout(sess.pid, sess.cwd, home)
+        # Role consumers need the native FD observation, separately from paths
+        # assigned by registry/start matching below. This does not change matching.
+        sess._fd_owner = bool(path)
         if not path:
             continue
         paths[sess.pid] = path

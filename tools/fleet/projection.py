@@ -683,6 +683,10 @@ def _artifact_reader():
 
 
 def _artifact_candidates(entity, artifact_root=None):
+    # A matching basename is never a session/work binding. Registered jobs
+    # retain their scoped compatibility lookup; anonymous processes do not.
+    if isinstance(entity, Session):
+        return []
     slug = _field(entity, "slug") or _field(entity, "key")
     if not slug:
         return []

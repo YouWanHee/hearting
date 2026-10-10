@@ -640,10 +640,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # D3/D4: a standard+ owner with no route binding at all still owns a card
         # (it is a direct dispatch child of the session), so the session row must show NO
         # stage of its own — only the card's owner row carries the single dim `—` fallback.
-        # The session ALSO has its own independently-resolvable (artifact-inferred) stage
-        # here — the pre-D3 exact-route-match rule would have left that stage showing on
-        # the session row once the owner's OWN route binding broke; the fix is card
-        # ownership, not route agreement, so it must stay suppressed regardless.
+        # A similarly named artifact directory cannot bind this session to work.
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "plans", "2026-07-22_unresolved-parent", "execute"))
             session = Session(harness="claude", pid=500, proc_start="root", cwd=tmp,
@@ -658,7 +655,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             projection.attach_projections([session], [owner], now=100.0)
             self.assertIsNone(owner.work_projection.route_id)
             self.assertFalse(owner.work_projection._route_view)
-            self.assertEqual(session.work_projection.source, "artifact-inferred")
+            self.assertEqual(session.work_projection.source, "none")
             texts = self._board_lines(session, [owner])
         session_line = next(t for t in texts if "unresolved-parent" in t)
         self.assertNotIn("CL/", session_line)
