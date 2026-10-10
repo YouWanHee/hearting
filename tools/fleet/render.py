@@ -3397,73 +3397,121 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     return pulse
 
 
-def _mem_event_rows(memory, limit=8):
-    """F-19 `a`-toggle detail — most-recent-first dim rows (F-18b dim-row family): time ·
-    action · tier/type · actor · snippet."""
-    if not memory:
-        return []
+def _memory_event_key(event):
+    return (event.get("cwd") or event.get("project"), event.get("scope"),
+            event.get("action"), event.get("snippet"))
+
+
+def _memory_event_groups(events):
+    """Count equal changes only when their observed source is the same."""
+    groups = []
+    by_key = {}
+    for event in events:
+        origin = event.get("cwd") or event.get("project")
+        key = _memory_event_key(event)
+        if origin and key in by_key:
+            by_key[key][1] += 1
+        else:
+            group = [event, 1]
+            groups.append(group)
+            if origin:
+                by_key[key] = group
+    return groups
+
+
+def _mem_change_rows(events, sid_titles=None, limit=8, term_width=None):
+    from .collectors.memory import ADDED_ACTIONS, EXPIRED_ACTIONS, PRUNED_ACTIONS
     rows = []
-    for e in (memory.get("recent") or [])[:limit]:
-        ts = (e.get("ts") or "—")
-        if "T" in ts:
-            ts = ts.split("T", 1)[1]   # HH:MM:SS only — date is always "today or recent"
-        tier_type = "%s/%s" % (e.get("tier") or "-", e.get("type") or "-")
-        snip = e.get("snippet") or ""
-        seg = [("  🧠 ", "dim"), (ts, "dim"), ("  ", None),
-               (e.get("action") or "?", "dim"), ("  ", None),
-               (tier_type, "dim"), ("  ", None),
-               (e.get("actor") or "?", "dim")]
-        if snip:
-            seg += [("  ", None), (_clip_w(snip, 60), "dim")]
-        rows.append(seg)
+    width = term_width or 120
+    for event, count in _memory_event_groups(events)[:limit]:
+        action = event.get("action")
+        if action in ADDED_ACTIONS:
+            label, sign, color = "기억 저장", "+", "lvl_g"
+        elif action in EXPIRED_ACTIONS or action in PRUNED_ACTIONS:
+            label, sign, color = "기억 정리", "−", "dim"
+        elif action == "decision-record":
+            label, sign, color = "기억 저장", "·", "dim"
+        else:
+            label, sign, color = "기억 변경", "·", "dim"
+        origin = event.get("cwd") or event.get("project")
+        if not origin:
+            origin = "공통" if event.get("scope") == "global" else "출처 미확인"
+        # Source is preserved in JSON. Keep its distinctive last path components
+        # in a narrow row, after the content and before optional session/time.
+        origin = str(origin)
+        source_room = max(12, min(36, width // 3))
+        if _dw(origin) > source_room:
+            while origin and _dw(origin) > source_room - 1:
+                origin = origin[1:]
+            origin = "…" + origin
+        suffix = " · " + origin + (" · %d회" % count if count > 1 else "")
+        title = (sid_titles or {}).get(event.get("sid"))
+        stamp = str(event.get("ts") or "")
+        if "T" in stamp:
+            stamp = stamp.replace("T", " ")[:16]
+        prefix = [("  🧠 ", "dim"), (sign, color), (" " + label + " · ", "dim")]
+        room = max(0, width - sum(_dw(t) for t, _ in prefix) - _dw(suffix))
+        snippet = _clip_w(str(event.get("snippet") or "내용 미확인"), room)
+        row = prefix + [(snippet, "dim"), (suffix, "dim")]
+        optional = (" ⟵ " + _clip_w(title, 22) if title else "") + (" · " + stamp if stamp else "")
+        remaining = width - sum(_dw(t) for t, _ in row)
+        if _dw(optional) <= remaining:
+            row.append((optional, "dim"))
+        rows.append(row)
     return rows
 
 
-_MEM_DIVIDER_MARGIN = 12   # in-band card-bottom divider inset (both sides), matches the
-                            # discarded two-plane demo's r5 rule — a dim `─` ON the tint, not
-                            # a full-width chrome bar (F-19 repo rows, 사용자 확정 2026-07-16)
+def _mem_event_rows(memory, limit=8, term_width=None, excluded_ids=()):
+    if not memory:
+        return []
+    events = [event for event in memory.get("recent") or []
+              if not event.get("id") or event["id"] not in excluded_ids]
+    return _mem_change_rows(events, limit=limit, term_width=term_width)
+
+
+_MEM_DIVIDER_MARGIN = 12
 _MEM_REPO_ROW_LIMIT = 2
-_MEM_REPO_TITLE_W = 22
 
 
 def _mem_divider(term_width=None):
-    """One dim in-band rule above a group card's per-repo mem rows — the tint prefix is
-    applied by the caller's existing group-body tint loop (F-19 repo rows)."""
     return [(" ", None), ("─" * max(8, (term_width or 78) - _MEM_DIVIDER_MARGIN), "dim")]
 
 
-def _mem_repo_rows(events, sid_titles, limit=_MEM_REPO_ROW_LIMIT):
-    """F-19 repo rows — a group card's own today-mem events, most-recent-first, dim:
-    `🧠 HH:MM ± tier/type actor ⟵ <source session title> "snippet"`. `+` (add) is green,
-    `−` (expire/prune) falls back to dim (the engine's only red key is bold-only, and bold
-    is reserved for the main-session row — round-2 precedent in the discarded two-plane
-    demo). The source session title is shown only when the journal `sid` resolves against a
-    currently-known session (honest omission otherwise, F-3)."""
-    if not events:
-        return []
-    from .collectors.memory import ADDED_ACTIONS, EXPIRED_ACTIONS, PRUNED_ACTIONS
+def _mem_repo_rows(events, sid_titles, limit=_MEM_REPO_ROW_LIMIT, term_width=None):
+    return _mem_change_rows(events or [], sid_titles, limit, term_width)
+
+
+def _diagnostic_rows(diagnostics, malformed=0, term_width=None):
+    """One reader-evidence summary for group/process views; never infer execution failure."""
     rows = []
-    for e in events[:limit]:
-        ts = e.get("ts") or "—"
-        if "T" in ts:
-            ts = ts.split("T", 1)[1][:5]        # HH:MM
-        action = e.get("action")
-        if action in ADDED_ACTIONS:
-            sign, sign_key = "+", "lvl_g"
-        elif action in EXPIRED_ACTIONS or action in PRUNED_ACTIONS:
-            sign, sign_key = "−", "dim"
-        else:
-            sign, sign_key = "·", "dim"
-        tier_type = "%s/%s" % (e.get("tier") or "-", e.get("type") or "-")
-        seg = [("  🧠 ", "dim"), (ts + " ", "dim"), (sign, sign_key),
-               (" %s " % tier_type, "dim"), ((e.get("actor") or "?") + " ", "dim")]
-        title = sid_titles.get(e.get("sid")) if e.get("sid") else None
-        if title:
-            seg.append(("⟵ " + _clip_w(title, _MEM_REPO_TITLE_W) + "  ", "dim"))
-        snip = e.get("snippet")
-        if snip:
-            seg.append(('"%s"' % _clip_w(snip, 60), "dim"))
-        rows.append(seg)
+    if malformed:
+        rows.append([("  jobs.log · 형식이 잘못된 행 %d개 제외" % malformed, "dim")])
+    labels = {
+        "missing-registry": "과거 참조 파일 없음",
+        "malformed-registry": "기록 파일 형식 오류",
+        "malformed-run": "실행 기록 형식 오류",
+        "malformed-index": "색인 형식 오류",
+        "resource-row-projection": "실행 정보 표시 미확인",
+    }
+    for diagnostic in diagnostics or []:
+        past = diagnostic.get("kind") == "missing-registry" and diagnostic.get("blocking") is False
+        if past and not _SHOW_ALL:
+            continue
+        label = labels.get(diagnostic.get("kind"), "리소스 관측 미확인")
+        prefix = "  리소스 기록 · " + label if past else "  리소스 관측 미확인"
+        if not past and label != "리소스 관측 미확인":
+            prefix += " · " + label
+        source = str(diagnostic.get("path") or diagnostic.get("run_id") or "")
+        if source:
+            # Show the project and the registry location, using only literal path parts.
+            source = source.split("/.agent_reports/", 1)
+            source = (source[0].rsplit("/", 1)[-1] + "/" + source[1]
+                      if len(source) == 2 else source[0])
+        impact = " · 실행 비차단" if diagnostic.get("blocking") is False else (
+            " · 차단" if diagnostic.get("blocking") is True else "")
+        detail = " · " + str(diagnostic.get("error") or diagnostic.get("reason") or "")
+        room = max(0, (term_width or 120) - _dw(prefix + impact))
+        rows.append([(prefix + _clip_w((" · " + source if source else "") + detail, room) + impact, "dim")])
     return rows
 
 
@@ -6365,7 +6413,7 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
 
 def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, term_width, layout,
                          node_evidence=None, governor=_IO_UNSET, resources=None, loading=False,
-                         observations=None):
+                         observations=None, resource_diagnostics=None):
     """F-30 (prd.md:304-310) — the process view: one card per ACTIVE route (pipeline-centric
     regrouping) instead of the group view's per-project regrouping. Returns the SAME flat
     segment-line contract as `_build_lines` ([[(text,key),...]|None]) — `_draw`/`render_once`/
@@ -6383,8 +6431,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     _governor = _governor_segs(governor)
     if _governor is not None:
         lines.append(_governor)
-    if malformed:
-        lines.append([("  +%d malformed jobs.log rows skipped" % malformed, "dim")])
+    lines.extend(_diagnostic_rows(resource_diagnostics, malformed, term_width))
     lines.append([(_HFILL, None)])
     compute_rows = _compute_host_rows(term_width, sessions, resources)
     _register_compute_folds(len(lines))
@@ -7055,7 +7102,7 @@ def _observation_lines(observations, term_width=None):
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
                  term_width=None, live_order=None, resources=None, usage_snapshots=None,
                  governor=_IO_UNSET, loading=False, node_evidence=None,
-                 route_entities=None, observations=None):
+                 route_entities=None, observations=None, resource_diagnostics=None):
     """Return a flat list of segment-lines for the whole screen (None = blank line).
 
     Side effect: refreshes the module-level `_SELECTABLE` stash (F-27) — see its definition.
@@ -7110,7 +7157,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         process_lines = _build_process_lines(
             sessions, display_jobs, _route_views_by_id, malformed, memory,
             term_width, layout, node_evidence=_node_evidence, governor=governor,
-            resources=resources, loading=loading, observations=observations)
+            resources=resources, loading=loading, observations=observations,
+            resource_diagnostics=resource_diagnostics)
         top_rows = _top_rows(term_width, narrow) + _observation_lines(observations, term_width)
         for entry in _FOLDABLE + _SELECTABLE:
             entry["line"] += len(top_rows)
@@ -7286,7 +7334,14 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     if _governor is not None:                  # counts (I8); None = source absent or quiet.
         lines.append(_governor)
     if _SHOW_ALL:
-        _mem_events = _mem_event_rows(memory)
+        _repo_ids = set()
+        for name in order:
+            _events = (memory or {}).get("by_repo", {}).get(name, [])
+            _shown_keys = {_memory_event_key(e) for e, _count in
+                           _memory_event_groups(_events)[:_MEM_REPO_ROW_LIMIT]}
+            _repo_ids.update(e["id"] for e in _events if e.get("id")
+                             and _memory_event_key(e) in _shown_keys)
+        _mem_events = _mem_event_rows(memory, term_width=term_width, excluded_ids=_repo_ids)
         if _mem_events:
             lines.extend(_mem_events)
             _seen_glyphs.add("mem")
@@ -7809,7 +7864,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         repo_events = (memory or {}).get("by_repo", {}).get(name) if memory else None
         if repo_events:
             lines.append(_mem_divider(term_width))
-            lines.extend(_mem_repo_rows(repo_events, sid_titles))
+            lines.extend(_mem_repo_rows(repo_events, sid_titles, term_width=term_width))
 
         # group BODY (round-5): every row of the group rides the body tint — the whole directory
         # The whole directory block is one panel, brighter when active.
@@ -7852,9 +7907,10 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                    "  (no active sessions or dispatch jobs)")
         lines.append([(message, "dim")])
 
-    if malformed:
+    diagnostic_rows = _diagnostic_rows(resource_diagnostics, malformed, term_width)
+    if diagnostic_rows:
         lines.append(None)
-        lines.append([("  +%d malformed jobs.log rows skipped" % malformed, "dim")])
+        lines.extend(diagnostic_rows)
 
     # legend — status dots (columns are labelled by the header row). F-12(c): working/idle/
     # dispatch/`~` are always-relevant vocabulary and stay unconditional; the rest only appear
@@ -8034,6 +8090,7 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     resources = snapshot.resources
     usage_snapshots = snapshot.usage_snapshots
     malformed = snapshot.malformed
+    resource_diagnostics = snapshot.resource_diagnostics
     mem_snapshot = _collect_memory()
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
@@ -8048,7 +8105,8 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
                              layout=_layout_mode(tw), memory=mem_snapshot, term_width=tw,
                              resources=resources, usage_snapshots=usage_snapshots,
                              governor=governor_snapshot, node_evidence=snapshot.node_evidence,
-                             route_entities=snapshot.route_entities, observations=snapshot.observations)
+                             route_entities=snapshot.route_entities, observations=snapshot.observations,
+                             resource_diagnostics=resource_diagnostics)
     finally:
         _GIT_TELEMETRY = previous_git_telemetry
     colored = bool(getattr(sys.stdout, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
@@ -8075,9 +8133,7 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
 def _malformed():
     try:
         from .collectors import dispatch
-        from .collectors import resource_runs
-        return (getattr(dispatch.collect, "last_malformed", 0)
-                + getattr(resource_runs.collect, "last_malformed", 0))
+        return getattr(dispatch.collect, "last_malformed", 0)
     except Exception:
         return 0
 
@@ -8779,7 +8835,8 @@ def reset_scroll():
 
 
 def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=None,
-          resources=None, usage_snapshots=None, governor=None, loading=False, snapshot=None):
+          resources=None, usage_snapshots=None, governor=None, loading=False, snapshot=None,
+          resource_diagnostics=None):
     global _OFFSET, _TOGGLE_ROWS, _CLICK_ROWS, _FOLD_ROWS, _PROMPT_HITS, _CURSOR_ID
     # reset before any early-return so a stale map never survives a click (§4.1 pattern) —
     # _PROMPT_HITS in particular must never carry the PRIOR stage's coordinates into this
@@ -8798,7 +8855,8 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
                          governor=governor, loading=loading,
                          node_evidence=snapshot.node_evidence if snapshot else None,
                          route_entities=snapshot.route_entities if snapshot else None,
-                         observations=snapshot.observations if snapshot else None)
+                         observations=snapshot.observations if snapshot else None,
+                         resource_diagnostics=snapshot.resource_diagnostics if snapshot else resource_diagnostics)
     body_h = max(1, h - 1)   # reserve 1 footer row
 
     # F-27: the cursor tracks a ROW, so the viewport follows it (not the reverse). Done before
@@ -9060,7 +9118,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                           live_order=live_order, resources=resources,
                           usage_snapshots=usage_snapshots, governor=governor_snapshot,
-                          loading=(generation == 0))
+                          loading=(generation == 0), snapshot=snapshot)
                     continue
             elif ch in (ord("s"), ord("S"), ord("x"), ord("X")):
                 # Enter selection mode. `x` doubles as the enter shortcut so the "press x to kill"

@@ -202,14 +202,14 @@ def collect(now=None, *, include_summary=True):
     events, journal_ok = _read_jsonl_tail(_write_events_path())
     today_events = [e for e in events if _is_today(e.get("ts"), midnight)]
     recent = [{key: e.get(key) for key in
-               ("ts", "action", "tier", "type", "actor", "sid", "snippet")}
+               ("ts", "action", "tier", "type", "actor", "sid", "snippet", "id", "cwd", "project", "scope")}
               for e in events[-RECENT_LIMIT:][::-1]]
     by_repo = {}
     for e in today_events:
         rk = _repo_key(e)
         if rk:
             by_repo.setdefault(rk, []).append({key: e.get(key) for key in
-                ("ts", "action", "tier", "type", "actor", "sid", "snippet")})
+                ("ts", "action", "tier", "type", "actor", "sid", "snippet", "id", "cwd", "project", "scope")})
     for rows in by_repo.values():
         rows.sort(key=lambda e: e.get("ts") or "", reverse=True)
     # Renderers only consume journal/project events. Keep the default aggregate API

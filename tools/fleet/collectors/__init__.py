@@ -615,8 +615,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
     collect_all.last_resource_jobs = resource_jobs
-    collect_all.last_resource_malformed = getattr(
-        resource_runs.collect, "last_malformed", 0) if "resource_runs" in locals() else 0
+    collect_all.last_resource_diagnostics = list(getattr(
+        resource_runs.collect, "last_diagnostics", [])) if "resource_runs" in locals() else []
 
     # v16: all surfaces receive one projection after evidence collection and association.
     try:
@@ -663,7 +663,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         sessions=sessions, jobs=jobs, resources=resource_jobs,
         usage_snapshots=usage_snapshots, node_evidence=node_evidence,
         degradations=degradations, pending_delivery=pending_delivery,
-        malformed=malformed + collect_all.last_resource_malformed,
+        malformed=malformed,
+        resource_diagnostics=copy.deepcopy(collect_all.last_resource_diagnostics),
         observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
     )
     if not sessions and not jobs and node_evidence:
@@ -679,7 +680,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
 
 
 collect_all.last_resource_jobs = []
-collect_all.last_resource_malformed = 0
+collect_all.last_resource_diagnostics = []
 collect_all.last_usage = {}
 collect_all.last_usage_snapshots = {}
 collect_all.last_peer_messages = None

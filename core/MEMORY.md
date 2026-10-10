@@ -45,6 +45,12 @@ There is no deterministic promote/skip classifier. The acting agent judges wheth
 
 ### §7.2. Write Mechanics and Deduplication
 
+Tests that accept answers through real workflow code isolate every memory sink
+in their shared fixture, including the store, write journal, pending decisions
+and remote exchange. Direct suite execution has the same boundary as the test
+runner. Proven test records in a user's store use the normal guarded delete and
+graveyard restore path; their historical journal is preserved.
+
 - After deciding to write, inspect visible memory and prefer updating the canonical record over creating an obvious duplicate. Fuzzy similarity is candidate evidence for the agent, not an automatic semantic verdict.
 - Prefer artifact pointers over replicated artifact prose. A pointer includes the current artifact path and only enough body text to explain why and when it should be retrieved.
 - Populate a concise headline plus bounded aliases, entities, and topics. These form the retrieval capsule and topic index; the full body remains evidence read on demand.

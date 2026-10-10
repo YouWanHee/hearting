@@ -197,6 +197,10 @@ Pane display updates belong to the existing detail pass; assigning a live
 session's number must not wait for pane metadata writes before basic publication.
 Delayed display writes check the pane's current exact session identity and
 assigned number; a changed or unconfirmed target receives no old metadata.
+Diagnostics retain the reader's kind, source and blocking evidence. A missing
+historical resource reference is not a broken dispatch log or a current execution
+failure. Memory rows describe a stored change with its content and observed origin;
+storage classifications never impersonate a current user decision.
 
 ## Basis and current scope
 

@@ -35,6 +35,8 @@ import workflow_state as WS  # noqa: E402
 import capability_topology as TOPO  # noqa: E402
 import dispatch_contract as DC  # noqa: E402
 import fixture_processes  # noqa: E402
+sys.path.insert(0, str(ROOT / "tools" / "memory" / "tests"))
+from tidy_isolation import memory_fixture_env  # noqa: E402
 
 
 # Completing nodes here must not launch detached open-cycle checkpoints into
@@ -96,6 +98,11 @@ class WorkflowFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
+        # Both workflow-supervisor and work-start answer tests share this fixture.
+        # A real release spawns tidy_decisions; never inherit the caller's store.
+        memory_environment = mock.patch.dict(os.environ, memory_fixture_env(self.base))
+        memory_environment.start()
+        self.addCleanup(memory_environment.stop)
         self.workflow_root = self.base / "workflow"
         self._previous = os.environ.get("AGENT_WORKFLOW_ROOT")
         os.environ["AGENT_WORKFLOW_ROOT"] = str(self.workflow_root)
