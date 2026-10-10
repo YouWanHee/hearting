@@ -441,6 +441,7 @@ def assemble(lines, *, load_record, load_outcome, jobs=(), node_evidence=None):
             record = None
         records_by_rid[rid] = record
         ambiguity = []
+        result = None
         if record is None:
             capability = line.get("capability")
             capability_mode = line.get("capability_mode")
@@ -458,6 +459,7 @@ def assemble(lines, *, load_record, load_outcome, jobs=(), node_evidence=None):
                 outcome = load_outcome(route_file, rid, route_hash)
             except Exception:
                 outcome = None
+            result = _route.result_projection(record, outcome)
             if not isinstance(outcome, dict) or not outcome.get("present"):
                 state = "open"
             elif outcome.get("match") is False:
@@ -470,7 +472,8 @@ def assemble(lines, *, load_record, load_outcome, jobs=(), node_evidence=None):
                 elif tgp is True:
                     state = "done"
                 elif tgp is False:
-                    state = "failed"
+                    state = "unknown"
+                    ambiguity.append("terminal-result-unproven")
                 else:
                     state = "unknown"
         nodes.append({
@@ -480,6 +483,7 @@ def assemble(lines, *, load_record, load_outcome, jobs=(), node_evidence=None):
             "intensity": intensity, "round": 1, "handoff_to": None, "handoff_from": None,
             "ambiguity": ambiguity, "source_route_id": line.get("source_route_id"),
             "ts": line.get("ts"), "_record": record,
+            "result": result,
         })
 
     # Step 4 — continuation folding (rule 3-i): verified hops collapse onto the earliest slot.

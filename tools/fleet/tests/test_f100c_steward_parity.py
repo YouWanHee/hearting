@@ -115,7 +115,7 @@ class StewardChipTest(unittest.TestCase):
             for width in (70, 100, 137, 168):
                 with self.subTest(harness=harness, width=width):
                     s = self._s(harness=harness, model=model, effort="xhigh",
-                                session_tag="46", title="column-marker")
+                                session_tag="46", runtime_name="column-marker")
                     plain = render._session_row(s, narrow=False)
                     plain_l2 = render._session_row_2line(s, term_width=width)[1]
                     s.steward = True

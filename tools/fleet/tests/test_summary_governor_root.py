@@ -108,7 +108,9 @@ class SummaryGovernorRootTest(_ConfigHomeMixin, unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 text = "".join(t for t, _ in rows[0])
                 self.assertIn("⚙ zsh 2m", text)
-                self.assertIn(entity.summary, text)
+                self.assertIn("마지막 요약", text)
+                if width >= 168:
+                    self.assertIn(entity.summary, text)
                 self.assertLessEqual(sum(render._dw(t) for t, _ in rows[0]), width)
 
 
