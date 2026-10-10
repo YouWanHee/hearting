@@ -673,6 +673,21 @@ def assignment_prompt(args, task: str, environ) -> str:
     )
 
 
+def worker_ending_prompt(*, supervised_owner: bool = False) -> str:
+    """One ending rule for every adapter; supervised wait turns are nonterminal."""
+    wait = (
+        "End an intermediate child-registration or resource-wait turn only with the "
+        "standalone line `runtime_wait: registered-children`, without a three-line handoff. "
+        if supervised_owner else ""
+    )
+    # State both ends: "nothing after it" alone allowed a summary before the
+    # envelope in two 2026-07-28 pipelines, losing their terminal handoff.
+    return (
+        wait + "For the terminal final response, end with the kernel's exact three-line "
+        "handoff as the entire message — no summary sentence before it, nothing after it.\n"
+    )
+
+
 def supervised_owner_prompt() -> str:
     return (
         "Runtime-owned completion join: launch the current batch through its checked dispatch surface. "

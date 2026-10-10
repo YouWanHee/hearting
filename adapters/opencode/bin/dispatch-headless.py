@@ -141,6 +141,7 @@ from worker_bootstrap import (
     assigned_contract,
     render_worker_bootstrap,
     runtime_progress_prompt,
+    worker_ending_prompt,
     resolve_worker_type,
 )
 from stage_session_runtime import (  # noqa: E402
@@ -941,8 +942,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         f"{released_task_prompt(args)}"
         f"{unit_bootstrap_prompt(args, task, os.environ)}"
         f"{assignment_prompt(args, task, os.environ)}"
-        "End with the kernel's exact three-line handoff as the entire final message — "
-        "no summary sentence before it, nothing after it.\n",
+        f"{worker_ending_prompt(supervised_owner=_supervised_owner(args))}",
         source,
     )
 
