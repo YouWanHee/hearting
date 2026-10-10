@@ -665,9 +665,7 @@ def classify_supervisor_log(path: str | Path | None, harness: str) -> Supervisor
             break  # an earlier turn's result cannot settle this failed turn
         if event == "result" and harness in {"claude", "opencode"}:
             return classify_session_result(row, 0, runtime=harness)
-        if event == "dispatch.supervisor.turn.completed" and row.get("status") != "completed":
-            return classify_supervisor_error(harness, "app-server-turn-failed")
-        if event in {"turn.completed", "dispatch.supervisor.turn.completed"}:
+        if event == "turn.completed":
             final_text = None
             for prior in range(index - 1, -1, -1):
                 item = rows[prior].get("item")
@@ -691,4 +689,11 @@ def classify_supervisor_log(path: str | Path | None, harness: str) -> Supervisor
             return classify_supervisor_error(
                 harness, reason
             )
-    return settlement_failure or classify_supervisor_error(harness, "terminal-event-missing")
+    if settlement_failure is not None:
+        return settlement_failure
+    if any(row.get("type") == "dispatch.supervisor.turn.completed" for row in rows):
+        # The model finished but its owner exited before a final writer input.
+        # Keep this an existing runtime continuation, not a model PASS or a
+        # malformed-envelope verdict that would refuse the user's correction.
+        return classify_supervisor_error(harness, "owner-exited-before-terminal-settlement")
+    return classify_supervisor_error(harness, "terminal-event-missing")

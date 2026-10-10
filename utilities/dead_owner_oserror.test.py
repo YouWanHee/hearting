@@ -189,18 +189,31 @@ class DeadOwnerOSErrorTest(unittest.TestCase):
                 row = J.exact_attempt_row(self.jobs, self.attempt)
                 self.assertEqual((row.status, row.metadata.get('failure_class')), ('done', 'pass'))
 
-    def test_old_codex_log_keeps_current_completed_turn_before_finalize_error(self):
+    def test_old_codex_turn_completion_does_not_claim_owner_settlement(self):
         text = f'artifact: {self.marker}\nverdict: PASS\nblocker: none'
         rows = [{'type': 'dispatch.supervisor.turn.started', 'turn_id': 'current'},
                 {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': text}},
                 {'type': 'dispatch.supervisor.turn.completed', 'status': 'completed'},
                 {'type': 'dispatch.supervisor.error', 'reason': 'terminal-reconcile-failed-OSError'},
                 {'type': 'dispatch.supervisor.error', 'reason': 'supervisor-finalize-lease-OSError'}]
+        for tail in ([], rows[3:], [rows[4]]):
+            for status in ('completed', 'interrupted'):
+                with self.subTest(tail=tail, status=status):
+                    rows[2]['status'] = status
+                    self.log.write_text('\n'.join(json.dumps(row) for row in rows[:3] + tail) + '\n')
+                    self.assertEqual(T.classify_supervisor_log(self.log, 'codex').failure_class, 'runtime')
+        # The old late owner envelope remains authoritative after settlement.
+        rows[2]['status'] = 'completed'
+        rows = rows[:3] + [{'type': 'turn.completed'}]
         self.log.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
         self.assertEqual(T.classify_supervisor_log(self.log, 'codex').failure_class, 'pass')
-        rows[2]['status'] = 'interrupted'
-        self.log.write_text('\n'.join(json.dumps(row) for row in rows) + '\n')
-        self.assertEqual(T.classify_supervisor_log(self.log, 'codex').failure_class, 'runtime')
+        self.log.write_text('\n'.join(json.dumps(row) for row in rows[:3]) + '\n')
+        answer = '기존 완료 기록을 보존하고 남은 작업만 이어 가세요.'
+        response = I.submit(self.jobs, self.attempt, answer)
+        self.assertTrue(response['retained'], response)
+        row = J.exact_attempt_row(self.jobs, self.attempt)
+        self.assertEqual((row.status, row.metadata['note']), ('done', 'dead-runtime-exit'))
+        self.assertEqual(R.death_kind(row.raw.split('\t'), row.metadata, jobs=self.jobs), R.CORRECTED)
 
     def test_previous_turn_terminal_does_not_finish_current_failed_turn(self):
         text = f'artifact: {self.marker}\nverdict: PASS\nblocker: none'

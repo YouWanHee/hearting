@@ -753,6 +753,8 @@ an unfinished settlement duty. Ordinary join, start, correction and session
 reconnection retry the same terminal writer after storage becomes writable.
 The writer retains its exact result in the existing log before settlement;
 recovery reads only the latest turn, including after finalization errors.
+Native turn completion alone is not the owner's final settlement. Older logs
+without its exact result retain the artifacts for the existing continuation.
 Reconnection writes the canonical registry only; legacy roots remain read-only.
 They use the exact PID/start, group and tagged-descendant observation, preserve
 committed results and completed stage markers, and retain corrections for the
