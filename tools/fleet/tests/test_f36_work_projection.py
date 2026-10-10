@@ -577,7 +577,9 @@ class WorkProjectionTest(unittest.TestCase):
         lines = render._build_lines([], jobs, section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(token for token, _kind in line)
-                         for line in lines if line)
+                         for line in lines if line and any(
+                             any(mark in token for mark in ("╭", "│", "├", "╰"))
+                             for token, _kind in line))
         for stage in ("plan", "execute", "test", "report"):
             self.assertIn(stage, text)
         self.assertNotIn("preparing…", text)

@@ -1412,14 +1412,14 @@ class SubagentStripBudgetTest(unittest.TestCase):
 
     def test_completed_elapsed_stops_at_ended_at_and_gains_idle_tail(self):
         """사용자 2026-07-29 '언제 끝났는지': 30m runtime that finished 45m ago must
-        read `30m (45m)` — not a forever-growing 75m."""
+        read `30m · 45m ago` — not a forever-growing 75m."""
         now = time.time()
         sa = SubAgent(agent_type="explore", active=False,
                       started_at=now - 75 * 60, ended_at=now - 45 * 60)
         self.assertEqual(render._subagent_elapsed_min(sa), 30)
         self.assertEqual(render._subagent_idle_min(sa), 45)
         text = self._strip_text([sa])
-        self.assertIn("30m (45m)", text)
+        self.assertIn("30m · 45m ago", text)
 
     def test_completed_without_ended_at_keeps_the_old_tail_only(self):
         now = time.time()

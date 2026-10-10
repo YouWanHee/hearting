@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fleet import render, route, route_chain, titles, refresh_title
-from fleet.model import DispatchJob, ResourceJob, Session, WorkProjection
+from fleet.model import DispatchJob, ResourceJob, Session, SubAgent, WorkProjection
 
 
 def text(lines):
@@ -222,6 +222,73 @@ class FreshnessTest(unittest.TestCase):
             self.assertEqual(render._text_age(self.now - minutes * 60, self.now), expected)
         for timestamp in (None, True, -1, self.now + 1, float("nan"), float("inf")):
             self.assertEqual(render._text_age(timestamp, self.now), "age unknown")
+
+    def test_long_project_name_preserves_file_age_and_result_at_80_columns(self):
+        project = "한글프로젝트" * 9
+        with mock.patch("time.time", return_value=self.now):
+            for result in (None, {"name": "완료한 작업 " * 20, "result": "success",
+                                  "at": self.now - 3600}):
+                for tinted in (False, True):
+                    with self.subTest(result=result, tinted=tinted), mock.patch.object(render, "_TINT_OK", tinted):
+                        s = self.session(cwd="/work/" + project,
+                                         work_projection=WorkProjection(result=result))
+                        rows = self.lines([s], width=80)
+                        header = next(render._plain(row) for row in rows if row and
+                                      any(key in ("grp", "grp_cool", "grp_hot") for _, key in row))
+                        self.assertTrue(header.endswith("1h ago" if result else "6m ago"), header)
+                        self.assertLessEqual(render._dw(header), 79)
+                        if result:
+                            self.assertIn("✓", header)
+                            self.assertIn("완료", header)
+
+    def test_failed_refresh_header_preserves_age_after_final_clipping(self):
+        health = {"snapshot": {"state": "failed", "age": 65,
+                               "last_error": "snapshot-reader-failed-with-a-long-cause"},
+                  "details": {"state": "failed", "last_error": "detail-reader-failed-with-a-long-cause"},
+                  "compute_hosts": {"state": "stalled"}}
+        with mock.patch("time.time", return_value=self.now), \
+             mock.patch.object(render, "_REFRESH_HEALTH", health), \
+             mock.patch.object(render, "_HEARTING", {"version": "v3.27.2", "install_method": "managed-release"}), \
+             mock.patch.object(render, "_COMPUTE_HOSTS", None):
+            for narrow in (False, True):
+                rows = render._build_lines([], [], "both", narrow, 0, term_width=80)
+                header = next(render._plain(row) for row in rows if row and
+                              any(key == "hearting_name" for _, key in row))
+                self.assertTrue(header.endswith(" · 1m ago"), header)
+                self.assertIn("error:", header)
+                self.assertLessEqual(render._dw(header), 79)
+
+    def test_completion_observation_ages_preserve_execution_durations(self):
+        with mock.patch("time.time", return_value=self.now):
+            sa = SubAgent(agent_type="한글작업" * 20, active=False,
+                          started_at=self.now - 106 * 60, ended_at=self.now - 102 * 60)
+            strip = text(render._subagent_strip([sa], term_width=80))
+            self.assertTrue(strip.endswith(" · 1h ago"), strip)
+            normal = text(render._subagent_strip([SubAgent(agent_type="review", active=False,
+                          started_at=sa.started_at, ended_at=sa.ended_at)]))
+            self.assertIn("4m", normal)
+            self.assertTrue(normal.endswith(" · 1h ago"), normal)
+            for state in ("dead", "stale"):
+                for width in (80, 200):
+                    s = self.session(liveness=state, mtime=self.now - 225 * 60, elapsed_min=16)
+                    visible = text(self.lines([s], width=width))
+                    self.assertRegex(visible, r"done · 3h ago(?:\n|$)")
+                    self.assertIn("16m", visible)
+            degraded, _, _ = render._route_node_text({"id": "execute", "state": "degraded",
+                "depends_on": ["plan"], "degradation": {"ts": self.now - 65,
+                "fallback_hop": "inline", "reason": "capacity"}})
+            self.assertTrue(degraded.endswith(" · 1m ago"), degraded)
+            self.assertIn("←{plan}", degraded)
+
+    def test_known_herdr_observation_labels_use_english_without_rewriting_other_errors(self):
+        with mock.patch("time.time", return_value=self.now):
+            for error, expected in (("herdr 조회 불가", "herdr unavailable"),
+                                    ("pane 조회 불가", "pane unavailable"),
+                                    ("사용자가 쓴 오류", "사용자가 쓴 오류")):
+                visible = text(render._observation_lines({"herdr": {
+                    "state": "failed", "age": 65, "last_error": error}}, term_width=80))
+                self.assertIn(expected, visible)
+                self.assertTrue(visible.endswith(" · 1m ago"), visible)
 
     def test_owner_card_preserves_age_suffix_in_plain_and_tinted_80_columns(self):
         owner = DispatchJob(key="code", slug="owner", harness="codex", cwd="/work/project",

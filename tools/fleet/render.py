@@ -1566,7 +1566,10 @@ def _text_age(timestamp, now=None):
 
 def _aged_text(text, timestamp, room=None):
     """Reserve the observation age at the end, even when prose is clipped."""
-    age = _text_age(timestamp)
+    return _text_with_age(text, _text_age(timestamp), room)
+
+
+def _text_with_age(text, age, room=None):
     if room is None:
         return str(text) + " · " + age
     suffix = " · " + age
@@ -1574,6 +1577,15 @@ def _aged_text(text, timestamp, room=None):
     if text_room < 1:
         return age if _dw(age) <= room else ""
     return _clip_w(str(text), text_room) + suffix
+
+
+def _clip_age_tail(text, room):
+    if room is None:
+        return text
+    body, separator, age = text.rpartition(" · ")
+    if separator and (age == "age unknown" or re.fullmatch(r"\d+[mhd] ago", age)):
+        return _text_with_age(body, age, room)
+    return _clip_w(text, room)
 
 
 def _subject_name_key(entity, key):
@@ -2099,14 +2111,6 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     else:
         segs += _suppressed_stage_segs(s, live == "working", stage_zone or _STAGE_ZONE_MAX,
                                        tag_by_key)
-    if dead_stale:
-        # F-13: a stale/dead row has no live model/effort/ctx to show — a wall of "—" placeholders
-        # read as broken telemetry rather than "this session stopped". One `done <age>` cell
-        # replaces the whole model+gauge zone (LIVE rows keep the explicit "—" convention, F-3).
-        # F-64 (v49): "last seen" → "done" — the finished state reads symmetric with the live
-        # "running" vocabulary instead of sounding like lost telemetry (user 2026-08-05).
-        age_min = int((time.time() - s.mtime) / 60) if s.mtime else (s.elapsed_min or 0)
-        segs += [("  ", None), ("done %s" % fmt_min(age_min), "dim")]
     if s.app_server:
         segs.append(("  app-server", "dim"))
     if s.orphan:
@@ -2117,6 +2121,8 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     # Elapsed rides inline as a dim bare `<t>` value right after the row's content, the
     # same grammar the summary rows and the in-card dispatch rows use.
     segs += [("  ", None), (_ELAPSED_GLYPH + fmt_min(s.elapsed_min), "dim")]
+    if dead_stale:
+        segs.append(("  done · " + _text_age(s.mtime), "dim"))
     return segs
 
 
@@ -2265,6 +2271,24 @@ def _clip_segs(segs, max_width):
         if _dw(piece) < _dw(text):
             break
     return out, used
+
+
+def _reserve_age_tail(segs, max_width):
+    """Clip styled prose before its final observed-age suffix."""
+    if not segs or max_width is None:
+        return segs
+    text, key = segs[-1]
+    match = re.search(r"(?: · |  )(?:\d+[mhd] ago|age unknown)$", text)
+    if not match:
+        return segs
+    suffix = match.group(0)
+    body = segs[:-1] + [(text[:match.start()], key)]
+    room = max_width - _dw(suffix)
+    if room < 0:
+        age = suffix.lstrip(" ·")
+        return [(age, key)] if _dw(age) <= max_width else []
+    out, _ = _clip_segs(body, room)
+    return out + [(suffix, key)]
 
 
 def _dispatch_box_width(term_width, layout=None):
@@ -3215,6 +3239,8 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     l2 = _pad_to_column(l2, _session_routing_column("narrow"))
     stage_fn = _session_stage_segs if show_projection_stage else _suppressed_stage_segs
     l2 += stage_fn(s, live == "working", _narrow_session_cell_budget(term_width), tag_by_key)
+    if live in ("stale", "dead"):
+        l2.append(("  done · " + _text_age(s.mtime), "dim"))
     # v16: context is emitted by _context_detail_row beneath the complete card.
     if _split:
         return l1, l2, br_segs
@@ -3975,7 +4001,7 @@ def _fit_strip(builders, width):
         segs = build()
         if sum(_dw(text) for text, _key in segs) <= width:
             return segs
-    return _clip_segs(segs, width)[0]
+    return _clip_segs(_reserve_age_tail(segs, width), width)[0]
 
 
 def _subagent_elapsed_min(sa):
@@ -4014,7 +4040,7 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
     gap: absent budget renders nothing) — model keeps its family color, effort uses
     the `_EFF_SHORT` 2-char form with the heat-ramp color keyed by the full value
     (same F-9(c) idiom as `_harness_model_cell`). A completed entry's elapsed stops
-    at its observed completion time and gains a dim `(<idle>)` tail — minutes asleep
+    at its observed completion time and gains a dim `· <age> ago` tail
     since it finished (사용자 2026-07-29 '언제 끝났는지'; no completion evidence →
     no tail). `depth` = the owning dispatch row's
     depth (0 for a session row): each level pushes the strip 2 more cells inward so it
@@ -4048,12 +4074,11 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
                 segs.append(("  " + tail, "dim"))
             idle = _subagent_idle_min(sa)
             if idle is not None and show_idle:
-                segs.append((" (" + fmt_min(idle) + ")", "dim"))
+                segs.append((" · " + _text_age(sa.ended_at), "dim"))
         return segs
     return [_fit_strip([lambda: build(True, True, True),
                         lambda: build(False, True, True),
-                        lambda: build(False, False, True),
-                        lambda: build(False, False, False)], term_width)]
+                        lambda: build(False, True, False)], term_width)]
 
 
 # The icon says WHAT the relation is, the arrow says which WAY it points. User decision
@@ -4951,7 +4976,7 @@ def _resource_now_text(entity, room=None):
             text = "%s · %s(exit %d) · %s" % (
                 subject_command(node, command), state, child.exit_code,
                 _resource_log_age(child))
-            return _clip_w(text, room) if room is not None else text
+            return _clip_age_tail(text, room)
     if not resource_context:
         return None
     if not children:
@@ -4968,9 +4993,8 @@ def _resource_now_text(entity, room=None):
             command = label if label != process["command"] else _resource_command_label(label)
     progress = _resource_progress_tail(child)
     log = _resource_log_age(child)
-    facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, log) if part)
-    if len(children) > 1:
-        facts += " · +%d" % (len(children) - 1)
+    extra = "+%d" % (len(children) - 1) if len(children) > 1 else ""
+    facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, extra, log) if part)
     label = subject_command(node, command)
     if room is not None:
         budget = room - _dw(" · " + facts)
@@ -4978,8 +5002,8 @@ def _resource_now_text(entity, room=None):
             label = _clip_w(label, budget)
         else:
             # Narrow NOW still identifies the work and its observed location.
-            return _clip_w(node + " · " + where + " · " + log, room)
-    return label + " · " + facts
+            return _clip_age_tail(node + " · " + where + " · " + log, room)
+    return _clip_age_tail(label + " · " + facts, room)
 
 
 def _resource_log_age(child):
@@ -6192,8 +6216,8 @@ def _route_node_text(n):
         degradation = n.get("degradation") or {}
         hop = degradation.get("fallback_hop") or "?"
         reason = degradation.get("reason") or "degraded"
-        tail = (" " + fmt_min(degradation.get("ts") and max(0, int((time.time() - degradation.get("ts")) / 60)))) if degradation.get("ts") else ""
-        return "%s ◐%s (%s·%s)%s" % (nid, tail, hop, reason, deps), "lvl_y", mark
+        tail = (" · " + _text_age(degradation.get("ts"))) if degradation.get("ts") else ""
+        return "%s ◐ (%s·%s)%s%s" % (nid, hop, reason, deps, tail), "lvl_y", mark
     return "%s ○%s" % (nid, deps), "dim", mark
 
 
@@ -7295,7 +7319,10 @@ def _observation_lines(observations, term_width=None):
         age = health.get("age")
         if health.get("last_success_at") is not None:
             age = time.monotonic() - health["last_success_at"]
-        text = "  %s unknown · %s" % (name, health.get("last_error") or "collection delayed")
+        error = health.get("last_error") or "collection delayed"
+        error = {"herdr 조회 불가": "herdr unavailable",
+                 "pane 조회 불가": "pane unavailable"}.get(error, error)
+        text = "  %s unknown · %s" % (name, error)
         lines.append([(_aged_text(text, time.time() - age if age is not None else None,
                                   term_width), "lvl_y")])
     return lines
@@ -7324,6 +7351,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             continue
         tinted = bool(_TINT_OK and line and _is_fill(line[0][0]) and line[0][0][1] in _TINT_CHARS)
         row_width = width - (_INSET + _PAD_IN if tinted else 0)
+        # Framing is out-of-band. Keep a final observation age inside the actual
+        # paint budget before the common plain/curses clipping pass.
+        if tinted:
+            line = line[:1] + _reserve_age_tail(line[1:], row_width)
+        else:
+            line = _reserve_age_tail(line, row_width)
         out, used = [], 0
         for text, key in line:
             if _is_fill(text):
@@ -7696,8 +7729,12 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         last_result = _group_last_result(group_sessions, group_jobs, emission["resources"])
         if last_result:
             lead = "✓ " if last_result["result"] == "success" else "✕ "
-            room = max(0, (_context_content_width(term_width) or 160)
-                       - sum(_dw(t) for t, _ in head_segs) - 2)
+            available = _context_content_width(term_width) or 160
+            age_width = _dw(" · " + _text_age(last_result["at"]))
+            result_room = min(_dw(lead + last_result["name"]) + age_width,
+                              max(age_width + _dw(lead) + 1, available // 2))
+            head_segs = _clip_segs(head_segs, max(0, available - result_room - 2))[0]
+            room = max(0, available - sum(_dw(t) for t, _ in head_segs) - 2)
             label = _aged_text(lead + last_result["name"], last_result["at"], room)
             if label:
                 head_segs.append(("  " + label, "dim"))

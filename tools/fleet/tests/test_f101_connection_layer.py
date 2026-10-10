@@ -361,7 +361,9 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     vocabulary, named context and separate state legends; below 138 columns the
     public renderer now uses the actual narrow layout. Later that day the user
     requested original technical terms and removal of context/NOW labels. These
-    fixed-clock goldens retain the layout changes without absent connection rows."""
+    fixed-clock goldens retain the layout changes without absent connection rows.
+    Exception on record: 2026-10-10 the user then requested compact English
+    Fleet labels; only the three legend lines change in these four goldens."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

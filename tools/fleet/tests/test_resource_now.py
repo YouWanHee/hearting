@@ -76,6 +76,23 @@ class ResourceNowTest(unittest.TestCase):
         owner.liveness, owner.resource_wait = "idle", {"run_ids": ["another"]}
         self.assertEqual(render._resource_now_text(owner), "waiting")
 
+    def test_log_age_survives_long_resource_now_for_live_and_exited_work(self):
+        now = 1791512200
+        for harness in ("claude", "codex", "opencode"):
+            owner, child = self.owner(self.rows[0], harness)
+            child.display_title = "길게 작성된 자원 작업 이름 " * 20
+            child.log_updated_at = now - 90
+            with mock.patch.object(render, "_fresh_compute_hosts", return_value=(None, 0)), \
+                 mock.patch.object(render.time, "time", return_value=now):
+                for state in ("working", "exited"):
+                    child.liveness = state
+                    child.exit_code = 0 if state == "exited" else None
+                    owner.summary = None
+                    for width in (80, 100, 168):
+                        row = render._plain(render._context_detail_row(owner, term_width=width)[0])
+                        self.assertTrue(row.endswith(" · 1m ago"), row)
+                        self.assertLessEqual(render._dw(row), width)
+
     def test_now_and_resource_row_share_verified_host_without_gpu_snapshot(self):
         for harness in ("claude", "codex", "opencode"):
             owner, child = self.owner(self.rows[0], harness)

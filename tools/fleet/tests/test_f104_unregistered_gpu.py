@@ -71,7 +71,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         header = next(i for i, line in enumerate(text) if "SR_CorrNet_DSC/" in line)
         row = next(i for i, line in enumerate(text) if "GPU moving4:0" in line)
         self.assertGreater(row, header)
-        for token in ("M6 학습", "19 GB", fmt_min(4500), "미등록"):
+        for token in ("M6 train", "19 GB", fmt_min(4500), "unregistered"):
             self.assertIn(token, text[row])
         self.assertIn("●", text[header])
 
@@ -109,7 +109,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         text = self.lines(snapshot, [session])
         self.assertEqual(sum(line.count("● GPU") for line in text), 1)
         row = next(line for line in text if "● GPU" in line)
-        self.assertNotIn("미등록", row)
+        self.assertNotIn("unregistered", row)
 
     def test_process_whose_session_left_the_board_gets_a_row(self):
         owner = _session_owner()
@@ -117,7 +117,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         text = self.lines(snapshot)
         rows = [line for line in text if "● GPU moving4:0" in line]
         self.assertEqual(len(rows), 1)
-        self.assertIn("미등록", rows[0])
+        self.assertIn("unregistered", rows[0])
 
     def test_probe_failure_is_silent_and_empty(self):
         good = _snapshot((0, [_process()]))
@@ -152,7 +152,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
                 header = next(i for i, line in enumerate(text) if "(unknown)/" in line)
                 row = next(i for i, line in enumerate(text) if "GPU moving4:0" in line)
                 self.assertGreater(row, header)
-                self.assertIn("미등록", text[row])
+                self.assertIn("unregistered", text[row])
 
     def test_row_never_overflows_and_keeps_identity(self):
         entry = compute_hosts.unregistered_gpu(_snapshot((0, [_process(
@@ -195,7 +195,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         # Identifier-based labels (M6/config) keep their existing short form.
         m6 = render._plain(render._gpu_work_row(
             compute_hosts.unregistered_gpu(_snapshot((0, [_process()])))[0], 168))
-        self.assertIn("M6 학습", m6)
+        self.assertIn("M6 train", m6)
         # Filename compaction leaves the script visible at the narrower width.
         narrow = render._plain(render._gpu_work_row(entry, 60))
         self.assertLessEqual(render._dw(narrow), 60)
@@ -257,7 +257,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         self.assertEqual(emission["gpu_strip_keys"], {("codex", SESSION_ID)})
         text = self.lines(snapshot, [session])
         self.assertEqual(sum(line.count("● GPU") for line in text), 1)
-        self.assertNotIn("미등록", "\n".join(text))
+        self.assertNotIn("unregistered", "\n".join(text))
         quiet = render._group_emission(group, True, True, {})
         self.assertIs(quiet["fold"], True)
 
@@ -300,11 +300,11 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         snapshot, child, job = self._job_owned_gpu()
         text = self.gpu_text(snapshot, [child], [job])
         self.assertEqual(sum(line.count("● GPU") for line in text), 1)
-        self.assertNotIn("미등록", "\n".join(text))
+        self.assertNotIn("unregistered", "\n".join(text))
         # the same holds when the hidden child session is not in the snapshot at all
         text = self.gpu_text(snapshot, [], [job])
         self.assertEqual(sum(line.count("● GPU") for line in text), 1)
-        self.assertNotIn("미등록", "\n".join(text))
+        self.assertNotIn("unregistered", "\n".join(text))
 
     def _group_keys(self, snapshot, sessions, jobs):
         render.set_compute_hosts(snapshot)
@@ -346,13 +346,13 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         text = self._texts(snapshot, [], [job], show_all=False)
         rows = [line for line in text if "● GPU" in line]
         self.assertEqual(len(rows), 1)
-        self.assertIn("미등록", rows[0])
+        self.assertIn("unregistered", rows[0])
         self.assertEqual(self._group_keys(snapshot, [], [job]), set())
         # --all draws the job row and its strip, so the card row steps aside
         text = self._texts(snapshot, [], [job], show_all=True)
         rows = [line for line in text if "● GPU" in line]
         self.assertEqual(len(rows), 1)
-        self.assertNotIn("미등록", "\n".join(text))
+        self.assertNotIn("unregistered", "\n".join(text))
 
     def test_nested_dead_owner_job_draws_its_strip_so_the_process_shows_once(self):
         snapshot = self._gpu_snapshot()
@@ -364,7 +364,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         for show_all in (False, True):
             text = self._texts(snapshot, [parent], [job], show_all=show_all)
             self.assertEqual(sum(line.count("● GPU") for line in text), 1, show_all)
-            self.assertNotIn("미등록", "\n".join(text))
+            self.assertNotIn("unregistered", "\n".join(text))
 
     def test_children_of_a_duplicate_session_id_draw_once_or_fall_back_to_the_card(self):
         snapshot = self._gpu_snapshot()
@@ -379,7 +379,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         job.parent_sid = "dup-session"
         text = self._texts(snapshot, [session(301), session(302)], [job], show_all=False)
         self.assertEqual(sum(line.count("● GPU") for line in text), 1)
-        self.assertNotIn("미등록", "\n".join(text))
+        self.assertNotIn("unregistered", "\n".join(text))
 
     def test_children_of_a_mem_worker_session_are_dropped_so_the_card_row_shows_it(self):
         snapshot = self._gpu_snapshot()
@@ -393,7 +393,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         text = self._texts(snapshot, [mem], [job], show_all=False)
         rows = [line for line in text if "● GPU" in line]
         self.assertEqual(len(rows), 1)
-        self.assertIn("미등록", rows[0])
+        self.assertIn("unregistered", rows[0])
 
     def test_folded_job_draws_no_strip_so_the_card_row_shows_it_once(self):
         snapshot, _child, _job = self._job_owned_gpu()
@@ -404,7 +404,7 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         folded._runtime_session_id = SESSION_ID
         text = self.gpu_text(snapshot, [], [owner, folded])
         self.assertEqual(sum(line.count("● GPU") for line in text), 1)
-        self.assertIn("미등록", next(line for line in text if "● GPU" in line))
+        self.assertIn("unregistered", next(line for line in text if "● GPU" in line))
 
     def test_projection_cost_is_bounded(self):
         hosts = []

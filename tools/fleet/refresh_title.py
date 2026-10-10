@@ -684,7 +684,7 @@ def read_opencode_activity(connection, session_id):
                 continue
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             if lines == ["WAITING_FOR_RUNTIME"]:
-                preview = "런타임 대기"
+                preview = "runtime waiting"
             else:
                 # The owner's terminal protocol is public status, not prose.
                 status = [line for line in lines if line.startswith(("verdict:", "blocker:"))]
@@ -705,7 +705,7 @@ def read_opencode_activity(connection, session_id):
         message, stamp = assistants[latest]
         native_time = message.get("time")
         if isinstance(native_time, dict) and not native_time.get("completed"):
-            result.update(summary="모델 응답 중", summary_ts=float(stamp) / 1000)
+            result.update(summary="model responding", summary_ts=float(stamp) / 1000)
     return result
 
 
