@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -15,6 +16,7 @@ from fleet import herdr_projection, session_tags
 from fleet.model import Session
 from fleet.session_handle import minted_tag, resolve_tag
 from fleet.collectors import procscan
+REPORT = herdr_projection._report
 
 
 def collision():
@@ -110,6 +112,15 @@ class SessionTagCollisionTest(unittest.TestCase):
         self.tags([self.session(self.a), self.session(self.b)])
         self.assertEqual(path.read_text(), "{broken")
 
+    def test_duplicate_mutable_assignments_are_corrupt_and_use_hash(self):
+        self.tags([self.session(self.a), self.session(self.b, started=20)])
+        data = json.loads(session_tags._path().read_text())
+        for row in data["assignments"]:
+            row["tag"] = "00"
+        session_tags._path().write_text(json.dumps(data))
+        self.assertEqual(resolve_tag("codex", self.a), minted_tag(self.a))
+        self.assertEqual(resolve_tag("codex", self.b), minted_tag(self.b))
+
     def test_unwritable_state_does_not_break_consumer(self):
         with mock.patch("fleet.session_tags.tempfile.mkstemp", side_effect=PermissionError):
             self.tags([self.session(self.a), self.session(self.b)])
@@ -150,6 +161,31 @@ class SessionTagCollisionTest(unittest.TestCase):
         self.agents.return_value = [{"agent": "codex", "pane_id": "w:new",
                                     "agent_session": {"kind": "id", "value": self.b}}]
         self.assertNotEqual(resolve_tag("codex", self.b), before)
+
+    def test_sequential_native_first_reports_allocate_before_metadata(self):
+        agents, reported = [], []
+        self.agents.side_effect = lambda: agents
+
+        def run(command, **kwargs):
+            if command[2] == "report-agent-session":
+                sid = command[command.index("--agent-session-id") + 1]
+                agents.append({"agent": "codex", "pane_id": command[3],
+                               "agent_session": {"kind": "id", "value": sid}})
+            elif command[2] == "report-metadata":
+                shown = command[command.index("--display-agent") + 1]
+                reported.append(shown)
+                next(a for a in agents if a["pane_id"] == command[3])["display_agent"] = shown
+            return SimpleNamespace(returncode=0)
+
+        with mock.patch("fleet.herdr_projection.subprocess.run", side_effect=run), \
+                mock.patch("fleet.herdr_projection.shutil.which", return_value="herdr"), \
+                mock.patch("fleet.herdr_projection.session_title", return_value=""), \
+                mock.patch("fleet.herdr_projection._formatter_overrides", return_value=(None, None)):
+            for sid in (self.a, self.b):
+                REPORT("codex", sid, "w:" + sid, True, session_seq=1, session_start_source="startup")
+        self.assertEqual(len(reported), 2)
+        self.assertNotEqual(reported[0], reported[1])
+        self.assertEqual(reported, ["[%s] codex" % resolve_tag("codex", sid) for sid in (self.a, self.b)])
 
     def test_idle_colliding_herdr_pane_updates_metadata_without_identity_or_prompt(self):
         self.agents.return_value = [{"agent": "codex", "pane_id": "w:" + sid,

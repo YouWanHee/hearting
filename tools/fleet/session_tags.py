@@ -35,6 +35,12 @@ def _read(path):
                 or key in rows):
             raise ValueError("invalid tag assignment")
         rows[key] = row
+    claimed = {}
+    for key, row in rows.items():
+        prior = claimed.get(row["tag"])
+        if prior and (key[0] != "claude" or prior[0] != "claude"):
+            raise ValueError("duplicate mutable tag assignment")
+        claimed[row["tag"]] = key
     return rows
 
 
