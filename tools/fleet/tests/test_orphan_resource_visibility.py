@@ -117,7 +117,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                     with mock.patch.object(render, "_COMPUTE_HOSTS_SET_AT", time.monotonic() - 100):
                         output = text(self.lines(process=process))
                     self.assertIn("resource full-run", output)
-                    self.assertIn("working  1d 3h", output)
+                    self.assertIn("● resource full-run  1d 3h", output)
                     self.assertNotIn("● GPU", output)
 
     def test_terminal_or_stale_identity_removes_resource_fallback(self):

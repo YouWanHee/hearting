@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,39 @@ def encoded(value):
 
 
 class ProjectionFixture(unittest.TestCase):
+    def test_route_without_report_keeps_absence_and_real_hash_mismatch(self):
+        with mock.patch.object(artifact_producer, "route_cycle_for",
+                               return_value={"cycle_id": CYCLE_ID}):
+            # Use an admitted cycle with no report stage and no report directory.
+            self.route["nodes"] = [{"id": "full-run", "outputs": []}]
+            self.route_path.write_bytes(encoded(self.route))
+            shutil.rmtree(self.source)
+            absent = projection.project_route(self.root, ROUTE_ID, ROUTE_HASH)
+            self.assertEqual(absent["verification"]["reason"], "report-source-unavailable")
+            wrong = projection.project_route(self.root, ROUTE_ID, "sha256:" + "9" * 64)
+            self.assertEqual(wrong["verification"]["reason"], "route-hash-binding-mismatch")
+
+    def test_existing_invalid_report_source_is_visible(self):
+        with mock.patch.object(artifact_producer, "route_cycle_for",
+                               return_value={"cycle_id": CYCLE_ID}):
+            self.source.rename(self.source.with_name("report-original"))
+            self.source.write_text("invalid report directory", encoding="utf-8")
+            payload = projection.project_route(self.root, ROUTE_ID, ROUTE_HASH)
+            self.assertEqual(payload["verification"]["reason"], "report-source-kind-invalid")
+            self.assertIs(projection.report_detail_payload(payload), payload)
+
+    def test_route_keeps_other_unresolved_reasons_and_checks_bound_subject_hash(self):
+        with mock.patch.object(artifact_producer, "route_cycle_for",
+                               return_value={"cycle_id": CYCLE_ID}):
+            for payload, reason in ((projection._unresolved("artifact-revision-stale"),
+                                     "artifact-revision-stale"),
+                                    ({"subject": {"state": "bound", "route_hash": "wrong"}},
+                                     "route-hash-binding-mismatch")):
+                with self.subTest(reason=reason), mock.patch.object(
+                        projection, "_resolve_source", return_value=payload):
+                    actual = projection.project_route(self.root, ROUTE_ID, ROUTE_HASH)
+                    self.assertEqual(actual["verification"]["reason"], reason)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
