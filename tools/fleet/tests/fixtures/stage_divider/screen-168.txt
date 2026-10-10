@@ -31,5 +31,5 @@
 
   session: ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch
   project: ● 활동
-  resource: ● 실행 · UTIL/VRAM · ↳ command
+  resource: ● 실행 · ◇ 실행 미확인 · UTIL/VRAM · ↳ command
   stage: ● 현재  ✓ 완료  ✕ 실패  ○ 예정

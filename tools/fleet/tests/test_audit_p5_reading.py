@@ -254,6 +254,32 @@ class ReadingTest(unittest.TestCase):
         self.assertRegex(pulse, r"↳ 4 jobs \(\S+ 4\)")
         self.assertLessEqual(render._dw(pulse), 59)
 
+    def test_r8_unknown_gpu_symbol_has_meaning_when_inline_note_drops(self):
+        resource = dict(host="moving4", index=0, model="RTX 6000 Ada Gen.",
+                        access_only=True, telemetry_unknown=True, processes=[dict(
+                            pid=101, proc_start=11,
+                            command="python train.py --config AMI_8ch_varying_0_3spk_v3.yaml --engine_mode train")])
+        for session_legend in (False, True):
+            for folded in (False, True):
+                for width in (80, 100, 160, 168):
+                    with self.subTest(session=session_legend, folded=folded, width=width), \
+                         mock.patch.object(render, "_gpu_commands_folded", return_value=folded):
+                        rows = render._gpu_resource_strip([resource], term_width=width)
+                        legend = render._reading_legend(width, session=session_legend)
+                        line = "\n".join(render._plain(row) for row in rows)
+                        explanation = "\n".join(render._plain(row) for row in legend)
+                        self.assertIn("◇", line)
+                        self.assertIn("AMI_8ch_varying_0_3spk_v3", line)
+                        self.assertIn("◇ 실행 미확인", explanation)
+                        self.assertTrue(all(render._dw(render._plain(row)) <= width - 1
+                                            for row in rows + legend))
+        # Unknown telemetry with no confirmed process must not claim access.
+        gpu = dict(index=0, observation_source="fixture", processes=[])
+        self.assertEqual(render._gpu_state(gpu), "unknown")
+        token = render._plain(render._gpu_token(gpu, 79))
+        self.assertIn("사용률·VRAM 모름", token)
+        self.assertNotIn("장치 접근 확인", token)
+
     def test_h1_observation_links_only_confirmed_caller_continuity(self):
         parent = Session(harness="claude", pid=1, cwd="/work/a", session_id="new", liveness="working",
                          session_aliases=["old"])

@@ -8158,7 +8158,7 @@ def _reading_legend(term_width, session=True):
     if session:
         rows.extend(_wrap_legend([('  session: ', "dim"), ('⠹ working  ● idle  ◑ blocked  ✕ dead', "dim")], term_width))
     for text in ('  project: ● 활동',
-                 '  resource: ● 실행 · UTIL/VRAM · ↳ command',
+                 '  resource: ● 실행 · ◇ 실행 미확인 · UTIL/VRAM · ↳ command',
                  "  stage: ● 현재  ✓ 완료  ✕ 실패  ○ 예정"):
         rows.extend(_wrap_route_node("", text, "dim", "", term_width, continuation="  "))
     return rows
