@@ -778,7 +778,7 @@ def replace_resource_predecessor(route, ledger, prior, record, resource):
                   "execution": evidence, "next_resource": record["predecessor_id"]}, actor="arm")
 
 
-def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs):
+def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, terminal_gates=None):
     """Resolve a late output at exact owner settlement, without starting work.
 
     Called under the ledger lock after the owner's terminal gates pass. The
@@ -786,6 +786,11 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs):
     the earlier missing-output observation and its legal recovery transitions.
     """
     import dispatch_resource_wait as OWNER_RESOURCE
+    import resource_failure_resolution
+    resource_failure_resolution.reconcile(route, ledger,
+        terminal_gates if terminal_gates is not None else
+        route_module().terminal_gate_observation(route, jobs=jobs, exact_terminal=True),
+        jobs, route_module())
     resolved_nodes = []
     journal = ledger.journal()
     for node, armed in read_armed(ledger).items():
@@ -2580,6 +2585,9 @@ def cmd_complete(args):
                               "unproven": unproven,
                               "workflow_state": state["workflow_state"]}, sort_keys=True))
             return 3
+        import resource_failure_resolution
+        resource_failure_resolution.reconcile(route, ledger, gates,
+            getattr(args, "jobs", None) or ledger.root.parent.parent / "jobs.log", route_module())
         ledger.complete(terminal_nodes, gates)
     print(json.dumps({"complete": True, **ledger_metadata(getattr(args, "jobs", None), ledger),
                       "terminal_nodes": terminal_nodes,
@@ -3124,5 +3132,9 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (SupervisorError, WS.WorkflowStateError) as exc:
+        if getattr(exc, "next_step", None) is not None:
+            print(json.dumps({"complete": False, "reason": exc.code, "detail": str(exc),
+                              "next_step": exc.next_step}, ensure_ascii=False))
+            raise SystemExit(3)
         print(f"workflow-supervisor: {exc}", file=sys.stderr)
         raise SystemExit(64)

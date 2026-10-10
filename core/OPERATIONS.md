@@ -931,6 +931,22 @@ A registered worker's `gate --block` on every harness takes its registry from
 refused before it mutates the ledger or creates delivery when it has neither;
 read-only no-jobs status/await/release compatibility remains available.
 
+**Later verification of failed resource outputs.** Ordinary terminal settlement
+can append a resolution of a retryable resource failure when its exact exited
+run and nonzero sentinel remain unchanged, a current resource-stage judgment
+accepts its preserved output bytes, and current downstream stages bind those
+same bytes through an independent PASS. The runtime records the run identity,
+consumed file hashes, stage-marker hashes and independent gate in the existing
+workflow journal. Original FAIL, exit, resource registry and artifacts stay
+unchanged; this resolves workflow consumption, never the process or scientific
+result. Owner wording or downstream PASS alone is insufficient. Missing or
+different bindings retain failure and return an executable continuation using
+the existing compose surface: a new resource attempt with a distinct `__a<N>`
+identity and output directory, followed by revalidation of its downstream
+stages. Old PASS markers are provenance, not authority for the new bytes.
+The same judgment serves owner settlement and workflow completion on all three
+harnesses, without another flag, required input or approval.
+
 **Advance evidence is four-part and fail-closed.** Before a supervisor may
 start a successor it proves, for the predecessor: exact process identity
 (recorded `pid` plus `/proc` start time plus command-line hash, so a reused PID

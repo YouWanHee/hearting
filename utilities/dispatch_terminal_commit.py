@@ -122,6 +122,7 @@ class TerminalCommitResult:
     terminal_nodes: tuple[str, ...] = ()
     envelope_text: Optional[str] = None
     shared_publication: Optional[Mapping[str, Any]] = None
+    next_step: Optional[Mapping[str, Any]] = None
 
 
 def _default_close_route(route, route_file, **kwargs):
@@ -1795,7 +1796,8 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         else:
             with ledger.lock():
                 from dispatch_resource_wait import supervisor
-                supervisor().reconcile_resource_artifacts(route, ledger, request.owner_attempt_id, request.jobs)
+                supervisor().reconcile_resource_artifacts(route, ledger, request.owner_attempt_id, request.jobs,
+                                                         terminal_gates=gates)
                 ledger.completion_paths(workflow.route_terminal_nodes(route), gates)
             result = settle_terminal_commit(request)
         if result.result == "completed":
@@ -1804,7 +1806,8 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
             with ledger.lock():
                 ledger.complete(workflow.route_terminal_nodes(route), gates, actor="completion-controller")
     except (OSError, ValueError, KeyError, TypeError, TerminalCommitError) as exc:
-        result = TerminalCommitResult("recoverable", "recovery-unavailable", str(exc))
+        result = TerminalCommitResult("recoverable", getattr(exc, "code", "recovery-unavailable"), str(exc),
+                                      next_step=getattr(exc, "next_step", None))
     except Exception as exc:
         # Producer/ledger errors are owned recovery outcomes, never a new
         # terminal failure. Preserve their typed reason without model content.
@@ -1840,6 +1843,7 @@ def cleanup_recover():
         raise TerminalCommitError("transaction-conflict", "cleanup-commit-mismatch")
     result = settle_terminal_commit(request)
     print(json.dumps({"result": result.result, "reason": result.reason, "detail": result.detail,
+                      **({"next_step": result.next_step} if result.next_step is not None else {}),
                       **({"shared_publication": result.shared_publication} if result.shared_publication is not None else {})}))
     return 0 if result.result == "completed" else 70
 
@@ -1866,5 +1870,6 @@ if __name__ == "__main__":
     if result.result == "completed":
         materialize_after_terminal_close(args.jobs, args.attempt)
     print(json.dumps({"result": result.result, "reason": result.reason, "detail": result.detail,
+                      **({"next_step": result.next_step} if result.next_step is not None else {}),
                       **({"shared_publication": result.shared_publication} if result.shared_publication is not None else {})}))
     raise SystemExit(0 if result.result == "completed" else 70)
