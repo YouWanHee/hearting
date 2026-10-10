@@ -108,6 +108,42 @@ class CurrentSessionTest(unittest.TestCase):
                 mock.patch.object(process_identity, "pane_session_successors", return_value={"old": {"current"}}):
             self.assertEqual(claude.session_id_of_process(self.pid, str(self.home)), "current")
 
+    def test_incomplete_target_pane_does_not_reconfirm_old_registry(self):
+        s = self._enrich_pane_observation(bound=False, complete=False)
+        self.assertIsNone(s.session_id)
+        self.assertIsNone(s.ctx_pct)
+        self.assertIsNone(s.status)
+        self.assertEqual(s.session_identity_evidence["verdict"], "unobserved")
+
+    def test_incomplete_other_pane_keeps_current_identity_and_telemetry(self):
+        s = self._enrich_pane_observation(bound=True, complete=False)
+        self.assertEqual(s.session_id, "current")
+        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.status)
+
+    def test_complete_pane_observation_resolves_first_snapshot(self):
+        s = self._enrich_pane_observation(bound=True, complete=True)
+        self.assertEqual(s.session_id, "current")
+        self.assertEqual(s.ctx_pct, 17)
+
+    def _enrich_pane_observation(self, *, bound, complete):
+        class Observation(tuple):
+            pass
+        observation = Observation((set(), {self.pid} if bound else set()))
+        observation.complete = complete
+        observation.errors = () if complete else ("wB:p9X: TimeoutError: process-info deadline",)
+        s = Session(harness="claude", pid=self.pid, proc_start=self.start, cwd=self.cwd)
+        panes = [{"pane_id": "wB:p3N", "agent": "claude", "cwd": self.cwd,
+                  "agent_session": {"agent": "claude", "value": "current"}}]
+        bindings = {self.pid: {"wB:p3N"}} if bound else {}
+        with mock.patch.object(procscan, "read_proc_start", return_value=self.start), \
+                mock.patch.object(herdr, "pane_session_aliases", return_value=[]), \
+                mock.patch.object(herdr, "_clear_gpu_session_aliases", return_value=[]), \
+                mock.patch.object(process_identity, "pane_session_successors", return_value={"old": {"current"}}):
+            herdr.enrich([s], agents=[], panes=panes, pids=observation, pane_bindings=bindings)
+            claude.enrich(s, tick={self.pid: getattr(s, "_pane_session_claim", None)})
+        return s
+
 
 class ProcessRolesTest(unittest.TestCase):
     def test_scan_omits_unbound_services_for_all_three_harnesses(self):

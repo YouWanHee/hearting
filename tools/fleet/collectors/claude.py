@@ -556,6 +556,9 @@ def _current_identity(sess, home, record, pane_claim=None):
     pane_sid, pane = None, None
     if (pane_claim and pane_claim.get("proc_start") == sess.proc_start
             and procscan.read_proc_start(sess.pid) == sess.proc_start):
+        if pane_claim.get("verdict") == "unobserved":
+            return None, {"verdict": "unobserved", "claims": claims, "session_id": None,
+                          "pid": sess.pid, "proc_start": sess.proc_start, "pane": None}
         pane_sid, pane = pane_claim.get("session_id"), pane_claim.get("pane")
         if pane_sid:
             claims["pane"] = pane_sid
@@ -594,8 +597,9 @@ def session_id_of_process(pid, home=None):
     selected = [p for p in panes or [] if p.get("agent") == "claude"
                 and p.get("cwd") == cwd]
     bindings = {}
-    herdr.pane_evidence(selected, bindings=bindings)
-    claims = pane_process_claims([sess], selected, bindings)
+    observation = herdr.pane_evidence(selected, bindings=bindings)
+    claims = pane_process_claims([sess], selected, bindings,
+                                 complete=getattr(observation, "complete", True))
     return _current_identity(sess, home, record, claims.get(pid))[0]
 
 

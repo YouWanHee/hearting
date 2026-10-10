@@ -362,7 +362,8 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None and getattr(pids, "complete", True)
     from ..process_identity import pane_process_claims
-    claims = pane_process_claims(sessions, panes, bindings)
+    claims = pane_process_claims(sessions, panes, bindings,
+                                 complete=pids is not None and getattr(pids, "complete", True))
     for session in sessions:
         session._pane_session_claim = claims.get(session.pid)
     # A native resume can run inside the still-live foreground runtime. Keep

@@ -79,14 +79,21 @@ def resolve_session_claims(claims, successors=None):
                  "claims": claims, "session_id": sid}
 
 
-def pane_process_claims(sessions, panes, bindings):
+def pane_process_claims(sessions, panes, bindings, *, complete=True):
     """Consume the existing foreground pane observation; never issue another probe."""
     from .collectors import procscan
     out = {}
     for s in sessions:
         pane_ids = bindings.get(s.pid, set())
-        if (not s.proc_start or s.is_child or s.app_server or len(pane_ids) != 1
+        if (not s.proc_start or s.is_child or s.app_server
                 or procscan.read_proc_start(s.pid) != s.proc_start):
+            continue
+        if len(pane_ids) != 1:
+            candidates = [p for p in panes or [] if p.get("agent") == s.harness
+                          and p.get("cwd") and s.cwd
+                          and os.path.realpath(p["cwd"]) == os.path.realpath(s.cwd)]
+            if not complete and candidates:
+                out[s.pid] = {"verdict": "unobserved", "proc_start": s.proc_start}
             continue
         pane_id = next(iter(pane_ids))
         values = set()
