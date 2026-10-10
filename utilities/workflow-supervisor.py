@@ -637,9 +637,20 @@ def resource_output_evidence(route, armed, evidence):
     row = _checked_resource_row(armed, evidence, require_success=False)
     if row is None:
         raise SupervisorError("resource-evidence-changed")
-    marker = (route_module().completion_dir(route["route_id"], jobs=armed["jobs"])
-              / (armed["node"] + ".json")) if armed.get("jobs") else None
-    return RUN_EVIDENCE.write(armed, row, preserve=bool(marker and marker.is_file()))
+    preserve = False
+    if armed.get("jobs"):
+        directory = route_module().completion_dir(route["route_id"], jobs=armed["jobs"])
+        preserve = (directory / (armed["node"] + ".json")).is_file()
+        output = RUN_EVIDENCE.paths(armed)["runtime_output"]
+        for marker in directory.glob("*.json") if output and not preserve else ():
+            try:
+                recorded = json.loads(marker.read_text())["evidence"]["path"]
+                if Path(recorded).resolve() == Path(output).resolve():
+                    preserve = True
+                    break
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+    return RUN_EVIDENCE.write(armed, row, preserve=preserve)
 
 
 def reopen_resource_output_failure(route, ledger, armed):
@@ -863,8 +874,10 @@ def _evaluate(route, ledger, armed, results):
         try:
             runtime_output = resource_output_evidence(route, armed, evidence)
         except (OSError, ValueError, SupervisorError) as error:
-            results.append({"node": node_id, "action": "wait-resource-output", "reason": str(error)})
-            return
+            if evidence.get("succeeded"):
+                results.append({"node": node_id, "action": "wait-resource-output", "reason": str(error)})
+                return
+            evidence["runtime_output_error"] = str(error)
     artifacts = artifact_evidence(armed)
     evidence["artifacts"] = artifacts
     row = {"node": node_id, "evidence": evidence}

@@ -87,7 +87,7 @@ def write(armed, row, *, preserve=False):
         if preimage is None:
             raise ValueError("resource-completion-evidence-missing")
         return {**receipt, "runtime_only": runtime_only(document)}
-    if preimage is not None and KEY not in document:
+    if preimage is not None and not runtime_only(document):
         return {**receipt, "runtime_only": False}
     namespace = document.setdefault(KEY, {"schema_version": 1, "producer": "hearting", "runs": {}})
     if (not isinstance(namespace, dict) or namespace.get("producer") != "hearting"

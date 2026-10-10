@@ -3933,6 +3933,63 @@ def gate_epoch(ledger, gate):
 
 
 class TestHarnessResourceEvidence(WorkflowFixture):
+    def test_owner_fields_added_to_runtime_document_preserve_exact_bytes(self):
+        route, path = self.two_stage_route()
+        registry = self.resource_registry(exit_code=0)
+        self.arm(path, registry, extra=['--artifact-base', str(self.base)])
+        armed = SUP.read_armed(SUP.ledger_for(route))['run']
+        evidence = SUP.resource_evidence(armed)
+        SUP.resource_output_evidence(route, armed, evidence)
+        output = self.base / 'run.json'
+        document = json.loads(output.read_bytes())
+        document['metric'] = 0.91
+        before = json.dumps(document, separators=(', ', ' : ')).encode()
+        output.write_bytes(before)
+        later = {**armed, 'node': 'later'}
+        self.assertFalse(SUP.resource_output_evidence(route, later, evidence)['runtime_only'])
+        self.assertEqual(output.read_bytes(), before)
+
+    def test_other_node_and_history_markers_preserve_bound_document(self):
+        for name in ('previous.json', 'run.1.json'):
+            with self.subTest(marker=name):
+                route, path = self.two_stage_route(route_id='rt-marker-' + name)
+                registry = self.resource_registry(exit_code=0)
+                jobs = self.base / 'jobs.log'
+                jobs.write_text('')
+                self.arm(path, registry, extra=['--artifact-base', str(self.base), '--jobs', str(jobs)])
+                armed = SUP.read_armed(SUP.ledger_for(route))['run']
+                evidence = SUP.resource_evidence(armed)
+                SUP.resource_output_evidence(route, armed, evidence)
+                output = self.base / 'run.json'
+                before = output.read_bytes()
+                marker = SUP.route_module().completion_dir(route['route_id'], jobs=jobs) / name
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(json.dumps({'evidence': {'path': str(output)}}))
+                # A later node would change the per-run facts without protection.
+                later = {**armed, 'node': 'later'}
+                SUP.resource_output_evidence(route, later, evidence)
+                self.assertEqual(output.read_bytes(), before)
+                output.unlink()
+
+    def test_output_write_error_keeps_actual_execution_failure(self):
+        for exit_code in (3, 0):
+            with self.subTest(exit_code=exit_code):
+                route, path = self.two_stage_route(route_id='rt-write-error-' + str(exit_code))
+                registry = self.resource_registry(exit_code=exit_code)
+                self.arm(path, registry, extra=['--artifact-base', str(self.base)])
+                ledger = SUP.ledger_for(route)
+                # The location was valid at arm time, then became unwritable.
+                (self.base / 'run.json').mkdir()
+                result = SUP.poll_once(route, ledger)[0]
+                self.assertEqual(result['action'], 'halt-failed' if exit_code else 'wait-resource-output')
+                state = ledger.state()
+                self.assertEqual(state['nodes']['run']['state'], 'FAILED_RETRYABLE' if exit_code else 'RUNNING')
+                if exit_code:
+                    self.assertEqual(state['workflow_state'], 'FAILED_RETRYABLE')
+                    self.assertEqual(state['nodes']['run']['evidence']['exit_code'], exit_code)
+                    self.assertIn('runtime_output_error', state['nodes']['run']['evidence'])
+                (self.base / 'run.json').rmdir()
+
     def test_late_output_recovery_resumes_each_durable_transition(self):
         for target in ('node-READY', 'node-RUNNING', 'workflow-READY', 'workflow-RUNNING'):
             with self.subTest(target=target):
