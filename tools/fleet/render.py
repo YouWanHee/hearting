@@ -570,13 +570,13 @@ _GLYPH_KEY = {"working": "g_work", "idle": "g_work_off", "unused": "g_unused",
               "blocked": "g_blocked", "done": "green",   # F-60: red, on its own key
               "stale": "g_stale", "dead": "g_dead", "degraded": "lvl_y", "queued": "dim", "unknown": "dim"}
 _INTERACTION_LABEL = {
-    "decision": "답변 필요",
-    "approval": "승인 필요",
+    "decision": "answer needed",
+    "approval": "approval needed",
     # Claude calls the runtime event a permission prompt while Codex calls the equivalent
     # user gate an approval request. Fleet keeps that producer evidence intact, but presents
     # one user-facing term for the same action.
-    "permission": "승인 필요",
-    "elicitation": "정보 필요",
+    "permission": "approval needed",
+    "elicitation": "input needed",
 }
 
 # group "cooling" state (user 2026-07-03): a directory with NO active work whose newest session
@@ -1554,14 +1554,45 @@ def _display_session_subject(s):
 def _text_age(timestamp, now=None):
     now = time.time() if now is None else now
     if (not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool)
-            or not math.isfinite(timestamp) or timestamp > now):
-        return "시각 미확인"
+            or not math.isfinite(timestamp) or not 0 <= timestamp <= now):
+        return "age unknown"
     minutes = int((now - timestamp) // 60)
     if minutes >= 1440:
-        return "%d일 전" % (minutes // 1440)
+        return "%dd ago" % (minutes // 1440)
     if minutes >= 60:
-        return "%d시간 전" % (minutes // 60)
-    return "%d분 전" % minutes
+        return "%dh ago" % (minutes // 60)
+    return "%dm ago" % minutes
+
+
+def _aged_text(text, timestamp, room=None):
+    """Reserve the observation age at the end, even when prose is clipped."""
+    return _text_with_age(text, _text_age(timestamp), room)
+
+
+def _text_with_age(text, age, room=None):
+    if room is None:
+        return str(text) + " · " + age
+    suffix = " · " + age
+    text_room = room - _dw(suffix)
+    if text_room < 1:
+        return age if _dw(age) <= room else ""
+    return _clip_w(str(text), text_room) + suffix
+
+
+def _clip_age_tail(text, room):
+    if room is None:
+        return text
+    body, separator, age = text.rpartition(" · ")
+    if separator and (age == "age unknown" or re.fullmatch(r"\d+[mhd] ago", age)):
+        return _text_with_age(body, age, room)
+    return _clip_w(text, room)
+
+
+def _subject_name_key(entity, key):
+    if (not getattr(entity, "runtime_name", None) and not _is_plugin_agent(entity)
+            and titles.previous_title(entity, getattr(entity, "title_ts", None))):
+        return _NAME_KEY_DIM.get(getattr(entity, "harness", None), "nmd_other")
+    return key
 
 
 def _subject_title(entity):
@@ -1570,9 +1601,6 @@ def _subject_title(entity):
         return ""
     if _is_plugin_agent(entity):
         return title
-    ts = getattr(entity, "title_ts", None)
-    if titles.previous_title(entity, ts):
-        return "이전 제목 · " + title
     return title
 
 
@@ -2057,7 +2085,7 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     if name_width is None:
         title_budget = min(title_budget, _TITLE_MAX)
     shown = _clip_w(name_txt, title_budget)
-    segs.append((shown, name_key))
+    segs.append((shown, _subject_name_key(s, name_key)))
     used = _dw(shown)
     for text, key in suffix:
         segs.append((text, key))
@@ -2083,14 +2111,6 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     else:
         segs += _suppressed_stage_segs(s, live == "working", stage_zone or _STAGE_ZONE_MAX,
                                        tag_by_key)
-    if dead_stale:
-        # F-13: a stale/dead row has no live model/effort/ctx to show — a wall of "—" placeholders
-        # read as broken telemetry rather than "this session stopped". One `done <age>` cell
-        # replaces the whole model+gauge zone (LIVE rows keep the explicit "—" convention, F-3).
-        # F-64 (v49): "last seen" → "done" — the finished state reads symmetric with the live
-        # "running" vocabulary instead of sounding like lost telemetry (user 2026-08-05).
-        age_min = int((time.time() - s.mtime) / 60) if s.mtime else (s.elapsed_min or 0)
-        segs += [("  ", None), ("done %s" % fmt_min(age_min), "dim")]
     if s.app_server:
         segs.append(("  app-server", "dim"))
     if s.orphan:
@@ -2101,6 +2121,8 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     # Elapsed rides inline as a dim bare `<t>` value right after the row's content, the
     # same grammar the summary rows and the in-card dispatch rows use.
     segs += [("  ", None), (_ELAPSED_GLYPH + fmt_min(s.elapsed_min), "dim")]
+    if dead_stale:
+        segs.append(("  done · " + _text_age(s.mtime), "dim"))
     return segs
 
 
@@ -2249,6 +2271,24 @@ def _clip_segs(segs, max_width):
         if _dw(piece) < _dw(text):
             break
     return out, used
+
+
+def _reserve_age_tail(segs, max_width):
+    """Clip styled prose before its final observed-age suffix."""
+    if not segs or max_width is None:
+        return segs
+    text, key = segs[-1]
+    match = re.search(r"(?: · |  )(?:\d+[mhd] ago|age unknown)$", text)
+    if not match:
+        return segs
+    suffix = match.group(0)
+    body = segs[:-1] + [(text[:match.start()], key)]
+    room = max_width - _dw(suffix)
+    if room < 0:
+        age = suffix.lstrip(" ·")
+        return [(age, key)] if _dw(age) <= max_width else []
+    out, _ = _clip_segs(body, room)
+    return out + [(suffix, key)]
 
 
 def _dispatch_box_width(term_width, layout=None):
@@ -2979,7 +3019,7 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
     # where the row actually crashed and there is nothing left to identify).
     name_key_j = ("nm_dead" if j.liveness == "dead"
                   else _NAME_KEY_DIM.get(j.harness, "nmd_other"))
-    segs.append((nm, name_key_j))
+    segs.append((nm, _subject_name_key(j, name_key_j)))
     if otag and used + len(otag) <= avail:
         segs.append((otag, "g_dead" if registry_split else "gate_u")); used += len(otag)
     branch_segs = _branch_suffix_segs(
@@ -3185,7 +3225,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
         if prov_seg:
             suffix.insert(prov_pos, prov_seg)
         title_budget = min(_NAME2_MAX, _TITLE_MAX)
-    l1.append((_clip_w(name_txt, title_budget), name_key))
+    l1.append((_clip_w(name_txt, title_budget), _subject_name_key(s, name_key)))
     l1.extend(suffix)
 
     # L2: elapsed time sits UNDER the harness column (fills the old empty indent — user
@@ -3199,6 +3239,8 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     l2 = _pad_to_column(l2, _session_routing_column("narrow"))
     stage_fn = _session_stage_segs if show_projection_stage else _suppressed_stage_segs
     l2 += stage_fn(s, live == "working", _narrow_session_cell_budget(term_width), tag_by_key)
+    if live in ("stale", "dead"):
+        l2.append(("  done · " + _text_age(s.mtime), "dim"))
     # v16: context is emitted by _context_detail_row beneath the complete card.
     if _split:
         return l1, l2, br_segs
@@ -3265,7 +3307,7 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
     name_key_j = ("nm_dead" if j.liveness == "dead"
                   else _NAME_KEY_DIM.get(j.harness, "nmd_other"))
     l1 = [("  ", None), (prefix, "dim"), (gch, gkey), (" ", None),
-          (_badge_cell(hn, max(9, _HW - len(prefix))), _BADGE_KEY.get(j.harness, "dim")), (shown_name, name_key_j)]
+          (_badge_cell(hn, max(9, _HW - len(prefix))), _BADGE_KEY.get(j.harness, "dim")), (shown_name, _subject_name_key(j, name_key_j))]
     if orphan:
         l1.append(("  (orphan)", "gate_u"))
     br_segs = _branch_suffix_segs(
@@ -3348,7 +3390,7 @@ def _periodic_curate_row(memory):
         slug = project_of(item.get("current_cwd"))
         elapsed = _fmt_exec_age(item.get("elapsed_s", 0))
         return [("  ⚙ ", "g_work"),
-                ("야간 큐레이터 %d/%d %s %s" %
+                ("curator %d/%d %s %s" %
                  (int(item.get("done", 0)) + 1, int(item["total"]), slug, elapsed), "g_work")]
     except (KeyError, TypeError, ValueError):
         return None
@@ -3388,7 +3430,7 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     by the header helper contract §5.2 asks for, instead of two independently-drifting copies."""
     if loading:
         spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
-        return [("  fleet ", "head"), (spin, "g_spin"), (' session 확인 중…', "dim")]
+        return [("  fleet ", "head"), (spin, "g_spin"), (' sessions loading…', "dim")]
     _real = [s for s in sessions if not s.app_server and not getattr(s, "mem_worker", False)]
     n_wk = sum(1 for s in _real if s.liveness == "working")
     n_id = sum(1 for s in _real if s.liveness == "idle")
@@ -3411,9 +3453,9 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     if n_dt:
         pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (' detached  ', "dim")]
     if _jobs_unconfirmed(observations):
-        pulse += [('↳ jobs.log 미확인', "lvl_y")]
+        pulse += [('↳ jobs.log unknown', "lvl_y")]
         if listed_jobs:
-            pulse += [(" (마지막 관측 %d개)" % len(listed_jobs), "dim")]
+            pulse += [(" (last seen %d)" % len(listed_jobs), "dim")]
     elif listed_jobs:
         pulse += [("↳ %d" % len(listed_jobs), "dim"),
                   (" jobs (", "dim"), (spin + " %d" % jw, "g_spin"), (")", "dim")]
@@ -3449,16 +3491,16 @@ def _mem_change_rows(events, sid_titles=None, limit=8, term_width=None):
     for event, count in _memory_event_groups(events)[:limit]:
         action = event.get("action")
         if action in ADDED_ACTIONS:
-            label, sign, color = 'mem 저장', "+", "lvl_g"
+            label, sign, color = 'mem saved', "+", "lvl_g"
         elif action in EXPIRED_ACTIONS or action in PRUNED_ACTIONS:
-            label, sign, color = 'mem 정리', "−", "dim"
+            label, sign, color = 'mem pruned', "−", "dim"
         elif action == "decision-record":
-            label, sign, color = 'mem 저장', "·", "dim"
+            label, sign, color = 'mem saved', "·", "dim"
         else:
-            label, sign, color = 'mem 변경', "·", "dim"
+            label, sign, color = 'mem changed', "·", "dim"
         origin = event.get("cwd") or event.get("project")
         if not origin:
-            origin = "공통" if event.get("scope") == "global" else "출처 미확인"
+            origin = "global" if event.get("scope") == "global" else "source unknown"
         # Source is preserved in JSON. Keep its distinctive last path components
         # in a narrow row, after the content and before optional session/time.
         origin = str(origin)
@@ -3467,14 +3509,14 @@ def _mem_change_rows(events, sid_titles=None, limit=8, term_width=None):
             while origin and _dw(origin) > source_room - 1:
                 origin = origin[1:]
             origin = "…" + origin
-        suffix = " · " + origin + (" · %d회" % count if count > 1 else "")
+        suffix = " · " + origin + (" · ×%d" % count if count > 1 else "")
         title = (sid_titles or {}).get(event.get("sid"))
         stamp = str(event.get("ts") or "")
         if "T" in stamp:
             stamp = stamp.replace("T", " ")[:16]
         prefix = [("  🧠 ", "dim"), (sign, color), (" " + label + " · ", "dim")]
         room = max(0, width - sum(_dw(t) for t, _ in prefix) - _dw(suffix))
-        snippet = _clip_w(str(event.get("snippet") or "내용 미확인"), room)
+        snippet = _clip_w(str(event.get("snippet") or "content unknown"), room)
         row = prefix + [(snippet, "dim"), (suffix, "dim")]
         optional = (" ⟵ " + _clip_w(title, 22) if title else "") + (" · " + stamp if stamp else "")
         remaining = width - sum(_dw(t) for t, _ in row)
@@ -3508,35 +3550,49 @@ def _diagnostic_rows(diagnostics, malformed=0, term_width=None):
     """One reader-evidence summary for group/process views; never infer execution failure."""
     rows = []
     if malformed:
-        rows.append([("  jobs.log · 형식이 잘못된 행 %d개 제외" % malformed, "dim")])
+        rows.append([("  jobs.log · skipped %d malformed rows" % malformed, "dim")])
     labels = {
-        "missing-registry": "과거 참조 파일 없음",
-        "malformed-registry": 'registry 형식 오류',
-        "malformed-run": 'run 기록 형식 오류',
-        "malformed-index": 'index 형식 오류',
-        "resource-row-projection": 'resource 표시 미확인',
+        "missing-registry": "missing reference",
+        "malformed-registry": 'invalid registry',
+        "malformed-run": 'invalid run record',
+        "malformed-index": 'invalid index',
+        "resource-row-projection": 'projection unknown',
     }
+    grouped = []
+    by_kind = {}
     for diagnostic in diagnostics or []:
+        key = tuple(str(diagnostic.get(field) or "") for field in ("kind", "error", "reason"))
+        if diagnostic.get("blocking") is False and key in by_kind:
+            by_kind[key][1] += 1
+        else:
+            group = [diagnostic, 1]
+            grouped.append(group)
+            if diagnostic.get("blocking") is False:
+                by_kind[key] = group
+    for diagnostic, count in grouped:
         past = diagnostic.get("kind") == "missing-registry" and diagnostic.get("blocking") is False
         if past and not _SHOW_ALL:
             continue
-        label = labels.get(diagnostic.get("kind"), 'resource 관측 미확인')
-        prefix = '  resource · ' + label if past else '  resource 관측 미확인'
-        if not past and label != 'resource 관측 미확인':
+        label = labels.get(diagnostic.get("kind"), 'observation unknown')
+        prefix = '  resource · ' + label if past else '  resource unknown'
+        if not past and label != 'observation unknown':
             prefix += " · " + label
+        if count > 1:
+            prefix += " ×%d" % count
         source = str(diagnostic.get("path") or diagnostic.get("run_id") or "")
         if source:
             # Show the project and the registry location, using only literal path parts.
             source = source.split("/.agent_reports/", 1)
             source = (source[0].rsplit("/", 1)[-1] + "/" + source[1]
                       if len(source) == 2 else source[0])
-        impact = " · 실행 비차단" if diagnostic.get("blocking") is False else (
-            " · 차단" if diagnostic.get("blocking") is True else "")
+        impact = " · nonblocking" if diagnostic.get("blocking") is False else (
+            " · blocking" if diagnostic.get("blocking") is True else "")
         detail = " · " + str(diagnostic.get("error") or diagnostic.get("reason") or "")
         budget = max(0, term_width - 1) if term_width else 120
         prefix = _clip_w(prefix, max(0, budget - _dw(impact)))
         room = max(0, budget - _dw(prefix + impact))
-        rows.append([(prefix + _clip_w((" · " + source if source else "") + detail, room) + impact, "dim")])
+        context = "" if count > 1 else (" · " + source if source else "") + detail
+        rows.append([(prefix + _clip_w(context, room) + impact, "dim")])
     return rows
 
 
@@ -3945,7 +4001,7 @@ def _fit_strip(builders, width):
         segs = build()
         if sum(_dw(text) for text, _key in segs) <= width:
             return segs
-    return _clip_segs(segs, width)[0]
+    return _clip_segs(_reserve_age_tail(segs, width), width)[0]
 
 
 def _subagent_elapsed_min(sa):
@@ -3984,7 +4040,7 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
     gap: absent budget renders nothing) — model keeps its family color, effort uses
     the `_EFF_SHORT` 2-char form with the heat-ramp color keyed by the full value
     (same F-9(c) idiom as `_harness_model_cell`). A completed entry's elapsed stops
-    at its observed completion time and gains a dim `(<idle>)` tail — minutes asleep
+    at its observed completion time and gains a dim `· <age> ago` tail
     since it finished (사용자 2026-07-29 '언제 끝났는지'; no completion evidence →
     no tail). `depth` = the owning dispatch row's
     depth (0 for a session row): each level pushes the strip 2 more cells inward so it
@@ -4018,12 +4074,11 @@ def _subagent_strip(subs, depth=0, in_card=False, term_width=None):
                 segs.append(("  " + tail, "dim"))
             idle = _subagent_idle_min(sa)
             if idle is not None and show_idle:
-                segs.append((" (" + fmt_min(idle) + ")", "dim"))
+                segs.append((" · " + _text_age(sa.ended_at), "dim"))
         return segs
     return [_fit_strip([lambda: build(True, True, True),
                         lambda: build(False, True, True),
-                        lambda: build(False, False, True),
-                        lambda: build(False, False, False)], term_width)]
+                        lambda: build(False, True, False)], term_width)]
 
 
 # The icon says WHAT the relation is, the arrow says which WAY it points. User decision
@@ -4138,7 +4193,7 @@ def _peer_half_segs(entry, direction, tag_by_key, include_kind=True, include_age
     if include_kind and kind:
         segs.append((" · " + _user_label(kind), "dim"))
     if include_age:
-        segs.append((" · " + fmt_min(entry.get("age_min") or 0), "dim"))
+        segs.append((" · " + _text_age(time.time() - (entry.get("age_min") or 0) * 60), "dim"))
     return segs
 
 
@@ -4389,9 +4444,7 @@ def _summary_row(summary, depth=0, term_width=None, start_col=None, summary_ts=N
     segs = [(indent, None)]
     if padding:
         segs.append((" " * padding, None))
-    # The source and age precede the prose so clipping never makes it look live.
-    label = "마지막 요약 · %s · " % _text_age(summary_ts)
-    segs.append((_clip_w(label + summary, maxw), "now_sub"))
+    segs.append((_aged_text(summary, summary_ts, maxw), "now_sub"))
     return [segs]
 
 
@@ -4416,14 +4469,17 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
         indicator_col = _dw("  " + _dispatch_prefix(job, orphan=orphan, in_card=in_card))
         detail_indent = (4 + _HW - _CTX_LABEL_W if _route_rides_the_rail(job, None, in_card)
                          else indicator_col + 2)
+        content_width = (_dispatch_box_width(term_width) - 2 if in_card and term_width else
+                         _context_content_width(term_width))
         return _context_detail_row(
-            job, depth=shown_depth, term_width=_context_content_width(term_width), dim=True,
+            job, depth=shown_depth, term_width=content_width, dim=True,
             indent_width=detail_indent, muted=True)
     summary = getattr(job, "summary", None)
     if not summary:
         return []
     shown_depth = min(depth, 1) if in_card else depth
-    return _summary_row(str(summary), depth=shown_depth, term_width=term_width,
+    content_width = _dispatch_box_width(term_width) - 2 if in_card and term_width else term_width
+    return _summary_row(str(summary), depth=shown_depth, term_width=content_width,
                         start_col=_NAME_COL,
                         summary_ts=getattr(job, "summary_ts", None))
 
@@ -4434,14 +4490,30 @@ def _report_verification_detail_row(job, depth=1, term_width=None, in_card=False
     payload = getattr(projection, "report_verification", None)
     if not isinstance(payload, dict):
         return []
-    display = payload.get("display") or {}
-    detail = display.get("detail_label") or (
-            "보고서 · "
-            + str(display.get("verification_label", "검증 미확정")) + " · "
-            + str(display.get("completion_label", "완료 미확정")) + " · "
-            + str(display.get("required_input_label", "필수 입력 미확정")))
-    if not display.get("detail_label") and display.get("reason_label"):
-        detail += " · " + display["reason_label"]
+    verification = payload.get("verification") or {}
+    completion = payload.get("completion") or {}
+    inputs = payload.get("required_input_observation") or {}
+    reasons = inputs.get("reasons") or []
+    reason = reasons[0] if reasons else verification.get("reason")
+    if (reason == "report-cycle-unadmitted"
+            and (payload.get("report_observation") or {}).get("state") == "present"):
+        detail = "report present · verify/close pending"
+    else:
+        verdict = {"PASS": "PASS", "FAIL": "FAIL"}.get(
+            verification.get("verdict"), "verify unknown")
+        state = {"complete": "complete", "pending": "close pending", "blocked": "close blocked",
+                 "not-applicable": "close n/a"}.get(completion.get("state"), "close unknown")
+        input_state = {"confirmed": "input checked", "failed": "input failed"}.get(
+            inputs.get("state"), "input unknown")
+        detail = "report · " + " · ".join((verdict, state, input_state))
+        if reason:
+            detail += " · " + {
+                "report-cycle-unadmitted": "verify/close pending",
+                "route-hash-binding-mismatch": "report binding mismatch",
+                "required-input-digest-mismatch": "input changed",
+                "artifact-revision-stale": "report changed",
+                "report-source-kind-invalid": "check report path",
+            }.get(reason, "check report")
     text = _conn_indent(depth, in_card) + "↳ " + detail
     if term_width:
         text = _clip_w(text, max(1, term_width - 2))
@@ -4459,8 +4531,7 @@ def _resource_progress_tail(child, room=None):
             count += "/" + str(progress["total"])
         count += " " + progress["unit"]
         age_s = progress["age_s"]
-        age = fmt_min(int(age_s / 60)) if age_s >= 60 else "%ds" % int(age_s)
-        suffix = " · %s ago" % age.strip()
+        suffix = " · " + _text_age(time.time() - age_s)
     except (KeyError, TypeError, ValueError, OverflowError):
         return ""
     if room is not None:
@@ -4498,7 +4569,7 @@ def _resource_process_location(child):
         return ""
     snapshot, _age = _fresh_compute_hosts()
     where, _resources = _resource_location(child, snapshot)
-    return "" if where == "호스트/GPU 미확인" else where
+    return "" if where == "host/GPU unknown" else where
 
 
 def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_children=(),
@@ -4745,7 +4816,7 @@ _WAIT_GLYPH = "⏳"
 # nothing and whose clock resets every iteration, so a 9-minute wait rendered as `sleep 18s`.
 # The badge names the WAIT and lets the elapsed — the CALL's, not the leaf's — carry the
 # information; the leaf comm stays in `--json` for forensics.
-_WAIT_LABEL = "대기"
+_WAIT_LABEL = "waiting"
 
 
 def _fmt_exec_age(seconds):
@@ -4846,7 +4917,7 @@ def _resource_location(child, snapshot):
                     and identity.get("reason") == "exact-identity-match"
                     and not getattr(child, "remote_training", None))
         where = ("%s:CPU" % _gpu_safe_text(local["host"])
-                 if local and cpu_only else "호스트/GPU 미확인")
+                 if local and cpu_only else "host/GPU unknown")
         placement = getattr(child, "local_placement", None) or {}
         requested = placement.get("requested_devices") or []
         if requested:
@@ -4868,11 +4939,11 @@ def _resource_location(child, snapshot):
                             for g in (local or {}).get("gpus", ())
                             for p in g.get("processes", ()))
             checked = checked and not uncertain
-            state = "GPU 사용 전" if checked else "GPU 사용 미관측"
-            where = "%s:%s 지정 · %s" % (host, ",".join(devices), state)
+            state = "GPU not in use" if checked else "GPU use unknown"
+            where = "%s:%s selected · %s" % (host, ",".join(devices), state)
             if placement.get("io_wait"):
-                where += " · 입출력 대기"
-    if where == "호스트/GPU 미확인":
+                where += " · I/O wait"
+    if where == "host/GPU unknown":
         where = _resource_verified_process_location(child) or where
     return where, resources
 
@@ -4901,15 +4972,15 @@ def _resource_now_text(entity, room=None):
             child = max(terminal, key=lambda c: getattr(c, "ended_at", None) or 0)
             node = _gpu_safe_text(_resource_name(child))
             command = _resource_command_label(getattr(child, "command", None))
-            state = "실패" if child.exit_code else "종료"
-            text = "마지막 %s · %s(exit %d) · %s" % (
+            state = "failed" if child.exit_code else "exited"
+            text = "%s · %s(exit %d) · %s" % (
                 subject_command(node, command), state, child.exit_code,
                 _resource_log_age(child))
-            return _clip_w(text, room) if room is not None else text
+            return _clip_age_tail(text, room)
     if not resource_context:
         return None
     if not children:
-        return "대기"
+        return "waiting"
     snapshot, _age = _fresh_compute_hosts()
     child = children[0]
     where, resources = _resource_location(child, snapshot)
@@ -4922,9 +4993,8 @@ def _resource_now_text(entity, room=None):
             command = label if label != process["command"] else _resource_command_label(label)
     progress = _resource_progress_tail(child)
     log = _resource_log_age(child)
-    facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, log) if part)
-    if len(children) > 1:
-        facts += " · +%d" % (len(children) - 1)
+    extra = "+%d" % (len(children) - 1) if len(children) > 1 else ""
+    facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, extra, log) if part)
     label = subject_command(node, command)
     if room is not None:
         budget = room - _dw(" · " + facts)
@@ -4932,17 +5002,17 @@ def _resource_now_text(entity, room=None):
             label = _clip_w(label, budget)
         else:
             # Narrow NOW still identifies the work and its observed location.
-            return _clip_w(node + " · " + where + " · " + log, room)
-    return label + " · " + facts
+            return _clip_age_tail(node + " · " + where + " · " + log, room)
+    return _clip_age_tail(label + " · " + facts, room)
 
 
 def _resource_log_age(child):
     if getattr(child, "log_size", None) == 0:
-        return "출력 없음"
+        return "no output"
     log_ts = getattr(child, "log_updated_at", None)
-    return ("로그 " + _fmt_exec_age(max(0, time.time() - log_ts))
+    return ("log · " + _text_age(log_ts)
             if isinstance(log_ts, (int, float)) and not isinstance(log_ts, bool)
-            else "출력 미확인" if getattr(child, "log_path", None) else "로그 없음")
+            else "output unknown" if getattr(child, "log_path", None) else "no log")
 
 
 def _context_content_width(term_width):
@@ -4970,8 +5040,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     now_text = getattr(entity, "summary", None)
     previous_summary = None
     if now_text:
-        previous_summary = "마지막 요약 · %s · %s" % (
-            _text_age(getattr(entity, "summary_ts", None)), now_text)
+        previous_summary = now_text
         now_text = None
     resource_now = _resource_now_text(entity)
     if resource_now is not None:
@@ -4980,7 +5049,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
           and not _exec_detail_segs(entity)):
         # A basic observation is real state, but missing detail is not an idle
         # verdict or an empty NOW. Never invent a command/model turn here.
-        now_text = "확인 중"
+        now_text = "loading"
     if previous_summary and resource_now is None:
         now_text = " · ".join(part for part in (now_text, previous_summary) if part)
     main_detail = indent_width is None and depth == 0
@@ -5030,11 +5099,13 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             now_room -= exec_w
         if now_text:
             sep = "  " if tail else ""
-            # Observations and the summary's source/age precede the old prose.
+            # Reserve the summary age after the clipped prose.
             text_room = now_room - _dw(sep)
             if resource_now is not None:
                 now_text = _resource_now_text(entity, max(0, text_room))
-            clipped = _clip_w(str(now_text), text_room) if text_room > 0 else ""
+            clipped = (_aged_text(now_text, getattr(entity, "summary_ts", None), text_room)
+                       if previous_summary and resource_now is None else
+                       _clip_w(str(now_text), text_room)) if text_room > 0 else ""
             if clipped:
                 if sep:
                     tail.append((sep, None))
@@ -5113,13 +5184,8 @@ def set_refresh_health(snapshot=None, compute_hosts=None, details=None):
 
 def _refresh_age_label(age):
     if age is None:
-        return "—"
-    age = max(0.0, age)
-    if age < 60:
-        return "%ds" % int(age)
-    if age < 3600:
-        return "%dm" % int(age // 60)
-    return "%dh" % int(age // 3600)
+        return "age unknown"
+    return _text_age(time.time() - max(0.0, age))
 
 
 def _refresh_health_segments(narrow=False):
@@ -5134,7 +5200,7 @@ def _refresh_health_segments(narrow=False):
     health = _REFRESH_HEALTH.get("snapshot") if isinstance(_REFRESH_HEALTH, dict) else None
     if not health:
         return []
-    segs = [(" · ", "dim"), ("refreshed " + _refresh_age_label(health.get("age")), "dim")]
+    segs = []
     state = health.get("state")
     if state == "stalled":
         segs.append((" · collection delayed", "lvl_y"))
@@ -5144,10 +5210,9 @@ def _refresh_health_segments(narrow=False):
         segs.append((" · error: " + error[:limit], "lvl_y"))
     detail = _REFRESH_HEALTH.get("details")
     if detail and detail.get("state") in ("failed", "stalled"):
-        cause = ("수집 지연" if detail.get("state") == "stalled" else
-                 str(detail.get("last_error") or "조회 실패")[:20 if narrow else 40])
-        segs.append((" · 상세 미확인 · 마지막 관측 " +
-                     _refresh_age_label(detail.get("age")) + " · " + cause, "lvl_y"))
+        cause = ("collection delayed" if detail.get("state") == "stalled" else
+                 str(detail.get("last_error") or "read failed")[:20 if narrow else 40])
+        segs.append((" · detail unknown · " + cause, "lvl_y"))
     compute_hosts = (_REFRESH_HEALTH.get("compute_hosts")
                       if isinstance(_REFRESH_HEALTH, dict) else None)
     # Segment importance, in survival order: ① refreshed <age> ② state word
@@ -5155,6 +5220,7 @@ def _refresh_health_segments(narrow=False):
     # segment and the first one narrow width drops entirely.
     if compute_hosts and compute_hosts.get("state") == "stalled" and not narrow:
         segs.append((" · gpu stalled", "lvl_y"))
+    segs.append((" · " + _refresh_age_label(health.get("age")), "dim"))
     return segs
 
 
@@ -5560,9 +5626,9 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
                 segs += [(" · " + _gpu_gib(resource.get("used_memory_mib", 0))
                           + " GB", "dim")]
             elif show_memory and resource.get("telemetry_unknown"):
-                segs += [(" · 사용률·VRAM 모름", "dim")]
+                segs += [(" · UTIL/VRAM unknown", "dim")]
                 if resource.get("access_only"):
-                    segs += [(" · 장치 접근 확인", "dim")]
+                    segs += [(" · check device access", "dim")]
             elapsed = resource.get("elapsed_s")
             if show_time and isinstance(elapsed, int) and not isinstance(elapsed, bool):
                 segs += [(" · " + fmt_min(elapsed // 60), "dim")]
@@ -5609,7 +5675,7 @@ def _gpu_work_strip(entries, term_width=None):
             "host": entry["host"], "index": ",".join(map(str, entry["gpu_indexes"])),
             "model": _gpu_safe_text(entry.get("gpu_name")).replace("NVIDIA ", ""),
             "processes": [], "used_memory_mib": 0, "has_memory": False,
-            "elapsed_s": None, "owner_label": entry.get("owner_label") or "미등록",
+            "elapsed_s": None, "owner_label": entry.get("owner_label") or "unregistered",
             "telemetry_unknown": entry.get("telemetry_unknown", False), "access_only": True,
         })
         resource["access_only"] &= entry.get("gpu_placement") == "device-access-only"
@@ -5641,7 +5707,7 @@ def _gpu_work_row(entry, term_width=None):
     indexes = ",".join(str(i) for i in entry.get("gpu_indexes") or ())
     identity = "GPU %s:%s" % (_gpu_safe_text(entry.get("host") or "?"), indexes)
     elapsed = entry.get("elapsed_s")
-    tag = _gpu_owner_label(_gpu_safe_text(entry.get("owner_label")) or "미등록")
+    tag = _gpu_owner_label(_gpu_safe_text(entry.get("owner_label")) or "unregistered")
 
     def build(show_time, show_tag, label=name):
         pulse_key = "g_work" if _BLINK_ON else "g_work_off"
@@ -5699,7 +5765,7 @@ def _gpu_process_label(command):
                     title = "M" + model.group(1)
                 else:
                     title = stem
-            activity = "학습" if mode in {"train", "train_ft"} else None
+            activity = "train" if mode in {"train", "train_ft"} else None
             return title + (" " + activity if activity else "")
     return command
 
@@ -5848,9 +5914,9 @@ def _gpu_token(gpu, available, show_name=False, sessions=None, index_width=1,
         segs = [(glyph + " ", state_key), (identity, "name_dim")]
         if name:
             segs += [(name + "  ", "name_dim")]
-        segs += [("사용률·VRAM 모름", "dim")]
+        segs += [("UTIL/VRAM unknown", "dim")]
         if any(p.get("gpu_placement") == "device-access-only" for p in gpu.get("processes") or ()):
-            segs += [(" · 장치 접근 확인", "lvl_y")]
+            segs += [(" · check device access", "lvl_y")]
         return _clip_segs(segs, available)[0]
     index = gpu.get("index")
     util = gpu.get("utilization_gpu_pct")
@@ -5904,6 +5970,20 @@ def _gpu_token(gpu, available, show_name=False, sessions=None, index_width=1,
     return segs
 
 
+def _gpu_status_text(status):
+    """Fleet vocabulary from the common measurement, without changing its payload."""
+    text = "GPU unavailable"
+    if status.get("code") == "nvml-driver-mismatch":
+        text += " · driver mismatch (lib %s / module %s)" % (
+            status.get("library_version") or "unknown", status.get("module_version") or "unknown")
+    if status.get("reboot_required"):
+        text += " · reboot needed"
+    count = status.get("running_count")
+    if type(count) is int:
+        text += " · runs:%d" % count
+    return text
+
+
 def _gpu_reservation_rows(leases, indent, width, unplaced=False):
     rows = []
     for lease in leases:
@@ -5912,7 +5992,7 @@ def _gpu_reservation_rows(leases, indent, width, unplaced=False):
         started = lease.get("started_at")
         when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
         task = _gpu_safe_text(_readable_name(lease.get("task") or lease.get("run_id") or "?"))
-        prefix = "GPU 예약 · 장치 위치 모름 · " if unplaced else "  reserved "
+        prefix = "GPU reserved · device unknown · " if unplaced else "  reserved "
         row = [(indent + prefix, "lvl_y"), (_gpu_safe_text(label), "tag"),
                (" · " + when + " · " + task, "dim")]
         rows.append(_clip_segs(row, width)[0])
@@ -6019,7 +6099,7 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
         status = host.get("gpu_status")
         if isinstance(status, dict) and status.get("summary"):
             indent = " " * prefix_width
-            text = _gpu_safe_text(status["summary"])
+            text = _gpu_safe_text(_gpu_status_text(status))
             # Wrap diagnostics at terminal cells, keeping the cause/count visible
             # even in narrow views. Raw query errors remain in full JSON only.
             room = max(1, width - prefix_width - 1)
@@ -6036,7 +6116,7 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
         if not gpus:
             if isinstance(status, dict) and status.get("summary"):
                 continue
-            state = "GPU 상태 확인 불가" if host.get("detail") else "no gpu"
+            state = "GPU unavailable" if host.get("detail") else "no gpu"
             row = [(" " * prefix_width, None),
                    (state, "lvl_y" if host.get("detail") else "dim")]
             rows.append(_clip_segs(row, width)[0])
@@ -6112,7 +6192,7 @@ def _route_node_text(n):
         tail = fmt_min(elapsed) if elapsed is not None else ""
         return "%s ✓%s%s" % (nid, tail, deps), "dim", mark
     if st == "attention":
-        return "%s ! 확인 필요%s" % (nid, deps), "lvl_y", mark
+        return "%s ! check%s" % (nid, deps), "lvl_y", mark
     if st == "active":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
         extra = ""
@@ -6122,12 +6202,12 @@ def _route_node_text(n):
         return "%s ●%s%s%s" % (nid, tail, extra, deps), ("g_work" if _BLINK_ON else "g_work_off"), mark
     if st == "reconciling":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
-        return "%s …종료 확인%s%s" % (nid, tail, deps), "lvl_y", mark
+        return "%s …exit wait%s%s" % (nid, tail, deps), "lvl_y", mark
     if st == "recovering":
         # user 2026-08-13: a crashed attempt with a staged relaunch must not read as ✕. The
         # label names the exact registry reason route.py decided, never a guess made here.
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
-        reason = "복구 대기"
+        reason = "recovery"
         return "%s …%s%s%s" % (nid, reason, tail, deps), "lvl_y", mark
     if st == "failed":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
@@ -6136,8 +6216,8 @@ def _route_node_text(n):
         degradation = n.get("degradation") or {}
         hop = degradation.get("fallback_hop") or "?"
         reason = degradation.get("reason") or "degraded"
-        tail = (" " + fmt_min(degradation.get("ts") and max(0, int((time.time() - degradation.get("ts")) / 60)))) if degradation.get("ts") else ""
-        return "%s ◐%s (%s·%s)%s" % (nid, tail, hop, reason, deps), "lvl_y", mark
+        tail = (" · " + _text_age(degradation.get("ts"))) if degradation.get("ts") else ""
+        return "%s ◐ (%s·%s)%s%s" % (nid, hop, reason, deps, tail), "lvl_y", mark
     return "%s ○%s" % (nid, deps), "dim", mark
 
 
@@ -6342,7 +6422,7 @@ def _route_card_l1(tag_bits, rid, done, total, route_elapsed, any_failed, arrow,
             # and `fmt_min`'s spaced units ("5h 20m") are what mark it as a duration.
             segs += [("  " + _ELAPSED_GLYPH, "dim"), (fmt_min(route_elapsed), "dim")]
         if show_failed and any_failed:
-            segs.append((' ⚠ stage 실패', "lvl_r"))
+            segs.append((' ⚠ stage failed', "lvl_r"))
         return segs
 
     ladder = [tag_bits]
@@ -6428,7 +6508,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
     work = work or (route_jobs[0] if route_jobs else None)
     cwd = getattr(work, "cwd", None) or view.get("cwd")
     title = (getattr(work, "title", None) or getattr(work, "parent_slug", None) or getattr(work, "slug", None)
-             or view.get("slug") or "작업 이름 미확인")
+             or view.get("slug") or "work unknown")
     # The collector owns parent identity. In particular, a rejected edge must
     # never be reconstructed from the registered SID in the renderer.
     edge_sid = getattr(work, "_parent_edge_sid", None)
@@ -6483,7 +6563,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
         # marker prints its bare name: no-claim, NOT a failure mark.
         gate_bits = [(n["gate"], bool(n.get("gate_passed"))) for n in nodes if n.get("gate")]
         if gate_bits:
-            segs = [("      완료 확인: ", "dim")]
+            segs = [("      gates: ", "dim")]
             for i, (name, passed) in enumerate(gate_bits):
                 if i:
                     segs.append((", ", "dim"))
@@ -6546,10 +6626,10 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
         fixed_w = _dw("  " + arrow + " ") + _dw("[%s] " % tag) + _dw(" — no route record")
         slug = _clip_w(slug, max(4, term_width - fixed_w))
     pending = getattr(job, "_details_pending", False)
-    label = ' — route 연결 확인 중' if pending else ' — route 연결 미확인'
+    label = ' — route linking' if pending else ' — route unknown'
     if job.registered_worker and job.worker_type == "support":
         tag = _user_project(job.caller_cwd or job.cwd)
-        label = ' — project 지원 작업'
+        label = ' — project support'
     l1 = [("  " + arrow + " ", "dim"), ("[%s] " % tag, "name_dim"),
           (slug, "dim"), (label, "dim")]
     out = [l1]
@@ -6672,8 +6752,8 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
             and not _orphan_resource_groups(resources, ())):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
-        message = ('  session 확인 중…' if loading else '  jobs.log 미확인'
-                   if _jobs_unconfirmed(observations) else "  관측된 실행 작업 없음")
+        message = ('  sessions loading…' if loading else '  jobs.log unknown'
+                   if _jobs_unconfirmed(observations) else "  no observed work")
         lines.append([(message, "dim")])
         lines.extend(_reading_legend(term_width))
         return lines
@@ -7239,9 +7319,12 @@ def _observation_lines(observations, term_width=None):
         age = health.get("age")
         if health.get("last_success_at") is not None:
             age = time.monotonic() - health["last_success_at"]
-        text = "  %s 미확인 · 마지막 관측 %s · %s" % (
-            name, _refresh_age_label(age), health.get("last_error") or "수집 지연")
-        lines.append([(_clip_w(text, term_width) if term_width else text, "lvl_y")])
+        error = health.get("last_error") or "collection delayed"
+        error = {"herdr 조회 불가": "herdr unavailable",
+                 "pane 조회 불가": "pane unavailable"}.get(error, error)
+        text = "  %s unknown · %s" % (name, error)
+        lines.append([(_aged_text(text, time.time() - age if age is not None else None,
+                                  term_width), "lvl_y")])
     return lines
 
 
@@ -7268,6 +7351,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             continue
         tinted = bool(_TINT_OK and line and _is_fill(line[0][0]) and line[0][0][1] in _TINT_CHARS)
         row_width = width - (_INSET + _PAD_IN if tinted else 0)
+        # Framing is out-of-band. Keep a final observation age inside the actual
+        # paint budget before the common plain/curses clipping pass.
+        if tinted:
+            line = line[:1] + _reserve_age_tail(line[1:], row_width)
+        else:
+            line = _reserve_age_tail(line, row_width)
         out, used = [], 0
         for text, key in line:
             if _is_fill(text):
@@ -7637,18 +7726,20 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         if _nmem:
             head_segs += [(" 🧠 %d" % _nmem, "dim")]
             _seen_glyphs.add("mem")
-        if _cool_min is not None:
-            head_segs += [("  파일 갱신 · " + _text_age(_last_act), "dim")]
         last_result = _group_last_result(group_sessions, group_jobs, emission["resources"])
         if last_result:
-            lead = "최근 결과 · %s · " % (
-                "성공" if last_result["result"] == "success" else "실패")
-            tail = " · " + _text_age(last_result["at"])
-            room = max(0, (term_width or 160) - sum(_dw(t) for t, _ in head_segs) - 2)
-            name_room = room - _dw(lead + tail)
-            if name_room > 0:
-                label = lead + _clip_w(last_result["name"], name_room) + tail
+            lead = "✓ " if last_result["result"] == "success" else "✕ "
+            available = _context_content_width(term_width) or 160
+            age_width = _dw(" · " + _text_age(last_result["at"]))
+            result_room = min(_dw(lead + last_result["name"]) + age_width,
+                              max(age_width + _dw(lead) + 1, available // 2))
+            head_segs = _clip_segs(head_segs, max(0, available - result_room - 2))[0]
+            room = max(0, available - sum(_dw(t) for t, _ in head_segs) - 2)
+            label = _aged_text(lead + last_result["name"], last_result["at"], room)
+            if label:
                 head_segs.append(("  " + label, "dim"))
+        elif _cool_min is not None:
+            head_segs += [("  " + _text_age(_last_act), "dim")]
         # The group header is the card's first title row.
         # tinted row of the panel, ▍ anchor on the card's padding edge; no floating label.
         _g0 = len(lines)                # panel start (title INCLUDED in the tint range)
@@ -8028,8 +8119,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         for lj in _sort_group_jobs(loops_jobs):
             if getattr(lj, "worker_type", None) == "support":
                 lines.append(None)
-                caller = (" · 호출 " + lj.caller_pane) if lj.caller_pane else ""
-                lines.append([('  project 지원 작업' + caller, "dim")])
+                caller = (" · caller " + lj.caller_pane) if lj.caller_pane else ""
+                lines.append([('  project support' + caller, "dim")])
             _emit_dispatch_tree(lj, orphan=False)
         # F-80 L2c: a grace-held edge stays a standalone tree row in the SAME group, no
         # `(orphan)` marker, no divider — nesting under the parent is unavailable because
@@ -8090,9 +8181,9 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                       (names[:90] + ("…" if len(names) > 90 else ""), "dim")])
 
     if not order:
-        message = ('  session 확인 중…' if loading else '  jobs.log 미확인'
+        message = ('  sessions loading…' if loading else '  jobs.log unknown'
                    if _jobs_unconfirmed(observations) else
-                   '  관측된 session·job 없음')
+                   '  no observed sessions/jobs')
         lines.append([(message, "dim")])
 
     diagnostic_rows = _diagnostic_rows(resource_diagnostics, malformed, term_width)
@@ -8113,15 +8204,15 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     if "detached" in _seen_glyphs:
         legend += [(_DETACHED_GLYPH, "g_work_off"), (' detached   ', "dim")]
     if "stale" in _seen_glyphs:
-        legend += [("·", "g_stale"), (" 오래된 관측   ", "dim")]
+        legend += [("·", "g_stale"), (" stale   ", "dim")]
     if "dead" in _seen_glyphs:
-        legend += [("✕", "g_dead"), (" 종료   ", "dim")]
+        legend += [("✕", "g_dead"), (" exited   ", "dim")]
     if "degraded" in _seen_glyphs:
-        legend += [("◐", "lvl_y"), (' stage 관측 불완전   ', "dim")]
+        legend += [("◐", "lvl_y"), (' stage unknown   ', "dim")]
     if "recovering" in _seen_glyphs:
-        legend += [("…", "lvl_y"), (" 복구 대기   ", "dim")]
+        legend += [("…", "lvl_y"), (" recovery   ", "dim")]
     if "blocked" in _seen_glyphs:
-        legend += [("◑", "g_blocked"), (" 입력 대기   ", "dim")]
+        legend += [("◑", "g_blocked"), (" input needed   ", "dim")]
     if "tag" in _seen_glyphs:
         legend += [("[", "dim"), ('id', "tag"), ("]", "dim"), (' session   ', "dim")]  # F-100a
     if "steward" in _seen_glyphs:
@@ -8157,9 +8248,9 @@ def _reading_legend(term_width, session=True):
     rows = []
     if session:
         rows.extend(_wrap_legend([('  session: ', "dim"), ('⠹ working  ● idle  ◑ blocked  ✕ dead', "dim")], term_width))
-    for text in ('  project: ● 활동',
-                 '  resource: ● 실행 · ◇ 실행 미확인 · UTIL/VRAM · ↳ command',
-                 "  stage: ● 현재  ✓ 완료  ✕ 실패  ○ 예정"):
+    for text in ('  project: ● active',
+                 '  resource: ● running · ◇ unknown · UTIL/VRAM · ↳ command',
+                 "  stage: ● current  ✓ done  ✕ failed  ○ planned"):
         rows.extend(_wrap_route_node("", text, "dim", "", term_width, continuation="  "))
     return rows
 

@@ -166,9 +166,9 @@ class NVMLFallbackTest(unittest.TestCase):
             for width in (60, 100, 168):
                 rows = render._compute_host_rows(width)
                 text = "\n".join(render._plain(row) for row in rows)
-                self.assertIn("GPU 상태 확인 불가", text)
-                self.assertIn("실행 중 2개", text)
-                self.assertIn("모름", text)
+                self.assertIn('GPU unavailable', text)
+                self.assertIn("runs:2", text)
+                self.assertIn("unknown", text)
                 self.assertIn("fix.yaml", text)
                 self.assertIn("varying.yaml", text)
                 self.assertNotIn("Failed to initialize", text)
@@ -178,7 +178,7 @@ class NVMLFallbackTest(unittest.TestCase):
                     gpu["processes"][0]["session_owner"]["harness"] = harness
                 resources = render._gpu_session_resources({"hosts": [host]})
                 self.assertEqual([r["index"] for r in resources[harness, "sid-exact"]], [0, 1])
-                self.assertIn("모름", "\n".join(render._plain(r) for r in render._gpu_resource_strip(resources[harness, "sid-exact"], 168)))
+                self.assertIn("unknown", "\n".join(render._plain(r) for r in render._gpu_resource_strip(resources[harness, "sid-exact"], 168)))
 
     def test_reloaded_frame_yields_to_new_or_expired_gpu_observations(self):
         names = ("_RELOAD_FRAME", "_RELOAD_FRAME_AT", "_RELOAD_FRAME_COMPUTE_AT",
@@ -214,7 +214,7 @@ class NVMLFallbackTest(unittest.TestCase):
                 text = "\n".join(render._plain(call.args[2]) for call in draw.call_args_list)
                 self.assertEqual("fix.yaml" in text, expect_old)
                 self.assertEqual("varying.yaml" in text, expect_old)
-                self.assertEqual("실행 중 2개" in text, expect_old)
+                self.assertEqual("runs:2" in text, expect_old)
         entries = compute_hosts.unregistered_gpu({"configured": True, "hosts": [host]})
         self.assertEqual(len(entries), 2)
 
@@ -290,7 +290,7 @@ class NVMLFallbackTest(unittest.TestCase):
         render.set_compute_hosts({"configured": True, "hosts": [host]})
         self.addCleanup(render.set_compute_hosts, None)
         text = "\n".join(render._plain(r) for r in render._compute_host_rows(168))
-        self.assertIn("GPU 예약 · 장치 위치 모름 · 확인된 예약", text)
+        self.assertIn("GPU reserved · device unknown · 확인된 예약", text)
         self.assertEqual(host["gpu_status"]["running_count"], 2)
         self.assertEqual(state.read_bytes(), original)
         self.assertEqual(state.stat().st_mtime_ns, mtime)

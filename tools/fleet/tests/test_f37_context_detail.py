@@ -72,7 +72,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
             row = render._context_detail_row(self._idle(context=context, summary=now), term_width=168)
             expected = " " * render._CONTEXT_INDENT_W + context_text
             if now:
-                expected += " " * (render._NAME_COL - render._dw(expected)) + "마지막 요약 · 시각 미확인 · " + now
+                expected += " " * (render._NAME_COL - render._dw(expected)) + now + " · age unknown"
             self.assertEqual(text(row), expected)
 
     def test_stale_and_dead_rows_suppress_cached_detail(self):
@@ -100,15 +100,15 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 visible = text(row)
                 self.assertIsNotNone(CTX_GAUGE_RE.search(visible))
                 self.assertIn("85%", visible)
-                self.assertEqual(render._dw(visible[:visible.index("마지막 요약")]), render._NAME_COL)
+                self.assertEqual(render._dw(visible[:re.search(r"(?:\d+%|—) +(\S)", visible).start(1)]), render._NAME_COL)
                 self.assertLessEqual(render._dw(visible), width)
 
                 rendered = text(render._build_lines(
                     [], [job], "both", False, 0,
                     layout=layout, term_width=width))
                 self.assertIsNotNone(CTX_GAUGE_RE.search(rendered))
-                self.assertIn("마지막 요약", rendered)
                 if width >= 100:
+                    self.assertIn("age unknown", rendered)
                     self.assertIn("NOW", rendered)
 
         job.summary = None
@@ -176,9 +176,9 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                               text(row)).group(0)
             self.assertEqual(len(track), BASE)
             self.assertIn(LEAD, text(row))
-            self.assertLess(text(row).index(LEAD), text(row).index("마지막 요약"))
+            self.assertLess(text(row).index(LEAD), re.search(r"(?:\d+%|—) +(\S)", text(row)).start(1))
             self.assertNotIn(": ", text(row))
-            self.assertIn("   마지막 요약", text(row))
+            self.assertTrue(text(row).endswith("age unknown"))
             if width >= 120:
                 self.assertIn("한글", text(row))
             row_text = text(row)
@@ -208,7 +208,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                     prefix = render._CONTEXT_INDENT_W + 2 * depth + render._CTX_LABEL_W \
                         + render._CTX_TRACK_MAX + render._CONTEXT_VALUE_W
                     self.assertEqual(
-                        render._dw(visible[:visible.index("마지막 요약")]),
+                        render._dw(visible[:visible.index("Doing work")]),
                         max(prefix + render._CONTEXT_NOW_GAP, render._NAME_COL))
                     track = re.search(r"[%s%s]+" % (re.escape(FULL), re.escape(EMPTY)),
                                       visible).group(0)
@@ -222,7 +222,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                                   summary="Doing work"), term_width=168)
                 visible = text(row)
                 self.assertNotIn(band, visible)
-                self.assertEqual(render._dw(visible[:visible.index("마지막 요약")]),
+                self.assertEqual(render._dw(visible[:visible.index("Doing work")]),
                                  render._NAME_COL)
                 self.assertNotIn(": ", visible)
 
@@ -290,7 +290,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 if width >= 120:
                     self.assertIn("review merge", visible)
                 else:
-                    self.assertIn("마지막 요약", visible)
+                    self.assertTrue("age unknown" in visible or "age unk" in visible)
         # A genuinely wide terminal lends its slack to the breadcrumb: the whole
         # collapsed route stays visible instead of folding its early stages.
         wide = text(render._build_lines([session], [owner], "both", False, 0,
@@ -793,9 +793,9 @@ class ChildAssociationTest(unittest.TestCase):
         visible = "\n".join("".join(part for part, _ in line) for line in lines if line)
         self.assertIsNotNone(CTX_GAUGE_RE.search(visible))
         self.assertLess(visible.index("└▸🚀"), visible.index("NOW"))
-        self.assertLess(visible.index("NOW"), visible.index("⚡tool"))
+        self.assertLess(re.search(r"(?:\d+%|—) +(\S)", visible).start(1), visible.index("⚡tool"))
         now_line = next(line for line in visible.splitlines() if "NOW" in line)
-        self.assertEqual(render._dw(now_line[:now_line.index("마지막 요약")]), render._NAME_COL)
+        self.assertEqual(render._dw(now_line[:now_line.index("NOW")]), render._NAME_COL)
 
 
 class CodexAttemptTelemetryTest(unittest.TestCase):

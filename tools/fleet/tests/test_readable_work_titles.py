@@ -140,7 +140,7 @@ class WorkTitlesTest(unittest.TestCase):
         self.assertEqual(result['result'], 'success')
         lines = render._build_lines([session], [], 'both', False, 0, term_width=160)
         screen = '\n'.join(render._plain(row) for row in lines)
-        self.assertIn('최근 결과 · 성공 · 최근 결과의 시각 표시', screen)
+        self.assertIn('✓ 최근 결과의 시각 표시', screen)
 
     def test_invalid_or_foreign_metadata_falls_back_without_mutation(self):
         for update in ({'artifact_root_id': 'foreign'}, {'campaign_id': 'foreign'},

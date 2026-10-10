@@ -56,7 +56,7 @@ class F63VisibilityTest(unittest.TestCase):
                              slug="curator", mem_worker=True, liveness="idle")
             text = _text(render._build_lines([worker], [], "fleet", False, 0,
                                              layout="wide", memory=snap, term_width=140))
-            self.assertIn("야간 큐레이터 2/2 beta 2m", text)
+            self.assertIn('curator 2/2 beta 2m', text)
 
     def test_dispatch_tree_uses_nested_card_frame_without_depth_tokens(self):
         parent = Session(harness="codex", pid=1, cwd="/work/repo", session_id="p",

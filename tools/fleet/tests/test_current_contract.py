@@ -51,7 +51,7 @@ class CompletionDisplayTest(unittest.TestCase):
                 self.assertTrue(view["nodes"][0]["gate_passed"])
                 self.assertEqual(view["nodes"][0]["state"], "attention")
                 label, color, mark = render._route_node_text(view["nodes"][0])
-                self.assertIn("확인 필요", label)
+                self.assertIn("check", label)
                 self.assertEqual(color, "lvl_y")
                 self.assertTrue(mark)
                 self.assertEqual(view["progress"]["done"], 0)

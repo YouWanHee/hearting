@@ -67,13 +67,13 @@ class InvalidationRenderTest(unittest.TestCase):
         stack = render._session_row_stack(session, term_width=60)[0]
         for segments in (wide, narrow, stack):
             text = render._plain(segments)
-            self.assertIn("답변 필요", text)
+            self.assertIn('answer needed', text)
             self.assertIn("◑", text)
             self.assertNotIn("실제 질문", text)
 
     def test_compact_kind_labels(self):
-        expected = {"decision": "답변 필요", "approval": "승인 필요",
-                    "permission": "승인 필요", "elicitation": "정보 필요"}
+        expected = {"decision": 'answer needed', "approval": 'approval needed',
+                    "permission": 'approval needed', "elicitation": 'input needed'}
         for kind, label in expected.items():
             self.assertEqual(render._interaction_badge(self.session(kind)).strip(), label)
 
@@ -82,7 +82,7 @@ class InvalidationRenderTest(unittest.TestCase):
             render._interaction_badge(self.session(kind)).strip()
             for kind in ("permission", "approval")
         }
-        self.assertEqual(labels, {"승인 필요"})
+        self.assertEqual(labels, {'approval needed'})
 
     def test_working_spinners_use_dedicated_vanilla_keys(self):
         with mock.patch.object(render.time, "time", return_value=0.0):

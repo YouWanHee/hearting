@@ -13,6 +13,7 @@ Coverage maps 1:1 onto the v30 contract:
   (g) group tier / pulse census follow classification only        (prd.md:263)
 """
 import os
+import re
 import sys
 import unittest
 from unittest import mock
@@ -80,7 +81,7 @@ class ExecChildScan(unittest.TestCase):
             found = procscan.exec_child(100, tree, kids)
         self.assertEqual(found["comm"], "zsh")
         # Nothing is running under the call, so it reads as a wait — which is also why the
-        # bare `zsh` name never reaches the screen (render shows `⏳ 대기 <elapsed>`).
+        # bare `zsh` name never reaches the screen (render shows `⏳ waiting <elapsed>`).
         self.assertEqual(found["kind"], "wait")
 
     def test_child_under_min_age_ignored(self):
@@ -417,8 +418,8 @@ class WaitPrimitiveCorrection(unittest.TestCase):
                            exec_child=child)
             rows = render._context_detail_row(sess, term_width=200)
             text = "".join(t for row in rows for t, _k in row)
-            self.assertIn("⏳ 대기 12m", text, comm)
-            self.assertNotIn(comm, text, comm)
+            self.assertIn("⏳ waiting 12m", text, comm)
+            self.assertNotRegex(text, r"\b" + re.escape(comm) + r"\b", comm)
 
     def test_busy_mapping_is_untouched_by_a_sleep_child(self):
         child = {"pid": 200, "comm": "sleep", "etime_s": 720}
@@ -435,7 +436,7 @@ class WaitPrimitiveCorrection(unittest.TestCase):
                                    "kind": "wait"})
         rows = render._context_detail_row(sess, term_width=200)
         text = "".join(t for row in rows for t, _k in row)
-        self.assertIn("⏳ 대기 4m", text)
+        self.assertIn("⏳ waiting 4m", text)
         self.assertNotIn("sleep", text)
         self.assertNotIn("⚙", text)
         keys = [k for row in rows for t, k in row if "⏳" in t]
@@ -448,7 +449,7 @@ class WaitPrimitiveCorrection(unittest.TestCase):
                        exec_child={"pid": 200, "comm": "sleep", "etime_s": 240})
         rows = render._context_detail_row(sess, term_width=200)
         text = "".join(t for row in rows for t, _k in row)
-        self.assertIn("⏳ 대기 4m", text)
+        self.assertIn("⏳ waiting 4m", text)
         keys = [k for row in rows for t, k in row if "⏳" in t]
         self.assertEqual(keys, ["dim"])
 
@@ -515,7 +516,7 @@ class WaitingCallVisibility(unittest.TestCase):
         sess = Session(harness="claude", pid=100, liveness="working", ctx_pct=40,
                        exec_child=found)
         text = self.text_of(render._context_detail_row(sess, term_width=200))
-        self.assertIn("⏳ 대기 9m", text)
+        self.assertIn("⏳ waiting 9m", text)
         self.assertNotIn("sleep", text)
 
     # (b) stability -----------------------------------------------------------------------
@@ -589,7 +590,7 @@ class WaitingCallVisibility(unittest.TestCase):
         self.assertIn("waiting", seen["wait"][0])
         self.assertIn("running", seen["work"][0])
         self.assertNotEqual(seen["wait"][0], seen["work"][0])
-        self.assertIn("⏳ 대기 9m", seen["wait"][1])
+        self.assertIn("⏳ waiting 9m", seen["wait"][1])
         self.assertIn("⚙ python3 9m", seen["work"][1])
 
     # thresholds and neighbours preserved -------------------------------------------------

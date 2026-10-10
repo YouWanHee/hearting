@@ -7,7 +7,7 @@ def label(value):
 
 
 def project(cwd):
-    return project_of(cwd) if cwd else "project 미확인"
+    return project_of(cwd) if cwd else "project unknown"
 
 
 def gpu_owner(label):

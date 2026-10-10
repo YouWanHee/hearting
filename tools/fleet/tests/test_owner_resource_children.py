@@ -222,7 +222,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     child_line = next(line for line in lines if line and "resource eval run" in flatten([line]))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in child_line), width)
                     if width == 168:
-                        self.assertIn("로그 없음", text)
+                        self.assertIn('no log', text)
         snap = json.loads(fleet._snapshot_json([], [self.owner], [self.resource]))
         self.assertEqual(len(snap["jobs"]), 1)
         job = snap["jobs"][0]
@@ -487,7 +487,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
         self.attach()
         self.resource.progress = {"completed": 12, "unit": "item", "age_s": 9900}
         text = flatten(render._resource_child_rows(self.owner, term_width=168))
-        self.assertIn("12 item · 2h 45m ago", text)
+        self.assertIn("12 item · 2h ago", text)
         self.assertEqual(self.resource.liveness, "working")
         self.assertEqual(self.owner.resource_wait["state"], "resource-parked")
         self.resource.progress = None

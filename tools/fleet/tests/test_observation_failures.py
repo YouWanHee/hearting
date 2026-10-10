@@ -97,7 +97,7 @@ class JobFailures(unittest.TestCase):
                 text = "\n".join(render._plain(line) for line in render._build_lines(
                     failed.sessions, failed.jobs, "both", False, 0,
                     observations=failed.observations, governor=None))
-                self.assertIn("jobs.log 미확인", text)
+                self.assertIn('jobs.log unknown', text)
                 self.assertNotIn("no active", text)
                 self.assertNotIn("0 jobs", text)
 
@@ -129,7 +129,7 @@ class JobFailures(unittest.TestCase):
             lines = render._build_lines(failed.sessions, failed.jobs, "both", False, 0,
                                         observations=failed.observations, governor=None)
         text = "\n".join(render._plain(line) for line in lines)
-        self.assertIn("jobs.log 미확인", text)
+        self.assertIn('jobs.log unknown', text)
         self.assertIn("audit-owner", text)
         self.assertEqual(recovered.jobs, [])
         self.assertEqual(recovered.observations["jobs"]["state"], "idle")
@@ -283,9 +283,9 @@ class PublishedSnapshots(unittest.TestCase):
                                   details={"state": "failed", "age": 55,
                                            "last_error": "OSError: NAS denied"})
         text = "".join(t for t, _ in render._refresh_health_segments())
-        self.assertIn("상세 미확인", text)
+        self.assertIn('detail unknown', text)
         self.assertIn("NAS denied", text)
-        self.assertIn("55s", text)
+        self.assertIn("0m ago", text)
 
     def test_actual_loop_publishes_detail_failure_while_basic_refresh_succeeds(self):
         self.addCleanup(setattr, render, "_BLINK_ON", render._BLINK_ON)
