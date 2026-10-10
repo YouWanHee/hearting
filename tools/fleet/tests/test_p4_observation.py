@@ -1,5 +1,7 @@
 """Fleet preserves typed diagnostics and the origin of memory changes."""
 import datetime
+from contextlib import ExitStack, redirect_stdout
+import io
 import json
 import os
 import sys
@@ -9,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fleet import fleet, render
+from fleet import collectors, fleet, render
 from fleet.collectors import dispatch, memory, resource_runs
 from fleet.model import Session
 
@@ -37,6 +39,43 @@ class ObservationTest(unittest.TestCase):
         evidence = [{"kind": "resource-collector", "error": "PermissionError", "blocking": True}]
         value = json.loads(fleet._snapshot_json([], [], resource_diagnostics=evidence))
         self.assertEqual(value["resource_diagnostics"], evidence)
+
+    def test_publication_keeps_resource_evidence_when_the_next_observation_changes(self):
+        evidence = {"kind": "missing-registry", "path": "/audit/past-reference.json",
+                    "reason": "registered-path-absent", "blocking": False}
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"XDG_STATE_HOME": td}))
+            for target, result in (
+                ("fleet.collectors.procscan.scan", []),
+                ("fleet.collectors.herdr.list_agents", []),
+                ("fleet.collectors.herdr.enrich", None),
+                ("fleet.collectors.usage_cache.account_usage", {}),
+                ("fleet.projection.attach_projections", None),
+                ("fleet.session_tags.refresh", None),
+                ("fleet.session_tags.assign", []),
+                ("fleet.herdr_projection._report", None),
+                ("fleet.collectors.dispatch.collect", []),
+            ):
+                stack.enter_context(mock.patch(target, return_value=result))
+            dispatch.collect.last_malformed = 0
+            reader = stack.enter_context(mock.patch.object(resource_runs, "collect", return_value=[]))
+            reader.last_diagnostics = [evidence.copy()]
+            published = collectors.collect_all(jobs_path=td + "/jobs", fast_first=True)
+            reader.last_diagnostics[0]["path"] = "/audit/next-reference.json"
+            collectors.collect_all.last_resource_diagnostics = reader.last_diagnostics
+            self.assertEqual(published.resource_diagnostics, [evidence])
+            self.assertEqual(published.malformed, 0)
+            value = json.loads(fleet._snapshot_json([], [], resource_diagnostics=published.resource_diagnostics))
+            self.assertEqual(value["resource_diagnostics"], [evidence])
+            render.set_show_all(True)
+            stack.enter_context(mock.patch.object(render, "_collect_governor", return_value=None))
+            stack.enter_context(mock.patch.object(render, "_collect_memory", return_value=None))
+            stack.enter_context(mock.patch.object(render, "_compute_host_rows", return_value=[]))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                render.render_once(lambda **kwargs: published, None, "both")
+            self.assertIn("past-reference.json", output.getvalue())
+            self.assertNotIn("next-reference.json", output.getvalue())
 
     def test_both_views_distinguish_past_references_from_unobserved_resources(self):
         missing = {"kind": "missing-registry", "path": "/work/project/old.json",

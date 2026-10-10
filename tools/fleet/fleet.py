@@ -311,7 +311,7 @@ def main(argv=None):
                              show_all=args.show_all,
                              hearting=hearting,
                              compute_host_snapshot=compute_host_snapshot,
-                             resource_diagnostics=getattr(projected_collector, "last_resource_diagnostics", [])))
+                             resource_diagnostics=observed.resource_diagnostics))
         return 0
 
     # curses / --once path (render module) — resolved lazily so --json needs no curses.
@@ -354,8 +354,7 @@ def main(argv=None):
         sessions, jobs = observed
         live_collector.last_resource_jobs = list(
             getattr(base_collector, "last_resource_jobs", []))
-        live_collector.last_resource_diagnostics = list(getattr(
-            base_collector, "last_resource_diagnostics", []))
+        live_collector.last_resource_diagnostics = list(observed.resource_diagnostics)
         live_collector.last_usage_snapshots = dict(
             getattr(base_collector, "last_usage_snapshots", {}))
         previous_sessions = list(sessions)
