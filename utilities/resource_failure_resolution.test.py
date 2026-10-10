@@ -4,6 +4,8 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import shlex
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -137,6 +139,34 @@ class FailedOutputResolutionTest(FIX.WorkflowFixture):
         result, commits = self._settle_resource_owner(route, path, jobs)
         self.assertEqual((result.reason, commits), ("resource-failure-unresolved", 0))
         self.assertIn("same-byte-consumer-binding-absent", result.detail)
+
+    def test_retry_pipe_delivers_the_original_task_to_compose(self):
+        route, path, jobs, registry, output, ledger, gates = self.fixture()
+        armed = json.loads((ledger.root / 'armed/full-run.json').read_text())
+        tokens = shlex.split(R.retry_step(route, armed, jobs, 'changed output')['command'])
+        separator = tokens.index('|')
+        task = tokens[2]
+        # Exercise the real CLI argument/task reader with a one-shot stdin pipe;
+        # stop at composition so this test cannot create or dispatch a route.
+        probe = '''import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("retry_compose_probe", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module._resolve_compose_plan = lambda *args: (None, None)
+def capture(**kwargs):
+    print(json.dumps(kwargs["work_request"]["text"]))
+    raise SystemExit(0)
+module.compose_route = capture
+sys.argv = [sys.argv[1], *sys.argv[2:]]
+module.main()
+'''
+        result = subprocess.run([sys.executable, '-c', probe, str(HERE / 'capability-route.py'),
+                                 *tokens[separator + 4:]], input=task, text=True,
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), task)
+        self.assertIn('fixture-run__a1', task)
 
     def test_owner_override_and_stale_consumer_cannot_resolve(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()

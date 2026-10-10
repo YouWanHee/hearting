@@ -205,6 +205,9 @@ def retry_step(route, armed, jobs, reason):
     argv = ["hearting", "run", "capability-route", "compose", "--start", "--shape", "staged",
             "--capability", route["capability"], "--capability-mode", route["capability_mode"],
             "--intensity", route["effective_intensity"], "--graph", ",".join(nodes),
+            # A pipe can be read only once. Supplying the existing slug option
+            # keeps compose's slug inference from consuming the task first.
+            "--slug", f"{route['route_id']}-{armed['node']}-retry-a{ordinal}",
             "--cwd", route["cwd"], "--artifact-root", route["artifact_root"],
             "--jobs", str(jobs), "--prompt-file", "/dev/stdin"]
     if route.get("campaign_key"):
