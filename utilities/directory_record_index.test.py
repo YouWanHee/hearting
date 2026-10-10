@@ -2,6 +2,7 @@
 """NAS lookup regressions: real lineage/admission with many unrelated records."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -183,6 +184,40 @@ class DirectoryLookupTest(F.ProducerTestBase):
         with mock.patch.object(Path, "read_text", read):
             self.assertEqual(R.route_status(self.root, open_only=True), expected)
         self.assertEqual(reads, [f"{self.a['route_id']}.json"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX filenames may contain non-UTF-8 bytes")
+    def test_foreign_non_utf8_filename_preserves_scan_and_cached_lookup(self):
+        b = self._continuation(self.a)
+        foreign = os.fsdecode(b"foreign-\xff.json")
+        (self.routes / foreign).write_text("{}")
+        expected = [b["route_id"]]
+        self.assertEqual([row["route_id"] for row in self.children()], expected)
+        cache = I._load(I._path(self.routes, "route-children"))
+        self.assertIn(foreign, cache["listing"])
+        P._ROUTE_EDGES.clear()
+        self.assertEqual([row["route_id"] for row in self.children()], expected)
+
+    def test_damaged_admission_route_projection_retains_removed_record_recovery(self):
+        cycle_id, route_id = self.cycle["cycle_id"], self.a["route_id"]
+        P.cycle_record_path(self.root, cycle_id).unlink()
+        index_path, original = P.artifact_admission._index_path(self.root), P._read_json
+        damages = ([1], {"root": [1]}, {"root": {route_id: []}},
+                   {"root": {route_id: {"cycle_id": []}}})
+        for projection in damages:
+            with self.subTest(projection=projection):
+                def read(path):
+                    if Path(path) == index_path:
+                        return {"cycles": {cycle_id: {}}, "routes": projection}
+                    return original(path)
+                with mock.patch.object(P, "_read_json", side_effect=read), \
+                        mock.patch.object(P, "read_cycle_record", return_value=self.record) as recover:
+                    self.assertEqual(P.list_cycle_records(self.root, route_ids={route_id}), [self.record])
+                    recover.assert_called_once_with(self.root, cycle_id)
+
+    def test_foreign_dot_json_cycle_filename_matches_original_scan_scope(self):
+        (self.cycles / ".json").write_text(json.dumps({"cycle_id": "foreign", "route_id": self.a["route_id"]}))
+        expected = P.list_cycle_records(self.root)
+        self.assertEqual(P.list_cycle_records(self.root, route_ids={self.a["route_id"]}), expected)
 
 
 if __name__ == "__main__":

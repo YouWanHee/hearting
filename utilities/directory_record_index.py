@@ -34,13 +34,14 @@ def route_keys(name, value):
 
 
 def cycle_keys(name, value):
-    return ([value["route_id"]] if isinstance(value, dict) and isinstance(value.get("route_id"), str)
+    return ([value["route_id"]] if Path(name).suffix == ".json" and isinstance(value, dict)
+            and isinstance(value.get("route_id"), str)
             else [])
 
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                     ensure_ascii=False).encode("utf-8")).hexdigest()
+                                     ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
 def _listing(directory, ignored):
@@ -90,7 +91,7 @@ def _save(path, listing, groups):
         if path.is_symlink():
             return
         body = {"version": 1, "listing": listing, "listing_digest": _digest(listing), "groups": groups}
-        data = json.dumps(dict(body, digest=_digest(body)), ensure_ascii=False, separators=(",", ":")) + "\n"
+        data = json.dumps(dict(body, digest=_digest(body)), ensure_ascii=True, separators=(",", ":")) + "\n"
         fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(data)

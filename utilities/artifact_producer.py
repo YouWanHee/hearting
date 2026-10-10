@@ -751,11 +751,25 @@ def list_cycle_records(root: Path, *, route_ids=None) -> List[Dict[str, Any]]:
         # route projection narrows recovery too; unindexed legacy rows retain
         # the original read-and-filter fallback.
         projected, matching = set(), set()
-        for bucket in (index.get("routes") or {}).values():
+        projection = index.get("routes") or {}
+        valid_projection = isinstance(projection, dict)
+        for bucket in projection.values() if valid_projection else ():
+            if not isinstance(bucket, dict):
+                valid_projection = False
+                break
             for route_id, item in bucket.items():
-                projected.add(item.get("cycle_id"))
+                if (not isinstance(route_id, str) or not isinstance(item, dict)
+                        or not isinstance(item.get("cycle_id"), str)):
+                    valid_projection = False
+                    break
+                projected.add(item["cycle_id"])
                 if route_id in route_ids:
-                    matching.add(item.get("cycle_id"))
+                    matching.add(item["cycle_id"])
+            if not valid_projection:
+                break
+        if not valid_projection:
+            # A damaged optional projection cannot suppress legacy recovery.
+            projected, matching = set(), set()
         known = {row.get("cycle_id") for row in rows}
         candidates = (matching | (set(index.get("cycles") or {}) - projected)) - known - {None}
     for cycle_id in sorted(candidates):
