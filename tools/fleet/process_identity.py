@@ -53,11 +53,13 @@ def process_role(*, tty=None, registered=False, session_backend=False, native_se
     return "unknown"
 
 
-def resolve_session_claims(claims, successors=None):
+def resolve_session_claims(claims, successors=None, *, current_source=None):
     """Resolve exact claims through directed conversation continuity, never recency.
 
-    Adapters validate PID/start before supplying claims. A unique claim reachable
-    from every other claim is the current conversation; unrelated claims stay unknown.
+    Adapters validate PID/start before supplying claims. A native current record
+    distinguishes its current selection from historical taps and pane labels.
+    It also follows a resume back to an earlier conversation. Without it,
+    claims must agree through directed continuity.
     """
     claims = {source: sid for source, sid in claims.items() if sid}
     ids = set(claims.values())
@@ -74,10 +76,18 @@ def resolve_session_claims(claims, successors=None):
                 pending.extend(successors.get(current, ()))
         return False
 
+    historical = {}
+    origin = claims.get(current_source) if current_source else None
+    if origin:
+        historical = {source: sid for source, sid in claims.items() if sid != origin}
+        ids = {origin}
     current = [sid for sid in ids if all(reaches(other, sid) for other in ids)]
     sid = current[0] if len(current) == 1 else None
-    return sid, {"verdict": "resolved" if sid else "conflict" if ids else "unobserved",
-                 "claims": claims, "session_id": sid}
+    evidence = {"verdict": "resolved" if sid else "conflict" if ids else "unobserved",
+                "claims": claims, "session_id": sid}
+    if origin:
+        evidence.update(current_source=current_source, historical_claims=historical)
+    return sid, evidence
 
 
 def pane_process_claims(sessions, panes, bindings, *, complete=True):

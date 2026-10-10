@@ -30,7 +30,10 @@ class CurrentSessionTest(unittest.TestCase):
         self.proj.mkdir(parents=True)
         (self.home / "sessions").mkdir()
         (self.home / "sessions" / f"{self.pid}.json").write_text(json.dumps({
-            "pid": self.pid, "procStart": self.start, "sessionId": "old",
+            # Legacy registry has no PID/start current-selection proof. These
+            # cases exercise continuity and conflict fallback; exact native
+            # selection is covered by test_session_cwd_current_identity.py.
+            "pid": self.pid, "sessionId": "old",
             "status": "idle", "name": "이틀 전 작업 완료", "updatedAt": 1000000,
         }))
         (self.home / ".statusline").mkdir()

@@ -4711,7 +4711,8 @@ def _continue_look(target, req):
     else the reason.
 
     The pane and harness are the booked ones and the session there is the one the clear started,
-    with no message yet: Claude -- the pane's process (or herdr) names `new_session`; Codex -- no
+    with no message yet: a proven process selection takes precedence over delayed pane labels.
+    Claude -- the pane's process (or herdr) names `new_session`; Codex -- no
     rollout exists for `new_session` yet and the status line shows it (or herdr/the process name
     it); OpenCode -- its home screen, which also is its empty box. Then idle, the card on its way,
     no form open, an empty input box."""
@@ -4725,7 +4726,10 @@ def _continue_look(target, req):
     pane = agent.get("pane") or target
     if harness in ("claude", "codex") and new in ("", "-"):
         return "new-session-unknown"
-    if harness == "claude" and agent.get("session_id") != new and _process_session(pane, harness) != new:
+    current = _process_session(pane, harness) if harness in ("claude", "codex") else None
+    if current and current != new:
+        return "target-changed"
+    if harness == "claude" and (current or agent.get("session_id")) != new:
         return "target-changed"
     if harness == "codex" and _codex_rollout_exists(new):
         return "new-input"              # the new thread already had its first message
@@ -4748,7 +4752,7 @@ def _continue_look(target, req):
             return "draft"
         return None if _opencode_home(lines) else "target-changed"
     if harness == "codex" and new not in _codex_footer_threads(lines) \
-            and agent.get("session_id") != new and _process_session(pane, harness) != new:
+            and agent.get("session_id") != new and current != new:
         return "target-changed"
     return _screen_ready(harness, lines)
 

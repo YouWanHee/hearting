@@ -499,6 +499,10 @@ def enrich(sess, tick=None):
             row = cur.execute("SELECT %s FROM session WHERE id=? LIMIT 1" % _COLS, (proven,)).fetchone()
             if row:
                 sess._opencode_bind_kind = "process"
+                directory = cur.execute("SELECT directory FROM session WHERE id=? LIMIT 1", (proven,)).fetchone()
+                if directory:
+                    from .. import session_cwd
+                    session_cwd.observe(sess, directory[0], proven)
         if row is None and start_ms is not None:
             row = _query_window(cur, sess.cwd, start_ms, (tick or {}).get(sess.pid))
             if row:
