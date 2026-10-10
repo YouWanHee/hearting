@@ -542,7 +542,7 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertIsNone(self.outcome(other_file))
         done = self.campaign("campaign-close", other_record["campaign_id"], "--reason", "done")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "session-ended")
+        self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "campaign-close")
         self.assertEqual(self.cycle_record(other_record["cycle_id"])["state"], "sealed")
 
     def test_r6_sub_agent_sharing_the_session_id_leaves_the_parent_route_alone(self):
