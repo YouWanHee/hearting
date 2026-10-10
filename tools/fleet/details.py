@@ -100,7 +100,7 @@ class DetailSnapshot:
 def _enrich(snapshot):
     """Fill copied rows with display detail; never rescan or reclassify work."""
     from .collectors import dispatch, _adopt_child_titles, apply_peer_rows
-    from . import projection, route_chain
+    from . import projection, route_chain, titles
     source_key = state_key(snapshot)
     value = copy.deepcopy(snapshot)
     sessions, jobs = value.sessions, value.jobs
@@ -121,6 +121,7 @@ def _enrich(snapshot):
         except Exception:
             pass
     _adopt_child_titles(sessions, jobs)
+    titles.annotate(sessions + jobs)
     route_chain.enrich(sessions, jobs=jobs, node_evidence=value.node_evidence, now=time.time())
     degradations = dispatch._scan_degradations(
         set(value.node_evidence) | {j.route_id for j in jobs if j.route_id}, jobs=jobs)
@@ -234,6 +235,7 @@ def merge(basic, detail):
             # the unobserved placeholder; do not replace a native current title.
             if not getattr(current, "title", None):
                 current.title = getattr(previous, "title", None)
+                current.title_ts = getattr(previous, "title_ts", None)
             same_activity = (getattr(row, "liveness", None) == getattr(previous, "liveness", None)
                              and getattr(row, "_detail_activity_key", None) ==
                                  getattr(previous, "_detail_activity_key", None)

@@ -2190,8 +2190,8 @@ def enrich(sess, tick=None):
             path = _fallback_rollout(sess, home)
     if not path:
         if sess.session_id:
-            from fleet.session_handle import minted_tag
-            sess.session_tag = minted_tag(sess.session_id)
+            from fleet.session_handle import resolve_tag
+            sess.session_tag = resolve_tag("codex", sess.session_id)
         return                           # no rollout-specific telemetry for this session
     rollout_model, rollout_effort = _rollout_model_effort(path)
     if rollout_model:
@@ -2214,8 +2214,8 @@ def enrich(sess, tick=None):
         from fleet import titles
         # F-100b — Codex exposes no derived `<basename>-<xx>` name, so the tag behind the
         # `[xx]` badge is minted from the thread id. Deterministic, so nothing is stored.
-        from fleet.session_handle import minted_tag
-        sess.session_tag = minted_tag(sess.session_id)
+        from fleet.session_handle import resolve_tag
+        sess.session_tag = resolve_tag("codex", sess.session_id)
         sidecar_title = _displayable_title(
             titles.last_title(sess.session_id, harness="codex")
         )

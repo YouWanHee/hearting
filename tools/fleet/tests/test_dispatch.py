@@ -647,7 +647,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "plans", "2026-07-22_unresolved-parent", "execute"))
             session = Session(harness="claude", pid=500, proc_start="root", cwd=tmp,
                               session_id="sid-unresolved", slug="unresolved-parent",
-                              title="unresolved-parent", liveness="working")
+                              runtime_name="unresolved-parent", liveness="working")
             owner = DispatchJob(
                 key="code", slug="unresolved-owner", cwd="/work/repo",
                 parent_sid="sid-unresolved", is_child=True, harness="claude",

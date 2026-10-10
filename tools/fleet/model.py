@@ -191,11 +191,14 @@ class WorkProjection:
     ambiguity: Optional[str] = None
     _route_view: Optional[dict] = field(default=None, repr=False, compare=False)
     report_verification: Optional[dict] = field(default=None, compare=False)
+    result: Optional[dict] = None  # recorded task result and event time; never file mtime
 
     def to_dict(self):
         payload = _public_value(self)
         if payload.get("report_verification") is None:
             payload.pop("report_verification", None)
+        if payload.get("result") is None:
+            payload.pop("result", None)
         # Public v16 shape is an array so future resolver diagnostics can be
         # additive without changing the JSON type.  Keep the scalar internal
         # storage compatible with existing constructors and comparisons.
@@ -271,6 +274,7 @@ class Session:
     session_id: Optional[str] = None
     slug: Optional[str] = None
     title: Optional[str] = None        # last successful Fleet subject title; native titles are not fallbacks
+    title_ts: Optional[float] = None   # exact sidecar title event time, independent of activity
     model: Optional[str] = None
     effort: Optional[str] = None
     # The runtime DID report an effort token, but it was the uninformative
@@ -540,6 +544,7 @@ class DispatchJob:
     title: Optional[str] = None         # the child session's own sidecar title, adopted in
                                         # collect_all (F-14 reach into dispatch rows) — None
                                         # keeps the slug as the row identity
+    title_ts: Optional[float] = None
     summary: Optional[str] = None       # the child session's own live sidecar summary,
                                         # adopted the same way as title (F-16/F-17 merge)
     summary_ts: Optional[float] = None  # F-63: sidecar write time of `summary`, adopted

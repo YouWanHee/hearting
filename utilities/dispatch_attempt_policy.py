@@ -166,6 +166,7 @@ class RegisteredWorkObservation:
     owner_completion_state: str = "settled"
     cleanup_state: str = "settled"
     provenance: tuple[tuple[str, str], ...] = ()
+    pane_relation: str = "executor"
 
 
 @dataclass(frozen=True)
@@ -217,6 +218,7 @@ def _registered_readiness(observation: RegisteredWorkObservation) -> CompletionR
                   ("evidence_state", observation.evidence_state),
                   ("owner_completion_state", observation.owner_completion_state),
                   ("cleanup_state", observation.cleanup_state),
+                  ("pane_relation", observation.pane_relation),
                   *observation.provenance)
     if (not observation.attempt_id or observation.owner_completion_state not in
             {"settled", "pending", "unknown"} or observation.cleanup_state not in
@@ -251,13 +253,17 @@ def _registered_readiness(observation: RegisteredWorkObservation) -> CompletionR
 
 def completion_readiness(
     observation: RegisteredWorkObservation | PaneObservation,
+    *, purpose: str = "completion",
 ) -> CompletionReadiness:
     """Project registered work or a native pane into one provenance-preserving result.
 
     Native idle/done means only that the interactive turn is ready. A bound
     registered attempt is evaluated through its already computed policy decision
-    and can keep the pane pending or unknown.
+    and can keep the pane pending or unknown. Input considers only executor
+    bindings; completion and retirement also consider registered children.
     """
+    if purpose not in {"completion", "input"}:
+        raise ValueError("readiness-purpose-invalid")
     if isinstance(observation, RegisteredWorkObservation):
         return _registered_readiness(observation)
     if not isinstance(observation, PaneObservation):
@@ -291,7 +297,8 @@ def completion_readiness(
         return CompletionReadiness(state, "native-turn", None, "wait-native-turn",
                                    "native-turn-" + turn, provenance,
                                    identity, observation.form_state, observation.draft_state)
-    work_results = [completion_readiness(item) for item in observation.bound_work]
+    work_results = [completion_readiness(item) for item in observation.bound_work
+                    if purpose == "completion" or item.pane_relation != "parent"]
     if any(result.state == "unknown" for result in work_results):
         return CompletionReadiness("unknown", "native-turn", None, "resolve-bound-work",
                                    "bound-registered-work-unknown", provenance + tuple(

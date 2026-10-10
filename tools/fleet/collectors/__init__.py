@@ -408,6 +408,17 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
+    # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
+    try:
+        from ..session_tags import refresh
+        from ..session_handle import resolve_tag
+        refresh(sessions)
+        for s in sessions:
+            if s.harness in {"codex", "opencode"} and s.session_id:
+                s.session_tag = resolve_tag(s.harness, s.session_id)
+    except Exception:
+        pass
+
     # F-100c: steward flag — exact (harness, session_id) join on the ledger's markers.
     try:
         from . import steward as _steward
@@ -536,6 +547,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         # This joins already observed exact child fields without further IO.
         # NOW/context/exec must be available in the basic snapshot too.
         _adopt_child_titles(sessions, jobs)
+        from .. import titles
+        titles.annotate(sessions + jobs)
     except Exception:
         pass
 

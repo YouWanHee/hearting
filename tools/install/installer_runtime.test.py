@@ -55,6 +55,22 @@ def _stubbed_runtime_projection():
         yield mocks
 
 
+class PeerReconnectTest(unittest.TestCase):
+    def test_callback_uses_activated_root_and_keeps_existing_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            utility = root / "utilities" / "peer-steward.py"
+            utility.parent.mkdir()
+            utility.touch()
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": "/fixture/jobs.log"}), \
+                 mock.patch.object(runtime_activation.subprocess, "Popen") as launch:
+                self.assertTrue(runtime_activation.reconnect_peer_obligations(root))
+                args, kwargs = launch.call_args
+                self.assertEqual(args[0], [sys.executable, str(utility), "__ensure-obligations"])
+                self.assertEqual(kwargs["env"]["AGENT_HOME"], str(root))
+                self.assertEqual(kwargs["env"]["AGENT_DISPATCH_JOBS"], "/fixture/jobs.log")
+
+
 class LauncherCommitBoundaryTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -140,6 +156,21 @@ class LauncherCommitBoundaryTest(unittest.TestCase):
             scope="global",
             dry_run=False,
         )
+
+    def test_activation_reconnects_once_and_rollback_never_reconnects(self):
+        with _stubbed_runtime_projection() as mocks, \
+             mock.patch.object(runtime_activation, "reconnect_peer_obligations") as reconnect:
+            mocks["activate"].return_value["active_root"] = "/fixture/release"
+            result = installer.cmd_runtime(self._args("activate"))
+            self.assertEqual(result["exit"], installer.EXIT_OK)
+            reconnect.assert_called_once_with("/fixture/release")
+        os.environ["HARNESS_INSTALLER_FAIL_AFTER_LAUNCHER"] = "1"
+        with _stubbed_runtime_projection() as mocks, \
+             mock.patch.object(runtime_activation, "reconnect_peer_obligations") as reconnect:
+            mocks["refresh"].return_value["active_root"] = "/fixture/release"
+            result = installer.cmd_runtime(self._args("refresh"))
+            self.assertEqual(result["exit"], installer.EXIT_BLOCKED)
+            reconnect.assert_not_called()
 
     def test_injected_failure_after_launcher_retirement_restores_exact_prior_state(self):
         self._install_legacy_launcher()

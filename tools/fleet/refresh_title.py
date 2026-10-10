@@ -2088,6 +2088,7 @@ def main(argv=None):
                 summary_failures=previous_failures,
                 cursor_kind=cursor_kind,
                 summary_error=previous.get("summary_error"),
+                title_ts=previous.get("title_ts"),
             )
             titles.sweep()
             return 0
@@ -2121,6 +2122,7 @@ def main(argv=None):
             summary_failures=summary_failures,
             cursor_kind=cursor_kind,
             summary_error=provider_box.get("error"),
+            title_ts=time.time() if title else previous.get("title_ts"),
         )
         titles.sweep()
         return 0

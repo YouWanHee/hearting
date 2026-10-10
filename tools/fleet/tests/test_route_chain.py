@@ -450,11 +450,11 @@ class AssembleStateTest(unittest.TestCase):
                                 {"rt-1": {"present": True, "terminal_gate_proven": True, "match": True}})
         self.assertEqual(chain["nodes"][0]["state"], "done")
 
-    def test_failed_when_terminal_gate_proven_false(self):
+    def test_unproven_terminal_gate_is_unknown_not_failure(self):
         r = _fake_route("rt-1", "autopilot-code")
         chain = self._assemble([_line_for(r)], {"rt-1": r},
                                 {"rt-1": {"present": True, "terminal_gate_proven": False, "match": True}})
-        self.assertEqual(chain["nodes"][0]["state"], "failed")
+        self.assertEqual(chain["nodes"][0]["state"], "unknown")
 
     def test_unknown_when_terminal_gate_proven_null_or_absent(self):
         r = _fake_route("rt-1", "autopilot-code")
@@ -589,7 +589,7 @@ class AssembleFailedFoldTest(unittest.TestCase):
             lines, load_record=_FakeRecords(records), load_outcome=_FakeOutcomes(outcomes),
         )
 
-    def test_failed_then_same_capability_folds_to_r2(self):
+    def test_unproven_then_same_capability_keeps_both_observations(self):
         r1 = _fake_route("rt-1", "autopilot-code")
         r2 = _fake_route("rt-2", "autopilot-code")
         lines = [_line_for(r1, ts=1.0), _line_for(r2, ts=2.0)]
@@ -598,17 +598,17 @@ class AssembleFailedFoldTest(unittest.TestCase):
             {"rt-1": {"present": True, "terminal_gate_proven": False, "match": True},
              "rt-2": {"present": True, "terminal_gate_proven": True, "match": True}},
         )
-        self.assertEqual(len(chain["nodes"]), 1)
-        self.assertEqual(chain["nodes"][0]["round"], 2)
-        self.assertEqual(chain["nodes"][0]["state"], "done")
+        self.assertEqual(len(chain["nodes"]), 2)
+        self.assertEqual([node["round"] for node in chain["nodes"]], [1, 1])
+        self.assertEqual([node["state"] for node in chain["nodes"]], ["unknown", "done"])
 
-    def test_trailing_failed_stays_failed(self):
+    def test_trailing_unproven_stays_unknown(self):
         r1 = _fake_route("rt-1", "autopilot-code")
         chain = self._assemble(
             [_line_for(r1, ts=1.0)], {"rt-1": r1},
             {"rt-1": {"present": True, "terminal_gate_proven": False, "match": True}},
         )
-        self.assertEqual(chain["nodes"][0]["state"], "failed")
+        self.assertEqual(chain["nodes"][0]["state"], "unknown")
         self.assertEqual(chain["nodes"][0]["round"], 1)
 
 
