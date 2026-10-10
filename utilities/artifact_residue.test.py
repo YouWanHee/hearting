@@ -36,6 +36,10 @@ def _files(root: Path, skip=(".runtime/artifact-producer/v1/journal", ".runtime/
         if not path.is_file() or path.is_symlink():
             continue
         rel = path.relative_to(root).as_posix()
+        # Disposable lookup projections are outside the rollback's durable state.
+        if rel in {".runtime/routes/.route-children-index.json",
+                   ".runtime/artifact-producer/v1/cycles/.cycle-routes-index.json"}:
+            continue
         if any(rel.startswith(s) for s in skip):
             continue
         out[rel] = _sha(path)
@@ -284,6 +288,10 @@ class ApplyTests(ResidueFixture):
                 self.assertEqual(resumed["status"], "rolled-back", resumed)
                 self.assertEqual(_files(self.root), before)
                 self.assertEqual(sorted(p.name for p in (self.root / ".runtime" / "routes").glob("*.json")), routes_before)
+                # A rolled-back cycle must disappear from indexed lookup too.
+                route_id = self.caller_route["route_id"]
+                expected = [row for row in P.list_cycle_records(self.root) if row.get("route_id") == route_id]
+                self.assertEqual(P.list_cycle_records(self.root, route_ids={route_id}), expected)
                 self.assertIsNone(RES.residue_hold(self.root))
         done = self.apply()
         self.assertEqual(done["status"], "complete")
