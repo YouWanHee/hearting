@@ -123,6 +123,13 @@ class SessionTagCollisionTest(unittest.TestCase):
             session_tags.refresh([])
         self.assertEqual(session_tags._read(session_tags._path()), {})
 
+    def test_zombie_process_releases_its_number(self):
+        self.tags([self.session(self.a)])
+        with mock.patch("fleet.collectors.procscan.read_proc_start", return_value=None), \
+                mock.patch("fleet.collectors.procscan.is_terminal_state", return_value=True):
+            session_tags.refresh([])
+        self.assertEqual(session_tags._read(session_tags._path()), {})
+
     def test_herdr_reserves_fixed_claude_outside_filtered_fleet_collection(self):
         (self.root / "claude/sessions").mkdir(parents=True)
         (self.root / "claude/sessions/1.json").write_text(json.dumps({"sessionId": "cl", "nameSource": "derived", "name": "hearting-" + minted_tag(self.a)}))

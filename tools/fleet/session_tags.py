@@ -130,11 +130,11 @@ def _keep(row, panes_known):
     """Release only proven exited reservations, never uncertain live processes."""
     pid, start = row.get("pid"), row.get("proc_start")
     if pid and start:
-        from .collectors.procscan import read_proc_start
+        from .collectors.procscan import read_proc_start, is_terminal_state
         actual = read_proc_start(pid)
         if actual is not None:
             return str(actual) == str(start)
-        return Path("/proc/%s" % pid).exists()
+        return Path("/proc/%s" % pid).exists() and not is_terminal_state(pid)
     return not (panes_known and row.get("pane_id"))
 
 
