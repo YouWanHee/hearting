@@ -787,7 +787,10 @@ def prepare_campaign_goal(request, binding, commit_id):
             target = campaign.campaign_path(request.artifact_root, goal["campaign_id"], heal=False)
             intent["head"] = campaign.completion_head(request.artifact_root, target)
     except Exception as exc:
-        intent["reason"] = str(getattr(exc, "code", "goal-input-unavailable"))
+        # Do not claim a terminal transaction or persist an unusable stream
+        # fence. The existing completion controller retries this preparation.
+        raise TerminalCommitError("goal-input-unavailable",
+                                  str(getattr(exc, "code", type(exc).__name__))) from exc
     _atomic_json(path, intent, exclusive=True)
 
 
@@ -1743,8 +1746,6 @@ def _completion_request(jobs, status, metadata):
     # Optional goal judgment: metadata alone is insufficient; the exact
     # owner-bound primary artifact is authoritative across harnesses.
     goal, _goal_source = read_owner_campaign_goal((handoff or {}).get("primary"))
-    if goal is None and isinstance(explicit_handoff, Mapping):
-        goal, _ = parse_campaign_goal(explicit_handoff.get("campaign_goal"))
     request = TerminalCommitRequest(path, metadata["attempt_id"], Path(jobs),
                                     Path(route["artifact_root"]), handoff, goal)
     verify_request_identity(request, route)

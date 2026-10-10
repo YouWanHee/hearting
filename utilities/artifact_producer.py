@@ -10103,16 +10103,21 @@ def resolve_output_dir(root: Path, bucket: str, *, cycle_dir_hint: Optional[str]
 def _route_autoclose(root: Path, trigger: str, campaign: Optional[str] = None) -> None:
     """Close routes nobody works on before campaign bookkeeping reads them
     (route_autoclose.py).  Bookkeeping only: it never fails the command.
-    `campaign` is the one `campaign-close` ends; its members close sooner."""
+    `campaign` limits `campaign-close` bookkeeping to that campaign."""
     try:
         import artifact_cutover
         import route_autoclose
         campaign_id = None
+        scope = {}
         if campaign is not None:
-            record, _raw = artifact_campaign.read_json(root, artifact_campaign.campaign_path(root, campaign))
+            path = artifact_campaign.campaign_path(root, campaign)
+            record, _raw = artifact_campaign.read_json(root, path)
             campaign_id = record.get("campaign_id")
+            scope = {"scope_campaign_id": campaign_id, "scope_dir": path.parent,
+                     "scope_key": record.get("key")}
         route_autoclose.report(route_autoclose.sweep(
-            root, api=artifact_cutover._route_module(), trigger=trigger, campaign_id=campaign_id))
+            root, api=artifact_cutover._route_module(), trigger=trigger,
+            campaign_id=campaign_id, **scope))
     except Exception as exc:  # noqa: BLE001
         print(f"route_autoclose error={type(exc).__name__}", file=sys.stderr)
 

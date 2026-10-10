@@ -12,6 +12,9 @@ intent or projection, and starts no background job. `campaign-status` and
 `campaign-list` are also pure queries. Writers retain recovery and projection
 materialization. Lifecycle and archive presentation have separate verdicts.
 
+The `campaign-close` route sweep is limited to the selected campaign. Unrelated
+campaigns' open routes and empty cycle controls remain untouched by that sweep.
+
 ## Fixed document fields
 
 | Field | Type and meaning |
@@ -109,13 +112,17 @@ codes remain those of [ARTIFACT_META.md](ARTIFACT_META.md).
 
 ## Historical rename and normal goal completion
 
-A relocated legacy v1 or current v2 close retains its old root/hash/event IDs
-and snapshot bytes. The current stable root and repository IDs bind through
+A legacy v1 or current v2 close retains its old root/hash/event IDs
+and snapshot bytes. Every close verifies the current stable root and repository
+IDs. A new v2 close snapshot records repository_id automatically. At its original
+path both authenticated snapshot IDs must equal RootIdentity; no manifest
+fallback is needed to prove those IDs. Relocated or legacy histories bind through
 the snapshot's exact campaign and manifest/revision IDs and raw-byte digests.
 A legacy snapshot lacking repository_id uses its surviving historical
 manifest's repository/root IDs. A matching root ID alone grants no foreign
 repository compatibility. Preserved historical revisions have authority over
-later current revisions. Missing, foreign or changed proof remains invalid.
+later current revisions. A present malformed historical revision cannot fall
+back to a current manifest. Missing, foreign or changed proof remains invalid.
 Official v2 rows for ended routes without manifests retain their authenticated
 snapshot provenance. At least one surviving manifest still binds the exact
 repository/root/campaign; the reader invents no manifest for those rows.
@@ -126,7 +133,8 @@ owner primary may carry one optional `campaign-goal` JSON fence containing
 uses `campaign_goal`. A generic JSON example or neighboring sidecar is ignored.
 Claude, Codex and OpenCode share the same completion consumer. The existing
 terminal transaction retains the decision and expected campaign head before
-claim; it saves the exact official close event before publication. Interruption
+claim; a transient head read fails preparation before claim and retries through
+the existing controller. It saves the exact official close event before publication. Interruption
 keeps PASS plus the recovery duty. Replay recognizes the saved event, including
 after a later begin/reopen, and cannot close later work with the older judgment.
 Scoped completion, child PASS and sealed cycles leave the goal judgment unset.

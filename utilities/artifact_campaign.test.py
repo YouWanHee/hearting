@@ -111,6 +111,8 @@ class CampaignTest(F.ProducerTestBase):
         path = Path(path or self.path)
         record = json.loads(path.read_text())
         snapshot = C._snapshot(self.root, path)
+        # Actual v1 snapshots, including TF history, predate repository_id.
+        snapshot.pop("repository_id", None)
         harness, session = "codex", "legacy-session"
         actor_id = "native-user:" + C.hashlib.sha256((harness + ":" + session).encode()).hexdigest()
         approval = {"harness": harness, "session_id": session, "actor_id": actor_id,
@@ -735,6 +737,8 @@ class RenameBindingTest(F.ProducerTestBase):
     def _write_v1_close(self, path):
         record = json.loads(path.read_text())
         snapshot = C._snapshot(self.root, path)
+        # Actual v1 snapshots, including TF history, predate repository_id.
+        snapshot.pop("repository_id", None)
         harness, session = "codex", "legacy-session"
         actor_id = "native-user:" + C.hashlib.sha256((harness + ":" + session).encode()).hexdigest()
         approval = {"harness": harness, "session_id": session, "actor_id": actor_id,
@@ -793,12 +797,12 @@ class RenameBindingTest(F.ProducerTestBase):
         with self.assertRaisesRegex(C.CampaignError, "rename-binding-mismatch"):
             C.campaign_state(new_root, new_path)
 
-    def test_same_path_history_still_valid_without_identity(self):
+    def test_same_path_history_without_identity_is_unverified(self):
         C.close(self.root, self.path, reason="done")
         raw = self.event_path.read_bytes()
         (self.root / P.artifact_admission.ADMISSION_REL / "root-identity.json").unlink()
-        folded = C.campaign_state(self.root, self.path)
-        self.assertEqual(folded.state, "satisfied")
+        with self.assertRaisesRegex(C.CampaignError, "campaign-event-invalid"):
+            C.campaign_state(self.root, self.path)
         self.assertEqual(self.event_path.read_bytes(), raw)
 
     def test_renamed_root_without_identity_stays_invalid(self):
@@ -841,6 +845,37 @@ class RenameBindingTest(F.ProducerTestBase):
             C.campaign_state(new_root, new_path)
         except C.CampaignError as exc:
             self.assertIn("rename-evidence-tampered", str(exc.detail))
+
+    def test_malformed_preserved_revision_cannot_fall_back_to_current(self):
+        C.close(self.root, self.path, reason="done")
+        new_root, new_path = self._moved_root()
+        row = json.loads((new_path.parent / "campaign.events/000001.json").read_text())["payload"]["snapshot"]["cycles"][0]
+        preserved = new_root / P.artifact_lifecycle.MANIFEST_SNAPSHOT_REL / row["cycle_id"] / (row["manifest_revision_id"] + ".json")
+        original = preserved.read_bytes()
+        for malformed in (b"{", b"{}"):
+            with self.subTest(malformed=malformed):
+                preserved.write_bytes(malformed)
+                exported = C.export_current(new_root)
+                observed = next(r for r in exported["campaigns"] if r["campaign_id"] == self.campaign)
+                self.assertEqual(observed["status"], "invalid")
+                self.assertIsNone(observed["state"])
+        preserved.write_bytes(original)
+        self.assertEqual(C.campaign_state(new_root, new_path).state, "satisfied")
+
+    def test_unhashable_manifest_id_returns_an_invalid_document(self):
+        C.close(self.root, self.path, reason="done")
+        new_root, new_path = self._moved_root()
+        row = json.loads((new_path.parent / "campaign.events/000001.json").read_text())["payload"]["snapshot"]["cycles"][0]
+        preserved = new_root / P.artifact_lifecycle.MANIFEST_SNAPSHOT_REL / row["cycle_id"] / (row["manifest_revision_id"] + ".json")
+        preserved.unlink()
+        current = new_root / Path(self.result["cycle_dir"]).relative_to(self.root) / "manifest.json"
+        doc = json.loads(current.read_text())
+        doc["cycle"]["cycle_id"] = []
+        current.write_text(json.dumps(doc))
+        observed = next(row for row in C.export_current(new_root)["campaigns"]
+                        if row["campaign_id"] == self.campaign)
+        self.assertNotEqual(observed["status"], "valid")
+        self.assertIsNone(observed["state"])
 
     def test_missing_evidence_is_rejected(self):
         C.close(self.root, self.path, reason="done")

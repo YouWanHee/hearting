@@ -530,7 +530,7 @@ class RouteAutocloseTest(unittest.TestCase):
         # A key that only prefixes another stream's folder name finds nothing.
         self.assertIsNone(RA.campaign_of_route(self.root, {"campaign_key": "other"}))
 
-    def test_campaign_status_observes_and_writer_closes_routes_in_every_campaign(self):
+    def test_campaign_status_observes_and_writer_closes_its_selected_campaign(self):
         # Query leaves ended routes alone; the existing writer owns the sweep.
         other_file, other, other_record = self._other_campaign_ended()
         mine_file, mine = self.compose("mine", "codex", "mine-session", campaign="scope-mine")
@@ -544,6 +544,32 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "campaign-close")
         self.assertEqual(self.cycle_record(other_record["cycle_id"])["state"], "sealed")
+
+    def test_campaign_close_preserves_unrelated_stale_routes_and_empty_controls(self):
+        other_file, _other, other_record = self._other_campaign_ended()
+        self.claude_crashed("empty-session")
+        empty_file, empty = self.compose("empty-other", "claude", "empty-session",
+                                         campaign="empty-other-stream")
+        empty_record = self.cycle(empty)
+        self.age(empty_file, "claude", "empty-session", TWO_HOURS)
+        self.claude_crashed("mine-ended")
+        mine_file, mine = self.compose("close-mine", "claude", "mine-ended",
+                                      campaign="close-selected-stream")
+        mine_record = self.write_artifact(mine)
+        self.age(mine_file, "claude", "mine-ended", TWO_HOURS)
+        protected = [other_file, empty_file]
+        for record in (other_record, empty_record):
+            protected.extend(p for p in self.cycle_dir(record).rglob("*") if p.is_file())
+            protected.append(artifact_producer.cycle_record_path(self.root, record["cycle_id"]))
+        before = {str(path): path.read_bytes() for path in protected}
+        done = self.campaign("campaign-close", mine_record["campaign_id"], "--reason", "done")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout)["status"], "satisfied")
+        self.assertEqual(before, {str(path): path.read_bytes() for path in protected})
+        self.assertIsNone(self.outcome(other_file))
+        self.assertIsNone(self.outcome(empty_file))
+        self.assertEqual(self.cycle_record(empty_record["cycle_id"])["state"], "open")
+        self.assertEqual(self.outcome(mine_file)["autoclose"]["reason"], "campaign-close")
 
     def test_r6_sub_agent_sharing_the_session_id_leaves_the_parent_route_alone(self):
         self.claude_alive("parent")

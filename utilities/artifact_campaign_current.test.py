@@ -239,6 +239,28 @@ class GoalCompletionTests(F.ProducerTestBase):
     def settle(self):
         return T.settle_campaign_goal(self.request, self.binding)
 
+    def test_same_path_foreign_repository_does_not_validate_close(self):
+        self.prepare()
+        self.assertEqual(self.settle()["status"], "satisfied")
+        identity = self.root / A.ADMISSION_REL / "root-identity.json"
+        doc = json.loads(identity.read_text())
+        doc["repository_id"] = "repo_" + "f" * 32
+        identity.write_text(json.dumps(doc))
+        exported = C.export_current(self.root)
+        row = next(row for row in exported["campaigns"] if row["campaign_id"] == self.cycle["campaign_id"])
+        self.assertEqual((row["status"], row["reason"]), ("conflict", "campaign-rename-binding-mismatch"))
+        self.assertIsNone(row["state"])
+
+    def test_transient_head_read_retries_before_terminal_claim(self):
+        with mock.patch.object(C, "completion_head", side_effect=OSError("temporary unavailable")):
+            with self.assertRaisesRegex(T.TerminalCommitError, "goal-input-unavailable"):
+                self.prepare()
+        self.assertFalse(T.campaign_goal_path(self.request).exists())
+        self.prepare()
+        self.assertEqual(self.settle()["status"], "satisfied")
+        self.assertEqual(self.settle()["status"], "satisfied")
+        self.assertEqual(C.campaign_state(self.root, self.path).last_sequence, 1)
+
     def test_explicit_goal_closes_once_and_no_judgment_does_not_close(self):
         self.assertEqual(self.settle()["reason"], "no-judgment")
         self.assertEqual(C.campaign_state(self.root, self.path).state, "active")
@@ -361,6 +383,33 @@ class GoalCompletionTests(F.ProducerTestBase):
 
 
 class NativeOwnerGoalTests(unittest.TestCase):
+    def test_metadata_goal_without_primary_judgment_does_not_close(self):
+        from dispatch_completion_join import exact_attempt_row
+        fixture = F.TerminalTransactionIntegrationTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        route, path, jobs, owner, cycle, _review, _request = fixture._prepare_fixture("codex")
+        primary = fixture.write_output(cycle, rel="owner-report.md",
+            data=b"Only this cycle passed. Campaign goal remains unjudged.\n")
+        text = f"artifact: {primary}\nverdict: PASS\nblocker: none"
+        log = jobs.parent / "owner.jsonl"
+        log.write_text("\n".join(json.dumps(row) for row in (
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+            {"type": "turn.completed"})) + "\n")
+        jobs.write_text(jobs.read_text().replace("worker_type=owner",
+            f"attempt_schema_version=2,worker_type=owner,log_file={log},workflow_completion=runtime-v1"))
+        fixture._closed_owner(jobs, owner)
+        metadata = exact_attempt_row(jobs, owner).metadata
+        metadata["owner_handoff"] = {"primary": str(primary), "campaign_goal": {
+            "campaign_id": cycle["campaign_id"], "verdict": "satisfied"}}
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            request = T._completion_request(jobs, "done", metadata)
+            self.assertIsNone(request.campaign_goal)
+            result = T.settle_owner_completion(jobs, "done", metadata)
+            self.assertEqual(result.result, "completed", result)
+            campaign_path = C.campaign_path(fixture.root, cycle["campaign_id"], heal=False)
+            self.assertEqual(C.campaign_state(fixture.root, campaign_path).state, "active")
+
     def test_normal_completion_consumes_exact_owner_artifact_for_all_harnesses(self):
         from dispatch_completion_join import exact_attempt_row
         native = {

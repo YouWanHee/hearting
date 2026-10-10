@@ -221,40 +221,28 @@ def _validate_event_row(root, path, event, raw, expected_sequence, campaign_id, 
     return event
 
 
-def _rename_evidence_map(root, campaign_dir, reads=None):
-    """Index surviving manifest evidence by (cycle_id, manifest_id, revision_id).
+def _rename_evidence_map(root, campaign_dir, required, reads=None):
+    """Read only the named historical revisions, before current fallback.
 
-    Sources, in order of authority for one row: the preserved historical
-    manifest store, then the campaign directory's current manifests.  Every
-    candidate is read through `reads` when given so a pure export consumes the
-    same captured bytes the fold validates.  Historical bytes are never
-    rewritten here.
+    A present historical revision is authoritative even when malformed. Its
+    errors cannot be concealed by the current manifest for the same revision.
+    All reads participate in the export's immutable input capture.
     """
     found = {}
-    try:
-        store = root / lifecycle.MANIFEST_SNAPSHOT_REL
-        names = reads.entries(store) if reads is not None else (sorted(store.iterdir()) if store.is_dir() and not store.is_symlink() else [])
-    except OSError:
-        names = []
-    for cycle_dir in names:
-        if cycle_dir.name.startswith(".") or cycle_dir.is_symlink() or not cycle_dir.is_dir():
-            continue
+    for key in sorted(required):
+        cycle_id, _manifest_id, revision_id = key
+        candidate = root / lifecycle.MANIFEST_SNAPSHOT_REL / cycle_id / (revision_id + ".json")
         try:
-            entries = reads.entries(cycle_dir) if reads is not None else sorted(cycle_dir.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.suffix != ".json" or entry.is_symlink() or not entry.is_file():
+            document, raw = read_json(root, candidate, reads=reads)
+        except CampaignError as exc:
+            if (exc.code == "campaign-input-missing"
+                    or isinstance(exc.__cause__, FileNotFoundError)):
                 continue
-            try:
-                document, raw = read_json(root, entry, reads=reads)
-            except CampaignError:
-                continue
-            cycle = document.get("cycle") if isinstance(document, dict) else None
-            key = (cycle.get("cycle_id") if isinstance(cycle, dict) else None,
-                   document.get("manifest_id"), document.get("manifest_revision_id"))
-            if all(isinstance(part, str) for part in key):
-                found.setdefault(key, (entry, document, raw))
+            raise CampaignError("campaign-event-invalid", {
+                "path": str(candidate), "detail": "rename-evidence-tampered"}) from exc
+        found[key] = (candidate, document, raw)
+    if required.issubset(found):
+        return found
     for entry, _layout in (reads.cycle_dirs(campaign_dir) if reads is not None else locator.iter_cycle_dirs(campaign_dir)):
         candidate = entry / "manifest.json"
         try:
@@ -270,7 +258,7 @@ def _rename_evidence_map(root, campaign_dir, reads=None):
         cycle = document.get("cycle") if isinstance(document, dict) else None
         key = (cycle.get("cycle_id") if isinstance(cycle, dict) else None,
                document.get("manifest_id"), document.get("manifest_revision_id"))
-        if all(isinstance(part, str) for part in key):
+        if all(isinstance(part, str) for part in key) and key in required:
             found.setdefault(key, (candidate, document, raw))
     return found
 
@@ -278,12 +266,12 @@ def _rename_evidence_map(root, campaign_dir, reads=None):
 def _bind_root(root, campaign_dir, payload, snapshot, record_campaign_id, event_path, reads=None):
     """Stable RootIdentity binding for a close event after a root rename.
 
-    A same-path history keeps its existing meaning: when the event's recorded
-    absolute path still names this root, nothing more is required.  A renamed
-    root (recorded path differs) is accepted only when every snapshot row still
-    binds, byte-exact, to a surviving manifest under the current identity: the
-    snapshot's `artifact_root_id` must equal the current one — a root ID alone
-    never authorizes the rename — and each row's `(manifest_id,
+    Historical paths are provenance, including when the path is unchanged.
+    Every close verifies current RootIdentity. A new v2 snapshot at its
+    original path supplies both stable IDs directly. A renamed or legacy
+    snapshot additionally binds each row, byte-exact, to a surviving manifest:
+    its `artifact_root_id` must equal the current one — a root ID alone never
+    authorizes the rename — and each row's `(manifest_id,
     manifest_revision_id)` must resolve to preserved or current manifest bytes
     whose SHA256 equals the row's `manifest_digest` and whose document agrees
     on manifest, revision, artifact-root, repository, and campaign identities.
@@ -292,8 +280,6 @@ def _bind_root(root, campaign_dir, payload, snapshot, record_campaign_id, event_
     history bytes are never modified.
     """
     recorded = payload.get("root") if isinstance(payload, dict) else None
-    if recorded == str(Path(root).resolve()):
-        return None
     if not isinstance(recorded, str) or not recorded:
         raise CampaignError("campaign-event-invalid", {"path": str(event_path), "detail": "rename-root-missing"})
     try:
@@ -309,10 +295,22 @@ def _bind_root(root, campaign_dir, payload, snapshot, record_campaign_id, event_
     if (not isinstance(snapshot, dict) or snapshot.get("artifact_root_id") != current.artifact_root_id
             or ("repository_id" in snapshot and snapshot["repository_id"] != current.repository_id)):
         raise CampaignError("campaign-event-invalid", {"path": str(event_path), "detail": "rename-binding-mismatch"})
+    if (recorded == str(Path(root).resolve())
+            and payload.get("contract") == CONTRACT
+            and snapshot.get("repository_id") == current.repository_id):
+        # New v2 snapshots bind both stable IDs in their authenticated body.
+        # At the original path no manifest fallback is needed to prove them,
+        # including byte-preserved formatted legacy seals.
+        return None
     rows = snapshot.get("cycles")
     if not isinstance(rows, list) or not rows:
         raise CampaignError("campaign-event-invalid", {"path": str(event_path), "detail": "rename-evidence-missing"})
-    evidence = _rename_evidence_map(Path(root).resolve(), campaign_dir, reads=reads)
+    required = {(row.get("cycle_id"), row.get("manifest_id"), row.get("manifest_revision_id"))
+                for row in rows if isinstance(row, dict)
+                and identity.is_well_formed(row.get("cycle_id"), "cycle")
+                and identity.is_well_formed(row.get("manifest_id"), "manifest")
+                and identity.is_well_formed(row.get("manifest_revision_id"), "manifest_revision")}
+    evidence = _rename_evidence_map(Path(root).resolve(), campaign_dir, required, reads=reads)
     bound_manifests = 0
     for row in rows:
         if not isinstance(row, dict):
@@ -806,7 +804,8 @@ def _snapshot(root, path, reads=None):
             or not identity.is_well_formed(campaign.get("campaign_id"), "campaign")):
         raise CampaignError("campaign-criterion-missing")
     root_id, rows = _cycle_rows(root, path, campaign, reads=reads)
-    return {"artifact_root_id": root_id.artifact_root_id, "root": str(root),
+    return {"artifact_root_id": root_id.artifact_root_id, "repository_id": root_id.repository_id,
+            "root": str(root),
             "campaign": campaign, "cycles": rows}
 
 
