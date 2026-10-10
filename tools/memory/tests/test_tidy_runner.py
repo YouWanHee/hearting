@@ -880,6 +880,29 @@ class WorkerFolderTest(RunnerCase):
             runner.artifact_root_for(str(self.iso.root / "no-such-folder"))
         self.assertIn("no artifact root for the worker's files", str(caught.exception))
 
+    def test_artifact_resolution_timeout_preserves_unread_memory_and_warns_once(self):
+        with self.iso.patched_environ(self.env()):
+            seat = st.resolve_seat("claude", str(self.cwd), os.environ)
+            st.write_card(seat, "claude", "sid-A", "진행 중인 일: 시간 초과 시험")
+            item = {"schema": runner.SCHEMA, "id": runner.new_id(), "created": runner._now(),
+                    "status": "queued", "updated": runner._now(), "seat": seat.as_dict(),
+                    "harness": "claude", "sid": "sid-A", "cwd": str(self.cwd), "transcript": "", "attempts": 0}
+            runner.write_item(item)
+            bundle = mock.Mock(empty=False, cursors=[], unread=[], related=[], exchange=None)
+            failure = runner.RunnerFailure("no artifact root for the worker's files: TimeoutExpired")
+            with mock.patch.object(runner, "assemble", return_value=bundle), \
+                 mock.patch.object(runner, "artifact_root_for", side_effect=failure), \
+                 mock.patch.object(runner, "dispatch_worker") as dispatch, \
+                 mock.patch.object(runner, "advance_watermarks") as advance:
+                runner.process_item(item)
+            self.assertEqual(self.item(item["id"])["status"], "failed")
+            dispatch.assert_not_called()
+            advance.assert_not_called()
+            self.assertIsNone(self.watermark("sid-A"))
+            self.assertEqual(st.read_latest_card(seat)["body"], "진행 중인 일: 시간 초과 시험")
+            self.assertEqual(len(self.notices()), 1)
+            self.assertIn("TimeoutExpired", self.notices()[0])
+
     def test_a_symlinked_folder_is_refused(self):
         self.transcript("sid-A", [claude_row("user", "무언가 결정했다")])
         elsewhere = self.iso.root / "elsewhere"

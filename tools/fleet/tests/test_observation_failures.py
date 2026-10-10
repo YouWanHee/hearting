@@ -97,7 +97,7 @@ class JobFailures(unittest.TestCase):
                 text = "\n".join(render._plain(line) for line in render._build_lines(
                     failed.sessions, failed.jobs, "both", False, 0,
                     observations=failed.observations, governor=None))
-                self.assertIn("작업 목록 미확인", text)
+                self.assertIn("jobs.log 미확인", text)
                 self.assertNotIn("no active", text)
                 self.assertNotIn("0 jobs", text)
 
@@ -129,7 +129,7 @@ class JobFailures(unittest.TestCase):
             lines = render._build_lines(failed.sessions, failed.jobs, "both", False, 0,
                                         observations=failed.observations, governor=None)
         text = "\n".join(render._plain(line) for line in lines)
-        self.assertIn("작업 미확인", text)
+        self.assertIn("jobs.log 미확인", text)
         self.assertIn("audit-owner", text)
         self.assertEqual(recovered.jobs, [])
         self.assertEqual(recovered.observations["jobs"]["state"], "idle")

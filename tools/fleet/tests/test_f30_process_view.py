@@ -247,8 +247,8 @@ class RenderContentTest(ProcessViewEnv):
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
         self.assertNotIn("rt-9fa0fed8", text)
-        self.assertIn("단계", text)
-        self.assertIn("1/4 단계", text)
+        self.assertIn("stages", text)
+        self.assertIn("1/4 stages", text)
 
     def test_t3_3_parallel_nodes_render_as_indented_siblings(self):
         jobs = self._lab_route_jobs()
@@ -293,9 +293,9 @@ class RenderContentTest(ProcessViewEnv):
                                     layout="wide", term_width=168)
         text = _joined(lines)
         self.assertIn("✕", text)
-        self.assertIn("⚠ 실패 단계", text)
+        self.assertIn("⚠ stage 실패", text)
         # auto-expanded — the DAG line (not just the 1-line header) must be present
-        self.assertIn("준비", text)
+        self.assertIn("setup", text)
 
     def test_exact_reconcile_needed_uses_gate_pending_not_failed(self):
         jobs = self._lab_route_jobs(sep_liveness="stale")
@@ -316,7 +316,7 @@ class RenderContentTest(ProcessViewEnv):
         text = _joined(build_observed_lines([], jobs, section="both", narrow=False,
                                             malformed=0, layout="wide", term_width=168))
         self.assertIn("…종료 확인", text)
-        self.assertNotIn("⚠ 실패 단계", text)
+        self.assertNotIn("⚠ stage 실패", text)
 
     def test_t3_5_all_done_route_defaults_to_one_line_fold(self):
         # code-test verification.md §10 — a job whose registry row is already `done` NEVER
@@ -336,7 +336,7 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("4/4 단계", text)
+        self.assertIn("4/4 stages", text)
         self.assertNotIn("plan ✓", text)   # L2 line never emitted — folded to 1 line
         self.assertIn("▸", text)           # collapsed glyph, never the word "folded"/"hidden"
         self.assertNotIn("folded", text)
@@ -352,7 +352,7 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("작업 연결 미확인", text)
+        self.assertIn("route 연결 미확인", text)
         self.assertIn("no-record-job", text)
 
     def test_conductor_not_duplicated_as_degrade_card_when_route_child_is_terminal(self):
@@ -378,7 +378,7 @@ class RenderContentTest(ProcessViewEnv):
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
         self.assertNotIn("rt-9fa0fed8", text)
-        self.assertIn("단계", text)          # the real record card IS present
+        self.assertIn("stages", text)          # the real record card IS present
         self.assertNotIn("no route record", text)   # the conductor must NOT re-appear as degrade
         self.assertEqual(text.count("v10-conductor"), 1)  # work name on one real card
 
@@ -413,7 +413,7 @@ class RenderContentTest(ProcessViewEnv):
         toggled = _joined(build_observed_lines([], [conductor, child], section="both",
                                               narrow=False, malformed=0, layout="wide",
                                               term_width=168))
-        self.assertIn("완료 확인: 계획", toggled)
+        self.assertIn("완료 확인: code-plan", toggled)
 
     def test_t3_13_no_overflow_at_60_120_168(self):
         jobs = self._lab_route_jobs()
@@ -538,7 +538,7 @@ class MutationCoverageGapTest(ProcessViewEnv):
         self.assertIn(render._ELAPSED_GLYPH + "15m", text)
         # The v10 critic's real worry survives the glyph: the value must stay visibly
         # detached from "n/m nodes" rather than reading as a number glued onto it.
-        self.assertIn("단계  ", text)
+        self.assertIn("stages  ", text)
 
     def test_demo_seeds_lab_setup_node_as_done(self):
         # M4 — demo._seed_route_evidence() must seed _LAB_RID's `setup` node (not just

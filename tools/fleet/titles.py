@@ -31,21 +31,21 @@ _FRESH_SEC = 24 * 3600
 _FRESH_SUMMARY_SEC = _FRESH_SEC
 _STALE_SWEEP_SEC = 7 * 24 * 3600
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-CURRENT_TEXT_SEC = 15 * 60
 _TITLE_TIME_UNSET = object()
 
 
-def current_text(entity, timestamp, now=None):
-    """Generated prose is current only alongside fresh observed activity."""
+def previous_title(entity, timestamp, now=None):
+    """A subject is previous only when its successful event time proves it."""
     now = time.time() if now is None else now
     if (not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool)
-            or not math.isfinite(timestamp) or not 0 <= now - timestamp <= CURRENT_TEXT_SEC):
+            or not math.isfinite(timestamp) or not 0 <= timestamp <= now):
         return False
-    if getattr(entity, "liveness", None) != "working":
-        return False
+    if now - timestamp > _FRESH_SEC:
+        return True
     current = (getattr(entity, "route_chain", None) or {}).get("current") or {}
     boundary = current.get("ts")
-    return not (isinstance(boundary, (int, float)) and timestamp < boundary)
+    return (isinstance(boundary, (int, float)) and not isinstance(boundary, bool)
+            and math.isfinite(boundary) and timestamp < boundary <= now)
 
 
 def annotate(entities):
