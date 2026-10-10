@@ -126,6 +126,63 @@ class CurrentSessionTest(unittest.TestCase):
         self.assertEqual(s.session_id, "current")
         self.assertEqual(s.ctx_pct, 17)
 
+    def test_folded_seat_history_retains_direction_into_explicit_clear(self):
+        process_identity._record()
+        import session_tidy
+        rows = [{"harness": "claude", "sid": "old", "event": "summary", "cwd": self.cwd, "ts": 1},
+                {"harness": "claude", "sid": "other-project", "event": "summary", "cwd": "/proj/z", "ts": 1},
+                {"harness": "claude", "sid": "current", "event": "start", "source": "clear", "cwd": self.cwd, "ts": 2}]
+        summary = {("claude", r["sid"]): r for r in rows}
+        with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
+                mock.patch.object(session_tidy, "session_summary", return_value=summary), \
+                mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
+            edges = process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
+                                                           claims={"old", "current", "other-project"})
+        self.assertEqual(edges, {"old": {"current"}})
+        sid, _ = process_identity.resolve_session_claims({"registry": "current", "pane": "old"}, edges)
+        self.assertEqual(sid, "current")
+        rows[-1]["source"] = "fork"
+        with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
+                mock.patch.object(session_tidy, "session_summary", return_value=summary), \
+                mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
+            self.assertEqual(process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
+                                                                      claims={"old", "current"}), {})
+        rows[-1]["source"] = "clear"
+        for last_seen in (3, None):
+            rows[0]["ts"] = last_seen
+            with mock.patch.object(session_tidy, "_read_ledger_lines", return_value=rows), \
+                    mock.patch.object(session_tidy, "session_summary", return_value=summary), \
+                    mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
+                self.assertEqual(process_identity.pane_session_successors("claude", "wB:p3N", self.cwd,
+                                                                          claims={"old", "current"}), {})
+
+    def test_repeated_native_ledger_folding_preserves_clear_identity(self):
+        process_identity._record()
+        import session_tidy
+        rows = [{"harness": "claude", "sid": "old", "event": "start", "source": "startup",
+                 "cwd": self.cwd, "ts": 1},
+                {"harness": "claude", "sid": "current", "event": "start", "source": "clear",
+                 "cwd": self.cwd, "ts": 2},
+                {"harness": "claude", "sid": "current", "event": "prompt", "cwd": self.cwd, "ts": 3}]
+        seat = session_tidy._pane_seat_of("wB:p3N")
+        def save(_path, body):
+            rows[:] = [json.loads(line) for line in body.decode().splitlines()]
+        with mock.patch.object(session_tidy, "_read_ledger_lines", side_effect=lambda _seat: rows[:]), \
+                mock.patch.object(session_tidy, "atomic_write", side_effect=save), \
+                mock.patch.object(session_tidy, "LEDGER_FOLD_LINES", 1), \
+                mock.patch.object(session_tidy, "LEDGER_KEEP_RAW", 1), \
+                mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
+            session_tidy._fold_ledger(seat)
+            rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "compact",
+                          "cwd": self.cwd, "ts": 4},
+                         {"harness": "claude", "sid": "current", "event": "prompt", "cwd": self.cwd, "ts": 5}])
+            session_tidy._fold_ledger(seat)
+            current = next(row for row in rows if row["sid"] == "current" and row["event"] == "summary")
+            self.assertEqual((current["start_source"], current["start_at"]), ("clear", 2))
+            edges = process_identity.pane_session_successors("claude", "wB:p3N", self.cwd)
+        sid, _ = process_identity.resolve_session_claims({"registry": "old", "pane": "current"}, edges)
+        self.assertEqual(sid, "current")
+
     def _enrich_pane_observation(self, *, bound, complete):
         class Observation(tuple):
             pass

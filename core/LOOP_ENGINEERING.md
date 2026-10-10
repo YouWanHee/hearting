@@ -207,6 +207,7 @@ Services produce no session row. Current session identity joins live PID/start,
 the pane selection and recorded conversation continuity once; title, state and
 context consume that same result. Conflicting identities and absent work bindings
 stay unknown rather than borrowing a neighboring transcript or artifact directory.
+Routine ledger folding preserves the recorded native transition direction.
 
 ## Basis and current scope
 

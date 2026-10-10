@@ -23,6 +23,7 @@ Import contract: like `route_chain`, importable with only `tools` on sys.path;
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 import sys
 
@@ -108,7 +109,7 @@ def pane_process_claims(sessions, panes, bindings, *, complete=True):
     return out
 
 
-def pane_session_successors(harness, pane, cwd):
+def pane_session_successors(harness, pane, cwd, *, claims=None):
     """Directed native clear transitions from the existing seat ledger.
 
     Display aliases are bidirectional and cannot supply these edges. Only a
@@ -122,14 +123,39 @@ def pane_session_successors(harness, pane, cwd):
         return {}
     seat = session_tidy._pane_seat_of(pane)
     summary = session_tidy.session_summary(seat)
-    starts = [row for row in session_tidy._read_ledger_lines(seat)
-              if row.get("event") == "start" and row.get("harness") == harness and row.get("sid")]
+    rows = [row for row in session_tidy._read_ledger_lines(seat)
+            if row.get("harness") == harness and row.get("sid")]
+    def timestamp(value):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and math.isfinite(value) and value > 0 else None
+
+    starts = [dict(row, source=row.get("source") if row.get("event") == "start"
+                   else row["start_source"], start_at=row.get("ts") if row.get("event") == "start"
+                   else row.get("start_at")) for row in rows
+              if row.get("event") == "start" or row.get("event") == "summary" and row.get("start_source")]
+    starts = sorted((row for row in starts if timestamp(row.get("start_at")) is not None),
+                    key=lambda row: row["start_at"])
     edges = {}
+    def same_repository(row):
+        return resolve_gitdir((summary.get((harness, row["sid"])) or {}).get("cwd"))[1] == repository
+
     for older, newer in zip(starts, starts[1:]):
-        same_repo = all(resolve_gitdir((summary.get((harness, row["sid"])) or {}).get("cwd"))[1]
-                        == repository for row in (older, newer))
-        if same_repo and newer.get("source") == "clear" and older["sid"] != newer["sid"]:
+        same_repo = all(same_repository(row) for row in (older, newer))
+        if (same_repo and newer.get("source") == "clear" and older["sid"] != newer["sid"]
+                and older["start_at"] < newer["start_at"]):
             edges.setdefault(older["sid"], set()).add(newer["sid"])
+    # Older folds kept the seat's ordered session history but dropped START
+    # sources. A later explicit clear closes those historical claims on this
+    # same seat/repository; neither a startup/fork nor a display alias does so.
+    folded = [row for row in rows if row.get("event") == "summary" and not row.get("start_source")
+              and claims is not None and row["sid"] in claims]
+    for row in starts:
+        if row.get("source") == "clear" and same_repository(row):
+            for older in folded:
+                last_seen = timestamp(older.get("ts"))
+                if (older["sid"] != row["sid"] and same_repository(older)
+                        and last_seen is not None and last_seen < row["start_at"]):
+                    edges.setdefault(older["sid"], set()).add(row["sid"])
     return edges
 
 

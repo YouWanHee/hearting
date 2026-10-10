@@ -567,7 +567,8 @@ def _current_identity(sess, home, record, pane_claim=None):
     if pane_sid and pane:
         from ..process_identity import pane_session_successors
         try:
-            for older, newer in pane_session_successors("claude", pane, sess.cwd).items():
+            for older, newer in pane_session_successors("claude", pane, sess.cwd,
+                                                        claims=set(claims.values())).items():
                 successors.setdefault(older, set()).update(newer)
         except (OSError, ValueError, TypeError):
             pass
