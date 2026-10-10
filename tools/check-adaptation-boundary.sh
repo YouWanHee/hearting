@@ -836,7 +836,7 @@ check_codex_bin_wrappers() {
     || ! grep -Fq 'render_worker_bootstrap' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'resolve_worker_type' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq -- '--worker-type' adapters/codex/bin/dispatch-headless.py \
-    || ! grep -Fq 'End with the kernel' adapters/codex/bin/dispatch-headless.py \
+    || ! grep -Fq 'ending = worker_ending_prompt(' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'prompt_path.write_text(prompt_text, encoding="utf-8")' adapters/codex/bin/dispatch-headless.py \
     || ! grep -Fq 'fcntl.flock' utilities/dispatch_wrapper_common.py \
     || ! grep -Fq 'jobs_lock = WRAPPER_COMMON.jobs_lock' adapters/codex/bin/dispatch-headless.py \

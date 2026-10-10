@@ -411,6 +411,87 @@ class OwnerGatePromptTest(unittest.TestCase):
                 self.assertIn("assignment_prompt(args, task, os.environ)", source)
 
 
+class WorkerEndingPromptTest(unittest.TestCase):
+    TERMINAL = (
+        "For the terminal final response, end with the kernel's exact three-line "
+        "handoff as the entire message — no summary sentence before it, nothing after it.\n"
+    )
+    WAIT = (
+        "End an intermediate child-registration or resource-wait turn only with the "
+        "standalone line `runtime_wait: registered-children`, without a three-line handoff. "
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.adapters = {}
+        for harness in ("claude", "codex", "opencode"):
+            path = ROOT / "adapters" / harness / "bin" / "dispatch-headless.py"
+            spec = importlib.util.spec_from_file_location(f"ending_{harness}_dispatch", path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            cls.adapters[harness] = module
+
+    def render(self, harness, *, intensity="standard", worker_type="owner", supervised=True):
+        module = self.adapters[harness]
+        args = module.parser().parse_args([
+            "--worktree", str(ROOT), "--slug", "ending-fixture",
+            "--capability", "autopilot-lab", "--capability-mode", "eval",
+            "--qa", "standard", "--intensity", intensity,
+            "--worker-type", worker_type,
+            "--dispatch-depth", "1" if worker_type == "owner" else "2",
+            "--prompt-text", "Run the assigned evaluation.",
+        ])
+        args.attempt_id = "att-ending-fixture"
+        args.artifact_root = "/fixture/.agent_reports"
+        args.resolved_completion_delivery = (
+            "app-server-supervised" if harness == "codex" else "session-resume-supervised"
+        ) if supervised else "poll-fallback"
+        args.owner_route_binding = (
+            SimpleNamespace(route_file=None)
+            if supervised and worker_type == "owner" and intensity != "quick" else None
+        )
+        with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT)}, clear=True):
+            renderer = module.prompt if harness == "opencode" else module.dispatch_prompt
+            return renderer(args)[0]
+
+    def test_all_supervised_owners_receive_the_same_wait_and_terminal_rules(self):
+        for intensity in ("quick", "standard", "strong", "thorough", "adversarial"):
+            for harness in self.adapters:
+                with self.subTest(harness=harness, intensity=intensity):
+                    prompt = self.render(harness, intensity=intensity)
+                    self.assertTrue(prompt.endswith(self.WAIT + self.TERMINAL))
+                    self.assertEqual(prompt.count(self.WAIT), 1)
+                    self.assertIn("The three-line handoff applies only to the terminal final response", prompt)
+
+    def test_polling_owners_keep_the_terminal_ending(self):
+        for harness in self.adapters:
+            with self.subTest(harness=harness):
+                prompt = self.render(harness, supervised=False)
+                self.assertTrue(prompt.endswith(self.TERMINAL))
+                self.assertNotIn(self.WAIT, prompt)
+                # The full bootstrap must keep the wait directive conditional,
+                # even when the adapter's trailing ending is correctly gated.
+                compact = " ".join(prompt.split())
+                self.assertIn(
+                    "For a supervised owner, end a child-registration or resource-wait turn with only",
+                    compact,
+                )
+                self.assertIn("polling fallback waits synchronously in the current turn.", compact)
+                if harness == "claude":
+                    self.assertIn("poll synchronously with utilities/dispatch-wait.sh in the current turn", compact)
+                elif harness == "codex":
+                    self.assertIn("after a child is registered, run only utilities/dispatch-wait.sh", compact)
+
+    def test_stage_and_review_workers_keep_the_terminal_ending(self):
+        for worker_type in ("stage", "review"):
+            for harness in self.adapters:
+                with self.subTest(harness=harness, worker_type=worker_type):
+                    prompt = self.render(harness, worker_type=worker_type)
+                    self.assertTrue(prompt.endswith(self.TERMINAL))
+                    self.assertNotIn(self.WAIT, prompt)
+
+
 class OwnerInlineMarkerPromptTest(OPA.OwnerRefineBase):
     """The owner is told to finish its stage first and how to publish a stage it ran itself (D2, round 1).
 

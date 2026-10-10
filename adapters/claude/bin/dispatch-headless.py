@@ -142,7 +142,7 @@ from owner_route_binding import (  # noqa: E402
 )
 from worker_bootstrap import (
     ARTIFACT_PRODUCER_CYCLE_ENV, artifact_cycle_environment, artifact_context_prompt, released_task_prompt, assignment_prompt, contract_read_prompt, unit_bootstrap_prompt,
-    supervised_owner_prompt,  # noqa: E402
+    supervised_owner_prompt, worker_ending_prompt,  # noqa: E402
     assigned_contract,
     profile_worker_type,
     render_worker_bootstrap,
@@ -589,16 +589,8 @@ def dispatch_prompt(
             "synchronously with utilities/dispatch-wait.sh in the current turn until terminal, "
             "then harvest. This fallback is not runtime completion parity (OPERATIONS.md §5.10).\n\n"
         )
-    # "nothing after it" alone reads as permission to put a summary sentence
-    # *before* the block, and that is how two 2026-07-28 pipelines lost their
-    # terminal envelope with correct artifacts already on disk. State both ends.
-    ending = (
-        "End a child-registration turn only with `runtime_wait: registered-children`. "
-        "When the full route is complete, end with the kernel's exact three-line handoff "
-        "as the entire final message — no summary sentence before it, nothing after it.\n"
-        if supervised and owner_standard_plus
-        else "End with the kernel's exact three-line handoff as the entire final message — "
-        "no summary sentence before it, nothing after it.\n"
+    ending = worker_ending_prompt(
+        supervised_owner=supervised and args.worker_type == "owner",
     )
     return (
         f"{sync_wait_clause}"
