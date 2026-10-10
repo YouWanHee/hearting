@@ -2778,8 +2778,8 @@ def _opts_segs(j, max_width=None):
         # Keep internal mode/profile/shape contracts in the existing all/JSON
         # detail surfaces. The normal row says what the worker is doing.
         action = _user_label(_entry_skill(j) or getattr(j, "key", None))
-        owner = _is_owner_mode_row(j) and action != "담당"
-        suffix = " 담당" if owner else ""
+        owner = _is_owner_mode_row(j) and action != "owner"
+        suffix = " owner" if owner else ""
         if max_width is not None:
             action = _clip_w(action, max(1, max_width - _dw(suffix)))
             if _dw(action + suffix) > max_width:

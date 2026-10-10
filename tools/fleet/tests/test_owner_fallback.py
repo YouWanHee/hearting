@@ -143,7 +143,7 @@ class OwnerFallbackTest(unittest.TestCase):
         self.assertNotIn("CX/", group)
 
         process = self._render([parent], [stage], process=True)
-        for node in ("계획", "구현", "검증"):
+        for node in ("plan", "execute", "test"):
             self.assertIn(node, process)
         self.assertNotIn("orphaned dispatch rows", process)
 
