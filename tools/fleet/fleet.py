@@ -103,7 +103,8 @@ def _collect_memory():
 
 
 def _snapshot_json(sessions, jobs, resource_jobs=None, usage=None, disabled=None, show_all=False,
-                   hearting=None, compute_host_snapshot=None, observations=None):
+                   hearting=None, compute_host_snapshot=None, observations=None,
+                   resource_diagnostics=None):
     resource_jobs = list(resource_jobs or [])
     visible_resources = resource_jobs if show_all else [
         row for row in resource_jobs if row.liveness == "working"
@@ -115,6 +116,7 @@ def _snapshot_json(sessions, jobs, resource_jobs=None, usage=None, disabled=None
         "sessions": [s.to_dict() for s in sessions],
         "jobs": [j.to_dict() for j in jobs],
         "resource_jobs": [j.to_dict() for j in visible_resources],
+        "resource_diagnostics": list(resource_diagnostics or []),
         "summary": {
             "session_count": len(sessions),
             "by_harness": counts,
@@ -280,14 +282,13 @@ def main(argv=None):
                                             **fast_kw))
         projected_collector.last_resource_jobs = list(
             observed.resources)
-        projected_collector.last_resource_malformed = getattr(
-            collect_all, "last_resource_malformed", 0)
+        projected_collector.last_resource_diagnostics = list(observed.resource_diagnostics)
         projected_collector.last_usage_snapshots = dict(
             observed.usage_snapshots)
         return observed
 
     projected_collector.last_resource_jobs = []
-    projected_collector.last_resource_malformed = 0
+    projected_collector.last_resource_diagnostics = []
     projected_collector.last_usage_snapshots = {}
 
     if args.json:
@@ -309,7 +310,8 @@ def main(argv=None):
                              disabled=disabled,
                              show_all=args.show_all,
                              hearting=hearting,
-                             compute_host_snapshot=compute_host_snapshot))
+                             compute_host_snapshot=compute_host_snapshot,
+                             resource_diagnostics=observed.resource_diagnostics))
         return 0
 
     # curses / --once path (render module) — resolved lazily so --json needs no curses.
@@ -352,15 +354,14 @@ def main(argv=None):
         sessions, jobs = observed
         live_collector.last_resource_jobs = list(
             getattr(base_collector, "last_resource_jobs", []))
-        live_collector.last_resource_malformed = getattr(
-            base_collector, "last_resource_malformed", 0)
+        live_collector.last_resource_diagnostics = list(observed.resource_diagnostics)
         live_collector.last_usage_snapshots = dict(
             getattr(base_collector, "last_usage_snapshots", {}))
         previous_sessions = list(sessions)
         return observed
 
     live_collector.last_resource_jobs = []
-    live_collector.last_resource_malformed = 0
+    live_collector.last_resource_diagnostics = []
     live_collector.last_usage_snapshots = {}
     # Live-only metadata refresh. render's snapshot pump invokes this off the curses
     # thread; --once/--json never opt into remote release discovery.

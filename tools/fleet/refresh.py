@@ -44,6 +44,7 @@ class LiveSnapshot:
     resources: list = field(default_factory=list)
     usage_snapshots: dict = field(default_factory=dict)
     malformed: int = 0
+    resource_diagnostics: list = field(default_factory=list)
     node_evidence: dict = field(default_factory=dict)
     degradations: dict = field(default_factory=dict)
     route_entities: list = field(default_factory=list)

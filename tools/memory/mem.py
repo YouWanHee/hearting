@@ -4509,7 +4509,8 @@ def delete_record(rid, quiet=False, force=False):
         _graveyard_flush((graveyard_line,))
         if not quiet:
             print(f"[delete] {rid}")
-        _append_write_event("delete", rid, tier=row[2], scope=row[3], rtype=row[4])
+        _append_write_event("delete", rid, tier=row[2], scope=row[3], rtype=row[4],
+                            snippet=prior.get("body") or prior.get("headline"))
         return True
     finally:
         con.close()
