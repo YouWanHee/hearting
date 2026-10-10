@@ -40,6 +40,7 @@ class ReadingTest(unittest.TestCase):
         owner = DispatchJob(key="lab", cwd="/work/TF-Rehancer", slug="resume-training", pid=2,
                             proc_start="22", harness="codex", worker_type="owner", parent_sid="sid")
         parent = Session(harness="claude", pid=1, cwd=owner.cwd, session_id="sid", session_tag="4d")
+        owner._parent_edge_sid = "sid"
         view = dict(key="route", route_id="rt-53b700ec81f04dc7", capability="autopilot-lab",
                     capability_mode="setup", effective_intensity="standard", nodes=[
                         dict(id="resume-run", state="active", level=0, job=owner, unit="_kernel/resource")])
@@ -48,6 +49,61 @@ class ReadingTest(unittest.TestCase):
         for token in ("TF-Rehancer", "resume-training", "[4d]"):
             self.assertIn(token, header)
         self.assertNotIn("rt-53b", header)
+
+    def test_r5_worktree_uses_shared_project_identity(self):
+        from fleet.display import project
+        for cwd in (str(ROOT), "/work/hearting-wt/a-reading-fix"):
+            self.assertEqual(project(cwd), model.project_of(cwd))
+        self.assertEqual(project("/work/hearting-wt/a-reading-fix"), "hearting")
+
+    def test_r5_rejected_parent_is_not_restored_in_header(self):
+        for harness, state in (("claude", "working"), ("codex", "dead")):
+            model.reset_parent_edge_tracker()
+            parent = Session(harness=harness, pid=1, proc_start="1", cwd="/work/a",
+                             session_id="same", session_tag="4d", liveness=state)
+            owner = DispatchJob(key="lab", cwd=parent.cwd, slug="training", pid=2,
+                                proc_start="2", harness="codex", worker_type="owner",
+                                parent_sid="same", is_child=True)
+            owner._registry_metadata = dict(parent_sid="same", parent_harness="codex")
+            owner._registry_path = "/fixture/jobs.log"
+            collectors.resolve_parent_edges([parent], [owner])
+            self.assertIsNone(owner._parent_edge_sid)
+            view = dict(key="route", capability="lab", nodes=[dict(id="train", state="active", level=0, job=owner)])
+            header = render._plain(render._route_card(view, {(1, "1"): parent}, 100, 0, display_owner=owner)[0][0])
+            self.assertNotIn("[4d]", header)
+
+    def test_r7_header_retains_elapsed_and_folded_failure(self):
+        view = dict(key="route", cwd="/work/a", slug="학습", capability="lab",
+                    nodes=[dict(id="train", state="active", level=0, elapsed_min=120)])
+        header = render._plain(render._route_card(view, {}, 168, 0)[0][0])
+        self.assertIn("2h 00m", header)
+        view["slug"] = "긴 실험 제목" * 30
+        view["nodes"][0]["state"] = "failed"
+        with mock.patch.object(render, "_ROUTE_FOLD", {"route": True}):
+            for width in (80, 100, 168):
+                header = render._plain(render._route_card(view, {}, width, 0)[0][0])
+                self.assertIn("실패 단계", header)
+                self.assertLessEqual(render._dw(header), width)
+
+    def test_r7_tinted_now_matches_actual_draw(self):
+        class Screen:
+            def __init__(self):
+                self.calls = []
+            def addstr(self, row, col, text, attr):
+                self.calls.append((col, text))
+        session = Session(harness="codex", pid=1, cwd="/work/a", session_id="s", ctx_pct=74,
+                          liveness="working", summary="현재 실행 결과를 확인하며 사용자 승인 필요")
+        with mock.patch.object(render, "_TINT_OK", True), mock.patch.object(render, "_key_attr", return_value=0):
+            for width in (80, 100):
+                lines = render._build_lines([session], [], "both", False, 0, term_width=width)
+                row = next(x for x in lines if x and any(k == "now_main" for _t, k in x))
+                plain = render._plain(row)
+                screen = Screen()
+                render._addline(screen, 0, row, width)
+                drawn = "".join(text for _col, text in screen.calls).strip()
+                self.assertEqual(drawn, plain.strip())
+                self.assertTrue("승인 필요" in drawn or drawn.endswith("…"))
+                self.assertLessEqual(max(col + render._dw(text) for col, text in screen.calls), width)
 
     def test_r5_human_input_uses_korean(self):
         self.assertEqual(render._INTERACTION_LABEL["decision"], "답변 필요")

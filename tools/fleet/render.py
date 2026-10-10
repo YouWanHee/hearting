@@ -4960,8 +4960,11 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     if main_detail and not degrade:
         # MAIN, OWNER and FRAME gauges share the fixed model-column anchor;
         # the WHERE word sits at the shared detail inset, without moving NOW.
-        segs = _pad_to_column(segs, 4 + _HW)
-    segs.append(("문맥 ", "dim"))
+        segs = _pad_to_column(segs, 4 + _HW - _dw("문맥 "))
+    # Use the existing main-row padding so naming context does not move its
+    # measured track or NOW anchor. At very small widths the legend names it.
+    if not degrade and sum(_dw(t) for t, _k in segs) + 5 + track + _CONTEXT_VALUE_W <= (term_width or _SUMMARY_FALLBACK_W):
+        segs.append(("문맥 ", "dim"))
     segs.extend(_gauge_segs(shown_pct, gauge_width, track=track))
     if shown_pct is None:
         value_text = "—"
@@ -4972,8 +4975,6 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     if now_text or exec_segs:
         prefix_width = sum(_dw(text) for text, _key in segs)
         gap = max(_CONTEXT_NOW_GAP, _NAME_COL - prefix_width)
-        if term_width and term_width <= 100:
-            gap = _CONTEXT_NOW_GAP
         total_width = term_width or _SUMMARY_FALLBACK_W
         now_room = max(0, total_width - prefix_width - gap)
         tail = []
@@ -6246,12 +6247,18 @@ def _route_card_l1(tag_bits, rid, done, total, route_elapsed, any_failed, arrow,
     variants = [(ladder[0], True, True)]
     for tags in ladder[1:]:
         variants.append((tags, True, True))
-    variants.append((ladder[-1], False, False))
+    variants.append((ladder[-1], False, True))
     for tags, show_elapsed, show_failed in variants:
         segs = build(tags, show_elapsed, show_failed)
         if term_width is None or sum(_dw(t) for t, _k in segs) <= term_width:
             return segs
-    return build(ladder[-1], False, False)
+    # Failure is actionable even on a folded route. Reserve its suffix before
+    # reducing the work name; elapsed is optional only when it does not fit.
+    fixed = build(ladder[-1], False, True)
+    fixed_w = sum(_dw(t) for t, _k in fixed) - _dw(rid)
+    room = max(1, (term_width or fixed_w + _dw(rid)) - fixed_w)
+    fixed[2] = (_clip_w(rid, room), fixed[2][1])
+    return fixed
 
 
 def _session_for_job(session_by_identity, job):
@@ -6318,20 +6325,18 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
     cwd = getattr(work, "cwd", None) or view.get("cwd")
     title = (getattr(work, "title", None) or getattr(work, "parent_slug", None) or getattr(work, "slug", None)
              or view.get("slug") or "작업 이름 미확인")
-    parents = [s for s in session_by_identity.values() if work is not None
-               and (getattr(work, "_parent_edge_sid", None) or getattr(work, "parent_sid", None))
-               in [s.session_id, *(getattr(s, "session_aliases", None) or [])]]
-    parent = parents[0] if len(parents) == 1 else _session_for_job(session_by_identity, work)
+    # The collector owns parent identity. In particular, a rejected edge must
+    # never be reconstructed from the registered SID in the renderer.
+    edge_sid = getattr(work, "_parent_edge_sid", None)
+    parents = [s for s in session_by_identity.values() if edge_sid
+               and edge_sid == s.session_id and session_parent_visible(s)
+               and not getattr(s, "is_child", False)]
+    parent = parents[0] if len(parents) == 1 else None
     fleet = getattr(parent, "session_tag", None)
     identity = _user_project(cwd) + (" [%s]" % fleet if fleet else "")
     # The internal route ID remains in JSON; the fold header names the actual
     # project/work and responsible Fleet session before optional timing.
     l1 = _route_card_l1([identity], str(title), done, total, route_elapsed, any_failed, arrow, term_width)
-    if term_width:
-        fixed = _dw("  " + arrow + " [" + identity + "]  — %d/%d 단계" % (done, total))
-        room = max(1, term_width - fixed - 1)
-        l1 = _route_card_l1([identity], _clip_w(str(title), room), done, total,
-                            None, any_failed, arrow, term_width)
 
     out = [l1]
     if folded:
@@ -7144,8 +7149,12 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     """One cell budget for plain output and curses, preserving row/map indexes."""
     if term_width and layout == "wide" and term_width < _TWO_LINE_CUTOFF:
         layout = "stack" if term_width < _NARROW_CUTOFF else "narrow"
+    # Producers clip NOW and names with an ellipsis before the final guard.
+    # A tinted panel adds four cells when curses draws it; reserve those here.
+    content_width = (max(1, term_width - 1 - (_INSET + _PAD_IN if _TINT_OK else 0))
+                     if term_width else None)
     lines = _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout, memory,
-                                    term_width, live_order, resources, usage_snapshots, governor, loading,
+                                    content_width, live_order, resources, usage_snapshots, governor, loading,
                                     node_evidence=node_evidence, route_entities=route_entities,
                                     observations=observations, resource_diagnostics=resource_diagnostics)
     if term_width is None:
@@ -7156,12 +7165,14 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         if line is None:
             bounded.append(None)
             continue
+        tinted = bool(_TINT_OK and line and _is_fill(line[0][0]) and line[0][0][1] in _TINT_CHARS)
+        row_width = width - (_INSET + _PAD_IN if tinted else 0)
         out, used = [], 0
         for text, key in line:
             if _is_fill(text):
                 out.append((text, key))
                 continue
-            piece = _clip_w(text, max(0, width - used), ellipsis="")
+            piece = _clip_w(text, max(0, row_width - used), ellipsis="")
             if piece:
                 out.append((piece, key))
                 used += _dw(piece)

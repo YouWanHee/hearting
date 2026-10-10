@@ -1,5 +1,5 @@
 """User vocabulary shared by Fleet's group and process views; no state judgments."""
-import os
+from .model import project_of
 
 LABELS = {
     "code": "개발", "autopilot-code": "개발", "lab": "실험", "autopilot-lab": "실험",
@@ -27,4 +27,4 @@ def label(value):
 
 
 def project(cwd):
-    return os.path.basename(str(cwd).rstrip("/")) if cwd else "프로젝트 미확인"
+    return project_of(cwd) if cwd else "프로젝트 미확인"
