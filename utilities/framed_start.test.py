@@ -1262,13 +1262,21 @@ class SelectionPinInheritanceTest(PinnedStartBase):
                 mock.patch.object(RA, "caller_identity", return_value=("claude", "parent")):
             changed = R._change_pins(self.route, self.jobs, ["owner=codex", "worker=codex"])
         self.assertTrue(changed["changed"])
-        result = self.settle()
+        # The frame checked Claude; composing the pinned Codex leg checks its
+        # conductor too. Keep that probe independent of installed CLIs.
+        checked = {"tuples": [T.nested("codex", "codex")],
+                   "candidates": T.registered_headless()["candidates"]}
+        with mock.patch.object(R, "_compose_readiness", return_value=checked) as probe:
+            result = self.settle()
+        self.assertEqual(probe.call_args.args[2], "codex")
         leg = self.first_leg()
+        self.assertIn(checked["tuples"][0], leg["dispatch_evidence"]["tuples"])
         self.assertEqual(leg["selection_pins"]["owner"]["harness"], "codex")
         self.assertEqual(leg["selection_pins"]["worker"]["harness"], "codex")
         self.assertEqual(leg["selection_pins"]["frame"]["harness"], "claude")
         self.assertEqual(leg["work_request"]["owner_harness"], "codex")
         self.assertEqual({n["harness_affinity"] for n in leg["nodes"] if n.get("dispatch_depth") == 2}, {"codex"})
+        self.assertEqual(len(self.leg_calls), 1, result)
         command = self.leg_calls[-1]
         self.assertEqual(command[command.index("--adapter") + 1], "codex", result)
         self.assertEqual(self.path.read_bytes(), before)
