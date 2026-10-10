@@ -104,9 +104,19 @@ class NativeCurrentTest(unittest.TestCase):
                 mock.patch.object(peer, "_read_screen", return_value=["fixture empty box"]), \
                 mock.patch.object(peer, "_screen_ready", return_value=None):
             self.assertIsNone(peer._continue_look("fixture-pane", req))
+            agent["session_id"] = "current"
             self.record["sessionId"] = "other"
             self.write_registry()
             self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
+            with mock.patch.object(peer, "_process_session", return_value=None):
+                self.assertIsNone(peer._continue_look("fixture-pane", req))
+                agent["session_id"] = "previous"
+                self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
+            agent["harness"] = req["harness"] = "codex"
+            agent["session_id"] = "current"
+            with mock.patch.object(peer, "_codex_rollout_exists", return_value=False), \
+                    mock.patch.object(peer, "_codex_footer_threads", return_value={"current"}):
+                self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
             agent["pane"] = "different-pane"
             self.assertEqual(peer._continue_look("fixture-pane", req), "target-changed")
 

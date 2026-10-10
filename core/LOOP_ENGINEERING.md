@@ -222,7 +222,9 @@ context consume that same result. Conflicting identities and absent work binding
 stay unknown rather than borrowing a neighboring transcript or artifact directory.
 An exact live PID/start native current-session record takes precedence over
 historical statusline taps and delayed pane session labels after an in-process
-resume or clear. Historical continuity cannot override an explicit native
+resume or clear. A proven different current session blocks an automated continue
+even when a delayed pane label still matches the booked session.
+Historical continuity cannot override an explicit native
 selection back to an earlier conversation. Without such a current record,
 recorded directed continuity resolves claims; unrelated claims remain unknown.
 File recency and launch arguments never prove a current selection. Project grouping uses the
