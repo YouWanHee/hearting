@@ -1,0 +1,1 @@
+../../../../tools/install/carrier_release_prune.test.py

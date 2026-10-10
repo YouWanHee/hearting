@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
 _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
+_RUNNERS: list[subprocess.Popen] = []
 
 
 class ObligationError(ValueError):
@@ -244,6 +246,44 @@ def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
     return kind + "-" + hashlib.sha256(raw).hexdigest()[:32]
 
 
+def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
+    """Replace only an exact observer whose old code cannot process this duty.
+
+    Accepted work stays in the existing store; the same flock fences its next
+    observer. A pidfd prevents a recycled PID from ever receiving the signal.
+    """
+    if not any(d.get("intent", {}).get("carrier") == "claude-parent-runtime"
+               for d in store.list()):
+        return False
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
+    state_root = str(store.root.parents[1])
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        pidfd = None
+        try:
+            pidfd = os.pidfd_open(int(proc.name))
+            argv = (proc / "cmdline").read_bytes().decode().rstrip("\0").split("\0")
+            if (len(argv) < 3 or Path(argv[1]).name != "peer-steward.py"
+                    or argv[2] != "__obligation-runner"
+                    or argv[argv.index("--state-root") + 1] != state_root):
+                continue
+            lock_fd = argv[argv.index("--lock-fd") + 1]
+            if (proc / "fd" / lock_fd).resolve() != lock_path.resolve():
+                continue
+            if "def _resume_registered_obligation(" in Path(argv[1]).read_text():
+                continue
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            return True
+        except (OSError, ValueError, IndexError, UnicodeError):
+            continue
+        finally:
+            if pidfd is not None:
+                os.close(pidfd)
+    return False
+
+
 def ensure_runner(root: str | Path | None = None) -> bool:
     """Start the existing peer-steward task runner once for actual open duties."""
     store = ObligationStore(root)
@@ -260,15 +300,27 @@ def ensure_runner(root: str | Path | None = None) -> bool:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return True
+            if not _handoff_legacy_runner(store, lock_path):
+                return True
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(0.02)
         os.set_inheritable(fd, True)
         runner = Path(__file__).with_name("peer-steward.py")
-        subprocess.Popen(
+        _RUNNERS[:] = [process for process in _RUNNERS if process.poll() is None]
+        process = subprocess.Popen(
             [sys.executable, str(runner), "__obligation-runner", "--lock-fd", str(fd),
              "--state-root", str(Path(root).resolve()) if root else str(peer_state_root())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, pass_fds=(fd,), start_new_session=True,
         )
+        _RUNNERS.append(process)
         return True
     except (OSError, subprocess.SubprocessError):
         return False

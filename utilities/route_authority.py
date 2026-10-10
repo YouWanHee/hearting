@@ -579,8 +579,8 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     for flag, expected in current.items():
         if flag in RECOVERY_SELECTION_OPTIONS and flag in options and options[flag] != [str(expected)]:
             raise _contract_error("replacement-argv-mismatch", flag)
-    granted = granted_permissions(candidate.get("applied_permissions"), candidate.get("launch_home"))
-    sealed = granted_permissions(history.get("applied_permissions"), history.get("launch_home"))
+    granted = granted_permissions(candidate.get("applied_permissions"), candidate.get("launch_home"), candidate.get("worktree"))
+    sealed = granted_permissions(history.get("applied_permissions"), history.get("launch_home"), history.get("worktree"))
     cross_owner = owner and candidate.get("harness") != history.get("harness")
     if cross_owner:
         require_recovery_grant_addresses(candidate, history, route=route, access=access)
@@ -632,7 +632,7 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
         # The normal OpenCode launcher grants the portable capability contracts
         # read visibility, with edit denies. These are runtime support addresses,
         # not an expansion of the task's writable scope.
-        reads.append(context.agent_home / "capabilities")
+        reads.extend(contract_read_roots(context.agent_home, route))
         targets = EA.resolve_task_targets(route)
         if targets:
             writes.extend(targets.writable_roots)
@@ -783,11 +783,11 @@ RELAUNCH_STABLE_KEYS = (
 
 
 # A path into the harness's own tree inside a permission value (`<root>/utilities/...`).
-_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:utilities|adapters|hooks|tools)/")
+_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:utilities|adapters|hooks|tools|capabilities)(?=/|[\"'])")
 RELEASE_ROOT_TOKEN = "<launch_home>"
 
 
-def granted_permissions(applied, launch_home=None) -> dict:
+def granted_permissions(applied, launch_home=None, worktree=None) -> dict:
     """``applied_permissions`` without the values the launcher's location decides.
 
     With ``launch_home`` (the release the launch ran from), a path into the harness's own tree
@@ -807,6 +807,11 @@ def granted_permissions(applied, launch_home=None) -> dict:
     roots = {root for root in _RELEASE_TREE_PATH.findall(text)
              if root == str(launch_home) or os.path.realpath(root) == home
              or (managed and (root == pointer or os.path.dirname(os.path.realpath(root)) == releases))}
+    # OpenCode edit rules check the same directory relative to the worktree.
+    # Normalize only aliases of the identified launch roots, never arbitrary
+    # relative task paths or another development checkout.
+    if worktree:
+        roots.update(os.path.relpath(root, worktree) for root in tuple(roots))
     for root in sorted(roots, key=len, reverse=True):
         text = re.sub(r"(?<![^\s\"'(])" + re.escape(root) + "/", RELEASE_ROOT_TOKEN + "/", text)
     return json.loads(text)
@@ -867,8 +872,8 @@ def release_moved(sealed: dict, current: dict, *, managed_release) -> frozenset:
 def same_sealed_work(previous, current, *, recovery=None) -> bool:
     """Whether two sealed launch inputs describe the same work with the same granted permissions."""
     exact = (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
-            and granted_permissions(previous.get("applied_permissions"), previous.get("launch_home"))
-            == granted_permissions(current.get("applied_permissions"), current.get("launch_home")))
+            and granted_permissions(previous.get("applied_permissions"), previous.get("launch_home"), previous.get("worktree"))
+            == granted_permissions(current.get("applied_permissions"), current.get("launch_home"), current.get("worktree")))
     if exact or recovery is None:
         return exact
     record, source, history, route = recovery
@@ -1243,6 +1248,26 @@ def access_grant(*args, **kwargs):
     return build_grant(*args, **kwargs)
 
 
+def contract_read_roots(agent_home: str | Path, route: dict | None = None) -> tuple[Path, ...]:
+    """Contract directories for an already validated launch binding.
+
+    Use the same sealed launch-home field the installer's in-use judgment
+    retains. A moving current pointer never replaces the route's contract
+    source. These are read addresses, not additional task write grants.
+    """
+    homes = [Path(agent_home)]
+    sealed = (route or {}).get("launch_compatibility_tuple") or {}
+    identity = sealed.get("launch_home") if isinstance(sealed, dict) else None
+    value = identity.get("path") if isinstance(identity, dict) else None
+    if isinstance(value, str) and os.path.isabs(value):
+        homes.append(Path(value))
+    roots = []
+    for home in homes:
+        root = home / "capabilities"
+        roots.extend((root, root.resolve(strict=False)))
+    return tuple(dict.fromkeys(roots))
+
+
 def bind_launch_access(args, *, runtime: str, default_roots, network_available: bool = False,
                        parent_network: bool = False, effective_sandbox: str = "workspace-write",
                        gpu_resource_scope: bool = False, inherit_parent_sandbox: bool = False):
@@ -1265,9 +1290,15 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
     owner_binding = getattr(args, "owner_route_binding", None)
     if not route_file and owner_binding is not None:
         route_file = owner_binding.route_file
+    # Both owner and node bindings have passed the wrappers' existing route
+    # validation before access binding; contract reads do not need a request.
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8")) if route_file else None
+    except (OSError, ValueError) as exc:
+        raise ExecutionAccessError("route-record-unreadable", str(exc)) from exc
+    args.contract_read_roots = contract_read_roots(args.agent_home, route)
     if route_file and request_path(args.execution_access_file, os.environ) is not None:
         from gpu_execution_sandbox import select as gpu_selection
-        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         compute_scope = gpu_selection(route, node=getattr(args, "route_node", None),
                                       owner=args.dispatch_depth == 1, environ={})["gpu_scope"]
     if args.dispatch_depth >= 2 and request_path(args.execution_access_file, os.environ) is not None:
