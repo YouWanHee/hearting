@@ -152,7 +152,7 @@ class ReadingTest(unittest.TestCase):
         with mock.patch.object(render, "_ROUTE_FOLD", {"route": True}):
             for width in (80, 100, 168):
                 header = render._plain(render._route_card(view, {}, width, 0)[0][0])
-                self.assertIn("stage 실패", header)
+                self.assertIn('stage failed', header)
                 self.assertLessEqual(render._dw(header), width)
 
     def test_r7_tinted_now_matches_actual_draw(self):
@@ -172,12 +172,12 @@ class ReadingTest(unittest.TestCase):
                 render._addline(screen, 0, row, width)
                 drawn = "".join(text for _col, text in screen.calls).strip()
                 self.assertEqual(drawn, plain.strip())
-                self.assertTrue("승인 필요" in drawn or drawn.endswith("…"))
+                self.assertTrue("승인 필요" in drawn or "…" in drawn)
                 self.assertLessEqual(max(col + render._dw(text) for col, text in screen.calls), width)
 
-    def test_r5_human_input_uses_korean(self):
-        self.assertEqual(render._INTERACTION_LABEL["decision"], "답변 필요")
-        self.assertEqual(render._INTERACTION_LABEL["permission"], "승인 필요")
+    def test_r5_human_input_uses_short_english(self):
+        self.assertEqual(render._INTERACTION_LABEL["decision"], 'answer needed')
+        self.assertEqual(render._INTERACTION_LABEL["permission"], 'approval needed')
 
     def test_r5_normal_chain_keeps_identifiers_and_user_names(self):
         render.set_show_all(False)
@@ -226,7 +226,7 @@ class ReadingTest(unittest.TestCase):
         text = "\n".join(render._plain(x) for x in render._build_lines([], [], "both", False, 0, term_width=80))
         for word in ("session", "resource", "stage"):
             self.assertIn(word, text)
-        self.assertIn("project: ● 활동", text)
+        self.assertIn("project: ● active", text)
         self.assertIn("↳ command", text)
         self.assertNotIn("문맥", text)
         render.set_show_all(True)
@@ -239,7 +239,7 @@ class ReadingTest(unittest.TestCase):
             self.assertIn("0 working", text)
             self.assertIn("0 idle", text)
             legend = text[text.index("session:"):]
-            for word in ("종료", "[id]", "steward", "pane", "project: ● 활동", "↳ command"):
+            for word in ("exited", "[id]", "steward", "pane", "project: ● active", "↳ command"):
                 self.assertIn(word, legend)
             for word in ("문맥", "계획 검토", "좌석"):
                 self.assertNotIn(word, legend)
@@ -270,15 +270,15 @@ class ReadingTest(unittest.TestCase):
                         explanation = "\n".join(render._plain(row) for row in legend)
                         self.assertIn("◇", line)
                         self.assertIn("AMI_8ch_varying_0_3spk_v3", line)
-                        self.assertIn("◇ 실행 미확인", explanation)
+                        self.assertIn("◇ unknown", explanation)
                         self.assertTrue(all(render._dw(render._plain(row)) <= width - 1
                                             for row in rows + legend))
         # Unknown telemetry with no confirmed process must not claim access.
         gpu = dict(index=0, observation_source="fixture", processes=[])
         self.assertEqual(render._gpu_state(gpu), "unknown")
         token = render._plain(render._gpu_token(gpu, 79))
-        self.assertIn("사용률·VRAM 모름", token)
-        self.assertNotIn("장치 접근 확인", token)
+        self.assertIn('UTIL/VRAM unknown', token)
+        self.assertNotIn('check device access', token)
 
     def test_h1_observation_links_only_confirmed_caller_continuity(self):
         parent = Session(harness="claude", pid=1, cwd="/work/a", session_id="new", liveness="working",
@@ -298,7 +298,7 @@ class ReadingTest(unittest.TestCase):
                               registered_worker=True, cwd="/work/a", liveness="working")
         parent = Session(harness="claude", pid=1, cwd=support.cwd, session_id="s", liveness="working")
         text = "\n".join(render._plain(x) for x in render._build_lines([parent], [support], "both", False, 0, term_width=100))
-        self.assertIn("project 지원 작업", text)
+        self.assertIn('project support', text)
 
     def test_h1_runner_publishes_caller_as_observation(self):
         item = dict(harness="codex", sid="caller-sid", cwd="/work/a", seat=dict(kind="pane", pane="wB:p3N"))

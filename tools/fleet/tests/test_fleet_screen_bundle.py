@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import re
 import unittest
 from unittest import mock
 
@@ -461,9 +462,9 @@ class BundleTest(unittest.TestCase):
         child = session("bb", model="MODEL", effort="high", herdr_attached=True, summary="NOWTEXT")
         for width in (60, 100, 168):
             rows = text(self.build([parent, child], width=width))
-            where = [row for row in rows if "herdr" in row and "마지막 요약" in row]
+            where = [row for row in rows if "herdr" in row and "age unknown" in row]
             self.assertEqual([row.index("herdr") for row in where], [render._SESSION_DETAIL_COL] * 2)
-            self.assertEqual([render._dw(row[:row.index("마지막 요약")]) for row in where],
+            self.assertEqual([render._dw(row[:re.search(r"(?:\d+%|—) +(\S)", row).start(1)]) for row in where],
                              [render._NAME_COL] * 2)
             self.assertEqual(where[0][render._STEWARD_LINE_COL], "⚑" if width == 168 else "┆")
             self.assertEqual(where[1][render._STEWARD_LINE_COL], " ")

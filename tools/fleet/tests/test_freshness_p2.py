@@ -39,7 +39,8 @@ class FreshnessTest(unittest.TestCase):
     def test_transcript_mtime_is_file_update_never_completion(self):
         header = text([self.header(self.lines([self.session()]))])
         self.assertNotIn("✓", header)
-        self.assertIn("파일 갱신", header)
+        self.assertNotIn("파일 갱신", header)
+        self.assertTrue(header.endswith("6m ago"))
 
     def test_idle_owner_running_resource_makes_project_active(self):
         owner = DispatchJob(key="autopilot-lab", slug="train", cwd="/work/project",
@@ -62,8 +63,8 @@ class FreshnessTest(unittest.TestCase):
         session = self.session()
         session.route_chain = {"nodes": [{"result": result}]}
         header = text([self.header(self.lines([session]))])
-        self.assertIn("최근 결과", header)
-        self.assertIn("성공", header)
+        self.assertNotIn("최근 결과", header)
+        self.assertIn("✓", header)
         self.assertIn("모델 설명 자료", header)
 
     def test_unproven_mismatched_or_pending_outcome_is_not_a_result(self):
@@ -82,31 +83,32 @@ class FreshnessTest(unittest.TestCase):
             for width in (80, 100, 160):
                 with self.subTest(width=width):
                     header = text([self.header(self.lines([s], width=width))])
-                    self.assertIn("최근 결과 · 성공", header)
-                    self.assertIn("1시간 전", header)
+                    self.assertIn('✓', header)
+                    self.assertIn('1h ago', header)
                     self.assertLessEqual(render._dw(header), width)
 
     def test_old_summary_keeps_its_age_without_repeating_idle(self):
         s = self.session(summary="보완 작업이 진행 중", summary_ts=self.now - 12 * 3600)
         row = text(render._context_detail_row(s, term_width=180))
         self.assertNotIn("대기", row)
-        self.assertIn("마지막 요약", row)
-        self.assertIn("12시간 전", row)
+        self.assertNotIn("마지막 요약", row)
+        self.assertIn('12h ago', row)
         self.assertNotIn(" · · ", row)
 
     def test_unknown_summary_time_stays_historical_and_exec_comes_first(self):
         s = self.session(liveness="working", summary="작업 완료",
                          exec_tool={"name": "exec_command", "command": "python train.py"})
         row = text(render._context_detail_row(s, term_width=180))
-        self.assertIn("마지막 요약 · 시각 미확인", row)
-        self.assertLess(row.index("⚙"), row.index("마지막 요약"))
+        self.assertTrue(row.endswith("작업 완료 · age unknown"))
+        self.assertLess(row.index("⚙"), row.index("작업 완료"))
 
     def test_old_completion_title_is_previous_for_every_harness(self):
         for harness in ("claude", "codex", "opencode"):
             s = self.session(harness=harness, title="하팅 작업 완료")
             s.title_ts = self.now - 48 * 3600
             with self.subTest(harness=harness):
-                self.assertIn("이전 제목", render._display_session_subject(s))
+                self.assertEqual(render._display_session_subject(s), s.title)
+                self.assertEqual(render._subject_name_key(s, "nm_codex"), render._NAME_KEY_DIM[s.harness])
                 s.runtime_name = "사용자 지정 이름"
                 self.assertEqual(render._session_name(s), s.runtime_name)
 
@@ -124,7 +126,7 @@ class FreshnessTest(unittest.TestCase):
             s = self.session(liveness=state, summary="새 상태 설명", summary_ts=self.now)
             row = text(render._context_detail_row(s, term_width=180))
             with self.subTest(state=state):
-                self.assertIn("마지막 요약", row)
+                self.assertNotIn("마지막 요약", row)
                 self.assertIn("새 상태 설명", row)
                 for word in ("작업 중", "대기", "분리됨", "상태 미확인"):
                     self.assertNotIn(word, row)
@@ -133,7 +135,8 @@ class FreshnessTest(unittest.TestCase):
         s = self.session(liveness="working")
         s.title_ts = self.now - 30
         s.route_chain = {"current": {"ts": self.now - 10}}
-        self.assertIn("이전 제목", render._display_session_subject(s))
+        self.assertEqual(render._display_session_subject(s), s.title)
+        self.assertEqual(render._subject_name_key(s, "nm_codex"), render._NAME_KEY_DIM[s.harness])
 
     def test_current_title_needs_no_prefix_or_working_state(self):
         s = self.session(liveness="working", title="하팅 작업 완료", title_ts=self.now - 60)
@@ -173,7 +176,8 @@ class FreshnessTest(unittest.TestCase):
             self.assertEqual(data["title_ts"], self.now - 48 * 3600)
             s = self.session(title=data["title"], liveness="working")
             titles.annotate([s])
-            self.assertIn("이전 제목", render._display_session_subject(s))
+            self.assertEqual(render._display_session_subject(s), s.title)
+            self.assertEqual(render._subject_name_key(s, "nm_codex"), render._NAME_KEY_DIM[s.harness])
 
     def test_noop_refresh_keeps_successful_title_time(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"FLEET_TITLE_STATE_DIR": tmp}):
@@ -197,6 +201,58 @@ class FreshnessTest(unittest.TestCase):
             s.title_ts = timestamp
             with self.subTest(timestamp=timestamp):
                 self.assertEqual(render._display_session_subject(s), s.title)
+
+    def test_age_suffix_survives_long_summary_in_both_render_paths(self):
+        summary = "한글 요약을 그대로 보존하며 길게 설명합니다. " * 30
+        s = self.session(summary=summary, summary_ts=self.now - 65)
+        with mock.patch("time.time", return_value=self.now):
+            for width in (80, 100, 200):
+                for rows in (render._summary_row(summary, term_width=width, summary_ts=s.summary_ts),
+                             render._context_detail_row(s, term_width=width)):
+                    row = text(rows)
+                    self.assertTrue(row.endswith(" · 1m ago"), row)
+                    self.assertIn("한글", row)
+                    self.assertLessEqual(render._dw(row), width)
+                    self.assertNotIn("마지막 요약", row)
+
+    def test_time_units_and_invalid_times_are_consistent(self):
+        for minutes, expected in ((0, "0m ago"), (1, "1m ago"), (59, "59m ago"),
+                                  (60, "1h ago"), (1439, "23h ago"), (1440, "1d ago"),
+                                  (4320, "3d ago")):
+            self.assertEqual(render._text_age(self.now - minutes * 60, self.now), expected)
+        for timestamp in (None, True, -1, self.now + 1, float("nan"), float("inf")):
+            self.assertEqual(render._text_age(timestamp, self.now), "age unknown")
+
+    def test_owner_card_preserves_age_suffix_in_plain_and_tinted_80_columns(self):
+        owner = DispatchJob(key="code", slug="owner", harness="codex", cwd="/work/project",
+                            worker_type="owner", depth=1, liveness="working", is_child=True,
+                            parent_sid="sid",
+                            summary="이 요약은 매우 길어서 먼저 잘려야 합니다. " * 20,
+                            summary_ts=self.now - 70)
+        with mock.patch("time.time", return_value=self.now):
+            for tinted in (False, True):
+                with mock.patch.object(render, "_TINT_OK", tinted):
+                    rows = self.lines([self.session(liveness="working")], jobs=[owner], width=80)
+                    detail = next(render._plain(row) for row in rows if row and "1m ago" in render._plain(row))
+                    self.assertIn("│", detail)
+                    self.assertRegex(detail.rstrip(), r"1m ago +│$")
+
+    def test_repeated_nonblocking_diagnostics_fold_but_blocking_sources_survive(self):
+        diagnostics = [dict(kind="missing-registry", blocking=False, reason="registered-path-absent",
+                            path="/work/%d/.agent_reports/jobs.log" % i) for i in range(6)]
+        diagnostics += [dict(kind="missing-registry", blocking=True, path="/work/blocked-%d" % i)
+                        for i in range(2)]
+        diagnostics.append(dict(kind="malformed-index", blocking=False, reason="invalid", path="/work/index"))
+        render.set_show_all(True)
+        self.addCleanup(render.set_show_all, False)
+        for width in (80, 200):
+            rows = render._diagnostic_rows(diagnostics, term_width=width)
+            self.assertEqual(len(rows), 4)
+            self.assertIn("missing reference ×6 · nonblocking", text(rows[:1]))
+            for i in range(2):
+                self.assertIn("blocked-%d" % i, text(rows))
+            for row in rows:
+                self.assertLessEqual(render._dw(render._plain(row)), width)
 
 
 if __name__ == "__main__":

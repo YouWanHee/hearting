@@ -68,13 +68,13 @@ class ReportVerificationDisplayTests(unittest.TestCase):
                                                 malformed=0, layout="wide", term_width=width)
                     output = "\n".join("".join(token for token, _kind in line)
                                        for line in lines if line)
-                    self.assertIn("검증 실패", output)
+                    self.assertIn("FAIL", output)
                     detail = "".join(token for token, _kind in
                                      render._report_verification_detail_row(
                                          self.job, depth=1, term_width=width)[0])
                     if width == 120:
-                        self.assertIn("작업 완료", detail)
-                        self.assertIn("필수 입력 확인 실패", detail)
+                        self.assertIn("complete", detail)
+                        self.assertIn("input failed", detail)
                     else:
                         self.assertTrue(detail.endswith("…"), detail)
         finally:
@@ -98,7 +98,7 @@ class ReportVerificationDisplayTests(unittest.TestCase):
                     self.assertNotIn(reason, "".join(t for t, _ in rows[0]))
                     self.assertEqual(self.job.work_projection.report_verification["verification"]["reason"], reason)
 
-    def test_report_detail_stays_inside_owner_card_and_uses_korean_reason(self):
+    def test_report_detail_stays_inside_owner_card_and_uses_short_reason(self):
         self.job.depth = self.job.dispatch_depth = 1
         self.job.worker_type = "owner"
         payload = report_verification_projection._display(
@@ -109,8 +109,8 @@ class ReportVerificationDisplayTests(unittest.TestCase):
         for width in (60, 100, 180):
             lines = render._build_lines([], [self.job], section="dispatch", narrow=width < 70,
                                         malformed=0, layout="wide", term_width=width)
-            detail = next(render._plain(line) for line in lines if line and "보고서" in render._plain(line))
-            self.assertIn("│", detail[:detail.index("보고서")])
+            detail = next(render._plain(line) for line in lines if line and "↳ report" in render._plain(line))
+            self.assertIn("│", detail[:detail.index("report")])
             self.assertNotIn("report-cycle-unadmitted", detail)
             header = next(render._plain(line) for line in lines if line and "╭" in render._plain(line))
             self.assertLessEqual(render._dw(detail), render._dw(header))

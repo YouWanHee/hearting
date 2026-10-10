@@ -11,9 +11,9 @@
 
 ● bundle/
 ▍ ⠋ [aa] claude code (Opus·high)            aa ▾4 (—)                                                  -  3h 00m
-▍    ⚑              ────────────────   —    마지막 요약 · 시각 미확인 · NOW owner work
+▍    ⚑              ────────────────   —    NOW owner work · age unknown
 ▍    ┆  ╭─  ⠋ claude code (Opus·high) ───── gpu-owner (—) ──────────────────────────────────────────── code owner  —   ───────────────────────────────────────────────╮
-▍    ┆  │           ────────────────   —    train train.py · gpu:0 · 2m · 로그 없음                                                                                   │
+▍    ┆  │           ────────────────   —    train train.py · gpu:0 · 2m · no log                                                                                      │
 ▍    ┆  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── one-shot ───┤
 ▍    ┆  │ ● GPU gpu:0 · train 2m                                                                                                                                      │
 ▍    ┆  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
@@ -30,6 +30,6 @@
 ▍                   ────────────────   —
 
   session: ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch
-  project: ● 활동
-  resource: ● 실행 · ◇ 실행 미확인 · UTIL/VRAM · ↳ command
-  stage: ● 현재  ✓ 완료  ✕ 실패  ○ 예정
+  project: ● active
+  resource: ● running · ◇ unknown · UTIL/VRAM · ↳ command
+  stage: ● current  ✓ done  ✕ failed  ○ planned

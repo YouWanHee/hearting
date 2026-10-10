@@ -62,7 +62,7 @@ class F51GaugeTest(unittest.TestCase):
             with self.subTest(width=width, layout=layout):
                 row = render._context_detail_row(session, term_width=width)
                 visible = "".join(value for value, _key in row[0])
-                self.assertEqual(render._dw(visible[:visible.index("마지막 요약")]), render._NAME_COL)
+                self.assertEqual(render._dw(visible[:re.search(r"(?:\d+%|—) +(\S)", visible).start(1)]), render._NAME_COL)
                 self.assertLessEqual(render._dw(visible), width)
                 headers = render._usage_header_rows([session], layout=layout)
                 if headers:

@@ -42,7 +42,7 @@ class BasicObservationTest(unittest.TestCase):
                 with mock.patch.object(render, '_fresh_compute_hosts', return_value=(None, None)):
                     now = render._resource_now_text(owner)
                 self.assertIn('train train.py', now)
-                self.assertIn('호스트/GPU 미확인', now)
+                self.assertIn('host/GPU unknown', now)
                 self.assertNotIn('previous model turn', now)
                 # A different declared route does not acquire a parked wait.
                 child.route_id = 'foreign'
@@ -63,7 +63,7 @@ class BasicObservationTest(unittest.TestCase):
         projection.attach_projections([], [owner], fast_first=True)
         self.assertIsNone(owner.work_projection.progress)
         text = render._plain(render._context_detail_row(owner, term_width=168)[0])
-        self.assertIn('확인 중', text)
+        self.assertIn('loading', text)
         self.assertNotIn('모델 턴', text)
         self.assertIsNone(owner.exec_tool)
 
@@ -118,7 +118,7 @@ class BasicObservationTest(unittest.TestCase):
         self.assertIn('worker-exact', screen)
         self.assertIn('exact stage NOW', screen)
         self.assertIn('gpt-6.1-sol', screen)
-        self.assertIn('route 연결 확인 중', screen)
+        self.assertIn('route linking', screen)
         self.assertNotIn('no active route', screen)
         self.assertNotIn('no route record', screen)
         self.assertIsNone(worker.work_projection.progress)
@@ -165,7 +165,7 @@ class BasicObservationTest(unittest.TestCase):
                 return '\n'.join(render._plain(line) for line in lines)
             with mock.patch.object(route, 'load', side_effect=AssertionError('basic render route read')):
                 before = screen(source)
-            for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py', 'route 연결 확인 중'):
+            for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py', 'route linking'):
                 self.assertIn(value, before)
             self.assertNotIn('no active route', before)
             with mock.patch.object(dispatch, '_pending_delivery_counts', return_value=None), \
@@ -183,7 +183,7 @@ class BasicObservationTest(unittest.TestCase):
             after = screen(joined)
             for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py'):
                 self.assertIn(value, after)
-            self.assertNotIn('route 연결 확인 중', after)
+            self.assertNotIn('route linking', after)
             self.assertNotIn('no active route', after)
             self.assertIsNone(owner.campaign_label)
 
@@ -445,7 +445,7 @@ class DelayedJoinTest(unittest.TestCase):
         detail.snapshot.jobs[0].exec_tool = None
         row = details.merge(source, detail).jobs[0]
         text = render._plain(render._context_detail_row(row, term_width=168)[0])
-        self.assertIn('확인 중', text)
+        self.assertIn('loading', text)
         self.assertEqual(row.liveness, 'working')
 
 

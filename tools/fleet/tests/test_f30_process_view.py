@@ -293,7 +293,7 @@ class RenderContentTest(ProcessViewEnv):
                                     layout="wide", term_width=168)
         text = _joined(lines)
         self.assertIn("✕", text)
-        self.assertIn("⚠ stage 실패", text)
+        self.assertIn('⚠ stage failed', text)
         # auto-expanded — the DAG line (not just the 1-line header) must be present
         self.assertIn("setup", text)
 
@@ -315,8 +315,8 @@ class RenderContentTest(ProcessViewEnv):
         render.set_process_view(True)
         text = _joined(build_observed_lines([], jobs, section="both", narrow=False,
                                             malformed=0, layout="wide", term_width=168))
-        self.assertIn("…종료 확인", text)
-        self.assertNotIn("⚠ stage 실패", text)
+        self.assertIn("…exit pending", text)
+        self.assertNotIn('⚠ stage failed', text)
 
     def test_t3_5_all_done_route_defaults_to_one_line_fold(self):
         # code-test verification.md §10 — a job whose registry row is already `done` NEVER
@@ -352,7 +352,7 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("route 연결 미확인", text)
+        self.assertIn("route unknown", text)
         self.assertIn("no-record-job", text)
 
     def test_conductor_not_duplicated_as_degrade_card_when_route_child_is_terminal(self):
@@ -413,7 +413,7 @@ class RenderContentTest(ProcessViewEnv):
         toggled = _joined(build_observed_lines([], [conductor, child], section="both",
                                               narrow=False, malformed=0, layout="wide",
                                               term_width=168))
-        self.assertIn("완료 확인: code-plan", toggled)
+        self.assertIn("gates: code-plan", toggled)
 
     def test_t3_13_no_overflow_at_60_120_168(self):
         jobs = self._lab_route_jobs()
@@ -434,7 +434,7 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [], section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("관측된 실행 작업 없음", text)
+        self.assertIn('no observed work', text)
 
 
 class MouseFoldTest(ProcessViewEnv):
