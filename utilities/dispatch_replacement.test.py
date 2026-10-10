@@ -1777,6 +1777,46 @@ class ReplacementTest(unittest.TestCase):
         self.assertNotIn('closure-check', text)
         self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
 
+    def test_old_claim_closure_admits_register_then_start_and_keeps_other_live_rounds_blocked(self):
+        record, node = self._legacy_closed_review_claim(test_fails=2)
+        spec = importlib.util.spec_from_file_location('registered_closure_dispatch_node',
+                                                      Path(__file__).with_name('dispatch-node.py'))
+        dispatch = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = dispatch
+        spec.loader.exec_module(dispatch)
+        registered = {'attempt_schema_version': '2', 'attempt_id': 'att-review-3',
+                      'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                      'worker_type': 'review', 'dispatch_depth': '2', 'launch_claimed': '0',
+                      'parent_attempt_id': record['replacement_attempt_id'], 'note': ''}
+        history = self.jobs.read_bytes()
+        # This isolated claim fixture has one route; use the real registry census and admission.
+        with mock.patch.object(dispatch.ROUTE, 'review_lineage_routes', return_value=[self.route]):
+            for status in ('open', 'running'):
+                with self.subTest(status=status):
+                    self.jobs.write_bytes(history)
+                    self.write(registered, status=status, append=True)
+                    before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+                    budget = dispatch.admit_round(self.route, node, self.jobs,
+                        exclude_attempt=registered['attempt_id'], record_auto_revisions=False).budget
+                    self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds, budget.next_round),
+                                     ('admit', 'closure-check', 2, 3))
+                    revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+                    self.assertEqual(revisions[0]['answers'], ['att-test-2', 'att-review-2'])
+                    budget = dispatch.admit_round(self.route, node, self.jobs,
+                                                   record_auto_revisions=False).budget
+                    self.assertEqual(budget.state, 'blocked-live')
+                    self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+            self.write({**registered, 'attempt_id': 'att-other-live'}, status='open', append=True)
+            budget = dispatch.admit_round(self.route, node, self.jobs,
+                exclude_attempt=registered['attempt_id'], record_auto_revisions=False).budget
+            self.assertEqual(budget.state, 'blocked-live')
+            self.jobs.write_bytes(history)
+            self.write({**registered, 'note': 'completed-review-blocking', 'failure_class': 'fail'}, append=True)
+            self.write({**registered, 'attempt_id': 'att-review-4'}, status='open', append=True)
+            budget = dispatch.admit_round(self.route, node, self.jobs,
+                exclude_attempt='att-review-4', record_auto_revisions=False).budget
+            self.assertEqual((budget.state, budget.verdict_rounds), ('exhausted', 3))
+
     def test_unrelated_duplicate_registry_rows_keep_an_approved_claim_original_answers(self):
         record, _ = self._legacy_closed_review_claim(test_fails=2)
         foreign = {'attempt_id': 'att-foreign', 'route_id': 'rt-other', 'route_node': 'test',

@@ -948,7 +948,7 @@ def _approved_fix_answers(record, jobs, rows=None):
         rows = _rows(Path(jobs).read_text().splitlines()) if rows is None else rows
         source = rows[record['original_attempt_id']][1]
         _, route = _route(jobs, record['original_attempt_id'], source)
-        eligible, _ = route_authority.fix_answers(route, ['\t'.join(fields) for fields, _ in rows.values()], jobs)
+        eligible, _ = route_authority.fix_answers(route, ['\t'.join(fields) for fields, _ in rows.values() if fields[1] not in ('open', 'running')], jobs)
     except (OSError, ValueError, KeyError, DC.DispatchContractError):
         # Supplemental historical targets cannot break an existing approved claim.
         return answers
