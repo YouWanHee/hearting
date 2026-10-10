@@ -33,6 +33,10 @@ def _runtime(pid):
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         words = [part.decode("utf-8", "replace") for part in argv if part]
         name = Path(words[0]).name
+        # Native daemon children rewrite argv[0] to a process title. They
+        # remain service-side processes, never physical pane owners.
+        if name in {"claude bg-spare", "claude bg-pty-host"}:
+            return "claude", True
         if name == "claude" or "/claude/versions/" in words[0]:
             return "claude", any(w in {"daemon", "bg-pty-host", "bg-spare"} for w in words[1:3])
         if name == "codex" or name.startswith("codex-"):
