@@ -125,8 +125,11 @@ A route's `launch_compatibility_tuple.launch_home.path` is also the source of
 its contract read access. A replacement or child launched after activation
 retains read access to that sealed home's `capabilities/`, alongside its own
 launch home's contracts; it needs no file hash comparison or correction from
-the parent. The installer already protects that same sealed home while its
-route is in use. Claude projects these directories with edit denies, OpenCode
+the parent. The installer protects that same sealed home while its route is
+in use, including an unclosed route whose current owner awaits correction to
+a readable BLOCKED or FAIL result. A superseded owner's pause does not retain
+the release after its successor finishes, and closed routes and stale launch
+deaths still release it. Claude projects these directories with edit denies, OpenCode
 allows their external reads with edit denies, and Codex's sandbox already
 permits these reads without adding writable roots. No whole release tree or
 task write scope is granted by this contract access.

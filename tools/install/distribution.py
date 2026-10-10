@@ -2502,7 +2502,8 @@ _ROUTE_TERMINAL_ROW_STATES = frozenset({"done", "killed", "cancelled"})
 def _route_registry_index(text: str) -> dict:
     """One pass over a registry: which routes are named, and which are still live.
 
-    `{"malformed": bool, "seen": set[route_id], "live": set[route_id]}`.
+    `{"malformed": bool, "seen": set[route_id], "live": set[route_id],
+      "paused": set[route_id]}`.
 
     Built once per registry file rather than re-scanned per route record: the
     text cache alone left the work `O(open_records x registry_bytes)`, measured
@@ -2521,7 +2522,8 @@ def _route_registry_index(text: str) -> dict:
     and node rows, and 0 rows carry both keys (review 🔴1).
     """
 
-    index: dict = {"malformed": False, "seen": set(), "live": set()}
+    index: dict = {"malformed": False, "seen": set(), "live": set(), "paused": set()}
+    owners: dict[str, tuple[str, dict[str, str]]] = {}
     for line in text.splitlines():
         if not line.strip():
             continue
@@ -2530,13 +2532,29 @@ def _route_registry_index(text: str) -> dict:
             index["malformed"] = True
             return index
         terminal = fields[1] in _ROUTE_TERMINAL_ROW_STATES
-        for item in fields[5].split(","):
-            key, _, value = item.partition("=")
-            if key not in ("route_id", "owner_route_id") or not value:
+        metadata = dict(item.split("=", 1) for item in fields[5].split(",") if "=" in item)
+        for key in ("route_id", "owner_route_id"):
+            value = metadata.get(key)
+            if not value:
                 continue
             index["seen"].add(value)
             if not terminal:
                 index["live"].add(value)
+            if metadata.get("worker_type") == "owner":
+                # Same latest-owner order as work_start._slot. A historical
+                # BLOCKED must not pin a route whose replacement has finished.
+                owners[value] = (fields[1], metadata)
+    for route_id, (status, metadata) in owners.items():
+        # Standalone install.sh cannot import the runtime. Mirror
+        # route_authority.answerable_owner_end: a kept correction continues
+        # this same unclosed route, so process exit cannot release its code.
+        # A launch/runtime death has no readable result and stays releasable.
+        if status == "done" and (
+            metadata.get("note") == "dead-worker-blocked"
+            or (metadata.get("note") == "dead-worker-fail"
+                and metadata.get("failure_class") == "fail")
+        ):
+            index["paused"].add(route_id)
     return index
 
 
@@ -2613,9 +2631,9 @@ def _route_attempts_finished(route_id: str, raw: dict, cache: dict, environ: dic
     # pin, even though only the sealed one may declare it finished.
     for other in _veto_registry_paths(environ):
         veto = _read_route_registry_index(other, cache)
-        if veto is not None and not veto["malformed"] and route_id in veto["live"]:
+        if veto is not None and not veto["malformed"] and route_id in veto["live"] | veto["paused"]:
             return False
-    if route_id in index["live"]:
+    if route_id in index["live"] | index["paused"]:
         return False
     return True if route_id in index["seen"] else None
 
@@ -2648,8 +2666,8 @@ def _route_record_launch_home(
     fail-closed is its own bug).
 
     Also `None` when the route is unclosed but every one of its registry
-    attempts is terminal (`_route_attempts_finished`) -- the P2 mirror of the
-    registry source's `open`-only rule. "Unclosed" and "still working" are not
+    attempts is terminal and its current owner has no readable result awaiting
+    correction (`_route_attempts_finished`). "Unclosed" and "still working" are not
     the same thing, and a route that died at launch is never closed by anyone.
 
     Returns `_UNDECIDABLE` if the record looks open (no outcome sibling) but
