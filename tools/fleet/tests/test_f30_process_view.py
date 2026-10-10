@@ -246,8 +246,9 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("rt-9fa0fed8", text)
-        self.assertIn("1/4 nodes", text)
+        self.assertNotIn("rt-9fa0fed8", text)
+        self.assertIn("단계", text)
+        self.assertIn("1/4 단계", text)
 
     def test_t3_3_parallel_nodes_render_as_indented_siblings(self):
         jobs = self._lab_route_jobs()
@@ -279,11 +280,10 @@ class RenderContentTest(ProcessViewEnv):
         text = _joined(build_observed_lines([], [owner, child_b, child_a], section="both",
                                             narrow=False, malformed=0, layout="wide",
                                             term_width=168))
-        self.assertIn("survey[research/research-survey]", text)
-        self.assertIn("claim-a[research/claim-verify]", text)
-        self.assertIn("claim-b[research/claim-verify]", text)
-        self.assertIn("synth[research/research-survey]", text)
-        self.assertIn("rt-336a0adf", text)
+        for name in ("survey", "claim-a", "claim-b", "synth", "composed-owner"):
+            self.assertIn(name, text)
+        self.assertNotIn("[research/", text)  # contracts remain in explicit detail/JSON
+        self.assertNotIn("rt-336a0adf", text)
         self.assertNotIn("plan › exec › test › report", text)
 
     def test_t3_4_failed_node_auto_expands_with_red_key(self):
@@ -293,9 +293,9 @@ class RenderContentTest(ProcessViewEnv):
                                     layout="wide", term_width=168)
         text = _joined(lines)
         self.assertIn("✕", text)
-        self.assertIn("⚠ failed node", text)
+        self.assertIn("⚠ 실패 단계", text)
         # auto-expanded — the DAG line (not just the 1-line header) must be present
-        self.assertIn("setup", text)
+        self.assertIn("준비", text)
 
     def test_exact_reconcile_needed_uses_gate_pending_not_failed(self):
         jobs = self._lab_route_jobs(sep_liveness="stale")
@@ -315,8 +315,8 @@ class RenderContentTest(ProcessViewEnv):
         render.set_process_view(True)
         text = _joined(build_observed_lines([], jobs, section="both", narrow=False,
                                             malformed=0, layout="wide", term_width=168))
-        self.assertIn("…gate", text)
-        self.assertNotIn("⚠ failed node", text)
+        self.assertIn("…종료 확인", text)
+        self.assertNotIn("⚠ 실패 단계", text)
 
     def test_t3_5_all_done_route_defaults_to_one_line_fold(self):
         # code-test verification.md §10 — a job whose registry row is already `done` NEVER
@@ -336,7 +336,7 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("4/4 nodes", text)
+        self.assertIn("4/4 단계", text)
         self.assertNotIn("plan ✓", text)   # L2 line never emitted — folded to 1 line
         self.assertIn("▸", text)           # collapsed glyph, never the word "folded"/"hidden"
         self.assertNotIn("folded", text)
@@ -377,9 +377,10 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [conductor], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("rt-9fa0fed8", text)          # the real record card IS present
+        self.assertNotIn("rt-9fa0fed8", text)
+        self.assertIn("단계", text)          # the real record card IS present
         self.assertNotIn("no route record", text)   # the conductor must NOT re-appear as degrade
-        self.assertNotIn("v10-conductor", text)     # its bare slug never rendered a 2nd card
+        self.assertEqual(text.count("v10-conductor"), 1)  # work name on one real card
 
     def test_t3_7_active_node_subagent_row_via_pid_join(self):
         conductor = DispatchJob(key="code", slug="v10-sub-conductor", cwd="/x", depth=1,
@@ -412,7 +413,7 @@ class RenderContentTest(ProcessViewEnv):
         toggled = _joined(build_observed_lines([], [conductor, child], section="both",
                                               narrow=False, malformed=0, layout="wide",
                                               term_width=168))
-        self.assertIn("code-plan", toggled)
+        self.assertIn("완료 확인: 계획", toggled)
 
     def test_t3_13_no_overflow_at_60_120_168(self):
         jobs = self._lab_route_jobs()
@@ -433,7 +434,7 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [], section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("no active route", text)
+        self.assertIn("관측된 실행 작업 없음", text)
 
 
 class MouseFoldTest(ProcessViewEnv):
@@ -537,7 +538,7 @@ class MutationCoverageGapTest(ProcessViewEnv):
         self.assertIn(render._ELAPSED_GLYPH + "15m", text)
         # The v10 critic's real worry survives the glyph: the value must stay visibly
         # detached from "n/m nodes" rather than reading as a number glued onto it.
-        self.assertIn("nodes  ", text)
+        self.assertIn("단계  ", text)
 
     def test_demo_seeds_lab_setup_node_as_done(self):
         # M4 — demo._seed_route_evidence() must seed _LAB_RID's `setup` node (not just

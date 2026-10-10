@@ -1367,6 +1367,7 @@ def _record_view(record, route_id, route_jobs, ev_by_node, now, gate_marks_for_r
             })
     result = {"route_id": route_id, "route_hash": record.get("route_hash"), "source": "record",
             "capability": record.get("capability"), "capability_mode": record.get("capability_mode"),
+            "cwd": record.get("cwd"), "slug": record.get("slug"),
             "execution_topology": record.get("execution_topology"),
             "unit_catalog_digest": record.get("unit_catalog_digest"),
             "composed": bool(record.get("composed")),

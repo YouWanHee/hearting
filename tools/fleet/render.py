@@ -36,6 +36,7 @@ import re
 import shlex
 import sys
 import time
+from .display import label as _user_label, project as _user_project
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
@@ -568,13 +569,13 @@ _GLYPH_KEY = {"working": "g_work", "idle": "g_work_off", "unused": "g_unused",
               "blocked": "g_blocked", "done": "green",   # F-60: red, on its own key
               "stale": "g_stale", "dead": "g_dead", "degraded": "lvl_y", "queued": "dim", "unknown": "dim"}
 _INTERACTION_LABEL = {
-    "decision": "question",
-    "approval": "approval",
+    "decision": "답변 필요",
+    "approval": "승인 필요",
     # Claude calls the runtime event a permission prompt while Codex calls the equivalent
     # user gate an approval request. Fleet keeps that producer evidence intact, but presents
     # one user-facing term for the same action.
-    "permission": "approval",
-    "elicitation": "elicit",
+    "permission": "승인 필요",
+    "elicitation": "정보 필요",
 }
 
 # group "cooling" state (user 2026-07-03): a directory with NO active work whose newest session
@@ -1588,7 +1589,7 @@ def _projection_stage_text(entity, max_width=24):
     suffix = ""
     if progress is not None:
         suffix = " %d/%d" % (progress.done, progress.total)
-    return _clip_w("stage %s%s" % (label, suffix), max_width)
+    return _clip_w("단계 %s%s" % (_user_label(label), suffix), max_width)
 
 
 def _spec_phase_seq(entity):
@@ -1665,7 +1666,7 @@ def _session_stage_segs(entity, working, max_width, tag_by_key=None):
         # vocabulary is the code cycle's, so an autopilot-spec session rendered `spec(direct) :
         # exec` — a code-pipeline stage word under a spec capability (observed live). A tag that
         # can contradict its own capability is worse than no tag.
-        name = cap["capability"].replace("autopilot-", "")
+        name = _user_label(cap["capability"].replace("autopilot-", ""))
         knob_items = [k for k in (cap.get("mode"), cap_intensity) if k]
         # User 2026-09-18 ("메인세션에서 라우팅 스킬도 회색인데?"): on a main row this tag is
         # the ONLY sign of the work it is in — no breadcrumb follows it, unlike the owner card
@@ -1673,7 +1674,7 @@ def _session_stage_segs(entity, working, max_width, tag_by_key=None):
         # as the projection fallback below: work hue while working, plain text otherwise; the
         # knobs stay dim.
         segs = [(name, "g_work" if working else None)]
-        if knob_items:
+        if knob_items and _SHOW_ALL:
             segs += [("(", "dim"), ("·".join(knob_items), "dim"), (")", "dim")]
         return segs
     text = _projection_stage_text(entity, max_width=max_width)
@@ -2252,11 +2253,6 @@ def _dispatch_box_width(term_width, layout=None):
     # No-width calls are hermetic component tests, not a real viewport. Keep the
     # historical no-clipping behavior while still returning a deterministic box.
     width = int(term_width) if term_width else 200
-    # A few hermetic truth-table tests deliberately force the wide renderer below
-    # its supported 138-column cutoff. Preserve that component-test behavior; a
-    # real viewport at this width is routed to narrow by `_layout_mode`.
-    if layout == "wide" and term_width and term_width < _TWO_LINE_CUTOFF:
-        width = 200
     # Tinted curses rows gain the outer inset and inner padding in `_addline`, so a
     # raw index lands at screen col `_INSET + _PAD_IN + index` and the tint band's
     # last paintable column is `width - _INSET - 1`. F-68d (user "우측은 시종일관
@@ -2765,6 +2761,15 @@ def _dispatch_stage_label(j):
 
 
 def _opts_segs(j, max_width=None):
+    if not _SHOW_ALL:
+        # Keep internal mode/profile/shape contracts in the existing all/JSON
+        # detail surfaces. The normal row says what the worker is doing.
+        action = _user_label(_entry_skill(j) or getattr(j, "key", None))
+        if _is_owner_mode_row(j):
+            action += " 담당"
+        if max_width is not None:
+            action = _clip_w(action, max_width)
+        return [(action, "name_dim")] if action else [], _dw(action)
     """F-15a options column — HIERARCHICAL dial (user 2026-07-20: "계층적으로
     code (mode inten) / boot 순"). Three axes, three visual levels instead of the flat
     '·' chain that mixed them: the entry skill heads the dial, its behaviour knobs
@@ -4111,7 +4116,7 @@ def _peer_half_segs(entry, direction, tag_by_key, include_kind=True, include_age
     segs = [(arrow, "dim"), (" ", None)] + list(endpoint)
     kind = entry.get("kind") or ""
     if include_kind and kind:
-        segs.append((" · " + kind, "dim"))
+        segs.append((" · " + _user_label(kind), "dim"))
     if include_age:
         segs.append((" · " + fmt_min(entry.get("age_min") or 0), "dim"))
     return segs
@@ -4164,10 +4169,10 @@ def _peer_obligation_strip(obligations=None, term_width=None, depth=0, in_card=F
             counts[kind] = counts.get(kind, 0) + 1
     if not counts:
         return []
-    labels = (("message", "msg"), ("delay", "delay"),
-              ("retire", "retire"), ("watch", "watch"))
+    labels = (("message", "메시지"), ("delay", "예약"),
+              ("retire", "정리"), ("watch", "관찰"))
     parts = [f"{label} {counts[kind]}" for kind, label in labels if counts.get(kind)]
-    segs = [(_conn_indent(depth, in_card), None), ("↻ pending ", "lvl_y")]
+    segs = [(_conn_indent(depth, in_card), None), ("↻ 대기 ", "lvl_y")]
     for index, part in enumerate(parts):
         if index:
             segs.append((" · ", "dim"))
@@ -4956,6 +4961,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         # MAIN, OWNER and FRAME gauges share the fixed model-column anchor;
         # the WHERE word sits at the shared detail inset, without moving NOW.
         segs = _pad_to_column(segs, 4 + _HW)
+    segs.append(("문맥 ", "dim"))
     segs.extend(_gauge_segs(shown_pct, gauge_width, track=track))
     if shown_pct is None:
         value_text = "—"
@@ -4966,6 +4972,8 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     if now_text or exec_segs:
         prefix_width = sum(_dw(text) for text, _key in segs)
         gap = max(_CONTEXT_NOW_GAP, _NAME_COL - prefix_width)
+        if term_width and term_width <= 100:
+            gap = _CONTEXT_NOW_GAP
         total_width = term_width or _SUMMARY_FALLBACK_W
         now_room = max(0, total_width - prefix_width - gap)
         tail = []
@@ -5438,7 +5446,7 @@ def _gpu_resources_for_session(session, resource_index):
 
 
 def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, resource_children=()):
-    """One compact GPU line; optional telemetry and names yield before identities."""
+    """Observed run names stay visible; full argv is controlled by command folds."""
     if not resources:
         return []
     indent = _conn_indent(depth, in_card)
@@ -5454,9 +5462,6 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
     for resource in resources:
         names = []
         seen = set()
-        if _gpu_commands_folded(resource["host"], resource["index"]):
-            labels[id(resource)] = ""
-            continue
         for process in resource.get("processes") or ():
             exact = (process["pid"], process["proc_start"])
             if exact in seen:
@@ -5465,6 +5470,10 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
             command = process["command"]
             name = _gpu_process_label(command)
             if name == command:
+                # Unknown argv has no observed run name. Fold only the full
+                # command; known names stay on the device line in either mode.
+                if _gpu_commands_folded(resource["host"], resource["index"]):
+                    continue
                 name = _gpu_display_command(command)
             if name not in names:
                 names.append(name)
@@ -5510,6 +5519,13 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
         segs = build(resources, model, memory, elapsed, tag)
         if sum(_dw(text) for text, _key in segs) <= width:
             return [segs]
+    if (term_width and term_width <= 100 and 1 < len(resources) <= 4
+            and len(set(labels.values()) - {""}) > 1):
+        # At narrow widths a separate device row preserves each run's identity
+        # better than squeezing all names into indistinguishable fragments.
+        return [line for i, resource in enumerate(resources)
+                for line in _gpu_resource_strip([resource], term_width, depth, in_card,
+                                                resource_children if i == 0 else ())]
     shown = list(resources)
     while len(shown) > 1 and sum(_dw(text) for text, _key in
             build(shown, name_width=0, remaining=len(resources) - len(shown))) > width:
@@ -5783,7 +5799,8 @@ def _gpu_token(gpu, available, show_name=False, sessions=None, index_width=1,
     segs = [(glyph, state_key), (" ", None),
             ("%s: " % index_text.rjust(max(1, index_width)), summary_key)]
     if show_state_word:
-        segs.append((state.ljust(7) + "  ", state_key))
+        word = _user_label(state)
+        segs.append((word + " " * max(0, 7 - _dw(word)) + "  ", state_key))
     fixed_tail_width = 5 + 4 + 7 + vram_slot + 2 + _GPU_CAPACITY_COLUMN_W
     show_model_column = (show_name and
                          sum(_dw(text) for text, _key in segs)
@@ -5978,14 +5995,14 @@ def _route_node_text(n):
     "not passed" mark to render: absence of evidence draws nothing."""
     st = n["state"]
     from . import route
-    nid = route.node_display_label(n)
+    nid = _user_label(route.node_display_label(n))
     unit = n.get("unit")
-    if unit:
+    if unit and _SHOW_ALL:
         nid = "%s[%s]" % (nid, _compact_dispatch_name(unit, _PROFILE_MAX))
     elapsed = n.get("elapsed_min")
     mark = _GATE_MARK if n.get("gate_passed") else ""
     parents = [str(parent) for parent in (n.get("depends_on") or ())]
-    deps = " ←{%s}" % ",".join(parents) if parents else ""
+    deps = " ←{%s}" % ",".join(_user_label(p) for p in parents) if parents else ""
     if st == "done":
         tail = fmt_min(elapsed) if elapsed is not None else ""
         return "%s ✓%s%s" % (nid, tail, deps), "dim", mark
@@ -6000,12 +6017,12 @@ def _route_node_text(n):
         return "%s ●%s%s%s" % (nid, tail, extra, deps), ("g_work" if _BLINK_ON else "g_work_off"), mark
     if st == "reconciling":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
-        return "%s …gate%s%s" % (nid, tail, deps), "lvl_y", mark
+        return "%s …종료 확인%s%s" % (nid, tail, deps), "lvl_y", mark
     if st == "recovering":
         # user 2026-08-13: a crashed attempt with a staged relaunch must not read as ✕. The
         # label names the exact registry reason route.py decided, never a guess made here.
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
-        reason = n.get("note") or "recovery"
+        reason = "복구 대기"
         return "%s …%s%s%s" % (nid, reason, tail, deps), "lvl_y", mark
     if st == "failed":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
@@ -6211,7 +6228,7 @@ def _route_card_l1(tag_bits, rid, done, total, route_elapsed, any_failed, arrow,
     def build(tags, show_elapsed, show_failed):
         segs = [("  " + arrow + " ", "dim"), ("[%s] " % "·".join(tags), "name_dim"),
                 (rid, "lvl_r" if any_failed else "dim"),
-                (" — %d/%d nodes" % (done, total), "dim")]
+                (" — %d/%d 단계" % (done, total), "dim")]
         if show_elapsed and route_elapsed is not None:
             # prd.md:307 wrote this as "<n/m nodes> ⏳<경과>", and the v10 critic's worry
             # was that a bare "  15m" reads as a stray number glued onto "n/m nodes".
@@ -6220,7 +6237,7 @@ def _route_card_l1(tag_bits, rid, done, total, route_elapsed, any_failed, arrow,
             # and `fmt_min`'s spaced units ("5h 20m") are what mark it as a duration.
             segs += [("  " + _ELAPSED_GLYPH, "dim"), (fmt_min(route_elapsed), "dim")]
         if show_failed and any_failed:
-            segs.append((" ⚠ failed node", "lvl_r"))
+            segs.append((" ⚠ 실패 단계", "lvl_r"))
         return segs
 
     ladder = [tag_bits]
@@ -6253,7 +6270,7 @@ def _subagents_for_job(session_by_identity, job):
     return getattr(session, "subagents", None) if session is not None else None
 
 
-def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, resource_owners=()):
+def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, resource_owners=(), display_owner=None):
     """One F-30 card. Returns (out_lines, meta) — meta = {"card_key", "fold_line" (index into
     out_lines of the header row), "job_rows": [(index_into_out_lines, DispatchJob), ...]}. The
     caller (`_build_process_lines`) owns translating these to ABSOLUTE line indices for
@@ -6295,7 +6312,26 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
     # `_TOGGLE_ROWS` (the `a`-toggle map) instead of `_FOLD_ROWS`.
     arrow = "▸" if folded else "▾"
 
-    l1 = _route_card_l1(tag_bits, rid, done, total, route_elapsed, any_failed, arrow, term_width)
+    route_jobs = list(resource_owners) + [n["job"] for n in nodes if n.get("job") is not None]
+    work = display_owner or next((j for j in route_jobs if _is_owner_mode_row(j)), None)
+    work = work or (route_jobs[0] if route_jobs else None)
+    cwd = getattr(work, "cwd", None) or view.get("cwd")
+    title = (getattr(work, "title", None) or getattr(work, "parent_slug", None) or getattr(work, "slug", None)
+             or view.get("slug") or "작업 이름 미확인")
+    parents = [s for s in session_by_identity.values() if work is not None
+               and (getattr(work, "_parent_edge_sid", None) or getattr(work, "parent_sid", None))
+               in [s.session_id, *(getattr(s, "session_aliases", None) or [])]]
+    parent = parents[0] if len(parents) == 1 else None
+    fleet = getattr(parent, "session_tag", None)
+    identity = _user_project(cwd) + (" [%s]" % fleet if fleet else "")
+    # The internal route ID remains in JSON; the fold header names the actual
+    # project/work and responsible Fleet session before optional timing.
+    l1 = _route_card_l1([identity], str(title), done, total, route_elapsed, any_failed, arrow, term_width)
+    if term_width:
+        fixed = _dw("  " + arrow + " [" + identity + "]  — %d/%d 단계" % (done, total))
+        room = max(1, term_width - fixed - 1)
+        l1 = _route_card_l1([identity], _clip_w(str(title), room), done, total,
+                            None, any_failed, arrow, term_width)
 
     out = [l1]
     if folded:
@@ -6338,11 +6374,11 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
         # marker prints its bare name: no-claim, NOT a failure mark.
         gate_bits = [(n["gate"], bool(n.get("gate_passed"))) for n in nodes if n.get("gate")]
         if gate_bits:
-            segs = [("      gates: ", "dim")]
+            segs = [("      완료 확인: ", "dim")]
             for i, (name, passed) in enumerate(gate_bits):
                 if i:
                     segs.append((", ", "dim"))
-                segs.append((name, "dim"))
+                segs.append((_user_label(name), "dim"))
                 if passed:
                     segs.append((_GATE_MARK, "gate_t"))
             out.append(segs)
@@ -6455,7 +6491,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if compute_rows:
         lines.append([(_HFILL, None)])
     lines.append(None)
-    lines.append([("  PROCESS VIEW", "head"), (_RFLUSH, None), ("p group view  ", "head")])
+    lines.append([("  작업 보기", "head"), (_RFLUSH, None), ("p 프로젝트 보기  ", "head")])
 
     session_by_identity = {(s.pid, getattr(s, "proc_start", None)): s
                            for s in sessions if s.pid is not None and s.proc_start is not None}
@@ -6524,9 +6560,10 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
             and not _orphan_resource_groups(resources, ())):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
-        message = ("  loading sessions…" if loading else "  작업 목록 미확인"
-                   if _jobs_unconfirmed(observations) else "  no active route")
+        message = ("  세션 확인 중…" if loading else "  작업 목록 미확인"
+                   if _jobs_unconfirmed(observations) else "  관측된 실행 작업 없음")
         lines.append([(message, "dim")])
+        lines.extend(_reading_legend(term_width))
         return lines
 
     seen_keys = set()
@@ -6539,8 +6576,13 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
             lines.append(None)
         first = False
         base = len(lines)
+        parent_slugs = {getattr(n.get("job"), "parent_slug", None) for n in view.get("nodes", ())}
+        display_owners = [j for j in jobs if getattr(j, "depth", 1) == 1
+                          and (j.slug in parent_slugs
+                               or getattr(getattr(j, "work_projection", None), "route_id", None) == view.get("route_id"))]
         card_lines, meta = _route_card(
             view, session_by_identity, term_width, now, gpu_resources=gpu_resources,
+            display_owner=display_owners[0] if len(display_owners) == 1 else None,
             resource_owners=[j for j in jobs
                              if getattr(getattr(j, "work_projection", None), "route_id", None)
                              == view.get("route_id")
@@ -6611,7 +6653,9 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
             lines.append(None)
         first = False
         name_w = 40 if term_width is None else max(8, min(40, term_width - 6))
-        anchor = [("  ● ", "dim"), (_clip_w(_display_session_subject(s), name_w), "name_dim")]
+        fleet = " [%s]" % s.session_tag if s.session_tag else ""
+        identity = _user_project(s.cwd) + fleet + " · " + _display_session_subject(s)
+        anchor = [("  ● ", "dim"), (_clip_w(identity, name_w), "name_dim")]
         if getattr(s, "model", None):
             anchor.append(("  " + str(s.model), "dim"))
         lines.append(anchor)
@@ -6634,6 +6678,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
               and not (isinstance(k, tuple) and k[:1] == _GPU_FOLD_ALL)]:
         del _ROUTE_FOLD[k]
 
+    lines.extend(_reading_legend(term_width))
     return lines
 
 
@@ -6803,47 +6848,21 @@ def _shown_group_sessions(group_sessions):
 
 
 def _known_parentless_support_job(job):
-    """Purely recognize the one registered route-free support display tuple."""
-    metadata = getattr(job, "_registry_metadata", None)
-    if not isinstance(metadata, dict):
-        return False
-    if not (
-        metadata.get("attempt_schema_version") == "2"
-        and metadata.get("transport") == "headless"
-        and metadata.get("execution_surface") == "registered-headless"
-        and metadata.get("registered_worker") == "1"
-        and metadata.get("dispatch_depth") == "1"
-        and metadata.get("worker_type") == "support"
-        and metadata.get("unit") == "ops/session-tidy-memory"
-        and metadata.get("assigned_contract") == "session-tidy-memory"
-        and not any(metadata.get(key) for key in (
-            "route_file", "route_id", "route_hash", "route_node", "registry_digest",
-            "write_scope", "completion_gate", "owner_route_file", "owner_route_id",
-            "owner_route_hash", "batch_route_id", "batch_route_node",
-        ))
-        and not any(metadata.get(key) for key in (
-            "parent_attempt_id", "parent_sid", "parent_session_id", "parent",
-            "parent_slug", "parent_cwd", "parent_worktree", "parent_managed_dir",
-            "managed_sidecar_log",
-        ))
-    ):
-        return False
-    if not (
-        getattr(job, "registered_worker", False) is True
-        and getattr(job, "worker_type", None) == "support"
-        and getattr(job, "unit", None) == "ops/session-tidy-memory"
-        and getattr(job, "assigned_contract", None) == "session-tidy-memory"
-        and getattr(job, "dispatch_depth", None) == 1
-        and getattr(job, "depth", 1) == 1
-    ):
-        return False
-    return not any((
-        getattr(job, "parent_attempt_id", None), getattr(job, "parent_sid", None),
-        getattr(job, "parent_slug", None), getattr(job, "parent_cwd", None),
-        getattr(job, "parent_managed_dir", None), getattr(job, "is_child", False),
-        getattr(job, "_parent_edge_sid", None), getattr(job, "_parent_edge_promoted_orphan", False),
-        getattr(job, "_parent_edge_confirmed", False),
-    ))
+    """Registered support without a confirmed parent is project support.
+
+    Classification uses the common worker role, never a particular helper/unit.
+    Existing execution parent/route evidence keeps its normal classification.
+    """
+    metadata = getattr(job, "_registry_metadata", None) or {}
+    return (getattr(job, "registered_worker", False)
+            and getattr(job, "worker_type", None) == "support"
+            and not any(getattr(job, key, None) for key in (
+                "parent_sid", "parent_slug", "parent_cwd", "parent_attempt_id",
+                "parent_managed_dir", "route_id", "owner_route_id"))
+            and not any(metadata.get(key) for key in (
+                "parent_sid", "parent_session_id", "parent", "parent_slug", "parent_cwd",
+                "parent_worktree", "parent_attempt_id", "parent_managed_dir", "managed_sidecar_log",
+                "route_id", "route_file", "owner_route_id", "owner_route_file")))
 
 
 def _classify_group_jobs(name, group_jobs, shown):
@@ -7116,6 +7135,38 @@ def _observation_lines(observations, term_width=None):
 
 
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
+                 term_width=None, live_order=None, resources=None, usage_snapshots=None,
+                 governor=_IO_UNSET, loading=False, node_evidence=None,
+                 route_entities=None, observations=None, resource_diagnostics=None):
+    """One cell budget for plain output and curses, preserving row/map indexes."""
+    if term_width and layout == "wide" and term_width < _TWO_LINE_CUTOFF:
+        layout = "stack" if term_width < _NARROW_CUTOFF else "narrow"
+    lines = _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout, memory,
+                                    term_width, live_order, resources, usage_snapshots, governor, loading,
+                                    node_evidence=node_evidence, route_entities=route_entities,
+                                    observations=observations, resource_diagnostics=resource_diagnostics)
+    if term_width is None:
+        return lines
+    width = max(1, term_width - 1)  # curses reserves its rightmost cell
+    bounded = []
+    for line in lines:
+        if line is None:
+            bounded.append(None)
+            continue
+        out, used = [], 0
+        for text, key in line:
+            if _is_fill(text):
+                out.append((text, key))
+                continue
+            piece = _clip_w(text, max(0, width - used), ellipsis="")
+            if piece:
+                out.append((piece, key))
+                used += _dw(piece)
+        bounded.append(out)
+    return bounded
+
+
+def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
                  term_width=None, live_order=None, resources=None, usage_snapshots=None,
                  governor=_IO_UNSET, loading=False, node_evidence=None,
                  route_entities=None, observations=None, resource_diagnostics=None):
@@ -7860,6 +7911,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             else:
                 _emit_dispatch_tree(oj, orphan=show_sessions)
         for lj in _sort_group_jobs(loops_jobs):
+            if getattr(lj, "worker_type", None) == "support":
+                lines.append(None)
+                lines.append([("  프로젝트 지원 작업", "dim")])
             _emit_dispatch_tree(lj, orphan=False)
         # F-80 L2c: a grace-held edge stays a standalone tree row in the SAME group, no
         # `(orphan)` marker, no divider — nesting under the parent is unavailable because
@@ -7935,8 +7989,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # when this build actually used them (_seen_glyphs, tracked above — local, not global).
     lines.append(None)
     legend = [
-        ("  ", None), ("⠹", "g_spin"), (" working   ", "dim"),
-        ("●", "g_work_off"), (" idle   ", "dim"),
+        ("  세션: ", None), ("⠹", "g_spin"), (" 작업 중   ", "dim"),
+        ("●", "g_work_off"), (" 대기   ", "dim"),
     ]
     if "unused" in _seen_glyphs:
         legend += [(_LIVE_GLYPH["unused"], "g_unused"), (" unused   ", "dim")]
@@ -7978,8 +8032,19 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # F-9(d) `~ derived/inherited value` retired with the marker itself (user 2026-07-16:
     # inherited effort now shows plain — the tilde read as noise).
     lines.extend(_wrap_legend(legend, term_width))
+    lines.extend(_reading_legend(term_width, session=False))
 
     return lines
+
+
+def _reading_legend(term_width, session=True):
+    rows = []
+    if session:
+        rows.extend(_wrap_legend([("  세션: ", "dim"), ("⠹ 작업 중  ● 대기  ◑ 입력 대기", "dim")], term_width))
+    for text in ("  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량",
+                 "  단계: ● 현재  ✓ 완료  ✕ 실패  ○ 예정 · 문맥 %는 대화 사용량"):
+        rows.extend(_wrap_route_node("", text, "dim", "", term_width, continuation="  "))
+    return rows
 
 
 def _wrap_legend(legend, term_width):
@@ -8823,28 +8888,30 @@ _PROCESS_HINT_MIN_WIDTH = 80  # F-30 (v10) — the base footer is already tight 
 
 
 def _footer_segs(select_mode, parts, width=None):
-    hint = [("click", "hdr_key"), (" row · ", "hdr_bar")] \
-        if width is not None and width >= _MOUSE_HINT_MIN_WIDTH else []
-    p_hint = [("p", "hdr_key"), (" %s · " % ("group" if _PROCESS_VIEW else "process"), "hdr_bar")] \
-        if width is None or width >= _PROCESS_HINT_MIN_WIDTH else []
+    """Fit every keyboard control before optional layout/mouse/runtime detail."""
     if select_mode:
-        return [(" ", "hdr_bar"),
-                ("↑↓/jk", "hdr_key"), (" move · ", "hdr_bar"),
-                ("x", "hdr_key"), (" kill · ", "hdr_bar"),
-                ("Esc", "hdr_key"), (" cancel · ", "hdr_bar"),
-                ("q", "hdr_key"), (" quit", "hdr_bar"),
-                (_RFLUSH, None), (" ".join(parts) + " " if parts else "", "hdr_bar")]
-    wlbl = "wide/narrow/stack" if _LAYOUT == "auto" else ("%s!" % _LAYOUT)
-    return [(" ", "hdr_bar"),
-            ("q", "hdr_key"), (" quit · ", "hdr_bar"),
-            ("r", "hdr_key"), (" refresh · ", "hdr_bar"),
-            ("a", "hdr_key"), (" all · ", "hdr_bar"),
-            ("c", "hdr_key"), (" GPU cmd · ", "hdr_bar"),
-            ("w", "hdr_key"), (" " + wlbl + " · ", "hdr_bar")] + p_hint + hint + [
-            ("jk", "hdr_key"), (" scroll · ", "hdr_bar"),
-            ("s", "hdr_key"), (" select · ", "hdr_bar"),
-            ("g/G", "hdr_key"), (" top/end", "hdr_bar"),
-            (_RFLUSH, None), (" ".join(parts) + " " if parts else "", "hdr_bar")]
+        keys = [("↑↓/jk", "이동"), ("x", "종료"), ("Esc", "취소"), ("q", "닫기")]
+    else:
+        keys = [("q", "닫기"), ("r", "갱신"), ("a", "전체"), ("c", "명령"),
+                ("w", "폭"), ("p", "보기"), ("jk", "이동"), ("s", "선택"), ("g/G", "끝")]
+    budget = max(1, width - 1) if width else 200
+    def build(labels=True):
+        segs = [(" ", "hdr_bar")]
+        for i, (key, meaning) in enumerate(keys):
+            if i:
+                segs.append((" ", "hdr_bar"))
+            segs.append((key, "hdr_key"))
+            if labels:
+                segs.append((":" + meaning, "hdr_bar"))
+        return segs
+    segs = build()
+    if sum(_dw(t) for t, _k in segs) > budget:
+        segs = build(False)
+    for extra in (["클릭 선택"] if width and width >= _MOUSE_HINT_MIN_WIDTH else []) + list(parts):
+        text = " · " + str(extra)
+        if sum(_dw(t) for t, _k in segs) + _dw(text) <= budget:
+            segs.append((text, "hdr_bar"))
+    return segs
 
 
 def reset_scroll():

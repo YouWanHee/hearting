@@ -137,6 +137,16 @@ def resolve_parent_edges(sessions, jobs):
     managed_parents = model.unique_managed_parents(sessions)
     for j in jobs:
         parent_sid = getattr(j, "parent_sid", None)
+        if not parent_sid and getattr(j, "caller_sid", None):
+            # Caller identity is observational: an exact SID or a verified session
+            # continuation may link it. A pane/cwd alone never selects another user.
+            caller_sid, harness = j.caller_sid, getattr(j, "caller_harness", None)
+            candidates = [s for s in sessions if harness == s.harness
+                          and caller_sid in [s.session_id, *(getattr(s, "session_aliases", None) or [])]
+                          and model.session_parent_visible(s) and not getattr(s, "is_child", False)]
+            j._parent_edge_sid = candidates[0].session_id if len(candidates) == 1 else None
+            j._parent_edge_promoted_orphan = False
+            continue
         if not (getattr(j, "is_child", False) and parent_sid):
             continue
         parent_sid, parent_harness = _effective_job_parent(j)

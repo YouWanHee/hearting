@@ -208,6 +208,11 @@ the pane selection and recorded conversation continuity once; title, state and
 context consume that same result. Conflicting identities and absent work bindings
 stay unknown rather than borrowing a neighboring transcript or artifact directory.
 Routine ledger folding preserves the recorded native transition direction.
+The normal view retains observed run/configuration names and explains session,
+device and stage symbols separately. Names, current actions and controls share
+the terminal's width budget; internal identifiers belong in detail. Support
+work carries its caller's observed session/seat independently of execution and
+delivery authority, and is labelled project support when that link is unproven.
 
 ## Basis and current scope
 

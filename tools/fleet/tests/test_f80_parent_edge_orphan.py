@@ -339,15 +339,15 @@ class RenderConsumesLedgerTest(unittest.TestCase):
                 self.assertNotIn(job, classified["loops_jobs"])
                 self.assertIn(job, classified["orphans"])
 
-    def test_support_requires_actual_registry_metadata(self):
+    def test_support_role_uses_project_support_without_specific_unit_tuple(self):
         job = DispatchJob(
             key="support", slug="unverified", worker_type="support",
             unit="ops/session-tidy-memory", assigned_contract="session-tidy-memory",
             registered_worker=True, dispatch_depth=1, depth=1,
         )
         classified = render._classify_group_jobs("jobs", [job], [])
-        self.assertNotIn(job, classified["loops_jobs"])
-        self.assertIn(job, classified["orphans"])
+        self.assertIn(job, classified["loops_jobs"])
+        self.assertNotIn(job, classified["orphans"])
 
     def test_grace_held_edge_renders_without_orphan_marker(self):
         # Parent is filtered off-screen (stale) this tick, but the ledger confirmed the

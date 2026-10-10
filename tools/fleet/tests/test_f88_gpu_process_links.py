@@ -308,7 +308,8 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
             text = [render._plain(row) for row in rows]
             self.assertTrue(all(render._dw(line) <= width for line in text))
             joined = "\n".join(text)
-            self.assertEqual(len(text), 1)
+            self.assertGreaterEqual(len(text), 1)
+            self.assertLessEqual(len(text), 2)
             self.assertEqual(joined.count("GPU moving4:0"), 1)
             self.assertEqual(joined.count("GPU moving4:1"), 1)
             if width >= 100:
@@ -316,8 +317,10 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                 self.assertIn("(M3_9 학습)", joined)
             self.assertNotIn("other.py", "\n".join(text))
         narrow = [render._plain(row) for row in render._gpu_resource_strip(linked, 60)]
-        self.assertEqual(len(narrow), 1)
-        self.assertNotIn(" GB", narrow[0])
+        self.assertEqual(len(narrow), 2)
+        self.assertTrue(all(render._dw(row) <= 60 for row in narrow))
+        for name in ("M6 학습", "M3_9 학습"):
+            self.assertIn(name, "\n".join(narrow))
         wide = render._plain(render._gpu_resource_strip(linked, 168)[0])
         self.assertIn("12 GB", wide)
         self.assertIn("9.8 GB", wide)
