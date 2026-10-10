@@ -109,7 +109,11 @@ class ObligationStoreTest(unittest.TestCase):
     def test_supported_observer_keeps_its_pid_and_same_lock(self):
         self._check_observer_handoff(supported=True)
 
-    def _check_observer_handoff(self, supported):
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_a_legacy_observer_keeps_its_pid_while_current_runner_starts(self):
+        self._check_observer_handoff(supported=False, legacy=True)
+
+    def _check_observer_handoff(self, supported, legacy=False):
         duty = self.store.create("registered-batch-fixture", "registered-batch",
                                  {"session_id": "parent"}, {"carrier": "claude-parent-runtime"})
         prior = self.store.create("message-fixture", "message", {"session_id": "other"}, {"ref": "old"})
@@ -118,7 +122,7 @@ class ObligationStoreTest(unittest.TestCase):
         if supported:
             source = "def _resume_registered_obligation(): pass\n" + source
         script.write_text(source)
-        lock_path = self.store.root / "runner.lock"
+        lock_path = self.store.root / ("runner.lock" if legacy else obligations.RUNNER_LOCK_NAME)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         process = subprocess.Popen([sys.executable, str(script), "__obligation-runner",
@@ -130,7 +134,12 @@ class ObligationStoreTest(unittest.TestCase):
             with mock.patch.object(obligations.subprocess, "Popen") as spawned, \
                     mock.patch.object(obligations, "_RUNNERS", []):
                 self.assertTrue(obligations.ensure_runner(self.root))
-                if supported:
+                if legacy:
+                    self.assertIsNone(process.poll())
+                    spawned.assert_called_once()
+                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
+                    self.assertNotEqual(lock_path.name, obligations.RUNNER_LOCK_NAME)
+                elif supported:
                     self.assertIsNone(process.poll())
                     spawned.assert_not_called()
                 else:
