@@ -3196,6 +3196,36 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
             self.idle()
             self.assertEqual(len(self.messages), 1)
 
+    def test_current_runner_delivers_after_draft_clears_without_idle_callback(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        meta = "attempt_id=att-child,parent_sid=sid-child,parent_harness=claude"
+        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
+        self.screen = RULE + "\n❯ existing user draft\n" + RULE + "\n"
+        with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                        ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
+            self.assertEqual(self.prompt("original event-free retry"), 3)
+            ref = self._all_records()[-1]["transfer_ref"]
+            original = peer_steward.peer_message._read_pending(ref)
+            store = peer_steward.peer_obligations.ObligationStore()
+            with (store.root / "runner.lock").open("w") as legacy, \
+                 (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as current:
+                fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(current, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                peer_steward.cmd_ensure_obligations(SimpleNamespace())
+                self.assertEqual(self.messages, [])
+
+                def clear_draft(_delay):
+                    self.assertEqual(self.keys, [])
+                    self.screen = CLAUDE_EMPTY
+
+                with mock.patch.object(peer_steward.time, "sleep", side_effect=clear_draft):
+                    self.assertEqual(peer_steward.cmd_obligation_runner(
+                        SimpleNamespace(state_root=self.tmp_root, lock_fd=current.fileno())), 0)
+            self.assertEqual(self.messages, [original["text"]])
+            received = peer_steward.peer_message._read_pending(ref)
+            self.assertEqual(received["state"], "received")
+            self.assertEqual(received["body_sha256"], original["body_sha256"])
+
     def idle(self):
         # Run the actual existing receive callback entry, with native identity
         # isolated to this fixture. Its internal claims/acks are not mocked.
@@ -3216,7 +3246,7 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(self.messages, [])
 
         self.screen = CLAUDE_EMPTY
-        lock_path = store.root / "runner.lock"
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             with mock.patch.object(peer_steward.time, "sleep"), mock.patch("builtins.print"):
@@ -4911,9 +4941,30 @@ class _RetireWorld:
 
 
 class RetireTest(_TmpRootMixin, unittest.TestCase):
+    def test_current_runner_leaves_retire_untouched_while_legacy_runner_is_live(self):
+        world = _RetireWorld(status="working")
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.list()[0]
+        world.status = "idle"
+        with (store.root / "runner.lock").open("w") as legacy, \
+             (store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME).open("w") as current:
+            fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(current, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(peer_steward, "_resume_retire_obligation") as resume, \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=InterruptedError("fixture")):
+                with self.assertRaises(InterruptedError):
+                    peer_steward.cmd_obligation_runner(
+                        SimpleNamespace(state_root=self.tmp_root, lock_fd=current.fileno()))
+                resume.assert_not_called()
+        self.assertEqual(store.get(duty["id"]), duty)
+        self.assertEqual(world.actions(), [])
+        self._run_retire_runner(world)
+        self.assertEqual(store.get(duty["id"])["state"], "complete")
+
     def _run_retire_runner(self, world, crash_phase=None):
         store = peer_steward.peer_obligations.ObligationStore()
-        lock_fd = os.open(store.root / "runner.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        lock_fd = os.open(store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         original_stat = os.stat
         clock = iter(range(100))
@@ -5096,7 +5147,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(duty["state"], "pending")
 
         world.status = "idle"
-        lock_path = store.root / "runner.lock"
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
         lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         original_stat = os.stat
         clock = iter(range(100))

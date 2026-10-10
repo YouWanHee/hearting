@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import json
 import os
@@ -32,6 +33,34 @@ class ObligationStoreTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_current_runner_starts_once_while_legacy_runner_lock_is_held(self):
+        self.store.create("message-reconnect", "message", {"session_id": "parent"},
+                          {"ref": "a" * 32})
+        with (self.store.root / "runner.lock").open("w") as legacy, \
+             mock.patch.object(obligations.subprocess, "Popen") as spawn:
+            fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(obligations.ensure_runner(self.root))
+            spawn.assert_called_once()
+            argv = spawn.call_args.args[0]
+            self.assertEqual(argv[-2:], ["--state-root", str(self.root)])
+            with (self.store.root / obligations.RUNNER_LOCK_NAME).open("w") as current:
+                fcntl.flock(current, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(obligations.ensure_runner(self.root))
+                spawn.assert_called_once()
+
+    def test_retire_lock_waits_for_legacy_and_releases_after_processing_error(self):
+        self.store.root.mkdir(parents=True)
+        with (self.store.root / "runner.lock").open("w") as legacy:
+            fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with obligations.legacy_runner_lock(self.store) as acquired:
+                self.assertFalse(acquired)
+        with self.assertRaisesRegex(RuntimeError, "fixture"):
+            with obligations.legacy_runner_lock(self.store) as acquired:
+                self.assertTrue(acquired)
+                raise RuntimeError("fixture")
+        with obligations.legacy_runner_lock(self.store) as acquired:
+            self.assertTrue(acquired)
 
     def test_create_is_idempotent_and_keeps_body_out_of_duty_record(self):
         intent = {"ref": "a" * 32, "body_digest": "b" * 64}

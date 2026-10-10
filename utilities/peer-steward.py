@@ -3742,7 +3742,7 @@ def cmd_obligation_runner(args):
     store = peer_obligations.ObligationStore(args.state_root)
     try:
         lock_target = Path(os.path.realpath(os.readlink(f"/proc/self/fd/{args.lock_fd}")))
-        if lock_target != (store.root / "runner.lock").resolve():
+        if lock_target != (store.root / peer_obligations.RUNNER_LOCK_NAME).resolve():
             return 70
         os.fstat(args.lock_fd)
     except (OSError, ValueError, TypeError):
@@ -3758,7 +3758,9 @@ def cmd_obligation_runner(args):
                         ("message-", "delay-")):
                     _resume_message_obligation(duty, store)
                 elif duty.get("intent", {}).get("kind") == "retire":
-                    _resume_retire_obligation(duty, store)
+                    with peer_obligations.legacy_runner_lock(store) as acquired:
+                        if acquired:
+                            _resume_retire_obligation(duty, store)
             except Exception:
                 try:
                     store.update(duty["id"], observer_error="observer-unavailable")

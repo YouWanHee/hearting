@@ -593,9 +593,12 @@ Peer input uses the same policy with an input purpose: a parent's idle native
 turn can receive messages while its registered children continue. Only work
 executed by that pane withholds input; exact foreground attempt tags distinguish
 execution from parent or handover bindings. Completion watches and retire keep
-all bindings. After installation, the existing reconnect callback retries accepted
-message duties with the activated code, even while an older runner holds its lock;
-the sealed transfer claim and receipt still prevent duplicate submission.
+all bindings. After installation, the existing reconnect callback resumes accepted
+message duties with the activated code and keeps retrying after a form or draft clears,
+even while a legacy runner holds its lock. One current runner uses a stable lock;
+the sealed transfer claim and receipt still prevent duplicate submission. Retire
+processing also holds the legacy runner lock, so the two generations cannot perform
+session cleanup together. No runner is interrupted to reconnect message delivery.
 Non-completion conditions such as working retain their native watch meaning.
 Duplicate watch requests resolve the current server/pane/harness/session before
 reusing a duty; a new session gets a separate duty while the old one is preserved.

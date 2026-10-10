@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -24,6 +25,7 @@ from dispatch_attempt_policy import (
 )
 
 SCHEMA_VERSION = 1
+RUNNER_LOCK_NAME = "runner-current.lock"
 _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
@@ -247,7 +249,9 @@ def ensure_runner(root: str | Path | None = None) -> bool:
     store = ObligationStore(root)
     if not store.list():
         return False
-    lock_path = store.root / "runner.lock"
+    # Legacy runners can remain alive through a long registered child. Their
+    # message claims still serialize transport; do not interrupt an in-flight send.
+    lock_path = store.root / RUNNER_LOCK_NAME
     store.root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if lock_path.is_symlink():
         raise ObligationError("peer-obligation-runner-lock-symlink")
@@ -268,6 +272,22 @@ def ensure_runner(root: str | Path | None = None) -> bool:
         return True
     except (OSError, subprocess.SubprocessError):
         return False
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def legacy_runner_lock(store: ObligationStore):
+    """Serialize retire side effects with a runner from before input separation."""
+    path = store.root / "runner.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
     finally:
         os.close(fd)
 
