@@ -316,7 +316,7 @@ class F52WidthLedgerTest(unittest.TestCase):
                 self.assertLessEqual(render._dw(visible), width)
                 self.assertEqual(render._dw(visible[:visible.index("herdr")]),
                                  render._CONTEXT_INDENT_W)
-                self.assertEqual(render._dw(visible[:visible.index("NOW")]), render._NAME_COL)
+                self.assertEqual(render._dw(visible[:visible.index("대기")]), render._NAME_COL)
 
     def test_legend_gained_no_new_entry(self):
         """F-12(c): the lead cell is a STATE mark, already covered by the state legend — the

@@ -547,6 +547,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         # This joins already observed exact child fields without further IO.
         # NOW/context/exec must be available in the basic snapshot too.
         _adopt_child_titles(sessions, jobs)
+        from .. import titles
+        titles.annotate(sessions + jobs)
     except Exception:
         pass
 

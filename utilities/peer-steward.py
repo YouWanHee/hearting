@@ -1680,11 +1680,16 @@ def _retire_pane_info(pane, timeout=5):
         return None
 
 
-def _retire_foreground(pane, harness):
+def _retire_foreground(pane, harness, *, strict=True):
     info = _retire_pane_info(pane)
-    if info is None or len(info["foreground_processes"]) != 1:
+    if info is None or (strict and len(info["foreground_processes"]) != 1):
         return None
-    item = info["foreground_processes"][0]
+    leaders = [item for item in info["foreground_processes"]
+               if isinstance(item, dict)
+               and item.get("pid") == info["foreground_process_group_id"]]
+    if len(leaders) != 1:
+        return None
+    item = leaders[0]
     pid = item.get("pid") if isinstance(item, dict) else None
     argv = item.get("argv") if isinstance(item, dict) else None
     if (type(pid) is not int or pid <= 0 or pid == info["shell_pid"]
@@ -1733,10 +1738,55 @@ def _retire_target(target):
                 "name": target, "pane": "-"}, 4, "herdr-protocol-error")
 
 
-def _retire_request(target, ident):
+def _retire_request_identity(ident, foreground):
     exact = {"server": _HERDR_SESSION or "default", "pane": ident["pane"],
              "harness": ident["harness"], "session_id": ident["session_id"],
-             "name": ident["name"]}
+             "name": ident["name"], "foreground": foreground}
+    return exact
+
+
+def _retire_booked_foreground(duty):
+    intent = duty.get("intent") or {}
+    original = (intent.get("identity") or {}).get("foreground")
+    observation = duty.get("observation") or {}
+    if not original and observation.get("phase") in {"exit-requested", "shell-returned"}:
+        # An older release recorded the exact lifetime when it sent the exit.
+        original = observation.get("foreground")
+    return original
+
+
+def _retire_subject_state(duty):
+    """The booked agent's kernel lifetime, never the pane's current occupant."""
+    original = _retire_booked_foreground(duty)
+    if not isinstance(original, dict) or not original.get("pid") or not original.get("start"):
+        return "unknown"
+    current = _retire_process_record(original["pid"])
+    start = current["start"] if current is not None else _proc_start_ticks(original["pid"])
+    if start is not None:
+        return "same" if start == original["start"] else "gone"
+    try:
+        os.stat(f"/proc/{original['pid']}")
+    except FileNotFoundError:
+        return "gone"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _complete_gone_retire(store, duty):
+    phase = (duty.get("observation") or {}).get("phase", "waiting")
+    settled = store.update(duty["id"], state="complete", result="target-already-gone",
+                           delivery="completed", cleanup="complete", expected_phases={phase},
+                           observation={"phase": "complete", "reason": "target-already-gone"})
+    if settled.get("state") == "complete":
+        ident = (duty.get("intent") or {}).get("identity") or {}
+        print(f"retired=true reason=target-already-gone agent={ident.get('harness', '-')} "
+              f"name={ident.get('name', '-')} pane={ident.get('pane', '-')}")
+        return True
+    return False
+
+
+def _retire_request(target, exact):
     duty_id = peer_obligations.stable_duty_id("retire", exact, target)
     own_sid, own_harness = _current_session_identity()
     store = peer_obligations.ObligationStore()
@@ -1764,6 +1814,8 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
             and _proc_start_ticks(foreground.get("shell_pid")) == foreground.get("shell_start")
         )
         if not still_exact or not _retire_shell_returned(info, foreground):
+            if info is not None and _retire_subject_state(duty) == "gone":
+                return 0 if _complete_gone_retire(store, duty) else 1
             current = store.get(duty["id"]) or duty
             observation = {**(current.get("observation") or {}),
                            "phase": "shell-returned", "reason": "shell-return-unverified"}
@@ -1774,6 +1826,8 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
         if (not final_info or final_info.get("shell_pid") != foreground.get("shell_pid")
                 or _proc_start_ticks(foreground.get("shell_pid")) != foreground.get("shell_start")
                 or not _retire_shell_returned(final_info, foreground)):
+            if final_info is not None and _retire_subject_state(duty) == "gone":
+                return 0 if _complete_gone_retire(store, duty) else 1
             return 1
         requester = (duty.get("intent") or {}).get("requester") or {}
         predecessor = {"harness": ident["harness"], "session_id": ident["session_id"],
@@ -1809,6 +1863,8 @@ def _resume_retire_obligation(duty, store):
     target = intent.get("target") or ""
     observation = duty.get("observation") or {}
     phase = observation.get("phase", "waiting")
+    if duty.get("state") in {"complete", "cancelled"}:
+        return
     if phase == "shell-returned":
         foreground = observation.get("foreground") or {}
         if foreground:
@@ -1827,6 +1883,8 @@ def _resume_retire_obligation(duty, store):
                     state="cleanup-pending", extra={"foreground": foreground})
                 if claimed:
                     _finish_retire_cleanup(store, claimed, ident, foreground)
+            elif info is not None and _retire_subject_state(duty) == "gone":
+                _complete_gone_retire(store, duty)
             else:
                 store.update(duty["id"], state="pending",
                              expected_phases={"exit-requested"},
@@ -1838,9 +1896,18 @@ def _resume_retire_obligation(duty, store):
     old_server = _HERDR_SESSION
     _HERDR_SESSION = None if server == "default" else server
     try:
+        subject = _retire_subject_state(duty)
+        if subject == "gone":
+            _complete_gone_retire(store, duty)
+            return
+        if subject == "unknown":
+            store.update(duty["id"], state="unknown", expected_phases={"waiting"},
+                         observation={"phase": "waiting", "reason": "foreground-unverified"})
+            return
         state, observed, _code, reason = _retire_target(target)
         if (reason or observed.get("harness") != ident.get("harness")
-                or observed.get("session_id") != ident.get("session_id")
+                or (ident.get("session_id") != "-"
+                    and observed.get("session_id") != ident.get("session_id"))
                 or observed.get("pane") != ident.get("pane")):
             store.update(duty["id"], state="unknown",
                          expected_phases={"waiting"},
@@ -1848,7 +1915,7 @@ def _resume_retire_obligation(duty, store):
             return
         readiness = _pane_readiness(target, state,
                                     expected_harness=ident["harness"],
-                                    expected_sid=ident["session_id"])
+                                    expected_sid=observed["session_id"])
         if readiness.state != "ready":
             store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
                          expected_phases={"waiting"},
@@ -1917,9 +1984,8 @@ def cmd_retire(args):
     if duty is None:
         if getattr(args, "_resume_request_id", None):
             return finish("retire-obligation-missing", pending=True)
-        exact = {"server": _HERDR_SESSION or "default", "pane": pane,
-                 "harness": harness, "session_id": ident["session_id"],
-                 "name": ident["name"]}
+        foreground = _retire_foreground(pane, harness, strict=False)
+        exact = _retire_request_identity(ident, foreground)
         existing_id = peer_obligations.stable_duty_id("retire", exact, target)
         duty = store.get(existing_id)
         if duty is not None:
@@ -1931,13 +1997,29 @@ def cmd_retire(args):
             # A repeated request retries a still-waiting duty now; the phase
             # claim below keeps the exit key single with the background runner.
         else:
-            store, duty = _retire_request(target, ident)
+            store, duty = _retire_request(target, exact)
             duty_id = duty["id"]
     else:
         duty_id = duty["id"]
+    if duty.get("state") == "complete":
+        print(f"retired=true reason=already-complete agent={harness} "
+              f"name={ident['name']} pane={pane}")
+        return 0
     phase = (duty.get("observation") or {}).get("phase", "waiting")
     if phase != "waiting":
         return finish("retire-already-pending", pending=True)
+    subject = _retire_subject_state(duty)
+    if subject == "gone":
+        if _complete_gone_retire(store, duty):
+            return 0
+        return finish("retire-already-pending", pending=True)
+    if subject == "unknown":
+        return finish("foreground-unverified", pending=True)
+    booked = (duty.get("intent") or {}).get("identity") or {}
+    if (booked.get("pane") != pane or booked.get("harness") != harness
+            or (booked.get("session_id") != "-"
+                and booked.get("session_id") != ident["session_id"])):
+        return finish("target-changed", pending=True)
     if reason or state not in {"idle", "done"}:
         return finish(reason or f"agent-{state}", pending=True)
     readiness = _pane_readiness(target, state, expected_harness=harness,
@@ -1947,6 +2029,8 @@ def cmd_retire(args):
     identity = _retire_foreground(pane, harness)
     if identity is None:
         return finish("foreground-unverified", pending=True)
+    if identity != _retire_booked_foreground(duty):
+        return finish("foreground-changed", pending=True)
     state2, ident2, _, _ = _retire_target(target)
     if state2 not in ("idle", "done") or ident2 != ident:
         return finish("target-changed", pending=True)
@@ -1963,8 +2047,8 @@ def cmd_retire(args):
         return finish("retire-duty-already-claimed", pending=True)
     duty = claimed
     try:
-        for index, (operation, value) in enumerate(_RETIRE_ACTIONS[harness]):
-            if index and _retire_foreground(pane, harness) != identity:
+        for operation, value in _RETIRE_ACTIONS[harness]:
+            if _retire_foreground(pane, harness) != identity:
                 return finish("foreground-changed", pending=True)
             sent = subprocess.run(_herdr_argv("pane", operation, pane, value),
                                   capture_output=True, text=True, timeout=5)
@@ -3291,7 +3375,8 @@ def _prompt_form_open(target, state_before):
     return _bottom_form_tokens(target)
 
 
-def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None):
+def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
+                    purpose="completion"):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session. The session the
@@ -3322,14 +3407,19 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
             and (expected_sid is None or sid == expected_sid)
             and (expected_pane is None or pane == expected_pane)
         )
-        bound, binding_state = (((), "observed") if unbound else
-                                peer_obligations.bound_work_for_pane(pane or "", harness or "", sid or ""))
+        execution_ids = peer_obligations.execution_attempts_for_processes(
+            info.get("foreground_processes", ()) if isinstance(info, dict) else ())
+        bound, binding_state = (((), "observed") if unbound and not execution_ids else
+                                peer_obligations.bound_work_for_pane(
+                                    pane or "", harness or "", sid or "",
+                                    execution_attempt_ids=execution_ids))
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
             identity_verified=exact, native_turn=observed_state,
             bound_work=bound, bindings_state=binding_state,
             provenance=(("target", target), ("observed_state", observed_state)),
+            purpose=purpose,
         )
     except Exception:
         return peer_obligations.pane_readiness(
@@ -3341,7 +3431,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
 
 def _prompt_input_reason(target, harness, state):
     """Withhold keyboard input when a form, draft or unreadable box is present."""
-    readiness = _pane_readiness(target, state, expected_harness=harness)
+    readiness = _pane_readiness(target, state, expected_harness=harness, purpose="input")
     if readiness.state == "unknown":
         return readiness.reason
     if readiness.reason.startswith("bound-registered-work") and readiness.state != "ready":
@@ -3615,7 +3705,7 @@ def _resume_message_obligation(duty, store):
             return
         readiness = _pane_readiness(target, state,
                                     expected_harness=recipient.get("harness"),
-                                    expected_sid=recipient.get("session_id"))
+                                    expected_sid=recipient.get("session_id"), purpose="input")
         if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
             if readiness.state != "ready":
                 store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
@@ -3652,7 +3742,7 @@ def cmd_obligation_runner(args):
     store = peer_obligations.ObligationStore(args.state_root)
     try:
         lock_target = Path(os.path.realpath(os.readlink(f"/proc/self/fd/{args.lock_fd}")))
-        if lock_target != (store.root / "runner.lock").resolve():
+        if lock_target != (store.root / peer_obligations.RUNNER_LOCK_NAME).resolve():
             return 70
         os.fstat(args.lock_fd)
     except (OSError, ValueError, TypeError):
@@ -3668,7 +3758,9 @@ def cmd_obligation_runner(args):
                         ("message-", "delay-")):
                     _resume_message_obligation(duty, store)
                 elif duty.get("intent", {}).get("kind") == "retire":
-                    _resume_retire_obligation(duty, store)
+                    with peer_obligations.legacy_runner_lock(store) as acquired:
+                        if acquired:
+                            _resume_retire_obligation(duty, store)
             except Exception:
                 try:
                     store.update(duty["id"], observer_error="observer-unavailable")
@@ -3682,6 +3774,15 @@ def cmd_ensure_obligations(_args):
     """Reconnect accepted peer duties from an existing harness lifecycle callback."""
     try:
         _ensure_watch_observers()
+        # Reconnect with the activated code, even if an older runner is still
+        # holding its lock. Existing transfer claims serialize submission.
+        store = peer_obligations.ObligationStore()
+        for duty in store.list():
+            if duty.get("intent", {}).get("kind") == "message":
+                try:
+                    _resume_message_obligation(duty, store)
+                except Exception:
+                    store.update(duty["id"], observer_error="observer-unavailable")
         peer_obligations.ensure_runner()
         dispatch_batch_obligations.ensure_observers()
     except Exception:
@@ -3708,7 +3809,8 @@ def receiver_idle(recipient, pane, *, peer=True):
     state, _pane = _agent_state(pane)
     if (current_harness, current_sid) != (harness, sid) or state not in {"idle", "done"}:
         return
-    readiness = _pane_readiness(pane, state, expected_harness=harness, expected_sid=sid)
+    readiness = _pane_readiness(pane, state, expected_harness=harness, expected_sid=sid,
+                                purpose="input")
     if readiness.state != "ready":
         return
     with contextlib.redirect_stdout(sys.stderr):

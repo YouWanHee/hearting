@@ -55,7 +55,7 @@ class DerivedTagTest(unittest.TestCase):
 
 class TagChipLedgerTest(unittest.TestCase):
     def _s(self, **over):
-        base = dict(harness="claude", pid=1, cwd="/x", slug="s", title="a title",
+        base = dict(harness="claude", pid=1, cwd="/x", slug="s", runtime_name="a title",
                     liveness="idle", elapsed_min=1)
         base.update(over)
         return Session(**base)

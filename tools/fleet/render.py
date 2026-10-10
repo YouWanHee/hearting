@@ -39,7 +39,7 @@ import time
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
-from . import gitinfo
+from . import gitinfo, titles
 from .collectors import compute_hosts as _compute_hosts
 from .refresh import LiveSnapshot, RefreshPump, background_read
 from .session_handle import sanitize_title as _sanitize_session_title
@@ -585,7 +585,6 @@ _COOL_WINDOW_MIN = 180
 # Shape-size gradient: recent active states are larger and filled; cold groups use a ring.
 _COOL_FILLED = "●"      # Recently completed directory within the cooling window.
 _COOL_RING = "○"        # Long-inactive directory.
-_COOL_TIME_ICON = "✓"   # Prefix for elapsed time since completion.
 
 
 _BLINK_ON = True     # shared manual blink: one second on, one second off
@@ -1544,6 +1543,37 @@ def _session_name(s):
     return ""
 
 
+def _display_session_subject(s):
+    if getattr(s, "runtime_name", None):
+        return _session_name(s)
+    return _subject_title(s)
+
+
+def _text_age(timestamp, now=None):
+    now = time.time() if now is None else now
+    if (not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool)
+            or not math.isfinite(timestamp) or timestamp > now):
+        return "시각 미확인"
+    minutes = int((now - timestamp) // 60)
+    if minutes >= 1440:
+        return "%d일 전" % (minutes // 1440)
+    if minutes >= 60:
+        return "%d시간 전" % (minutes // 60)
+    return "%d분 전" % minutes
+
+
+def _subject_title(entity):
+    title = _sanitize_session_title(getattr(entity, "title", None) or "")
+    if not title:
+        return ""
+    if _is_plugin_agent(entity):
+        return title
+    ts = getattr(entity, "title_ts", None)
+    if titles.current_text(entity, ts):
+        return "제목 · " + title
+    return "이전 제목 · " + title
+
+
 def _projection_stage_text(entity, max_width=24):
     """Render only the entity's attached projection, never a guessed child route."""
     projection = getattr(entity, "work_projection", None)
@@ -1977,7 +2007,7 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     # responsive name column. Calls without a terminal-derived width retain the
     # legacy 24-cell cap for hermetic/backward-compatible row construction.
     avail = max(3, name_width or _NW_S)
-    name_txt = _session_name(s)
+    name_txt = _display_session_subject(s)
     suffix = []
     suffix_w = 0
     if is_parent and child_count:
@@ -2868,7 +2898,7 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
     # The dispatched session's own haiku sidecar title is its identity when present
     # (user 2026-07-16: the summary agent attaches to every dispatched session); the
     # slug stays the fallback — same title → name → slug chain as session rows.
-    slug_name = getattr(j, "title", None) or j.slug or key
+    slug_name = _subject_title(j) or j.slug or key
     gch, gkey = _glyph(j.liveness, dim=True)
     afterglow_j = bool(getattr(j, "afterglow", False))
     if afterglow_j:
@@ -3110,7 +3140,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
         suffix.append(("  app-server", "dim"))
     if s.orphan:
         suffix.append(("  worktree-gone", "g_dead"))
-    name_txt = _session_name(s)
+    name_txt = _display_session_subject(s)
     if term_width:
         # A tinted L1 has 4 left cells (inset+padding) and a 2-cell right
         # inset. Reserve those six cells plus every suffix before clipping.
@@ -3193,7 +3223,7 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
     # The dispatched session's own haiku sidecar title is its identity when present
     # (user 2026-07-16: the summary agent attaches to every dispatched session); the
     # slug stays the fallback — same title → name → slug chain as session rows.
-    slug_name = getattr(j, "title", None) or j.slug or key
+    slug_name = _subject_title(j) or j.slug or key
     gch, gkey = _glyph(j.liveness, dim=True)
     afterglow_j = bool(getattr(j, "afterglow", False))
     if afterglow_j:
@@ -3479,13 +3509,43 @@ def _visible_group_jobs(jobs, show_sessions, show_jobs):
 
 def _group_activity_rank(g):
     members_live = [s.liveness for s in g["sessions"]] + [j.liveness for j in g["jobs"]]
-    if g.get("gpu") or g.get("resources"):
+    if g.get("gpu") or _group_running_resources(g):
         members_live.append("working")
     if "working" in members_live:
         return 0
     elif "idle" in members_live:
         return 1
     return 2
+
+
+def _group_running_resources(g):
+    """Rendering placement does not change the project's activity census."""
+    candidates = list(g.get("resources") or ())
+    candidates.extend(child for job in g["jobs"]
+                      for child in getattr(job, "resource_children", ()))
+    return {id(child): child for child in candidates if child.liveness == "working"}
+
+
+def _group_last_result(sessions, jobs, resources):
+    candidates = []
+    for entity in list(sessions) + list(jobs):
+        projection = getattr(entity, "work_projection", None)
+        candidates.append(getattr(projection, "result", None))
+        candidates.extend(node.get("result") for node in
+                          (getattr(entity, "route_chain", None) or {}).get("nodes", ()))
+    children = list(resources)
+    children.extend(child for job in jobs for child in getattr(job, "resource_children", ()))
+    for child in children:
+        if (child.liveness in ("exited", "dead") and type(child.exit_code) is int
+                and isinstance(child.ended_at, (int, float)) and not isinstance(child.ended_at, bool)):
+            candidates.append({"name": "자원 " + (child.node or child.run_id),
+                               "result": "failure" if child.exit_code else "success",
+                               "at": child.ended_at, "source": "resource-exit"})
+    return max((value for value in candidates if isinstance(value, dict)
+                and value.get("name") and value.get("result") in ("success", "failure")
+                and type(value.get("at")) in (int, float)
+                and math.isfinite(value["at"]) and value["at"] <= time.time()),
+               key=lambda value: value["at"], default=None)
 
 
 def _group_sort_key(name, g):
@@ -4210,7 +4270,7 @@ def _plugin_agent_row(job, orphan=False, term_width=None):
     elapsed = fmt_min(getattr(job, "elapsed_min", None))
     phase = _plugin_phase(job)
     orphan_text = "  (orphan)" if orphan else ""
-    title = getattr(job, "title", None) or getattr(job, "slug", None) or ""
+    title = _subject_title(job) or getattr(job, "slug", None) or ""
     fixed = (_dw(_SUBAGENT_IND) + _dw(_ICON_SUBAGENT) + _dw("codex task ")
              + _dw(marker) + _dw("  " + elapsed)
              + (_dw(" : " + phase) if phase else 0) + _dw(orphan_text))
@@ -4232,30 +4292,9 @@ _SUMMARY_FALLBACK_W = 60   # hermetic/no-terminal-width callers (mirrors the dim
                            # convention used elsewhere, e.g. the memory-row snippet cells)
 
 
-# F-63: a summary younger than this reads as "now" and carries no tag; past it the
-# text stays (24h sidecar window, titles.py) and this dim `(<elapsed>)` age tag keeps
-# it honest. 15 minutes is the pre-F-63 freshness cutoff, kept as the live threshold.
-_SUMMARY_AGE_TAG_SEC = 15 * 60
-
-
-def _summary_age_tag(summary_ts, now=None):
-    """`(<elapsed>)` for a summary older than the live window, else None.
-
-    F-76: the only elapsed on the board that does NOT sit in a column of its own — it
-    trails a Korean sentence, where a bare `38m` would read as a number glued onto the
-    prose. Parentheses do the separating that `⏳` used to, without an icon."""
-    if not isinstance(summary_ts, (int, float)) or isinstance(summary_ts, bool):
-        return None
-    now = time.time() if now is None else now
-    age = now - summary_ts
-    if age < _SUMMARY_AGE_TAG_SEC:
-        return None
-    return "(%s)" % fmt_min(int(age // 60))
-
-
 def _summary_row(summary, depth=0, term_width=None, start_col=None, summary_ts=None):
     """One dim subtitle row directly under a session/dispatch row (F-16/F-17 merge,
-    사용자 확정 2026-07-19): the live one-sentence status from the SAME haiku call that
+    사용자 확정 2026-07-19): the last recorded summary from the SAME haiku call that
     produced the title. Pure inset — no connector/icon, `_SUBAGENT_IND` + the same
     per-depth ladder `_subagent_strip` uses, so it reads as INSIDE its owner row and
     never collides with the sub-agent strip's own indent. Caller gates presence
@@ -4271,15 +4310,9 @@ def _summary_row(summary, depth=0, term_width=None, start_col=None, summary_ts=N
     segs = [(indent, None)]
     if padding:
         segs.append((" " * padding, None))
-    # F-63: the age tag reserves its own width so a long summary clips before the
-    # tag disappears — the reader always learns HOW old the sentence is first.
-    tag = _summary_age_tag(summary_ts)
-    tag_w = (_dw(tag) + 1) if tag else 0
-    if tag and maxw > tag_w:
-        segs.append((_clip_w(summary, maxw - tag_w), "now_sub"))
-        segs.append((" " + tag, "dim"))
-    else:
-        segs.append((_clip_w(summary, maxw), "now_sub"))
+    # The source and age precede the prose so clipping never makes it look live.
+    label = "마지막 요약 · %s · " % _text_age(summary_ts)
+    segs.append((_clip_w(label + summary, maxw), "now_sub"))
     return [segs]
 
 
@@ -4361,6 +4394,25 @@ def _resource_progress_tail(child, room=None):
     return count + suffix
 
 
+def _resource_process_location(child):
+    """Use existing exact local identity/placement, never GPU selection or log age."""
+    if type(child.pid) is not int or child.pid <= 0 or not str(child.starttime).isdigit():
+        return ""
+    placement = getattr(child, "local_placement", None) or {}
+    placed = any(isinstance(p, dict) and p.get("pid") == child.pid
+                 and str(p.get("starttime")) == str(child.starttime)
+                 for p in placement.get("processes", ()))
+    evidence = getattr(child, "state_evidence", None) or {}
+    current = evidence.get("current_identity") or {}
+    verified = (evidence.get("reason") == "exact-identity-match"
+                and current.get("pid") == child.pid
+                and str(current.get("starttime")) == str(child.starttime))
+    if child.liveness != "working" or not (placed or verified):
+        return ""
+    host = _gpu_safe_text(placement.get("hostname")) if placed else ""
+    return (host + " · " if host else "") + "PID %s" % child.pid
+
+
 def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_children=(),
                          children=None):
     """Observed resource children, never log-parsed progress or model dispatch rows."""
@@ -4374,18 +4426,26 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
         if not _SHOW_ALL and child.liveness != "working":
             continue
         glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
-        node = child.route_node or child.node or child.run_id
-        tail = "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min))
-        # Keep the existing liveness/elapsed and at least a short node label;
-        # narrow widths clip the counter text before its update age, never wrap.
-        progress_room = (width - _dw(indent + glyph + " resource " + tail)
-                         - min(12, _dw(str(node))) - 2) if width else None
+        if child.liveness == "working":
+            glyph, key = "●", "g_work" if _BLINK_ON else "g_work_off"
+        node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+        tail = ("  " + fmt_min(child.elapsed_min) if child.liveness == "working"
+                else "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min)))
+        # Name and elapsed survive first; placement then counters yield as needed.
+        # A long name keeps a useful 24-column prefix before optional details.
+        room = (max(0, width - _dw(indent + glyph + " resource " + tail)
+                    - min(24, _dw(node))) if width else None)
+        location = _resource_process_location(child)
+        if location and (room is None or room >= _dw("  " + location)):
+            tail += "  " + location
+            if room is not None:
+                room -= _dw("  " + location)
+        progress_room = max(0, room - 2) if room is not None else None
         progress = _resource_progress_tail(child, progress_room)
-        if not progress and width and getattr(child, "progress", None):
-            progress = _resource_progress_tail(
-                child, width - _dw(indent + glyph + " resource " + tail) - 3)
         if progress:
             tail += "  " + progress
+        if width:
+            tail = _clip_w(tail, max(0, width - _dw(indent + glyph + " resource ") - 1))
         budget = max(1, width - _dw(indent + glyph + " resource " + tail)) if width else 44
         rows.append([(indent, None), (glyph, key), (" resource ", "dim"),
                      (_clip_w(str(node), budget), "name_dim"), (tail, "dim")])
@@ -4785,6 +4845,11 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     context = getattr(entity, "context", None)
     pct = getattr(context, "used_pct", None) if context is not None else getattr(entity, "ctx_pct", None)
     now_text = getattr(entity, "summary", None)
+    previous_summary = None
+    if now_text:
+        previous_summary = "마지막 요약 · %s · %s" % (
+            _text_age(getattr(entity, "summary_ts", None)), now_text)
+        now_text = None
     resource_now = _resource_now_text(entity)
     if resource_now is not None:
         now_text = resource_now
@@ -4793,6 +4858,11 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         # A basic observation is real state, but missing detail is not an idle
         # verdict or an empty NOW. Never invent a command/model turn here.
         now_text = "확인 중"
+    if previous_summary and resource_now is None and not now_text:
+        now_text = {"working": "작업 중", "idle": "대기", "detached": "분리됨"}.get(
+            getattr(entity, "liveness", None), "상태 미확인")
+    if previous_summary and resource_now is None:
+        now_text += " · " + previous_summary
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
@@ -4840,25 +4910,15 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             now_room -= exec_w
         if now_text:
             sep = "  " if tail else ""
-            # F-63: same reserved-width age tag as the dispatch subtitle row — the
-            # tag survives clipping; only when the zone cannot hold tag + any text
-            # does it drop and the bare NOW clip behaves exactly as before.
-            tag = None if resource_now is not None else _summary_age_tag(getattr(entity, "summary_ts", None))
+            # Observations and the summary's source/age precede the old prose.
             text_room = now_room - _dw(sep)
             if resource_now is not None:
                 now_text = _resource_now_text(entity, max(0, text_room))
-            tag_w = (_dw(tag) + 1) if tag else 0
-            if tag and text_room > tag_w:
-                clipped = _clip_w(str(now_text), text_room - tag_w)
-            else:
-                tag = None
-                clipped = _clip_w(str(now_text), text_room) if text_room > 0 else ""
+            clipped = _clip_w(str(now_text), text_room) if text_room > 0 else ""
             if clipped:
                 if sep:
                     tail.append((sep, None))
                 tail.append((clipped, now_key))
-                if tag:
-                    tail.append((" " + tag, "dim"))
         if tail:
             segs.append((" " * gap, None))
             segs.extend(tail)
@@ -6474,7 +6534,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
             lines.append(None)
         first = False
         name_w = 40 if term_width is None else max(8, min(40, term_width - 6))
-        anchor = [("  ● ", "dim"), (_clip_w(_session_name(s), name_w), "name_dim")]
+        anchor = [("  ● ", "dim"), (_clip_w(_display_session_subject(s), name_w), "name_dim")]
         if getattr(s, "model", None):
             anchor.append(("  " + str(s.model), "dim"))
         lines.append(anchor)
@@ -7319,12 +7379,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # while the group works, plain bold otherwise. Doubles with the active card tint.
         n_work = sum(1 for s in live_sessions if s.liveness == "working") + \
                  sum(1 for j in group_jobs if j.liveness == "working") + \
-                 len(emission["gpu"]) + len(emission["resources"])
-        # cooling (round-6, user 2026-07-03): no active work, but the newest session transcript
-        # A write within the cooling window indicates a directory that just finished.
-        # state between hot (green ●) and cold (no glyph): a grey ring + time-since-done, so a
-        # just-finished repo reads as "done & waiting" rather than fully dormant. Sessions linger
-        # as idle (still within the 48h live window), so the group is not folded (R4).
+                 len(emission["gpu"]) + len(_group_running_resources(g))
+        # With no active work, a recent transcript write marks file activity only.
+        # Completion is shown separately from a recorded result and its event time.
         _last_act = max((s.mtime for s in group_sessions if s.mtime), default=None)
         _cool_min = None
         if not n_work and _last_act is not None:
@@ -7339,7 +7396,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         if n_work:
             head_segs += [("●", "g_work" if _BLINK_ON else "g_work_off"), (" ", None)]
         elif _cool_min is not None:
-            # Recent completion uses a filled grey dot, distinct from dead and stale.
+            # Recent file activity uses a filled grey dot, distinct from dead and stale.
             head_segs += [(_COOL_FILLED, "grp_cool"), (" ", None)]
         else:
             # Long inactivity uses a grey ring.
@@ -7360,8 +7417,17 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             head_segs += [(" 🧠 %d" % _nmem, "dim")]
             _seen_glyphs.add("mem")
         if _cool_min is not None:
-            # Prefix time since completion with a check mark.
-            head_segs += [("  ", None), ("%s %s" % (_COOL_TIME_ICON, fmt_min(_cool_min)), "grp_cool")]
+            head_segs += [("  파일 갱신 · " + _text_age(_last_act), "dim")]
+        last_result = _group_last_result(group_sessions, group_jobs, emission["resources"])
+        if last_result:
+            lead = "최근 결과 · %s · " % (
+                "성공" if last_result["result"] == "success" else "실패")
+            tail = " · " + _text_age(last_result["at"])
+            room = max(0, (term_width or 160) - sum(_dw(t) for t, _ in head_segs) - 2)
+            name_room = room - _dw(lead + tail)
+            if name_room > 0:
+                label = lead + _clip_w(last_result["name"], name_room) + tail
+                head_segs.append(("  " + label, "dim"))
         # The group header is the card's first title row.
         # tinted row of the panel, ▍ anchor on the card's padding edge; no floating label.
         _g0 = len(lines)                # panel start (title INCLUDED in the tint range)

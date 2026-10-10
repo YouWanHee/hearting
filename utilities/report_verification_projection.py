@@ -216,6 +216,13 @@ def _display(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def report_detail_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """An absent report is normal; retain all observed verification problems."""
+    if payload.get("verification", {}).get("reason") == "report-source-unavailable":
+        return None
+    return payload
+
+
 def _route_nodes(route: Mapping[str, Any]) -> list[dict[str, Any]]:
     nodes = route.get("nodes")
     if not isinstance(nodes, list) or any(not isinstance(node, dict) for node in nodes):
@@ -518,7 +525,9 @@ def _resolve_source(source: Path, root: Path, jobs: Path | None, snapshot: ReadS
     try:
         if root.is_symlink() or not root.is_dir():
             raise ProjectionProblem("artifact-root-unavailable")
-        if source.is_symlink() or not source.is_dir():
+        if source.is_symlink() or (source.exists() and not source.is_dir()):
+            raise ProjectionProblem("report-source-kind-invalid")
+        if not source.is_dir():
             raise ProjectionProblem("report-source-unavailable")
         root = root.resolve(strict=True)
         source = source.resolve(strict=True)
@@ -746,7 +755,9 @@ def project_route(artifact_root: str | Path, route_id: str, route_hash: str | No
             source = cycle_dir / "artifacts" / "report"
             payload = _resolve_source(source, root, Path(jobs).expanduser() if jobs else None,
                                       snapshot)
-            if route_hash and payload.get("subject", {}).get("route_hash") != route_hash:
+            subject = payload.get("subject", {})
+            if (route_hash and subject.get("state") == "bound"
+                    and subject.get("route_hash") != route_hash):
                 return _display(_unresolved("route-hash-binding-mismatch"))
             return payload
     except ProjectionProblem as exc:

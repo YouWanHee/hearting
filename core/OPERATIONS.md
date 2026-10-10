@@ -983,7 +983,13 @@ including existing `route`/`node` registries. A verified working resource lights
 its declared route node; a supervised parked owner shows that node and
 `resource-parked` instead of presenting an old model summary as current work.
 Resource liveness stays independent of the owner's model activity, and a missing
-progress declaration leaves only elapsed time and liveness (2026-10-07 SR eval-run).
+progress declaration leaves elapsed time, liveness and verified process placement.
+An active resource uses Fleet's existing green blinking dot. Its row retains the
+node name, elapsed time, observed host/PID and declared progress in that order
+as width permits; exact GPU matches reuse the GPU row instead of duplicating it.
+Registered log mtime is not workload progress or output freshness. Report detail
+is shown only when a report exists or a meaningful integrity problem is observed;
+an absent report preserves its unresolved reason and produces no report row.
 Verified working resources whose exact parent owner is no longer drawn
 remain on their project card in both Fleet views. The row reuses exact GPU
 identity and existing elapsed/progress; absent a fresh GPU match, it shows
@@ -1452,6 +1458,12 @@ its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
 Retirement refuses busy sessions, open forms, drafts, unknown process identity
 or an unconfirmed shell return; it has no retry, forced kill or forced close.
+An accepted retirement keeps the agent PID/start and shell PID/start observed
+when it was requested, including before a pane has a session. Reconnection
+compares that original lifetime before sending input. A proven-dead or reused
+agent PID completes the obligation as `target-already-gone`, without input,
+pane closure or handover to a later process in the same pane. Unreadable birth
+evidence remains unknown; a later observation cannot supply a missing original.
 When the retire succeeds from the pane started beside the predecessor, the
 predecessor's open depth-1 routes pass to the successor, on any harness: it may
 `start` and `correct` them, and their stored completion records reach it
