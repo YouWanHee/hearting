@@ -16,6 +16,7 @@ if _TOOLS_DIR not in sys.path:
 from fleet import render               # noqa: E402
 from fleet.collectors import dispatch  # noqa: E402
 from fleet.model import DispatchJob, Session  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines
 
 
 class SlugStemTest(unittest.TestCase):
@@ -200,7 +201,7 @@ class FoldingTest(unittest.TestCase):
     def _emit(self, conductor, children, show_all=False):
         render.set_show_all(show_all)
         try:
-            lines = render._build_lines([], [conductor] + children, section="dispatch",
+            lines = build_observed_lines([], [conductor] + children, section="dispatch",
                                         narrow=False, malformed=0, layout="wide")
         finally:
             render.set_show_all(False)
@@ -239,7 +240,7 @@ class FoldingTest(unittest.TestCase):
                             worker_role="development", liveness="working")
         render.set_show_all(False)
         try:
-            lines = render._build_lines([], [conductor, child], section="dispatch",
+            lines = build_observed_lines([], [conductor, child], section="dispatch",
                                         narrow=False, malformed=0, layout="wide",
                                         term_width=240)
         finally:
@@ -290,7 +291,7 @@ class FoldingTest(unittest.TestCase):
                             parent_slug="missing-owner", worker_role="code-plan",
                             liveness="working", cwd="/tmp/project")
         render.set_show_all(False)
-        lines = render._build_lines([], [child], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [child], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(t for t, _k in line) for line in lines if line)
         self.assertIn("plan live-depth-two", text)
@@ -306,13 +307,13 @@ class FoldingTest(unittest.TestCase):
                                 parent_slug="missing-owner", worker_role="code-exec",
                                 liveness=finished, cwd="/tmp/project")
             render.set_show_all(False)
-            lines = render._build_lines([], [child], section="dispatch", narrow=False,
+            lines = build_observed_lines([], [child], section="dispatch", narrow=False,
                                         malformed=0, layout="wide")
             text = "\n".join("".join(t for t, _k in line) for line in lines if line)
             self.assertNotIn("finished-depth-two", text, finished)
             render.set_show_all(True)
             try:
-                lines = render._build_lines([], [child], section="dispatch", narrow=False,
+                lines = build_observed_lines([], [child], section="dispatch", narrow=False,
                                             malformed=0, layout="wide")
                 text = "\n".join("".join(t for t, _k in line) for line in lines if line)
                 self.assertIn("finished-depth-two", text, finished)

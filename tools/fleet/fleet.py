@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 
 # Support both `python3 fleet.py` (script) and `python3 -m fleet.fleet` (module).
 if __package__ in (None, ""):
@@ -24,11 +25,13 @@ if __package__ in (None, ""):
     from fleet.collectors import compute_hosts
     from fleet.collectors import procscan
     from fleet import installinfo
+    from fleet.refresh import as_snapshot
 else:
     from .collectors import collect_all
     from .collectors import compute_hosts
     from .collectors import procscan
     from . import installinfo
+    from .refresh import as_snapshot
 
 
 def parse_args(argv):
@@ -100,7 +103,7 @@ def _collect_memory():
 
 
 def _snapshot_json(sessions, jobs, resource_jobs=None, usage=None, disabled=None, show_all=False,
-                   hearting=None, compute_host_snapshot=None):
+                   hearting=None, compute_host_snapshot=None, observations=None):
     resource_jobs = list(resource_jobs or [])
     visible_resources = resource_jobs if show_all else [
         row for row in resource_jobs if row.liveness == "working"
@@ -122,6 +125,8 @@ def _snapshot_json(sessions, jobs, resource_jobs=None, usage=None, disabled=None
             "resource_exited": sum(j.liveness == "exited" for j in resource_jobs),
         },
     }
+    if observations is not None:
+        out["observations"] = observations
     mem = _collect_memory()
     if mem is not None:
         out["memory"] = mem
@@ -253,8 +258,9 @@ def main(argv=None):
             from . import demo
 
         def collector(harness_filter=None, usage="cache-only", fast_first=False):      # LIVE real data + injected demo fixtures (merged)
-            rs, rj = collect_all(harness_filter=harness_filter, usage="cache-only",
-                                 **({"fast_first": True} if fast_first else {}))
+            observed = as_snapshot(collect_all(harness_filter=harness_filter, usage="cache-only",
+                                               **({"fast_first": True} if fast_first else {})))
+            rs, rj = observed
             ds, dj = demo.collect(harness_filter=harness_filter)
             # Real rows are projected by collect_all. Only the injected rows
             # still need projection; never reread the live routes/artifact tree.
@@ -263,40 +269,41 @@ def main(argv=None):
             else:
                 from .projection import attach_projections
             ds, dj = attach_projections(ds, dj)
-            return rs + ds, rj + dj
+            return replace(observed, sessions=rs + ds, jobs=rj + dj)
 
     def projected_collector(harness_filter=None, usage="cache-only", fast_first=False):
         fast_kw = {"fast_first": True} if fast_first else {}
         if usage == "cache-only":
-            sessions, jobs = collector(harness_filter=harness_filter, **fast_kw)
+            observed = as_snapshot(collector(harness_filter=harness_filter, **fast_kw))
         else:
-            sessions, jobs = collector(harness_filter=harness_filter, usage=usage,
-                                       **fast_kw)
+            observed = as_snapshot(collector(harness_filter=harness_filter, usage=usage,
+                                            **fast_kw))
         projected_collector.last_resource_jobs = list(
-            getattr(collect_all, "last_resource_jobs", []))
+            observed.resources)
         projected_collector.last_resource_malformed = getattr(
             collect_all, "last_resource_malformed", 0)
         projected_collector.last_usage_snapshots = dict(
-            getattr(collect_all, "last_usage_snapshots", {}))
-        return sessions, jobs
+            observed.usage_snapshots)
+        return observed
 
     projected_collector.last_resource_jobs = []
     projected_collector.last_resource_malformed = 0
     projected_collector.last_usage_snapshots = {}
 
     if args.json:
-        sessions, jobs = projected_collector(harness_filter=hfilter)
+        observed = projected_collector(harness_filter=hfilter)
+        sessions, jobs = observed
         compute_host_snapshot = compute_hosts.collect()
         usage_json = dict(getattr(collect_all, "last_usage", {}))
         snapshots = [value for value in usage_json.values() if isinstance(value, dict)]
         freshnesses = [value.get("freshness") for value in snapshots]
         usage_json["freshness"] = ("fresh" if "fresh" in freshnesses else
                                     "stale" if "stale" in freshnesses else "unknown")
-        observed = [value.get("observed_at") for value in snapshots
-                    if isinstance(value.get("observed_at"), (int, float))]
-        usage_json["observed_at"] = max(observed) if observed else None
+        usage_observed = [value.get("observed_at") for value in snapshots
+                          if isinstance(value.get("observed_at"), (int, float))]
+        usage_json["observed_at"] = max(usage_observed) if usage_observed else None
         usage_json["api_disabled"] = disabled["api_disabled"]
-        print(_snapshot_json(sessions, jobs,
+        print(_snapshot_json(sessions, jobs, observations=observed.observations,
                              resource_jobs=projected_collector.last_resource_jobs,
                              usage=usage_json,
                              disabled=disabled,
@@ -340,8 +347,9 @@ def main(argv=None):
         if not disabled["api_disabled"] and args.section in ("fleet", "both"):
             live = render.live_harnesses(previous_sessions) & effective & {"claude", "codex"}
         usage = "refresh" if live else "cache-only"
-        sessions, jobs = base_collector(harness_filter=harness_filter, usage=usage,
-                                        **({"fast_first": True} if fast_first else {}))
+        observed = base_collector(harness_filter=harness_filter, usage=usage,
+                                   **({"fast_first": True} if fast_first else {}))
+        sessions, jobs = observed
         live_collector.last_resource_jobs = list(
             getattr(base_collector, "last_resource_jobs", []))
         live_collector.last_resource_malformed = getattr(
@@ -349,7 +357,7 @@ def main(argv=None):
         live_collector.last_usage_snapshots = dict(
             getattr(base_collector, "last_usage_snapshots", {}))
         previous_sessions = list(sessions)
-        return sessions, jobs
+        return observed
 
     live_collector.last_resource_jobs = []
     live_collector.last_resource_malformed = 0

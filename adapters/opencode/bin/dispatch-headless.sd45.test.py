@@ -716,7 +716,7 @@ class ForegroundReviewStartPathTest(unittest.TestCase):
                 with self.subTest(key=key):
                     env = dict(environment)
                     extra = []
-                    expected_value = str(route_file) if key == "route_file" else "bound"
+                    expected_value = str(route_file) if key in ("route_file", "owner_route_file") else "bound"
                     if key == "route_file":
                         extra.extend(["--route-file", str(route_file)])
                     elif key.startswith("owner_route_"):
@@ -727,7 +727,7 @@ class ForegroundReviewStartPathTest(unittest.TestCase):
                         extra.extend(["--" + key.replace("_", "-"), "bound"])
                     owner_binding = types.SimpleNamespace(route_file="", route_id="", route_hash="")
                     if key.startswith("owner_route_"):
-                        setattr(owner_binding, key.removeprefix("owner_"), "bound")
+                        setattr(owner_binding, key.removeprefix("owner_"), expected_value)
                     reservation = ({"batch_group": "fixture-group", key: "bound"}
                                    if key.startswith("batch_") else {})
 

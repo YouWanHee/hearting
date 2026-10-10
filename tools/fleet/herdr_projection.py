@@ -230,27 +230,62 @@ def is_steward(harness: str, session_id: str) -> bool:
     return False
 
 
+def _tag_metadata_identity(agent):
+    harness = agent.get("agent")
+    identity = agent.get("agent_session") or {}
+    pane = agent.get("pane_id")
+    if (harness not in {"codex", "opencode"} or not pane
+            or not isinstance(identity, dict) or identity.get("kind") != "id"
+            or identity.get("agent", harness) != harness):
+        return None
+    sid = identity.get("value")
+    return (pane, harness, sid) if isinstance(sid, str) and sid else None
+
+
+def refresh_observed_tag_metadata(agents) -> None:
+    """A delayed detail may update only the same currently observed pane.
+
+    This reads target identity immediately before each metadata attempt; it
+    never changes session identity/lifecycle or reclassifies Fleet rows.
+    """
+    from .collectors.herdr import list_agents
+    herdr = shutil.which("herdr")
+    if not herdr:
+        return
+    for observed in _tag_metadata_targets(agents):
+        pane, harness, sid = observed
+        metadata = _metadata_command(herdr, harness, sid, pane)
+        # Titles and personal formatters may be slow. Confirm the target after
+        # all preparation, immediately before sending the metadata command.
+        current = list_agents()
+        peers = [row for row in current or [] if row.get("pane_id") == observed[0]]
+        if len(peers) == 1 and _tag_metadata_identity(peers[0]) == observed:
+            prepared = re.match(r"^\[([0-9a-f]{2})\]",
+                                metadata[metadata.index("--display-agent") + 1])
+            if prepared and prepared.group(1) == resolve_tag(harness, sid):
+                _send_projection(metadata, None)
+
+
+def _tag_metadata_targets(agents):
+    for agent in agents:
+        identity = _tag_metadata_identity(agent)
+        if identity is None:
+            continue
+        _, harness, sid = identity
+        tag = resolve_tag(harness, sid)
+        shown = re.match(r"^\[([0-9a-f]{2})\]", str(agent.get("display_agent") or ""))
+        if tag and (not shown or shown.group(1) != tag):
+            yield identity
+
+
 def refresh_tag_metadata(agents) -> None:
     """Refresh changed numbers on exactly identified panes, even while idle.
 
     This reuses the regular metadata projection. It reports no runtime session
     identity or lifecycle, and never prompts or wakes the pane's session.
     """
-    for agent in agents:
-        harness = agent.get("agent")
-        identity = agent.get("agent_session") or {}
-        pane = agent.get("pane_id")
-        if (harness not in {"codex", "opencode"} or not pane
-                or not isinstance(identity, dict) or identity.get("kind") != "id"
-                or identity.get("agent", harness) != harness):
-            continue
-        sid = identity.get("value")
-        if not isinstance(sid, str) or not sid:
-            continue
-        tag = resolve_tag(harness, sid)
-        shown = re.match(r"^\[([0-9a-f]{2})\]", str(agent.get("display_agent") or ""))
-        if tag and (not shown or shown.group(1) != tag):
-            _report(harness, sid, pane, False)
+    for pane, harness, sid in _tag_metadata_targets(agents):
+        _report(harness, sid, pane, False)
 
 
 def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None,
@@ -502,6 +537,19 @@ def _send_projection(command, observation):
             observation[field] = "spawn-error"
 
 
+def _metadata_command(herdr, harness, session_id, pane):
+    title = session_title(harness, session_id)
+    label, custom_title = _formatter_overrides(harness, session_id, title)
+    agent, shown_title = compose(harness, session_id, title=custom_title or title, label=label)
+    # Herdr replaces the whole metadata record, so send both fields together.
+    metadata = [herdr, "pane", "report-metadata", pane, "--source", "herdr:%s" % harness,
+                "--display-agent", agent]
+    header = header_title(agent, shown_title)
+    if header:
+        metadata += ["--title", header]
+    return metadata
+
+
 def _report(harness: str, session_id: str, pane: str, report_session: bool,
             observation=None, session_seq=None, session_start_source=None) -> None:
     herdr = shutil.which("herdr")
@@ -523,17 +571,7 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
         # Publish the exact native identity before the number resolver observes
         # this new pane. Otherwise its first metadata report still uses the hash.
         _send_projection(session_command, observation)
-    title = session_title(harness, session_id)
-    label, custom_title = _formatter_overrides(harness, session_id, title)
-    agent, shown_title = compose(harness, session_id, title=custom_title or title,
-                                 label=label)
-    # Both fields go in the SAME report: herdr's metadata record is per-source and a
-    # report replaces it whole, so sending one alone clears the other (measured).
-    metadata = [herdr, "pane", "report-metadata", pane, "--source", source,
-                "--display-agent", agent]
-    header = header_title(agent, shown_title)
-    if header:
-        metadata += ["--title", header]
+    metadata = _metadata_command(herdr, harness, session_id, pane)
     if observation is not None and not report_session:
         observation["session_report"] = "skipped"
     _send_projection(metadata, observation)

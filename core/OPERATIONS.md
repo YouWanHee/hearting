@@ -113,6 +113,27 @@ loaded when its process started. Runtime-owned credentials, sessions, logs,
 caches, databases, and Codex `config.toml` remain outside this activation
 boundary.
 
+Release cleanup retains trees used by live processes, including their working
+directories and open files. Shared Python dispatch code holds its resolved code
+root open for the process lifetime, so a hook launched through a rotating runtime
+ projection still names the release that supplies its later imports. Older live
+projection processes without that reference conservatively retain their release family
+until they exit. This uses the installer's existing in-use judgment, with no
+additional registry or caller step.
+
+A route's `launch_compatibility_tuple.launch_home.path` is also the source of
+its contract read access. A replacement or child launched after activation
+retains read access to that sealed home's `capabilities/`, alongside its own
+launch home's contracts; it needs no file hash comparison or correction from
+the parent. The installer protects that same sealed home while its route is
+in use, including an unclosed route whose current owner awaits correction to
+a readable BLOCKED or FAIL result. A superseded owner's pause does not retain
+the release after its successor finishes, and closed routes and stale launch
+deaths still release it. Claude projects these directories with edit denies, OpenCode
+allows their external reads with edit denies, and Codex's sandbox already
+permits these reads without adding writable roots. No whole release tree or
+task write scope is granted by this contract access.
+
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
 different physical roots may compare equal only at an explicitly code-root-only
@@ -720,6 +741,18 @@ and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
 Runtime completion carriers report a bounded native log line for skipped delivery,
 claims and prompt admission, with the session and reason. Observing transport never
 changes the settled result or grants another execution.
+
+An accepted Claude native wake is also retained as the existing outer manager's
+registered-batch duty. If its hook exits before delivery, that task runner checks
+the same current attempt and pending notice and hands it to the existing peer
+courier for the exact parent session. Native and recovery delivery share the
+notice claim; forms and busy turns use the courier's existing retained-message
+path. Codex and OpenCode keep their existing retained completion controllers.
+Confirmed session handover changes the recipient, while the signed notice stays
+under the registered parent's storage key. If an older outer observer cannot
+process this retained duty, its exact PID and existing lock identify a safe
+observer replacement: accepted records remain intact and the replacement takes
+the same lock. A supported observer and the native carrier stay alive.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
