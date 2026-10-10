@@ -114,9 +114,7 @@ def _answers_blocked_owner(row, live):
     # A correction to an exactly exited owner belongs to the same continuation.
     # Keep successful, cancelled, live and unobservable owners out of this path.
     from dispatch_contract import attempt_process_quiescence
-    from dispatch_replacement import RUNTIME_DEATH_NOTES
-    return (row.status == "done"
-            and row.metadata.get("note") in RUNTIME_DEATH_NOTES
+    return (route_authority.runtime_owner_can_resume(row.status, row.metadata)
             and attempt_process_quiescence(row.metadata, terminal_receipt=True).state == "quiescent")
 
 

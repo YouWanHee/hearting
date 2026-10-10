@@ -1018,6 +1018,19 @@ def blocked_progress(route, rows, *, worker_type="test") -> int:
     return streak
 
 
+def runtime_owner_can_resume(status, meta) -> bool:
+    """A launched supervised owner's runtime end still has its same-route work.
+
+    Admission also checks actual process quiescence; this metadata judgment
+    keeps the route's sealed contract available while it awaits continuation.
+    """
+    return (status == "done" and meta.get("worker_type") == "owner"
+            and meta.get("launch_started") == "1"
+            and meta.get("supervisor_lease") == "flock-v1"
+            and bool(meta.get("supervisor_lease_file"))
+            and meta.get("note") in {"dead-runtime-exit", "dead-runtime-error"})
+
+
 def answerable_owner_end(status, meta) -> str:
     """How an ended owner's result waits for a person, or "".
 
