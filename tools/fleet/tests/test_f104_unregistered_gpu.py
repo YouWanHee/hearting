@@ -230,13 +230,15 @@ class UnregisteredGpuRowTest(UnregisteredGpuTestBase):
         for width in (168, 100, 60, 40):
             with self.subTest(width=width):
                 rows = [line for line in self.lines(snapshot, width=width) if "● GPU" in line]
-                self.assertEqual(len(rows), 1)
-                self.assertLessEqual(render._dw(rows[0]), width)
+                self.assertGreaterEqual(len(rows), 1)
+                self.assertLessEqual(len(rows), 3)
+                self.assertTrue(all(render._dw(row) <= width for row in rows))
+                joined = "\n".join(rows)
                 if width >= 60:
                     for identity in ("GPU cnn:0", "GPU cnn:1", "GPU moving4:1"):
-                        self.assertIn(identity, rows[0])
-                if width <= 60:
-                    self.assertNotIn(" GB", rows[0])
+                        self.assertIn(identity, joined)
+                if width >= 60:
+                    self.assertIn("UMA_7ch_fix_2spk_v2_1", joined)
                 self.assertEqual(json.dumps(snapshot, sort_keys=True), original)
                 self.assertEqual(compute_hosts.unregistered_gpu(snapshot), entries)
 

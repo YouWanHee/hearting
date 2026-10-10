@@ -55,7 +55,7 @@ class SkillOnlyCellTest(unittest.TestCase):
     def test_capability_and_knobs_only(self):
         cell = self._cell({"capability": "autopilot-code", "mode": "dev",
                            "intensity": "standard"})
-        self.assertEqual(cell, "code(dev·std)")
+        self.assertEqual(cell, "개발")
 
     def test_no_stage_trails_the_capability(self):
         """The regression this suite exists for: an artifact-derived stage must not be
@@ -63,7 +63,7 @@ class SkillOnlyCellTest(unittest.TestCase):
         cell = self._cell({"capability": "autopilot-spec", "intensity": "direct"},
                           projection=P.WorkProjection(source="artifact-inferred",
                                                       stage_label="exec"))
-        self.assertEqual(cell, "spec(direct)")
+        self.assertEqual(cell, "설계")
         self.assertNotIn("exec", cell)
         self.assertNotIn(":", cell)
 
@@ -77,11 +77,11 @@ class SkillOnlyCellTest(unittest.TestCase):
             s.cap_grounding = cap
             segs = render._session_stage_segs(s, working, 80)
             with self.subTest(working=working):
-                self.assertEqual(segs[0], ("code", name_key))
-                self.assertEqual([k for t, k in segs[1:]], ["dim", "dim", "dim"])
+                self.assertEqual(segs[0], ("개발", name_key))
+                self.assertEqual([k for t, k in segs[1:]], [])
 
     def test_capability_without_knobs(self):
-        self.assertEqual(self._cell({"capability": "autopilot-research"}), "research")
+        self.assertEqual(self._cell({"capability": "autopilot-research"}), "조사")
 
     def test_no_capability_falls_back_to_the_projection_text(self):
         """Without a marker the cell is unchanged from before — a route-backed session

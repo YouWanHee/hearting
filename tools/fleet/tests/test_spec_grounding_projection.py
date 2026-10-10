@@ -349,7 +349,7 @@ class SpecGroundingRenderTest(unittest.TestCase):
             source="artifact-inferred", stage_label="spec agent-fleet-dashboard ·dev")
         text = render._projection_stage_text(entity, max_width=24)
         self.assertLessEqual(render._dw(text), 24)
-        self.assertTrue(text.startswith("stage "))
+        self.assertTrue(text.startswith("단계 "))
         self.assertTrue(text.endswith("…"))
 
 
@@ -468,6 +468,7 @@ class RouteStageSkippedGlyphTest(unittest.TestCase):
         self.assertNotIn("⊘", rendered)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class CapabilityGroundingTest(unittest.TestCase):
     """2026-07-24: inline entry work (no route/dispatch row) shows `capability(mode·intensity)`
     on the main session row from a `.capability-grounding/<sid>` marker."""
