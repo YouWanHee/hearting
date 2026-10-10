@@ -270,6 +270,26 @@ class NativeCommandTest(NativeCase):
         self.assertEqual(self.run_command(req, path, continuing=True)["continued"], "unverified")
         self.write.assert_called_once()
 
+    def test_prompt_during_final_screen_read_cancels_clear_and_continue(self):
+        for continuing in (False, True):
+            with self.subTest(continuing=continuing):
+                req, path = self.book(continuing=continuing)
+                self.prepare_transport()
+                lines = [[("❯", False)], [("─", False)]]
+                count = 0
+                def read(*args, **kwargs):
+                    nonlocal count
+                    count += 1
+                    if count == 2:
+                        st.run_hook("claude", "prompt", "session-B" if continuing else "session-A", cwd=self.cwd)
+                    return lines
+                self.view.side_effect = read
+                result = self.run_command(req, path, continuing=continuing)
+                self.assertEqual(result["reason"], "new-input")
+                self.write.assert_not_called()
+                if continuing:
+                    self.assertEqual(clear.read_reservation(self.seat.key)["continued"]["state"], "pending")
+
     def test_native_retire_does_not_acquire_cross_pane_authority(self):
         import dispatch_seat_handover as handover
         self.assertIsNone(handover.record_retire_handover("before", "claude", "session-A", "claude"))

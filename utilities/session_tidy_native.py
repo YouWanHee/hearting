@@ -285,6 +285,15 @@ def command(req, request_path, nonce, *, continuing, screen_ready):
             if why or proc.poll() is not None:
                 if continuing: clear.release_unsent_continue(claim)
                 return result("skipped", why or "target-changed")
+            # The screen read can wait while a short user prompt finishes. Its
+            # idle/empty result must not hide a newer prompt, card or booking.
+            if continuing:
+                current, why = clear.validate_continue(request_path, nonce, _sending_claim=claim)
+            else:
+                current, why = clear.validate_request(request_path, nonce)
+            if current is None:
+                if continuing: clear.release_unsent_continue(claim)
+                return result("skipped", why)
             text = clear.CONTINUE_TEXT if continuing else "/clear"
             # A single write includes Enter; partial/failed writes are never retried.
             data = (text + "\r").encode()

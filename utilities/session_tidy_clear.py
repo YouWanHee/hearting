@@ -329,7 +329,8 @@ def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] 
     return (None, reason) if reason else (req, "")
 
 
-def validate_continue(path, nonce: Optional[str] = None, *, now: Optional[float] = None):
+def validate_continue(path, nonce: Optional[str] = None, *, now: Optional[float] = None,
+                      _sending_claim: Optional[dict] = None):
     """``(booking, "")`` when the cleared window may still get the continue prompt, else ``(None, reason)``.
 
     Shared by the helper and ``peer-steward.py continue``: the seat's own booking, cleared, its
@@ -346,7 +347,11 @@ def validate_continue(path, nonce: Optional[str] = None, *, now: Optional[float]
     if req.get("continue_off"):
         return None, "off"
     held = req.get("continued") if isinstance(req.get("continued"), dict) else {}
-    if held.get("state") != "pending":
+    claimed = (_sending_claim is not None and held.get("state") == "sending"
+               and req.get("nonce") == _sending_claim.get("nonce")
+               and req["seat"]["key"] == (_sending_claim.get("seat") or {}).get("key")
+               and held == _sending_claim.get("continued"))
+    if not claimed and (held.get("state") != "pending" or _sending_claim is not None):
         return None, "superseded"
     if now > float(held.get("deadline", 0) or 0):
         return None, "expired"
