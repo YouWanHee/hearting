@@ -740,6 +740,31 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
                      "note=dead-worker-blocked,failure_class=blocked"),
         ]), "only the current owner decides whether correction is still awaited")
 
+    def test_a_settled_runtime_owner_keeps_its_same_route_contract_release(self):
+        for note in ("dead-runtime-exit", "dead-runtime-error"):
+            with self.subTest(note=note):
+                self.assertTrue(self._pins([
+                    ("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,"
+                             f"attempt_id=att-2,note={note},launch_started=1,"
+                             "supervisor_lease=flock-v1,supervisor_lease_file=/tmp/lease"),
+                ]), "runtime continuation still reads the sealed capabilities")
+
+    def test_runtime_retention_excludes_stale_launches_and_finished_replacements(self):
+        for extra in ("launch_started=0,supervisor_lease=flock-v1,supervisor_lease_file=/tmp/lease",
+                      "launch_started=1", "launch_started=1,supervisor_lease=flock-v1"):
+            with self.subTest(extra=extra):
+                self.assertFalse(self._pins([
+                    ("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,"
+                             f"attempt_id=att-1,note=dead-runtime-exit,{extra}"),
+                ]), "an unstarted or unsupervised death has no settlement continuation")
+        self.assertFalse(self._pins([
+            ("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,attempt_id=att-1,"
+                     "note=dead-runtime-exit,launch_started=1,supervisor_lease=flock-v1,"
+                     "supervisor_lease_file=/tmp/lease"),
+            ("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,attempt_id=att-2,"
+                     "note=completed-marker,failure_class=pass"),
+        ]), "a finished successor releases the historical runtime continuation")
+
     def test_a_closed_route_releases_even_an_answerable_owner(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         base = Path(tmp.name)

@@ -1529,9 +1529,12 @@ class ReplacementTest(unittest.TestCase):
         self.assertNotIn('You replace exact-dead attempt', text)
 
     def test_runtime_death_receives_correction_on_the_same_route_without_replaying_reviews(self):
-        self._blocked_owner()
-        self.jobs.write_text(self.jobs.read_text().replace('dead-worker-blocked', 'dead-runtime-exit')
-                             .replace('failure_class=blocked', 'failure_class=runtime'))
+        meta = self._blocked_owner()
+        meta.pop('launch_outcome', None)
+        meta.update(note='dead-runtime-exit', failure_class='runtime', launch_started='1',
+                    supervisor_lease='flock-v1',
+                    supervisor_lease_file=str(D.supervisor_lease_path(self.jobs, meta['attempt_id'])))
+        self.write(meta)
         answer = '이미 통과한 검토를 보존하고 남은 관찰과 verdict만 완료하세요.'
         self.assertTrue(self._answer(text=answer)['retained'])
         R._reuse_snapshot.return_value['completed'] = [{'node': 'independent-verify'}]
