@@ -295,6 +295,8 @@ def command(req, request_path, nonce, *, continuing, screen_ready):
                 if not record: return result("unverified", "target-changed")
                 if not continuing and record["sessionId"] != sid:
                     return result("true", new_session=record["sessionId"])
+                if continuing and record["sessionId"] != sid:
+                    return result("unverified", "target-changed")
                 if continuing and st.read_prompt_seq(st.seat_from_dict(req["seat"])) > req["prompt_seq"]:
                     return result("true")
                 # Drain the PTY so the attacher never stalls on a full output buffer.
