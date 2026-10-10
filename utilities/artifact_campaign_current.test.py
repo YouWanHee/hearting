@@ -74,9 +74,33 @@ class CurrentExportTests(unittest.TestCase):
         self.assertEqual([(row["campaign_id"], row["state"]) for row in result["campaigns"]],
                          [(self.campaign, "active")])
         self.assertEqual(os.readlink(alias), self.directory.name)
+        original_input = next(item for item in result["inputs"] if item["path"] == "campaigns/old-locator")
+        self.assertEqual(original_input, {"path": "campaigns/old-locator",
+            "link_target": self.directory.name,
+            "link_sha256": "sha256:" + hashlib.sha256(os.fsencode(self.directory.name)).hexdigest()})
         alias.unlink()
         alias.symlink_to("../elsewhere", target_is_directory=True)
-        self.assertEqual(self.export()["status"], "invalid")
+        changed = self.export()
+        self.assertEqual(changed["status"], "invalid")
+        changed_input = next(item for item in changed["inputs"] if item["path"] == "campaigns/old-locator")
+        self.assertNotEqual(changed_input["link_sha256"], original_input["link_sha256"])
+
+    def test_alias_target_change_during_export_is_a_conflict(self):
+        alias = self.directory.parent / "old-locator"
+        alias.symlink_to(self.directory.name, target_is_directory=True)
+        original_fold = C.campaign_state
+        def change_after_fold(*args, **kwargs):
+            folded = original_fold(*args, **kwargs)
+            alias.unlink()
+            alias.symlink_to("../elsewhere", target_is_directory=True)
+            return folded
+        with mock.patch.object(C, "campaign_state", side_effect=change_after_fold):
+            result = C.export_current(self.root)
+        self.assertEqual((result["status"], result["reason"]), ("conflict", "input-changed"))
+        self.assertEqual((result["campaigns"][0]["status"], result["campaigns"][0]["state"]),
+                         ("conflict", None))
+        captured = next(item for item in result["inputs"] if item["path"] == "campaigns/old-locator")
+        self.assertEqual(captured["link_target"], self.directory.name)
 
     def test_missing_and_malformed_identity_with_nonempty_campaign(self):
         self.identity.unlink()

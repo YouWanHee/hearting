@@ -1207,6 +1207,7 @@ class CampaignReads:
         self.root = Path(root).resolve()
         self.files = {}
         self.listings = {}
+        self.links = {}
         self.changed = set()
         self.nodes = {}
         self.used = set()
@@ -1310,6 +1311,26 @@ class CampaignReads:
         except (ValueError, UnicodeError, identity.IdentityError) as exc:
             raise CampaignError("root-identity-invalid", path) from exc
 
+    def read_link(self, path):
+        path = self._path(path)
+        rel = self._rel(path)
+        self.used.add(("link", rel))
+        if rel not in self.links:
+            info = {"signature": self._stat(path), "raw": None, "target": None, "error": None}
+            self.links[rel] = info
+            try:
+                _safe(self.root, path.parent)
+                info["raw"] = os.readlink(os.fsencode(path))
+                info["target"] = info["raw"].decode("utf-8")
+            except (OSError, UnicodeError, CampaignError):
+                info["error"] = "campaign-directory-invalid"
+            if self._stat(path) != info["signature"]:
+                self.changed.add(rel)
+        info = self.links[rel]
+        if info["error"]:
+            raise CampaignError(info["error"], path)
+        return info["target"]
+
     def entries(self, path):
         path = self._path(path)
         rel = self._rel(path)
@@ -1354,10 +1375,13 @@ class CampaignReads:
     def inputs(self, used=None):
         rows = []
         for kind, rel in sorted(self.used if used is None else used):
-            info = (self.files if kind == "file" else self.listings)[rel]
+            info = ({"file": self.files, "directory": self.listings, "link": self.links}[kind])[rel]
             row = {"path": rel}
             if info["signature"] is None:
                 row["missing"] = True
+            elif kind == "link" and info["raw"] is not None:
+                row.update(link_target=info["target"], link_sha256="sha256:" +
+                           hashlib.sha256(info["raw"]).hexdigest())
             elif info["error"]:
                 row["error"] = info["error"]
             elif kind == "directory":
@@ -1392,6 +1416,16 @@ class CampaignReads:
             elif info["signature"] is not None and not info["error"]:
                 try:
                     if sorted(p.name for p in path.iterdir()) != info["entries"]:
+                        changed.add(rel)
+                except OSError:
+                    changed.add(rel)
+        for rel, info in self.links.items():
+            path = self.root / rel
+            if self._stat(path) != info["signature"]:
+                changed.add(rel)
+            elif info["raw"] is not None:
+                try:
+                    if os.readlink(os.fsencode(path)) != info["raw"]:
                         changed.add(rel)
                 except OSError:
                     changed.add(rel)
@@ -1435,6 +1469,22 @@ def export_current(root):
     except CampaignError as exc:
         directories = []
         root_reason = root_reason or exc.code
+    # Capture aliases before rows so the shared namespace verdict and link
+    # inputs bind every row regardless of directory sort order.
+    for directory in directories:
+        if directory.name.startswith(".") or not directory.is_symlink():
+            continue
+        try:
+            target_name = reads.read_link(directory)
+            target = directory.parent / target_name
+            canonical_alias = (Path(target_name).name == target_name
+                               and target in directories and not target.is_symlink()
+                               and target.is_dir())
+        except CampaignError:
+            canonical_alias = False
+        if not canonical_alias:
+            root_reason = root_reason or "campaign-directory-invalid"
+    shared.update(reads.used)
     rows, seen = [], {}
     for directory in directories:
         if directory.name.startswith("."):
@@ -1444,17 +1494,6 @@ def export_current(root):
             # Official locator amendments leave a direct relative redirect to
             # a canonical sibling. Never read a campaign through that alias or
             # count it twice; unrelated, chained or escaping links remain errors.
-            try:
-                target_name = os.readlink(directory)
-                target = directory.parent / target_name
-                canonical_alias = (Path(target_name).name == target_name
-                                   and target in directories and not target.is_symlink()
-                                   and target.is_dir())
-            except OSError:
-                canonical_alias = False
-            if canonical_alias:
-                continue
-            root_reason = root_reason or "campaign-directory-invalid"
             continue
         if not directory.is_dir():
             continue  # ordinary index/control files are not campaigns
@@ -1521,5 +1560,6 @@ def export_current(root):
             "artifact_root_path": str(root), "status": root_status, "reason": root_reason,
             "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "inputs": reads.inputs(set(("file", rel) for rel in reads.files) |
-                                   set(("directory", rel) for rel in reads.listings)),
+                                   set(("directory", rel) for rel in reads.listings) |
+                                   set(("link", rel) for rel in reads.links)),
             "campaigns": sorted(rows, key=lambda row: str(row["campaign_id"] or row["locator"]))}

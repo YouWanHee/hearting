@@ -69,6 +69,16 @@ observation time included in the digest:
 ```
 
 ```json
+{"path":"campaigns/old-locator","link_target":"example","link_sha256":"sha256:<64 lowercase hex>"}
+```
+
+`link_sha256` hashes the exact raw `readlink` target bytes, separately from
+regular file bytes. `link_target` is UTF-8 text, or null for an invalid UTF-8
+target; that invalid target remains an enumeration error. Alias inputs are
+shared by every campaign row. Their first-read targets and final byte/stat
+checks detect target drift, including between two exported input digests.
+
+```json
 {"path":"campaigns/example/campaign.events","error":"campaign-directory-unreadable"}
 ```
 
