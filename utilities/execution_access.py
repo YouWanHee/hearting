@@ -22,8 +22,15 @@ from typing import Iterable, Mapping
 
 
 SCHEMA_VERSION = 1
-MAX_REQUEST_BYTES = 64 * 1024
+MAX_REQUEST_BYTES = 4 * 1024 * 1024
+MAX_ROOT_INVENTORY_BYTES = 64 * 1024
 MAX_ROOTS = 16
+MAX_READ_ROOTS = 256
+READ_INPUTS_VERSION = 1
+HARNESS_SOURCE_DIRECTORIES = (
+    "core", "capabilities", "roles", "utilities", "adapters", "docs",
+    "hooks", "profiles", "tools",
+)
 MAX_PATH_LENGTH = 4096
 MAX_HOSTS = 32
 MAX_TEXT_LENGTH = 500
@@ -542,7 +549,29 @@ def _task_paths(text: str) -> list[tuple[int, str, str, str, str, str]]:
     return found
 
 
-def _sensitive(path: Path, context: AccessContext) -> bool:
+def harness_source_read_roots(agent_home: Path) -> tuple[Path, ...]:
+    """Source contracts only, including the alias native tools may use."""
+    canonical_home = agent_home.resolve()
+    roots = []
+    for name in HARNESS_SOURCE_DIRECTORIES:
+        lexical = agent_home / name
+        try:
+            canonical = lexical.resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not _is_within(canonical, canonical_home):
+            continue
+        parts = canonical.relative_to(canonical_home).parts
+        if not parts or parts[0] not in HARNESS_SOURCE_DIRECTORIES:
+            continue
+        if any(part.lower() in _SENSITIVE_NAMES or part.lower().startswith(_SENSITIVE_PREFIXES)
+               or part.lower().endswith(_SENSITIVE_SUFFIXES) for part in parts):
+            continue
+        roots.extend((lexical, canonical))
+    return tuple(dict.fromkeys(roots))
+
+
+def _sensitive(path: Path, context: AccessContext, *, source_read: bool = False) -> bool:
     parts = path.parts
     if len(parts) > 1 and parts[1] in _SENSITIVE_TOP:
         return True
@@ -551,11 +580,19 @@ def _sensitive(path: Path, context: AccessContext) -> bool:
         if (lowered in _SENSITIVE_NAMES or lowered.startswith(_SENSITIVE_PREFIXES)
                 or lowered.endswith(_SENSITIVE_SUFFIXES)):
             return True
-    if _is_within(path, context.home) and path != context.home:
+    source = source_read and any(_is_within(path, root) for root in
+                                harness_source_read_roots(context.agent_home))
+    data_roots = (context.home / ".local/share",)
+    if os.environ.get("XDG_DATA_HOME"):
+        data_roots += (Path(os.environ["XDG_DATA_HOME"]),)
+    inventory = source_read and "ops" in path.parts and any(
+        root.is_absolute() and _is_within(path, root) for root in data_roots)
+    if _is_within(path, context.home) and path != context.home and not (source or inventory):
         if path.relative_to(context.home).parts[0].startswith("."):
             return True
     return any(_is_within(path, root) for root in (
-        *context.config_roots, context.agent_home, context.dispatch_state_root))
+        *context.config_roots, context.dispatch_state_root)) or (
+            _is_within(path, context.agent_home) and not source)
 
 
 def _excerpt(quote: str) -> str:
@@ -570,7 +607,8 @@ def _derivable(literal: Path, resolved: Path, access: str, entry: dict, context:
 
     if access == "excluded":
         return "excluded-by-scope", literal, resolved, access
-    if _sensitive(literal, context) or _sensitive(resolved, context):
+    if _sensitive(literal, context, source_read=access == "read") or _sensitive(
+            resolved, context, source_read=access == "read"):
         return "sensitive", literal, resolved, access
     if not resolved.is_dir():
         if not resolved.exists():
@@ -578,7 +616,8 @@ def _derivable(literal: Path, resolved: Path, access: str, entry: dict, context:
         if access == "write":
             access, entry["note"] = "read", "file-target-read-only"
         literal, resolved = literal.parent, resolved.parent
-    if _sensitive(literal, context) or _sensitive(resolved, context):
+    if _sensitive(literal, context, source_read=access == "read") or _sensitive(
+            resolved, context, source_read=access == "read"):
         return "sensitive", literal, resolved, access
     if any(_is_within(resolved, area) for area in granted):
         return "already-granted", literal, resolved, access
@@ -591,9 +630,28 @@ def _derivable(literal: Path, resolved: Path, access: str, entry: dict, context:
     return "", literal, resolved, access
 
 
+def _root_inventory(path: Path, context: AccessContext) -> tuple[str, ...]:
+    """One task-named data file, never executable code or recursive references."""
+    if path.suffix.lower() != ".json" or _sensitive(path, context, source_read=True):
+        return ()
+    try:
+        raw = _read_bounded_regular_file(path, MAX_ROOT_INVENTORY_BYTES)
+        if not _json_depth_is_bounded(raw):
+            return ()
+        data = json.loads(raw, object_pairs_hook=_pairs_no_duplicates)
+    except (ExecutionAccessError, OSError, ValueError):
+        return ()
+    rows = data.get("roots") if isinstance(data, dict) else None
+    if not isinstance(rows, list) or len(rows) > MAX_READ_ROOTS:
+        return ()
+    return tuple(value for row in rows
+                 for value in (row.get("artifact_root_path") if isinstance(row, dict) else row,)
+                 if isinstance(value, str) and value.startswith("/"))
+
+
 def derive_task_access(
     route: Mapping[str, object], context: AccessContext, *, writable: Iterable[Path] = (),
-    write: bool = True,
+    write: bool = True, read_limit: int = MAX_READ_ROOTS,
 ) -> DerivedAccess:
     """The access a sealed task names, with the line each root came from.
 
@@ -622,6 +680,21 @@ def derive_task_access(
             continue
         occurrences.append((number, literal, resolved, access, source, quote, why))
     excluded = [resolved for _, _, resolved, access, _, _, _ in occurrences if access == "excluded"]
+    # Inventory membership is approved read input, never a write instruction.
+    # Inspect only directly named files, before an in-worktree file is absorbed.
+    for number, literal, resolved, access, source, quote, why in list(occurrences):
+        if access == "excluded" or any(_is_within(resolved, x) for x in excluded):
+            continue
+        for token in _root_inventory(resolved, context):
+            try:
+                _validate_path_text(token)
+                target = Path(token)
+                canonical = _resolve_request_path(target)
+            except (ExecutionAccessError, OSError, RuntimeError, ValueError):
+                skipped.append({"path": token[:200], "source": "inventory", "reason": "not-a-path"})
+                continue
+            occurrences.append((number, target, canonical, "read", "inventory",
+                                str(literal), "task-named root inventory"))
     kept_read_only = [resolved for _, _, resolved, access, source, _, _ in occurrences
                       if access == "read" and source == "scope"]
     defaults = (context.worktree, context.artifact_root,
@@ -649,12 +722,12 @@ def derive_task_access(
     read_roots = [r for r in read_roots
                   if not any(_is_within(r, w) for w in write_roots)
                   and not any(_proper_ancestor(o, r) for o in read_roots)]
-    budget = MAX_ROOTS - len(_unique_paths(writable))
     chosen: list[tuple[Path, str]] = []
     for root in (*write_roots, *read_roots):
         access = "write" if root in write_roots else "read"
         entry = next(e for r, a, e in candidates if r == root and a == access)
-        if len(chosen) >= budget:
+        limit = MAX_ROOTS - len(_unique_paths(writable)) if access == "write" else read_limit
+        if sum(a == access for _, a in chosen) >= limit:
             skipped.append({"path": str(root), **entry, "reason": "root-limit"})
             continue
         chosen.append((root, access))
@@ -777,7 +850,7 @@ def prepare_task_request(
     request the route's parent last handed its next owner is that explicit request
     (`route_authority.access_in_force`). Each route node keeps its own prepared file, and a
     node derives once, at its first preparation: a later start or resume reuses that
-    result, and a node prepared before derivation existed keeps deriving nothing."""
+    result. An older snapshot adds only its missing read inputs once."""
 
     # The explicit typed request keeps precedence over preview-table input.
     lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
@@ -826,6 +899,17 @@ def prepare_task_request(
         directory = directory / "compute"
         request_path_value = directory / "request.json"
         binding_path = directory / "binding.json"
+    prior = _prepared_binding(binding_path) or previous_binding
+    upgrade_reads = explicit is None and prior is not None and prior.get("read_inputs_version") != READ_INPUTS_VERSION
+    if upgrade_reads:
+        # Keep the historical request and its write decisions. Only the missing
+        # read inputs are filled on the first normal start after upgrading.
+        directory = directory / "read-inputs"
+        request_path_value = directory / "request.json"
+        binding_path = directory / "binding.json"
+        upgraded = _prepared_binding(binding_path)
+        if upgraded is not None:
+            prior, upgrade_reads = upgraded, False
     context = AccessContext.build(
         worktree=str(route.get("cwd") or ""),
         artifact_root=str(route.get("artifact_root") or ""),
@@ -843,13 +927,32 @@ def prepare_task_request(
         named.append(run_root)
     if supplied is not None:
         named.extend(supplied.writable_roots)
-    prior = _prepared_binding(binding_path) or previous_binding
     if explicit is not None:
         derived = None
     elif prior is not None:
         derived = _derived_from_record(prior.get("derivation"))
+        if upgrade_reads:
+            reads = derive_task_access(route, context,
+                writable=(*named, *(derived.writable_roots if derived else ())), write=False)
+            previous = derived.record if derived else {}
+            rows = {row["path"]: row for row in previous.get("granted", [])}
+            read_roots = {row["path"] for row in rows.values() if row.get("access") == "read"}
+            if inventory_root is not None:
+                read_roots.add(str(inventory_root))
+            skipped = [*previous.get("skipped", []), *reads.record.get("skipped", [])]
+            for row in reads.record.get("granted", []):
+                if row["path"] in rows:
+                    continue
+                if row["path"] not in read_roots and len(read_roots) >= MAX_READ_ROOTS:
+                    skipped.append({**row, "reason": "root-limit"})
+                    continue
+                rows[row["path"]] = row
+                read_roots.add(row["path"])
+            derived = _derived_from_record({"granted": list(rows.values()),
+                                           "skipped": skipped[:MAX_DERIVATION_SKIPPED]})
     else:
-        derived = derive_task_access(route, context, writable=named, write=node == "owner")
+        derived = derive_task_access(route, context, writable=named, write=node == "owner",
+                                    read_limit=MAX_READ_ROOTS - int(inventory_root is not None))
 
     def assemble(derived: DerivedAccess | None) -> dict:
         roots = [str(path) for path in _unique_paths(named)]
@@ -890,7 +993,8 @@ def prepare_task_request(
         if derived is None or not (derived.writable_roots or derived.read_roots):
             raise
         # A derived root never adds a refusal: keep what was named explicitly.
-        derived = _derived_from_record({**derived.record, "granted": [], "dropped": exc.reason})
+        retained = (prior.get("derivation") or {}).get("granted", []) if upgrade_reads else []
+        derived = _derived_from_record({**derived.record, "granted": retained, "dropped": exc.reason})
         request = assemble(derived)
         validated = _validate_request(request, source=request_path_value, context=context)
     if targets is None and run_root is None and not (request["writable_roots"] or request["read_roots"]):
@@ -899,6 +1003,7 @@ def prepare_task_request(
     request_digest = validated.request_sha256
     binding = {
         "schema_version": 1,
+        "read_inputs_version": READ_INPUTS_VERSION,
         "route_id": route_id,
         "route_hash": route_hash,
         "artifact_root": str(Path(str(route.get("artifact_root") or "")).resolve(strict=False)),
@@ -911,6 +1016,8 @@ def prepare_task_request(
     if derived is not None and any(derived.record.get(key) for key in ("granted", "skipped", "dropped")):
         binding["derivation"] = derived.record
     binding_bytes = (json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    if max(len(request_bytes), len(binding_bytes)) > MAX_REQUEST_BYTES:
+        raise ExecutionAccessError("execution-access-unreadable", "prepared access exceeds the bounded cache size")
     try:
         existing_request = _read_bounded_regular_file(request_path_value, MAX_REQUEST_BYTES) if request_path_value.exists() else None
         existing_binding = _read_bounded_regular_file(binding_path, MAX_REQUEST_BYTES) if binding_path.exists() else None
@@ -1338,11 +1445,11 @@ def _validate_request(
         )
 
     # Phase ⑤ begins only after every unknown-key and type check in phase ④.
-    if len(writable_raw) + len(read_raw) > MAX_ROOTS:
+    if len(writable_raw) > MAX_ROOTS or len(read_raw) > MAX_READ_ROOTS:
         _reject(
             "execution-access-path-invalid",
             "root-count",
-            f"at most {MAX_ROOTS} total roots are supported",
+            f"at most {MAX_ROOTS} writable and {MAX_READ_ROOTS} read roots are supported",
         )
     for raw_path in (*writable_raw, *read_raw):
         _validate_path_text(str(raw_path))

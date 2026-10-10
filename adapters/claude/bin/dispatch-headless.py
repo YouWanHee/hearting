@@ -919,16 +919,21 @@ def _read_only_projection(args: argparse.Namespace) -> tuple[list[str], list[str
     (`harness_capabilities` access means): each root is an `--add-dir`, and the
     roots the grant keeps unwritten get an Edit deny rule (Edit rules also govern Write)."""
     grant = getattr(args, "execution_access_grant", None)
-    writable = [Path(args.worktree).resolve(strict=False)]
-    if grant is not None:
-        writable.extend(Path(root).resolve(strict=False) for root in grant.writable_roots)
-    contracts = tuple(root for root in getattr(args, "contract_read_roots", ())
-                      if not any(Path(root).resolve(strict=False).is_relative_to(scope)
-                                 for scope in writable))
-    reads = tuple(dict.fromkeys((*contracts, *(grant.read_roots if grant is not None else ()))))
-    unwritten = tuple(dict.fromkeys((*contracts, *(grant.unwritable_read_roots if grant is not None else ()))))
+    home = getattr(args, "agent_home", None)
+    source = tuple(dict.fromkeys((
+        *(() if home is None else route_authority.contract_read_roots(home)),
+        *getattr(args, "contract_read_roots", ()),
+    )))
+    writable = [Path(args.worktree).resolve(), *(grant.writable_roots if grant else ())]
+    if getattr(args, "artifact_root", None) is not None:
+        writable.append(Path(args.artifact_root).resolve())
+    source = tuple(root for root in source if root.is_dir() and not any(
+        root.resolve().is_relative_to(area) or area.is_relative_to(root.resolve())
+        for area in writable))
+    reads = tuple(dict.fromkeys((*source, *(grant.read_roots if grant else ()))))
+    denied = tuple(dict.fromkeys((*source, *(grant.unwritable_read_roots if grant else ()))))
     return ([str(root) for root in reads],
-            [f"Edit(//{str(root).lstrip('/')}/**)" for root in unwritten])
+            [f"Edit(//{str(root).lstrip('/')}/**)" for root in denied])
 
 
 def _async_wait_policy(args: argparse.Namespace) -> str:
