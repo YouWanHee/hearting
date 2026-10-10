@@ -328,6 +328,20 @@ def pane_session_aliases(harness, sid, pane, cwd):
         return []
 
 
+def _lineage_attachment(sessions, lineage):
+    """Reuse launcher evidence when the pane surface cannot be observed."""
+    if lineage is None:
+        from . import procscan
+        lineage = procscan.provenance
+    for s in sessions:
+        if not _eligible(s):
+            continue
+        try:
+            s.herdr_attached = True if lineage(s.pid) == "herdr" else None
+        except Exception:
+            s.herdr_attached = None
+
+
 def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None):
     """Set ``herdr_attached`` on every eligible depth-0 session. ``agents`` = a
     pre-fetched ``list_agents()`` result (``None`` → probe once here); ``panes``/``pids``
@@ -336,22 +350,18 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     for session in sessions:
         session._gpu_session_aliases = []
         session._herdr_name = None
+        session._pane_session_claim = None
     if agents is None:
         agents = list_agents()
     if agents is None:
-        if lineage is None:
-            try:
-                from . import procscan
-                lineage = procscan.provenance
-            except Exception:
-                lineage = None
+        _lineage_attachment(sessions, lineage)
+        # Agent-list failure does not erase a supplied foreground observation.
+        # For a known herdr process, an absent pane observation cannot confirm
+        # its older native registry identity either. Do not issue another probe.
+        from ..process_identity import pane_process_claims
+        claims = pane_process_claims(sessions, panes, pane_bindings or {}, complete=False)
         for s in sessions:
-            if not _eligible(s) or lineage is None:
-                continue
-            try:
-                s.herdr_attached = True if lineage(s.pid) == "herdr" else None
-            except Exception:
-                s.herdr_attached = None
+            s._pane_session_claim = claims.get(s.pid)
         return {"complete": False, "last_error": "herdr 조회 불가"}
     index = attached_index(agents)
     bindings = {} if pane_bindings is None else pane_bindings
@@ -359,8 +369,15 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         if panes is None:
             panes = list_panes()
         pids = pane_pids(panes, bindings=bindings) if panes is not None else None
+    if panes is None:
+        _lineage_attachment(sessions, lineage)
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None and getattr(pids, "complete", True)
+    from ..process_identity import pane_process_claims
+    claims = pane_process_claims(sessions, panes, bindings,
+                                 complete=pids is not None and getattr(pids, "complete", True))
+    for session in sessions:
+        session._pane_session_claim = claims.get(session.pid)
     # A native resume can run inside the still-live foreground runtime. Keep
     # one pane row instead of letting that detached companion make the same
     # display alias ambiguous. Independent live processes remain separate.

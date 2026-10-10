@@ -1,7 +1,7 @@
   hearting unknown · unmanaged
 
-  usage claude code   no usage api — plan quota is console-only
-        codex         no usage api — plan quota is console-only
+  usage claude code   no usage api — plan quota is console-
+        codex         no usage api — plan quota is console-
   fleet ⠋ 2 working   ● 0 idle   ↳ 4 jobs (4 working)
 ─────
   compute resources  1/1
@@ -13,29 +13,32 @@
 ● bundle/
 ▍ ⠋ [aa] claude     aa ▾4
 ▍    ⚑  3h 00m      Opus (high)              -
-▍    ┆              ────────────────   —    작업 중 · 마지…
+▍    ┆          문맥────────────────   —    작업 중 · 마지…
 ▍    ┆  ╭─  ⠋ claude   gpu-owner ─────────────────────────╮
-▍    ┆  │  —        Opus (high)              code(std·ow… │
-▍    ┆  │           ────────────────   —    train · gpu:… │
+▍    ┆  │  —        Opus (high)              개발 담당    │
+▍    ┆  │   문맥    ────────────────   —    train · gpu:… │
 ▍    ┆  ├──────────────────────────────────── one-shot ───┤
 ▍    ┆  │ ● GPU gpu:0 · train 2m                          │
 ▍    ┆  ╰─────────────────────────────────────────────────╯
 ▍    ┆  ╭─  ⠋ codex    worker-owner ──────────────────────╮
-▍    ┆  │  —        gpt-6.1-sol (high)       code(std·ow… │
-▍    ┆  │           ────────────────   —                  │
+▍    ┆  │  —        gpt-6.1-sol (high)       개발 담당    │
+▍    ┆  │   문맥    ────────────────   —                  │
 ▍    ┆  ├─────────────────────────────────── preparing ───┤
 ▍    ┆  │   ⠋ codex    exec worker                        │
-▍    ┆  │  3m       gpt-6.1-sol (medium)       code-exec… │
+▍    ┆  │  3m       gpt-6.1-sol (medium)       구현     … │
 ▍    ┆  │           running                               │
-▍    ┆  │        ────────────────   —                     │
+▍    ┆  │  문맥  ────────────────   —                     │
 ▍    ┆  ╰─────────────────────────────────────────────────╯
 ▍    ┆  ╭─  ⠋ opencode childless-owner ───────────────────╮
-▍    ┆  │  —        gpt-6.1-sol (high)       code(std·ow… │
-▍    ┆  │           ────────────────   —                  │
+▍    ┆  │  —        gpt-6.1-sol (high)       개발 담당    │
+▍    ┆  │   문맥    ────────────────   —                  │
 ▍    ┆  ╰──────────────────────────────────── scaffold ───╯
 ▍ ⠋ [bb] codex      bb
 ▍       3h 00m      gpt-6.1-sol (medium)     -
-▍                   ────────────────   —
+▍               문맥────────────────   —
 
-  ⠹ working   ● idle   [id] session   [id] steward
+  세션: ⠹ 작업 중   ● 대기   [id] session   [id] steward
   ▾N child jobs   ↳ dispatch
+  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량
+  단계: ● 현재  ✓ 완료  ✕ 실패  ○ 예정 · 문맥 %는 대화 사용
+  량

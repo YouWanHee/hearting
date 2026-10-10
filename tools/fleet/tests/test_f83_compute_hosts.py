@@ -204,8 +204,8 @@ class ComputeHostRenderTest(unittest.TestCase):
                               "cpu", "no gpu"):
                     self.assertIn(value, text)
                 if width >= 100:
-                    self.assertIn("working", text)
-                    self.assertIn("idle", text)
+                    self.assertIn("작업 중", text)
+                    self.assertIn("대기", text)
                 self.assertNotIn("g0", text)
                 self.assertNotIn("g1", text)
                 self.assertNotIn("HOME", text)
@@ -288,13 +288,13 @@ class ComputeHostRenderTest(unittest.TestCase):
         self.assertEqual(idle_row[0], ("●", "g_work_off"))
         self.assertIn(("UTIL ", "dim"), idle_row)
         self.assertIn(("A100              ", "gpu_ampere"), idle_row)
-        self.assertIn("idle", render._plain(idle_row))
+        self.assertIn("대기", render._plain(idle_row))
         self.assertNotIn("· idle", render._plain(idle_row))
         self.assertIn(working_a[0][0], render._SPIN)
         self.assertEqual(working_a[0][1], "g_spin")
         self.assertIn(("UTIL ", "resource_active"), working_a)
         self.assertIn(("A100              ", "gpu_ampere_active"), working_a)
-        self.assertIn("working", render._plain(working_a))
+        self.assertIn("작업 중", render._plain(working_a))
         self.assertNotEqual(working_a[0][0], working_b[0][0])
         self.assertNotIn("unattributed:", render._plain(working_a))
         command_row = render._gpu_process_rows(working, "", 120)[0]
@@ -309,7 +309,7 @@ class ComputeHostRenderTest(unittest.TestCase):
         with mock.patch.object(render.time, "time", return_value=1.0):
             wide = render._gpu_token(gpu, 87, show_name=False)
             narrow = render._gpu_token(gpu, 47, show_name=False)
-        self.assertIn("working", render._plain(wide))
+        self.assertIn("작업 중", render._plain(wide))
         self.assertNotIn("working", render._plain(narrow))
         self.assertNotIn("work…", render._plain(narrow))
         self.assertIn(narrow[0][0], render._SPIN)
@@ -458,7 +458,7 @@ class ComputeHostRenderTest(unittest.TestCase):
         lines = render._build_process_lines([], [], {}, 0, None, 120, "wide")
         text = [render._plain(line) for line in lines]
         resource_at = next(i for i, line in enumerate(text) if "compute resources" in line)
-        process_at = next(i for i, line in enumerate(text) if "PROCESS VIEW" in line)
+        process_at = next(i for i, line in enumerate(text) if "작업 보기" in line)
         divider_at = next(i for i, line in enumerate(text)
                           if i > resource_at and line == "─────")
         self.assertLess(resource_at, divider_at)

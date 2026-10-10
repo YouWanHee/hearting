@@ -325,8 +325,8 @@ class F52WidthLedgerTest(unittest.TestCase):
                           slug="s", elapsed_min=1)
         lines = render._build_lines([session], [], "fleet", False, 0,
                                     layout="wide", term_width=168)
-        legend = "".join(v for v, _k in [ln for ln in lines if ln][-1])
-        self.assertIn("idle", legend)
+        legend = next(render._plain(ln) for ln in lines if ln and "세션: " in render._plain(ln))
+        self.assertIn("대기", legend)
         self.assertNotIn("context", legend)
         self.assertNotIn(FULL, legend)
         self.assertNotIn(EMPTY, legend)

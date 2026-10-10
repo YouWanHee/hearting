@@ -162,7 +162,7 @@ class RecoveringRendersWithoutTheFailureGlyphTest(unittest.TestCase):
         text, key, mark = render._route_node_text(
             {"id": "r3", "state": "recovering", "note": "awaiting-resume",
              "elapsed_min": 7, "depends_on": []})
-        self.assertIn("awaiting-resume", text)
+        self.assertIn("복구 대기", text)
         self.assertIn("…", text)
         self.assertNotIn("✕", text)
         self.assertEqual(key, "lvl_y")

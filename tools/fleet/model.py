@@ -272,6 +272,8 @@ class Session:
     elapsed_min: int = 0               # ps etime
     # --- enrichment (None = harness doesn't expose it → render '—') ---
     session_id: Optional[str] = None
+    process_role: str = "unknown"       # common observation: conversation | registered-worker | session-backend | service
+    session_identity_evidence: Optional[dict] = None
     slug: Optional[str] = None
     title: Optional[str] = None        # last successful Fleet subject title; native titles are not fallbacks
     title_ts: Optional[float] = None   # exact sidecar title event time, independent of activity
@@ -459,6 +461,10 @@ class DispatchJob:
     cwd: str = ""
     parent_sid: Optional[str] = None    # spawning parent session id (CLAUDE_CODE_SESSION_ID from environ)
     parent_cwd: Optional[str] = None    # fallback parent cwd when runtime session id is unavailable/mismatched
+    caller_sid: Optional[str] = None   # observation only; no dispatch/delivery authority
+    caller_harness: Optional[str] = None
+    caller_pane: Optional[str] = None
+    caller_cwd: Optional[str] = None
     parent_managed_dir: Optional[str] = None  # exact managed Codex state dir derived from
                                              # registered managed_sidecar_log (F-68)
     is_child: bool = False              # portable/adapter worker marker
@@ -1485,6 +1491,9 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
     if ev_in.get("orphan"):
         return out("stale", 2, "proc", "orphan cwd (deleted worktree)")
 
+    if (ev_in.get("session_identity_evidence") or {}).get("verdict") == "conflict":
+        return out("unknown", 2, "session-identity", "current session claims conflict")
+
     interaction_wait = ev_in.get("interaction_wait")
     if (
         isinstance(interaction_wait, dict)
@@ -1546,7 +1555,7 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
                 return out("unused", 1, "claude-registry",
                            "idle refined to unused (no transcript, updatedAt≈startedAt)")
             return out(st, 1, st_source, st_rule)
-        return out("idle", 3, "mtime", "no mtime and no registry status")
+        return out("unknown", 3, "observation", "no mtime and no registry status")
 
     age_min = (now - m) / 60.0
     if age_min > stale_min:

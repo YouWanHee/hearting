@@ -201,6 +201,21 @@ Diagnostics retain the reader's kind, source and blocking evidence. A missing
 historical resource reference is not a broken dispatch log or a current execution
 failure. Memory rows describe a stored change with its content and observed origin;
 storage classifications never impersonate a current user decision.
+A process name proves a runtime, not a conversation: one shared process-role
+observation distinguishes terminal sessions, registered workers and unbound services.
+Services produce no session row. Current session identity joins live PID/start,
+the pane selection and recorded conversation continuity once; title, state and
+context consume that same result. Conflicting identities and absent work bindings
+stay unknown rather than borrowing a neighboring transcript or artifact directory.
+Routine ledger folding preserves the recorded native transition direction.
+The normal view retains observed run/configuration names and explains session,
+device and stage symbols separately. Names, current actions and controls share
+the terminal's width budget; internal identifiers belong in detail. Support
+work carries its caller's observed session/seat independently of execution and
+delivery authority, and is labelled project support when that link is unproven.
+GPU owner labels add who is responsible, such as a verified Fleet session tag;
+they do not repeat the execution's run/job identifier beside its training name.
+Raw owner identifiers remain available in structured output.
 
 ## Basis and current scope
 

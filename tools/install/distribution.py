@@ -2546,13 +2546,17 @@ def _route_registry_index(text: str) -> dict:
                 owners[value] = (fields[1], metadata)
     for route_id, (status, metadata) in owners.items():
         # Standalone install.sh cannot import the runtime. Mirror
-        # route_authority.answerable_owner_end: a kept correction continues
-        # this same unclosed route, so process exit cannot release its code.
-        # A launch/runtime death has no readable result and stays releasable.
+        # Mirror route_authority.answerable_owner_end/runtime_owner_can_resume:
+        # a correction continues this route, so exit cannot release its code.
+        # Unstarted or unsupervised deaths still have no settlement continuation.
         if status == "done" and (
             metadata.get("note") == "dead-worker-blocked"
             or (metadata.get("note") == "dead-worker-fail"
                 and metadata.get("failure_class") == "fail")
+            or (metadata.get("note") in {"dead-runtime-exit", "dead-runtime-error"}
+                and metadata.get("launch_started") == "1"
+                and metadata.get("supervisor_lease") == "flock-v1"
+                and bool(metadata.get("supervisor_lease_file")))
         ):
             index["paused"].add(route_id)
     return index
@@ -2666,9 +2670,10 @@ def _route_record_launch_home(
     fail-closed is its own bug).
 
     Also `None` when the route is unclosed but every one of its registry
-    attempts is terminal and its current owner has no readable result awaiting
-    correction (`_route_attempts_finished`). "Unclosed" and "still working" are not
-    the same thing, and a route that died at launch is never closed by anyone.
+    attempts is terminal and its current owner has no readable result or launched
+    runtime continuation awaiting correction (`_route_attempts_finished`).
+    "Unclosed" and "still working" are not the same thing, and a route that died
+    at launch is never closed by anyone.
 
     Returns `_UNDECIDABLE` if the record looks open (no outcome sibling) but
     cannot be trusted: oversized, unreadable, unparsable, or missing the

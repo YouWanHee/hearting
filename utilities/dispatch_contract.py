@@ -288,6 +288,8 @@ ATTEMPT_MUTABLE_METADATA = {
     "parent_close_requested", "parent_close_route_id", "parent_close_route_hash",
     "parent_close_stop_resources", "parent_close_settled",
     "resolved_model",
+    # Observational caller provenance, never parent execution/delivery authority.
+    "caller_sid", "caller_harness", "caller_pane", "caller_cwd",
     "launch_claimed",
     "pid",
     "pid_start",

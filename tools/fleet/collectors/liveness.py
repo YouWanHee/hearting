@@ -88,6 +88,7 @@ def collect_evidence(sess):
         "proc_start_match": match,
         "orphan": bool(sess.orphan),
         "status": sess.status,
+        "session_identity_evidence": getattr(sess, "session_identity_evidence", None),
         "task_lifecycle": getattr(sess, "task_lifecycle", None),
         # F-47: the shared classifier separates owned tool execution from the
         # model's waiting state; this layer only carries process evidence.

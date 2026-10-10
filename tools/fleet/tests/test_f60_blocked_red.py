@@ -70,14 +70,14 @@ class BlockedRowTest(unittest.TestCase):
         segs = render._session_row(_blocked("approval"), narrow=False, name_width=40)
         self.assertEqual(self._keys(segs).count("g_blocked_chip"), 1)
         chip = [v for v, k in segs if k == "g_blocked_chip"][0]
-        self.assertEqual(chip, " approval ")            # padded INSIDE the reversed run
+        self.assertEqual(chip, " 승인 필요 ")            # padded INSIDE the reversed run
         glyph_keys = [k for v, k in segs if v == render._LIVE_GLYPH["blocked"]]
         self.assertEqual(glyph_keys, ["g_blocked"])
 
     def test_narrow_and_stack_rows_carry_the_same_chip(self):
         for row in (render._session_row_2line(_blocked("permission"), term_width=100)[0],
                     render._session_row_stack(_blocked("permission"), term_width=60)[0]):
-            self.assertIn(" approval ", [v for v, k in row if k == "g_blocked_chip"])
+            self.assertIn(" 승인 필요 ", [v for v, k in row if k == "g_blocked_chip"])
 
     def test_the_separator_space_stays_outside_the_reversed_run(self):
         """Otherwise the inverted block runs straight into the title with no gutter."""

@@ -118,7 +118,7 @@ class BasicObservationTest(unittest.TestCase):
         self.assertIn('worker-exact', screen)
         self.assertIn('exact stage NOW', screen)
         self.assertIn('gpt-6.1-sol', screen)
-        self.assertIn('route 확인 중', screen)
+        self.assertIn('작업 연결 확인 중', screen)
         self.assertNotIn('no active route', screen)
         self.assertNotIn('no route record', screen)
         self.assertIsNone(worker.work_projection.progress)
@@ -165,7 +165,7 @@ class BasicObservationTest(unittest.TestCase):
                 return '\n'.join(render._plain(line) for line in lines)
             with mock.patch.object(route, 'load', side_effect=AssertionError('basic render route read')):
                 before = screen(source)
-            for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py', 'route 확인 중'):
+            for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py', '작업 연결 확인 중'):
                 self.assertIn(value, before)
             self.assertNotIn('no active route', before)
             with mock.patch.object(dispatch, '_pending_delivery_counts', return_value=None), \
@@ -183,7 +183,7 @@ class BasicObservationTest(unittest.TestCase):
             after = screen(joined)
             for value in ('owner', 'exact-worker', 'real worker NOW', 'train train.py'):
                 self.assertIn(value, after)
-            self.assertNotIn('route 확인 중', after)
+            self.assertNotIn('작업 연결 확인 중', after)
             self.assertNotIn('no active route', after)
             self.assertIsNone(owner.campaign_label)
 

@@ -137,6 +137,16 @@ def resolve_parent_edges(sessions, jobs):
     managed_parents = model.unique_managed_parents(sessions)
     for j in jobs:
         parent_sid = getattr(j, "parent_sid", None)
+        if not parent_sid and getattr(j, "caller_sid", None):
+            # Caller identity is observational: an exact SID or a verified session
+            # continuation may link it. A pane/cwd alone never selects another user.
+            caller_sid, harness = j.caller_sid, getattr(j, "caller_harness", None)
+            candidates = [s for s in sessions if harness == s.harness
+                          and caller_sid in [s.session_id, *(getattr(s, "session_aliases", None) or [])]
+                          and model.session_parent_visible(s) and not getattr(s, "is_child", False)]
+            j._parent_edge_sid = candidates[0].session_id if len(candidates) == 1 else None
+            j._parent_edge_promoted_orphan = False
+            continue
         if not (getattr(j, "is_child", False) and parent_sid):
             continue
         parent_sid, parent_harness = _effective_job_parent(j)
@@ -364,6 +374,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
     for s in sessions:
         fn = enrichers.get(s.harness)
+        if s.harness == "claude":
+            continue  # resolve once after the existing foreground pane observation
         if fn:
             try:
                 if s.harness == "codex" and codex_tick is not None:
@@ -403,6 +415,22 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
+    # F-100b: herdr attachment — one `herdr agent list` per snapshot, exact session-id
+    # match; additive enrichment that never touches liveness or row existence.
+    try:
+        from . import herdr as _herdr
+        observed = _herdr.enrich(sessions)
+        if isinstance(observed, dict):
+            observations["herdr"] = _observation_health(
+                job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
+    except Exception as exc:
+        observations["herdr"] = _observation_health(job_key, "herdr", "%s: %s" % (type(exc).__name__, exc))
+    for s in sessions:
+        if s.harness == "claude" and enrichers.get("claude"):
+            try:
+                enrichers["claude"](s, tick={s.pid: getattr(s, "_pane_session_claim", None)})
+            except Exception:
+                pass
     # Exact Fleet-owned decision/approval waits are additive enrichment. Run
     # after harness identity resolution and before the single liveness verdict.
     try:
@@ -416,16 +444,6 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
-    # F-100b: herdr attachment — one `herdr agent list` per snapshot, exact session-id
-    # match; additive enrichment that never touches liveness or row existence.
-    try:
-        from . import herdr as _herdr
-        observed = _herdr.enrich(sessions)
-        if isinstance(observed, dict):
-            observations["herdr"] = _observation_health(
-                job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
-    except Exception as exc:
-        observations["herdr"] = _observation_health(job_key, "herdr", "%s: %s" % (type(exc).__name__, exc))
     # Resume/fork aliases must be resolved BEFORE the two ledger joins below, which both
     # key on `(harness, session_id)`: a resumed session's older receipts and any steward
     # marker written before the resume still name the id it used to have.
@@ -562,6 +580,12 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     try:
         from . import codex_companion
         jobs = jobs + codex_companion.collect()
+    except Exception:
+        pass
+
+    try:
+        from ..process_identity import finalize_process_roles
+        finalize_process_roles(sessions, jobs)
     except Exception:
         pass
 
