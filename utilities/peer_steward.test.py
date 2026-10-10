@@ -61,6 +61,12 @@ class _TmpRootMixin:
         runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
         runner_patch.start()
         self.addCleanup(runner_patch.stop)
+        # Existing peer tests use already admitted fixture panes. The shared
+        # admission is tested against real ptys in pane_ownership.test.py.
+        import pane_ownership
+        proof = mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda pane, *a, **kw: pane or "")
+        proof.start()
+        self.addCleanup(proof.stop)
         self.addCleanup(lambda: setattr(peer_steward, "_HERDR_SESSION", self._old_herdr_session))
         self.addCleanup(self._restore_environ)
 

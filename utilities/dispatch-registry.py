@@ -1338,6 +1338,21 @@ def reconcile(rows, args):
                              and not any((args.session, args.route, args.node, args.job,
                                           getattr(args, "all", False)))
                              and meta.get("worker_type") == "owner")
+        if args.apply and row["status"] in OPEN and meta.get("worker_type") == "owner":
+            from dispatch_completion_join import settle_exited_owner_terminal
+            completion = settle_exited_owner_terminal(
+                ChildRow(row["order"], row["status"], row["slug"], meta.get("attempt_id", ""),
+                         row["raw"], meta), jobs=args.jobs)
+            if completion is not None:
+                current = exact_attempt_row(args.jobs, meta["attempt_id"])
+                closed = current.status not in OPEN
+                decisions.append({"attempt_id": meta["attempt_id"], "slug": row["slug"],
+                                  "category": "owner-terminal-settled" if closed else "owner-terminal-pending",
+                                  "reason": current.metadata.get("reconcile_reason") if closed else completion,
+                                  "proposed_note": current.metadata.get("note") if closed else None,
+                                  "closed": closed, "revalidated": closed, "cascade": [], "cleanup": None,
+                                  "summary_owner": {"state": "not-applied", "reason": "owner-terminal-writer"}})
+                continue
         if (exact_owner_scope and row["status"] == "done"
                 and meta.get("classifier_source") == OWNER_ROUTE_CANCEL_CLASSIFIER
                 and meta.get("note") == OWNER_ROUTE_CANCEL_NOTE

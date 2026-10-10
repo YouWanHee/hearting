@@ -471,7 +471,7 @@ def emit(value: dict[str, Any]) -> None:
 def reconcile(args: argparse.Namespace, terminal: SupervisorTerminal) -> bool:
     try:
         outcome = reconcile_supervisor_terminal(
-            args.jobs, args.parent_attempt_id, terminal
+            args.jobs, args.parent_attempt_id, terminal, emit=emit
         )
         # SD-111 P2 trigger 1: dispatch_supervisor_terminal cannot import this
         # module (circular), so its own docstring asks the caller to close
