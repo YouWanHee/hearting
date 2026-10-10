@@ -74,6 +74,24 @@ class ResourceNowTest(unittest.TestCase):
         owner.liveness, owner.resource_wait = "idle", {"run_ids": ["another"]}
         self.assertEqual(render._resource_now_text(owner), "대기")
 
+    def test_now_and_resource_row_share_verified_host_without_gpu_snapshot(self):
+        for harness in ("claude", "codex", "opencode"):
+            owner, child = self.owner(self.rows[0], harness)
+            child.local_placement = {"hostname": "moving4.iip.lab", "processes": [
+                {"pid": child.pid, "starttime": child.starttime}]}
+            child.log_path, child.log_updated_at = "/logs/empty.log", None
+            child.log_size = 0
+            with mock.patch.object(render, "_fresh_compute_hosts", return_value=(None, 0)):
+                now = render._resource_now_text(owner)
+                row = render._plain(render._resource_child_rows(owner, term_width=180)[0])
+            for text in (now, row):
+                self.assertIn("moving4.iip.lab", text)
+                self.assertNotIn("호스트/GPU 미확인", text)
+            self.assertIn("출력 없음", now)
+            self.assertNotIn("로그 ", now)
+            child.log_size = None
+            self.assertEqual(render._resource_log_age(child), "출력 미확인")
+
     def test_remote_gpu_join_uses_exact_attempt_not_directory_or_local_pid(self):
         owner, child = self.owner(self.rows[0], "opencode")
         snapshot = {"hosts": [{"host": "cnn", "self": False, "reachable": True,

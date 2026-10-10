@@ -629,9 +629,8 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
         context = EA.AccessContext.build(worktree=history["worktree"], artifact_root=route["artifact_root"],
             dispatch_state_root=Path(history["jobs"]).parent,
             agent_home=candidate.get("launch_home") or Path(__file__).resolve().parents[1])
-        # The normal OpenCode launcher grants the portable capability contracts
-        # read visibility, with edit denies. These are runtime support addresses,
-        # not an expansion of the task's writable scope.
+        # Ordinary launchers grant installed contracts and utilities read
+        # visibility with edit denies. Recovery uses the same source addresses.
         reads.extend(contract_read_roots(context.agent_home, route))
         targets = EA.resolve_task_targets(route)
         if targets:
@@ -783,7 +782,7 @@ RELAUNCH_STABLE_KEYS = (
 
 
 # A path into the harness's own tree inside a permission value (`<root>/utilities/...`).
-_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:utilities|adapters|hooks|tools|capabilities)(?=/|[\"'])")
+_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:core|capabilities|roles|utilities|adapters|docs|hooks|profiles|tools)(?=/|[\"'])")
 RELEASE_ROOT_TOKEN = "<launch_home>"
 
 
@@ -1255,6 +1254,7 @@ def contract_read_roots(agent_home: str | Path, route: dict | None = None) -> tu
     retains. A moving current pointer never replaces the route's contract
     source. These are read addresses, not additional task write grants.
     """
+    from execution_access import harness_source_read_roots
     homes = [Path(agent_home)]
     sealed = (route or {}).get("launch_compatibility_tuple") or {}
     identity = sealed.get("launch_home") if isinstance(sealed, dict) else None
@@ -1263,8 +1263,7 @@ def contract_read_roots(agent_home: str | Path, route: dict | None = None) -> tu
         homes.append(Path(value))
     roots = []
     for home in homes:
-        root = home / "capabilities"
-        roots.extend((root, root.resolve(strict=False)))
+        roots.extend(harness_source_read_roots(home))
     return tuple(dict.fromkeys(roots))
 
 

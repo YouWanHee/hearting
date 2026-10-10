@@ -50,6 +50,18 @@ def encoded(value):
 
 
 class ProjectionFixture(unittest.TestCase):
+    def test_empty_report_directory_is_hidden_and_open_report_is_explained(self):
+        with mock.patch.object(artifact_lifecycle, "read_admitted_cycle", return_value=None):
+            present = projection.project_report(self.source, artifact_root=self.root)
+            detail = projection.report_detail_payload(present)
+            self.assertIn("보고서 있음", detail["display"]["detail_label"])
+            self.assertIn("담당 작업의 검증·마감 확인 필요", detail["display"]["detail_label"])
+            self.assertEqual(present["verification"]["reason"], "report-cycle-unadmitted")
+            for path in self.source.iterdir():
+                if path.is_file():
+                    path.unlink()
+            absent = projection.project_report(self.source, artifact_root=self.root)
+            self.assertIsNone(projection.report_detail_payload(absent))
     def test_route_without_report_keeps_absence_and_real_hash_mismatch(self):
         with mock.patch.object(artifact_producer, "route_cycle_for",
                                return_value={"cycle_id": CYCLE_ID}):
