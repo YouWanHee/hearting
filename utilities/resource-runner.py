@@ -3,6 +3,7 @@
 import argparse, contextlib, fcntl, hashlib, json, os, re, select, signal, subprocess, sys, time
 from pathlib import Path
 import resource_resume as RESOURCE_RESUME
+import resource_run_evidence as RUN_EVIDENCE
 from resource_progress import environment as progress_environment
 import gpu_leases
 from gpu_execution_sandbox import gpu_resource_nodes
@@ -202,6 +203,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             sup.reattach_resource_watch(route, ledger, armed)
             row = json.loads(Path(registry).read_text())["runs"][args.run_id]
         print(json.dumps({**row, "replayed": True, "payload_spawned": False,
+                          **RUN_EVIDENCE.paths(armed or {}),
                           "supervisor_alive": RESOURCE_RESUME.supervisor_alive(row.get("supervision"))}))
         return
     placeholder = row
@@ -213,6 +215,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     try:
         register_registry(registry)
         artifacts = prepare_route_artifact_env(route_file, start=True, jobs=jobs)
+        node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
+        output_receipt = RUN_EVIDENCE.paths({"artifact_base": artifacts["AGENT_ARTIFACT_OUTPUT_DIR"],
+            "declared_outputs": node.get("outputs", ["run.json"])}, prepare=True)
         ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
         runtime = ledger.root / "resource"
         runtime.mkdir(parents=True, exist_ok=True)
@@ -236,6 +241,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             queued = {**placeholder, "launch_state": "queued"}
             publish_verified_run(registry, args.run_id, placeholder, queued)
             print(json.dumps({**queued, "payload_spawned": False, "supervisor_alive": False,
+                              **output_receipt,
                               "required_action": "yield-owner-turn", "verification_admitted": False,
                               "workflow_complete": False}))
             return
@@ -299,6 +305,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         os.close(release)
         release = None
         print(json.dumps({**row, "replayed": False, "payload_spawned": True,
+                          **output_receipt,
                           "supervisor_alive": True, "watch_seconds": None,
                           "verification_admitted": False, "workflow_complete": False}))
     except Exception as error:
