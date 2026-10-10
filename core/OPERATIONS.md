@@ -799,6 +799,9 @@ The writer retains its exact result in the existing log before settlement;
 recovery reads only the latest turn, including after finalization errors.
 Native turn completion alone is not the owner's final settlement. Older logs
 without its exact result retain the artifacts for the existing continuation.
+A launched supervised owner's runtime continuation retains the unclosed
+route's sealed contract root until its successor finishes or the route closes.
+Failures before owner launch remain reclaimable.
 Reconnection writes the canonical registry only; legacy roots remain read-only.
 They use the exact PID/start, group and tagged-descendant observation, preserve
 committed results and completed stage markers, and retain corrections for the
