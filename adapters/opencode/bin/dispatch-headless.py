@@ -596,6 +596,7 @@ def scoped_external_directory_config(
     execution_access_read_roots: tuple[Path, ...] = (),
     *,
     agent_home: Path | None = None,
+    contract_read_roots: tuple[Path, ...] = (),
     worktree: str | None = None,
     selected_agent: str | None = None,
 ) -> str:
@@ -668,9 +669,9 @@ def scoped_external_directory_config(
     # The launch environment and this permission projection use the same
     # resolved agent home. Keep its lexical alias as well as the canonical
     # directory: native tools can check either form of a symlinked install.
-    contract_roots = () if agent_home is None else tuple(dict.fromkeys((
-        str(agent_home / "capabilities"),
-        str((agent_home / "capabilities").resolve()),
+    contract_roots = tuple(str(root) for root in dict.fromkeys((
+        *(() if agent_home is None else route_authority.contract_read_roots(agent_home)),
+        *contract_read_roots,
     )))
     for root in (artifact_root, report_bundle_root, *execution_access_roots, *contract_roots):
         if not root:
@@ -1437,18 +1438,17 @@ def main(argv: list[str]) -> int:
         default_roots = adapter_default_roots(args)
         args.execution_access_grant = route_authority.bind_launch_access(
             args, runtime="opencode", default_roots=default_roots)
-        if args.execution_access_grant is not None:
-            args.opencode_config_content = scoped_external_directory_config(
-                args.artifact_root,
-                str(args.report_bundle_root)
-                if args.report_bundle_root is not None
-                else None,
-                args.execution_access_grant.additional_writable_roots,
-                args.execution_access_grant.read_roots,
-                agent_home=args.agent_home,
-                worktree=args.worktree,
-                selected_agent=args.agent,
-            )
+        grant = args.execution_access_grant
+        args.opencode_config_content = scoped_external_directory_config(
+            args.artifact_root,
+            str(args.report_bundle_root) if args.report_bundle_root is not None else None,
+            grant.additional_writable_roots if grant is not None else (),
+            grant.read_roots if grant is not None else (),
+            agent_home=args.agent_home,
+            contract_read_roots=args.contract_read_roots,
+            worktree=args.worktree,
+            selected_agent=args.agent,
+        )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
     except ValueError as exc:

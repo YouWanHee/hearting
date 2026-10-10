@@ -677,6 +677,74 @@ class WrapperAdmissionTest(unittest.TestCase):
                 os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
                 self.assertIsNone(RA.bind_launch_access(args, runtime="opencode", default_roots=()))
 
+class SealedContractReadTest(unittest.TestCase):
+    """An activated replacement still reads the route's original contracts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.opencode = _load("sealed_contract_opencode", "adapters/opencode/bin/dispatch-headless.py")
+        cls.claude = _load("sealed_contract_claude", "adapters/claude/bin/dispatch-headless.py")
+        cls.distribution = _load("sealed_contract_distribution", "tools/install/distribution.py")
+
+    def test_owner_and_child_without_access_request_keep_the_prune_pin_readable(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {
+                "OPENCODE_CONFIG_CONTENT": ""}):
+            os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+            root = Path(td)
+            old, new = root / "releases/v1", root / "releases/v2"
+            for home in (old, new):
+                (home / "capabilities").mkdir(parents=True)
+                (home / "capabilities/autopilot-lab.md").write_text("lab contract")
+            route = {"route_id": "rt-contract", "launch_compatibility_tuple": {
+                "launch_home": {"path": str(old)}}}
+            route_file = root / "route.json"
+            route_file.write_text(json.dumps(route))
+            # This is the existing install pin, with no new retention input.
+            pin = self.distribution._route_record_launch_home(route_file, {}, {})
+            self.assertEqual(pin, str(old))
+            for depth in (1, 2):
+                args = SimpleNamespace(worktree=str(root / "work"), artifact_root=str(root / "reports"),
+                    jobs_path=root / "state/jobs.log", agent_home=new, dispatch_depth=depth,
+                    execution_access_file=None, parent_binding=None,
+                    route_file=str(route_file) if depth == 2 else None,
+                    owner_route_binding=SimpleNamespace(route_file=str(route_file)) if depth == 1 else None)
+                grant = RA.bind_launch_access(args, runtime="opencode", default_roots=())
+                self.assertIsNone(grant)  # Contract visibility requires no access request.
+                self.assertIn(Path(pin) / "capabilities", args.contract_read_roots)
+                config = json.loads(self.opencode.scoped_external_directory_config(
+                    args.artifact_root, agent_home=new, worktree=args.worktree,
+                    contract_read_roots=args.contract_read_roots, selected_agent="build"))
+                for rules in (config["permission"], config["agent"]["build"]["permission"]):
+                    for home in (old, new):
+                        self.assertEqual(rules["external_directory"][str(home / "capabilities") + "/**"], "allow")
+                        self.assertEqual(rules["edit"][str(home / "capabilities") + "/**"], "deny")
+                    self.assertEqual(rules["external_directory"].get("*", config["permission"]["external_directory"]["*"]), "deny")
+                    self.assertNotIn(str(old) + "/**", rules["external_directory"])
+                args.execution_access_grant = None
+                read_dirs, denies = self.claude._read_only_projection(args)
+                self.assertIn(str(old / "capabilities"), read_dirs)
+                self.assertIn(f"Edit(//{str(old / 'capabilities').lstrip('/')}/**)", denies)
+
+    def test_read_projection_preserves_the_approved_development_worktree(self):
+        args = SimpleNamespace(worktree=str(ROOT), execution_access_grant=None,
+                               contract_read_roots=RA.contract_read_roots(ROOT))
+        self.assertEqual(self.claude._read_only_projection(args), ([], []))
+
+    def test_same_install_contract_permissions_compare_equal_but_another_checkout_does_not(self):
+        old, new = "/opt/hearting/releases/v1", "/opt/hearting/releases/v2"
+        worktree = "/work/project"
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}):
+            def permissions(home, route=None):
+                return {"opencode_permission": json.loads(self.opencode.scoped_external_directory_config(
+                    "/reports", agent_home=Path(home),
+                    contract_read_roots=RA.contract_read_roots(home, route), worktree=worktree))["permission"]}
+            before = permissions(old)
+            after = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": old}}})
+            self.assertEqual(RA.granted_permissions(before, old, worktree), RA.granted_permissions(after, new, worktree))
+            other = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": "/work/dev"}}})
+            self.assertNotEqual(RA.granted_permissions(before, old, worktree), RA.granted_permissions(other, new, worktree))
+
+
 class ReleaseAxisTest(unittest.TestCase):
     """Launch roots that differ only because the installed release moved, from one managed
     release to another verified one, are where the launch runs, not the work."""
