@@ -383,6 +383,22 @@ def _agent_start_cmd(run_mock):
 
 
 class StartTest(_TmpRootMixin, unittest.TestCase):
+    def test_overlong_name_is_explained_before_any_pane_or_launch_action(self):
+        name = "hearting-fleetaudit-structure-cx-1010"
+        with mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json({"error": {"code": "invalid_agent_name"}})) as run, \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.main(["start", name, "--kind", "codex",
+                                               "--beside", "w1:p0"]), 1)
+        run.assert_not_called()
+        self.assertIn("reason=agent-name-too-long", printed.call_args[0][0])
+        self.assertIn("max_length=32", printed.call_args[0][0])
+        self.assertIn("최대 32자", printed.call_args[0][0])
+
+    def test_name_at_the_32_character_limit_still_reaches_start(self):
+        with mock.patch.object(peer_steward, "_start_in_pane", return_value=0) as start:
+            self.assertEqual(self._start(name="p" * 32), 0)
+        self.assertEqual(start.call_args[0][0].name, "p" * 32)
+
     def _start(self, name="peer-c", kind="claude", pane="w1:pM", permission_mode=None, agent_args=None):
         argv = ["start", name, "--kind", kind, "--pane", pane]
         if permission_mode:
@@ -2257,8 +2273,13 @@ class KillFixtureTest(_WatchMixin, unittest.TestCase):
         while time.monotonic() < deadline:
             arms = [p for p in self.watch_root.glob("*.json")] if self.watch_root.is_dir() else []
             if arms:
-                arm = json.loads(arms[0].read_text())
-                break
+                candidate = json.loads(arms[0].read_text())
+                # The accepted record exists before its observer is published.
+                # Kill the caller only after that observer's identity is ready.
+                watcher = candidate.get("watcher") or {}
+                if watcher.get("pid") and watcher.get("pid_start"):
+                    arm = candidate
+                    break
             time.sleep(0.02)
         self.assertIsNotNone(arm, "watch never armed")
         pid, pid_start = arm["watcher"]["pid"], arm["watcher"]["pid_start"]
@@ -4094,11 +4115,79 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
 
     def decision(self, layout, free=None, foreground=None, prompt=True):
         free = free or set()
-        with mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json({"result": {"layout": layout}})), \
+        def run(argv, **kwargs):
+            key = "tabs" if argv[1:3] == ["tab", "list"] else "layout"
+            return _herdr_json({"result": {key: [] if key == "tabs" else layout}})
+        with mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
              mock.patch.object(peer_steward, "_pane_has_agent", side_effect=lambda p: None if p in free else "pane-occupied"), \
              mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=foreground), \
              mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=prompt):
             return peer_steward._start_placement("w1:p0")
+
+    def workspace_decision(self, rects_by_tab, free=()):
+        """Live inventory order differs from creation order; names are user-owned."""
+        layouts, panes, tabs = {}, [], []
+        for number, (tab, rects) in enumerate(rects_by_tab, 1):
+            layout = self.layout(rects)
+            layout["tab_id"] = tab
+            for i, pane in enumerate(layout["panes"]):
+                pane["pane_id"] = f"w1:p{number}-{i}"
+                panes.append({"pane_id": pane["pane_id"], "tab_id": tab, "workspace_id": "w1"})
+                layouts[pane["pane_id"]] = layout
+            tabs.append({"tab_id": tab, "workspace_id": "w1", "number": number,
+                         "label": f"직접 정한 이름 {number}"})
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:3] == ["tab", "list"]:
+                return _herdr_json({"result": {"tabs": tabs}})
+            if argv[1:3] == ["pane", "list"]:
+                return _herdr_json({"result": {"panes": panes}})
+            if argv[1:3] == ["pane", "layout"]:
+                return _herdr_json({"result": {"layout": layouts[argv[-1]]}})
+            raise AssertionError(argv)
+        with mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_pane_has_agent", side_effect=lambda p: None if p in free else "pane-occupied"), \
+             mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=True):
+            decision = peer_steward._start_placement("w1:p1-0")
+        return decision, calls
+
+    def test_full_caller_fills_the_newest_other_partial_grid(self):
+        decision, calls = self.workspace_decision([
+            ("w1:tCaller", self.FOUR), ("w1:tOlder", self.TWO), ("w1:tNewest", self.FULL)])
+        self.assertEqual(decision, ("split", "w1:p3-0", "right"))
+        self.assertNotIn(["herdr", "pane", "layout", "--pane", "w1:p2-0"], calls)
+        self.assertTrue(all(argv[1:3] in (["pane", "layout"], ["pane", "list"], ["tab", "list"])
+                            for argv in calls))
+
+    def test_all_workspace_tabs_full_create_a_new_tab(self):
+        decision, _ = self.workspace_decision([
+            ("w1:tCaller", self.FOUR), ("w1:tOther", self.FOUR)])
+        self.assertEqual(decision, ("tab", "w1", None))
+
+    def test_other_full_tab_with_an_empty_shell_is_reused(self):
+        decision, _ = self.workspace_decision([
+            ("w1:tCaller", self.FOUR), ("w1:tOther", self.FOUR)], free={"w1:p2-3"})
+        self.assertEqual(decision, ("reuse", "w1:p2-3", None))
+
+    def test_full_newest_tab_does_not_hide_an_older_partial_tab(self):
+        decision, _ = self.workspace_decision([
+            ("w1:tCaller", self.FOUR), ("w1:tOlder", self.THREE), ("w1:tNewest", self.FOUR)])
+        self.assertEqual(decision, ("split", "w1:p2-0", "down"))
+
+    def test_unreadable_or_foreign_tab_inventory_never_allocates(self):
+        for inventory in ({"error": {"code": "unavailable"}}, {"result": {"tabs": None}},
+                          {"result": {"tabs": [{"workspace_id": "w2", "tab_id": "w2:t1", "number": 9}]}}):
+            calls = []
+            def run(argv, **kwargs):
+                calls.append(argv)
+                return _herdr_json({"result": {"layout": self.layout(self.FOUR)}}
+                                   if argv[1:3] == ["pane", "layout"] else inventory)
+            with mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+                 mock.patch.object(peer_steward, "_pane_has_agent", return_value="pane-occupied"):
+                self.assertIsNone(peer_steward._start_placement("w1:p0"))
+            self.assertEqual([a[1:3] for a in calls], [["pane", "layout"], ["tab", "list"]])
 
     def test_one_two_three_fill_the_grid_even_when_the_reference_is_in_the_other_column(self):
         for rects, expected in ((self.FULL, ("split", "w1:p0", "right")),
@@ -4209,6 +4298,8 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                         calls.append(argv)
                         if argv[1:3] == ["pane", "layout"]:
                             return _herdr_json({"result": {"layout": self.layout(rects)}})
+                        if argv[1:3] == ["tab", "list"]:
+                            return _herdr_json({"result": {"tabs": []}})
                         if argv[1:3] in (["pane", "split"], ["tab", "create"]):
                             return _herdr_json({"result": {"pane" if action == "split" else "root_pane":
                                                           {"pane_id": "w1:pNew", "focused": False}}})
@@ -4236,7 +4327,7 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                     if action == "reuse":
                         self.assertEqual(len(calls), 2)  # layout and start, no creation/move
                     else:
-                        create = calls[1]
+                        create = next(a for a in calls if a[1:3] in (["pane", "split"], ["tab", "create"]))
                         self.assertIn("--no-focus", create)
                         if action == "split":
                             self.assertEqual(create[create.index("--pane") + 1], target)
@@ -4913,11 +5004,10 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
     def retire(self, world, record=None, *, clear_existing=True, resume_request_id=None):
         printed = []
         store = peer_steward.peer_obligations.ObligationStore()
-        exact = {"server": "default", "pane": "w1:pOld", "harness": world.harness,
-                 "session_id": "old-sid", "name": "old"}
-        duty_id = peer_steward.peer_obligations.stable_duty_id("retire", exact, "old")
         if clear_existing:
-            store._record_path(duty_id).unlink(missing_ok=True)
+            # Every row here belongs to this test's isolated temporary root.
+            for path in store.root.glob("retire-*.json"):
+                path.unlink()
         original_stat = os.stat
         clock = iter(range(100))
 
@@ -4992,7 +5082,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
             ["herdr", "pane", "close", "w1:pOld"],
         ])
         before = list(world.actions())
-        rc, line = self.retire(world, clear_existing=False)
+        rc, line = self.retire(world, clear_existing=False, resume_request_id=duty["id"])
         self.assertEqual(rc, 0)
         self.assertIn("reason=already-complete", line)
         self.assertEqual(world.actions(), before)
@@ -5008,6 +5098,144 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
             ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
             ["herdr", "pane", "close", "w1:pOld"],
         ])
+
+    def test_pending_sessionless_retire_never_exits_a_later_process(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                world = _RetireWorld(harness=harness, sid=None, status="working")
+                with mock.patch.object(peer_steward, "_proven_session", return_value=None):
+                    self.retire(world)
+                    store = peer_steward.peer_obligations.ObligationStore()
+                    duty = store.list()[0]
+                    world.status = "idle"
+                    rc, line = self.retire(world, clear_existing=False,
+                        resume_request_id=duty["id"],
+                        record={"start": "900", "group": 4242, "argv": [harness]})
+                self.assertEqual(rc, 0)
+                self.assertIn("reason=target-already-gone", line)
+                self.assertEqual(world.actions(), [])
+                settled = store.get(duty["id"])
+                self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                                 ("complete", "target-already-gone", "complete"))
+
+    def test_runner_closes_gone_subject_even_when_pane_has_a_new_session(self):
+        for reused in (False, True):
+            with self.subTest(pid_reused=reused):
+                world = _RetireWorld(sid=None, status="working")
+                self.retire(world)
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty = store.list()[0]
+                original_stat = os.stat
+
+                def stat(path, *args, **kwargs):
+                    if str(path) == "/proc/4242":
+                        raise FileNotFoundError(path)
+                    return original_stat(path, *args, **kwargs)
+
+                record = {"start": "900", "group": 4242, "argv": ["codex"]} if reused else None
+                with mock.patch.object(peer_steward, "_retire_process_record", return_value=record), \
+                     mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
+                     mock.patch.object(peer_steward, "_seat_handover") as handover:
+                    world.sid, world.status = "new-sid", "idle"
+                    peer_steward._resume_retire_obligation(duty, store)
+                    peer_steward._resume_retire_obligation(store.get(duty["id"]), store)
+                self.assertEqual(world.actions(), [])
+                handover.assert_not_called()
+                self.assertEqual(store.get(duty["id"])["result"], "target-already-gone")
+
+    def test_unreadable_or_missing_original_birth_never_adopts_current_process(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                world = _RetireWorld(sid=None, status="working")
+                self.retire(world)
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty = store.list()[0]
+                if legacy:
+                    duty["intent"]["identity"].pop("foreground")
+                original_stat = os.stat
+
+                def stat(path, *args, **kwargs):
+                    if str(path) == "/proc/4242":
+                        raise PermissionError(path)
+                    return original_stat(path, *args, **kwargs)
+
+                with mock.patch.object(peer_steward, "_retire_process_record", return_value=None), \
+                     mock.patch.object(peer_steward, "_proc_start_ticks", return_value=None), \
+                     mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run):
+                    world.status = "idle"
+                    peer_steward._resume_retire_obligation(duty, store)
+                self.assertEqual(world.actions(), [])
+                self.assertEqual(store.get(duty["id"])["state"], "unknown")
+
+    def test_busy_subject_is_booked_with_children_without_authorizing_busy_exit(self):
+        world = _RetireWorld(sid=None, status="working")
+        original_info = world.info
+
+        def info():
+            value = original_info()
+            if world.status == "working":
+                value["foreground_processes"].append({"pid": 4243, "argv": ["sleep"]})
+            return value
+
+        world.info = info
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.list()[0]
+        self.assertEqual(duty["intent"]["identity"]["foreground"]["start"], "800")
+        self.assertEqual(world.actions(), [])
+        world.status = "idle"
+        self.retire(world, clear_existing=False, resume_request_id=duty["id"])
+        self.assertEqual(store.get(duty["id"])["result"], "normal-exit")
+
+    def test_new_explicit_sessionless_retire_has_its_own_process_identity(self):
+        for sid in (None, "same-resumed-sid"):
+            with self.subTest(sid=sid):
+                world = _RetireWorld(sid=sid, status="working")
+                self.retire(world)
+                store = peer_steward.peer_obligations.ObligationStore()
+                first = store.list()[0]
+                self.retire(world, clear_existing=False,
+                            record={"start": "900", "group": 4242, "argv": ["codex"]})
+                duties = store.list()
+                self.assertEqual(len(duties), 2)
+                self.assertEqual({row["intent"]["identity"]["foreground"]["start"] for row in duties}, {"800", "900"})
+                self.assertEqual(store.get(first["id"])["intent"], first["intent"])
+                self.assertEqual(world.actions(), [])
+
+    def test_start_tick_proves_reuse_when_argv_is_unreadable(self):
+        world = _RetireWorld(sid=None, status="working")
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.list()[0]
+        with mock.patch.object(peer_steward, "_retire_process_record", return_value=None), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", return_value="900"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run):
+            peer_steward._resume_retire_obligation(duty, store)
+        self.assertEqual(world.actions(), [])
+        self.assertEqual(store.get(duty["id"])["result"], "target-already-gone")
+
+    def test_successor_after_exit_or_before_close_finishes_without_closing_its_pane(self):
+        for phase in ("exit-requested", "shell-returned"):
+            with self.subTest(phase=phase):
+                world = _RetireWorld(sid=None, status="working")
+                self.retire(world)
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty = store.list()[0]
+                store.claim_phase(duty["id"], {"waiting"}, phase,
+                                  extra={"foreground": duty["intent"]["identity"]["foreground"]})
+                world.sid, world.status = "new-sid", "idle"
+                with mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
+                     mock.patch.object(peer_steward, "_retire_process_record",
+                                       return_value={"start": "900", "group": 4242, "argv": ["codex"]}), \
+                     mock.patch.object(peer_steward, "_proc_start_ticks",
+                                       side_effect=lambda pid: "700" if pid == 101 else "900"), \
+                     mock.patch.object(peer_steward, "_seat_handover") as handover:
+                    peer_steward._resume_retire_obligation(store.get(duty["id"]), store)
+                self.assertEqual(world.actions(), [])
+                handover.assert_not_called()
+                self.assertEqual(store.get(duty["id"])["result"], "target-already-gone")
 
     def test_pane_whose_process_proves_a_session_herdr_lacks_retires_by_that_session(self):
         """2026-10-10 recurrence: Codex 0.162 opens its thread before any input,
@@ -5224,7 +5452,16 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(world.actions(), [["herdr", "pane", "send-text", "w1:pOld", "/exit"]])
 
     def test_changed_shell_after_exit_is_not_closed(self):
-        world = _RetireWorld(); world.final_changed = True
+        world = _RetireWorld()
+        original_info = world.info
+
+        def changed_after_exit():
+            value = original_info()
+            if world.sent:
+                value["shell_pid"] = 999
+            return value
+
+        world.info = changed_after_exit
         rc, line = self.retire(world)
         self.assertIn("retired=false reason=agent-still-running", line)
         self.assertEqual(world.actions(), [["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"]])

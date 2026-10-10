@@ -1423,9 +1423,14 @@ two side-by-side panes split the right column down, and three panes split the
 remaining full column down. Each split uses ratio 0.5. Existing horizontal
 rows fill the equivalent grid by splitting right. `--beside` selects the reference
 tab/pane, not the direction; `--pane` retains explicit reuse. Placement in a full
-or irregular tab reuses an agent-free foreground shell with an empty visible
-prompt or creates a tab in the same workspace, without subdivision. Concurrent starts serialize placement
+or irregular tab first reuses an agent-free foreground shell with an empty visible
+prompt there, then checks the other tabs in the same workspace, newest first,
+using the same grid-split and empty-shell decision. Only when none has room does
+it create a tab. Existing tab names and layouts are preserved apart from filling
+an available grid cell. Concurrent starts serialize placement
 through launch so they cannot claim the same shell or subdivide a stale layout.
+Names longer than Herdr's 32-character limit are explained before any placement
+or launch action, so a refused name leaves no extra pane.
 The start completes placement without a post-start pane move. The new pane's
 split-cwd and launcher preparation finish under one fixed
 monotonic deadline, including a stable foreground-shell snapshot after bootstrap,
@@ -1441,6 +1446,12 @@ its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
 Retirement refuses busy sessions, open forms, drafts, unknown process identity
 or an unconfirmed shell return; it has no retry, forced kill or forced close.
+An accepted retirement keeps the agent PID/start and shell PID/start observed
+when it was requested, including before a pane has a session. Reconnection
+compares that original lifetime before sending input. A proven-dead or reused
+agent PID completes the obligation as `target-already-gone`, without input,
+pane closure or handover to a later process in the same pane. Unreadable birth
+evidence remains unknown; a later observation cannot supply a missing original.
 When the retire succeeds from the pane started beside the predecessor, the
 predecessor's open depth-1 routes pass to the successor, on any harness: it may
 `start` and `correct` them, and their stored completion records reach it

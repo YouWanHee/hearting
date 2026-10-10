@@ -1238,43 +1238,97 @@ def _grid_split(layout):
     return None
 
 
+def _placement_result(*argv):
+    proc = subprocess.run(_herdr_argv(*argv), capture_output=True, text=True,
+                          timeout=_herdr_get_timeout())
+    payload = json.loads(proc.stdout or "")
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if proc.returncode or not isinstance(result, dict) or payload.get("error"):
+        return {}
+    return result
+
+
+def _start_layout(beside):
+    layout = _placement_result("pane", "layout", "--pane", beside).get("layout")
+    if not isinstance(layout, dict):
+        return None
+    panes, workspace = layout.get("panes"), layout.get("workspace_id")
+    if (not isinstance(workspace, str) or not workspace.strip()
+            or not isinstance(layout.get("tab_id"), str) or not isinstance(panes, list)
+            or not panes or any(not isinstance(p, dict) or not isinstance(p.get("pane_id"), str)
+                                or not p["pane_id"].strip() for p in panes)):
+        return None
+    ids = [p["pane_id"] for p in panes]
+    if (beside not in ids or len(ids) != len(set(ids))
+            or not layout["tab_id"].startswith(workspace + ":")
+            or any(not pane_id.startswith(workspace + ":") for pane_id in ids)):
+        return None
+    return layout
+
+
+def _tab_placement(layout):
+    """One grid/shell decision for both the caller tab and its workspace peers."""
+    split = _grid_split(layout)
+    if split:
+        return "split", split[0], split[1]
+    for pane in layout["panes"]:
+        pane_id = pane["pane_id"]
+        if (_pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None
+                and _wait_for_shell_prompt(pane_id, timeout_ms=1)
+                and _pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None):
+            return "reuse", pane_id, None
+    return None
+
+
 def _start_placement(beside):
-    """Choose a split, a safe shell, or a fresh tab from this tab's live layout."""
+    """Fill the caller tab, then the newest available tab in the same workspace."""
     try:
-        proc = subprocess.run(_herdr_argv("pane", "layout", "--pane", beside),
-                              capture_output=True, text=True, timeout=_herdr_get_timeout())
-        payload = json.loads(proc.stdout or "")
-        result = payload.get("result") if isinstance(payload, dict) else None
-        layout = result.get("layout") if isinstance(result, dict) else None
-        if (proc.returncode or not isinstance(payload, dict) or payload.get("error")
-                or not isinstance(layout, dict)):
+        layout = _start_layout(beside)
+        if layout is None:
             return None
-        panes, workspace = layout.get("panes"), layout.get("workspace_id")
-        if (not isinstance(workspace, str) or not workspace.strip()
-                or not isinstance(layout.get("tab_id"), str) or not isinstance(panes, list)
-                or not panes or any(not isinstance(p, dict) or not isinstance(p.get("pane_id"), str)
-                                    or not p["pane_id"].strip() for p in panes)):
+        placement = _tab_placement(layout)
+        if placement:
+            return placement
+        workspace = layout["workspace_id"]
+        tabs = _placement_result("tab", "list", "--workspace", workspace).get("tabs")
+        if not isinstance(tabs, list):
             return None
-        ids = [p["pane_id"] for p in panes]
-        if (beside not in ids or len(ids) != len(set(ids))
-                or not layout["tab_id"].startswith(workspace + ":")
-                or any(not pane_id.startswith(workspace + ":") for pane_id in ids)):
-            return None
-        split = _grid_split(layout)
-        if split:
-            return "split", split[0], split[1]
-        for pane in panes:
-            pane_id = pane["pane_id"]
-            if (_pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None
-                    and _wait_for_shell_prompt(pane_id, timeout_ms=1)
-                    and _pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None):
-                return "reuse", pane_id, None
+        others = []
+        for tab in tabs:
+            if (not isinstance(tab, dict) or tab.get("workspace_id") != workspace
+                    or not isinstance(tab.get("tab_id"), str)
+                    or not tab["tab_id"].startswith(workspace + ":")
+                    or type(tab.get("number")) is not int):
+                return None
+            if tab["tab_id"] != layout["tab_id"]:
+                others.append(tab)
+        if others:
+            panes = _placement_result("pane", "list", "--workspace", workspace).get("panes")
+            if not isinstance(panes, list):
+                return None
+            for tab in sorted(others, key=lambda t: t["number"], reverse=True):
+                pane_id = next((p.get("pane_id") for p in panes if isinstance(p, dict)
+                                and p.get("workspace_id") == workspace and p.get("tab_id") == tab["tab_id"]
+                                and isinstance(p.get("pane_id"), str)
+                                and p["pane_id"].startswith(workspace + ":")), None)
+                if pane_id is None:
+                    return None
+                other = _start_layout(pane_id)
+                if other is None or other["workspace_id"] != workspace or other["tab_id"] != tab["tab_id"]:
+                    return None
+                placement = _tab_placement(other)
+                if placement:
+                    return placement
         return "tab", workspace, None
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
 
 
 def cmd_start(args):
+    if len(args.name) > 32:
+        print(f"started=false reason=agent-name-too-long agent={args.kind} name={args.name} "
+              "max_length=32 detail=이름은 최대 32자까지 사용할 수 있습니다")
+        return 1
     beside = args.beside or (os.environ.get("HERDR_PANE_ID", "").strip() if not args.pane else None)
     if not beside:
         return _start_in_pane(args)
@@ -1626,11 +1680,16 @@ def _retire_pane_info(pane, timeout=5):
         return None
 
 
-def _retire_foreground(pane, harness):
+def _retire_foreground(pane, harness, *, strict=True):
     info = _retire_pane_info(pane)
-    if info is None or len(info["foreground_processes"]) != 1:
+    if info is None or (strict and len(info["foreground_processes"]) != 1):
         return None
-    item = info["foreground_processes"][0]
+    leaders = [item for item in info["foreground_processes"]
+               if isinstance(item, dict)
+               and item.get("pid") == info["foreground_process_group_id"]]
+    if len(leaders) != 1:
+        return None
+    item = leaders[0]
     pid = item.get("pid") if isinstance(item, dict) else None
     argv = item.get("argv") if isinstance(item, dict) else None
     if (type(pid) is not int or pid <= 0 or pid == info["shell_pid"]
@@ -1679,10 +1738,55 @@ def _retire_target(target):
                 "name": target, "pane": "-"}, 4, "herdr-protocol-error")
 
 
-def _retire_request(target, ident):
+def _retire_request_identity(ident, foreground):
     exact = {"server": _HERDR_SESSION or "default", "pane": ident["pane"],
              "harness": ident["harness"], "session_id": ident["session_id"],
-             "name": ident["name"]}
+             "name": ident["name"], "foreground": foreground}
+    return exact
+
+
+def _retire_booked_foreground(duty):
+    intent = duty.get("intent") or {}
+    original = (intent.get("identity") or {}).get("foreground")
+    observation = duty.get("observation") or {}
+    if not original and observation.get("phase") in {"exit-requested", "shell-returned"}:
+        # An older release recorded the exact lifetime when it sent the exit.
+        original = observation.get("foreground")
+    return original
+
+
+def _retire_subject_state(duty):
+    """The booked agent's kernel lifetime, never the pane's current occupant."""
+    original = _retire_booked_foreground(duty)
+    if not isinstance(original, dict) or not original.get("pid") or not original.get("start"):
+        return "unknown"
+    current = _retire_process_record(original["pid"])
+    start = current["start"] if current is not None else _proc_start_ticks(original["pid"])
+    if start is not None:
+        return "same" if start == original["start"] else "gone"
+    try:
+        os.stat(f"/proc/{original['pid']}")
+    except FileNotFoundError:
+        return "gone"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _complete_gone_retire(store, duty):
+    phase = (duty.get("observation") or {}).get("phase", "waiting")
+    settled = store.update(duty["id"], state="complete", result="target-already-gone",
+                           delivery="completed", cleanup="complete", expected_phases={phase},
+                           observation={"phase": "complete", "reason": "target-already-gone"})
+    if settled.get("state") == "complete":
+        ident = (duty.get("intent") or {}).get("identity") or {}
+        print(f"retired=true reason=target-already-gone agent={ident.get('harness', '-')} "
+              f"name={ident.get('name', '-')} pane={ident.get('pane', '-')}")
+        return True
+    return False
+
+
+def _retire_request(target, exact):
     duty_id = peer_obligations.stable_duty_id("retire", exact, target)
     own_sid, own_harness = _current_session_identity()
     store = peer_obligations.ObligationStore()
@@ -1710,6 +1814,8 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
             and _proc_start_ticks(foreground.get("shell_pid")) == foreground.get("shell_start")
         )
         if not still_exact or not _retire_shell_returned(info, foreground):
+            if info is not None and _retire_subject_state(duty) == "gone":
+                return 0 if _complete_gone_retire(store, duty) else 1
             current = store.get(duty["id"]) or duty
             observation = {**(current.get("observation") or {}),
                            "phase": "shell-returned", "reason": "shell-return-unverified"}
@@ -1720,6 +1826,8 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
         if (not final_info or final_info.get("shell_pid") != foreground.get("shell_pid")
                 or _proc_start_ticks(foreground.get("shell_pid")) != foreground.get("shell_start")
                 or not _retire_shell_returned(final_info, foreground)):
+            if final_info is not None and _retire_subject_state(duty) == "gone":
+                return 0 if _complete_gone_retire(store, duty) else 1
             return 1
         requester = (duty.get("intent") or {}).get("requester") or {}
         predecessor = {"harness": ident["harness"], "session_id": ident["session_id"],
@@ -1755,6 +1863,8 @@ def _resume_retire_obligation(duty, store):
     target = intent.get("target") or ""
     observation = duty.get("observation") or {}
     phase = observation.get("phase", "waiting")
+    if duty.get("state") in {"complete", "cancelled"}:
+        return
     if phase == "shell-returned":
         foreground = observation.get("foreground") or {}
         if foreground:
@@ -1773,6 +1883,8 @@ def _resume_retire_obligation(duty, store):
                     state="cleanup-pending", extra={"foreground": foreground})
                 if claimed:
                     _finish_retire_cleanup(store, claimed, ident, foreground)
+            elif info is not None and _retire_subject_state(duty) == "gone":
+                _complete_gone_retire(store, duty)
             else:
                 store.update(duty["id"], state="pending",
                              expected_phases={"exit-requested"},
@@ -1784,9 +1896,18 @@ def _resume_retire_obligation(duty, store):
     old_server = _HERDR_SESSION
     _HERDR_SESSION = None if server == "default" else server
     try:
+        subject = _retire_subject_state(duty)
+        if subject == "gone":
+            _complete_gone_retire(store, duty)
+            return
+        if subject == "unknown":
+            store.update(duty["id"], state="unknown", expected_phases={"waiting"},
+                         observation={"phase": "waiting", "reason": "foreground-unverified"})
+            return
         state, observed, _code, reason = _retire_target(target)
         if (reason or observed.get("harness") != ident.get("harness")
-                or observed.get("session_id") != ident.get("session_id")
+                or (ident.get("session_id") != "-"
+                    and observed.get("session_id") != ident.get("session_id"))
                 or observed.get("pane") != ident.get("pane")):
             store.update(duty["id"], state="unknown",
                          expected_phases={"waiting"},
@@ -1794,7 +1915,7 @@ def _resume_retire_obligation(duty, store):
             return
         readiness = _pane_readiness(target, state,
                                     expected_harness=ident["harness"],
-                                    expected_sid=ident["session_id"])
+                                    expected_sid=observed["session_id"])
         if readiness.state != "ready":
             store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
                          expected_phases={"waiting"},
@@ -1863,9 +1984,8 @@ def cmd_retire(args):
     if duty is None:
         if getattr(args, "_resume_request_id", None):
             return finish("retire-obligation-missing", pending=True)
-        exact = {"server": _HERDR_SESSION or "default", "pane": pane,
-                 "harness": harness, "session_id": ident["session_id"],
-                 "name": ident["name"]}
+        foreground = _retire_foreground(pane, harness, strict=False)
+        exact = _retire_request_identity(ident, foreground)
         existing_id = peer_obligations.stable_duty_id("retire", exact, target)
         duty = store.get(existing_id)
         if duty is not None:
@@ -1877,13 +1997,29 @@ def cmd_retire(args):
             # A repeated request retries a still-waiting duty now; the phase
             # claim below keeps the exit key single with the background runner.
         else:
-            store, duty = _retire_request(target, ident)
+            store, duty = _retire_request(target, exact)
             duty_id = duty["id"]
     else:
         duty_id = duty["id"]
+    if duty.get("state") == "complete":
+        print(f"retired=true reason=already-complete agent={harness} "
+              f"name={ident['name']} pane={pane}")
+        return 0
     phase = (duty.get("observation") or {}).get("phase", "waiting")
     if phase != "waiting":
         return finish("retire-already-pending", pending=True)
+    subject = _retire_subject_state(duty)
+    if subject == "gone":
+        if _complete_gone_retire(store, duty):
+            return 0
+        return finish("retire-already-pending", pending=True)
+    if subject == "unknown":
+        return finish("foreground-unverified", pending=True)
+    booked = (duty.get("intent") or {}).get("identity") or {}
+    if (booked.get("pane") != pane or booked.get("harness") != harness
+            or (booked.get("session_id") != "-"
+                and booked.get("session_id") != ident["session_id"])):
+        return finish("target-changed", pending=True)
     if reason or state not in {"idle", "done"}:
         return finish(reason or f"agent-{state}", pending=True)
     readiness = _pane_readiness(target, state, expected_harness=harness,
@@ -1893,6 +2029,8 @@ def cmd_retire(args):
     identity = _retire_foreground(pane, harness)
     if identity is None:
         return finish("foreground-unverified", pending=True)
+    if identity != _retire_booked_foreground(duty):
+        return finish("foreground-changed", pending=True)
     state2, ident2, _, _ = _retire_target(target)
     if state2 not in ("idle", "done") or ident2 != ident:
         return finish("target-changed", pending=True)
@@ -1909,8 +2047,8 @@ def cmd_retire(args):
         return finish("retire-duty-already-claimed", pending=True)
     duty = claimed
     try:
-        for index, (operation, value) in enumerate(_RETIRE_ACTIONS[harness]):
-            if index and _retire_foreground(pane, harness) != identity:
+        for operation, value in _RETIRE_ACTIONS[harness]:
+            if _retire_foreground(pane, harness) != identity:
                 return finish("foreground-changed", pending=True)
             sent = subprocess.run(_herdr_argv("pane", operation, pane, value),
                                   capture_output=True, text=True, timeout=5)
