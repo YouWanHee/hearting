@@ -28,3 +28,8 @@ def label(value):
 
 def project(cwd):
     return project_of(cwd) if cwd else "프로젝트 미확인"
+
+
+def gpu_owner(label):
+    """Execution IDs repeat the run identity; person/session labels add context."""
+    return "" if str(label).startswith(("run:", "job:")) else label

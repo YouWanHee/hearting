@@ -36,7 +36,7 @@ import re
 import shlex
 import sys
 import time
-from .display import label as _user_label, project as _user_project
+from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
@@ -5538,8 +5538,9 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
             elapsed = resource.get("elapsed_s")
             if show_time and isinstance(elapsed, int) and not isinstance(elapsed, bool):
                 segs += [(" · " + fmt_min(elapsed // 60), "dim")]
-            if show_tag and resource.get("owner_label"):
-                segs += [(" · ", "dim"), (resource["owner_label"], "lvl_y")]
+            owner = _gpu_owner_label(_gpu_safe_text(resource.get("owner_label")))
+            if show_tag and owner:
+                segs += [(" · ", "dim"), (owner, "lvl_y")]
         if remaining:
             segs += [(" · +%d GPU" % remaining, "dim")]
         if resource_suffix:
@@ -5610,7 +5611,7 @@ def _gpu_work_row(entry, term_width=None):
     indexes = ",".join(str(i) for i in entry.get("gpu_indexes") or ())
     identity = "GPU %s:%s" % (_gpu_safe_text(entry.get("host") or "?"), indexes)
     elapsed = entry.get("elapsed_s")
-    tag = _gpu_safe_text(entry.get("owner_label")) or "미등록"
+    tag = _gpu_owner_label(_gpu_safe_text(entry.get("owner_label")) or "미등록")
 
     def build(show_time, show_tag, label=name):
         pulse_key = "g_work" if _BLINK_ON else "g_work_off"
@@ -5620,7 +5621,7 @@ def _gpu_work_row(entry, term_width=None):
             segs += [(" · " + _gpu_gib(entry["used_memory_mib"]) + " GB", "dim")]
         if show_time and isinstance(elapsed, int) and not isinstance(elapsed, bool):
             segs += [(" · " + fmt_min(elapsed // 60), "dim")]
-        if show_tag:
+        if show_tag and tag:
             segs += [(" · ", "dim"), (tag, "lvl_y")]
         return segs
 

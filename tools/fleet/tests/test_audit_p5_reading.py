@@ -1,5 +1,6 @@
 """Fleet 감사 P5: 이미 관측한 이름·호출자와 좁은 화면의 소비자 경계."""
 import sys
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +9,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "utilities"))
-from fleet import collectors, demo, model, render
+from fleet import collectors, demo, fleet, model, render
 from fleet.model import DispatchJob, Session
 import session_tidy_runner as runner
 
@@ -35,6 +36,35 @@ class ReadingTest(unittest.TestCase):
             text = "\n".join(render._plain(x) for x in render._gpu_resource_strip([resource], 80))
         self.assertIn("AMI_8ch_varying_0_3spk_v3", text)
         self.assertNotIn("--config", text)
+
+    def test_r2_gpu_owner_adds_person_not_repeated_execution_id(self):
+        from fleet.collectors import compute_hosts
+        for kind, identifier in (("run", "moving4-20261008-203517-css-AMI8var-v3"),
+                                 ("job", "training-owner")):
+            label = kind + ":" + identifier
+            process = dict(pid=101, proc_start=11, command="python run.py --config AMI_8ch_varying_0_3spk_v3.yaml",
+                           cwd="/work/project", owner=dict(kind=kind, id=identifier, label=label))
+            snapshot = dict(configured=True, hosts=[dict(host="moving4", reachable=True,
+                            gpus=[dict(index=0, processes=[process])])])
+            entry = compute_hosts.unregistered_gpu(snapshot)[0]
+            for show_all in (False, True):
+                render.set_show_all(show_all)
+                for width in (80, 100, 168):
+                    row = render._plain(render._gpu_work_row(entry, width))
+                    strip = "\n".join(render._plain(x) for x in render._gpu_work_strip([entry], width))
+                    for text in (row, strip):
+                        self.assertIn("AMI_8ch_varying_0_3spk_v3", text)
+                        self.assertNotIn(label, text)
+                        self.assertNotIn("미등록", text)
+                    self.assertLessEqual(render._dw(row), width)
+            with mock.patch.object(fleet, "_collect_memory", return_value=None), \
+                 mock.patch.object(fleet, "_collect_governor", return_value=None):
+                payload = json.loads(fleet._snapshot_json([], [], compute_host_snapshot=snapshot))
+            self.assertEqual(payload["unregistered_gpu"][0]["owner_label"], label)
+            self.assertEqual(payload["compute_hosts"]["hosts"], snapshot["hosts"])
+            entry["owner_label"] = "[4d]"
+            self.assertIn("[4d]", render._plain(render._gpu_work_row(entry, 168)))
+            self.assertIn("[4d]", "\n".join(render._plain(x) for x in render._gpu_work_strip([entry], 168)))
 
     def test_r5_process_header_names_work_project_and_fleet(self):
         owner = DispatchJob(key="lab", cwd="/work/TF-Rehancer", slug="resume-training", pid=2,
