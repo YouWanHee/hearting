@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Current campaign observation and exact optional goal completion fixtures."""
+import contextlib
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -74,6 +76,28 @@ class CurrentExportTests(unittest.TestCase):
         self.assertEqual((result["status"], result["reason"]), ("invalid", "root-identity-invalid"))
         self.assertIn("sha256", next(i for i in result["inputs"] if i["path"].endswith("root-identity.json")))
 
+    def test_special_inputs_are_errors_without_waiting_for_a_fifo_writer(self):
+        original = self.record.read_bytes()
+        self.record.unlink()
+        os.mkfifo(self.record)
+        row = self.export()["campaigns"][0]
+        self.assertEqual((row["status"], row["reason"], row["state"]),
+                         ("invalid", "campaign-input-kind-or-size", None))
+        self.assertEqual(P.list_campaign_summaries(self.root), [])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = P.main(["campaign-status", "--artifact-root", str(self.root),
+                           "--campaign", self.campaign])
+        self.assertNotEqual(code, 0)
+        self.assertIn("campaign-input-kind-or-size", output.getvalue())
+        self.record.unlink()
+        self.record.write_bytes(original)
+        os.mkfifo(self.directory / "meta.json")
+        row = self.export()["campaigns"][0]
+        self.assertEqual((row["status"], row["state"]), ("valid", "active"))
+        self.assertEqual((row["presentation_status"], row["presentation_reason"]),
+                         ("invalid", "campaign-input-kind-or-size"))
+
     def test_missing_and_malformed_record_are_distinct(self):
         self.record.unlink()
         self.assertEqual(self.export()["campaigns"][0]["status"], "missing")
@@ -131,6 +155,14 @@ class CurrentExportTests(unittest.TestCase):
         self.record.write_text(json.dumps({"campaign_id": self.campaign, "state": "completed"}))
         row = self.export()["campaigns"][0]
         self.assertEqual((row["status"], row["presentation_status"]), ("invalid", "valid"))
+
+    def test_metadata_schema_is_integer_and_lifecycle_remains_independent(self):
+        for version in (1.0, True, "1", None, 2):
+            self.mark(schema_version=version)
+            row = self.export()["campaigns"][0]
+            self.assertEqual((row["status"], row["state"]), ("valid", "active"))
+            self.assertEqual((row["presentation_status"], row["presentation_reason"]),
+                             ("invalid", "presentation-contract-unknown"))
 
     def test_capture_caches_consumed_bytes_and_detects_restore(self):
         reads = C.CampaignReads(self.root)
@@ -283,6 +315,32 @@ class GoalCompletionTests(F.ProducerTestBase):
             with self.assertRaisesRegex(M.MetaError, reason):
                 M.run_write(self.root, lambda ws: M.op_set(ws, self.cycle["campaign_id"], cycle,
                             {"presentation_kind": "archive_bundle"}), actor_by=by)
+
+    def test_export_detects_new_event_and_mutation_of_captured_event(self):
+        self.prepare()
+        self.assertEqual(self.settle()["status"], "satisfied")
+        directory = self.path.parent / C.EVENTS_DIR
+        event = next(directory.glob("*.json"))
+        captured = event.read_bytes()
+        real_check = C.CampaignReads.check_mutation
+        for addition in (True, False):
+            with self.subTest(addition=addition):
+                extra = directory / "000002.json"
+                def mutate(reads):
+                    if addition:
+                        extra.write_text("{}")
+                    else:
+                        event.write_bytes(captured + b" ")
+                    return real_check(reads)
+                with mock.patch.object(C.CampaignReads, "check_mutation", mutate):
+                    result = C.export_current(self.root)
+                row = result["campaigns"][0]
+                self.assertEqual((result["status"], result["reason"]), ("conflict", "input-changed"))
+                self.assertEqual((row["status"], row["state"]), ("conflict", None))
+                item = next(i for i in row["inputs"] if i["path"] == event.relative_to(self.root).as_posix())
+                self.assertEqual(item["sha256"], "sha256:" + hashlib.sha256(captured).hexdigest())
+                extra.unlink(missing_ok=True)
+                event.write_bytes(captured)
 
     def test_all_queries_keep_pending_projection_and_bytes_unchanged(self):
         with mock.patch.object(C, "_materialize", side_effect=OSError("projection interrupted")):

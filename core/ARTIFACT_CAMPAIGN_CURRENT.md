@@ -116,6 +116,9 @@ A legacy snapshot lacking repository_id uses its surviving historical
 manifest's repository/root IDs. A matching root ID alone grants no foreign
 repository compatibility. Preserved historical revisions have authority over
 later current revisions. Missing, foreign or changed proof remains invalid.
+Official v2 rows for ended routes without manifests retain their authenticated
+snapshot provenance. At least one surviving manifest still binds the exact
+repository/root/campaign; the reader invents no manifest for those rows.
 
 Campaign goal satisfaction is separate from cycle/route PASS. The exact normal
 owner primary may carry one optional `campaign-goal` JSON fence containing

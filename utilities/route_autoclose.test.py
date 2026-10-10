@@ -40,7 +40,8 @@ TWO_HOURS, TWO_DAYS, EIGHT_DAYS = 2 * 3600, 2 * 24 * 3600, 8 * 24 * 3600
 # Only these reach the commands under test; everything else is set explicitly,
 # so a caller running inside a dispatch worker (AGENT_ARTIFACT_*, AGENT_WORKFLOW_ROOT,
 # session ids, XDG state) cannot steer a test write into a real artifact root.
-INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR", "USER", "LOGNAME", "SHELL")
+INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR", "USER", "LOGNAME", "SHELL",
+             "GIT_CONFIG_GLOBAL")  # Preserve the official runner's private safe.directory.
 
 
 def isolated_env(**explicit) -> dict:
@@ -529,13 +530,17 @@ class RouteAutocloseTest(unittest.TestCase):
         # A key that only prefixes another stream's folder name finds nothing.
         self.assertIsNone(RA.campaign_of_route(self.root, {"campaign_key": "other"}))
 
-    def test_campaign_status_still_closes_routes_in_every_campaign(self):
-        # Pure `campaign-status` no longer sweeps; the writer `campaign-close`
-        # owns the sweep. This covers the same cross-campaign close via close.
+    def test_campaign_status_observes_and_writer_closes_routes_in_every_campaign(self):
+        # Query leaves ended routes alone; the existing writer owns the sweep.
         other_file, other, other_record = self._other_campaign_ended()
         mine_file, mine = self.compose("mine", "codex", "mine-session", campaign="scope-mine")
         self.assertIsNone(self.outcome(other_file))
-        done = self.campaign("campaign-close", self.cycle(mine)["campaign_id"], "--reason", "done")
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        observed = self.campaign("campaign-status", self.cycle(mine)["campaign_id"])
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(before, {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
+        self.assertIsNone(self.outcome(other_file))
+        done = self.campaign("campaign-close", other_record["campaign_id"], "--reason", "done")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "session-ended")
         self.assertEqual(self.cycle_record(other_record["cycle_id"])["state"], "sealed")

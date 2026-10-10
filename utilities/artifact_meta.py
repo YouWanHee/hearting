@@ -237,7 +237,7 @@ def _membership(root: Path) -> Dict[str, Dict[str, Any]]:
 def _validate_meta_doc(doc: Mapping[str, Any], root_id: str, campaign_id: str,
                        members: Mapping[str, Mapping[str, Any]], repository_id: Optional[str] = None) -> List[str]:
     """Raises MetaError on any known-field violation; returns the cycle keys owned by another campaign."""
-    if (doc.get("schema_version") != 1 or isinstance(doc.get("schema_version"), bool)
+    if (type(doc.get("schema_version")) is not int or doc.get("schema_version") != 1
             or doc.get("contract") != META_CONTRACT):
         raise MetaError("contract-unknown")
     if doc.get("artifact_root_id") != root_id or doc.get("campaign_id") != campaign_id:

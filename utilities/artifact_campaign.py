@@ -159,7 +159,7 @@ def read_json(root, path, reads=None):
 def _read_json_raw(root, path):
     path = _safe(root, path)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_JSON:
@@ -313,12 +313,23 @@ def _bind_root(root, campaign_dir, payload, snapshot, record_campaign_id, event_
     if not isinstance(rows, list) or not rows:
         raise CampaignError("campaign-event-invalid", {"path": str(event_path), "detail": "rename-evidence-missing"})
     evidence = _rename_evidence_map(Path(root).resolve(), campaign_dir, reads=reads)
+    bound_manifests = 0
     for row in rows:
         if not isinstance(row, dict):
             raise CampaignError("campaign-event-invalid",
                                 {"path": str(event_path), "detail": "rename-binding-mismatch"})
         cycle_id, manifest_id, revision_id, row_digest = (row.get("cycle_id"), row.get("manifest_id"),
                                                           row.get("manifest_revision_id"), row.get("manifest_digest"))
+        if (payload.get("contract") == CONTRACT and row.get("state") == "open"
+                and row.get("route_closed") is True
+                and identity.is_well_formed(cycle_id, "cycle")
+                and isinstance(row.get("route_id"), str) and row["route_id"]
+                and all(row.get(key) is None for key in
+                        ("manifest_id", "manifest_revision_id", "manifest_digest", "index_digest"))):
+            # Official v2 closes can include an already-ended route whose
+            # cycle has no manifest. The authenticated snapshot retains that
+            # row; surviving manifest rows must still prove this repository.
+            continue
         if (not identity.is_well_formed(cycle_id, "cycle")
                 or not identity.is_well_formed(manifest_id, "manifest")
                 or not identity.is_well_formed(revision_id, "manifest_revision")
@@ -348,6 +359,10 @@ def _bind_root(root, campaign_dir, payload, snapshot, record_campaign_id, event_
                                  "detail": ("rename-evidence-tampered" if actual != row_digest
                                             else "rename-binding-mismatch"),
                                  "cycle_id": cycle_id})
+        bound_manifests += 1
+    if not bound_manifests:
+        raise CampaignError("campaign-event-invalid",
+                            {"path": str(event_path), "detail": "rename-evidence-missing"})
     return None
 
 
@@ -821,7 +836,8 @@ def status(root, selection):
         return {"status": folded.state, "state": folded.state, "campaign_id": record["campaign_id"],
                 "canonical": record.get("relocation"),
                 "satisfied": False, "closable": False,
-                "close_refusal": {"reason": "campaign-not-active"}, "events": event_rows}
+                "close_refusal": {"reason": "campaign-not-active"}, "events": event_rows,
+                "projection_pending": folded.projection_pending}
     try:
         snapshot = _snapshot(root, path)
         result = {"status": "active", "state": "active", "campaign_id": record["campaign_id"],
@@ -840,7 +856,8 @@ def status(root, selection):
     except CampaignError as exc:
         return {"status": "active", "state": "active", "campaign_id": record["campaign_id"],
                 "satisfied": False, "closable": False,
-                "close_refusal": {"reason": exc.code, "detail": exc.detail}, "events": event_rows}
+                "close_refusal": {"reason": exc.code, "detail": exc.detail}, "events": event_rows,
+                "projection_pending": folded.projection_pending}
 
 
 
@@ -1228,7 +1245,7 @@ class CampaignReads:
             return info
         try:
             _safe(self.root, path)
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as stream:
                 before = os.fstat(stream.fileno())
                 if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_JSON:

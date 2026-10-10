@@ -771,6 +771,28 @@ class RenameBindingTest(F.ProducerTestBase):
         self.assertEqual((folded.state, folded.last_sequence), ("satisfied", 1))
         self.assertEqual((new_path.parent / C.LEGACY_EVENT_NAME).read_bytes(), raw)
 
+    def test_v2_rename_keeps_manifestless_closed_member_provenance(self):
+        route, route_file = self.route(slug="closed-without-manifest", campaign_key="rename-binding")
+        child = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                        intensity="direct", campaign_id=self.campaign)
+        self.write_output(child)
+        self.close(route, route_file)
+        C.close(self.root, self.path, reason="explicit campaign goal judgment")
+        raw = self.event_path.read_bytes()
+        snapshot = json.loads(raw)["payload"]["snapshot"]
+        self.assertTrue(any(row["state"] == "open" and row["manifest_id"] is None
+                            and row["route_closed"] is True for row in snapshot["cycles"]))
+        new_root, new_path = self._moved_root()
+        folded = C.campaign_state(new_root, new_path)
+        self.assertEqual((folded.state, folded.last_sequence), ("satisfied", 1))
+        self.assertEqual((new_path.parent / C.EVENTS_DIR / "000001.json").read_bytes(), raw)
+        identity_path = new_root / P.artifact_admission.ADMISSION_REL / "root-identity.json"
+        payload = json.loads(identity_path.read_text())
+        payload["repository_id"] = "repo_" + "f" * 32
+        identity_path.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(C.CampaignError, "rename-binding-mismatch"):
+            C.campaign_state(new_root, new_path)
+
     def test_same_path_history_still_valid_without_identity(self):
         C.close(self.root, self.path, reason="done")
         raw = self.event_path.read_bytes()

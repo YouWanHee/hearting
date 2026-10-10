@@ -2226,8 +2226,11 @@ def list_campaign_summaries(root: Path, *, active_only: bool = True) -> List[Dic
     root = Path(root)
     rows: List[Dict[str, Any]] = []
     for entry in artifact_locator.iter_campaign_dirs(root):
-        record = _read_json(entry / "campaign.json")
-        if not record or not isinstance(record.get("campaign_id"), str):
+        try:
+            record, _ = artifact_campaign.read_json(root, entry / "campaign.json")
+        except artifact_campaign.CampaignError:
+            continue
+        if not isinstance(record.get("campaign_id"), str):
             continue
         try:
             folded = artifact_campaign.campaign_state(root, entry / "campaign.json", record)
@@ -10377,7 +10380,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "campaign-status":
             import artifact_cross_root_move as cross_move
             try:
-                historical_path, historical = cross_move._campaign(root, args.campaign)
+                historical_path, historical = cross_move._campaign(
+                    root, args.campaign,
+                    read_record=lambda path: artifact_campaign.read_json(root, path)[0])
             except ProducerError:
                 historical = {}
             if historical.get("relocation"):
