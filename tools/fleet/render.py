@@ -8432,6 +8432,7 @@ def _addline(stdscr, row, segs, w):
 _OFFSET = 0                 # scroll offset — READ only in _draw (see module docstring)
 _RESUME_ORDER = None         # private state inherited only by this viewer's replacement
 _RELOAD_FRAME = None         # last rows remain visible until the first new observation
+_SHELL_TTY_MODE = None       # original shell mode, rather than the old curses mode
 _TOGGLE_ROWS = {}            # screen_y -> True, reset at the top of every _draw (mouse click map)
 _CLICK_ROWS = {}             # screen_y -> _SELECTABLE entry (F-27 v9 row click map, §4.2.1 —
                               # filled from _SELECTABLE, NOT _live_targets(): base mode's first
@@ -8965,14 +8966,16 @@ def _footer_segs(select_mode, parts, width=None):
 
 
 def reset_scroll():
-    global _OFFSET, _RESUME_ORDER, _RELOAD_FRAME
+    global _OFFSET, _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE
     _OFFSET = 0
     _RESUME_ORDER = _RELOAD_FRAME = None
+    _SHELL_TTY_MODE = None
 
 
 def viewer_state(live_order):
     return {"offset": _OFFSET, "process_view": _PROCESS_VIEW, "show_all": _SHOW_ALL,
             "layout": _LAYOUT,
+            "terminal_modes": _SHELL_TTY_MODE,
             "folds": list(_ROUTE_FOLD.items()), "select_mode": _SELECT_MODE,
             "cursor": _CURSOR_ID, "frame": _RELOAD_FRAME,
             "order": {"groups": live_order.groups, "tiers": live_order.group_tiers,
@@ -8981,7 +8984,7 @@ def viewer_state(live_order):
 
 def restore_viewer_state(value):
     global _OFFSET, _PROCESS_VIEW, _SHOW_ALL, _ROUTE_FOLD, _SELECT_MODE, _CURSOR_ID
-    global _RESUME_ORDER, _RELOAD_FRAME
+    global _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE
     global _LAYOUT
 
     def tuples(item):
@@ -8990,6 +8993,7 @@ def restore_viewer_state(value):
     _OFFSET = max(0, int(value.get("offset", 0)))
     _PROCESS_VIEW = bool(value.get("process_view"))
     _SHOW_ALL = bool(value.get("show_all"))
+    _SHELL_TTY_MODE = value.get("terminal_modes")
     layout = value.get("layout", "auto")
     _LAYOUT = layout if layout in ("auto", "wide", "narrow", "stack") else "auto"
     _ROUTE_FOLD = {tuples(key): bool(folded) for key, folded in value.get("folds", [])}
@@ -9405,6 +9409,7 @@ def run_live(collect_all, hfilter, section, interval):
         sys.stderr.write("fleet: stdout is not a TTY — use --once (snapshot) or --json.\n")
         return 1
     try:
+        _prepare_terminal()
         with _StderrToLog(_stderr_log_path()) as stderr_log:
             collect_all.restart_stderr_fd = stderr_log.saved
             return curses.wrapper(_loop, collect_all, hfilter, section, interval)
@@ -9413,3 +9418,29 @@ def run_live(collect_all, hfilter, section, interval):
     except Exception as e:  # pragma: no cover
         sys.stderr.write("fleet: curses failed: %s\n" % e)
         return 1
+
+
+def _prepare_terminal():
+    """Let the new curses instance save the original shell's terminal mode.
+
+    The previous viewer execs while still in curses mode to keep its screen.
+    Without this, the replacement saves that raw mode as its shell mode and
+    leaves the terminal raw after q. Restore immediately before initscr,
+    retaining the screen and pending input throughout import/startup.
+    """
+    global _SHELL_TTY_MODE
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        fd = sys.stdin.fileno()
+        if _SHELL_TTY_MODE is None:
+            modes = termios.tcgetattr(fd)
+            # JSON supports ints; tcsetattr accepts either ints or one-byte values.
+            _SHELL_TTY_MODE = modes[:-1] + [[value[0] if isinstance(value, bytes) else value
+                                           for value in modes[-1]]]
+        else:
+            termios.tcsetattr(fd, termios.TCSANOW, _SHELL_TTY_MODE)
+    except (termios.error, OSError, ValueError):
+        pass  # non-TTY input retains the existing curses behavior

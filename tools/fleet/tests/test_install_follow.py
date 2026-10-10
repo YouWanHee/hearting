@@ -77,6 +77,17 @@ class InstallFollowTest(unittest.TestCase):
         self.activate(other)
         self.assertIsNone(self.follower.target())
 
+    def test_valid_forward_pin_is_a_normal_install_and_unknown_channel_is_ignored(self):
+        self.activate(self.new)
+        path = self.state / "distribution.json"
+        state = json.loads(path.read_text())
+        state.update(channel="pinned", pinned_version=self.new.name)
+        path.write_text(json.dumps(state))
+        self.assertEqual(self.follower.target(), self.new)
+        state["channel"] = "unknown"
+        path.write_text(json.dumps(state))
+        self.assertIsNone(self.follower.target())
+
     def test_incomplete_or_uncommitted_release_is_ignored(self):
         self.activate(self.new)
         (self.new / "RELEASE_VERSION").write_text("v3.25.999\n")
@@ -115,7 +126,7 @@ class InstallFollowTest(unittest.TestCase):
 
     def test_viewer_handoff_roundtrip_includes_tuple_fold_keys_and_order(self):
         names = ("_OFFSET", "_PROCESS_VIEW", "_SHOW_ALL", "_ROUTE_FOLD", "_SELECT_MODE",
-                 "_CURSOR_ID", "_RESUME_ORDER", "_RELOAD_FRAME", "_LAYOUT")
+                 "_CURSOR_ID", "_RESUME_ORDER", "_RELOAD_FRAME", "_LAYOUT", "_SHELL_TTY_MODE")
         saved = {key: getattr(render, key) for key in names}
         self.addCleanup(lambda: [setattr(render, key, value) for key, value in saved.items()])
         render._OFFSET, render._PROCESS_VIEW, render._SHOW_ALL = 12, True, True
@@ -173,6 +184,44 @@ class InstallFollowTest(unittest.TestCase):
         self.assertEqual(value['jobs'], '/fixture/jobs.log')
         self.assertEqual(value['home'], str(self.new))
         self.assertEqual(result.stderr, 'stderr restored\n')
+
+    def test_real_exec_restores_original_shell_terminal_modes(self):
+        import termios
+        self.activate(self.new)
+        tools = str(Path(__file__).resolve().parents[2])
+        (self.new / "tools/fleet/fleet.py").write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {tools!r})\n"
+            "from fleet import install_follow, render\n"
+            "render.restore_viewer_state(install_follow.read_handoff())\n"
+            "render._prepare_terminal()\n")
+        driver = (
+            "import os, sys, tty\n"
+            f"sys.path.insert(0, {tools!r})\n"
+            "from fleet import install_follow, render\n"
+            "render._prepare_terminal()\n"
+            "tty.setraw(0)\n"
+            f"follower = install_follow.InstallFollower({str(self.old)!r})\n"
+            "follower.restart(follower.target(), [], render.viewer_state(render._LiveOrderState()))\n"
+            "raise SystemExit('exec did not happen')\n")
+        master, slave = os.openpty()
+        try:
+            before = termios.tcgetattr(slave)
+            result = subprocess.run([sys.executable, '-c', driver], stdin=slave,
+                                    capture_output=True, text=True, timeout=10,
+                                    env={**os.environ, **self.env})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(termios.tcgetattr(slave), before)
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_non_tty_input_retains_existing_curses_fallback(self):
+        self.addCleanup(setattr, render, "_SHELL_TTY_MODE", render._SHELL_TTY_MODE)
+        render._SHELL_TTY_MODE = None
+        with open(os.devnull, 'rb') as stream, mock.patch.object(render.sys, 'stdin', stream):
+            render._prepare_terminal()
+        self.assertIsNone(render._SHELL_TTY_MODE)
 
     def test_cached_loading_frame_does_not_reset_scroll(self):
         self.addCleanup(setattr, render, "_OFFSET", render._OFFSET)

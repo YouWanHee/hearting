@@ -101,6 +101,7 @@ class InstallFollower:
             release = installinfo._load_json(target / ".hearting-release.json") or {}
             checksum = state.get("archive_sha256")
             if (state.get("schema") != 1 or release.get("schema") != 1
+                    or state.get("channel", "stable") not in {"stable", "pinned"}
                     or state.get("version") != version or release.get("version") != version
                     or not installinfo._same_root(state.get("release_root"), target)
                     or not isinstance(checksum, str) or len(checksum) != 64
