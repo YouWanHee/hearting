@@ -54,6 +54,14 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
+if __package__:
+    from .work_titles import readable
+else:  # Existing file-path consumers load this module without a package.
+    tools_dir = str(Path(__file__).resolve().parents[1])
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from fleet.work_titles import readable
+
 _CACHE = {}          # {abspath: (mtime, size, record|None)}
 _OUTCOME_CACHE = {}  # {abspath: (mtime, size, outcome|None)} — F-<next> sidecar reader
 
@@ -575,8 +583,9 @@ def result_projection(record, outcome):
     name = record.get("slug")
     if not isinstance(name, str) or not name.strip():
         return None
-    return {"name": name, "result": "success", "at": timestamp,
-            "source": "route-outcome", "route_id": record.get("route_id")}
+    return {"name": readable(record.get("display_title")) or readable(record.get("title")) or readable(name),
+            "result": "success", "at": timestamp, "source": "route-outcome",
+            "route_id": record.get("route_id"), "artifact_root": record.get("artifact_root")}
 
 
 def _valid_attempt_axes(marker, node):

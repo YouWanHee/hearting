@@ -329,6 +329,7 @@ def resource_evidence(armed):
         "sentinel_present": bool(row.get("sentinel")) and Path(str(row["sentinel"])).is_file(),
         "ended_at": row.get("ended_at"),
         "failure_class": row.get("failure_class"),
+        "never_started": RR.resource_never_started(row),
         "reason": reason,
         "log": row.get("log"),
         "parent_attempt_id": row.get("parent_attempt_id"),
@@ -626,7 +627,8 @@ def _checked_resource_row(armed, evidence, *, require_success=True):
     if (RESOURCE_RESUME.row_digest(row) != evidence.get("resource_sha256")
             or runner().read_sentinel(row.get("sentinel")) != evidence.get("exit_code")
             or (require_success and evidence.get("exit_code") != 0)
-            or RR.classify_identity(row)[0] != "exited"):
+            or (RR.classify_identity(row)[0] != "exited"
+                and (require_success or not RR.resource_never_started(row)))):
         return None
     return row
 

@@ -136,6 +136,7 @@ def resource_key(row):
 def context(args, control):
     """Read only exact armed records under the current owner route and registry."""
     import owner_route_binding as OWNER
+    from resource_run_registry import resource_never_started
     route_file = getattr(args, "route_file", "")
     if not route_file or not Path(route_file).is_file():
         return None
@@ -175,7 +176,7 @@ def context(args, control):
                 or row.get("parent_attempt_id") != args.parent_attempt_id
                 or row.get("route") != binding.route_file or row.get("node") != node
                 or row.get("jobs") != str(jobs) or not row.get("command")
-                or not (controller_intent(row) or
+                or not (controller_intent(row) or resource_never_started(row) or
                         (type(row.get("pid")) is int and row["pid"] > 0 and row.get("starttime")))
                 or (row.get("pid_namespace") is not None and
                     row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))

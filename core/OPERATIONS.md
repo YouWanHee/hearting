@@ -121,6 +121,16 @@ projection processes without that reference conservatively retain their release 
 until they exit. This uses the installer's existing in-use judgment, with no
 additional registry or caller step.
 
+The live Fleet viewer follows a committed forward managed installation by
+replacing its own process in the same terminal. It reads the existing distribution
+lock and installation record; an in-progress, failed, incomplete or rolled-back
+installation leaves the viewer on its source. Its view, explicit folds, scroll,
+selection and ordering pass to the new process as private viewer state. The last
+drawn frame stays visible until new observations arrive. Pending confirmation or
+process termination defers replacement. Snapshot modes and development checkouts
+keep their original source. This shared viewer behavior adds no option or step
+to any runtime, and does not move a pinned dispatch tree.
+
 A route's `launch_compatibility_tuple.launch_home.path` is also the source of
 its contract read access. A replacement or child launched after activation
 retains read access to that sealed home's `capabilities/`, alongside its own
@@ -831,15 +841,30 @@ needed. Missing, corrupt or unwritable assignment state falls back to the origin
 session-id hash. Exhaustion of the 256 values and duplicate fixed Claude numbers
 leave uniqueness unavailable.
 
-Merge with `hearting run merge-line <PR>`. This shared command queues sessions
-and worktrees for the same GitHub repository under a user-state `flock`, shows
-the waiting position and preceding PR, then updates the branch only if it lacks
-the latest default-branch commit. It waits for that head's CI, rechecks head and
-base immediately before merging, and pins the merge to the checked head. Existing
-successful CI on an up-to-date head is reused. Failure or interruption releases
-the turn; process death releases the OS lock and the next caller discards the
-dead PID/start entry. This is local cooperative merge serialization, with no
-new approval or workflow gate; all three harnesses use the same command.
+Merge with `hearting run merge-line <PR>`. Sessions and worktrees for the same
+GitHub repository share one user-state FIFO `flock`. A lone PR retains the
+existing latest-base/head-CI path. Multiple waiting PRs are merged in order into
+an isolated integration branch and tested together through a temporary PR. Only
+successful CI for that exact integration head and merge-result tree authorizes
+one fast-forward publication of the PRs' individual merge commits. GitHub marks
+the original PRs merged through commit ancestry; their heads, history and reviews
+remain intact. The publication lease pins the checked base, avoiding intermediate
+main CI runs and preserving any concurrent default-branch successor. Protected
+branches/rules use the original per-PR path rather than bypassing merge policy. A
+changed head or default branch restarts validation for the remaining work. PR
+and main Checks share the same authenticated validated-tree lookup: an identical
+tree reuses its completed successful full PR run, including across a rebase;
+changed, failed, partial or unverified trees retain full validation.
+CI failure splits the group automatically, excluding a failing singleton while
+continuing the others. Integration conflicts use the original single-PR path.
+Every caller receives its own result through the same command, without new
+input or approval. Interruption releases the OS lock; the next caller removes
+dead PID/start entries, resumes uncompleted requests and cleans abandoned
+integration PRs/branches. This is cooperative local serialization; outside
+merges are observed through head/base checks and rejected by the publication
+lease. Temporary branch deletion uses an exact-head lease too and does not
+rerun source pre-push hooks: it publishes no source change. All three
+harnesses use the same implementation.
 
 Release publication uses immutable tags and the tested commit. Repeated or
 out-of-order successful checks are ordinary observations: refresh tags before
@@ -1004,6 +1029,13 @@ the same resource output reconciliation without payload replay.
 Registration and supervisor arming share the terminal-execution judgment for
 same-route/node retries. They retain the old row and predecessor binding;
 only that resource's failed/retryable state returns to running.
+The runner's failure before its private payload fence is released is a finished
+failure, including legacy direct-launch `resource-launch-incomplete` rows with
+no process identity, controller claim or sentinel. One shared judgment settles
+that failure and admits the ordinary `__a<N>` retry; a missing identity or a
+controller crash after claim alone proves nothing. Admission checks precede
+arming where possible, and an armed pre-release failure settles the workflow
+as `FAILED_RETRYABLE`, preserving its failed predecessor and starting no successor.
 
 GPU monitoring is observation, separate from payload completion. A generated
 resource bridge settles the exact payload exit and declared outputs even when
@@ -1385,7 +1417,8 @@ memory. Memory-holding idle processes are occupied too. An occupied explicit
 choice starts nothing and reports its owner, task, start time and free devices.
 `--share` is the single optional override for deliberate sharing; no reservation
 command or additional required input is involved. An explicit empty
-`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution. GPU measurement failure
+`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution; the CUDA spelling
+`CUDA_VISIBLE_DEVICES=-1` is also CPU-only. GPU measurement failure
 cannot establish availability. Receipts retain the observed memory/utilization.
 
 Reservation lifetime follows the exact wrapper PID, start time and PID namespace,

@@ -657,6 +657,8 @@ class ResourceJob:
     route_id: Optional[str] = None
     route_node: Optional[str] = None
 
+    display_title: Optional[str] = None  # exact cycle metadata, filled only by the detail pass
+
     def to_dict(self):
         return _public_value(self)
 
