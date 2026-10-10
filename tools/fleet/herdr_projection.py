@@ -220,6 +220,29 @@ def is_steward(harness: str, session_id: str) -> bool:
     return False
 
 
+def refresh_tag_metadata(agents) -> None:
+    """Refresh changed numbers on exactly identified panes, even while idle.
+
+    This reuses the regular metadata projection. It reports no runtime session
+    identity or lifecycle, and never prompts or wakes the pane's session.
+    """
+    for agent in agents:
+        harness = agent.get("agent")
+        identity = agent.get("agent_session") or {}
+        pane = agent.get("pane_id")
+        if (harness not in {"codex", "opencode"} or not pane
+                or not isinstance(identity, dict) or identity.get("kind") != "id"
+                or identity.get("agent", harness) != harness):
+            continue
+        sid = identity.get("value")
+        if not isinstance(sid, str) or not sid:
+            continue
+        tag = resolve_tag(harness, sid)
+        shown = re.match(r"^\[([0-9a-f]{2})\]", str(agent.get("display_agent") or ""))
+        if tag and (not shown or shown.group(1) != tag):
+            _report(harness, sid, pane, False)
+
+
 def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None,
             label=None) -> tuple:
     """→ ``(display_agent, title)`` in the fixed order number → harness → ⚑ → summary.

@@ -39,9 +39,24 @@ def _read(path):
 
 
 def assigned_tag(harness, sid):
-    """Atomic snapshot read. Missing/corrupt state uses the resolver's hash fallback."""
+    """Read the shared assignment, seeding a first-use live inventory automatically.
+
+    An existing lock with no snapshot means record loss, rather than first use;
+    that call stays on the hash fallback until ordinary collection recovers it.
+    """
+    path = _path()
     try:
-        row = _read(_path()).get((harness, sid))
+        row = _read(path).get((harness, sid))
+        if row:
+            return row["tag"]
+    except FileNotFoundError:
+        if (path.parent / "tag-assignments.lock").exists():
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    refresh([])
+    try:
+        row = _read(path).get((harness, sid))
         return row["tag"] if row else None
     except (OSError, ValueError, TypeError):
         return None
@@ -60,6 +75,8 @@ def _started(harness, sid, started=None):
 def _inventory(sessions):
     from .session_handle import resolve_tag
     from .collectors.herdr import list_agents
+    from . import session_registry
+    from .collectors.procscan import read_proc_start
     live = {}
     for sess in sessions:
         harness, sid = sess.harness, getattr(sess, "session_id", None)
@@ -71,6 +88,28 @@ def _inventory(sessions):
         if harness == "claude":
             row["tag"] = getattr(sess, "session_tag", None) or resolve_tag(harness, sid)
         live[(harness, sid)] = row
+    # Native/managed registry evidence also reserves sessions outside Herdr or
+    # a harness-filtered collection. PID/start agreement prevents recycled PIDs.
+    for harness in ("claude", "codex", "opencode"):
+        directory = Path(session_registry._dir_for(harness))
+        for path in directory.glob("*.json"):
+            if not path.stem.isdecimal():
+                continue
+            pid = int(path.stem)
+            record = session_registry.read(harness, pid)
+            start = read_proc_start(pid)
+            if not record or start is None or record.get("status") == "exited":
+                continue
+            if record.get("procStart") is not None and str(record["procStart"]) != str(start):
+                continue
+            sid = record.get("sessionId")
+            if not isinstance(sid, str) or not sid:
+                continue
+            row = live.setdefault((harness, sid), {"harness": harness, "session_id": sid,
+                                  "started_at": _started(harness, sid, session_registry._ms_to_sec(record.get("startedAt")))})
+            row.update(pid=pid, proc_start=start)
+            if harness == "claude" and not row.get("tag"):
+                row["tag"] = resolve_tag(harness, sid)
     agents = list_agents()
     for agent in agents or []:
         identity = agent.get("agent_session") or {}
@@ -84,7 +123,7 @@ def _inventory(sessions):
         row["pane_id"] = agent.get("pane_id")
         if harness == "claude" and not row.get("tag"):
             row["tag"] = resolve_tag(harness, sid)
-    return live, agents is not None
+    return live, agents
 
 
 def _keep(row, panes_known):
@@ -112,13 +151,13 @@ def refresh(sessions):
         path.parent.mkdir(parents=True, exist_ok=True)
         with (path.parent / "tag-assignments.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            live, panes_known = _inventory(sessions)
+            live, agents = _inventory(sessions)
             try:
                 old = _read(path)
             except FileNotFoundError:
                 old = {}
             for key, row in old.items():
-                if key not in live and _keep(row, panes_known):
+                if key not in live and _keep(row, agents is not None):
                     live[key] = row.copy()
             now = time.time()
             for key, row in live.items():
@@ -168,6 +207,10 @@ def refresh(sessions):
                 finally:
                     if os.path.exists(temp):
                         os.unlink(temp)
+        # Metadata alone: no session identity, status, lifecycle or user input.
+        # Retry mismatches on each normal refresh, including panes currently idle.
+        from .herdr_projection import refresh_tag_metadata
+        refresh_tag_metadata(agents or [])
     except (OSError, ValueError, TypeError, ImportError):
         pass  # observation must not block any session or consumer
 

@@ -34,11 +34,15 @@ class SessionTagCollisionTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root),
+                                              "FLEET_SESSION_REGISTRY_DIR": str(self.root / "registry"),
                                               "CLAUDE_CONFIG_DIR": str(self.root / "claude")})
         self.env.start()
         self.addCleanup(self.env.stop)
         patch = mock.patch("fleet.collectors.herdr.list_agents", return_value=[])
         self.agents = patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch("fleet.herdr_projection._report")
+        self.report = patch.start()
         self.addCleanup(patch.stop)
         self.a, self.b = collision()
 
@@ -123,6 +127,41 @@ class SessionTagCollisionTest(unittest.TestCase):
         (self.root / "claude/sessions").mkdir(parents=True)
         (self.root / "claude/sessions/1.json").write_text(json.dumps({"sessionId": "cl", "nameSource": "derived", "name": "hearting-" + minted_tag(self.a)}))
         self.agents.return_value = [{"agent": "claude", "pane_id": "w:p", "agent_session": {"kind": "id", "value": "cl"}}]
+        self.assertNotEqual(self.tags([self.session(self.a)])[0], minted_tag(self.a))
+
+    def test_first_standalone_consumers_allocate_without_fleet(self):
+        self.agents.return_value = [{"agent": harness, "pane_id": "w:" + sid,
+                                    "agent_session": {"kind": "id", "value": sid}}
+                                   for harness, sid in (("codex", self.a), ("opencode", self.b))]
+        first = resolve_tag("codex", self.a)
+        second = resolve_tag("opencode", self.b)
+        self.assertNotEqual(first, second)
+        self.assertEqual(resolve_tag("codex", self.a), first)
+
+    def test_new_live_session_resolves_before_next_fleet_tick(self):
+        before = self.tags([self.session(self.a)])[0]
+        self.agents.return_value = [{"agent": "codex", "pane_id": "w:new",
+                                    "agent_session": {"kind": "id", "value": self.b}}]
+        self.assertNotEqual(resolve_tag("codex", self.b), before)
+
+    def test_idle_colliding_herdr_pane_updates_metadata_without_identity_or_prompt(self):
+        self.agents.return_value = [{"agent": "codex", "pane_id": "w:" + sid,
+                                    "display_agent": "[%s] codex" % minted_tag(sid),
+                                    "agent_session": {"kind": "id", "value": sid}}
+                                   for sid in (self.a, self.b)]
+        self.tags([self.session(self.a), self.session(self.b, started=20)])
+        self.report.assert_called_once_with("codex", self.b, "w:" + self.b, False)
+        self.agents.return_value[1]["display_agent"] = "[%s] codex" % resolve_tag("codex", self.b)
+        self.tags([])
+        self.assertEqual(self.report.call_count, 1)
+
+    def test_non_herdr_registry_reserves_claude(self):
+        from fleet import session_registry
+        directory = self.root / "claude/sessions"
+        directory.mkdir(parents=True)
+        pid = os.getpid()
+        (directory / (str(pid) + ".json")).write_text(json.dumps({"sessionId": "outside-cl", "procStart": procscan.read_proc_start(pid),
+                                                               "nameSource": "derived", "name": "hearting-" + minted_tag(self.a)}))
         self.assertNotEqual(self.tags([self.session(self.a)])[0], minted_tag(self.a))
 
     def test_unknown_identity_does_not_gain_a_number(self):
