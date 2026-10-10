@@ -937,18 +937,26 @@ def _approved_fix_answers(record, jobs, rows=None):
 
     Older claims omitted those reviews because their completion note masked the FAIL.
     Their exact reuse snapshot still binds the historical marker and verdict; it can
-    restore that target without editing the claim or adopting any later failed round.
+    restore an admissible target without editing the claim or adopting any later failed round.
     """
     proof = record.get('proof') or {}
     answers = list(proof.get('answers') or [])
-    if proof.get('death_kind') != CORRECTED or proof.get('source_result') != 'FAIL':
+    if (proof.get('death_kind') != CORRECTED or proof.get('source_result') != 'FAIL'
+            or not (record.get('reuse') or {}).get('completed')):
         return answers
-    rows = _rows(Path(jobs).read_text().splitlines()) if rows is None else rows
+    try:
+        rows = _rows(Path(jobs).read_text().splitlines()) if rows is None else rows
+        source = rows[record['original_attempt_id']][1]
+        _, route = _route(jobs, record['original_attempt_id'], source)
+        eligible, _ = route_authority.fix_answers(route, ['\t'.join(fields) for fields, _ in rows.values()], jobs)
+    except (OSError, ValueError, KeyError, DC.DispatchContractError):
+        # Supplemental historical targets cannot break an existing approved claim.
+        return answers
     import review_round_cap
     directory = DC._route_module().completion_dir(record['route_id'], jobs=jobs)
     for pin in (record.get('reuse') or {}).get('completed') or []:
         attempt = pin.get('attempt_id')
-        if not attempt or attempt in answers or attempt not in rows:
+        if not attempt or attempt in answers or attempt not in eligible:
             continue
         fields, meta = rows[attempt]
         if (meta.get('route_id') != record['route_id']
@@ -995,7 +1003,10 @@ def answered_fix_revisions(jobs, route_id):
         if (record and record.get('route_id') == route_id and proof.get('death_kind') == CORRECTED
                 and proof.get('source_result') == 'FAIL'):
             if rows is None:
-                rows = _rows(Path(jobs).read_text().splitlines())
+                try:
+                    rows = _rows(Path(jobs).read_text().splitlines())
+                except (OSError, DC.DispatchContractError):
+                    rows = {}  # Keep the claim's original answers when enrichment is unavailable.
             answers = _approved_fix_answers(record, jobs, rows)
             if not answers:
                 continue

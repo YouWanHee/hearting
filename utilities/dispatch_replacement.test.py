@@ -1714,6 +1714,81 @@ class ReplacementTest(unittest.TestCase):
                 record = self.claim()
                 self.assertEqual(record['proof']['answers'], ['att-test-2', 'att-review-2'])
 
+    def _legacy_closed_review_claim(self, verdicts=2, test_fails=0):
+        import route_authority as RA
+        self._failed_owner(test_fails=test_fails)
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        closed = {'attempt_schema_version': '2', 'attempt_id': f'att-review-{verdicts}',
+                  'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                  'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                  'note': 'completed-marker', 'failure_class': 'fail',
+                  'review_gate_closure': 'owner-closure', 'review_independence': 'owner-overridden'}
+        for number in range(1, verdicts):
+            self.write({**closed, 'attempt_id': f'att-review-{number}',
+                        'note': 'completed-review-blocking'}, append=True)
+        self.write(closed, append=True)
+        marker = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'node_id': 'impl-review',
+                  'attempt_id': closed['attempt_id'], 'review_gate_closure': 'owner-closure',
+                  'review_independence': 'owner-overridden', 'sequence': 1}
+        directory = D._route_module().completion_dir('rt-test', jobs=self.jobs)
+        directory.mkdir(parents=True)
+        (directory/'impl-review.json').write_text(json.dumps(marker))
+        R._reuse_snapshot.return_value['completed'] = [{'node': 'impl-review',
+            'attempt_id': closed['attempt_id'], 'marker_digest': R._digest(marker)}]
+        self.assertTrue(self._answer(text='approved fix: unfinished report', request_id='fix-1')['retained'])
+        with mock.patch.object(RA, 'fix_answers', return_value=(
+                [f'att-test-{test_fails}'] if test_fails else [], [])):
+            record = self.claim()  # A v3.27.5 claim that omitted the owner-closed review.
+        return record, node
+
+    def test_owner_closed_spent_review_does_not_block_an_approved_infra_or_report_fix(self):
+        import route_authority as RA
+        import review_round_cap as CAP
+        self._failed_owner(test_fails=0)
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        for number in (1, 2, 3):
+            self.write({'attempt_schema_version': '2', 'attempt_id': f'att-review-{number}',
+                        'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                        'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                        'note': 'completed-marker' if number == 3 else 'completed-review-blocking',
+                        'failure_class': 'fail', 'review_gate_closure': 'owner-closure',
+                        'review_independence': 'owner-overridden'}, append=True)
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), ([], []))
+        self.assertTrue(self._answer(text='approved fix: unfinished report', request_id='report-fix')['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        self.assertEqual(result['record']['proof']['answers'], [])
+        self.assertEqual(self.claim(), result['record'])
+        rows = R._rows(self.jobs.read_text().splitlines())
+        census = [(fields[1], meta) for fields, meta in rows.values() if meta.get('route_node') == 'impl-review']
+        budget = CAP.round_budget(self.route, node, census, revisions=[{'answers': ['att-review-3']}])
+        self.assertEqual((budget.state, budget.verdict_rounds), ('exhausted', 3))
+        self.assertEqual(rows['att-review-3'][1]['failure_class'], 'fail')
+
+    def test_old_claim_does_not_promise_a_closure_for_an_already_spent_owner_closed_review(self):
+        record, _ = self._legacy_closed_review_claim(verdicts=3)
+        before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        self.assertEqual(R.answered_fix_revisions(self.jobs, 'rt-test'), [])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('unfinished report', text)
+        self.assertNotIn('closure-check', text)
+        self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+
+    def test_unrelated_duplicate_registry_rows_keep_an_approved_claim_original_answers(self):
+        record, _ = self._legacy_closed_review_claim(test_fails=2)
+        foreign = {'attempt_id': 'att-foreign', 'route_id': 'rt-other', 'route_node': 'test',
+                   'worker_type': 'stage', 'note': 'completed-marker'}
+        self.write(foreign, append=True)
+        self.write(foreign, append=True)
+        before = self.jobs.read_bytes()
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertEqual([item['answers'] for item in revisions], [['att-test-2']])
+        self.assertEqual(R._approved_fix_answers(record, self.jobs), ['att-test-2'])
+        self.assertEqual(self.jobs.read_bytes(), before)
+
     def test_failed_owner_without_failed_checks_continues_once_per_answer(self):
         import dispatch_owner_input as I
         self._failed_owner(test_fails=0)

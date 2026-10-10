@@ -220,7 +220,7 @@ def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs
         rows = [(cols[1], meta) for cols, meta in logical_round_records(rows, jobs=jobs)]
         verdicts = [(status, meta) for status, meta in rows
                     if classify_round_row(status, meta, worker_type="review") == "verdict"]
-        if not last_verdict_blocking(verdicts, "review"):
+        if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
             return fields
         latest = verdicts[-1][1]
         route_path = route_file or canonical_route_path(route["artifact_root"], route["route_id"])

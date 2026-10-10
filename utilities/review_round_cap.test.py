@@ -12,8 +12,10 @@ unregistered hop instead (`VERDICTLESS_BOUND`).
 """
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
@@ -246,6 +248,25 @@ class RoundBudgetTest(unittest.TestCase):
 
 
 class RecoveryFieldsTest(unittest.TestCase):
+    def test_owner_closed_review_does_not_repeat_its_completion_commands(self):
+        r = {**route(), 'route_id': 'rt-test', 'route_hash': 'sha256:test'}
+        node = review_node()
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+                'route_lineage.verified_route_lineage', return_value=[r]):
+            jobs = Path(directory)/'jobs.log'
+            r['artifact_root'] = directory
+            for note in ('completed-review-blocking', 'completed-marker'):
+                metadata = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': node['id'],
+                            'attempt_id': 'att-review-2', 'worker_type': 'review', 'note': note,
+                            'failure_class': 'fail', 'review_gate_closure': 'owner-closure',
+                            'review_independence': 'owner-overridden'}
+                jobs.write_text('now\tdone\twt\troot\ttask\t' + ','.join(
+                    f'{key}={value}' for key, value in metadata.items()) + '\n')
+                fields = CAP.recovery_fields('review-worker', route=r, node=node, jobs=jobs,
+                                             route_file=Path(directory)/'route.json')
+                for key in ('recovery_complete_command', 'recovery_check_command'):
+                    self.assertEqual(key in fields, note == 'completed-review-blocking')
+
     def test_exhausted_review_worker_points_at_owner_closure(self):
         fields = CAP.recovery_fields("review-worker")
         self.assertEqual(fields["recovery_surface"], "capability-route complete")
