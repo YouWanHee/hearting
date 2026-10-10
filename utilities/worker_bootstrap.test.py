@@ -470,6 +470,18 @@ class WorkerEndingPromptTest(unittest.TestCase):
                 prompt = self.render(harness, supervised=False)
                 self.assertTrue(prompt.endswith(self.TERMINAL))
                 self.assertNotIn(self.WAIT, prompt)
+                # The full bootstrap must keep the wait directive conditional,
+                # even when the adapter's trailing ending is correctly gated.
+                compact = " ".join(prompt.split())
+                self.assertIn(
+                    "For a supervised owner, end a child-registration or resource-wait turn with only",
+                    compact,
+                )
+                self.assertIn("polling fallback waits synchronously in the current turn.", compact)
+                if harness == "claude":
+                    self.assertIn("poll synchronously with utilities/dispatch-wait.sh in the current turn", compact)
+                elif harness == "codex":
+                    self.assertIn("after a child is registered, run only utilities/dispatch-wait.sh", compact)
 
     def test_stage_and_review_workers_keep_the_terminal_ending(self):
         for worker_type in ("stage", "review"):
