@@ -646,7 +646,18 @@ def reopen_resource_output_failure(route, ledger, armed):
     """Append recovery of missing output, without treating a file as an exit."""
     stage = ledger.state()["nodes"].get(armed["node"], {})
     previous = stage.get("evidence") or {}
-    if (armed.get("predecessor_kind") != "resource" or stage.get("state") != "FAILED_RETRYABLE"
+    if stage.get("state") != "FAILED_RETRYABLE" and not previous.get("resolved_missing_outputs"):
+        return False
+    journal = ledger.journal()
+    latest = next((e for e in reversed(journal) if e.get("node") == armed["node"]), {})
+    recovering = (stage.get("state") in {"READY", "RUNNING"}
+                  and latest.get("actor") == "resource-output-recovery")
+    if recovering:
+        failure = next((e for e in reversed(journal) if e.get("node") == armed["node"]
+                        and e.get("state") == "FAILED_RETRYABLE"), {})
+        previous = failure.get("evidence") or {}
+    if (armed.get("predecessor_kind") != "resource"
+            or (stage.get("state") != "FAILED_RETRYABLE" and not recovering)
             or previous.get("succeeded") is not True or previous.get("exit_code") != 0
             or not previous.get("resource_sha256")
             or (previous.get("artifacts") or {}).get("reason") != "declared-artifact-missing"):
@@ -675,13 +686,16 @@ def reopen_resource_output_failure(route, ledger, armed):
         return False
     recovered = {**current, "artifacts": artifact_evidence(armed),
                  "resolved_missing_outputs": previous["artifacts"]["missing"]}
-    ledger.record(armed["node"], "READY", evidence=recovered, actor="resource-output-recovery")
-    ledger.record(armed["node"], "RUNNING", evidence=recovered, actor="resource-output-recovery")
+    if stage["state"] == "FAILED_RETRYABLE":
+        ledger.record(armed["node"], "READY", evidence=recovered, actor="resource-output-recovery")
+    if ledger.state()["nodes"][armed["node"]]["state"] == "READY":
+        ledger.record(armed["node"], "RUNNING", evidence=recovered, actor="resource-output-recovery")
     if state["workflow_state"] == "FAILED_RETRYABLE":
         ledger.set_workflow_state("READY", evidence={"resolved_resource_artifacts": [armed["node"]]},
                                   actor="resource-output-recovery")
+    if ledger.state()["workflow_state"] == "READY":
         ledger.set_workflow_state("RUNNING", evidence={"node": armed["node"]},
-                                  actor="resource-output-recovery")
+                                 actor="resource-output-recovery")
     return True
 
 
@@ -976,8 +990,9 @@ def _poll_once_locked(route, ledger):
         if state in ("STAGE_SUCCEEDED", "FAILED_TERMINAL", "CANCELLED"):
             results.append({"node": node_id, "action": "settled", "state": state})
             continue
-        if state == "FAILED_RETRYABLE":
-            if not reopen_resource_output_failure(route, ledger, armed):
+        if state in {"FAILED_RETRYABLE", "READY", "RUNNING"}:
+            recovered = reopen_resource_output_failure(route, ledger, armed)
+            if state == "FAILED_RETRYABLE" and not recovered:
                 results.append({"node": node_id, "action": "halted", "state": state})
                 continue
         if armed["continuation_kind"] == "human-gate":

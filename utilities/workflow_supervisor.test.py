@@ -3933,6 +3933,37 @@ def gate_epoch(ledger, gate):
 
 
 class TestHarnessResourceEvidence(WorkflowFixture):
+    def test_late_output_recovery_resumes_each_durable_transition(self):
+        for target in ('node-READY', 'node-RUNNING', 'workflow-READY', 'workflow-RUNNING'):
+            with self.subTest(target=target):
+                route, path = self.two_stage_route(route_id='rt-recover-' + target)
+                route['nodes'][0]['outputs'].append('science.json')
+                path.write_text(json.dumps(route))
+                registry = self.resource_registry(exit_code=0)
+                self.arm(path, registry, extra=['--artifact-base', str(self.base)])
+                ledger = SUP.ledger_for(route)
+                self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'halt-missing-artifact')
+                history = ledger.journal_path.read_bytes()
+                (self.base / 'science.json').write_text('{"score":1}')
+                method = 'record' if target.startswith('node') else 'set_workflow_state'
+                original = getattr(WS.WorkflowLedger, method)
+                def interrupted(instance, *args, **kwargs):
+                    result = original(instance, *args, **kwargs)
+                    state = args[1] if method == 'record' else args[0]
+                    if state == target.split('-')[1] and kwargs.get('actor') == 'resource-output-recovery':
+                        raise OSError('fixture interruption after durable append')
+                    return result
+                with mock.patch.object(WS.WorkflowLedger, method, interrupted):
+                    with self.assertRaises(OSError):
+                        SUP.poll_once(route, ledger)
+                with mock.patch.object(SUP, '_start_successor', return_value={'started': True}) as start:
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'advanced')
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'settled')
+                    self.assertEqual(start.call_count, 1)
+                self.assertTrue(ledger.journal_path.read_bytes().startswith(history))
+                (self.base / 'science.json').unlink()
+                (self.base / 'run.json').unlink()
+
     def test_late_output_cannot_promote_failed_or_changed_execution(self):
         for kind in ('failed', 'sentinel', 'identity', 'namespace', 'cancelled', 'other-failure'):
             with self.subTest(kind=kind):
