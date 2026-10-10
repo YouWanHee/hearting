@@ -981,7 +981,9 @@ def _start_shell_snapshot(pane, original_shell, deadline=None):
     return None
 
 
-_BESIDE_READY_SECONDS = 15
+# NAS-backed prompt initialization can spend minutes in a git child. Keep one
+# finite deadline and the same shell/prompt checks through bootstrap and start.
+_BESIDE_READY_SECONDS = 300
 
 
 def _wait_for_created_shell(pane, cwd, original_shell, deadline):
@@ -1841,11 +1843,23 @@ def _complete_gone_retire(store, duty):
 
 def _retire_request(target, exact):
     duty_id = peer_obligations.stable_duty_id("retire", exact, target)
-    own_sid, own_harness = _current_session_identity()
     store = peer_obligations.ObligationStore()
-    duty = store.create(duty_id, "retire", exact,
-                        {"target": target, "requester": {
-                            "session_id": own_sid, "harness": own_harness}})
+    duty = store.get(duty_id)
+    retry_of = None
+    # Cancellation is history, not an outstanding exit claim. Derive the next
+    # id from that history so repeated requests still converge on one duty.
+    while duty is not None and duty.get("state") == "cancelled":
+        retry_of = duty_id
+        duty_id = peer_obligations.stable_duty_id("retire", exact, retry_of)
+        duty = store.get(duty_id)
+    if duty is None:
+        own_sid, own_harness = _current_session_identity()
+        intent = {"target": target, "requester": {
+            "session_id": own_sid, "harness": own_harness,
+            "pane": _caller_pane(), "server": _HERDR_SESSION or "default"}}
+        if retry_of:
+            intent["retry_of"] = retry_of
+        duty = store.create(duty_id, "retire", exact, intent)
     peer_obligations.ensure_runner()
     return store, duty
 
@@ -2028,8 +2042,16 @@ def cmd_retire(args):
     if not isinstance(ident.get("pane"), str) or ident["pane"] in {"", "-"}:
         return finish(reason or "pane-unverified")
     pane, harness = ident["pane"], ident["harness"]
-    own_sid, own_harness = _current_session_identity()
-    if (pane == _caller_pane()
+    if duty is not None:
+        requester = (duty.get("intent") or {}).get("requester") or {}
+        own_sid, own_harness = requester.get("session_id"), requester.get("harness")
+        own_pane = requester.get("pane")
+        own_server = requester.get("server", (duty.get("intent") or {}).get(
+            "identity", {}).get("server", "default"))
+    else:
+        own_sid, own_harness = _current_session_identity()
+        own_pane, own_server = _caller_pane(), _HERDR_SESSION or "default"
+    if ((own_pane and pane == own_pane and own_server == (_HERDR_SESSION or "default"))
             or (own_sid and ident["session_id"] == own_sid and harness == own_harness)):
         return finish("self-target")
     if harness not in _RETIRE_ACTIONS:
@@ -2039,25 +2061,16 @@ def cmd_retire(args):
             return finish("retire-obligation-missing", pending=True)
         foreground = _retire_foreground(pane, harness, strict=False)
         exact = _retire_request_identity(ident, foreground)
-        existing_id = peer_obligations.stable_duty_id("retire", exact, target)
-        duty = store.get(existing_id)
-        if duty is not None:
-            duty_id = existing_id
-            if duty.get("state") == "complete":
-                print(f"retired=true reason=already-complete agent={harness} "
-                      f"name={ident['name']} pane={pane}")
-                return 0
-            # A repeated request retries a still-waiting duty now; the phase
-            # claim below keeps the exit key single with the background runner.
-        else:
-            store, duty = _retire_request(target, exact)
-            duty_id = duty["id"]
+        store, duty = _retire_request(target, exact)
+        duty_id = duty["id"]
     else:
         duty_id = duty["id"]
     if duty.get("state") == "complete":
         print(f"retired=true reason=already-complete agent={harness} "
               f"name={ident['name']} pane={pane}")
         return 0
+    if duty.get("state") == "cancelled":
+        return finish("retire-cancelled")
     phase = (duty.get("observation") or {}).get("phase", "waiting")
     if phase != "waiting":
         return finish("retire-already-pending", pending=True)
@@ -4554,6 +4567,31 @@ def _clear_observe(target, req, request_path, before_threads=()):
     return None
 
 
+def _native_tidy_command(args, req, *, continuing):
+    """Keep the exact-job transport under the same peer-steward judgement ledger."""
+    from session_tidy_native import command
+    action, word = ("continue", "continued") if continuing else ("clear", "cleared")
+    started = time.monotonic()
+    verdict = command(req, args.request, args.nonce, continuing=continuing, screen_ready=_screen_ready)
+    outcome = verdict[word]
+    harness, old = req.get("harness"), req.get("sid")
+    new = verdict.get("new_session") or req.get("new_session")
+    target = f"native:{req['seat']['native']['job']}"
+    receipt = (f"action={action} {word}={outcome} harness={harness} old_session={old} "
+               f"new_session={new or '-'} verify=native ms={int((time.monotonic() - started) * 1000)}"
+               + (f" reason={verdict['reason']}" if verdict.get("reason") else ""))
+    try:
+        _record(to_harness=harness, to_name=target, kind="notice",
+                summary_text=f"[notice] action={action} {outcome}",
+                to_session_id=new if continuing else old, to_pane=None, ref=[],
+                status=_CLEAR_LEDGER_STATUS[outcome], receipt=receipt,
+                from_identity=(old, harness, _project_of(req.get("cwd"))), from_name=_from_name(harness, old))
+    except Exception:
+        pass
+    print(" ".join(f"{key}={value}" for key, value in verdict.items() if value))
+    return _CLEAR_EXIT[outcome]
+
+
 def cmd_clear(args):
     """session-tidy auto-clear: type the harness's own new-conversation command into `target`.
 
@@ -4578,6 +4616,9 @@ def cmd_clear(args):
     `action=clear` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
+    req, why = clear.validate_request(args.request, args.nonce)
+    if req and (req.get("seat") or {}).get("kind") == "native":
+        return _native_tidy_command(args, req, continuing=False)
     if _herdr_missing():
         print("cleared=failed reason=herdr-not-found")
         return _CLEAR_EXIT["failed"]
@@ -4749,6 +4790,9 @@ def cmd_continue(args):
     5 unverified. One ledger row (`kind=notice`, `action=continue` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
+    req, why = clear.validate_continue(args.request, args.nonce)
+    if req and (req.get("seat") or {}).get("kind") == "native":
+        return _native_tidy_command(args, req, continuing=True)
     if _herdr_missing():
         print("continued=failed reason=herdr-not-found")
         return _CLEAR_EXIT["failed"]

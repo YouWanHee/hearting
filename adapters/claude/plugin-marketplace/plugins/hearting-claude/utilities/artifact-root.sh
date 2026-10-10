@@ -72,7 +72,24 @@ start=$(physical_dir "$start") || {
 
 if command -v git >/dev/null 2>&1 \
   && git -C "$start" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  primary=$(git -C "$start" worktree list --porcelain 2>/dev/null \
+  # The ordinary common directory names the primary checkout directly.
+  # Enumerating every linked checkout can wait on unrelated NAS paths long
+  # enough to exhaust session-tidy's path-resolution timeout.
+  common=$(git -C "$start" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+  primary=""
+  case "$common" in
+    */.git)
+      candidate=$(dirname "$common")
+      # A separated git directory can also be named .git. Preserve its
+      # configured worktree rather than assuming the containing directory.
+      configured=$(git --git-dir="$common" config --get core.worktree 2>/dev/null) || configured=""
+      bare=$(git --git-dir="$common" config --bool --get core.bare 2>/dev/null) || bare=""
+      if [ -z "$configured" ] && [ "$bare" = false ] && [ -d "$candidate" ]; then
+        primary=$candidate
+      fi
+      ;;
+  esac
+  [ -n "$primary" ] || primary=$(git -C "$start" worktree list --porcelain 2>/dev/null \
     | awk '$1=="worktree"{print substr($0,10); exit}')
   [ -n "$primary" ] || primary=$(git -C "$start" rev-parse --show-toplevel)
   primary=$(physical_dir "$primary")

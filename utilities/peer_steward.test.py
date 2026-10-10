@@ -4598,7 +4598,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
             return "exported"
 
         def snapshot(pane, shell, deadline=None):
-            self.assertEqual(deadline, 15)
+            self.assertEqual(deadline, peer_steward._BESIDE_READY_SECONDS)
             events.append("snapshot")
             return "settled" if clock["now"] >= .05 else None
 
@@ -4745,6 +4745,74 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
                                      ["herdr", "pane", "send-keys"]) for a in calls))
         self.assertEqual(events[-2:], ["snapshot", "native start"])
         close.assert_not_called()
+
+    def test_slow_nas_prompt_finishes_in_the_same_start_call_on_every_harness(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                clock, calls = {"now": 0.0}, []
+                cwd = str(self.tmp_root)
+
+                def run(argv, **kw):
+                    calls.append(list(argv))
+                    if argv[:3] == ["herdr", "pane", "split"]:
+                        return _herdr_json({"result": {"pane": {"pane_id": "w1:pN", "focused": False}}})
+                    if argv[:3] == ["herdr", "pane", "get"]:
+                        return _herdr_json({"result": {"pane": {"agent": None}}})
+                    if argv[:3] == ["herdr", "pane", "process-info"]:
+                        processes = [{"pid": 101, "argv": ["zsh"]}]
+                        if clock["now"] < 240:
+                            processes.append({"pid": 202, "argv": ["git", "status"]})
+                        return _herdr_json({"result": {"process_info": {"pane_id": "w1:pN",
+                            "shell_pid": 101, "foreground_process_group_id": 101,
+                            "foreground_processes": processes}}})
+                    if argv[:3] == ["herdr", "pane", "wait-output"]:
+                        self.assertGreaterEqual(clock["now"], 240)
+                        return subprocess.CompletedProcess(argv, 0, stdout="prompt", stderr="")
+                    if argv[:3] == ["herdr", "agent", "start"]:
+                        self.assertEqual(argv[7], "w1:pN")
+                        self.assertGreaterEqual(clock["now"], 240)
+                        return _herdr_json({"result": {"agent": {"agent": harness, "name": "new"}}})
+                    raise AssertionError(argv)
+
+                with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+                     mock.patch.object(peer_steward, "_proc_start_ticks", return_value="700"), \
+                     mock.patch.object(peer_steward, "_proc_cwd", return_value=cwd), \
+                     mock.patch.object(peer_steward, "_managed_ingress_dir", return_value=None), \
+                     mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+                     mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value="missing"), \
+                     mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="stable prompt"), \
+                     mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
+                     mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+                     mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+                     mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: clock["now"]), \
+                     mock.patch.object(peer_steward.time, "sleep", side_effect=lambda seconds:
+                                       clock.update(now=clock["now"] + max(seconds, 5))), \
+                     mock.patch.object(peer_steward, "_close_pane") as close, mock.patch("builtins.print") as printed:
+                    rc = peer_steward.main(["start", "new", "--kind", harness, "--beside", "w1:pOld",
+                                           "--cwd", cwd, "--permission-mode", "inherit"])
+                self.assertEqual(rc, 0)
+                self.assertIn("started=true", printed.call_args[0][0])
+                self.assertEqual(sum(a[:3] == ["herdr", "agent", "start"] for a in calls), 1)
+                self.assertFalse(any(a[:3] in (["herdr", "pane", "send-text"],
+                                             ["herdr", "pane", "send-keys"]) for a in calls))
+                self.assertLess(clock["now"], 300)
+                close.assert_not_called()
+
+    def test_slow_shell_replacement_still_refuses_launch(self):
+        info = {"pane_id": "w1:pN", "shell_pid": 101,
+                "foreground_process_group_id": 101,
+                "foreground_processes": [{"pid": 101}, {"pid": 202}]}
+        with mock.patch.object(peer_steward, "_pane_has_agent", return_value=None), \
+             mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+             mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=["700", "701"]), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=None), \
+             mock.patch.object(peer_steward.time, "sleep"), \
+             mock.patch.object(peer_steward, "_wait_for_shell_prompt") as prompt:
+            reason, shell = peer_steward._wait_for_created_shell(
+                "w1:pN", "/fixture", (101, "700"), time.monotonic() + 300)
+        self.assertEqual((reason, shell), ("beside-shell-changed", (101, "700")))
+        prompt.assert_not_called()
 
     def test_beside_readiness_deadline_retains_pane_without_start_or_snapshot(self):
         clock = {"now": 0.0}
@@ -5493,6 +5561,85 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
             ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
             ["herdr", "pane", "close", "w1:pOld"],
         ])
+
+    def test_cancelled_retire_accepts_one_fresh_request_and_preserves_history(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                world = _RetireWorld(harness=harness, status="working")
+                self.retire(world)
+                store = peer_steward.peer_obligations.ObligationStore()
+                first = store.list()[0]
+                cancelled = store.update(first["id"], state="cancelled", cleanup="complete",
+                                         observation={"phase": "cancelled", "reason": "self-target"})
+                with mock.patch.object(peer_steward, "_current_session_identity", return_value=("new-requester", "codex")):
+                    rc, line = self.retire(world, clear_existing=False)
+                    self.assertEqual(rc, 0)
+                    self.assertIn("reason=agent-working", line)
+                    fresh = store.list()[0]
+                    self.assertNotEqual(fresh["id"], first["id"])
+                    self.assertEqual(fresh["intent"]["retry_of"], first["id"])
+                    self.assertEqual(fresh["intent"]["requester"]["session_id"], "new-requester")
+                    self.retire(world, clear_existing=False)
+                    self.assertEqual([d["id"] for d in store.list()], [fresh["id"]])
+                    world.status = "idle"
+                    rc, line = self.retire(world, clear_existing=False)
+                self.assertEqual(rc, 0)
+                self.assertIn("retired=true reason=normal-exit", line)
+                self.assertEqual(store.get(first["id"]), cancelled)
+                self.assertEqual(store.get(fresh["id"])["result"], "normal-exit")
+                self.assertEqual(sum(a[:3] == ["herdr", "pane", "close"] for a in world.actions()), 1)
+
+    def test_runner_in_target_environment_uses_recorded_requester(self):
+        for harness in ("claude", "codex", "opencode"):
+            for legacy in (False, True):
+                with self.subTest(harness=harness, legacy=legacy):
+                    world = _RetireWorld(harness=harness, status="working")
+                    with mock.patch.object(peer_steward, "_current_session_identity", return_value=("requester-sid", "claude")), \
+                         mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pCaller"}):
+                        self.retire(world)
+                    store = peer_steward.peer_obligations.ObligationStore()
+                    duty = store.list()[0]
+                    if legacy:
+                        duty["intent"]["requester"].pop("pane", None)
+                        duty["intent"]["requester"].pop("server", None)
+                        peer_steward.peer_obligations._write_atomic(store._record_path(duty["id"]), duty)
+                    world.status = "idle"
+                    with mock.patch.object(peer_steward, "_current_session_identity", return_value=(world.sid, harness)), \
+                         mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pOld"}):
+                        self._run_retire_runner(world)
+                    settled = store.get(duty["id"])
+                    self.assertEqual((settled["state"], settled["result"]), ("complete", "normal-exit"))
+                    self.assertEqual(sum(a[:3] == ["herdr", "pane", "close"] for a in world.actions()), 1)
+
+    def test_resumed_self_target_is_refused_despite_different_runner(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                world = _RetireWorld(harness=harness, status="working")
+                self.retire(world)
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty = store.list()[0]
+                duty["intent"]["requester"] = {"harness": harness, "session_id": world.sid}
+                peer_steward.peer_obligations._write_atomic(store._record_path(duty["id"]), duty)
+                world.status = "idle"
+                with mock.patch.object(peer_steward, "_current_session_identity", return_value=("runner-sid", "claude")), \
+                     mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pOther"}):
+                    self._run_retire_runner(world)
+                self.assertEqual(store.get(duty["id"])["state"], "cancelled")
+                self.assertEqual(world.actions(), [])
+
+    def test_cancelled_resume_stays_cancelled_without_creating_new_request(self):
+        world = _RetireWorld(status="working")
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.list()[0]
+        cancelled = store.update(duty["id"], state="cancelled", cleanup="complete",
+                                 observation={"phase": "cancelled", "reason": "self-target"})
+        world.status = "idle"
+        rc, line = self.retire(world, clear_existing=False, resume_request_id=duty["id"])
+        self.assertEqual(rc, 1)
+        self.assertIn("reason=retire-cancelled", line)
+        self.assertEqual(store.get(duty["id"]), cancelled)
+        self.assertEqual(world.actions(), [])
 
     def test_confirmed_normal_exit_closes_once_and_records_notice(self):
         for harness, status in (("codex", "idle"), ("opencode", "done"), ("claude", "idle")):
