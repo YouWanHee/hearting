@@ -891,9 +891,9 @@ log, declared output paths and observed start/end times. Arming validates the
 known output directory before launch and returns these expected paths; launch
 receipts carry the same paths without new inputs. Runtime-authored documents
 put facts in a Hearting namespace; an existing owner document retains its
-bytes and is consumed only after rechecking the runtime execution. An existing
+bytes and is consumed after rechecking the runtime execution. An existing
 completion marker's evidence bytes are preserved. A runtime-only document
-proves execution, never scientific verification. For a supervised owner it
+proves execution, distinct from scientific verification. For a supervised owner it
 retains the existing next-resource wait until owner terminal settlement, so
 sequential runs stay possible without another owner-written run.json.
 
@@ -901,8 +901,8 @@ A missing output after an exact successful resource exit is re-observed by
 poll. When the same execution and sentinel remain proven and the output arrives,
 the existing retry transitions append a new observation and advance once.
 Earlier FAIL journal entries survive; execution failure, cancellation and
-unknown identity do not gain success from a late file. Owner settlement uses
-the same resource output reconciliation and never reruns the payload.
+unknown identity remain unproven after a late file. Owner settlement uses
+the same resource output reconciliation without payload replay.
 
 Registration and supervisor arming share the terminal-execution judgment for
 same-route/node retries. They retain the old row and predecessor binding;
