@@ -7,9 +7,11 @@ separable `standard+` work, dispatch registered dispatch-depth-2 stages through
 runtime completion-delivery boundary: a supervised owner yields the current turn
 for the runtime join and resumes from its bounded typed receipt, while an explicitly
 reported polling fallback waits synchronously in the current turn. It also joins a route-bound resource whose runner receipt confirms payload release
-and a ready supervisor. Yield the same wait sentinel after that receipt rather
-than waiting for training inside a Bash/model turn. This registered resource is
-not a model child and needs no model-child launch tuple. Its typed result resumes
+and a ready supervisor. End a child-registration or resource-wait turn with only
+`runtime_wait: registered-children` on one line, without the three-line handoff.
+Reserve that handoff for the terminal final response. Yield the wait sentinel
+after that receipt rather than waiting for training inside a Bash/model turn.
+This registered resource is not a model child and needs no model-child launch tuple. Its typed result resumes
 this owner; apply pending corrections before admitting the declared next work.
 The runtime acknowledges notifications and reconciles exact worker outcomes; inspect the
 reported evidence and decide the authorized next work. Synthesize one owner artifact. Do not
