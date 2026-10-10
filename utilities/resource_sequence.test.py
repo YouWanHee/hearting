@@ -162,6 +162,99 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(json.loads((output / 'run.json').read_text()), {"phase":"resumed"})
         self.assertTrue((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').is_file())
 
+    def unstarted_fixture(self, **changes):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        data = json.loads(registry.read_text())
+        row = data['runs']['fixture-run']
+        Path(row['sentinel']).unlink()
+        for key in ('pid', 'starttime', 'command_hash', 'process_group', 'pid_namespace',
+                    'launch_argv', 'supervision', 'exit_code', 'ended_at'):
+            row.pop(key, None)
+        row.update(status='failed', workflow_state='FAILED_RETRYABLE',
+                   failure_class='resource-launch-incomplete', **changes)
+        registry.write_text(json.dumps(data))
+        return route, path, jobs, registry, output, ledger
+
+    def test_legacy_armed_admission_failure_settles_and_retries_same_node_once(self):
+        route, path, jobs, registry, output, ledger = self.unstarted_fixture()
+        result = SUP.poll_once(route, ledger)[0]
+        self.assertEqual(result['action'], 'halt-failed')
+        self.assertTrue(result['evidence']['never_started'])
+        self.assertIsNone(result['evidence']['exit_code'])
+        self.assertEqual(ledger.state()['workflow_state'], 'FAILED_RETRYABLE')
+        self.assertEqual(ledger.claims(), {})
+        old = json.loads(registry.read_text())['runs']['fixture-run']
+        self.assertTrue(old['ended_at'])
+        retry = self.next_body(registry, 'fixture-run__a1', output)
+        payloads, receipt = self.launch(route, path, jobs, registry, output, retry)
+        self.assertEqual(len(payloads), 1)
+        self.assertTrue(receipt['payload_spawned'])
+        self.assertEqual(ledger.state()['workflow_state'], 'RUNNING')
+        self.assertEqual(SUP.read_armed(ledger)['full-run']['predecessor_id'], retry['run_id'])
+        self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old)
+        payloads, receipt = self.launch(route, path, jobs, registry, output, retry)
+        self.assertEqual(payloads, [])
+        self.assertFalse(receipt['payload_spawned'])
+        self.assertEqual(ledger.claims(), {})
+
+    def test_unproven_claim_and_post_start_crash_do_not_admit_retry(self):
+        route, path, jobs, registry, output, ledger = self.unstarted_fixture()
+        original = json.loads(registry.read_text())['runs']['fixture-run']
+        for changes in ({'launch_state': 'claimed', 'launch_controller': {'pid': 123}},
+                        {'launch_state': 'started'}, {'pid': 999999999, 'starttime': '1', 'command_hash': 'x'},
+                        {'failure_class': 'no-exit-sentinel'}, {'exit_code': 1},
+                        {'cancel_requested': True}, {'parent_close_requested': True},
+                        {'launch_state': 'not-started', **SUP.RR.proc_identity(os.getpid())}):
+            with self.subTest(changes=changes):
+                registry.write_text(json.dumps({'schema_version': 1, 'runs': {
+                    'fixture-run': {**original, **changes}}}))
+                old = json.loads(registry.read_text())['runs']['fixture-run']
+                self.assertFalse(SUP.RR.resource_never_started(old))
+                self.assertFalse(WAIT.resource_execution_finished(old))
+                retry = self.next_body(registry, 'fixture-run__a1', output)
+                with self.assertRaisesRegex(ValueError, 'resource-route-body-conflict'):
+                    self.launch(route, path, jobs, registry, output, retry)
+                self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run'], old)
+
+    def test_runner_failure_after_arm_settles_without_payload_and_opens_retry(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        SUP.poll_once(route, ledger)
+        body = self.next_body(registry, 'fixture-run__a1', output)
+        forbidden = self.base / 'payload-must-not-start'
+        body['command'] = [sys.executable, '-c',
+            f'from pathlib import Path; Path({str(forbidden)!r}).write_text("wrong")']
+        # Fail the watch identity check after real arm and wrapper spawn,
+        # before the private fence permits the payload to execute.
+        with mock.patch.object(SUP.runner().RESOURCE_RESUME, 'supervisor_alive', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'resource-launch-identity-unconfirmed'):
+                self.launch(route, path, jobs, registry, output, body)
+        row = json.loads(registry.read_text())['runs'][body['run_id']]
+        self.assertEqual(row['launch_state'], 'not-started')
+        self.assertFalse(Path(row['sentinel']).exists())
+        self.assertFalse(forbidden.exists())
+        self.assertEqual(ledger.state()['workflow_state'], 'FAILED_RETRYABLE')
+        self.assertEqual(ledger.claims(), {})
+        retry = self.next_body(registry, 'fixture-run__a2', output)
+        payloads, receipt = self.launch(route, path, jobs, registry, output, retry)
+        self.assertEqual(len(payloads), 1)
+        self.assertTrue(receipt['payload_spawned'])
+
+    def test_gpu_admission_failure_precedes_arm_and_can_retry(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        body = self.next_body(registry, 'fixture-run__a1', output)
+        with mock.patch.object(SUP.runner().gpu_leases, 'resource_admission',
+                               side_effect=SUP.runner().gpu_leases.GPUUnavailable('unknown GPU 99')), \
+             mock.patch.object(SUP, 'main') as arm:
+            with self.assertRaisesRegex(SUP.runner().gpu_leases.GPUUnavailable, 'unknown GPU 99'):
+                self.launch(route, path, jobs, registry, output, body)
+        arm.assert_not_called()
+        row = json.loads(registry.read_text())['runs'][body['run_id']]
+        self.assertTrue(SUP.RR.resource_never_started(row))
+        retry = self.next_body(registry, 'fixture-run__a2', output)
+        payloads, receipt = self.launch(route, path, jobs, registry, output, retry)
+        self.assertEqual(len(payloads), 1)
+        self.assertTrue(receipt['payload_spawned'])
+
     def receipt_fixture(self, *, queued_controller=False, failed=False):
         route, path, jobs, registry, output, ledger = self.fixture()
         if queued_controller:

@@ -978,6 +978,13 @@ the same resource output reconciliation without payload replay.
 Registration and supervisor arming share the terminal-execution judgment for
 same-route/node retries. They retain the old row and predecessor binding;
 only that resource's failed/retryable state returns to running.
+The runner's failure before its private payload fence is released is a finished
+failure, including legacy direct-launch `resource-launch-incomplete` rows with
+no process identity, controller claim or sentinel. One shared judgment settles
+that failure and admits the ordinary `__a<N>` retry; a missing identity or a
+controller crash after claim alone proves nothing. Admission checks precede
+arming where possible, and an armed pre-release failure settles the workflow
+as `FAILED_RETRYABLE`, preserving its failed predecessor and starting no successor.
 
 GPU monitoring is observation, separate from payload completion. A generated
 resource bridge settles the exact payload exit and declared outputs even when
@@ -1359,7 +1366,8 @@ memory. Memory-holding idle processes are occupied too. An occupied explicit
 choice starts nothing and reports its owner, task, start time and free devices.
 `--share` is the single optional override for deliberate sharing; no reservation
 command or additional required input is involved. An explicit empty
-`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution. GPU measurement failure
+`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution; the CUDA spelling
+`CUDA_VISIBLE_DEVICES=-1` is also CPU-only. GPU measurement failure
 cannot establish availability. Receipts retain the observed memory/utilization.
 
 Reservation lifetime follows the exact wrapper PID, start time and PID namespace,

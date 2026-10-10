@@ -739,8 +739,10 @@ def continuation_attempt_state(metadata):
 
 def resource_predecessor_finished(row):
     """A resource's exact ended execution, independent of its scientific verdict."""
-    from resource_run_registry import classify_identity
+    from resource_run_registry import classify_identity, resource_never_started
     from dispatch_resource_wait import supervisor
+    if resource_never_started(row):
+        return True
     if (row.get("status") == "launching" or row.get("cancel_requested")
             or row.get("parent_close_requested") or classify_identity(row)[0] != "exited"):
         return False
