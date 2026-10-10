@@ -937,9 +937,9 @@ run and nonzero sentinel remain unchanged, a current resource-stage judgment
 accepts its preserved output bytes, and current downstream stages bind those
 same bytes through an independent PASS. The runtime records the run identity,
 consumed file hashes, stage-marker hashes and independent gate in the existing
-workflow journal. Original FAIL, exit, resource registry and artifacts stay
-unchanged; this resolves workflow consumption, never the process or scientific
-result. Owner wording or downstream PASS alone is insufficient. Missing or
+workflow journal as downstream consumption, preserving the original FAIL,
+exit, resource registry, artifacts and scientific result. Owner wording or
+downstream PASS alone is insufficient. Missing or
 different bindings retain failure and return an executable continuation using
 the existing compose surface: a new resource attempt with a distinct `__a<N>`
 identity and output directory, followed by revalidation of its downstream
