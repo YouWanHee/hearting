@@ -2847,7 +2847,12 @@ def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
     from at request time. The bug this fix repairs had been accidentally
     shielding them since 2026-09-04.
 
-    Reads `/proc/<pid>/environ` and `cmdline` only. A `/proc` that cannot be
+    Reads environment, argv, cwd and open files. Python's shared dispatch code
+    holds its resolved code root open: argv may name a rotating projection,
+    while that descriptor still names the original import tree. Older projected
+    processes without a descriptor retain the install's release family until
+    they exit; resolving their argv now cannot recover their original sys.path.
+    A `/proc` that cannot be
     enumerated returns in-use: undecidable is in use, like every other source
     here. A pid that disappears mid-scan is skipped -- that one is decidable
     (it is gone).
@@ -2876,6 +2881,7 @@ def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
         except OSError:
             continue
         readable = False
+        arguments = []
         for name, separator in (("environ", "\0"), ("cmdline", "\0")):
             try:
                 blob = (entry / name).read_text(encoding="utf-8", errors="replace")
@@ -2888,6 +2894,34 @@ def _release_held_by_live_process(candidate: Path) -> tuple[bool, str]:
                 value = field.split("=", 1)[1] if name == "environ" and "=" in field else field
                 if value == real or value.startswith(prefix):
                     return True, f"live-process:{entry.name}"
+                if name == "cmdline":
+                    arguments.append(value)
+        links = [entry / "cwd", entry / "exe"]
+        try:
+            links.extend((entry / "fd").iterdir())
+        except OSError:
+            pass
+        release_reference = False
+        family = str(candidate.parent.resolve()).rstrip("/") + "/"
+        for link in links:
+            try:
+                value = os.readlink(link)
+            except OSError:
+                continue
+            readable = True
+            if value == real or value.startswith(prefix):
+                return True, f"live-process:{entry.name}"
+            if (link.parent == entry / "fd" and Path(value).parent == candidate.parent.resolve()
+                    and os.path.isdir(link)):
+                release_reference = True
+        if not release_reference and candidate.parent.name == "releases":
+            for value in arguments:
+                # Only actual absolute argv paths, never arbitrary command text.
+                if not value.startswith("/"):
+                    continue
+                resolved = os.path.realpath(value)
+                if resolved != value and resolved.startswith(family):
+                    return True, f"live-process:{entry.name}:unsealed-projection"
         if not readable:
             opaque += 1
     if opaque:

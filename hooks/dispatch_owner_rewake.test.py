@@ -1633,6 +1633,45 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             code = rewake.main()
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def test_lost_carrier_completion_reaches_existing_runner_without_user_prompt(self):
+        self._open_row()
+        spec = importlib.util.spec_from_file_location("retained_steward_test", ROOT / "utilities/peer-steward.py")
+        steward = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(steward)
+        launch = rewake.Launch("att-owner-1", self.jobs, "session-1")
+        claim = rewake.ArmClaim(rewake.arm_path(self.jobs, launch.attempt_id), launch.attempt_id,
+                                launch.session_id, 1, tuple(DEAD_HOLDER))
+        with mock.patch.object(rewake.peer_obligations, "ensure_runner"), \
+                mock.patch.object(rewake, "_run_carrier", side_effect=RuntimeError("carrier crashed")):
+            with self.assertRaisesRegex(RuntimeError, "carrier crashed"):
+                rewake._observe_carrier(launch, claim, {})
+        store = rewake.peer_obligations.ObligationStore(self.root)
+        duty, = store.list()
+        sent = []
+        def prompt(args):
+            sent.append(Path(args.body_file).read_text())
+            return 0
+        agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:p9",
+                                        "agent_session": {"value": "session-1"}}]}}
+        with mock.patch.object(steward.subprocess, "run", return_value=type("Reply", (), {
+                    "stdout": json.dumps(agents), "returncode": 0})()), \
+                mock.patch.object(steward, "_resolve_target", return_value=("claude", "session-1", None)), \
+                mock.patch.object(steward, "cmd_prompt", side_effect=prompt):
+            # A dead carrier is not completed work and must wait for its owner.
+            steward._resume_registered_obligation(duty, store)
+            self.assertEqual(sent, [])
+            path = self._close_and_materialize()
+            steward._resume_registered_obligation(duty, store)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("att-owner-1", sent[0])
+            self.assertEqual(store.get(duty["id"])["state"], "complete")
+            self.assertEqual(json.loads(path.read_text())["state"], "sent-ambiguous")
+            # Acknowledged notices retain their original delivery identity.
+            rewake.pending_delivery.ack(self.root, "session-1", json.loads(path.read_text())["delivery_id"],
+                                         acked_by="session-sweep:session-1")
+            steward._resume_registered_obligation(duty, store)
+            self.assertEqual(len(sent), 1)
+
     def test_claim_win_emits_and_transitions_to_sent_ambiguous(self):
         self._open_row()
         record_path = self._close_and_materialize()

@@ -37,6 +37,7 @@ from dispatch_completion_join import (  # noqa: E402
     delivery_required_action,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import peer_obligations  # noqa: E402
 from frame_interview import PENDING_ANSWER_RULE  # noqa: E402
 import dispatch_seat_handover as seat_handover  # noqa: E402
 from parent_next_directive import entrypoint, resume_command, wait_command  # noqa: E402
@@ -1479,6 +1480,7 @@ def _record_carrier_exit(claim: ArmClaim, observation: dict[str, Any]) -> None:
 
 
 def _observe_carrier(launch: Launch, claim: ArmClaim, payload: Any) -> int:
+    _retain_completion(launch, claim)
     observation: dict[str, Any] = {"wait_state": "starting", "reason": "carrier-return",
                                    "exit_code": 1, "exit_kind": "exception", "exit_text": ""}
     holder = {"claim": claim}
@@ -1516,6 +1518,26 @@ def _observe_carrier(launch: Launch, claim: ArmClaim, payload: Any) -> int:
                 signal.signal(signum, handler)
             except (OSError, ValueError):
                 pass
+
+
+def _retain_completion(launch: Launch, claim: ArmClaim) -> None:
+    """The existing outer task runner retains the wake if this native hook dies."""
+    try:
+        row = current_attempt_row(launch.jobs, launch.attempt_id)
+        if (row is None or row.metadata.get("parent_sid") != launch.session_id
+                or row.metadata.get("parent_completion_delivery") != "claude-parent-runtime"):
+            return
+        identity = {"jobs": str(launch.jobs.resolve()), "attempt_id": launch.attempt_id,
+                    "session_id": launch.session_id, "harness": "claude",
+                    "server": os.environ.get("AGENT_HERDR_SESSION") or "default"}
+        store = peer_obligations.ObligationStore(launch.jobs.parent)
+        duty = store.create(peer_obligations.stable_duty_id("registered-batch", identity),
+                            "registered-batch", identity, {"carrier": "claude-parent-runtime"})
+        if duty.get("state") not in {"complete", "cancelled"}:
+            store.update(duty["id"], observation={"holder": list(claim.holder)})
+            peer_obligations.ensure_runner(launch.jobs.parent)
+    except (OSError, ValueError, JoinContractError):
+        pass  # Native delivery still owns this attempt; persistence is best effort.
 
 
 def main() -> int:
@@ -1589,6 +1611,7 @@ def _run_carrier(launch, claim, payload, observation, holder) -> int:
                 if successor is not None:
                     launch, claim = successor
                     holder["claim"] = claim
+                    _retain_completion(launch, claim)
                     continue  # Same deadline; one registry-bound successor only.
                 if _owner_status(launch) in {"open", "running"}:
                     # A transient attention (or a ready readout the current

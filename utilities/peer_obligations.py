@@ -28,6 +28,7 @@ _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
 _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
+_RUNNERS: list[subprocess.Popen] = []
 
 
 class ObligationError(ValueError):
@@ -259,12 +260,14 @@ def ensure_runner(root: str | Path | None = None) -> bool:
             return True
         os.set_inheritable(fd, True)
         runner = Path(__file__).with_name("peer-steward.py")
-        subprocess.Popen(
+        _RUNNERS[:] = [process for process in _RUNNERS if process.poll() is None]
+        process = subprocess.Popen(
             [sys.executable, str(runner), "__obligation-runner", "--lock-fd", str(fd),
              "--state-root", str(Path(root).resolve()) if root else str(peer_state_root())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, pass_fds=(fd,), start_new_session=True,
         )
+        _RUNNERS.append(process)
         return True
     except (OSError, subprocess.SubprocessError):
         return False

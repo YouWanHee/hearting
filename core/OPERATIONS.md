@@ -113,6 +113,14 @@ loaded when its process started. Runtime-owned credentials, sessions, logs,
 caches, databases, and Codex `config.toml` remain outside this activation
 boundary.
 
+Release cleanup retains trees used by live processes, including their working
+directories and open files. Shared Python dispatch code holds its resolved code
+root open for the process lifetime, so a hook launched through a rotating runtime
+ projection still names the release that supplies its later imports. Older live
+projection processes without that reference conservatively retain their release family
+until they exit. This uses the installer's existing in-use judgment, with no
+additional registry or caller step.
+
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
 different physical roots may compare equal only at an explicitly code-root-only
@@ -711,6 +719,13 @@ and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
 Runtime completion carriers report a bounded native log line for skipped delivery,
 claims and prompt admission, with the session and reason. Observing transport never
 changes the settled result or grants another execution.
+
+An accepted Claude native wake is also retained as the existing outer manager's
+registered-batch duty. If its hook exits before delivery, that task runner checks
+the same current attempt and pending notice and hands it to the existing peer
+courier for the exact parent session. Native and recovery delivery share the
+notice claim; forms and busy turns use the courier's existing retained-message
+path. Codex and OpenCode keep their existing retained completion controllers.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress

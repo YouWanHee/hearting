@@ -3,9 +3,6 @@
 
 from __future__ import annotations
 
-from hearting_gates import gates_on, same_work_or_refuse
-from session_identity import session_label
-
 import base64
 from contextlib import contextmanager
 import contextvars
@@ -29,6 +26,14 @@ import uuid
 from typing import Callable, Iterator, Mapping, NamedTuple
 from types import MappingProxyType
 
+# Keep the actual import tree visible to the installer's existing /proc in-use
+# scan even when argv names ~/.claude/hooks or another rotating projection.
+# The descriptor closes on exec/process exit; no runtime state is written.
+_CODE_ROOT_FD = os.open(Path(__file__).resolve().parents[1],
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+
+from hearting_gates import gates_on, same_work_or_refuse
+from session_identity import session_label
 from route_identity import registered_node_identity
 from governor_identity import close_witness, create_witness
 from dispatch_attempt_policy import (decide_attempt, SUBSESSION_NOTE, SUCCESS_NOTES, committed_outcome,
