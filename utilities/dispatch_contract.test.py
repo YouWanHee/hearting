@@ -1347,6 +1347,17 @@ class DispatchContractTest(unittest.TestCase):
      expected_attempt_id="att-parent-canonical")
     self.assertEqual(binding.repository_identity,
                      D.canonical_repository_identity(primary))
+    self.assertEqual(binding.repository_path, str(primary))
+    # Git can time out on NAS after admission and return a physical-path
+    # fallback. That is not parent extinction and must never enter the
+    # foreground guard's TERM path. No repeated Git call is needed here.
+    with mock.patch.object(D, "canonical_repository_identity", return_value=str(primary)) as git:
+     self.assertTrue(D.parent_attempt_binding_is_live(jobs, binding))
+     git.assert_not_called()
+     jobs.write_text(row.replace(f"\t{primary}\t", "\t/foreign\t") + "\n")
+     self.assertFalse(D.parent_attempt_binding_is_live(jobs, binding))
+     git.assert_not_called()
+    jobs.write_text(row + "\n")
     with self.assertRaises(D.DispatchContractError) as wrong_worktree:
      D.resolve_live_parent_attempt(
       jobs,parent_slug="owner",repo=str(linked),worktree=str(primary),

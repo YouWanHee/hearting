@@ -464,8 +464,8 @@ class CensusFollowsClassification(unittest.TestCase):
                     exec_child={"pid": 400, "comm": "npm", "etime_s": 720}),
         ]
         text = "".join(t for t, _k in render._pulse_segs(sessions, []))
-        self.assertIn("1 작업 중", text)
-        self.assertIn("● 1 대기", text)
+        self.assertIn("1 working", text)
+        self.assertIn("● 1 idle", text)
 
     def test_group_tier_counts_only_working_rows(self):
         sessions = [Session(harness="claude", pid=100, liveness="idle", cwd="/w",

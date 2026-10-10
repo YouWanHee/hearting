@@ -509,6 +509,15 @@ the worker's recovery context, along with later-round guidance, without changing
 that assignment or its digest.
 The existing sealed launch input also retains this recovery guidance so an
 automatic replacement replays the same instructions and semantic round.
+An owner continuing an uncapped stage with a different nonempty request after
+the prior execution has settled opens new work under the same stage and gate;
+it does not inherit a transport retry link. Compare the existing sealed request,
+not the slug or request-file name. Identical requests retain the automatic
+replacement limit; unreadable inputs, unresolved cleanup and terminal conflicts
+retain their existing handling. Review-round and owner continuation budgets do
+not reset. Parent monitoring rechecks the exact admitted registry paths and
+process or supervisor lease, without repeating Git repository discovery: a Git
+timeout is not evidence that the parent ended.
 The replacement manifest binds the current owner attempt; successful peers keep
 their original owner and completion evidence. Launch refusals retain their
 field-level detail in both the batch receipt and its diagnostic ledger.
@@ -1586,8 +1595,10 @@ Names longer than Herdr's 32-character limit are explained before any placement
 or launch action, so a refused name leaves no extra pane.
 The start completes placement without a post-start pane move. The new pane's
 split-cwd and launcher preparation finish under one fixed
-monotonic deadline, including a stable foreground-shell snapshot after bootstrap,
+five-minute monotonic deadline, including a stable foreground-shell snapshot after bootstrap,
 before its single start request; caller-provided panes keep their existing path.
+An initializing shell may keep running its prompt children within that bound;
+the same shell lifetime, empty input and stable prompt are checked before launch.
 Uncertain readiness leaves the new pane retained with its reuse command in the receipt.
 The predecessor hands over its card and documents, receives the successor's ACK,
 leaves its last result and becomes idle; the successor then uses `retire <predecessor>` to send
@@ -1605,6 +1616,10 @@ compares that original lifetime before sending input. A proven-dead or reused
 agent PID completes the obligation as `target-already-gone`, without input,
 pane closure or handover to a later process in the same pane. Unreadable birth
 evidence remains unknown; a later observation cannot supply a missing original.
+Resumed retirement determines self-target from its recorded requester's session
+and pane identity. A cancelled request is terminal history:
+a new explicit request for the same lifetime accepts a fresh duty while retaining
+the cancelled record; repeated active or completed requests share that fresh duty.
 When the retire succeeds from the pane started beside the predecessor, the
 predecessor's open depth-1 routes pass to the successor, on any harness: it may
 `start` and `correct` them, and their stored completion records reach it

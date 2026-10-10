@@ -86,13 +86,13 @@ class FreshnessTest(unittest.TestCase):
                     self.assertIn("1시간 전", header)
                     self.assertLessEqual(render._dw(header), width)
 
-    def test_old_summary_is_labelled_after_observed_idle(self):
+    def test_old_summary_keeps_its_age_without_repeating_idle(self):
         s = self.session(summary="보완 작업이 진행 중", summary_ts=self.now - 12 * 3600)
         row = text(render._context_detail_row(s, term_width=180))
-        self.assertIn("대기", row)
+        self.assertNotIn("대기", row)
         self.assertIn("마지막 요약", row)
         self.assertIn("12시간 전", row)
-        self.assertLess(row.index("대기"), row.index("마지막 요약"))
+        self.assertNotIn(" · · ", row)
 
     def test_unknown_summary_time_stays_historical_and_exec_comes_first(self):
         s = self.session(liveness="working", summary="작업 완료",
@@ -119,14 +119,15 @@ class FreshnessTest(unittest.TestCase):
             titles.annotate([s])
         self.assertIsNone(s.title_ts)
 
-    def test_fresh_summary_still_needs_observed_working(self):
-        for state in ("working", "idle", "unknown"):
+    def test_fresh_summary_is_historical_without_repeating_state(self):
+        for state in ("working", "idle", "detached", "unknown"):
             s = self.session(liveness=state, summary="새 상태 설명", summary_ts=self.now)
             row = text(render._context_detail_row(s, term_width=180))
             with self.subTest(state=state):
                 self.assertIn("마지막 요약", row)
-                if state == "working":
-                    self.assertLess(row.index("작업 중"), row.index("마지막 요약"))
+                self.assertIn("새 상태 설명", row)
+                for word in ("작업 중", "대기", "분리됨", "상태 미확인"):
+                    self.assertNotIn(word, row)
 
     def test_new_route_boundary_makes_previous_title_historical(self):
         s = self.session(liveness="working")
@@ -134,15 +135,19 @@ class FreshnessTest(unittest.TestCase):
         s.route_chain = {"current": {"ts": self.now - 10}}
         self.assertIn("이전 제목", render._display_session_subject(s))
 
-    def test_fresh_completion_title_is_still_labelled_generated_text(self):
+    def test_current_title_needs_no_prefix_or_working_state(self):
         s = self.session(liveness="working", title="하팅 작업 완료", title_ts=self.now - 60)
-        self.assertEqual(render._display_session_subject(s), "제목 · 하팅 작업 완료")
+        for state in ("working", "idle", "detached", "unknown"):
+            for age in (60, 901, 12 * 3600, 24 * 3600):
+                s.liveness, s.title_ts = state, self.now - age
+                with self.subTest(state=state, age=age), mock.patch("time.time", return_value=self.now):
+                    self.assertEqual(render._display_session_subject(s), s.title)
 
     def test_recorded_resource_failure_names_its_scope_not_workflow_success(self):
         child = ResourceJob(run_id="run", node="full-run", liveness="exited",
                             exit_code=2, ended_at=self.now - 360)
         result = render._group_last_result([], [], [child])
-        self.assertEqual((result["name"], result["result"]), ("자원 full run", "failure"))
+        self.assertEqual((result["name"], result["result"]), ("resource full run", "failure"))
         child.ended_at = None
         self.assertIsNone(render._group_last_result([], [], [child]))
 
@@ -184,7 +189,14 @@ class FreshnessTest(unittest.TestCase):
         with mock.patch.object(titles, "read", return_value={"title": s.title, "ts": self.now}):
             titles.annotate([s])
         self.assertIsNone(s.title_ts)
-        self.assertIn("이전 제목", render._display_session_subject(s))
+        self.assertEqual(render._display_session_subject(s), s.title)
+
+    def test_invalid_title_time_cannot_prove_a_previous_subject(self):
+        s = self.session()
+        for timestamp in (None, True, "old", float("nan"), float("inf"), self.now + 1):
+            s.title_ts = timestamp
+            with self.subTest(timestamp=timestamp):
+                self.assertEqual(render._display_session_subject(s), s.title)
 
 
 if __name__ == "__main__":

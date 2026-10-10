@@ -313,7 +313,7 @@ class NestingTest(_QueueFixture):
         text = self._render([self._session(_SID)], [self._row()])
         self.assertIn("⚡codex task", text)
         # The generic GPU legend explains ↳; the plugin body stays undispatched.
-        self.assertNotIn("↳", text.split("\n  세션:", 1)[0])
+        self.assertNotIn("↳", text.split("\n  session:", 1)[0])
         self.assertNotIn("dispatch", text)
         self.assertNotIn("(orphan)", text)
 

@@ -351,7 +351,7 @@ class WorkProjectionTest(unittest.TestCase):
             )
             render.set_process_view(False)
             self.assertIn("execute", group_text)
-            self.assertIn("구현", process_text)
+            self.assertIn("execute", process_text)
 
     def test_childless_abandoned_compile_does_not_pollute_linear_lineage(self):
         with tempfile.TemporaryDirectory() as tmp:

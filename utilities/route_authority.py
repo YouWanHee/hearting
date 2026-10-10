@@ -949,21 +949,50 @@ def declared_subsession(args) -> bool:
     return True
 
 
-def retry_predecessor(prior_rows):
+def new_owner_request(previous_row, *, jobs=None, task=None):
+    """A changed sealed assignment after a settled failure, without rewriting it."""
+    if (jobs is None or not isinstance(task, str) or not task.strip()
+            or previous_row.get("_status") not in {"done", "closed"}
+            or committed_outcome(previous_row["_status"], previous_row) != "failed"):
+        return False
+    from dispatch_contract import (
+        DispatchContractError, attempt_process_quiescence, terminal_conflict_pending,
+    )
+    from dispatch_replacement import launch_input
+    try:
+        previous = launch_input(jobs, previous_row["attempt_id"], previous_row)["task"]
+        return (isinstance(previous, str) and bool(previous.strip())
+                and " ".join(previous.split()) != " ".join(task.split())
+                and not terminal_conflict_pending(previous_row)
+                and attempt_process_quiescence(
+                    previous_row, terminal_receipt=True).state == "quiescent")
+    except (DispatchContractError, OSError, ValueError, KeyError, TypeError):
+        # Missing history cannot manufacture a new request boundary.
+        return False
+
+
+def retry_predecessor(prior_rows, *, jobs=None, task=None):
     """The transport retry a new launch of this node continues, or "".
 
     Only a transport failure (a death, a runtime error) is retried in place.
     A worker's readable FAIL or BLOCKED is its result, on a capped node or
     not: the next launch is new work, so it never inherits a retry link and
     never spends the node's one replacement. Capped nodes still count it as a
-    round through the shared round admission. No original row is changed.
+    round through the shared round admission. A different explicit request on
+    an uncapped stage is also new work once the old execution is quiescent.
+    Callers keep capped rounds on their existing admission path. No original
+    row or automatic replacement allowance is changed.
     """
     if not prior_rows:
         return ""
     latest = prior_rows[-1]
     status = latest["_status"]
     if committed_outcome(status, latest) == "failed":
-        return "" if readable_result(latest) else latest.get("attempt_id", "")
+        if readable_result(latest):
+            return ""
+        if new_owner_request(latest, jobs=jobs, task=task):
+            return ""
+        return latest.get("attempt_id", "")
     if status == "open" and latest.get("launch_claimed") == "0":
         # Register/start reuse the same unlaunched transport successor. A
         # semantic round has no such link and keeps its own round identity.

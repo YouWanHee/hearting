@@ -921,6 +921,7 @@ class ParentAttemptBinding:
     worktree: str
     slug: str
     liveness_metadata_fingerprint: tuple[tuple[str, str], ...]
+    repository_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -4816,8 +4817,8 @@ def parent_attempt_binding_is_live(
             if (
                 fields[4] != binding.slug
                 or fields[3] != binding.worktree
-                or canonical_repository_identity(fields[2])
-                != binding.repository_identity
+                or (fields[2] != binding.repository_path if binding.repository_path
+                    else canonical_repository_identity(fields[2]) != binding.repository_identity)
             ):
                 return False
             return _parent_binding_is_live_from_metadata(
@@ -5426,6 +5427,7 @@ def resolve_live_parent_attempt(
             transport=metadata.get("transport", ""),
             runtime_sandbox=metadata.get("runtime_sandbox", ""),
             repository_identity=requested_repository,
+            repository_path=parent_fields[2],
             worktree=parent_fields[3],
             slug=parent_fields[4],
             liveness_metadata_fingerprint=tuple(
