@@ -834,7 +834,10 @@ the original PRs merged through commit ancestry; their heads, history and review
 remain intact. The publication lease pins the checked base, avoiding intermediate
 main CI runs and preserving any concurrent default-branch successor. Protected
 branches/rules use the original per-PR path rather than bypassing merge policy. A
-changed head or default branch restarts validation for the remaining work.
+changed head or default branch restarts validation for the remaining work. PR
+and main Checks share the same authenticated validated-tree lookup: an identical
+tree reuses its completed successful full PR run, including across a rebase;
+changed, failed, partial or unverified trees retain full validation.
 CI failure splits the group automatically, excluding a failing singleton while
 continuing the others. Integration conflicts use the original single-PR path.
 Every caller receives its own result through the same command, without new
