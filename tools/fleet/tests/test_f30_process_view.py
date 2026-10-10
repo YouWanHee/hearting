@@ -315,7 +315,7 @@ class RenderContentTest(ProcessViewEnv):
         render.set_process_view(True)
         text = _joined(build_observed_lines([], jobs, section="both", narrow=False,
                                             malformed=0, layout="wide", term_width=168))
-        self.assertIn("…exit pending", text)
+        self.assertIn("…exit wait", text)
         self.assertNotIn('⚠ stage failed', text)
 
     def test_t3_5_all_done_route_defaults_to_one_line_fold(self):

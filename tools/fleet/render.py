@@ -6192,7 +6192,7 @@ def _route_node_text(n):
         tail = fmt_min(elapsed) if elapsed is not None else ""
         return "%s ✓%s%s" % (nid, tail, deps), "dim", mark
     if st == "attention":
-        return "%s ! check needed%s" % (nid, deps), "lvl_y", mark
+        return "%s ! check%s" % (nid, deps), "lvl_y", mark
     if st == "active":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
         extra = ""
@@ -6202,12 +6202,12 @@ def _route_node_text(n):
         return "%s ●%s%s%s" % (nid, tail, extra, deps), ("g_work" if _BLINK_ON else "g_work_off"), mark
     if st == "reconciling":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
-        return "%s …exit pending%s%s" % (nid, tail, deps), "lvl_y", mark
+        return "%s …exit wait%s%s" % (nid, tail, deps), "lvl_y", mark
     if st == "recovering":
         # user 2026-08-13: a crashed attempt with a staged relaunch must not read as ✕. The
         # label names the exact registry reason route.py decided, never a guess made here.
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
-        reason = "recovery pending"
+        reason = "recovery"
         return "%s …%s%s%s" % (nid, reason, tail, deps), "lvl_y", mark
     if st == "failed":
         tail = (" " + fmt_min(elapsed)) if elapsed is not None else ""
@@ -8210,7 +8210,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     if "degraded" in _seen_glyphs:
         legend += [("◐", "lvl_y"), (' stage unknown   ', "dim")]
     if "recovering" in _seen_glyphs:
-        legend += [("…", "lvl_y"), (" recovery pending   ", "dim")]
+        legend += [("…", "lvl_y"), (" recovery   ", "dim")]
     if "blocked" in _seen_glyphs:
         legend += [("◑", "g_blocked"), (" input needed   ", "dim")]
     if "tag" in _seen_glyphs:

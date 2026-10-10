@@ -723,7 +723,7 @@ class ReconciliationRenderTest(unittest.TestCase):
 
     def test_process_node_uses_yellow_gate_pending_label(self):
         text, key, mark = render._route_node_text(self._node())
-        self.assertEqual((text, key, mark), ("frame …exit pending 3m", "lvl_y", ""))
+        self.assertEqual((text, key, mark), ("frame …exit wait 3m", "lvl_y", ""))
 
     def test_breadcrumb_uses_yellow_ellipsis(self):
         breadcrumb = render._route_stage_segs([("frame", "reconciling"),

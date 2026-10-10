@@ -290,6 +290,23 @@ class FreshnessTest(unittest.TestCase):
                 self.assertIn(expected, visible)
                 self.assertTrue(visible.endswith(" · 1m ago"), visible)
 
+    def test_compact_route_states_do_not_add_a_row_to_an_existing_flow(self):
+        labels = ("plan-check", "execute", "impl-review", "test", "report")
+        for state, old_status in (("recovering", "…복구 대기 3m"),
+                                  ("reconciling", "…종료 확인 3m"),
+                                  ("attention", "! 확인 필요")):
+            nodes = [{"id": name, "level": level, "state": state if not level else "planned",
+                      "elapsed_min": 3 if not level else None, "depends_on": []}
+                     for level, name in enumerate(labels)]
+            baseline = labels[0] + " " + old_status + " › " + " › ".join(
+                name + " ○" for name in labels[1:])
+            room = render._dw(baseline)
+            with self.subTest(state=state, width=room):
+                rows = render._route_card_l2({"nodes": nodes}, max_width=room)
+                self.assertEqual(len(rows), 1, text(rows))
+                self.assertTrue(text(rows).endswith("report ○"), text(rows))
+                self.assertLessEqual(render._dw(text(rows)), room)
+
     def test_owner_card_preserves_age_suffix_in_plain_and_tinted_80_columns(self):
         owner = DispatchJob(key="code", slug="owner", harness="codex", cwd="/work/project",
                             worker_type="owner", depth=1, liveness="working", is_child=True,
