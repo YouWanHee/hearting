@@ -544,8 +544,8 @@ def enrich(sess, tick=None):
         sess.session_id = sid
         # F-100b — OpenCode has no derived session name either (Q-3: sqlite title/slug
         # only), so the `[xx]` badge tag is minted from the session id the same way.
-        from fleet.session_handle import minted_tag
-        sess.session_tag = minted_tag(sid)
+        from fleet.session_handle import resolve_tag
+        sess.session_tag = resolve_tag("opencode", sid)
     if slug:
         sess.slug = slug
     provider = None
