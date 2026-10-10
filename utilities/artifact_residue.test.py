@@ -284,14 +284,20 @@ class ApplyTests(ResidueFixture):
                 hold = RES.residue_hold(self.root)
                 self.assertIsNotNone(hold)
                 self.assertEqual(RD.migration_hold(self.root), hold)
+                begun = json.loads(Path(hold["journal"]).read_text())["begun"].values()
+                route_ids = {row["route_id"] for row in begun}
+                removed_ids = {row["cycle_id"] for row in begun}
+                self.assertTrue(removed_ids)
+                indexed = P.list_cycle_records(self.root, route_ids=route_ids)
+                self.assertTrue(removed_ids <= {row["cycle_id"] for row in indexed})
                 resumed = self.apply()
                 self.assertEqual(resumed["status"], "rolled-back", resumed)
                 self.assertEqual(_files(self.root), before)
                 self.assertEqual(sorted(p.name for p in (self.root / ".runtime" / "routes").glob("*.json")), routes_before)
                 # A rolled-back cycle must disappear from indexed lookup too.
-                route_id = self.caller_route["route_id"]
-                expected = [row for row in P.list_cycle_records(self.root) if row.get("route_id") == route_id]
-                self.assertEqual(P.list_cycle_records(self.root, route_ids={route_id}), expected)
+                expected = [row for row in P.list_cycle_records(self.root) if row.get("route_id") in route_ids]
+                self.assertFalse(removed_ids & {row["cycle_id"] for row in expected})
+                self.assertEqual(P.list_cycle_records(self.root, route_ids=route_ids), expected)
                 self.assertIsNone(RES.residue_hold(self.root))
         done = self.apply()
         self.assertEqual(done["status"], "complete")
