@@ -2209,6 +2209,9 @@ def enrich(sess, tick=None):
     # B-3: a tier-1 session_registry sessionId (set above) outranks the rollout's —
     # preserve it instead of unconditionally overwriting with the rollout-derived id.
     sess.session_id = sess.session_id or _sid(path)
+    if sess.session_id == _sid(path):
+        from .. import session_cwd
+        session_cwd.observe(sess, session_cwd.jsonl_cwd(path, "codex", sess.session_id), sess.session_id)
     sess._transcript_path = path                 # ephemeral: live title scheduler, not --json
     sess._refresh_source = {"kind": "transcript", "harness": "codex",
                             "session_id": sess.session_id, "path": path,

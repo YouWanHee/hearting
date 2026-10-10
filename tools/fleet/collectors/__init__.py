@@ -431,6 +431,10 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
                 enrichers["claude"](s, tick={s.pid: getattr(s, "_pane_session_claim", None)})
             except Exception:
                 pass
+    # Session directories describe work; the foreground observation above used
+    # process launch directories. Do not change those matching inputs mid-pass.
+    from .. import session_cwd
+    session_cwd.project(sessions)
     # Exact Fleet-owned decision/approval waits are additive enrichment. Run
     # after harness identity resolution and before the single liveness verdict.
     try:
