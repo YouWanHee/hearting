@@ -207,6 +207,13 @@ class SessionTagCollisionTest(unittest.TestCase):
                                                                "nameSource": "derived", "name": "hearting-" + minted_tag(self.a)}))
         self.assertNotEqual(self.tags([self.session(self.a)])[0], minted_tag(self.a))
 
+    def test_codex_registry_without_process_start_does_not_reserve_recycled_sid(self):
+        directory = self.root / "registry/codex"
+        directory.mkdir(parents=True)
+        (directory / (str(os.getpid()) + ".json")).write_text(json.dumps({"sessionId": self.a}))
+        session_tags.refresh([])
+        self.assertNotIn(("codex", self.a), session_tags._read(session_tags._path()))
+
     def test_unknown_identity_does_not_gain_a_number(self):
         self.tags([Session(harness="codex", pid=os.getpid())])
         self.assertIsNone(resolve_tag("codex", ""))

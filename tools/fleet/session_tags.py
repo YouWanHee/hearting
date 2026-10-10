@@ -106,6 +106,8 @@ def _inventory(sessions):
             start = read_proc_start(pid)
             if not record or start is None or record.get("status") == "exited":
                 continue
+            if harness != "claude" and record.get("procStart") is None:
+                continue
             if record.get("procStart") is not None and str(record["procStart"]) != str(start):
                 continue
             sid = record.get("sessionId")
