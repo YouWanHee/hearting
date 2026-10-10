@@ -226,10 +226,14 @@ class InstallFollowTest(unittest.TestCase):
     def test_cached_loading_frame_does_not_reset_scroll(self):
         self.addCleanup(setattr, render, "_OFFSET", render._OFFSET)
         self.addCleanup(setattr, render, "_RELOAD_FRAME", render._RELOAD_FRAME)
+        self.addCleanup(setattr, render, "_RELOAD_FRAME_AT", render._RELOAD_FRAME_AT)
+        self.addCleanup(setattr, render, "_RELOAD_FRAME_COMPUTE_AT", render._RELOAD_FRAME_COMPUTE_AT)
         self.addCleanup(setattr, render, "_SELECT_MODE", render._SELECT_MODE)
         render._SELECT_MODE = False
         render._OFFSET = 12
         render._RELOAD_FRAME = [[("line %d" % n, "dim")] for n in range(60)]
+        render._RELOAD_FRAME_AT = render.time.monotonic()
+        render._RELOAD_FRAME_COMPUTE_AT = render._COMPUTE_HOSTS_SET_AT
         screen = mock.Mock()
         screen.getmaxyx.return_value = 24, 100
         with mock.patch.object(render, "_build_lines", side_effect=AssertionError("fresh loading")), \

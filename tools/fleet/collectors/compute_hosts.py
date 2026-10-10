@@ -17,7 +17,10 @@ import time
 from ..model import project_of
 
 
-COLLECT_TIMEOUT = 5.0
+# Covers interpreter/local preparation plus parallel bounded SSH samples.
+# The proc fallback can exceed the old 5s whole-cycle budget even when every
+# host answers within its own deadline. Live polling runs in its own pump.
+COLLECT_TIMEOUT = 20.0
 
 
 def _tool_argv():
@@ -202,6 +205,8 @@ def unregistered_gpu(snapshot, resource_jobs=(), shown_sessions=frozenset(), age
                         "pid": pid, "proc_start": proc_start,
                         "pgid": pgid if _pos_int(pgid) else None,
                         "used_memory_mib": None,
+                        "telemetry_unknown": bool(gpu.get("observation_source")),
+                        "gpu_placement": process.get("gpu_placement"),
                         "elapsed_s": (elapsed + max(0, int(age_s or 0)))
                         if _nonneg_int(elapsed) else None,
                         "command": process.get("command")
