@@ -692,6 +692,12 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"1"}]),"")
 
  def test_new_execute_gap_registers_after_transport_budget_was_spent(self):
+  self.assert_new_execute_request("gap-three")
+
+ def test_new_execute_request_can_reuse_its_failed_slug(self):
+  self.assert_new_execute_request("gap-two")
+
+ def assert_new_execute_request(self, slug):
   import dispatch_contract as DC
   import dispatch_replacement as REPLACEMENT
   with self.dispatch_env():
@@ -699,7 +705,10 @@ class FallbackTest(unittest.TestCase):
    route=json.loads(path.read_text())
    self.seed_parent()
    self.seed_predecessor_markers(path,"execute")
-   args=SimpleNamespace(attempt_id="att-execute-gap-two",jobs_path=self.jobs,
+   old_id=F.attempt_identity(
+    SimpleNamespace(slug="gap-two",parent="owner",parent_attempt_id="att-fallback-parent"),
+    route,{"id":"execute"},{"child_harness":"codex"},1)
+   args=SimpleNamespace(attempt_id=old_id,jobs_path=self.jobs,
                         worktree=self.repo,replacement_input_argv=["--slug","gap-two"])
    old_task="Close migration fixtures and import integration."
    meta={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
@@ -730,12 +739,12 @@ class FallbackTest(unittest.TestCase):
     if "--dry-run" in command:
      return SimpleNamespace(returncode=0,stdout="check=ok\n",stderr="")
     commands.append(command)
-    row=f"now\topen\t{self.repo}\t{self.repo}\tgap-three\t"+",".join(f"{k}={v}" for k,v in candidate.items())
+    row=f"now\topen\t{self.repo}\t{self.repo}\t{slug}\t"+",".join(f"{k}={v}" for k,v in candidate.items())
     started="--start" in command
     self.assertTrue(DC.claim_attempt_row(self.jobs,aid,row,launch=started))
     return SimpleNamespace(returncode=0,stdout=("check=ok\nregistered_worker=1\n"
                           f"child_spawned={int(started)}\nattempt_id={aid}\n"),stderr="")
-   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","execute","--slug","gap-three",
+   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","execute","--slug",slug,
          "--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),
          "--prompt-file",str(prompt),"--start"]
    out=io.StringIO()
@@ -753,6 +762,16 @@ class FallbackTest(unittest.TestCase):
    launched=F.registry_rows(self.jobs,route["route_id"],"execute")[-1]
    self.assertEqual(launched["completion_gate"],"code-execute")
    self.assertNotIn("automatic_retry_of",launched)
+   self.assertNotEqual(launched["attempt_id"],old_id)
+   if slug=="gap-two":
+    prior=F.registry_rows(self.jobs,route["route_id"],"execute")
+    self.assertEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task=prompt.read_text()),
+                     launched["attempt_id"])
+    self.assertEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task=" \n"+prompt.read_text()+"  "),
+                     launched["attempt_id"])
+    self.assertEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task=old_task),old_id)
+    self.assertNotEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task="A third distinct request."),
+                        launched["attempt_id"])
    self.assertTrue(REPLACEMENT._budget_exhausted(self.jobs,meta))
 
  def test_a_readable_result_in_the_launch_window_is_reported_not_retried(self):

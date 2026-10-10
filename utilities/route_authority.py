@@ -949,6 +949,28 @@ def declared_subsession(args) -> bool:
     return True
 
 
+def new_owner_request(previous_row, *, jobs=None, task=None):
+    """A changed sealed assignment after a settled failure, without rewriting it."""
+    if (jobs is None or not isinstance(task, str) or not task.strip()
+            or previous_row.get("_status") not in {"done", "closed"}
+            or committed_outcome(previous_row["_status"], previous_row) != "failed"):
+        return False
+    from dispatch_contract import (
+        DispatchContractError, attempt_process_quiescence, terminal_conflict_pending,
+    )
+    from dispatch_replacement import launch_input
+    try:
+        previous = launch_input(jobs, previous_row["attempt_id"], previous_row)["task"]
+        return (isinstance(previous, str) and bool(previous.strip())
+                and " ".join(previous.split()) != " ".join(task.split())
+                and not terminal_conflict_pending(previous_row)
+                and attempt_process_quiescence(
+                    previous_row, terminal_receipt=True).state == "quiescent")
+    except (DispatchContractError, OSError, ValueError, KeyError, TypeError):
+        # Missing history cannot manufacture a new request boundary.
+        return False
+
+
 def retry_predecessor(prior_rows, *, jobs=None, task=None):
     """The transport retry a new launch of this node continues, or "".
 
@@ -968,23 +990,8 @@ def retry_predecessor(prior_rows, *, jobs=None, task=None):
     if committed_outcome(status, latest) == "failed":
         if readable_result(latest):
             return ""
-        if jobs is not None and isinstance(task, str) and task.strip():
-            from dispatch_contract import (
-                DispatchContractError, attempt_process_quiescence,
-                terminal_conflict_pending,
-            )
-            from dispatch_replacement import launch_input
-            try:
-                previous = launch_input(jobs, latest["attempt_id"], latest)["task"]
-                if (isinstance(previous, str) and previous.strip()
-                        and " ".join(previous.split()) != " ".join(task.split())
-                        and not terminal_conflict_pending(latest)
-                        and attempt_process_quiescence(
-                            latest, terminal_receipt=True).state == "quiescent"):
-                    return ""
-            except (DispatchContractError, OSError, ValueError, KeyError, TypeError):
-                # Missing history cannot manufacture a new request boundary.
-                pass
+        if new_owner_request(latest, jobs=jobs, task=task):
+            return ""
         return latest.get("attempt_id", "")
     if status == "open" and latest.get("launch_claimed") == "0":
         # Register/start reuse the same unlaunched transport successor. A

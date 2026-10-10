@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from model_config import ModelConfigError, resolve_config  # noqa: E402
-from route_authority import retry_predecessor, route_in_force, sealed_pin_harness  # noqa: E402
+from route_authority import new_owner_request, retry_predecessor, route_in_force, sealed_pin_harness  # noqa: E402
 
 
 def _unit_role(unit):
@@ -988,6 +988,18 @@ def attempt_identity(args: argparse.Namespace, route: dict, node: dict, row: dic
     }
     if round_number > 1:
         payload["round"] = round_number
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return "att-" + digest[:48]
+
+
+def request_attempt_identity(attempt_id, prior_rows, *, jobs, task):
+    """Reuse a slug while keeping a changed assignment's claim stable."""
+    previous = next((row for row in prior_rows if row.get("attempt_id") == attempt_id), None)
+    if previous is None or not new_owner_request(previous, jobs=jobs, task=task):
+        return attempt_id
+    payload = {"assignment_of": attempt_id, "task": " ".join(task.split())}
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -2095,6 +2107,9 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                 attempt_id = attempt_identity(
                     args, route, node, row, ordinal,
                     node_round_admission.budget.next_round if node_round_admission is not None else 1)
+                if request_task is not None:
+                    attempt_id = request_attempt_identity(
+                        attempt_id, prior_rows, jobs=args.jobs, task=request_task)
                 if args.automatic_retry_of and attempt_id == args.automatic_retry_of:
                     # This very tuple just failed: its successor is a new attempt.
                     attempt_id = retry_attempt_identity(attempt_id)
