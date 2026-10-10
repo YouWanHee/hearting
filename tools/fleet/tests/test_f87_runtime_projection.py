@@ -29,6 +29,14 @@ HELPER = ROOT / "adapters/claude/tools/fleet/session_handle.py"
 
 
 class RuntimeProjectionTest(unittest.TestCase):
+    def setUp(self):
+        # This suite verifies native session identity and metadata formatting.
+        # Physical ownership has its own real-pty regression suite.
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import pane_ownership
+        proof = unittest.mock.patch.object(pane_ownership, "verified_pane", return_value="fixture-pane")
+        proof.start()
+        self.addCleanup(proof.stop)
     # Whoever runs this suite may themselves BE a registered worker (a dispatched
     # reviewer, the title refresher). Those markers gate the projection, so leaving them
     # inherited makes the result depend on who ran the test.
@@ -45,6 +53,13 @@ class RuntimeProjectionTest(unittest.TestCase):
                     "CODEX_HOME": str(root / "codex"), "FLEET_TITLE_STATE_DIR": str(root / "titles"),
                     "PYTHONDONTWRITEBYTECODE": "1"})
         env.pop("CODEX_THREAD_ID", None)
+        fixture = root / "python-fixture"
+        fixture.mkdir(exist_ok=True)
+        (fixture / "sitecustomize.py").write_text(
+            f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
+            "import pane_ownership\n"
+            "pane_ownership.verified_pane=lambda pane,*a,**kw: pane or ''\n")
+        env["PYTHONPATH"] = str(fixture) + os.pathsep + env.get("PYTHONPATH", "")
         env.update(overrides)
         return env
 

@@ -141,7 +141,15 @@ def runtime_identity():
     return ("codex", None) if codex_seen else (None, None)
 
 
-def may_report(harness: str, session_id: str, *, worker=None) -> bool:
+def verified_pane(pane, harness, session_id=None, **kwargs):
+    utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
+    from pane_ownership import verified_pane as verify
+    return verify(pane, harness, session_id, **kwargs)
+
+
+def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> bool:
     """The ONE decision whether this process may report ``session_id`` to herdr.
 
     - never for a registered/background worker (D-42);
@@ -162,9 +170,11 @@ def may_report(harness: str, session_id: str, *, worker=None) -> bool:
     runtime, own = runtime_identity()
     if runtime != harness:
         return False
-    if runtime == "opencode" and own is None:
-        return True
-    return own == session_id
+    if not (runtime == "opencode" and own is None) and own != session_id:
+        return False
+    if not verified_pane(pane_id or os.environ.get("HERDR_PANE_ID"), harness, session_id):
+        return False
+    return True
 
 
 def _runtime_name(harness: str, session_id: str) -> str:
@@ -355,24 +365,17 @@ def _codex_tui_pane(session_id: str):
     Two panes resolving to one session (same-cwd TUIs sharing the fallback candidate)
     stay None: a badge on the wrong pane also misdirects peer messages.
     """
-    from fleet.collectors import codex as codex_collector
     from fleet.collectors import procscan
-    live = []
-
-    def live_codex():
-        if not live:
-            live.append(procscan.scan(harness_filter={"codex"}))
-        return live[0]
-
     panes = set()
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or _comm(int(entry)) != "codex":
             continue
         pane = procscan.read_environ(int(entry)).get("HERDR_PANE_ID")
         try:
-            if pane and codex_collector.session_id_of_process(
-                    int(entry), live_codex) == session_id:
-                panes.add(pane)
+            if pane:
+                proven = verified_pane(pane, "codex", session_id, pid=int(entry))
+                if proven:
+                    panes.add(proven)
         except Exception:
             continue
     return panes.pop() if len(panes) == 1 else None
@@ -432,7 +435,7 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
         if codex_main:
             _defer_until_proven(session_id, report_session)
         return True
-    if not may_report(harness, session_id, worker=worker):
+    if not may_report(harness, session_id, worker=worker, pane_id=pane):
         if observation is not None:
             observation["reason"] = "guard-refused"
         if codex_main and runtime_identity() == ("codex", None):

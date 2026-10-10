@@ -369,6 +369,15 @@ cycle environment can be recovered from the route's producer record. Refusals
 name the correct output directory, and node scopes are relative to that directory.
 Another open cycle or a matching filename suffix does not grant write authority.
 
+Cards, peer callbacks and pane reports use `utilities/pane_ownership.py` across
+Claude, Codex and OpenCode. It connects the caller's runtime to the live pane's
+foreground PID, controlling terminal and process-start identity. Environment,
+cwd, title, history and shared-daemon ancestry are lookup hints. Shared services
+and background attachments need exact native evidence of the current session;
+a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
+tidy at its existing project seat and pane hooks silent, without new user input
+or runtime-state migration.
+
 An OpenCode child inside a Codex owner's workspace sandbox receives per-attempt
 XDG data/cache/state/config directories beneath the worktree. User configuration
 and existing authentication are linked for reading; generated dependency state

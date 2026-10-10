@@ -36,7 +36,7 @@ import tempfile
 HARNESSES = ("claude", "codex", "opencode")
 FIELDS = ("pid", "sessionId", "cwd", "startedAt", "procStart", "version", "kind",
           "entrypoint", "name", "nameSource", "nameSince", "status", "updatedAt",
-          "statusUpdatedAt", "harness")
+          "statusUpdatedAt", "harness", "parkedJobId")
 STATUSES = ("idle", "busy", "shell", "exited")
 WRITER_SUPPORT = {"claude": "runtime-native",
                   "codex": "hearting-managed",
