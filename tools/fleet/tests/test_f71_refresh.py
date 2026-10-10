@@ -308,7 +308,7 @@ class FirstSnapshotRenderTest(unittest.TestCase):
                     lines = render._build_lines([], [], "both", False, 0,
                                                 term_width=168, governor=None, loading=True)
                     text = "\n".join(render._plain(line) for line in lines if line)
-                    self.assertIn("session 확인 중", text)
+                    self.assertIn('sessions loading', text)
                     self.assertNotIn("0 working", text)
                     self.assertNotIn("0 idle", text)
                     self.assertNotIn("no active", text)
@@ -320,7 +320,7 @@ class FirstSnapshotRenderTest(unittest.TestCase):
                 lines = render._build_lines([], [], "both", False, 0,
                                             term_width=168, governor=None)
                 text = "\n".join(render._plain(line) for line in lines if line)
-                self.assertIn("관측된 session·job 없음", text)
+                self.assertIn('no observed sessions/jobs', text)
                 self.assertIn("0 working", text)
                 attach.assert_not_called()
 
@@ -495,7 +495,7 @@ class RefreshPumpRecoveryTest(unittest.TestCase):
             snapshot={"state": "idle", "age": 12.0, "last_success_at": 1.0,
                       "last_error": None, "leaked_workers": 0, "stall_after": 90.0},
             compute_hosts=None)
-        self.assertIn("refreshed 12s", render._plain(render._hearting_header_row()))
+        self.assertIn("0m ago", render._plain(render._hearting_header_row()))
 
         render.set_refresh_health(
             snapshot={"state": "stalled", "age": 400.0, "last_success_at": 1.0,
@@ -503,7 +503,7 @@ class RefreshPumpRecoveryTest(unittest.TestCase):
                       "stall_after": 90.0},
             compute_hosts=None)
         header = render._plain(render._hearting_header_row())
-        self.assertIn("refreshed 6m", header)
+        self.assertIn("6m ago", header)
         self.assertIn("collection delayed", header)
         self.assertNotIn("workers stuck", header)
 

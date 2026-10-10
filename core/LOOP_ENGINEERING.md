@@ -192,8 +192,16 @@ name with locator dates and execution suffixes removed. Read titles in the
 existing detail pass; never wait for them before publishing basic observations.
 The name does not repeat the same command or execution identity on its line.
 Keep technical terms, capability/stage identifiers and short keyboard actions
-in their original notation; use natural Korean for time and brief factual
-explanations. Do not put a translation beside the same original term.
+in their original notation. Fleet's own labels and legends use short English
+or symbols; session titles, summaries and memory content remain as written.
+Relative observation times use `1m ago`, `2h ago` or `3d ago` at the end of
+the text, with their suffix reserved when clipping. Execution durations retain
+their existing format. Previous subjects use dim color without a label prefix;
+project results use a result glyph, title and age. Repeated nonblocking resource
+diagnostics share one counted row per kind/reason, while blocking observations
+remain individually visible. These display changes add no rows, flags or
+settings and preserve gauges, percentages and column anchors at narrow widths.
+Do not put a translation beside the same original term.
 Current execution or wait observations precede generated text. Session symbols
 already show state; NOW does not repeat a state word, and the context gauge and
 current subject need no labels. Mark a subject as previous only when its known
@@ -237,7 +245,7 @@ device and stage symbols separately. Names, current actions and controls share
 the terminal's width budget; internal identifiers belong in detail. Support
 work carries its caller's observed session/seat independently of execution and
 delivery authority, and is labelled project support when that link is unproven.
-Legends explain statuses and roles in the audience's language, including project
+Legends explain statuses and roles in short English, including project
 activity and expanded GPU commands; a copied dot or arrow must retain its meaning.
 GPU owner labels add who is responsible, such as a verified Fleet session tag;
 they do not repeat the execution's run/job identifier beside its training name.

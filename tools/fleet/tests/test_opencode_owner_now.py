@@ -146,7 +146,7 @@ class OwnerNowTest(unittest.TestCase):
     def test_model_turn_before_public_text_has_now(self):
         self.message()
         self.enrich()
-        self.assertEqual(self.job.summary,"모델 응답 중")
+        self.assertEqual(self.job.summary,"model responding")
 
     def test_malformed_native_time_does_not_assert_a_running_call(self):
         self.message()
@@ -192,7 +192,7 @@ class OwnerNowTest(unittest.TestCase):
         paths=[Path(str(self.db)+suffix) for suffix in ("","-wal","-shm")]
         before={str(p):p.read_bytes() for p in paths if p.exists()}
         self.enrich()
-        self.assertEqual(self.job.summary,"런타임 대기")
+        self.assertEqual(self.job.summary,"runtime waiting")
         self.assertEqual(before,{str(p):p.read_bytes() for p in paths if p.exists()})
 
     def test_announcement_survives_a_large_control_only_tail(self):

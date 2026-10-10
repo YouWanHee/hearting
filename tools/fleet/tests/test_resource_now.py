@@ -43,9 +43,9 @@ class ResourceNowTest(unittest.TestCase):
                     self.assertIn(expected_name, now)
                     location = ("moving4:0" if row["gpu"] == 0 else
                                 "moving4:CPU" if row["node"] == "eval-run" else
-                                "호스트/GPU 미확인")
+                                'host/GPU unknown')
                     self.assertIn(location, now)
-                    self.assertIn("로그 ", now)
+                    self.assertIn('log ', now)
                     self.assertIn(model.fmt_min(child.elapsed_min), now)
                     self.assertIn(".py", text)
                     self.assertNotIn("previous model turn", now)
@@ -58,23 +58,40 @@ class ResourceNowTest(unittest.TestCase):
         with mock.patch.object(render, "_fresh_compute_hosts", return_value=(None, 0)):
             full = render._resource_now_text(owner)
             self.assertIn("7/40 epoch", full)
-            self.assertIn("로그 없음", full)
-            self.assertIn("호스트/GPU 미확인", full)
+            self.assertIn('no log', full)
+            self.assertIn('host/GPU unknown', full)
             for width in (60, 80, 100, 168):
                 line = render._context_detail_row(owner, term_width=width)[0]
                 self.assertLessEqual(sum(render._dw(t) for t, _ in line), width)
             owner.resource_children = []
-            self.assertEqual(render._resource_now_text(owner), "대기")
+            self.assertEqual(render._resource_now_text(owner), "waiting")
             owner.resource_wait = None
             owner.state_evidence = {"inputs": {"observed_liveness": {"state": "parked-supervised"}}}
-            self.assertEqual(render._resource_now_text(owner), "대기")
+            self.assertEqual(render._resource_now_text(owner), "waiting")
 
     def test_working_model_and_unrelated_resource_keep_their_own_now(self):
         owner, child = self.owner(self.rows[0], "opencode")
         owner.liveness, owner.resource_wait = "working", None
         self.assertIsNone(render._resource_now_text(owner))
         owner.liveness, owner.resource_wait = "idle", {"run_ids": ["another"]}
-        self.assertEqual(render._resource_now_text(owner), "대기")
+        self.assertEqual(render._resource_now_text(owner), "waiting")
+
+    def test_log_age_survives_long_resource_now_for_live_and_exited_work(self):
+        now = 1791512200
+        for harness in ("claude", "codex", "opencode"):
+            owner, child = self.owner(self.rows[0], harness)
+            child.display_title = "길게 작성된 자원 작업 이름 " * 20
+            child.log_updated_at = now - 90
+            with mock.patch.object(render, "_fresh_compute_hosts", return_value=(None, 0)), \
+                 mock.patch.object(render.time, "time", return_value=now):
+                for state in ("working", "exited"):
+                    child.liveness = state
+                    child.exit_code = 0 if state == "exited" else None
+                    owner.summary = None
+                    for width in (80, 100, 168):
+                        row = render._plain(render._context_detail_row(owner, term_width=width)[0])
+                        self.assertTrue(row.endswith(" · 1m ago"), row)
+                        self.assertLessEqual(render._dw(row), width)
 
     def test_now_and_resource_row_share_verified_host_without_gpu_snapshot(self):
         for harness in ("claude", "codex", "opencode"):
@@ -88,11 +105,11 @@ class ResourceNowTest(unittest.TestCase):
                 row = render._plain(render._resource_child_rows(owner, term_width=180)[0])
             for text in (now, row):
                 self.assertIn("moving4.iip.lab", text)
-                self.assertNotIn("호스트/GPU 미확인", text)
-            self.assertIn("출력 없음", now)
-            self.assertNotIn("로그 ", now)
+                self.assertNotIn('host/GPU unknown', text)
+            self.assertIn('no output', now)
+            self.assertNotIn('log ', now)
             child.log_size = None
-            self.assertEqual(render._resource_log_age(child), "출력 미확인")
+            self.assertEqual(render._resource_log_age(child), 'output unknown')
 
     def test_remote_gpu_join_uses_exact_attempt_not_directory_or_local_pid(self):
         owner, child = self.owner(self.rows[0], "opencode")
@@ -112,9 +129,9 @@ class ResourceNowTest(unittest.TestCase):
                 owner.liveness, owner.resource_wait, owner.summary = "working", None, None
                 child.liveness, child.exit_code, child.ended_at = "exited", 1, 1791514929
                 now = render._resource_now_text(owner)
-                self.assertIn("마지막 eval run eval_v54.py", now)
-                self.assertIn("실패(exit 1)", now)
-                self.assertIn("로그 ", now)
+                self.assertIn("eval run eval_v54.py", now)
+                self.assertIn("failed(exit 1)", now)
+                self.assertIn('log ', now)
                 owner.summary = "model handling the result"
                 self.assertIsNone(render._resource_now_text(owner))
                 owner.summary, owner.exec_child = None, {"name": "python3"}
@@ -124,9 +141,9 @@ class ResourceNowTest(unittest.TestCase):
                 owner.exec_tool, owner.liveness = None, "idle"
                 owner.state_evidence = {"inputs": {"observed_liveness": {"state": "parked-supervised"}}}
                 owner.summary = "previous model turn before resource wait"
-                self.assertIn("실패(exit 1)", render._resource_now_text(owner))
+                self.assertIn("failed(exit 1)", render._resource_now_text(owner))
                 owner.resource_wait = {"run_ids": [child.run_id]}
-                self.assertIn("실패(exit 1)", render._resource_now_text(owner))
+                self.assertIn("failed(exit 1)", render._resource_now_text(owner))
                 self.assertEqual(child.exit_code, 1)
 
 

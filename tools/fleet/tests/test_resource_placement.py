@@ -124,7 +124,7 @@ class PlacementNowTest(unittest.TestCase):
 
     def test_selection_before_use_is_shared_and_never_creates_gpu_memory(self):
         for harness in ("claude", "codex", "opencode"):
-            self.assertIn("moving4:1 지정 · GPU 사용 전 · 입출력 대기", self.now(harness))
+            self.assertIn('moving4:1 selected · GPU not in use · I/O wait', self.now(harness))
         self.assertEqual(render._resource_gpu_resources(self.child, self.snapshot), [])
 
     def test_observed_child_with_new_group_wins_and_reused_pid_does_not(self):
@@ -132,26 +132,26 @@ class PlacementNowTest(unittest.TestCase):
         process.update(pid=102, proc_start="102", pgid=102)
         for harness in ("claude", "codex", "opencode"):
             self.assertIn("moving4:1", self.now(harness))
-            self.assertNotIn("지정", self.now(harness))
-            self.assertNotIn("GPU 사용 전", self.now(harness))
+            self.assertNotIn("selected", self.now(harness))
+            self.assertNotIn('GPU not in use', self.now(harness))
         process["proc_start"] = "reused"
-        self.assertIn("지정", self.now("opencode"))
+        self.assertIn("selected", self.now("opencode"))
 
     def test_uuid_selection_and_no_sample_do_not_guess(self):
         self.child.local_placement["requested_devices"] = ["GPU-12345678"]
-        self.assertIn("moving4:1 지정", self.now("codex"))
+        self.assertIn('moving4:1 selected', self.now("codex"))
         self.child.local_placement = None
-        self.assertIn("호스트/GPU 미확인", self.now("codex"))
+        self.assertIn('host/GPU unknown', self.now("codex"))
 
     def test_failed_probe_or_partial_tree_keeps_selection_without_claiming_no_use(self):
         host = self.snapshot["hosts"][0]
         for field in ("detail", "process_detail", "gpu_error", "process_error"):
             with self.subTest(field=field):
                 host[field] = "unavailable"
-                self.assertIn("moving4:1 지정 · GPU 사용 미관측", self.now("opencode"))
+                self.assertIn('moving4:1 selected · GPU use unknown', self.now("opencode"))
                 host.pop(field)
         self.child.local_placement["complete"] = False
-        self.assertIn("GPU 사용 미관측", self.now("opencode"))
+        self.assertIn('GPU use unknown', self.now("opencode"))
 
     def test_exact_new_group_child_is_registered_in_json_only_on_this_host(self):
         process = self.snapshot["hosts"][0]["gpus"][0]["processes"][0]
@@ -174,7 +174,7 @@ class PlacementNowTest(unittest.TestCase):
         for start in (None, "reused"):
             process["proc_start"] = start
             for harness in ("claude", "codex", "opencode"):
-                self.assertIn("moving4:1 지정 · GPU 사용 미관측", self.now(harness))
+                self.assertIn('moving4:1 selected · GPU use unknown', self.now(harness))
             self.assertEqual(render._resource_gpu_resources(self.child, self.snapshot), [])
 
 

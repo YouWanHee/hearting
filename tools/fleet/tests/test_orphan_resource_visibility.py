@@ -106,7 +106,7 @@ class OrphanResourceVisibilityTest(unittest.TestCase):
                                 if "full run" in row and "● GPU" not in row]
                     self.assertEqual(len(now_rows), 1)
                     self.assertIn("gpu-host:0", now_rows[0])
-                    self.assertIn("로그 없음", now_rows[0])
+                    self.assertIn('no log', now_rows[0])
                     self.assertEqual(owner.resource_children, [self.child])
 
     def test_probe_absence_or_expiry_preserves_resource_liveness_and_elapsed(self):

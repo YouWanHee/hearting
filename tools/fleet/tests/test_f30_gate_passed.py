@@ -538,7 +538,7 @@ class GateDetailRowTest(GateMarkBase):
         views = route.build_views([], {}, {self.route_id: self.record}, 1_000_000.0, gate_marks)
         out, _meta = render._route_card(views[0], {}, 120, 1_000_000.0)
         rows = [segs for segs in out
-                if segs and isinstance(segs[0][0], str) and "완료 확인: " in segs[0][0]]
+                if segs and isinstance(segs[0][0], str) and "gates: " in segs[0][0]]
         return rows
 
     def test_gates_row_hidden_without_show_all(self):
@@ -555,7 +555,7 @@ class GateDetailRowTest(GateMarkBase):
             self.assertEqual(len(rows), 1)
             segs = rows[0]
             text = "".join(t for t, _k in segs)
-            self.assertEqual(text, "      완료 확인: code-plan ⊸, code-execute, code-test, "
+            self.assertEqual(text, "      gates: code-plan ⊸, code-execute, code-test, "
                                   "code-report ⊸")
             self.assertEqual([k for t, k in segs if t == render._GATE_MARK],
                              ["gate_t", "gate_t"])
@@ -567,7 +567,7 @@ class GateDetailRowTest(GateMarkBase):
         try:
             segs = self._card({})[0]
             self.assertEqual("".join(t for t, _k in segs),
-                             "      완료 확인: code-plan, code-execute, code-test, code-report")
+                             "      gates: code-plan, code-execute, code-test, code-report")
         finally:
             render.set_show_all(False)
 
@@ -723,7 +723,7 @@ class ReconciliationRenderTest(unittest.TestCase):
 
     def test_process_node_uses_yellow_gate_pending_label(self):
         text, key, mark = render._route_node_text(self._node())
-        self.assertEqual((text, key, mark), ("frame …종료 확인 3m", "lvl_y", ""))
+        self.assertEqual((text, key, mark), ("frame …exit wait 3m", "lvl_y", ""))
 
     def test_breadcrumb_uses_yellow_ellipsis(self):
         breadcrumb = render._route_stage_segs([("frame", "reconciling"),

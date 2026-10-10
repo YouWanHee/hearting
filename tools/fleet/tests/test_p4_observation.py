@@ -91,7 +91,7 @@ class ObservationTest(unittest.TestCase):
             rows = render._build_lines([], [], "both", False, 2,
                            term_width=80, resource_diagnostics=[missing, failure])
             text = flatten(rows)
-            for expected in ("jobs.log", "2", "과거 참조", "비차단", "resource 관측 미확인", "PermissionError"):
+            for expected in ("jobs.log", "2", "missing reference", "nonblocking", 'resource unknown', "PermissionError"):
                 self.assertIn(expected, text)
             self.assertNotIn("malformed jobs.log", text)
             self.assertTrue(all(render._dw("".join(t for t, _ in r)) <= 80
@@ -117,18 +117,18 @@ class ObservationTest(unittest.TestCase):
         rows = render._mem_event_rows({"recent": events}, term_width=80)
         text = flatten(rows)
         self.assertEqual(len(rows), 2)
-        for value in ("/tmp/tmp-first", "/tmp/tmp-second", "mem 저장", "범위를 정해 주세요"):
+        for value in ("/tmp/tmp-first", "/tmp/tmp-second", 'mem saved', "범위를 정해 주세요"):
             self.assertIn(value, text)
         self.assertNotIn("tidy-applier", text)
         self.assertTrue(all(render._dw(flatten([row])) <= 80 for row in rows))
-        self.assertIn("출처 미확인", flatten(render._mem_event_rows({"recent": [{"snippet": "내용"}]})))
+        self.assertIn('source unknown', flatten(render._mem_event_rows({"recent": [{"snippet": "내용"}]})))
 
     def test_legacy_delete_with_no_recorded_content_is_explicit(self):
         event = {"id": "r1", "cwd": "/work/project", "snippet": "",
                  "action": "delete", "actor": "manual", "tier": "working", "type": "decision"}
         text = flatten(render._mem_event_rows({"recent": [event]}, term_width=80))
-        self.assertIn("mem 정리", text)
-        self.assertIn("내용 미확인", text)
+        self.assertIn('mem pruned', text)
+        self.assertIn('content unknown', text)
         self.assertIn("/work/project", text)
         self.assertNotIn("manual", text)
 
@@ -137,7 +137,7 @@ class ObservationTest(unittest.TestCase):
                  "action": "decision-record"}
         rows = render._mem_event_rows({"recent": [event, {**event, "id": "r2"}]})
         self.assertEqual(len(rows), 1)
-        self.assertIn("2회", flatten(rows))
+        self.assertIn("×2", flatten(rows))
         self.assertEqual(render._mem_event_rows({"recent": [event]}, excluded_ids={"r1"}), [])
 
     def test_section_filter_never_hides_a_memory_change_or_displays_it_twice(self):
