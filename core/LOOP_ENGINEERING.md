@@ -185,6 +185,12 @@ Unknown observations stay unknown, and slow details must not stop basic refresh.
 Project activity includes running resources nested under an idle owner. A file
 update is labelled as a file update, never as completion. Recent results show
 the recorded task, result and event time; an unproven gate is not a failed task.
+Work names share one display rule across recent results, resource rows and GPU
+links: prefer the existing cycle easy title or one-line summary, then its
+recorded title and campaign title. Without a usable title, show a short readable
+name with locator dates and execution suffixes removed. Read titles in the
+existing detail pass; never wait for them before publishing basic observations.
+The name does not repeat the same command or execution identity on its line.
 Current execution or wait observations precede generated text. Older titles
 are labelled as previous subjects, and summaries as previous text with their
 own age, including sentences that say work is running or complete.

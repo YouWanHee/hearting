@@ -127,6 +127,8 @@ def _enrich(snapshot):
         set(value.node_evidence) | {j.route_id for j in jobs if j.route_id}, jobs=jobs)
     projection.attach_projections(sessions, jobs, node_evidence=value.node_evidence,
                                   degradations=degradations, resources=value.resources, now=time.time())
+    from .work_titles import annotate
+    annotate(sessions, jobs, value.resources)
     # Optional header details retain their last observed value across cheap
     # ticks. Initial absence stays unknown; these observers never classify work.
     value.degradations = degradations
@@ -281,11 +283,24 @@ def merge(basic, detail):
                         current.resource_wait = previous.resource_wait
             target.append(current)
     _rebind_projections(sessions + jobs)
+    from .work_titles import resource_identity
+    previous_resources = {resource_identity(child): child for child in value.resources}
+    resources = []
+    for child in basic.resources:
+        current = copy.copy(child)
+        previous = previous_resources.get(resource_identity(child))
+        if previous is not None:
+            current.display_title = previous.display_title
+        resources.append(current)
+    titled = {resource_identity(child): child for child in resources}
+    for job in jobs:
+        job.resource_children = [titled.get(resource_identity(child), child)
+                                 for child in job.resource_children]
     evidence = {}
     if current_state == detail.source_key:
         evidence = {"degradations": value.degradations,
                     "pending_delivery": value.pending_delivery,
                     "route_entities": value.route_entities}
-    return replace(basic, sessions=sessions, jobs=jobs,
+    return replace(basic, sessions=sessions, jobs=jobs, resources=resources,
                    memory=value.memory, governor=value.governor,
                    hearting=value.hearting or basic.hearting, **evidence)

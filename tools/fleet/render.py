@@ -41,6 +41,7 @@ from .display import label as _user_label, project as _user_project, gpu_owner a
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo, titles
+from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
 from .collectors import compute_hosts as _compute_hosts
 from .refresh import LiveSnapshot, RefreshPump, background_read, as_snapshot
 from .session_handle import sanitize_title as _sanitize_session_title
@@ -3614,7 +3615,7 @@ def _group_last_result(sessions, jobs, resources):
     for child in children:
         if (child.liveness in ("exited", "dead") and type(child.exit_code) is int
                 and isinstance(child.ended_at, (int, float)) and not isinstance(child.ended_at, bool)):
-            candidates.append({"name": "자원 " + (child.node or child.run_id),
+            candidates.append({"name": "자원 " + _resource_name(child),
                                "result": "failure" if child.exit_code else "success",
                                "at": child.ended_at, "source": "resource-exit"})
     return max((value for value in candidates if isinstance(value, dict)
@@ -4516,7 +4517,7 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
         glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
         if child.liveness == "working":
             glyph, key = "●", "g_work" if _BLINK_ON else "g_work_off"
-        node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+        node = _gpu_safe_text(_resource_name(child))
         tail = ("  " + fmt_min(child.elapsed_min) if child.liveness == "working"
                 else "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min)))
         # Name and elapsed survive first; placement then counters yield as needed.
@@ -4543,11 +4544,28 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
 def _resource_gpu_suffix(children, room=None):
     """Resource identity once at the GPU line end; working is already implicit."""
     unique = {child.run_id: child for child in children}
+    title_groups = {}
+    for child in unique.values():
+        key = resource_title_key(child)
+        if key:
+            title_groups[key] = title_groups.get(key, 0) + 1
+    shown_titles = set()
     parts = []
     for child in unique.values():
-        node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+        node = _gpu_safe_text(_resource_name(child))
+        key = resource_title_key(child)
+        if title_groups.get(key, 0) > 1:
+            # A shared cycle title names the work once; each execution still
+            # keeps its own short node, state, elapsed time and counters.
+            short_node = _gpu_safe_text(_readable_name(child.route_node or child.node))
+            short_node = "" if short_node == node else short_node
+            if key not in shown_titles:
+                shown_titles.add(key)
+                node += " · " + short_node if short_node else ""
+            else:
+                node = short_node
         state = "" if child.liveness == "working" else " " + _gpu_safe_text(child.liveness)
-        parts.append([child, node + state + " " + fmt_min(child.elapsed_min)])
+        parts.append([child, (node + state + " " + fmt_min(child.elapsed_min)).strip()])
     base = "".join(" · " + text for _child, text in parts)
     extra = max(0, room - _dw(base)) if room is not None else None
     out = ""
@@ -4881,11 +4899,11 @@ def _resource_now_text(entity, room=None):
                     and type(getattr(child, "exit_code", None)) is int]
         if terminal:
             child = max(terminal, key=lambda c: getattr(c, "ended_at", None) or 0)
-            node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+            node = _gpu_safe_text(_resource_name(child))
             command = _resource_command_label(getattr(child, "command", None))
             state = "실패" if child.exit_code else "종료"
-            text = "마지막 %s%s · %s(exit %d) · %s" % (
-                node, " " + command if command else "", state, child.exit_code,
+            text = "마지막 %s · %s(exit %d) · %s" % (
+                subject_command(node, command), state, child.exit_code,
                 _resource_log_age(child))
             return _clip_w(text, room) if room is not None else text
     if not resource_context:
@@ -4895,7 +4913,7 @@ def _resource_now_text(entity, room=None):
     snapshot, _age = _fresh_compute_hosts()
     child = children[0]
     where, resources = _resource_location(child, snapshot)
-    node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+    node = _gpu_safe_text(_resource_name(child))
     command = _resource_command_label(getattr(child, "command", None))
     if resources:
         process = next((p for r in resources for p in r.get("processes", ())), None)
@@ -4907,7 +4925,7 @@ def _resource_now_text(entity, room=None):
     facts = " · ".join(part for part in (where, fmt_min(child.elapsed_min), progress, log) if part)
     if len(children) > 1:
         facts += " · +%d" % (len(children) - 1)
-    label = node + (" " + command if command else "")
+    label = subject_command(node, command)
     if room is not None:
         budget = room - _dw(" · " + facts)
         if budget > 0:
@@ -5510,6 +5528,9 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
                 if _gpu_commands_folded(resource["host"], resource["index"]):
                     continue
                 name = _gpu_display_command(command)
+            if any(_resource_command_label(name).casefold() in _resource_name(child).casefold()
+                   for child in resource_children):
+                continue
             if name not in names:
                 names.append(name)
         labels[id(resource)] = ", ".join(names)
@@ -5984,7 +6005,7 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
                 label = owner.get("label") or "%s:%s" % (owner.get("harness", "?"), str(owner.get("id", "unknown"))[:8])
                 started = lease.get("started_at")
                 when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
-                task = _gpu_safe_text(lease.get("task") or lease.get("run_id") or "?")
+                task = _gpu_safe_text(_readable_name(lease.get("task") or lease.get("run_id") or "?"))
                 reserved = [(indent + "  reserved ", "lvl_y"), (_gpu_safe_text(label), "tag"),
                             (" · " + when + " · " + task, "dim")]
                 rows.append(_clip_segs(reserved, width)[0])
