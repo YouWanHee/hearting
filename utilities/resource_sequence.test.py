@@ -239,6 +239,37 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(len(payloads), 1)
         self.assertTrue(receipt['payload_spawned'])
 
+    def test_native_owner_reads_exact_never_started_failure_without_pid(self):
+        import owner_route_binding as OWNER
+        route, path, jobs, registry, output, ledger = self.unstarted_fixture(launch_state='not-started')
+        data = json.loads(registry.read_text())
+        row = data['runs']['fixture-run']
+        ident = SUP.RR.proc_identity(os.getpid())
+        row['owner_wait'].update(route_id=route['route_id'], route_hash=route['route_hash'],
+            jobs=str(jobs), owner_pid=ident['pid'], owner_start=ident['starttime'])
+        registry.write_text(json.dumps(data))
+        arm_path = ledger.root / 'armed/full-run.json'
+        armed = json.loads(arm_path.read_text())
+        armed.update(resource_binding=WAIT.resource_body_digest(row), successor_external=True,
+                     successor_command=None)
+        arm_path.write_text(json.dumps(armed))
+        args = SimpleNamespace(parent_attempt_id='att-parent', route_id=route['route_id'],
+            route_hash=route['route_hash'], route_file=str(path), jobs=str(jobs))
+        binding = SimpleNamespace(route_file=str(path), route_id=route['route_id'], route_hash=route['route_hash'])
+        parent = SimpleNamespace(status='open', raw='time\topen\trepo\tworktree\tslug\tmeta',
+            metadata={'pid':str(ident['pid']), 'pid_start':ident['starttime']})
+        with mock.patch.object(WAIT, 'supervisor', return_value=SUP), \
+             mock.patch.object(OWNER, 'resolve_owner_route_lifecycle', return_value=(binding, None)), \
+             mock.patch.object(OWNER, '_owner_row_proof'), \
+             mock.patch.object(WAIT.JOIN, 'exact_attempt_row', return_value=parent):
+            found = WAIT.context(args, SimpleNamespace(thread_id='same-native'))
+            self.assertEqual(found[3][0][1]['run_id'], 'fixture-run')
+            self.assertFalse(found[3][0][1].get('pid'))
+            row['failure_class'] = 'no-exit-sentinel'
+            registry.write_text(json.dumps(data))
+            with self.assertRaisesRegex(WAIT.JOIN.JoinContractError, 'resource-owner-binding-invalid'):
+                WAIT.context(args, SimpleNamespace(thread_id='same-native'))
+
     def test_gpu_admission_failure_precedes_arm_and_can_retry(self):
         route, path, jobs, registry, output, ledger = self.fixture()
         body = self.next_body(registry, 'fixture-run__a1', output)
