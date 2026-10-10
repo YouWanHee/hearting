@@ -37,6 +37,46 @@ class ReadingTest(unittest.TestCase):
         self.assertIn("AMI_8ch_varying_0_3spk_v3", text)
         self.assertNotIn("--config", text)
 
+    def test_r2_gpu_dedup_compares_entire_observed_name(self):
+        name = "Acoustic Model alpha"
+        resource = dict(host="h", index=0, processes=[dict(
+            pid=101, proc_start=11, command="python train.py --name '" + name + "'")])
+        titles = ((name, False), (name.upper(), False),
+                  ("Acoustic Model beta", True), ("Acoustic Model alphabeta", True),
+                  ("Acoustic Model alpha v2", True), ("Unrelated Work", True))
+        for title, keeps_gpu_name in titles:
+            child = model.ResourceJob(run_id="fixture-run", node="train", liveness="working",
+                                      display_title=title, elapsed_min=3)
+            for folded in (False, True):
+                for width in (80, 100, 160, 168):
+                    with self.subTest(title=title, folded=folded, width=width), \
+                         mock.patch.object(render, "_gpu_commands_folded", return_value=folded):
+                        rows = render._gpu_resource_strip([resource], term_width=width,
+                                                          resource_children=[child])
+                        text = "\n".join(render._plain(row) for row in rows)
+                        self.assertIn(title, text)
+                        self.assertEqual("(" + name + ")" in text, keeps_gpu_name, text)
+                        if not keeps_gpu_name:
+                            self.assertEqual(text.casefold().count(name.casefold()), 1)
+                        self.assertTrue(all(render._dw(render._plain(row)) <= width - 1 for row in rows))
+
+    def test_r2_unnamed_command_dedup_uses_complete_script_label(self):
+        resource = dict(host="h", index=0, processes=[dict(
+            pid=101, proc_start=11, command="python train.py")])
+        for title, keeps_command in (("train.py", False), ("train.py v2", True),
+                                      ("train.pyx", True)):
+            child = model.ResourceJob(run_id="fixture-run", node="train", liveness="working",
+                                      display_title=title, elapsed_min=3)
+            for width in (80, 100, 160, 168):
+                with self.subTest(title=title, width=width), \
+                     mock.patch.object(render, "_gpu_commands_folded", return_value=False):
+                    rows = render._gpu_resource_strip([resource], term_width=width,
+                                                      resource_children=[child])
+                    text = "\n".join(render._plain(row) for row in rows)
+                    self.assertIn(title, text)
+                    self.assertEqual("(python train.py)" in text, keeps_command, text)
+                    self.assertTrue(all(render._dw(render._plain(row)) <= width - 1 for row in rows))
+
     def test_r2_gpu_owner_adds_person_not_repeated_execution_id(self):
         from fleet.collectors import compute_hosts
         for kind, identifier in (("run", "moving4-20261008-203517-css-AMI8var-v3"),
