@@ -1,4 +1,4 @@
-"""Passive live detail fills joined to exact basic observations.
+"""Live display detail fills joined to exact basic observations.
 
 The ordinary snapshot pump owns existence/liveness/resources. This module runs
 on one coalesced RefreshPump worker and can neither create rows nor change those
@@ -129,18 +129,22 @@ def _enrich(snapshot):
                                   degradations=degradations, resources=value.resources, now=time.time())
     # Optional header details retain their last observed value across cheap
     # ticks. Initial absence stays unknown; these observers never classify work.
-    dispatch.collect.last_degradations = degradations
+    value.degradations = degradations
     try:
-        dispatch.collect.last_pending_delivery = dispatch._pending_delivery_counts(
+        value.pending_delivery = dispatch._pending_delivery_counts(
             dispatch._candidate_jobs_paths())
     except Exception:
-        dispatch.collect.last_pending_delivery = None
+        value.pending_delivery = None
     try:
         from .collectors import peer_messages
         peer = peer_messages.collect()
         apply_peer_rows(sessions, (peer or {}).get("by_session") or {})
     except Exception:
         pass
+    # Pane metadata only: no runtime identity/lifecycle writes. The input was
+    # published with basic rows; slow panes occupy this existing detail worker.
+    from .herdr_projection import refresh_observed_tag_metadata
+    refresh_observed_tag_metadata(value.tag_metadata)
     return DetailSnapshot(source_key, value)
 
 
@@ -277,6 +281,11 @@ def merge(basic, detail):
                         current.resource_wait = previous.resource_wait
             target.append(current)
     _rebind_projections(sessions + jobs)
+    evidence = {}
+    if current_state == detail.source_key:
+        evidence = {"degradations": value.degradations,
+                    "pending_delivery": value.pending_delivery,
+                    "route_entities": value.route_entities}
     return replace(basic, sessions=sessions, jobs=jobs,
                    memory=value.memory, governor=value.governor,
-                   hearting=value.hearting or basic.hearting)
+                   hearting=value.hearting or basic.hearting, **evidence)

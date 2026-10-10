@@ -5,10 +5,30 @@ liveness, and dispatch modules are imported defensively so a partial checkout / 
 enricher never drops backbone rows (PRD §1: enrichment fills fields; it does not decide existence).
 """
 import importlib
+import copy
+from dataclasses import replace
 import os
 import time as _time
 
 from . import procscan
+from ..refresh import LiveSnapshot
+
+
+_JOB_OBSERVATIONS = {}
+_OBSERVATION_SUCCESSES = {}
+
+
+def _observation_health(key, source, error=None):
+    """The same health vocabulary as RefreshPump, bound to this publication."""
+    now = _time.monotonic()
+    cache_key = (key, source)
+    if error is None:
+        _OBSERVATION_SUCCESSES[cache_key] = now
+        if len(_OBSERVATION_SUCCESSES) > 32:
+            _OBSERVATION_SUCCESSES.pop(next(iter(_OBSERVATION_SUCCESSES)))
+    success = _OBSERVATION_SUCCESSES.get(cache_key)
+    return {"state": "failed" if error else "idle", "last_error": error,
+            "last_success_at": success, "age": None if success is None else now - success}
 
 
 def _same_path(a, b):
@@ -311,6 +331,9 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
                     NOW and resource inputs stay attached; display details fill
                     independently. ``--once``/JSON keep the full pass.
     """
+    job_key = (str(jobs_path or os.environ.get("AGENT_DISPATCH_JOBS") or ""),
+               tuple(sorted(harness_filter or ())))
+    observations = {}
     sessions = procscan.scan(harness_filter=harness_filter)
 
     # --- per-harness passive enrichment (each enricher self-resolves its home from env) ---
@@ -397,9 +420,12 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     # match; additive enrichment that never touches liveness or row existence.
     try:
         from . import herdr as _herdr
-        _herdr.enrich(sessions)
-    except Exception:
-        pass
+        observed = _herdr.enrich(sessions)
+        if isinstance(observed, dict):
+            observations["herdr"] = _observation_health(
+                job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
+    except Exception as exc:
+        observations["herdr"] = _observation_health(job_key, "herdr", "%s: %s" % (type(exc).__name__, exc))
     # Resume/fork aliases must be resolved BEFORE the two ledger joins below, which both
     # key on `(harness, session_id)`: a resumed session's older receipts and any steward
     # marker written before the resume still name the id it used to have.
@@ -409,10 +435,11 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
 
     # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
+    tag_metadata = []
     try:
-        from ..session_tags import refresh
+        from ..session_tags import assign
         from ..session_handle import resolve_tag
-        refresh(sessions)
+        tag_metadata = assign(sessions)
         for s in sessions:
             if s.harness in {"codex", "opencode"} and s.session_id:
                 s.session_tag = resolve_tag(s.harness, s.session_id)
@@ -501,13 +528,32 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
 
     # --- dispatch section ---
     jobs = []
+    previous = _JOB_OBSERVATIONS.get(job_key)
+    job_error = None
+    node_evidence, degradations, pending_delivery, malformed = {}, {}, None, 0
     try:
         from . import dispatch
         jobs = dispatch.collect(jobs_path=jobs_path, harness_filter=harness_filter,
                                 session_rows=sessions,
                                 **({"fast_first": True} if fast_first else {}))
-    except Exception:
-        jobs = []
+        # Capture the collector's output at its boundary, never in render or
+        # from the independent detail worker. Older readers keep the attributes.
+        node_evidence = copy.deepcopy(getattr(dispatch.collect, "last_route_nodes", {}) or {})
+        degradations = copy.deepcopy(getattr(dispatch.collect, "last_degradations", {}) or {})
+        pending_delivery = copy.deepcopy(getattr(dispatch.collect, "last_pending_delivery", None))
+        malformed = getattr(dispatch.collect, "last_malformed", 0)
+    except Exception as exc:
+        job_error = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+        if previous is not None:
+            jobs = copy.deepcopy(previous.jobs)
+            node_evidence = copy.deepcopy(previous.node_evidence)
+            degradations = copy.deepcopy(previous.degradations)
+            pending_delivery, malformed = previous.pending_delivery, previous.malformed
+            for job in jobs:
+                job._last_observed_liveness = job.liveness
+                job.liveness = "unknown"
+                job._observation_stale = True
+    dispatch_rows = list(jobs)
 
     # F-50 (v33): the openai-codex plugin queue is a SEPARATE runtime surface (F-35e), so its
     # rows are appended, never merged or deduped against jobs.log attempts — no plugin job is
@@ -555,7 +601,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     try:
         from .. import route_chain as _route_chain
         _route_chain.enrich(sessions, jobs=jobs,
-                             node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
+                             node_evidence=node_evidence,
                              now=_time.time(), **({"fast_first": True} if fast_first else {}))
     except Exception:
         pass
@@ -581,8 +627,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         # for a node the registry already resolved.
         attach_projections(sessions, jobs, artifact_root=os.environ.get("AGENT_ARTIFACT_ROOT"),
                            now=_time.time(),
-                           node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
-                           degradations=getattr(dispatch.collect, "last_degradations", None),
+                           node_evidence=node_evidence,
+                           degradations=degradations,
                            resources=resource_jobs, **({"fast_first": True} if fast_first else {}))
     except Exception:
         # Projection failure is fail-closed at the row boundary, never a reason to drop data.
@@ -612,7 +658,24 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
-    return sessions, jobs
+    observations["jobs"] = _observation_health(job_key, "jobs", job_error)
+    snapshot = LiveSnapshot(
+        sessions=sessions, jobs=jobs, resources=resource_jobs,
+        usage_snapshots=usage_snapshots, node_evidence=node_evidence,
+        degradations=degradations, pending_delivery=pending_delivery,
+        malformed=malformed + collect_all.last_resource_malformed,
+        observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
+    )
+    if not sessions and not jobs and node_evidence:
+        from ..projection import terminal_route_entities
+        snapshot.route_entities = terminal_route_entities(node_evidence, degradations)
+    if job_error is None:
+        # Cache projected rows, not a reference later mutated by another reader.
+        _JOB_OBSERVATIONS[job_key] = copy.deepcopy(replace(
+            snapshot, sessions=[], jobs=dispatch_rows, resources=[], usage_snapshots={}, tag_metadata=[]))
+        if len(_JOB_OBSERVATIONS) > 16:
+            _JOB_OBSERVATIONS.pop(next(iter(_JOB_OBSERVATIONS)))
+    return snapshot
 
 
 collect_all.last_resource_jobs = []

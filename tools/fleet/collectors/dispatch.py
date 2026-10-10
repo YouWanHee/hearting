@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import sqlite3
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -1047,6 +1048,14 @@ def _opencode_config_home():
     return os.path.expanduser("~/.config/opencode")
 
 
+def _registry_file(path):
+    """Only absence is an empty source; inaccessible registry paths fail observation."""
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except FileNotFoundError:
+        return False
+
+
 def _installed_registry_paths():
     """Installed per-runtime-home dispatch registries that exist as files.
 
@@ -1065,7 +1074,7 @@ def _installed_registry_paths():
         if not home:
             continue
         path = os.path.join(home, ".harness", "dispatch", "jobs.log")
-        if os.path.isfile(path):
+        if _registry_file(path):
             out.append(path)
     return out
 
@@ -1101,7 +1110,7 @@ def _candidate_jobs_paths(override=None):
     default_home = Path(default).expanduser().parent.parent
     paths = [] if _is_versioned_source_home(default_home) else [default]
     legacy = os.path.expanduser("~/.claude/.dispatch/jobs.log")
-    if legacy and not any(_same_path(legacy, path) for path in paths) and os.path.exists(legacy):
+    if legacy and not any(_same_path(legacy, path) for path in paths) and _registry_file(legacy):
         paths.append(legacy)
     paths.extend(_installed_registry_paths())
     if not paths:
@@ -2817,7 +2826,7 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
         if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
             continue
         real = os.path.realpath(raw_path)
-        if real in canonical or not os.path.isfile(raw_path):
+        if real in canonical or not _registry_file(raw_path):
             continue
         latest = {}
         try:
@@ -2830,7 +2839,7 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
                     attempt = meta.get("attempt_id")
                     if attempt in attempts:
                         latest[attempt] = meta
-        except OSError:
+        except FileNotFoundError:
             continue
         matched = {attempt for attempt, meta in latest.items()
                    if (meta.get("parent_sid") or meta.get("parent_session_id")) in parent_ids}
@@ -2864,7 +2873,7 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             rows = f.read().splitlines()
-    except OSError:
+    except FileNotFoundError:
         return jobs, 0
     # Reconcile each job to its LATEST row before deciding live-ness. Identity key = slug,
     # NOT the worktree path: a terminal (done/killed/cancelled) row drops the worktree to '-'
@@ -3120,7 +3129,7 @@ def _jobs_log_fields(paths):
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 rows = f.read().splitlines()
-        except OSError:
+        except FileNotFoundError:
             continue
         path_attempts = {}
         for line in rows:

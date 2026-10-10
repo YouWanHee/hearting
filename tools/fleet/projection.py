@@ -1776,6 +1776,24 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     return sessions, jobs
 
 
+def terminal_route_entities(node_evidence, degradations=None):
+    """Project observed routes without rows before publishing the snapshot."""
+    carriers = []
+    for rid, nodes in (node_evidence or {}).items():
+        evidence = next(iter((nodes or {}).values()), {})
+        route_file = evidence.get("route_file") if isinstance(evidence, dict) else None
+        node = next(iter((nodes or {}).keys()), None)
+        if not route_file or not node:
+            continue
+        carrier = DispatchJob(key="", slug="", route_id=rid, route_file=route_file,
+                              route_hash=evidence.get("route_hash"), route_node=node,
+                              liveness="done")
+        attach_projections([], [carrier], node_evidence=node_evidence,
+                           degradations=degradations, now=time.time())
+        carriers.append(carrier)
+    return carriers
+
+
 attach_work_projections = attach_projections
 
 

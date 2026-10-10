@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from fleet import render  # noqa: E402
 from fleet.model import ContextProjection, DispatchJob, ProgressProjection, Session, WorkProjection  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines
 
 
 def text(lines):
@@ -59,7 +60,7 @@ class OwnerFallbackTest(unittest.TestCase):
 
     def _render(self, sessions, jobs, process=False, term_width=168):
         render.set_process_view(process)
-        return text(render._build_lines(
+        return text(build_observed_lines(
             sessions, jobs, section="both", narrow=False, malformed=0,
             layout="wide", term_width=term_width,
         ))
