@@ -60,7 +60,14 @@ def _newest_transcript_path(home, cwd, sid):
     proj = os.path.join(home, "projects", _enc_cwd(cwd))
     if sid:
         p = os.path.join(proj, sid + ".jsonl")
-        return p if _mtime(p) is not None else None
+        if _mtime(p) is not None:
+            return p
+        # A resumed session can work elsewhere than the process launch directory.
+        # Only its exact, unique transcript may supply the directory/telemetry.
+        if isinstance(sid, str) and os.path.basename(sid) == sid:
+            import glob
+            paths = glob.glob(os.path.join(home, "projects", "*", glob.escape(sid) + ".jsonl"))
+            return paths[0] if len(paths) == 1 else None
     return None
 
 
@@ -562,17 +569,23 @@ def _current_identity(sess, home, record, pane_claim=None):
         pane_sid, pane = pane_claim.get("session_id"), pane_claim.get("pane")
         if pane_sid:
             claims["pane"] = pane_sid
-    successors = (_continued_sessions(home, sess.cwd, claims.values())
-                  if len(set(claims.values())) > 1 else {})
-    if pane_sid and pane:
+    native_current = bool(record_sid and sess.proc_start and claimed_start is not None
+                          and str(claimed_start) == str(sess.proc_start)
+                          and str((record or {}).get("pid")) == str(sess.pid))
+    cwd = (record or {}).get("cwd") if native_current else None
+    cwd = cwd or sess.cwd
+    successors = (_continued_sessions(home, cwd, claims.values())
+                  if not native_current and len(set(claims.values())) > 1 else {})
+    if not native_current and pane_sid and pane:
         from ..process_identity import pane_session_successors
         try:
-            for older, newer in pane_session_successors("claude", pane, sess.cwd,
+            for older, newer in pane_session_successors("claude", pane, cwd,
                                                         claims=set(claims.values())).items():
                 successors.setdefault(older, set()).update(newer)
         except (OSError, ValueError, TypeError):
             pass
-    sid, evidence = resolve_session_claims(claims, successors)
+    sid, evidence = resolve_session_claims(claims, successors,
+                                          current_source="registry" if native_current else None)
     evidence.update(pid=sess.pid, proc_start=sess.proc_start, pane=pane)
     return sid, evidence
 
@@ -655,6 +668,11 @@ def enrich(sess, tick=None):
 
     # 3) Liveness mtime and title. Priority: fresh sidecar, AI title, then slug.
     path = _newest_transcript_path(home, sess.cwd, sid)
+    if sid:
+        from .. import session_cwd
+        native_cwd = (sj or {}).get("cwd") if evidence.get("current_source") == "registry" else None
+        observed_cwd = session_cwd.valid_cwd(native_cwd) or session_cwd.jsonl_cwd(path, "claude", sid)
+        session_cwd.observe(sess, observed_cwd, sid)
     if path:
         sess._transcript_path = path              # ephemeral: live title scheduler, not --json
         sess._refresh_source = {"kind": "transcript", "harness": "claude",
