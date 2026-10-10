@@ -1435,6 +1435,12 @@ its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
 Retirement refuses busy sessions, open forms, drafts, unknown process identity
 or an unconfirmed shell return; it has no retry, forced kill or forced close.
+An accepted retirement keeps the agent PID/start and shell PID/start observed
+when it was requested, including before a pane has a session. Reconnection
+compares that original lifetime before sending input. A proven-dead or reused
+agent PID completes the obligation as `target-already-gone`, without input,
+pane closure or handover to a later process in the same pane. Unreadable birth
+evidence remains unknown; a later observation cannot supply a missing original.
 When the retire succeeds from the pane started beside the predecessor, the
 predecessor's open depth-1 routes pass to the successor, on any harness: it may
 `start` and `correct` them, and their stored completion records reach it
