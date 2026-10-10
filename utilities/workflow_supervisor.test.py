@@ -695,7 +695,13 @@ raise SystemExit(code)
                                      "probe-bridge", sys.executable, str(script)],
                                     stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, env=env)
             try:
-                row.update(runner.proc_identity(proc.pid), status="running")
+                identity = runner.proc_identity(proc.pid)
+                deadline = time.monotonic() + 5
+                while identity is None:
+                    self.assertLess(time.monotonic(), deadline, "wrapper identity unavailable")
+                    time.sleep(0.005)
+                    identity = runner.proc_identity(proc.pid)
+                row.update(identity, status="running")
                 registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": row}}))
                 proc.communicate(b"start\n", timeout=10)
             finally:
