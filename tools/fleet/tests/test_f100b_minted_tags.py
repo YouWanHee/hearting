@@ -97,12 +97,11 @@ class CollectorWiringCensusTest(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             return fh.read()
 
-    def test_codex_and_opencode_collectors_assign_a_minted_tag(self):
+    def test_codex_and_opencode_collectors_use_the_shared_resolver(self):
         for name in ("codex.py", "opencode.py"):
             with self.subTest(collector=name):
                 source = self._source(name)
-                self.assertIn("minted_tag", source)
-                self.assertRegex(source, r"sess\.session_tag\s*=\s*minted_tag\(")
+                self.assertRegex(source, r"sess\.session_tag\s*=\s*resolve_tag\(")
 
     def test_claude_collector_keeps_reading_its_derived_name(self):
         """F-100a is untouched: Claude never mints, it reads the runtime's own suffix.

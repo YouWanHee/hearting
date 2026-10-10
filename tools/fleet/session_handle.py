@@ -124,8 +124,9 @@ def minted_tag(session_id: object) -> Optional[str]:
 
     Claude carries its tag inside the derived session name, so ``derived_tag()`` only has
     to read it off. Codex and OpenCode expose no such name, so Fleet mints the tag itself
-    from the canonical session id. A hash keeps it deterministic — the same session shows
-    the same badge across ticks, restarts, and a lost tag store — so nothing is persisted.
+    from the canonical session id. This pure hash is the initial candidate and the
+    fallback when the shared live assignment store is unavailable. Display consumers
+    use ``resolve_tag`` to honor collision-free live assignments.
 
     NOT the id's own leading hex: a Codex thread id is a UUIDv7 and every one of them
     starts ``01``. Pure. Returns ``None`` for a missing or non-string id. Collisions are
@@ -248,8 +249,8 @@ def resolve_tag(harness: object, session_id: object, *, home: object = None) -> 
 
     Fleet's collectors, `peer-message.py`'s trailer alias, and the Herdr pane title all
     have to answer the same question — "which badge does this session wear?" — and the
-    rule differs per harness (Claude reads it off its own derived name, the other two
-    mint it from the id). Keeping three copies of that split is how the badge and the
+    rule differs per harness (Claude reads its derived name, the other two read their
+    shared live assignment, falling back to the hash). Keeping copies is how the badge and the
     trailer drift apart, so this is the single definition; callers add their own
     brackets. I/O-bearing and fail-soft: any unreadable record yields the next source,
     and an unresolvable session yields ``None`` rather than a guess.
@@ -259,7 +260,11 @@ def resolve_tag(harness: object, session_id: object, *, home: object = None) -> 
     if not harness_key or not sid:
         return None
     if harness_key in ("codex", "opencode"):
-        return minted_tag(sid)
+        try:
+            from .session_tags import assigned_tag
+            return assigned_tag(harness_key, sid) or minted_tag(sid)
+        except ImportError:
+            return minted_tag(sid)
     if harness_key != "claude":
         return None
     # Claude: the derived `<basename>-<xx>` name is the only carrier, and only while the
