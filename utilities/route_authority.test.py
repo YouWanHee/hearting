@@ -408,6 +408,50 @@ class Case4RetryLinkTest(unittest.TestCase):
         death = {**latest, "note": "dead-route-completion-rejected", "failure_class": "contract"}
         self.assertEqual(RA.retry_predecessor([death]), "att-0c43")
 
+    def test_new_settled_request_does_not_inherit_a_spent_transport_retry(self):
+        import dispatch_replacement as replacement
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            args = SimpleNamespace(attempt_id="att-gap-two", jobs_path=jobs,
+                                   worktree=td, replacement_input_argv=["--slug", "gap-two"])
+            latest = {"_status": "done", "attempt_id": args.attempt_id,
+                      "note": "dead-parent-terminated", "failure_class": "runtime",
+                      "automatic_retry_of": "att-gap-one", "launch_outcome": "never-launched"}
+            latest.update(DC.parse_registry_metadata(replacement.seal_launch_input(
+                args, "codex", "Close migration fixtures and import integration.")))
+            before = dict(latest)
+            new = "Close historical/current conflict and actual DB parity."
+            self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), "")
+            for task in (None, "", "Close migration fixtures and import integration.",
+                         "  Close migration fixtures\n and import integration.  "):
+                with self.subTest(task=task):
+                    self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=task), args.attempt_id)
+            self.assertTrue(replacement._budget_exhausted(jobs, latest))
+            self.assertEqual(latest, before)
+            candidate = {**latest, "attempt_id": "att-gap-three"}
+            candidate.pop("automatic_retry_of")
+            self.assertIsNone(replacement.admission(jobs, [], candidate))
+            # Same-task transport continuation still sees the spent allowance.
+            with self.assertRaises(DC.DispatchContractError) as spent:
+                replacement.admission(jobs, ["now\tdone\t/repo\t/wt\tgap-two\t" +
+                    ",".join(f"{k}={v}" for k, v in latest.items() if not k.startswith("_"))],
+                    {**candidate, "automatic_retry_of": args.attempt_id})
+            self.assertEqual(spent.exception.reason, "automatic-replacement-exhausted")
+            for state in ("live", "unverifiable"):
+                with mock.patch.object(DC, "attempt_process_quiescence",
+                                       return_value=SimpleNamespace(state=state)):
+                    self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), args.attempt_id)
+            conflicted = {**latest, "terminal_conflict": "pending"}
+            with mock.patch.object(DC, "terminal_conflict_pending", return_value=True):
+                self.assertEqual(RA.retry_predecessor([conflicted], jobs=jobs, task=new), args.attempt_id)
+            replacement._directory(jobs).joinpath("inputs", args.attempt_id + ".json").write_text("{}")
+            self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), args.attempt_id)
+
+    def test_changed_task_cannot_skip_an_open_unlaunched_transport_successor(self):
+        latest = {"_status": "open", "launch_claimed": "0", "attempt_id": "att-gap-two",
+                  "automatic_retry_of": "att-gap-one"}
+        self.assertEqual(RA.retry_predecessor([latest], jobs="unused", task="new request"), "att-gap-one")
+
     def test_the_attempt_policy_retries_only_transport_failures(self):
         from dispatch_attempt_policy import decide_attempt
         def retry(note, failure_class):

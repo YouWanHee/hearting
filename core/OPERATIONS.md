@@ -509,6 +509,15 @@ the worker's recovery context, along with later-round guidance, without changing
 that assignment or its digest.
 The existing sealed launch input also retains this recovery guidance so an
 automatic replacement replays the same instructions and semantic round.
+An owner continuing an uncapped stage with a different nonempty request after
+the prior execution has settled opens new work under the same stage and gate;
+it does not inherit a transport retry link. Compare the existing sealed request,
+not the slug or request-file name. Identical requests retain the automatic
+replacement limit; unreadable inputs, unresolved cleanup and terminal conflicts
+retain their existing handling. Review-round and owner continuation budgets do
+not reset. Parent monitoring rechecks the exact admitted registry paths and
+process or supervisor lease, without repeating Git repository discovery: a Git
+timeout is not evidence that the parent ended.
 The replacement manifest binds the current owner attempt; successful peers keep
 their original owner and completion evidence. Launch refusals retain their
 field-level detail in both the batch receipt and its diagnostic ledger.
