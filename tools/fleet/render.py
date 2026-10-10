@@ -6321,7 +6321,7 @@ def _route_card(view, session_by_identity, term_width, now, gpu_resources=None, 
     parents = [s for s in session_by_identity.values() if work is not None
                and (getattr(work, "_parent_edge_sid", None) or getattr(work, "parent_sid", None))
                in [s.session_id, *(getattr(s, "session_aliases", None) or [])]]
-    parent = parents[0] if len(parents) == 1 else None
+    parent = parents[0] if len(parents) == 1 else _session_for_job(session_by_identity, work)
     fleet = getattr(parent, "session_tag", None)
     identity = _user_project(cwd) + (" [%s]" % fleet if fleet else "")
     # The internal route ID remains in JSON; the fold header names the actual
@@ -6406,7 +6406,7 @@ def _degrade_candidates(jobs, covered_slugs=()):
             continue
         if max(1, int(getattr(j, "depth", 1) or 1)) != 1:
             continue
-        if j.key not in _PIPE_STAGES:
+        if j.key not in _PIPE_STAGES and not (j.registered_worker and j.worker_type == "support"):
             continue
         if j.slug in covered_slugs:
             continue
@@ -6421,7 +6421,7 @@ def _degrade_candidates(jobs, covered_slugs=()):
 def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
     """§5.3's degrade card — `source: heuristic`, existing `_PIPE_STAGES` breadcrumb, no DAG
     (there is no record to derive one from). No job-row entry (the card key IS the job)."""
-    cap = job.key or "?"
+    cap = _user_label(job.key) or "?"
     tag_bits = [cap]
     capability_mode = _display_capability_mode(job)
     if capability_mode:
@@ -6437,7 +6437,10 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
         fixed_w = _dw("  " + arrow + " ") + _dw("[%s] " % tag) + _dw(" — no route record")
         slug = _clip_w(slug, max(4, term_width - fixed_w))
     pending = getattr(job, "_details_pending", False)
-    label = " — route 확인 중" if pending else " — no route record"
+    label = " — 작업 연결 확인 중" if pending else " — 작업 연결 미확인"
+    if job.registered_worker and job.worker_type == "support":
+        tag = _user_project(job.caller_cwd or job.cwd)
+        label = " — 프로젝트 지원 작업"
     l1 = [("  " + arrow + " ", "dim"), ("[%s] " % tag, "name_dim"),
           (slug, "dim"), (label, "dim")]
     out = [l1]
@@ -7913,7 +7916,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         for lj in _sort_group_jobs(loops_jobs):
             if getattr(lj, "worker_type", None) == "support":
                 lines.append(None)
-                lines.append([("  프로젝트 지원 작업", "dim")])
+                caller = (" · 호출 " + lj.caller_pane) if lj.caller_pane else ""
+                lines.append([("  프로젝트 지원 작업" + caller, "dim")])
             _emit_dispatch_tree(lj, orphan=False)
         # F-80 L2c: a grace-held edge stays a standalone tree row in the SAME group, no
         # `(orphan)` marker, no divider — nesting under the parent is unavailable because

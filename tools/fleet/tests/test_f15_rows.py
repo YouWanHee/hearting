@@ -249,7 +249,7 @@ class FoldingTest(unittest.TestCase):
         running_keys = [key for line in lines if line for t, key in line if t == "running"]
         preparing_keys = [key for line in lines if line for t, key in line if t == "preparing…"]
         self.assertIn("exec agent-first-home-c", text)
-        self.assertIn("code-execute(strong)", text)
+        self.assertIn("구현", text)
         self.assertNotIn("dev/refactor·strong·development", text)
         self.assertTrue(any(key in ("stg1_on", "stg1_off") for key in running_keys))
         self.assertTrue(any(key in ("stg0_on", "stg0_off") for key in preparing_keys))
@@ -418,7 +418,9 @@ class OptsDialHierarchyTest(unittest.TestCase):
 
     @staticmethod
     def _dial(j):
-        segs, w = render._opts_segs(j)
+        # Internal contracts remain available in the explicit detail surface.
+        with mock.patch.object(render, "_SHOW_ALL", True):
+            segs, w = render._opts_segs(j)
         text = "".join(t for t, _k in segs)
         assert w == len(text), "declared width must match rendered text"
         return text

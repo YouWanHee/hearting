@@ -15,6 +15,13 @@ import session_tidy_runner as runner
 
 class ReadingTest(unittest.TestCase):
     def setUp(self):
+        from fleet.collectors import dispatch
+        patch = mock.patch.object(dispatch.collect, "last_route_nodes", {})
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(render, "_ROUTE_FOLD", {})
+        patch.start()
+        self.addCleanup(patch.stop)
         self.addCleanup(render.set_show_all, False)
         self.addCleanup(render.set_process_view, False)
         self.addCleanup(render.set_compute_hosts, None)
@@ -53,6 +60,8 @@ class ReadingTest(unittest.TestCase):
             self.assertLessEqual(render._dw(text), width - 1)
             for key in ("q", "r", "a", "c", "w", "p", "jk", "s", "g/G"):
                 self.assertIn(key, text)
+            for word in ("선택", "이동", "갱신"):
+                self.assertIn(word, text)
 
     def test_r7_all_rows_fit_shared_width(self):
         sessions, jobs = demo.collect()
