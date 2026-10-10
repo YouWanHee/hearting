@@ -288,6 +288,7 @@ class DegradationLadderTest(unittest.TestCase):
             setattr(s, k, v)
         # These tests exercise width pressure with an existing successful title.
         s.title = s.registry_name
+        s.runtime_name = s.registry_name  # this width fixture is an explicit name, not generated prose
         return s
 
     def _wide(self, term_width):

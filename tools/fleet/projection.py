@@ -649,6 +649,9 @@ def _projection_from_record(entity, record, route_id, jobs, node_evidence=None, 
         progress=ProgressProjection(sum(n.get("state") == "done" for n in work_nodes), len(work_nodes)),
         scope_node_ids=scope_ids,
         _route_view={"record": record, "nodes": nodes, "view": view},
+        result=route.result_projection(record, route.load_outcome(
+            _field(entity, "owner_route_file") or _field(entity, "route_file"),
+            record.get("route_id"), record.get("route_hash"))),
     )
 
 

@@ -182,6 +182,12 @@ defect. A slower or emptier view is a regression even when every check passes.
 Publish observed session identity, execution/wait reasons and resources first;
 campaign titles, route details and installation/git metadata fill asynchronously.
 Unknown observations stay unknown, and slow details must not stop basic refresh.
+Project activity includes running resources nested under an idle owner. A file
+update is labelled as a file update, never as completion. Recent results show
+the recorded task, result and event time; an unproven gate is not a failed task.
+Current execution or wait observations precede generated text. Older titles
+are labelled as previous subjects, and summaries as previous text with their
+own age, including sentences that say work is running or complete.
 
 ## Basis and current scope
 

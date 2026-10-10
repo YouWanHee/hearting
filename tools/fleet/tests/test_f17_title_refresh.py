@@ -91,7 +91,7 @@ class TitlesHelperTest(_ConfigHomeMixin, unittest.TestCase):
     def test_write_then_read_roundtrip(self):
         titles.write("sid1", "Fix login bug", source="refresher", offset=42, now=100.0)
         d = titles.read("sid1")
-        self.assertEqual(d, {"title": "Fix login bug", "ts": 100.0, "source": "refresher", "offset": 42})
+        self.assertEqual(d, {"title": "Fix login bug", "title_ts": 100.0, "ts": 100.0, "source": "refresher", "offset": 42})
 
     def test_write_atomic_no_partial(self):
         titles.write("sid2", "Some title", now=100.0)
