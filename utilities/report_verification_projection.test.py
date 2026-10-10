@@ -55,7 +55,7 @@ class ProjectionFixture(unittest.TestCase):
             present = projection.project_report(self.source, artifact_root=self.root)
             detail = projection.report_detail_payload(present)
             self.assertIn("보고서 있음", detail["display"]["detail_label"])
-            self.assertIn("검증·마감 확인 대기", detail["display"]["detail_label"])
+            self.assertIn("담당 작업의 검증·마감 확인 필요", detail["display"]["detail_label"])
             self.assertEqual(present["verification"]["reason"], "report-cycle-unadmitted")
             for path in self.source.iterdir():
                 if path.is_file():

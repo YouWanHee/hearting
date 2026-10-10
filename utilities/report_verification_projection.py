@@ -206,7 +206,7 @@ def _display(payload: dict[str, Any]) -> dict[str, Any]:
     reasons = payload.get("required_input_observation", {}).get("reasons") or []
     reason = reasons[0] if reasons else payload.get("verification", {}).get("reason")
     reason_labels = {
-        "report-cycle-unadmitted": "검증·마감 확인 대기",
+        "report-cycle-unadmitted": "담당 작업의 검증·마감 확인 필요",
         "route-hash-binding-mismatch": "작업과 보고서 기록이 일치하지 않음 · 담당 작업 확인 필요",
         "required-input-digest-mismatch": "검증 입력이 바뀜 · 담당 작업 재확인 필요",
         "artifact-revision-stale": "보고서 변경 뒤 검증 기록 확인 필요",
@@ -215,7 +215,7 @@ def _display(payload: dict[str, Any]) -> dict[str, Any]:
     detail = None
     if (reason == "report-cycle-unadmitted"
             and payload.get("report_observation", {}).get("state") == "present"):
-        detail = "보고서 있음 · 검증·마감 확인 대기"
+        detail = "보고서 있음 · 담당 작업의 검증·마감 확인 필요"
     payload["display"] = {
         "verification_label": verification_labels.get(verdict, "검증 미확정"),
         "completion_label": completion_labels.get(completion, "완료 미확정"),
