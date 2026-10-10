@@ -1441,6 +1441,19 @@ def export_current(root):
             continue
         # Symlinks and unexpected files must not hide campaigns from the observation.
         if directory.is_symlink():
+            # Official locator amendments leave a direct relative redirect to
+            # a canonical sibling. Never read a campaign through that alias or
+            # count it twice; unrelated, chained or escaping links remain errors.
+            try:
+                target_name = os.readlink(directory)
+                target = directory.parent / target_name
+                canonical_alias = (Path(target_name).name == target_name
+                                   and target in directories and not target.is_symlink()
+                                   and target.is_dir())
+            except OSError:
+                canonical_alias = False
+            if canonical_alias:
+                continue
             root_reason = root_reason or "campaign-directory-invalid"
             continue
         if not directory.is_dir():

@@ -66,6 +66,18 @@ class CurrentExportTests(unittest.TestCase):
         self.assertIn(self.identity.relative_to(self.root).as_posix(), [i["path"] for i in row["inputs"]])
         self.assertIn({"path": "campaigns/example/campaign.satisfied.json", "missing": True}, row["inputs"])
 
+    def test_official_sibling_locator_alias_is_not_an_error_or_duplicate(self):
+        alias = self.directory.parent / "old-locator"
+        alias.symlink_to(self.directory.name, target_is_directory=True)
+        result = self.export()
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual([(row["campaign_id"], row["state"]) for row in result["campaigns"]],
+                         [(self.campaign, "active")])
+        self.assertEqual(os.readlink(alias), self.directory.name)
+        alias.unlink()
+        alias.symlink_to("../elsewhere", target_is_directory=True)
+        self.assertEqual(self.export()["status"], "invalid")
+
     def test_missing_and_malformed_identity_with_nonempty_campaign(self):
         self.identity.unlink()
         result = self.export()

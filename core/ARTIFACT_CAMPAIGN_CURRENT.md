@@ -45,6 +45,9 @@ Root status aggregates lifecycle observations with conflict before invalid
 before missing before valid; a mandatory identity/enumeration failure has its
 own root reason. Presentation errors do not replace lifecycle errors or make
 valid lifecycle invalid. A duplicate ID is a conflict in every colliding row.
+An official locator amendment's direct relative alias to a canonical sibling
+is skipped without following it or counting another campaign. Other campaign
+links remain enumeration errors.
 An input mutation clears affected validated lifecycle states and yields
 `input-changed`; the root document is never a valid mixed observation.
 
