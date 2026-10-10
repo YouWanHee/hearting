@@ -154,11 +154,11 @@ class LegendTest(unittest.TestCase):
 
     def test_entries_appear_only_when_seen(self):
         plain = self._legend()
-        self.assertNotIn("[id]", plain)
+        self.assertNotIn("[번호]", plain)
         self.assertNotIn("herdr", plain)
         self.assertNotIn("tty", plain)
-        self.assertIn("[id]", self._legend(session_tag="46"))
-        self.assertIn("herdr pane", self._legend(herdr_attached=True))
+        self.assertIn("[번호]", self._legend(session_tag="46"))
+        self.assertIn("herdr 좌석", self._legend(herdr_attached=True))
         self.assertIn("tty", self._legend(herdr_attached=False))
 
 

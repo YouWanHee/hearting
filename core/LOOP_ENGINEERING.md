@@ -219,6 +219,8 @@ device and stage symbols separately. Names, current actions and controls share
 the terminal's width budget; internal identifiers belong in detail. Support
 work carries its caller's observed session/seat independently of execution and
 delivery authority, and is labelled project support when that link is unproven.
+Legends explain statuses and roles in the audience's language, including project
+activity and expanded GPU commands; a copied dot or arrow must retain its meaning.
 GPU owner labels add who is responsible, such as a verified Fleet session tag;
 they do not repeat the execution's run/job identifier beside its training name.
 Raw owner identifiers remain available in structured output.
