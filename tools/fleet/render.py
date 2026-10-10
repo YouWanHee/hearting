@@ -3387,7 +3387,7 @@ def _pulse_segs(sessions, jobs, loading=False, observations=None):
     by the header helper contract §5.2 asks for, instead of two independently-drifting copies."""
     if loading:
         spin = _SPIN[int(time.time() * 10) % len(_SPIN)]
-        return [("  fleet ", "head"), (spin, "g_spin"), (" loading sessions…", "dim")]
+        return [("  fleet ", "head"), (spin, "g_spin"), (" 세션 확인 중…", "dim")]
     _real = [s for s in sessions if not s.app_server and not getattr(s, "mem_worker", False)]
     n_wk = sum(1 for s in _real if s.liveness == "working")
     n_id = sum(1 for s in _real if s.liveness == "idle")
@@ -3532,7 +3532,9 @@ def _diagnostic_rows(diagnostics, malformed=0, term_width=None):
         impact = " · 실행 비차단" if diagnostic.get("blocking") is False else (
             " · 차단" if diagnostic.get("blocking") is True else "")
         detail = " · " + str(diagnostic.get("error") or diagnostic.get("reason") or "")
-        room = max(0, (term_width or 120) - _dw(prefix + impact))
+        budget = max(0, term_width - 1) if term_width else 120
+        prefix = _clip_w(prefix, max(0, budget - _dw(impact)))
+        room = max(0, budget - _dw(prefix + impact))
         rows.append([(prefix + _clip_w((" · " + source if source else "") + detail, room) + impact, "dim")])
     return rows
 
@@ -8020,9 +8022,9 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                       (names[:90] + ("…" if len(names) > 90 else ""), "dim")])
 
     if not order:
-        message = ("  loading sessions…" if loading else "  작업 목록 미확인"
+        message = ("  세션 확인 중…" if loading else "  작업 목록 미확인"
                    if _jobs_unconfirmed(observations) else
-                   "  (no active sessions or dispatch jobs)")
+                   "  관측된 세션·작업 없음")
         lines.append([(message, "dim")])
 
     diagnostic_rows = _diagnostic_rows(resource_diagnostics, malformed, term_width)
