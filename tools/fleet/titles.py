@@ -2,7 +2,7 @@
 
 Canonical state:
   <state-root>/<harness>/<sid>.json
-  {"title": str, "ts": float, "source": str, "offset": int, "cursor_kind": str,
+  {"title": str, "title_ts": float|null, "ts": float, "source": str, "offset": int, "cursor_kind": str,
    "summary": str, "summary_ts": float, "summary_failures": int,
    "summary_error": str}  # optional bounded failure diagnostic
 
@@ -17,6 +17,7 @@ The pre-F-21 Claude path (``~/.claude/.fleet-titles/<sid>.json``) remains a
 read-only migration fallback; every new write goes to the neutral state root.
 """
 import json
+import math
 import os
 import re
 import tempfile
@@ -30,6 +31,48 @@ _FRESH_SEC = 24 * 3600
 _FRESH_SUMMARY_SEC = _FRESH_SEC
 _STALE_SWEEP_SEC = 7 * 24 * 3600
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+CURRENT_TEXT_SEC = 15 * 60
+_TITLE_TIME_UNSET = object()
+
+
+def current_text(entity, timestamp, now=None):
+    """Generated prose is current only alongside fresh observed activity."""
+    now = time.time() if now is None else now
+    if (not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool)
+            or not math.isfinite(timestamp) or not 0 <= now - timestamp <= CURRENT_TEXT_SEC):
+        return False
+    if getattr(entity, "liveness", None) != "working":
+        return False
+    current = (getattr(entity, "route_chain", None) or {}).get("current") or {}
+    boundary = current.get("ts")
+    return not (isinstance(boundary, (int, float)) and timestamp < boundary)
+
+
+def annotate(entities):
+    """Carry the exact successful title's event time, across every harness.
+
+    Never borrow a neighbouring sidecar or attach a time to different text.
+    This passive metadata fill runs on the collection/detail worker, not render.
+    """
+    for entity in entities:
+        entity.title_ts = None
+        if not getattr(entity, "title", None):
+            continue
+        harness = getattr(entity, "harness", None)
+        if harness not in ("claude", "codex", "opencode"):
+            continue
+        keys = (getattr(entity, "session_id", None),
+                getattr(entity, "_runtime_session_id", None),
+                attempt_sid(getattr(entity, "attempt_id", None)))
+        for sid in dict.fromkeys(key for key in keys if key):
+            data = read(sid, harness=harness) or {}
+            # Legacy `ts` also advanced on no-op/failure writes. It cannot
+            # establish when a title was actually generated successfully.
+            ts = data.get("title_ts")
+            if (data.get("title") == entity.title and isinstance(ts, (int, float))
+                    and not isinstance(ts, bool) and math.isfinite(ts)):
+                entity.title_ts = ts
+                break
 
 
 def _safe_key(value, label):
@@ -158,15 +201,19 @@ def fresh_summary_with_ts(sid, harness="claude", now=None,
 
 
 def write(sid, title, source="refresher", offset=0, now=None, harness="claude", summary=None,
-          summary_ts=None, cursor_kind=None, summary_failures=0, summary_error=None):
+          summary_ts=None, cursor_kind=None, summary_failures=0, summary_error=None,
+          title_ts=_TITLE_TIME_UNSET):
     """Atomically write neutral fleet-owned state. ``title=''`` is allowed.
 
     ``summary`` is additive and omitted from the written dict when falsy — old
     readers see the same shape they always have.
     """
     write_ts = time.time() if now is None else now
+    generated_at = write_ts if title_ts is _TITLE_TIME_UNSET else title_ts
     data = {
         "title": title or "",
+        "title_ts": generated_at if (type(generated_at) in (int, float)
+                                      and math.isfinite(generated_at)) else None,
         "ts": write_ts,
         "source": source,
         "offset": int(offset),

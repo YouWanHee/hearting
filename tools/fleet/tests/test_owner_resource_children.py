@@ -158,6 +158,32 @@ class OwnerResourceChildrenTest(unittest.TestCase):
         self.attach(resources=[])
         self.assertEqual(self.owner.resource_children, [])
 
+    def test_resource_dot_reuses_gpu_blink_and_observed_host_pid_without_log_age(self):
+        self.attach()
+        self.resource.local_placement = {"hostname": "moving4.iip.lab", "processes": [
+            {"pid": self.resource.pid, "starttime": self.resource.starttime}]}
+        self.resource.log_updated_at = 1
+        for phase, key in ((True, "g_work"), (False, "g_work_off")):
+            with self.subTest(phase=phase), mock.patch.object(render, "_BLINK_ON", phase):
+                rows = render._resource_child_rows(self.owner, term_width=168)
+                self.assertIn(("●", key), rows[0])
+                self.assertIn("moving4.iip.lab", flatten(rows))
+                self.assertIn("PID 41", flatten(rows))
+                self.assertNotIn("ago", flatten(rows))
+        for width in (24, 36, 60, 80, 168):
+            rows = render._resource_child_rows(self.owner, term_width=width)
+            self.assertLessEqual(sum(render._dw(t) for t, _ in rows[0]), width)
+            if width >= 40:
+                self.assertIn("eval-run", flatten(rows))
+                self.assertIn("6h 50m", flatten(rows))
+        self.resource.local_placement = None
+        self.assertNotIn("PID", flatten(render._resource_child_rows(self.owner, term_width=168)))
+        self.resource.state_evidence = {"reason": "exact-identity-match", "current_identity": {
+            "pid": self.resource.pid, "starttime": self.resource.starttime}}
+        self.assertEqual(render._resource_process_location(self.resource), "PID 41")
+        self.resource.state_evidence["current_identity"]["starttime"] = "456"
+        self.assertEqual(render._resource_process_location(self.resource), "")
+
     def test_working_owner_and_plain_idle_owner_are_not_labeled_parked(self):
         for liveness, evidence in (("working", self.owner.state_evidence), ("idle", {})):
             with self.subTest(liveness=liveness):
@@ -190,7 +216,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                                                 resources=[self.resource], governor=None)
                     text = flatten(lines)
                     self.assertIn("resource eval-run", text)
-                    self.assertIn("working  6h 50m", text)
+                    self.assertIn("6h 50m", text)
                     self.assertNotIn("old model summary", text)
                     self.assertEqual(text.count("resource eval-run"), 1)
                     child_line = next(line for line in lines if line and "resource eval-run" in flatten([line]))
@@ -215,7 +241,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     rows = render._resource_child_rows(self.owner, term_width=width, in_card=True)
                     framed = [render._frame_dispatch_line(
                         row, render._dispatch_box_width(width), "mid", "frm_idle") for row in rows]
-                    self.assertIn("working  6h 50m", flatten(framed))
+                    self.assertIn("6h 50m", flatten(framed))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in framed[0]), width)
 
     def test_stage_divider_and_closing_rail_never_repeat_campaign_title(self):
@@ -451,7 +477,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     self.assertEqual(len(actual), len(baseline))
                     line = next(line for line in actual if line and "resource eval-run" in flatten([line]))
                     self.assertIn("2m ago", flatten([line]))
-                    self.assertIn("working  6h 50m", flatten([line]))
+                    self.assertIn("6h 50m", flatten([line]))
                     if width >= 80:
                         self.assertIn("12/50 epoch", flatten([line]))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in line), width)
@@ -475,8 +501,9 @@ class OwnerResourceChildrenTest(unittest.TestCase):
             with self.subTest(width=width):
                 rows = render._resource_child_rows(self.owner, term_width=width, in_card=True)
                 self.assertEqual(len(rows), 1)
-                self.assertIn("2m ago", flatten(rows))
-                self.assertIn("working  6h 50m", flatten(rows))
+                if width >= 80:
+                    self.assertIn("2m ago", flatten(rows))
+                self.assertIn("6h 50m", flatten(rows))
                 self.assertLessEqual(sum(render._dw(t) for t, _ in rows[0]),
                                      render._dispatch_box_width(width) - 1)
 

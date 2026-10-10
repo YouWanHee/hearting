@@ -649,6 +649,9 @@ def _projection_from_record(entity, record, route_id, jobs, node_evidence=None, 
         progress=ProgressProjection(sum(n.get("state") == "done" for n in work_nodes), len(work_nodes)),
         scope_node_ids=scope_ids,
         _route_view={"record": record, "nodes": nodes, "view": view},
+        result=route.result_projection(record, route.load_outcome(
+            _field(entity, "owner_route_file") or _field(entity, "route_file"),
+            record.get("route_id"), record.get("route_hash"))),
     )
 
 
@@ -1755,9 +1758,10 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                     cache_key = (str(root), work.route_id, work.route_hash, str(jobs_path or ""))
                     if cache_key not in report_verification_cache:
                         try:
-                            from utilities.report_verification_projection import project_route
-                            report_verification_cache[cache_key] = project_route(
-                                root, work.route_id, work.route_hash, jobs=jobs_path)
+                            from utilities.report_verification_projection import (
+                                project_route, report_detail_payload)
+                            report_verification_cache[cache_key] = report_detail_payload(project_route(
+                                root, work.route_id, work.route_hash, jobs=jobs_path))
                         except Exception:
                             report_verification_cache[cache_key] = None
                     if report_verification_cache[cache_key] is not None:
