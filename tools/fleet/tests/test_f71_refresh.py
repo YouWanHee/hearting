@@ -208,8 +208,8 @@ class RefreshPumpTest(unittest.TestCase):
             # The collector stays blocked until `release`, so these waits are
             # hang guards: getch is reached while it is blocked or never.
             self.assertTrue(collector_entered.wait(5.0))
-            self.assertTrue(governor_entered.wait(5.0))
             self.assertTrue(getch_called.wait(5.0))
+            self.assertFalse(governor_entered.is_set())
             release.set()
             # Hang guard only; `_loop` itself bounds its exit by its 1.0s stop join.
             thread.join(5.0)
@@ -299,6 +299,7 @@ class FirstSnapshotRenderTest(unittest.TestCase):
              mock.patch.object(dispatch.collect, "last_degradations", {}, create=True), \
              mock.patch.object(projection, "attach_projections") as attach, \
              mock.patch.object(render, "_compute_host_rows", return_value=[]), \
+             mock.patch.object(render, "_fresh_compute_hosts", return_value=(None, None)), \
              mock.patch.object(render, "_usage_header_rows", return_value=[]), \
              mock.patch.object(render, "_SHOW_ALL", False):
             for process_view in (False, True):
@@ -313,15 +314,15 @@ class FirstSnapshotRenderTest(unittest.TestCase):
                     self.assertNotIn("no active", text)
                     attach.assert_not_called()
 
-            # Once a census is published, the existing completed-route fallback
-            # and truthful empty display remain available to snapshot callers.
+            # A published empty census remains empty even if the collector's
+            # unpublished globals change. Route carriers arrive in the snapshot.
             with mock.patch.object(render, "_PROCESS_VIEW", False):
                 lines = render._build_lines([], [], "both", False, 0,
                                             term_width=168, governor=None)
                 text = "\n".join(render._plain(line) for line in lines if line)
                 self.assertIn("no active sessions or dispatch jobs", text)
                 self.assertIn("0 working", text)
-                attach.assert_called_once()
+                attach.assert_not_called()
 
 
 class RefreshPumpRecoveryTest(unittest.TestCase):

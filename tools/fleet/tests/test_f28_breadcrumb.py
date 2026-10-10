@@ -18,6 +18,7 @@ from fleet import projection, render         # noqa: E402
 from fleet import route                     # noqa: E402
 from fleet.collectors import dispatch       # noqa: E402
 from fleet.model import DispatchJob         # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines, draw_observed
 
 _FIXDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "route")
 _REAL_CLAUDE = os.path.join(_FIXDIR, "real_claude_staged.json")
@@ -54,7 +55,7 @@ class RouteBreadcrumbTest(unittest.TestCase):
             job = DispatchJob(key="code", stage="exec", slug="no-route-job", cwd=tmp,
                               liveness="working", depth=1)
             via_build_lines = _joined(
-                render._build_lines([], [job], section="dispatch", narrow=False,
+                build_observed_lines([], [job], section="dispatch", narrow=False,
                                     malformed=0, layout="wide"))
         direct = render._dispatch_stage_segs(job, "code", "exec", "no-route-job", working=True)
         expected_text = "".join(t for t, _k in direct)
@@ -71,7 +72,7 @@ class RouteBreadcrumbTest(unittest.TestCase):
         job = DispatchJob(key="code", stage="exec", slug="no-route-job", cwd="/nonexistent/x",
                           liveness="working", depth=1)
         via_build_lines = _joined(
-            render._build_lines([], [job], section="dispatch", narrow=False,
+            build_observed_lines([], [job], section="dispatch", narrow=False,
                                 malformed=0, layout="wide"))
         self.assertIn("preparing…", via_build_lines)
         self.assertNotIn("pre › plan › exec › test", via_build_lines)
@@ -87,7 +88,7 @@ class RouteBreadcrumbTest(unittest.TestCase):
         child = DispatchJob(key="code-execute", slug="v10-conductor-execute", cwd="/x",
                             parent_slug="v10-conductor", depth=2, liveness="working",
                             route_id=_REAL_RID, route_file=_REAL_CLAUDE, route_node="execute")
-        text = _joined(render._build_lines([], [conductor, child], section="dispatch",
+        text = _joined(build_observed_lines([], [conductor, child], section="dispatch",
                                            narrow=False, malformed=0, layout="wide"))
         # _STAGE_ZONE_MAX(30) crops PAST stages first (SD-F2, unchanged _drop_past_stages) —
         # "plan✓" folds away here exactly like a 4-stage `_PIPE_STAGES` breadcrumb would, so
@@ -111,7 +112,7 @@ class RouteBreadcrumbTest(unittest.TestCase):
         child = DispatchJob(key="lab-eval", slug="lab-conductor-eval-sep", cwd="/x",
                             parent_slug="lab-conductor", depth=2, liveness="working",
                             route_id=lab_rid, route_file=_LAB, route_node="eval-sep")
-        text = _joined(render._build_lines([], [conductor, child], section="dispatch",
+        text = _joined(build_observed_lines([], [conductor, child], section="dispatch",
                                            narrow=False, malformed=0, layout="wide"))
         self.assertIn("eval-sep", text)
 
@@ -155,7 +156,7 @@ class RouteBreadcrumbTest(unittest.TestCase):
                               route_id=rid, route_file=_COMPOSED, route_node="claim-a",
                               assigned_contract="autopilot-code")
         projection.attach_projections([], [owner, child_b, child_a], now=100.0)
-        text = _joined(render._build_lines([], [owner, child_b, child_a], section="dispatch",
+        text = _joined(build_observed_lines([], [owner, child_b, child_a], section="dispatch",
                                            narrow=False, malformed=0, layout="wide",
                                            term_width=168))
         self.assertIn("claim-a", text)

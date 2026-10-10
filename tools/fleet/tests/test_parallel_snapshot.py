@@ -42,13 +42,14 @@ class ParallelSnapshotTest(unittest.TestCase):
             self.assertTrue(release.wait(5.0))
             return result
 
-        def sessions(harness_filter=None):
+        def sessions(harness_filter=None, **kwargs):
             try:
                 self.assertTrue(hosts_started.wait(2.0))
                 self.assertTrue(governor_started.wait(2.0))
             finally:
                 release.set()
-            return [], []
+            return refresh.LiveSnapshot(resources=["resource"],
+                                        usage_snapshots={"codex": "cached"})
 
         sessions.last_resource_jobs = ["resource"]
         sessions.last_usage_snapshots = {"codex": "cached"}
@@ -73,7 +74,7 @@ class ParallelSnapshotTest(unittest.TestCase):
             collector.last_usage_snapshots = sessions.last_usage_snapshots
             self.assertEqual(fleet.main(["--once"]), 0)
 
-    def test_host_exception_keeps_existing_snapshot_and_propagates(self):
+    def test_host_exception_keeps_existing_snapshot_and_marks_unconfirmed(self):
         previous = {"hosts": ["old"]}
         render.set_compute_hosts(previous)
 
@@ -82,10 +83,12 @@ class ParallelSnapshotTest(unittest.TestCase):
 
         with self.quiet_renderer(), \
              mock.patch.object(render, "_collect_governor", return_value=None), \
-             mock.patch.object(render, "_build_lines") as build:
-            with self.assertRaisesRegex(ValueError, "host failure"):
-                render.render_once(lambda **kw: ([], []), None, "both", compute_hosts_refresh=failed)
-            build.assert_not_called()
+             mock.patch.object(render, "_build_lines", return_value=[]) as build:
+            self.assertEqual(render.render_once(lambda **kw: ([], []), None, "both",
+                                                compute_hosts_refresh=failed), 0)
+            health = build.call_args.kwargs["observations"]["compute hosts"]
+            self.assertEqual(health["state"], "failed")
+            self.assertIn("host failure", health["last_error"])
         self.assertEqual(render._COMPUTE_HOSTS, previous)
 
     def test_governor_failure_stays_optional(self):
@@ -197,10 +200,10 @@ class ParallelSnapshotTest(unittest.TestCase):
             build.assert_not_called()
         self.assertEqual(render._COMPUTE_HOSTS, {"hosts": []})
 
-    def test_thread_exhaustion_uses_synchronous_read(self):
-        caller = threading.get_ident()
+    def test_thread_exhaustion_reports_an_unconfirmed_read(self):
         with mock.patch.object(refresh.threading.Thread, "start", side_effect=RuntimeError("no threads")):
-            self.assertEqual(refresh.background_read(threading.get_ident).result(), caller)
+            with self.assertRaisesRegex(RuntimeError, "no threads"):
+                refresh.background_read(threading.get_ident).result()
 
 
 if __name__ == "__main__":

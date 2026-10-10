@@ -188,6 +188,11 @@ the recorded task, result and event time; an unproven gate is not a failed task.
 Current execution or wait observations precede generated text. Older titles
 are labelled as previous subjects, and summaries as previous text with their
 own age, including sentences that say work is running or complete.
+An incomplete observation cannot establish absence: publish the last observed
+work together with the failed source, its last success and the reason it is
+unconfirmed. Basic and detail refresh share this health vocabulary. Publish
+route evidence and its projection in the same snapshot; rendering consumes
+that snapshot without rereading collector globals or redoing the judgment.
 
 ## Basis and current scope
 
