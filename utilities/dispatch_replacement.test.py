@@ -1528,6 +1528,25 @@ class ReplacementTest(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
 
+    def test_runtime_death_receives_correction_on_the_same_route_without_replaying_reviews(self):
+        self._blocked_owner()
+        self.jobs.write_text(self.jobs.read_text().replace('dead-worker-blocked', 'dead-runtime-exit')
+                             .replace('failure_class=blocked', 'failure_class=runtime'))
+        answer = '이미 통과한 검토를 보존하고 남은 관찰과 verdict만 완료하세요.'
+        self.assertTrue(self._answer(text=answer)['retained'])
+        R._reuse_snapshot.return_value['completed'] = [{'node': 'independent-verify'}]
+        result, commands = self._launch()
+        self.assertEqual(len(commands), 1)
+        record = result['record']
+        self.assertEqual(record['route_id'], self.route['route_id'])
+        self.assertEqual(record['proof']['source_result'], 'EXITED')
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        for expected in (answer, 'independent-verify', 'Continue only unfinished work',
+                         'exited before settlement', 'existing route'):
+            self.assertIn(expected, text)
+        self.assertNotIn('ended BLOCKED', text)
+
     # -- an owner that ended with a readable FAIL, answered with a fix a person approved ----------
     def _failed_owner(self, test_fails=2):
         """BC rt-96bab699: the owner reported its test FAIL as its result; the check's rounds are spent."""
@@ -1574,7 +1593,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual((budget.state, budget.round_kind), ('admit', 'closure-check'))
         self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), (['att-test-2'], []))
 
-    def test_failed_owner_without_failed_checks_accepts_one_ordinary_correction(self):
+    def test_failed_owner_without_failed_checks_continues_once_per_answer(self):
         import dispatch_owner_input as I
         self._failed_owner(test_fails=0)
         self.assertTrue(self._answer(text='approved fix: retain missing GPU observation',
@@ -1584,23 +1603,60 @@ class ReplacementTest(unittest.TestCase):
         record = result['record']
         self.assertEqual(record['proof']['source_result'], 'FAIL')
         self.assertEqual(record['proof']['answers'], [])
-        self.assertNotIn('after_capacity', record['logical_node'])
+        self.assertEqual(record['logical_node']['after_capacity'], 'att-source')
         text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
                                        jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
         self.assertIn('retain missing GPU observation', text)
         self.assertNotIn('closure-check', text)
         self.assertEqual(R.answered_fix_revisions(self.jobs, 'rt-test'), [])
-        # Replay converges on the claim; a second FAIL never creates another allowance.
+        # Replay converges on the claim; the next FAIL waits for its own new answer.
         self.assertEqual(self.claim(), record)
         successor = self._successor(record, self.meta | {'worker_type': 'owner'}, status='open')
         I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
         successor = self._die(successor, note='dead-worker-fail', failure_class='fail')
-        self.assertTrue(self._answer(aid=successor['attempt_id'], text='another fix',
-                                    request_id='infra-fix-2')['retained'])
         retry, commands = self._launch(successor['attempt_id'])
         self.assertEqual(commands, [])
-        self.assertEqual(retry.get('reason'), 'automatic-replacement-exhausted', retry)
+        self.assertNotEqual(retry.get('state'), 'running')
         self.assertEqual(len(list((R._directory(self.jobs) / 'claims').glob('*.json'))), 1)
+        self.assertTrue(self._answer(aid=successor['attempt_id'], text='another fix',
+                                    request_id='infra-fix-2')['retained'])
+        # The route may still name the original owner: following lineage sees the new answer too.
+        retry, commands = self._launch('att-source')
+        self.assertEqual(len(commands), 1, retry)
+        second = retry['record']
+        self.assertEqual(second['logical_node']['after_capacity'], successor['attempt_id'])
+        self.assertNotEqual(second['family_id'], record['family_id'])
+        self.assertEqual(second['proof']['corrections'][0]['id'], 'infra-fix-2')
+        self.assertEqual(R.claim(self.jobs, successor['attempt_id']), second)
+        self.assertEqual(len(list((R._directory(self.jobs) / 'claims').glob('*.json'))), 2)
+        rows = R._rows(self.jobs.read_text().splitlines())
+        for aid in ('att-source', successor['attempt_id']):
+            self.assertEqual((rows[aid][0][1], rows[aid][1]['note'], rows[aid][1]['failure_class']),
+                             ('done', 'dead-worker-fail', 'fail'))
+
+    def test_resource_fail_answer_continues_after_the_silent_replacement_was_spent(self):
+        import dispatch_owner_input as I
+        self._owner(note='dead-exact-pid')
+        first = self.claim()
+        self.assertNotIn('after_capacity', first['logical_node'])
+        successor = self._successor(first, self.meta | {'worker_type': 'owner'}, status='open')
+        I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
+        successor = self._die(successor, note='dead-worker-fail', failure_class='fail')
+        self.assertTrue(self._answer(aid=successor['attempt_id'], text='approved: fix GPU check and run __a2',
+                                    request_id='resource-fix')['retained'])
+        result, commands = self._launch('att-source')
+        self.assertEqual(len(commands), 1, result)
+        record = result['record']
+        self.assertEqual(record['route_id'], first['route_id'])
+        self.assertEqual(record['proof']['death_kind'], R.CORRECTED)
+        self.assertEqual(record['proof']['source_result'], 'FAIL')
+        self.assertEqual(record['proof']['answers'], [])
+        self.assertEqual(record['logical_node']['after_capacity'], successor['attempt_id'])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of=successor['attempt_id'],
+                                       worker_type='owner', jobs_path=self.jobs,
+                                       attempt_id=record['replacement_attempt_id']))
+        self.assertIn('fix GPU check and run __a2', text)
+        self.assertNotIn('closure-check', text)
 
     def test_a_fix_for_a_check_that_used_its_closure_check_makes_no_round(self):
         import route_authority as RA

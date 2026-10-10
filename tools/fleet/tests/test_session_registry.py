@@ -61,7 +61,7 @@ class _RegistryDirMixin:
 class ConstantsTest(unittest.TestCase):
     def test_frozen_shapes(self):
         self.assertEqual(session_registry.HARNESSES, ("claude", "codex", "opencode"))
-        self.assertEqual(len(session_registry.FIELDS), 15)
+        self.assertEqual(len(session_registry.FIELDS), 16)
         self.assertEqual(session_registry.STATUSES, ("idle", "busy", "shell", "exited"))
         self.assertEqual(
             session_registry.WRITER_SUPPORT,

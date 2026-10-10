@@ -188,6 +188,19 @@ the recorded task, result and event time; an unproven gate is not a failed task.
 Current execution or wait observations precede generated text. Older titles
 are labelled as previous subjects, and summaries as previous text with their
 own age, including sentences that say work is running or complete.
+An incomplete observation cannot establish absence: publish the last observed
+work together with the failed source, its last success and the reason it is
+unconfirmed. Basic and detail refresh share this health vocabulary. Publish
+route evidence and its projection in the same snapshot; rendering consumes
+that snapshot without rereading collector globals or redoing the judgment.
+Pane display updates belong to the existing detail pass; assigning a live
+session's number must not wait for pane metadata writes before basic publication.
+Delayed display writes check the pane's current exact session identity and
+assigned number; a changed or unconfirmed target receives no old metadata.
+Diagnostics retain the reader's kind, source and blocking evidence. A missing
+historical resource reference is not a broken dispatch log or a current execution
+failure. Memory rows describe a stored change with its content and observed origin;
+storage classifications never impersonate a current user decision.
 
 ## Basis and current scope
 

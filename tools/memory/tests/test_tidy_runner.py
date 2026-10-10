@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 
 from tidy_isolation import isolated_env  # noqa: E402
 import session_tidy as st  # noqa: E402
+import pane_ownership  # noqa: E402
 import session_tidy_runner as runner  # noqa: E402
 from test_tidy_isolation import FIXTURES  # noqa: E402
 
@@ -233,6 +234,11 @@ class RunnerCase(unittest.TestCase):
     def setUp(self):
         self.iso = isolated_env()
         self.addCleanup(self.iso.cleanup)
+        # Runner/clear fixtures start after pane admission. Physical ownership
+        # is tested on real ptys in utilities/pane_ownership.test.py.
+        proof = mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda pane, *a, **kw: pane or "")
+        proof.start()
+        self.addCleanup(proof.stop)
         self.addCleanup(self.reap_detached)       # runs before the root is removed
         self.cwd = self.iso.root / "proj"
         self.cwd.mkdir()
@@ -292,7 +298,12 @@ class RunnerCase(unittest.TestCase):
         return env
 
     def cli(self, *args, input=None, **more):
-        return self.iso.run([sys.executable, TIDY, *args], input=input, extra=self.env(**more), cwd=self.cwd)
+        code = (f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r}); "
+                "import pane_ownership; "
+                "pane_ownership.verified_pane=lambda pane,*a,**kw: pane or ''; "
+                "import session_tidy; sys.argv=['session_tidy.py',*sys.argv[1:]]; "
+                "raise SystemExit(session_tidy.main())")
+        return self.iso.run([sys.executable, "-c", code, *args], input=input, extra=self.env(**more), cwd=self.cwd)
 
     def transcript(self, sid, rows):
         path = self.projects / f"{sid}.jsonl"

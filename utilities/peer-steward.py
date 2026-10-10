@@ -272,6 +272,14 @@ def _project_of(cwd):
     return os.path.basename(str(cwd).rstrip("/"))
 
 
+def _caller_pane():
+    """The common live ownership judgment, never the inherited pane label."""
+    from pane_ownership import verified_pane
+    sid, harness = _current_session_identity()
+    return verified_pane(os.environ.get("HERDR_PANE_ID", ""), harness, sid,
+                         server=_HERDR_SESSION)
+
+
 def _caller_is_claude():
     from session_identity import identity
     return identity().harness == "claude"
@@ -1121,7 +1129,7 @@ def _seat_handover(ident, own_sid, own_harness):
     beside the predecessor, its routes become this session's, across harnesses
     (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
     this is not a seat change (the receipt then stays as it was); it never fails the retire."""
-    pane = os.environ.get("HERDR_PANE_ID", "")
+    pane = _caller_pane()
     if not pane:
         return None
     path = _seat_successor_path(pane)
@@ -1329,7 +1337,7 @@ def cmd_start(args):
         print(f"started=false reason=agent-name-too-long agent={args.kind} name={args.name} "
               "max_length=32 detail=이름은 최대 32자까지 사용할 수 있습니다")
         return 1
-    beside = args.beside or (os.environ.get("HERDR_PANE_ID", "").strip() if not args.pane else None)
+    beside = args.beside or (_caller_pane() if not args.pane else None)
     if not beside:
         return _start_in_pane(args)
     # Hold the workspace claim until native start settles, including shell reuse.
@@ -1347,7 +1355,7 @@ def _start_in_pane(args):
         return _unavailable("herdr-not-found")
     if not args.pane and not args.beside:
         # Beside the calling pane, the way a session starts its own peer.
-        args.beside = os.environ.get("HERDR_PANE_ID", "").strip() or None
+        args.beside = _caller_pane() or None
         if not args.beside:
             print(f"started=false reason=pane-unknown agent={args.kind} name={args.name} "
                   "pane=- detail=name --pane or --beside outside a herdr pane")
@@ -1976,7 +1984,7 @@ def cmd_retire(args):
         return finish(reason or "pane-unverified")
     pane, harness = ident["pane"], ident["harness"]
     own_sid, own_harness = _current_session_identity()
-    if (pane == os.environ.get("HERDR_PANE_ID")
+    if (pane == _caller_pane()
             or (own_sid and ident["session_id"] == own_sid and harness == own_harness)):
         return finish("self-target")
     if harness not in _RETIRE_ACTIONS:

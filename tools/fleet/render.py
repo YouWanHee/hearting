@@ -41,7 +41,7 @@ from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo, titles
 from .collectors import compute_hosts as _compute_hosts
-from .refresh import LiveSnapshot, RefreshPump, background_read
+from .refresh import LiveSnapshot, RefreshPump, background_read, as_snapshot
 from .session_handle import sanitize_title as _sanitize_session_title
 from .session_handle import _cell_width as _session_handle_cell_width
 from .session_handle import clip_cells as _clip_cells
@@ -3359,7 +3359,7 @@ def _governor_segs(snapshot=_IO_UNSET):
     return [("  ⚙ ", "dim"), ("governor %d/%d" % (active, cap), "dim")]
 
 
-def _pulse_segs(sessions, jobs, loading=False):
+def _pulse_segs(sessions, jobs, loading=False, observations=None):
     """`  fleet ⠙ N working   ● N idle ...` — whole-board census. Extracted (F-30, v10) so both
     the group view and the process view (§5.1) render the EXACT same row — one source, shared
     by the header helper contract §5.2 asks for, instead of two independently-drifting copies."""
@@ -3387,79 +3387,131 @@ def _pulse_segs(sessions, jobs, loading=False):
         pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (" unused   ", "dim")]
     if n_dt:
         pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (" detached   ", "dim")]
-    if listed_jobs:
+    if _jobs_unconfirmed(observations):
+        pulse += [("↳ 작업 목록 미확인", "lvl_y")]
+        if listed_jobs:
+            pulse += [(" (마지막 관측 %d개)" % len(listed_jobs), "dim")]
+    elif listed_jobs:
         pulse += [("↳ %d" % len(listed_jobs), "dim"),
                   (" job%s (%d working)" % ("s" if len(listed_jobs) != 1 else "", jw), "dim")]
     return pulse
 
 
-def _mem_event_rows(memory, limit=8):
-    """F-19 `a`-toggle detail — most-recent-first dim rows (F-18b dim-row family): time ·
-    action · tier/type · actor · snippet."""
-    if not memory:
-        return []
+def _memory_event_key(event):
+    return (event.get("cwd") or event.get("project"), event.get("scope"),
+            event.get("action"), event.get("snippet"))
+
+
+def _memory_event_groups(events):
+    """Count equal changes only when their observed source is the same."""
+    groups = []
+    by_key = {}
+    for event in events:
+        origin = event.get("cwd") or event.get("project")
+        key = _memory_event_key(event)
+        if origin and key in by_key:
+            by_key[key][1] += 1
+        else:
+            group = [event, 1]
+            groups.append(group)
+            if origin:
+                by_key[key] = group
+    return groups
+
+
+def _mem_change_rows(events, sid_titles=None, limit=8, term_width=None):
+    from .collectors.memory import ADDED_ACTIONS, EXPIRED_ACTIONS, PRUNED_ACTIONS
     rows = []
-    for e in (memory.get("recent") or [])[:limit]:
-        ts = (e.get("ts") or "—")
-        if "T" in ts:
-            ts = ts.split("T", 1)[1]   # HH:MM:SS only — date is always "today or recent"
-        tier_type = "%s/%s" % (e.get("tier") or "-", e.get("type") or "-")
-        snip = e.get("snippet") or ""
-        seg = [("  🧠 ", "dim"), (ts, "dim"), ("  ", None),
-               (e.get("action") or "?", "dim"), ("  ", None),
-               (tier_type, "dim"), ("  ", None),
-               (e.get("actor") or "?", "dim")]
-        if snip:
-            seg += [("  ", None), (_clip_w(snip, 60), "dim")]
-        rows.append(seg)
+    width = term_width or 120
+    for event, count in _memory_event_groups(events)[:limit]:
+        action = event.get("action")
+        if action in ADDED_ACTIONS:
+            label, sign, color = "기억 저장", "+", "lvl_g"
+        elif action in EXPIRED_ACTIONS or action in PRUNED_ACTIONS:
+            label, sign, color = "기억 정리", "−", "dim"
+        elif action == "decision-record":
+            label, sign, color = "기억 저장", "·", "dim"
+        else:
+            label, sign, color = "기억 변경", "·", "dim"
+        origin = event.get("cwd") or event.get("project")
+        if not origin:
+            origin = "공통" if event.get("scope") == "global" else "출처 미확인"
+        # Source is preserved in JSON. Keep its distinctive last path components
+        # in a narrow row, after the content and before optional session/time.
+        origin = str(origin)
+        source_room = max(12, min(36, width // 3))
+        if _dw(origin) > source_room:
+            while origin and _dw(origin) > source_room - 1:
+                origin = origin[1:]
+            origin = "…" + origin
+        suffix = " · " + origin + (" · %d회" % count if count > 1 else "")
+        title = (sid_titles or {}).get(event.get("sid"))
+        stamp = str(event.get("ts") or "")
+        if "T" in stamp:
+            stamp = stamp.replace("T", " ")[:16]
+        prefix = [("  🧠 ", "dim"), (sign, color), (" " + label + " · ", "dim")]
+        room = max(0, width - sum(_dw(t) for t, _ in prefix) - _dw(suffix))
+        snippet = _clip_w(str(event.get("snippet") or "내용 미확인"), room)
+        row = prefix + [(snippet, "dim"), (suffix, "dim")]
+        optional = (" ⟵ " + _clip_w(title, 22) if title else "") + (" · " + stamp if stamp else "")
+        remaining = width - sum(_dw(t) for t, _ in row)
+        if _dw(optional) <= remaining:
+            row.append((optional, "dim"))
+        rows.append(row)
     return rows
 
 
-_MEM_DIVIDER_MARGIN = 12   # in-band card-bottom divider inset (both sides), matches the
-                            # discarded two-plane demo's r5 rule — a dim `─` ON the tint, not
-                            # a full-width chrome bar (F-19 repo rows, 사용자 확정 2026-07-16)
+def _mem_event_rows(memory, limit=8, term_width=None, excluded_ids=()):
+    if not memory:
+        return []
+    events = [event for event in memory.get("recent") or []
+              if not event.get("id") or event["id"] not in excluded_ids]
+    return _mem_change_rows(events, limit=limit, term_width=term_width)
+
+
+_MEM_DIVIDER_MARGIN = 12
 _MEM_REPO_ROW_LIMIT = 2
-_MEM_REPO_TITLE_W = 22
 
 
 def _mem_divider(term_width=None):
-    """One dim in-band rule above a group card's per-repo mem rows — the tint prefix is
-    applied by the caller's existing group-body tint loop (F-19 repo rows)."""
     return [(" ", None), ("─" * max(8, (term_width or 78) - _MEM_DIVIDER_MARGIN), "dim")]
 
 
-def _mem_repo_rows(events, sid_titles, limit=_MEM_REPO_ROW_LIMIT):
-    """F-19 repo rows — a group card's own today-mem events, most-recent-first, dim:
-    `🧠 HH:MM ± tier/type actor ⟵ <source session title> "snippet"`. `+` (add) is green,
-    `−` (expire/prune) falls back to dim (the engine's only red key is bold-only, and bold
-    is reserved for the main-session row — round-2 precedent in the discarded two-plane
-    demo). The source session title is shown only when the journal `sid` resolves against a
-    currently-known session (honest omission otherwise, F-3)."""
-    if not events:
-        return []
-    from .collectors.memory import ADDED_ACTIONS, EXPIRED_ACTIONS, PRUNED_ACTIONS
+def _mem_repo_rows(events, sid_titles, limit=_MEM_REPO_ROW_LIMIT, term_width=None):
+    return _mem_change_rows(events or [], sid_titles, limit, term_width)
+
+
+def _diagnostic_rows(diagnostics, malformed=0, term_width=None):
+    """One reader-evidence summary for group/process views; never infer execution failure."""
     rows = []
-    for e in events[:limit]:
-        ts = e.get("ts") or "—"
-        if "T" in ts:
-            ts = ts.split("T", 1)[1][:5]        # HH:MM
-        action = e.get("action")
-        if action in ADDED_ACTIONS:
-            sign, sign_key = "+", "lvl_g"
-        elif action in EXPIRED_ACTIONS or action in PRUNED_ACTIONS:
-            sign, sign_key = "−", "dim"
-        else:
-            sign, sign_key = "·", "dim"
-        tier_type = "%s/%s" % (e.get("tier") or "-", e.get("type") or "-")
-        seg = [("  🧠 ", "dim"), (ts + " ", "dim"), (sign, sign_key),
-               (" %s " % tier_type, "dim"), ((e.get("actor") or "?") + " ", "dim")]
-        title = sid_titles.get(e.get("sid")) if e.get("sid") else None
-        if title:
-            seg.append(("⟵ " + _clip_w(title, _MEM_REPO_TITLE_W) + "  ", "dim"))
-        snip = e.get("snippet")
-        if snip:
-            seg.append(('"%s"' % _clip_w(snip, 60), "dim"))
-        rows.append(seg)
+    if malformed:
+        rows.append([("  jobs.log · 형식이 잘못된 행 %d개 제외" % malformed, "dim")])
+    labels = {
+        "missing-registry": "과거 참조 파일 없음",
+        "malformed-registry": "기록 파일 형식 오류",
+        "malformed-run": "실행 기록 형식 오류",
+        "malformed-index": "색인 형식 오류",
+        "resource-row-projection": "실행 정보 표시 미확인",
+    }
+    for diagnostic in diagnostics or []:
+        past = diagnostic.get("kind") == "missing-registry" and diagnostic.get("blocking") is False
+        if past and not _SHOW_ALL:
+            continue
+        label = labels.get(diagnostic.get("kind"), "리소스 관측 미확인")
+        prefix = "  리소스 기록 · " + label if past else "  리소스 관측 미확인"
+        if not past and label != "리소스 관측 미확인":
+            prefix += " · " + label
+        source = str(diagnostic.get("path") or diagnostic.get("run_id") or "")
+        if source:
+            # Show the project and the registry location, using only literal path parts.
+            source = source.split("/.agent_reports/", 1)
+            source = (source[0].rsplit("/", 1)[-1] + "/" + source[1]
+                      if len(source) == 2 else source[0])
+        impact = " · 실행 비차단" if diagnostic.get("blocking") is False else (
+            " · 차단" if diagnostic.get("blocking") is True else "")
+        detail = " · " + str(diagnostic.get("error") or diagnostic.get("reason") or "")
+        room = max(0, (term_width or 120) - _dw(prefix + impact))
+        rows.append([(prefix + _clip_w((" · " + source if source else "") + detail, room) + impact, "dim")])
     return rows
 
 
@@ -4982,11 +5034,12 @@ def set_compute_hosts(value):
 _REFRESH_HEALTH = {}   # {"snapshot": health-dict|None, "compute_hosts": health-dict|None}
 
 
-def set_refresh_health(snapshot=None, compute_hosts=None):
+def set_refresh_health(snapshot=None, compute_hosts=None, details=None):
     global _REFRESH_HEALTH
     _REFRESH_HEALTH = {
         "snapshot": dict(snapshot) if isinstance(snapshot, dict) else None,
         "compute_hosts": dict(compute_hosts) if isinstance(compute_hosts, dict) else None,
+        "details": dict(details) if isinstance(details, dict) else None,
     }
 
 
@@ -5021,6 +5074,12 @@ def _refresh_health_segments(narrow=False):
         error = health.get("last_error") or ""
         limit = 20 if narrow else 40
         segs.append((" · error: " + error[:limit], "lvl_y"))
+    detail = _REFRESH_HEALTH.get("details")
+    if detail and detail.get("state") in ("failed", "stalled"):
+        cause = ("수집 지연" if detail.get("state") == "stalled" else
+                 str(detail.get("last_error") or "조회 실패")[:20 if narrow else 40])
+        segs.append((" · 상세 미확인 · 마지막 관측 " +
+                     _refresh_age_label(detail.get("age")) + " · " + cause, "lvl_y"))
     compute_hosts = (_REFRESH_HEALTH.get("compute_hosts")
                       if isinstance(_REFRESH_HEALTH, dict) else None)
     # Segment importance, in survival order: ① refreshed <age> ② state word
@@ -6353,7 +6412,8 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
 
 
 def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, term_width, layout,
-                         node_evidence=None, governor=_IO_UNSET, resources=None, loading=False):
+                         node_evidence=None, governor=_IO_UNSET, resources=None, loading=False,
+                         observations=None, resource_diagnostics=None):
     """F-30 (prd.md:304-310) — the process view: one card per ACTIVE route (pipeline-centric
     regrouping) instead of the group view's per-project regrouping. Returns the SAME flat
     segment-line contract as `_build_lines` ([[(text,key),...]|None]) — `_draw`/`render_once`/
@@ -6367,12 +6427,11 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     for record lookup, and needs the identical fix for the SAME reason."""
     global _FOLDABLE
     _FOLDABLE = []
-    lines = [_pulse_segs(sessions, jobs, loading=loading)]
+    lines = [_pulse_segs(sessions, jobs, loading=loading, observations=observations)]
     _governor = _governor_segs(governor)
     if _governor is not None:
         lines.append(_governor)
-    if malformed:
-        lines.append([("  +%d malformed jobs.log rows skipped" % malformed, "dim")])
+    lines.extend(_diagnostic_rows(resource_diagnostics, malformed, term_width))
     lines.append([(_HFILL, None)])
     compute_rows = _compute_host_rows(term_width, sessions, resources)
     _register_compute_folds(len(lines))
@@ -6449,7 +6508,9 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
             and not _orphan_resource_groups(resources, ())):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
-        lines.append([("  loading sessions…" if loading else "  no active route", "dim")])
+        message = ("  loading sessions…" if loading else "  작업 목록 미확인"
+                   if _jobs_unconfirmed(observations) else "  no active route")
+        lines.append([(message, "dim")])
         return lines
 
     seen_keys = set()
@@ -7018,9 +7079,30 @@ def _group_emission(g, show_sessions, show_jobs, gpu_resources=None,
             "gpu_strip_keys": strip_keys, "classified": classified}
 
 
+def _jobs_unconfirmed(observations):
+    return (observations or {}).get("jobs", {}).get("state") in ("failed", "stalled")
+
+
+def _observation_lines(observations, term_width=None):
+    lines = []
+    for source, health in (observations or {}).items():
+        if health.get("state") not in ("failed", "stalled"):
+            continue
+        name = {"jobs": "작업", "herdr": "pane 연결", "governor": "실행 용량",
+                "compute hosts": "연산 장치"}.get(source, source)
+        age = health.get("age")
+        if health.get("last_success_at") is not None:
+            age = time.monotonic() - health["last_success_at"]
+        text = "  %s 미확인 · 마지막 관측 %s · %s" % (
+            name, _refresh_age_label(age), health.get("last_error") or "수집 지연")
+        lines.append([(_clip_w(text, term_width) if term_width else text, "lvl_y")])
+    return lines
+
+
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
                  term_width=None, live_order=None, resources=None, usage_snapshots=None,
-                 governor=_IO_UNSET, loading=False):
+                 governor=_IO_UNSET, loading=False, node_evidence=None,
+                 route_entities=None, observations=None, resource_diagnostics=None):
     """Return a flat list of segment-lines for the whole screen (None = blank line).
 
     Side effect: refreshes the module-level `_SELECTABLE` stash (F-27) — see its definition.
@@ -7034,61 +7116,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     global _SELECTABLE, _FOLDABLE
     _SELECTABLE = []     # reset before any early return — a stale target map must never survive
     _FOLDABLE = []
-    # Direct managed-row callers use the same parent decision as collect_all.
-    # Existing collector verdicts (including grace) never advance a second tick.
-    from .collectors import resolve_parent_edges
-    resolve_parent_edges(sessions, [j for j in jobs
-                                   if (getattr(j, "parent_managed_dir", None)
-                                       or getattr(j, "_registry_metadata", None))
-                                   and not hasattr(j, "_parent_edge_promoted_orphan")])
-    # Direct hermetic callers from pre-v16 tests may construct rows without running the
-    # collector boundary.  Use the same shared resolver as the snapshot path; never call
-    # live_stage() or a renderer-specific route resolver. Terminal node evidence is the
-    # collector's read-only input for routes whose live child has already disappeared.
-    _node_evidence = {}
-    _degradations = {}
-    try:
-        from .collectors import dispatch as _dispatch
-        # The first live frame has no published session snapshot yet. Dispatch
-        # can already be filling these side channels in its worker; treating
-        # them as a completed empty census projects every historical route on
-        # the curses thread and stalls adoption of the real first snapshot.
-        if not loading:
-            _node_evidence = getattr(_dispatch.collect, "last_route_nodes", None) or {}
-            _degradations = getattr(_dispatch.collect, "last_degradations", None) or {}
-    except Exception:
-        _node_evidence = {}
-        _degradations = {}
-    if jobs and all(getattr(entity, "work_projection", None) is None
-                    for entity in list(sessions) + list(jobs)):
-        try:
-            from .projection import attach_projections
-            attach_projections(sessions, jobs, node_evidence=_node_evidence, now=time.time(),
-                               degradations=_degradations, resources=resources)
-        except Exception:
-            pass
-    # A completed route can have no live entity at all.  Keep an ephemeral projection
-    # carrier so process rendering still consumes the common attached route view; it is
-    # never added to display_jobs and therefore cannot create a phantom job row.
-    _projection_entities = list(sessions) + list(jobs)
-    if not _projection_entities and _node_evidence:
-        try:
-            from .model import DispatchJob
-            from .projection import attach_projections
-            for _rid, _nodes in _node_evidence.items():
-                _ev = next(iter((_nodes or {}).values()), {})
-                _rf = _ev.get("route_file") if isinstance(_ev, dict) else None
-                _rn = next(iter((_nodes or {}).keys()), None)
-                if not _rf or not _rn:
-                    continue
-                _carrier = DispatchJob(key="", slug="", route_id=_rid, route_file=_rf,
-                                       route_hash=_ev.get("route_hash"), route_node=_rn,
-                                       liveness="done")
-                attach_projections([], [_carrier], node_evidence=_node_evidence, now=time.time(),
-                                   degradations=_degradations)
-                _projection_entities.append(_carrier)
-        except Exception:
-            pass
+    _node_evidence = node_evidence or {}
+    _projection_entities = list(sessions) + list(jobs) + list(route_entities or [])
     # v16: route authority is attached by collectors/projection.py before this surface.
     # Rendering never reopens a route file or calls dispatch-only stage discovery.
     _route_views_by_id = {}
@@ -7128,8 +7157,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         process_lines = _build_process_lines(
             sessions, display_jobs, _route_views_by_id, malformed, memory,
             term_width, layout, node_evidence=_node_evidence, governor=governor,
-            resources=resources, loading=loading)
-        top_rows = _top_rows(term_width, narrow)
+            resources=resources, loading=loading, observations=observations,
+            resource_diagnostics=resource_diagnostics)
+        top_rows = _top_rows(term_width, narrow) + _observation_lines(observations, term_width)
         for entry in _FOLDABLE + _SELECTABLE:
             entry["line"] += len(top_rows)
         return top_rows + process_lines
@@ -7285,7 +7315,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
 
     # The product identity is a distinct, quiet title block. Keep one breathing row
     # before account usage begins instead of letting the two metadata zones touch.
-    lines = _top_rows(term_width, narrow)
+    lines = _top_rows(term_width, narrow) + _observation_lines(observations, term_width)
     _seen_glyphs = set()
     # F-98b's "both endpoints on screen" rule is retired (user 2026-09-09): an off-screen
     # peer now gets the same line, labelled by name or `<harness>:<sid8>` instead of a tag.
@@ -7299,12 +7329,21 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # fleet pulse — htop's "Tasks: N, M running" analogue: whole-board census + live spend Σ
     # Show the row by default; counts skip app-server companions. Extracted into _pulse_segs
     # (F-30, v10) so the process view (§5.1) shares this EXACT row instead of a second copy.
-    lines.append(_pulse_segs(sessions, display_jobs, loading=loading))
+    lines.append(_pulse_segs(sessions, display_jobs, loading=loading, observations=observations))
     _governor = _governor_segs(governor)       # F-28c — snapshot-owned in the live loop
     if _governor is not None:                  # counts (I8); None = source absent or quiet.
         lines.append(_governor)
     if _SHOW_ALL:
-        _mem_events = _mem_event_rows(memory)
+        _repo_ids = set()
+        for name in order:
+            if emission_by_group[name]["empty"] or emission_by_group[name]["fold"]:
+                continue
+            _events = (memory or {}).get("by_repo", {}).get(name, [])
+            _shown_keys = {_memory_event_key(e) for e, _count in
+                           _memory_event_groups(_events)[:_MEM_REPO_ROW_LIMIT]}
+            _repo_ids.update(e["id"] for e in _events if e.get("id")
+                             and _memory_event_key(e) in _shown_keys)
+        _mem_events = _mem_event_rows(memory, term_width=term_width, excluded_ids=_repo_ids)
         if _mem_events:
             lines.extend(_mem_events)
             _seen_glyphs.add("mem")
@@ -7827,7 +7866,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         repo_events = (memory or {}).get("by_repo", {}).get(name) if memory else None
         if repo_events:
             lines.append(_mem_divider(term_width))
-            lines.extend(_mem_repo_rows(repo_events, sid_titles))
+            lines.extend(_mem_repo_rows(repo_events, sid_titles, term_width=term_width))
 
         # group BODY (round-5): every row of the group rides the body tint — the whole directory
         # The whole directory block is one panel, brighter when active.
@@ -7865,12 +7904,15 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                       (names[:90] + ("…" if len(names) > 90 else ""), "dim")])
 
     if not order:
-        lines.append([("  loading sessions…" if loading else
-                       "  (no active sessions or dispatch jobs)", "dim")])
+        message = ("  loading sessions…" if loading else "  작업 목록 미확인"
+                   if _jobs_unconfirmed(observations) else
+                   "  (no active sessions or dispatch jobs)")
+        lines.append([(message, "dim")])
 
-    if malformed:
+    diagnostic_rows = _diagnostic_rows(resource_diagnostics, malformed, term_width)
+    if diagnostic_rows:
         lines.append(None)
-        lines.append([("  +%d malformed jobs.log rows skipped" % malformed, "dim")])
+        lines.extend(diagnostic_rows)
 
     # legend — status dots (columns are labelled by the header row). F-12(c): working/idle/
     # dispatch/`~` are always-relevant vocabulary and stay unconditional; the rest only appear
@@ -8021,7 +8063,8 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     hosts_read = (background_read(compute_hosts_refresh)
                   if callable(compute_hosts_refresh) else None)
     try:
-        sessions, jobs = collect_all(harness_filter=hfilter)
+        snapshot = as_snapshot(collect_all(harness_filter=hfilter))
+        sessions, jobs = snapshot
     except BaseException:
         # Drain both reads. Preserve the original serial failure priority:
         # hosts before sessions before governor (normally fail-soft).
@@ -8035,12 +8078,21 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     else:
         try:
             governor_snapshot = governor_read.result()
+        except Exception as exc:
+            governor_snapshot = None
+            snapshot.observations["governor"] = {
+                "state": "failed", "last_error": "%s: %s" % (type(exc).__name__, exc)}
         finally:
             if hosts_read is not None:
-                set_compute_hosts(hosts_read.result())
-    resources = list(getattr(collect_all, "last_resource_jobs", []))
-    usage_snapshots = dict(getattr(collect_all, "last_usage_snapshots", {}))
-    malformed = _malformed()
+                try:
+                    set_compute_hosts(hosts_read.result())
+                except Exception as exc:
+                    snapshot.observations["compute hosts"] = {
+                        "state": "failed", "last_error": "%s: %s" % (type(exc).__name__, exc)}
+    resources = snapshot.resources
+    usage_snapshots = snapshot.usage_snapshots
+    malformed = snapshot.malformed
+    resource_diagnostics = snapshot.resource_diagnostics
     mem_snapshot = _collect_memory()
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
@@ -8054,7 +8106,9 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
         lines = _build_lines(sessions, jobs, section, narrow=False, malformed=malformed,
                              layout=_layout_mode(tw), memory=mem_snapshot, term_width=tw,
                              resources=resources, usage_snapshots=usage_snapshots,
-                             governor=governor_snapshot)
+                             governor=governor_snapshot, node_evidence=snapshot.node_evidence,
+                             route_entities=snapshot.route_entities, observations=snapshot.observations,
+                             resource_diagnostics=resource_diagnostics)
     finally:
         _GIT_TELEMETRY = previous_git_telemetry
     colored = bool(getattr(sys.stdout, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
@@ -8081,9 +8135,7 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
 def _malformed():
     try:
         from .collectors import dispatch
-        from .collectors import resource_runs
-        return (getattr(dispatch.collect, "last_malformed", 0)
-                + getattr(resource_runs.collect, "last_malformed", 0))
+        return getattr(dispatch.collect, "last_malformed", 0)
     except Exception:
         return 0
 
@@ -8785,7 +8837,8 @@ def reset_scroll():
 
 
 def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=None,
-          resources=None, usage_snapshots=None, governor=None, loading=False):
+          resources=None, usage_snapshots=None, governor=None, loading=False, snapshot=None,
+          resource_diagnostics=None):
     global _OFFSET, _TOGGLE_ROWS, _CLICK_ROWS, _FOLD_ROWS, _PROMPT_HITS, _CURSOR_ID
     # reset before any early-return so a stale map never survives a click (§4.1 pattern) —
     # _PROMPT_HITS in particular must never carry the PRIOR stage's coordinates into this
@@ -8801,7 +8854,11 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     lines = _build_lines(sessions, jobs, section, narrow, malformed, layout=_layout_mode(w),
                          memory=memory, term_width=w, live_order=live_order,
                          resources=resources, usage_snapshots=usage_snapshots,
-                         governor=governor, loading=loading)
+                         governor=governor, loading=loading,
+                         node_evidence=snapshot.node_evidence if snapshot else None,
+                         route_entities=snapshot.route_entities if snapshot else None,
+                         observations=snapshot.observations if snapshot else None,
+                         resource_diagnostics=snapshot.resource_diagnostics if snapshot else resource_diagnostics)
     body_h = max(1, h - 1)   # reserve 1 footer row
 
     # F-27: the cursor tracks a ROW, so the viewport follows it (not the reverse). Done before
@@ -8926,16 +8983,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     detail_generation = 0
 
     def collect_snapshot():
-        sessions, jobs = collect_all(harness_filter=hfilter, fast_first=True)
-        from .collectors import dispatch
-        snapshot = LiveSnapshot(
-            sessions=list(sessions), jobs=list(jobs),
-            resources=list(getattr(collect_all, "last_resource_jobs", [])),
-            usage_snapshots=dict(getattr(collect_all, "last_usage_snapshots", {})),
-            malformed=_malformed(),
-            node_evidence=getattr(dispatch.collect, "last_route_nodes", None) or {},
-            hearting=dict(_HEARTING) if isinstance(_HEARTING, dict) else None,
-        )
+        snapshot = as_snapshot(collect_all(harness_filter=hfilter, fast_first=True))
+        snapshot.hearting = dict(_HEARTING) if isinstance(_HEARTING, dict) else None
         # Publication makes these rows immutable to the detail worker. Every
         # basic tick stays cheap even while that worker is delayed on NAS.
         latest_basic[0] = snapshot
@@ -8945,10 +8994,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         source = latest_basic[0]
         governor = _collect_governor()
         detail_refresh = getattr(collect_all, "detail_refresh", None)
-        if source is None:
-            value = LiveSnapshot()
-            result = details.DetailSnapshot(None, value)
-        elif callable(detail_refresh):
+        if callable(detail_refresh):
             result = detail_refresh(source)
             value = result.snapshot
         else:
@@ -8973,7 +9019,6 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     pump.start()
     # Existing coalescing/last-good semantics, independent of basic refresh.
     detail_pump = RefreshPump(collect_details, interval, name="fleet-detail-refresh")
-    detail_pump.start()
     basic_snapshot = snapshot
     latest_detail = None
     compute_host_refresh = getattr(collect_all, "compute_hosts_refresh", None)
@@ -8997,12 +9042,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     governor_snapshot = snapshot.governor
     set_refresh_health(
         snapshot=pump.health(time.monotonic()),
+        details=detail_pump.health(time.monotonic()),
         compute_hosts=(compute_host_pump.health(time.monotonic())
                        if compute_host_pump is not None else None))
     stdscr.timeout(200)                     # getch blocks ≤200ms → responsive keys
     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
           live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-          governor=governor_snapshot, loading=(generation == 0))
+          governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
     try:
         while True:
             # Wake at the next 0.1s spinner frame while staying key-responsive. Collection
@@ -9013,11 +9059,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             now = time.time()
             now_mono = time.monotonic()
             pump.request_due(now=now_mono)
-            detail_pump.request_due(now=now_mono)
+            if latest_basic[0] is not None:
+                detail_pump.request_due(now=now_mono)
             if compute_host_pump is not None:
                 compute_host_pump.request_due(now=now_mono)
             set_refresh_health(
                 snapshot=pump.health(now_mono),
+                details=detail_pump.health(now_mono),
                 compute_hosts=(compute_host_pump.health(now_mono)
                                if compute_host_pump is not None else None))
             update = pump.poll(generation)
@@ -9065,14 +9113,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _handle_prompt_key(ch)
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                      governor=governor_snapshot, loading=(generation == 0))
+                      governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
                 continue
             if _SELECT_MODE:
                 if _handle_select_key(ch):
                     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                           live_order=live_order, resources=resources,
                           usage_snapshots=usage_snapshots, governor=governor_snapshot,
-                          loading=(generation == 0))
+                          loading=(generation == 0), snapshot=snapshot)
                     continue
             elif ch in (ord("s"), ord("S"), ord("x"), ord("X")):
                 # Enter selection mode. `x` doubles as the enter shortcut so the "press x to kill"
@@ -9081,7 +9129,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _set_action("no selectable rows")
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                      governor=governor_snapshot, loading=(generation == 0))
+                      governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
                 continue
 
             # --- base mode: scroll keys UNCHANGED (F-27 regression budget = 0) ---
@@ -9103,7 +9151,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             # Redraw every wake for the spinner/blink; curses doupdate emits only changed cells.
             _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                   live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                  governor=governor_snapshot, loading=(generation == 0))
+                  governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
     finally:
         pump.stop(join_timeout=1.0)
         detail_pump.stop(join_timeout=1.0)

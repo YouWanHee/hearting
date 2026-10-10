@@ -60,7 +60,7 @@ def assigned_tag(harness, sid):
             return None
     except (OSError, ValueError, TypeError):
         return None
-    refresh([])
+    assign([])
     try:
         row = _read(path).get((harness, sid))
         return row["tag"] if row else None
@@ -146,8 +146,8 @@ def _keep(row, panes_known):
     return not (panes_known and row.get("pane_id"))
 
 
-def refresh(sessions):
-    """Fleet's ordinary collection seeds/refreshes all assignments under one lock.
+def assign(sessions):
+    """Seed/refresh assignments under one lock without waiting for pane writes.
 
     Unknown consumers only read the resulting snapshot. A corrupt file is left
     untouched; a later normal collection can seed a missing file automatically.
@@ -215,11 +215,22 @@ def refresh(sessions):
                 finally:
                     if os.path.exists(temp):
                         os.unlink(temp)
-        # Metadata alone: no session identity, status, lifecycle or user input.
-        # Retry mismatches on each normal refresh, including panes currently idle.
-        from .herdr_projection import refresh_tag_metadata
         assigned = {(row["harness"], row["session_id"]) for row in rows}
-        refresh_tag_metadata([agent for agent in agents or []
-                              if (agent.get("agent"), (agent.get("agent_session") or {}).get("value")) in assigned])
+        return [agent for agent in agents or []
+                if (agent.get("agent"), (agent.get("agent_session") or {}).get("value")) in assigned]
     except (OSError, ValueError, TypeError, ImportError):
-        pass  # observation must not block any session or consumer
+        return []  # observation must not block any session or consumer
+
+
+def refresh(sessions):
+    """Native metadata callers retain assignment followed by pane projection.
+
+    Fleet publishes assign() results first and sends pane writes through its
+    existing detail worker instead of serializing them in basic collection.
+    """
+    agents = assign(sessions)
+    try:
+        from .herdr_projection import refresh_tag_metadata
+        refresh_tag_metadata(agents)
+    except (OSError, ValueError, TypeError, ImportError):
+        pass

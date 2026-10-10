@@ -107,7 +107,17 @@ def _answers_blocked_owner(row, live):
     """An owner that ended BLOCKED, or with a readable FAIL, waits for a person, not gone
     (`route_authority.answerable_owner_end`): a correction sent to it is kept (`retained`) and
     the next start continues the route with it (dispatch_replacement)."""
-    return not live and bool(route_authority.answerable_owner_end(row.status, row.metadata))
+    if live:
+        return False
+    if route_authority.answerable_owner_end(row.status, row.metadata):
+        return True
+    # A correction to an exactly exited owner belongs to the same continuation.
+    # Keep successful, cancelled, live and unobservable owners out of this path.
+    from dispatch_contract import attempt_process_quiescence
+    from dispatch_replacement import RUNTIME_DEATH_NOTES
+    return (row.status == "done"
+            and row.metadata.get("note") in RUNTIME_DEATH_NOTES
+            and attempt_process_quiescence(row.metadata, terminal_receipt=True).state == "quiescent")
 
 
 def _owner_phase(attempt):
@@ -176,6 +186,11 @@ def submit(jobs, attempt, text, request_id=None):
     request_id = request_id or "input-" + _digest([attempt, digest])[:32]
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
         raise InputError("correction-id-invalid")
+    if row.status in {"open", "running"} and not supervisor_lease_is_held(jobs, row.metadata):
+        # Settlement takes the jobs lock before input admission takes its own
+        # lock. Storage failures leave the same open row available for retry.
+        from dispatch_completion_join import settle_finished_attempt
+        settle_finished_attempt(Path(jobs), row)
     with _locked(jobs, attempt) as (path, value):
         if value is None:
             raise InputError("owner-input-unsupported")
@@ -212,7 +227,7 @@ def _retained_fields(item):
     if item["state"] != "retained":
         return {}
     return {"retained": True,
-            "next_step": "The owner had ended (BLOCKED, or with a FAIL a person may answer with a fix); "
+            "next_step": "The owner had ended; "
                 "this answer is kept for it. Starting the route continues the work in a replacement "
                 "owner that receives this answer first."}
 

@@ -269,5 +269,26 @@ def isolated_env(**kwargs) -> IsolatedEnv:
     return IsolatedEnv(**kwargs)
 
 
+def memory_fixture_env(root: Path) -> dict[str, str]:
+    """Memory-only isolation for shared workflow fixtures, also inherited by children.
+
+    Workflow tests own their runtime/registry fixtures already. Keep those intact
+    while pinning all memory writes and pending decisions to their throwaway root.
+    """
+    root = Path(root) / "memory-fixture"
+    store, state, config = root / "store", root / "state", root / "config"
+    for path in (store, state, config / "hearting"):
+        path.mkdir(parents=True, exist_ok=True)
+    (config / "hearting/memory-sync.json").write_text('{"enabled":false}\n')
+    return {
+        "MEM_STORE": str(store), "MEM_WRITE_EVENTS": str(store / "write-events.jsonl"),
+        "MEM_RECALL_EVENTS": str(state / "recall-events.jsonl"),
+        "MEM_RECALL_RECEIPTS": str(state / "recall-opportunities"),
+        "MEM_CANDIDATE_SEEN": str(state / "candidate-seen"),
+        "XDG_STATE_HOME": str(state), "XDG_CONFIG_HOME": str(config),
+        "MEM_EXCHANGE_AUTO": "0",
+    }
+
+
 def python() -> str:
     return sys.executable

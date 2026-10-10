@@ -23,6 +23,9 @@ import os
 import shutil
 import subprocess
 import time
+from concurrent.futures import wait
+
+from ..refresh import background_read
 
 _TIMEOUT_S = 2.0
 def verified_id_harnesses():
@@ -86,6 +89,14 @@ def list_panes(runner=subprocess.run, which=shutil.which):
     return [p for p in panes if isinstance(p, dict)]
 
 
+class PaneEvidence(tuple):
+    """Unpackable PID evidence with the completeness needed for a negative fact."""
+    def __new__(cls, values, complete=True, errors=()):
+        result = super().__new__(cls, values)
+        result.complete, result.errors = complete, tuple(errors)
+        return result
+
+
 def pane_evidence(panes, runner=subprocess.run, bindings=None):
     """Return shell PIDs, foreground PIDs, and exact Codex PID → thread IDs.
 
@@ -95,21 +106,33 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None):
     """
     shells, fg = set(), set()
     identities = {}
-    for pane in panes or []:
-        if not pane.get("agent"):
-            continue
+    errors = []
+    selected = [pane for pane in panes or [] if pane.get("agent")]
+
+    def read(pane):
         pane_id = pane.get("pane_id")
         if not pane_id:
-            continue
+            raise ValueError("pane id missing")
+        proc = runner(["herdr", "pane", "process-info", "--pane", str(pane_id)],
+                      capture_output=True, text=True, timeout=_TIMEOUT_S)
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError("process-info exit %s" % proc.returncode)
+        info = (json.loads(proc.stdout or "").get("result") or {}).get("process_info")
+        if not isinstance(info, dict):
+            raise ValueError("process-info missing")
+        return info
+
+    # One shared deadline replaces N serial pane deadlines. Daemon reads never
+    # hold the TUI open; subprocess.run still owns each child's timeout/cleanup.
+    reads = [(pane, background_read(lambda pane=pane: read(pane))) for pane in selected]
+    if reads:
+        wait([future for _, future in reads], timeout=_TIMEOUT_S)
+    for pane, future in reads:
+        pane_id = pane.get("pane_id")
         try:
-            proc = runner(["herdr", "pane", "process-info", "--pane", str(pane_id)],
-                          capture_output=True, text=True, timeout=_TIMEOUT_S)
-            if getattr(proc, "returncode", 1) != 0:
-                continue
-            info = (json.loads(proc.stdout or "").get("result") or {}).get("process_info") or {}
-        except Exception:
-            continue
-        try:
+            if not future.done():
+                raise TimeoutError("process-info deadline")
+            info = future.result()
             if info.get("shell_pid"):
                 shells.add(int(info["shell_pid"]))
             for proc_rec in info.get("foreground_processes") or []:
@@ -125,16 +148,19 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None):
                             and isinstance(agent_session.get("value"), str)
                             and proc_rec.get("name") == "codex"):
                         identities.setdefault(pid, set()).add(agent_session["value"])
-        except (TypeError, ValueError):
-            continue
-    return shells, fg, {pid: next(iter(sids)) for pid, sids in identities.items()
-                        if len(sids) == 1}
+        except Exception as exc:
+            errors.append("%s: %s: %s" % (pane_id, type(exc).__name__, str(exc)[:120]))
+    return PaneEvidence((shells, fg, {pid: next(iter(sids)) for pid, sids in identities.items()
+                                    if len(sids) == 1}),
+                        complete=panes is not None and not errors, errors=errors)
 
 
 def pane_pids(panes, runner=subprocess.run, bindings=None):
     """F-100c — ``(shell_pids, foreground_pids)`` for agent panes."""
-    shells, fg, _identities = pane_evidence(panes, runner=runner, bindings=bindings)
-    return shells, fg
+    evidence = pane_evidence(panes, runner=runner, bindings=bindings)
+    shells, fg, _identities = evidence
+    return PaneEvidence((shells, fg), complete=getattr(evidence, "complete", True),
+                        errors=getattr(evidence, "errors", ()))
 
 
 def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
@@ -326,7 +352,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
                 s.herdr_attached = True if lineage(s.pid) == "herdr" else None
             except Exception:
                 s.herdr_attached = None
-        return
+        return {"complete": False, "last_error": "herdr 조회 불가"}
     index = attached_index(agents)
     bindings = {} if pane_bindings is None else pane_bindings
     if pids is None:
@@ -334,7 +360,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
             panes = list_panes()
         pids = pane_pids(panes, bindings=bindings) if panes is not None else None
     shells, fg = pids if pids else (set(), set())
-    probe_ok = pids is not None
+    probe_ok = pids is not None and getattr(pids, "complete", True)
     # A native resume can run inside the still-live foreground runtime. Keep
     # one pane row instead of letting that detached companion make the same
     # display alias ambiguous. Independent live processes remain separate.
@@ -372,9 +398,9 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         harness = str(getattr(s, "harness", "") or "").lower()
         if sid and (harness, sid) in index:
             s.herdr_attached = True
-        elif probe_ok and pid_in_panes(getattr(s, "pid", None), shells, fg):
+        elif pid_in_panes(getattr(s, "pid", None), shells, fg):
             s.herdr_attached = True
-        elif probe_ok or (sid and harness in verified_id_harnesses()):
+        elif probe_ok:
             # herdr answered on both surfaces (or on the id surface for a verified-id
             # harness) and nothing matched → a plain terminal, not a guess.
             s.herdr_attached = False
@@ -404,3 +430,6 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
                     s.session_aliases = list(dict.fromkeys(
                         list(getattr(s, "session_aliases", None) or [])
                         + [other for other in pane_aliases if (harness, other) not in live]))
+    errors = list(getattr(pids, "errors", ()))
+    return {"complete": probe_ok,
+            "last_error": "; ".join(errors) if errors else None if probe_ok else "pane 조회 불가"}
