@@ -746,6 +746,14 @@ allocation usage gate. A tap's
 write time is not a new usage observation: one reset window cannot gain headroom
 from a lower stale value being written again.
 
+An owner-closed review remains the reviewer's FAIL, even when its row's note is
+`completed-marker`; `failure_class=fail` and the owner-overridden closure identify
+that verdict. Approved-fix selection and closure-check admission read the same
+judgment. Existing approved claims retain any omitted FAIL bound by their exact
+completion snapshot, without rewriting the claim, review history or markers.
+The existing cap+1 ceiling still bounds the check; owner disposition retains
+reduced independence rather than an independent PASS.
+
 ### §5.10a. Completion Delivery (model-visible contract)
 
 The parent carries one field, not the carrier taxonomy: every launch receipt that

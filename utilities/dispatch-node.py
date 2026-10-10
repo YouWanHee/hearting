@@ -388,11 +388,7 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=
  )
  if last_kind != "verdict":
   return ()
- last_note = last_meta.get("note", "")
- last_blocking = (
-  last_note == ROUTE.REVIEW_BLOCKING_NOTE
-  or (last_note == "dead-worker-fail" and last_meta.get("failure_class") == "fail")
- )
+ last_blocking = REVIEW_ROUND_CAP.last_verdict_blocking([(last_status, last_meta)], worker_type)
  last_attempt = last_meta.get("attempt_id")
  if not last_blocking or not last_attempt:
   return ()

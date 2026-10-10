@@ -220,7 +220,7 @@ def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs
         rows = [(cols[1], meta) for cols, meta in logical_round_records(rows, jobs=jobs)]
         verdicts = [(status, meta) for status, meta in rows
                     if classify_round_row(status, meta, worker_type="review") == "verdict"]
-        if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
+        if not last_verdict_blocking(verdicts, "review"):
             return fields
         latest = verdicts[-1][1]
         route_path = route_file or canonical_route_path(route["artifact_root"], route["route_id"])
@@ -385,11 +385,9 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
     # live/unsettled rows and the verdictless bound always take precedence.
     verdict_indexes = [index for index, kind in enumerate(kinds) if kind == "verdict"]
     if state in ("admit", "exhausted") and verdict_rounds < cap + 1 and revisions and verdict_indexes:
-        _last_status, last_meta = rows[verdict_indexes[-1]]
-        last_note = last_meta.get("note", "")
-        last_blocking = last_note == REVIEW_BLOCKING_NOTE or (
-            last_note == "dead-worker-fail" and last_meta.get("failure_class") == "fail"
-        )
+        last_row = rows[verdict_indexes[-1]]
+        _last_status, last_meta = last_row
+        last_blocking = _last_round_blocking_verdict([last_row], worker_type)
         last_attempt = last_meta.get("attempt_id")
         if last_blocking and last_attempt and any(
             last_attempt in (revision.get("answers") or ()) for revision in revisions
@@ -452,6 +450,10 @@ def _last_round_blocking_verdict(rows, worker_type):
     if kind != "verdict":
         return False
     note = metadata.get("note", "")
+    if (note == "completed-marker" and metadata.get("failure_class") == "fail"
+            and (metadata.get("worker_type") or worker_type) == "review"):
+        from dispatch_contract import owner_closure_shape
+        return owner_closure_shape(metadata) == "registered-review"
     return note == REVIEW_BLOCKING_NOTE or (
         note == "dead-worker-fail" and metadata.get("failure_class") == "fail"
     )

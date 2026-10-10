@@ -96,6 +96,37 @@ class ClassifyRoundRowTest(unittest.TestCase):
 
 
 class RoundBudgetTest(unittest.TestCase):
+    def test_owner_closed_fail_gets_one_approved_closure_without_becoming_pass(self):
+        closed = row('done', 'completed-marker', failure_class='fail', extra={
+            'attempt_id': 'att-review-2', 'review_gate_closure': 'owner-closure',
+            'review_independence': 'owner-overridden'})
+        rows = [row('done', 'completed-review-blocking', extra={'attempt_id': 'att-review-1'}), closed]
+        revisions = [{'answers': ['att-review-2']}]
+        self.assertTrue(CAP.last_verdict_blocking(rows, 'review'))
+        self.assertTrue(CAP.gate_unmet(rows, 'review'))
+        self.assertEqual(CAP.round_budget(route(), review_node(), rows).state, 'exhausted')
+        budget = CAP.round_budget(route(), review_node(), rows, revisions=revisions)
+        self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds),
+                         ('admit', 'closure-check', 2))
+        self.assertEqual(CAP.marker_round_census(route(), review_node(), rows,
+                         site='registered', revisions=revisions)['closure_class'], 'closure-check')
+        for note in ('completed-review-blocking', 'completed-marker'):
+            later = row('done', note, failure_class='fail' if note.endswith('blocking') else 'pass',
+                        extra={'attempt_id': 'att-review-3'})
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows + [later],
+                                             revisions=revisions).state, 'exhausted')
+        for delta in ({'failure_class': 'pass'}, {'worker_type': 'stage'}, {'review_independence': 'independent'},
+                      {'review_gate_closure': ''}):
+            ordinary = (closed[0], {**closed[1], **delta})
+            self.assertFalse(CAP.last_verdict_blocking([ordinary], 'review'))
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows[:1] + [ordinary],
+                                             revisions=revisions).state, 'exhausted')
+        for status, expected in (('open', 'blocked-live'), ('done', 'blocked-unsettled')):
+            tail = row(status, '', extra={'terminal_conflict': '1',
+                                         'conflicting_terminal_note': 'x'})
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows + [tail],
+                                             revisions=revisions).state, expected)
+
     def test_sd161_parallel_review_legs_keep_capped_identity_without_broadening_other_nodes(self):
         for node_id in CAP.ROUND_CAPPED_NODE_IDS:
             self.assertTrue(CAP.is_round_capped_node({"id": node_id}))
