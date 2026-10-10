@@ -185,14 +185,16 @@ def retry_step(route, armed, jobs, reason):
     """The existing compose surface opens a new leg; no caller input file needed."""
     nodes = [armed["node"], *[node["id"] for node in descendants(route, armed["node"])]]
     run_id = armed["predecessor_id"]
-    base = re.sub(r"__a[1-9][0-9]*$", "", run_id)
+    suffix = re.search(r"__a([1-9][0-9]*)$", run_id)
+    base = run_id[:suffix.start()] if suffix else run_id
     try:
         runs = json.loads(Path(armed.get("resource_registry") or "").read_text())["runs"]
     except (OSError, ValueError, KeyError, TypeError):
         runs = {}  # The new cycle uses a separate registry and output directory.
     if not isinstance(runs, dict):
         runs = {}
-    ordinal = 1
+    # Even a missing registry cannot reuse the attempt that just failed.
+    ordinal = int(suffix.group(1)) + 1 if suffix else 1
     while f"{base}__a{ordinal}" in runs:
         ordinal += 1
     retry = f"{base}__a{ordinal}"

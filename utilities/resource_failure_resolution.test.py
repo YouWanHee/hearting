@@ -168,6 +168,17 @@ module.main()
         self.assertEqual(json.loads(result.stdout), task)
         self.assertIn('fixture-run__a1', task)
 
+    def test_retry_of_a_retry_gets_a_distinct_identity_with_a_missing_registry(self):
+        route, path, jobs, registry, output, ledger, gates = self.fixture()
+        armed = json.loads((ledger.root / 'armed/full-run.json').read_text())
+        armed['predecessor_id'] = 'fixture-run__a1'
+        armed['resource_registry'] = str(output / 'missing-registry.json')
+        step = R.retry_step(route, armed, jobs, 'missing registry')
+        self.assertEqual(step['run_id'], 'fixture-run__a2')
+        registry.write_text(json.dumps({'runs': {'fixture-run__a2': {}}}))
+        armed['resource_registry'] = str(registry)
+        self.assertEqual(R.retry_step(route, armed, jobs, 'changed bytes')['run_id'], 'fixture-run__a3')
+
     def test_owner_override_and_stale_consumer_cannot_resolve(self):
         route, path, jobs, registry, output, ledger, gates = self.fixture()
         directory = SUP.route_module().completion_dir(route["route_id"], jobs=jobs)
