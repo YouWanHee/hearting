@@ -305,8 +305,9 @@ class F97dLegendWidthTest(unittest.TestCase):
             # Every trailing line from the first legend glyph ("working") onward is
             # a legend line — collect all of them, not `texts[-1]` alone (a wrapped
             # legend is now more than one physical line).
-            start = max(i for i, t in enumerate(texts) if "working" in t)
-            yield layout, texts[start:]
+            start = next(i for i, t in enumerate(texts) if "세션: " in t)
+            end = next(i for i in range(start + 1, len(texts)) if "학습·장치: " in texts[i])
+            yield layout, texts[start:end]
 
     def test_legend_wraps_with_zero_overflow_at_every_width(self):
         for term_width in (60, 100, 120, 168):
@@ -325,9 +326,9 @@ class F97dLegendWidthTest(unittest.TestCase):
 
     def test_measured_per_line_widths_at_60_columns(self):
         for kind, repo, wt, expect in (
-            ("primary", None, None, [52]),
-            ("isolated-wt", None, "isolated-wt", [49, 14]),
-            ("foreign-repo", "hearting", None, [49, 16]),
+            ("primary", None, None, [58]),
+            ("isolated-wt", None, "isolated-wt", [55, 14]),
+            ("foreign-repo", "hearting", None, [55, 16]),
         ):
             for layout, legend_texts in self._legend_lines(kind, location_repo=repo,
                                                             location_wt=wt, term_width=60):
@@ -342,7 +343,7 @@ class F97dLegendWidthTest(unittest.TestCase):
                     "foreign-repo", location_repo="hearting", term_width=term_width):
                 self.assertEqual(len(legend_texts), 1,
                                  "unexpected wrap at %d cols/%s" % (term_width, layout))
-                self.assertEqual(render._dw(legend_texts[0]), 69)
+                self.assertEqual(render._dw(legend_texts[0]), 75)
 
 
 class F97cCampaignLabelTest(unittest.TestCase):

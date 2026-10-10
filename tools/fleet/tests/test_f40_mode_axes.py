@@ -13,6 +13,7 @@ from fleet.collectors import dispatch  # noqa: E402
 from fleet import render  # noqa: E402
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class DispatchModeAxesTest(unittest.TestCase):
     @staticmethod
     def _opts_text(job):

@@ -94,7 +94,7 @@ class BundleTest(unittest.TestCase):
                             continue
                         pos = 0
                         for value, key in row:
-                            if value in ("code", "lab", "draft") and key == "name_dim":
+                            if value in ("개발", "실험", "작성") and key == "name_dim":
                                 starts.append(pos)
                             if not render._is_fill(value):
                                 pos += render._dw(value)
@@ -135,7 +135,7 @@ class BundleTest(unittest.TestCase):
             l2 = render._plain(render._dispatch_row_2line(worker, in_card=True)[1])
             self.assertEqual(l2.index("17m"), 4)
             self.assertEqual(l2.index("gpt-6.1-sol"), 20)
-            self.assertEqual(l2.index("code-execute"), 47)
+            self.assertEqual(render._dw(l2[:l2.index("구현")]), 47)
 
     def test_owner_close_rail_preserves_residue_and_dead_resume_evidence(self):
         owner = DispatchJob(key="code", slug="owner", harness="codex", cwd="/work/bundle",
@@ -266,7 +266,7 @@ class BundleTest(unittest.TestCase):
                     self.assertEqual(rows[i][render._STEWARD_LINE_COL + 1:render._RAIL_COL], "  ")
             self.assertTrue(any("┆" in r and "╭" in r for r in rows))
             box = [r for r in rows if "╭" in r or "╰" in r]
-            self.assertTrue(all(r.index(r[-1]) == render._dispatch_box_width(width, render._layout_mode(width)) - 1
+            self.assertTrue(all(render._dw(r[:r.index(r[-1])]) == render._dispatch_box_width(width, render._layout_mode(width)) - 1
                                 for r in box))
             self.assertNotIn("⚑ →", "\n".join(rows))
             self.assertNotIn("⚑ ←", "\n".join(rows))
@@ -318,7 +318,7 @@ class BundleTest(unittest.TestCase):
             render._handle_base_key(ord("c"), 20)
             self.assertTrue(all(render._gpu_commands_folded("gpu", i) for i in (0, 1)))
         self.assertEqual(render._COMPUTE_HOSTS, original)
-        self.assertIn("c GPU cmd", render._plain(render._footer_segs(False, [], 168)))
+        self.assertIn("c:명령", render._plain(render._footer_segs(False, [], 168)))
         fake = mock.Mock()
         render._configure_input(fake, {})
         fake.mousemask.assert_not_called()
@@ -437,12 +437,13 @@ class BundleTest(unittest.TestCase):
                 position = 0
                 starts = []
                 for value, key in row:
-                    if value in ("code", "lab", "draft") and key == "name_dim":
+                    if value in ("개발", "실험", "작성") and key == "name_dim":
                         starts.append(position)
                     if not render._is_fill(value):
                         position += render._dw(value)
                 self.assertEqual(starts, [anchor])
 
+    @mock.patch.object(render, "_SHOW_ALL", True)
     def test_narrow_worker_state_ellipsizes_before_two_cell_border_margin(self):
         worker = DispatchJob(key="code", slug="worker", harness="codex", depth=1,
                              worker_type="review", model="gpt-6.1-sol", effort="xhigh",
@@ -504,12 +505,12 @@ class BundleTest(unittest.TestCase):
                 for row in lines:
                     pos = 0
                     for value, key in row or ():
-                        if key == "name_dim" and value in ("code", "route-frame"):
+                        if key == "name_dim" and value in ("개발", "방향 검토"):
                             starts.append(pos)
                         if not render._is_fill(value):
                             pos += render._dw(value)
                 self.assertEqual(starts, [anchor] * 6)
-                gauges = [row.index("━") for row in rows if "━" in row and "50%" in row]
+                gauges = [render._dw(row[:row.index("━")]) for row in rows if "━" in row and "50%" in row]
                 self.assertEqual(gauges.count(4 + render._HW), 7)  # MAIN + three OWNER/FRAME pairs
                 self.assertEqual(gauges.count(17), 3)              # original worker detail column
                 self.assertEqual(sum("frame 0/1" in row for row in rows if "╰" in row), 3)

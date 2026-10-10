@@ -109,6 +109,15 @@ class ReadingTest(unittest.TestCase):
         self.assertEqual(render._INTERACTION_LABEL["decision"], "답변 필요")
         self.assertEqual(render._INTERACTION_LABEL["permission"], "승인 필요")
 
+    def test_r5_normal_chain_uses_korean_and_keeps_user_names(self):
+        render.set_show_all(False)
+        node = dict(label="route-frame", state="open", mode="debug", intensity="standard")
+        text = render._plain(render._route_chain_node_segs(node, True, {}, True, True))
+        self.assertIn("방향 검토", text)
+        self.assertNotIn("debug", text)
+        node["label"] = "AMI_8ch_fix_2spk_v3"
+        self.assertIn(node["label"], render._plain(render._route_chain_node_segs(node, True, {})))
+
     def test_r7_footer_preserves_keys_at_80_and_100(self):
         for width in (80, 100):
             segs = render._footer_segs(False, [], width)

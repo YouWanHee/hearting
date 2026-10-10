@@ -356,7 +356,11 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     the exact capture procedure above; the only diff was that one label line per width.
     Exception on record: 2026-10-08 the approved shared detail inset and aligned
     MAIN/OWNER/FRAME gauge anchor moved the three context tracks from 12 to 20;
-    these four goldens record that intentional layout change."""
+    these four goldens record that intentional layout change.
+    Exception on record: 2026-10-10 the approved P5 audit fixes add Korean
+    vocabulary, named context and separate state legends; below 138 columns the
+    public renderer now uses the actual narrow layout. The fixed-clock goldens
+    record those R5/R7/R8 changes without adding absent connection rows."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

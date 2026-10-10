@@ -412,6 +412,7 @@ class TitleCapTest(unittest.TestCase):
         self.assertLessEqual(len(name_text), render._TITLE_MAX)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class OptsDialHierarchyTest(unittest.TestCase):
     """user 2026-07-20: "계층적으로 code (mode inten) / boot 순" — the dial reads
     capability (behaviour knobs) / environment, not a flat '·' chain mixing the axes."""
@@ -507,7 +508,7 @@ class OptsDialHierarchyTest(unittest.TestCase):
         text, _key, _mark = render._route_node_text({
             "id": "test", "unit": "verify", "state": "pending",
         })
-        self.assertEqual(text, "test[verify] ○")
+        self.assertEqual(text, "검증[verify] ○")
 
     def test_entry_and_environment_tail_without_knobs(self):
         j = DispatchJob(key="code", slug="s", depth=1, profile="layer2")

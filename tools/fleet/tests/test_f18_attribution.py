@@ -217,6 +217,7 @@ class CodexRolloutAttributionTest(unittest.TestCase):
         self.assertIn("11111111", path)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class RenderDuplicateParentTest(unittest.TestCase):
     def test_duplicate_session_id_renders_child_tree_once(self):
         sessions = [Session(harness="codex", pid=1, cwd="/work/repo", session_id="same", slug="repo", liveness="working"),

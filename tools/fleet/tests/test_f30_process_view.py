@@ -352,7 +352,7 @@ class RenderContentTest(ProcessViewEnv):
         lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("no route record", text)
+        self.assertIn("작업 연결 미확인", text)
         self.assertIn("no-record-job", text)
 
     def test_conductor_not_duplicated_as_degrade_card_when_route_child_is_terminal(self):

@@ -313,7 +313,7 @@ class InstallInfoTest(unittest.TestCase):
         divider = next(i for i, line in enumerate(lines)
                        if line and line[0][0] == render._HFILL)
         header = next(i for i, line in enumerate(lines)
-                      if line and "PROCESS VIEW" in "".join(text for text, _key in line))
+                      if line and "작업 보기" in "".join(text for text, _key in line))
         self.assertEqual(header, divider + 2)
         self.assertIsNone(lines[divider + 1])
         self.assertIsNotNone(lines[header + 1])

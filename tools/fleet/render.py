@@ -1666,7 +1666,9 @@ def _session_stage_segs(entity, working, max_width, tag_by_key=None):
         # vocabulary is the code cycle's, so an autopilot-spec session rendered `spec(direct) :
         # exec` — a code-pipeline stage word under a spec capability (observed live). A tag that
         # can contradict its own capability is worse than no tag.
-        name = _user_label(cap["capability"].replace("autopilot-", ""))
+        name = cap["capability"].replace("autopilot-", "")
+        if not _SHOW_ALL:
+            name = _user_label(name)
         knob_items = [k for k in (cap.get("mode"), cap_intensity) if k]
         # User 2026-09-18 ("메인세션에서 라우팅 스킬도 회색인데?"): on a main row this tag is
         # the ONLY sign of the work it is in — no breadcrumb follows it, unlike the owner card
@@ -2089,7 +2091,7 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
         age_min = int((time.time() - s.mtime) / 60) if s.mtime else (s.elapsed_min or 0)
         segs += [("  ", None), ("done %s" % fmt_min(age_min), "dim")]
     if s.app_server:
-        segs.append(("  app-server", "dim"))
+        segs.append(("  " + ("app-server" if _SHOW_ALL else "앱 연결"), "dim"))
     if s.orphan:
         segs.append(("  worktree-gone", "g_dead"))
 
@@ -2293,19 +2295,29 @@ def _reserve_frame_prefix(segs, rail_col, elapsed_only=False):
     if elapsed_only:
         return segs
     chars = [(ch, None if ch == " " else style) for value, style in prefix for ch in value]
-    if any(_cw(ch) != 1 for ch, _ in chars):
+    # Border positions are display cells. A Korean telemetry label may occupy
+    # two cells per character; retain whole characters while moving its padding.
+    starts, cell = {}, 0
+    for index, (ch, _style) in enumerate(chars):
+        starts[cell] = index
+        cell += _cw(ch)
+    starts[cell] = len(chars)
+    if rail_col not in starts:
         return segs
-    occupied = sum(ch != " " for ch, _ in chars[rail_col:rail_col + 2])
+    rail_index = starts[rail_col]
+    rail_end = next((index for col, index in starts.items() if col >= rail_col + 2), len(chars))
+    occupied = any(ch != " " for ch, _ in chars[rail_index:rail_end])
+    shift = 2 if occupied else 0
     spares = []
-    for index in range(len(chars) - 1, rail_col + 1, -1):
+    for index in range(len(chars) - 1, rail_end - 1, -1):
         if chars[index][0] != " ":
             break
         spares.append(index)
-    if len(spares) < occupied:
+    if len(spares) < shift:
         return segs
-    for index in spares[:occupied]:
+    for index in spares[:shift]:
         chars.pop(index)
-    chars[rail_col:rail_col] = [(" ", None)] * occupied
+    chars[rail_index:rail_index] = [(" ", None)] * shift
     rebuilt = []
     for char, style in chars:
         if rebuilt and rebuilt[-1][1] == style:
@@ -2765,11 +2777,16 @@ def _opts_segs(j, max_width=None):
         # Keep internal mode/profile/shape contracts in the existing all/JSON
         # detail surfaces. The normal row says what the worker is doing.
         action = _user_label(_entry_skill(j) or getattr(j, "key", None))
-        if _is_owner_mode_row(j):
-            action += " 담당"
+        owner = _is_owner_mode_row(j) and action != "담당"
+        suffix = " 담당" if owner else ""
         if max_width is not None:
-            action = _clip_w(action, max_width)
-        return [(action, "name_dim")] if action else [], _dw(action)
+            action = _clip_w(action, max(1, max_width - _dw(suffix)))
+            if _dw(action + suffix) > max_width:
+                suffix = ""
+        segs = [(action, "name_dim")] if action else []
+        if suffix:
+            segs.append((suffix, "dim"))
+        return segs, _dw(action + suffix)
     """F-15a options column — HIERARCHICAL dial (user 2026-07-20: "계층적으로
     code (mode inten) / boot 순"). Three axes, three visual levels instead of the flat
     '·' chain that mixed them: the entry skill heads the dial, its behaviour knobs
@@ -3142,7 +3159,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
     if not _split:
         suffix.extend(br_segs)
     if s.app_server:
-        suffix.append(("  app-server", "dim"))
+        suffix.append(("  " + ("app-server" if _SHOW_ALL else "앱 연결"), "dim"))
     if s.orphan:
         suffix.append(("  worktree-gone", "g_dead"))
     name_txt = _display_session_subject(s)
@@ -4208,6 +4225,8 @@ def _route_chain_node_segs(node, with_knobs, tag_by_key, is_current=False, worki
     and a planned node is `label ○`. A node handed to another session keeps its dim
     `label◌→[tag]` form (`✓→`/`✕→` once closed)."""
     label = node.get("label") or "?"
+    if not _SHOW_ALL:
+        label = _user_label(label)
     handoff_to = node.get("handoff_to")
     if handoff_to:
         tag = (tag_by_key or {}).get((handoff_to.get("harness"), handoff_to.get("session_id")))
@@ -4218,7 +4237,7 @@ def _route_chain_node_segs(node, with_knobs, tag_by_key, is_current=False, worki
     state = node.get("state")
     if state == "planned":
         return [(label + " ○", "dim")]
-    knobs = _route_chain_node_knobs(node, with_knobs)
+    knobs = _route_chain_node_knobs(node, with_knobs and _SHOW_ALL)
     if is_current:
         lit = None
         if state == "open":
@@ -4395,7 +4414,7 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
         detail_indent = (4 + _HW - _CTX_LABEL_W if _route_rides_the_rail(job, None, in_card)
                          else indicator_col + 2)
         return _context_detail_row(
-            job, depth=shown_depth, term_width=term_width, dim=True,
+            job, depth=shown_depth, term_width=_context_content_width(term_width), dim=True,
             indent_width=detail_indent, muted=True)
     summary = getattr(job, "summary", None)
     if not summary:
@@ -4444,7 +4463,10 @@ def _resource_progress_tail(child, room=None):
     if room is not None:
         count_room = room - _dw(suffix)
         if count_room < 1:
-            return ""
+            # At a small viewport retain the observation's age even when the
+            # counter cannot fit beside the complete short work name.
+            age_only = suffix.removeprefix(" · ")
+            return age_only if _dw(age_only) <= room else ""
         count = _clip_w(count, count_room)
     return count + suffix
 
@@ -4482,7 +4504,8 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
     rows = []
     shown_depth = min(depth, 1) if in_card else depth
     indent = _SUBAGENT_IND + "  " * max(0, shown_depth)
-    width = (_dispatch_box_width(term_width) - 2 if in_card else term_width) if term_width else None
+    width = (_dispatch_box_width(term_width) - 2 if in_card else
+             _context_content_width(term_width) - (0 if _PROCESS_VIEW else 2)) if term_width else None
     for child in (getattr(job, "resource_children", ()) if children is None else children):
         if any(child is linked for linked in gpu_children):
             continue
@@ -4902,6 +4925,13 @@ def _resource_log_age(child):
             else "출력 미확인" if getattr(child, "log_path", None) else "로그 없음")
 
 
+def _context_content_width(term_width):
+    if not term_width:
+        return term_width
+    inset = _INSET + _PAD_IN if _TINT_OK and not _PROCESS_VIEW else 0
+    return max(1, term_width - inset - 1)
+
+
 def _context_detail_row(entity, depth=0, term_width=None, dim=False,
                         indent_width=None, muted=False, now_key="now_sub"):
     """One ``<herdr|tty> <gauge> <value>   NOW`` row for every live card.
@@ -4960,11 +4990,13 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     if main_detail and not degrade:
         # MAIN, OWNER and FRAME gauges share the fixed model-column anchor;
         # the WHERE word sits at the shared detail inset, without moving NOW.
-        segs = _pad_to_column(segs, 4 + _HW - _dw("문맥 "))
+        segs = _pad_to_column(segs, 4 + _HW - _dw("문맥"))
     # Use the existing main-row padding so naming context does not move its
     # measured track or NOW anchor. At very small widths the legend names it.
-    if not degrade and sum(_dw(t) for t, _k in segs) + 5 + track + _CONTEXT_VALUE_W <= (term_width or _SUMMARY_FALLBACK_W):
-        segs.append(("문맥 ", "dim"))
+    if main_detail and not degrade:
+        segs.append(("문맥", "dim"))
+    elif not degrade and getattr(entity, "herdr_attached", None) is None:
+        segs[1] = ("문맥" + " " * (_CTX_LABEL_W - _dw("문맥")), "dim")
     segs.extend(_gauge_segs(shown_pct, gauge_width, track=track))
     if shown_pct is None:
         value_text = "—"
@@ -7149,12 +7181,10 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     """One cell budget for plain output and curses, preserving row/map indexes."""
     if term_width and layout == "wide" and term_width < _TWO_LINE_CUTOFF:
         layout = "stack" if term_width < _NARROW_CUTOFF else "narrow"
-    # Producers clip NOW and names with an ellipsis before the final guard.
-    # A tinted panel adds four cells when curses draws it; reserve those here.
-    content_width = (max(1, term_width - 1 - (_INSET + _PAD_IN if _TINT_OK else 0))
-                     if term_width else None)
+    # Each producer owns its framing budget (boxes already reserve their edge).
+    # Context/NOW reserves its actual paint inset before clipping the sentence.
     lines = _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout, memory,
-                                    content_width, live_order, resources, usage_snapshots, governor, loading,
+                                    term_width, live_order, resources, usage_snapshots, governor, loading,
                                     node_evidence=node_evidence, route_entities=route_entities,
                                     observations=observations, resource_diagnostics=resource_diagnostics)
     if term_width is None:
@@ -7862,7 +7892,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                 _sess_bold_ids.update(range(_n0, len(lines)))
             # F-69: main-session rows get the brighter, bold NOW sentence; dispatch
             # subtitles keep the dim supporting weight (see _dispatch_summary_detail_row).
-            detail = _context_detail_row(s, term_width=term_width, now_key="now_main")
+            detail = _context_detail_row(s, term_width=_context_content_width(term_width), now_key="now_main")
             if detail:
                 lines.extend(detail)
             # F-103: the route chain lives in the session's stage cell (last three nodes);
