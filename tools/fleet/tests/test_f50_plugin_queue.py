@@ -312,7 +312,8 @@ class NestingTest(_QueueFixture):
     def test_exact_session_id_match_nests_the_row(self):
         text = self._render([self._session(_SID)], [self._row()])
         self.assertIn("⚡codex task", text)
-        self.assertNotIn("↳", text)
+        # The generic GPU legend explains ↳; the plugin body stays undispatched.
+        self.assertNotIn("↳", text.split("\n  세션:", 1)[0])
         self.assertNotIn("dispatch", text)
         self.assertNotIn("(orphan)", text)
 

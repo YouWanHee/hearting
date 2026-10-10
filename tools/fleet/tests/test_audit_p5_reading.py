@@ -180,6 +180,32 @@ class ReadingTest(unittest.TestCase):
         text = "\n".join(render._plain(x) for x in render._build_lines([], [], "both", False, 0, term_width=80))
         for word in ("세션", "학습·장치", "단계"):
             self.assertIn(word, text)
+        self.assertIn("프로젝트: ● 활동", text)
+        self.assertIn("↳ 전체 명령", text)
+        render.set_show_all(True)
+        render.set_process_view(False)
+        session.liveness, session.session_tag = "dead", "4d"
+        session.steward, session.herdr_attached = True, True
+        for width in (80, 100):
+            text = "\n".join(render._plain(x) for x in render._build_lines(
+                [session], [], "both", False, 0, term_width=width))
+            self.assertIn("0 작업 중", text)
+            self.assertIn("0 대기", text)
+            legend = text[text.index("세션:"):]
+            for word in ("종료", "[번호]", "감독", "좌석", "프로젝트: ● 활동", "↳ 전체 명령"):
+                self.assertIn(word, legend)
+            for word in (" dead ", " session ", " steward ", " pane "):
+                self.assertNotIn(word, legend)
+        sessions = [Session(harness="codex", pid=i, cwd="/work/a", liveness=state)
+                    for i, state in ((1, "working"), (2, "unused"))]
+        jobs = [DispatchJob(key="code", slug="job-%d" % i, cwd="/work/a", liveness="working")
+                for i in range(4)]
+        lines = render._build_lines(sessions, jobs, "both", False, 0, term_width=60)
+        pulse = next(render._plain(x) for x in lines if x and "  fleet " in render._plain(x))
+        self.assertIn("1 작업 중", pulse)
+        self.assertIn("◌ 1 미사용", pulse)
+        self.assertIn("↳ 4 작업(4 실행)", pulse)
+        self.assertLessEqual(render._dw(pulse), 59)
 
     def test_h1_observation_links_only_confirmed_caller_continuity(self):
         parent = Session(harness="claude", pid=1, cwd="/work/a", session_id="new", liveness="working",

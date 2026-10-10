@@ -2,7 +2,7 @@
 
   usage claude code   no usage api — plan quota is console-only
         codex         no usage api — plan quota is console-only
-  fleet ⠋ 2 working   ● 0 idle   ↳ 4 jobs (4 working)
+  fleet ⠋ 2 작업 중  ● 0 대기  ↳ 4 작업(4 실행)
 ─────
   compute resources  1/1
   ◇ gpu  CPU ────────  — thr  · MEM —/—GB  · SWP —/—GB
@@ -29,6 +29,7 @@
 ▍ ⠋ [bb] codex (gpt-6.1-sol·medium)         bb (—)                                                     -  3h 00m
 ▍               문맥────────────────   —
 
-  세션: ⠹ 작업 중   ● 대기   [id] session   [id] steward   ▾N child jobs   ↳ dispatch
-  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량
+  세션: ⠹ 작업 중   ● 대기   [번호] 세션   [번호] 감독   ▾N 하위 작업   ↳ 위임
+  프로젝트: ● 활동
+  학습·장치: ● 실행 · UTIL/VRAM 장치 사용량 · ↳ 전체 명령
   단계: ● 현재  ✓ 완료  ✕ 실패  ○ 예정 · 문맥 %는 대화 사용량
