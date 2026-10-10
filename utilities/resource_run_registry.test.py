@@ -78,20 +78,38 @@ class ResourceRegistryTest(unittest.TestCase):
                             {'boot_id': 'invalid'}, {'boot_host': None}):
                 self.assertIsNone(registry.reboot_evidence({**row, **changes}))
 
+    def test_shared_previous_boot_proof_requires_host_or_local_journal(self):
+        current = {'boot_id': '67138871-1a60-467f-b9dc-d46749025baa', 'boot_host': 'local'}
+        previous = '83f954bc-4963-4dfa-9f2f-c8f3597900a6'
+        with mock.patch.object(registry, 'boot_identity', return_value=current), \
+                mock.patch.object(registry, 'local_boot_history', return_value={previous, current['boot_id']}) as history:
+            self.assertIsNotNone(registry.previous_boot_evidence({'boot_id': previous, 'boot_host': 'local'}))
+            history.assert_not_called()
+            self.assertIsNotNone(registry.previous_boot_evidence({'boot_id': previous}))
+            for identity in ({}, None, {'boot_id': 'bad'}, {'boot_id': current['boot_id']},
+                             {'boot_id': previous, 'boot_host': 'foreign'}, {'boot_id': previous, 'boot_host': None}):
+                self.assertIsNone(registry.previous_boot_evidence(identity))
+            with mock.patch.object(registry, 'local_boot_history', return_value={current['boot_id']}):
+                self.assertIsNone(registry.previous_boot_evidence({'boot_id': previous}))
+
     def test_legacy_boot_reset_requires_all_existing_launch_coordinates(self):
+        current, previous = '67138871-1a60-467f-b9dc-d46749025baa', '83f954bc-4963-4dfa-9f2f-c8f3597900a6'
         row = {'resource_policy': 'supervised-owner', 'started_at': 50, 'starttime': '10000', 'owner_wait': {'bound': True},
                'pid_namespace': os.readlink('/proc/self/ns/pid')}
         with mock.patch.object(registry, '_boot_epoch', return_value=100), \
                 mock.patch.object(Path, 'read_text', return_value='10.0 1.0'), \
                 mock.patch.object(os, 'sysconf', return_value=100), \
-                mock.patch.object(registry, 'legacy_resource_boot', return_value='old'), \
-                mock.patch.object(registry, 'boot_identity', return_value={'boot_id': 'new', 'boot_host': 'local'}), \
-                mock.patch.object(registry, 'local_boot_history', return_value={'old', 'new'}):
+                mock.patch.object(registry, 'legacy_resource_identity', return_value={'boot_id': previous}), \
+                mock.patch.object(registry, 'boot_identity', return_value={'boot_id': current, 'boot_host': 'local'}), \
+                mock.patch.object(registry, 'local_boot_history', return_value={previous, current}):
             self.assertIsNotNone(registry.reboot_evidence(row))
             for changes in ({'started_at': 101}, {'starttime': '500'}, {'started_at': None},
                             {'pid_namespace': 'foreign'}, {'resource_policy': None}, {'boot_id': 'bad'}):
                 self.assertIsNone(registry.reboot_evidence({**row, **changes}))
-            with mock.patch.object(registry, 'local_boot_history', return_value={'new'}):
+            with mock.patch.object(registry, 'local_boot_history', return_value={current}):
+                self.assertIsNone(registry.reboot_evidence(row))
+            with mock.patch.object(registry, 'legacy_resource_identity',
+                    return_value={'boot_id': previous, 'boot_host': 'foreign'}):
                 self.assertIsNone(registry.reboot_evidence(row))
         with mock.patch.object(registry, '_boot_epoch', return_value=None):
             self.assertIsNone(registry.reboot_evidence(row))
@@ -114,6 +132,10 @@ class ResourceRegistryTest(unittest.TestCase):
                         'boot_id': '83f954bc-4963-4dfa-9f2f-c8f3597900a6'}
             state.write_text(json.dumps({'claims': {'token': {'claimant_identity': identity}}}))
             self.assertEqual(registry.legacy_resource_boot(row), identity['boot_id'])
+            state.write_text(json.dumps({'claims': {'token': {'claimant_identity': identity},
+                'ambiguous': {'claimant_identity': {**identity, 'boot_id': '67138871-1a60-467f-b9dc-d46749025baa'}}}}))
+            self.assertIsNone(registry.legacy_resource_boot(row))
+            state.write_text(json.dumps({'claims': {'token': {'claimant_identity': identity}}}))
             for change in ({'owner_pid': 124}, {'owner_start': '457'}, {'route_hash': 'foreign'},
                            {'jobs': 'foreign'}, {'parent_attempt_id': 'foreign'}):
                 self.assertIsNone(registry.legacy_resource_boot({**row, 'owner_wait': {**row['owner_wait'], **change}}))

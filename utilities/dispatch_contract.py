@@ -3713,7 +3713,9 @@ def attempt_process_quiescence(
 ) -> ProcessQuiescence:
     """Classify the exact governed process, then prove no tagged descendant survives.
 
-    The leader/process-group verdict below is left exactly as it was; it is only
+    A retained claim proving this host's past kernel settles the whole process
+    tree before consulting potentially reused PIDs. Contradictory or foreign
+    boot evidence stays unverifiable. Otherwise the leader/group verdict is
     post-processed on its way to ``quiescent``. That is the one verdict a false
     negative can turn into a duplicate launch, and it is also the rare one, so
     the ``/proc`` scan runs only at the moment quiescence is about to be
@@ -3721,6 +3723,16 @@ def attempt_process_quiescence(
     previous meaning to the letter, with one exception: a receiptless row whose
     recorded namespaces are extinct on the host (`_namespace_extinct_quiescence`).
     """
+
+    from resource_run_registry import recorded_governor_identity, previous_boot_evidence, boot_identity
+    identity = recorded_governor_identity(metadata)
+    if identity:
+        if previous_boot_evidence(identity):
+            return ProcessQuiescence("quiescent", "host-reboot")
+        current_boot = boot_identity()
+        if not current_boot or (identity.get('boot_id') != current_boot['boot_id']
+                or ('boot_host' in identity and identity['boot_host'] != current_boot['boot_host'])):
+            return ProcessQuiescence("unverifiable", "process-boot-unverifiable")
 
     # A terminal namespace-local row can become visible before its wrapper has
     # finished publishing the portable post-exit receipt.  Local PID/group and

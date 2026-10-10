@@ -12,6 +12,8 @@ class IdentityWitnessTest(unittest.TestCase):
         identity = G.capture_local_identity()
         self.assertEqual(identity["pid"], os.getpid())
         self.assertTrue(identity["starttime"])
+        from resource_run_registry import boot_identity
+        self.assertEqual(identity['boot_host'], boot_identity()['boot_host'])
 
     def test_held_witness_is_live_and_close_removes_exact_file(self):
         with tempfile.TemporaryDirectory() as td:
