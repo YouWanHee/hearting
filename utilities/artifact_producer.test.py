@@ -5194,6 +5194,10 @@ class RouteLineageBindingTest(ProducerTestBase):
         """Snapshot fixture bytes and symlink targets to prove judgments are pure."""
         state = {}
         for path in sorted(self.root.rglob("*")):
+            # D-120 permits disposable lookup caches; purity concerns the
+            # records/evidence, not rebuilding these two derived projections.
+            if path.name in (".route-children-index.json", ".cycle-routes-index.json"):
+                continue
             relative = path.relative_to(self.root).as_posix()
             mode = path.lstat().st_mode
             if path.is_symlink():

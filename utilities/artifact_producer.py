@@ -67,6 +67,7 @@ import artifact_manifest  # noqa: E402
 import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
 import route_lineage  # noqa: E402
+import directory_record_index  # noqa: E402
 import dispatch_contract  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
@@ -713,6 +714,9 @@ def _write_cycle_record(root: Path, record: Dict[str, Any], *, exclusive: bool) 
     else:
         _write_atomic(path, data, 0o600)
 
+    directory_record_index.published(path, record, kind="cycle-routes",
+                                     classify=directory_record_index.cycle_keys)
+
 
 def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str,
                          *, started_on: Optional[str] = None) -> None:
@@ -725,19 +729,38 @@ def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str,
     _write_exclusive(marker, data)
 
 
-def list_cycle_records(root: Path) -> List[Dict[str, Any]]:
+def list_cycle_records(root: Path, *, route_ids=None) -> List[Dict[str, Any]]:
     directory = producer_dir(root) / "cycles"
     rows: List[Dict[str, Any]] = []
-    for entry in sorted(directory.iterdir(), key=lambda p: p.name) if directory.is_dir() else []:
-        if entry.suffix == ".json":
-            value = _read_json(entry)
-            if value is not None:
-                rows.append(value)
+    if route_ids is not None:
+        route_ids = set(route_ids)
+        rows = directory_record_index.select(directory, route_ids, kind="cycle-routes",
+                                              classify=directory_record_index.cycle_keys, read_json=_read_json)
+    else:
+        for entry in sorted(directory.iterdir(), key=lambda p: p.name) if directory.is_dir() else []:
+            if entry.suffix == ".json" and entry.name != ".cycle-routes-index.json":
+                value = _read_json(entry)
+                if value is not None:
+                    rows.append(value)
     index = _read_json(artifact_admission._index_path(root)) or {}
-    known = {row.get("cycle_id") for row in rows}
-    for cycle_id in sorted(set(index.get("cycles") or {}) - known):
+    if route_ids is None:
+        known = {row.get("cycle_id") for row in rows}
+        candidates = set(index.get("cycles") or {}) - known
+    else:
+        # Admitted manifests recover removed producer records. Their existing
+        # route projection narrows recovery too; unindexed legacy rows retain
+        # the original read-and-filter fallback.
+        projected, matching = set(), set()
+        for bucket in (index.get("routes") or {}).values():
+            for route_id, item in bucket.items():
+                projected.add(item.get("cycle_id"))
+                if route_id in route_ids:
+                    matching.add(item.get("cycle_id"))
+        known = {row.get("cycle_id") for row in rows}
+        candidates = (matching | (set(index.get("cycles") or {}) - projected)) - known - {None}
+    for cycle_id in sorted(candidates):
         record = read_cycle_record(root, cycle_id)
-        if record is not None:
+        if record is not None and (route_ids is None or record.get("route_id") in route_ids):
             rows.append(record)
     return rows
 
@@ -796,7 +819,7 @@ def _qualified_continuation(entry_stem: str, candidate: Any, route_id: Optional[
         return False
     if route_hash_value is not None and candidate.get("source_route_hash") != route_hash_value:
         return False
-    return route_identity.route_hash(candidate) == candidate.get("route_hash")
+    return bool(directory_record_index.route_keys(entry_stem + ".json", candidate))
 
 
 class _RouteEdges:
@@ -898,11 +921,25 @@ def _route_edges(root: Path) -> Mapping[Tuple[str, Any], List[Dict[str, Any]]]:
 def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[Dict[str, Any]]:
     """Every continuation whose sealed edge names ``route_id``/``route_hash_value`` as its source.
 
-    The directory is read through `_route_edges` (once per process while it is unchanged); the
-    edges are copied out so a caller's edit never reaches the next one."""
+    A listing-bound disposable index survives CLI processes. Only the selected
+    sealed child files are parsed on a hit; missing/stale/corrupt indexes scan
+    the original records and repair themselves."""
     return [copy.deepcopy(child)
-            for child in _route_edges(root).get((route_id, route_hash_value), [])
+            for child in _indexed_route_children(root, route_id, route_hash_value)
             if not _closed_unexecuted_continuation(root, child)]
+
+
+def _indexed_route_children(root: Path, route_id: str, route_hash_value: str):
+    def classify(name, candidate):
+        return ([directory_record_index.route_key(candidate["source_route_id"], candidate.get("source_route_hash"))]
+                if _qualified_continuation(Path(name).stem, candidate) else [])
+    try:
+        return directory_record_index.select(
+            _routes_dir(root), [directory_record_index.route_key(route_id, route_hash_value)],
+            kind="route-children", classify=classify, read_json=_read_json,
+            ignored=directory_record_index.ROUTE_SIDECARS)
+    except OSError:
+        return list(_route_edges(root).get((route_id, route_hash_value), []))
 
 
 def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
@@ -917,7 +954,7 @@ def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> boo
             or outcome.get("route_id") != route["route_id"]
             or outcome.get("route_hash") != route["route_hash"]
             or outcome.get("terminal_gate_proven") is not False
-            or _route_edges(root).get((route["route_id"], route["route_hash"]))):
+            or _indexed_route_children(root, route["route_id"], route["route_hash"])):
         return False
     try:
         module = artifact_lifecycle._load_capability_route()
@@ -987,7 +1024,7 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
                 return LineageHandover(False, frozenset())  # a cycle in the lineage is never closed
             tree.add(child["route_id"])
             queue.append(child)
-    others = {rec.get("route_id") for rec in list_cycle_records(root)
+    others = {rec.get("route_id") for rec in list_cycle_records(root, route_ids=tree)
               if rec.get("cycle_id") != record.get("cycle_id")}
     return LineageHandover(True, frozenset(tree & others) - {begin_route["route_id"]})
 
@@ -1018,7 +1055,7 @@ def route_cycle_for(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, 
     except route_lineage.RouteLineageError as exc:
         raise ProducerError(exc.code, exc.detail) from exc
     nearness = {r.get("route_id"): index for index, r in enumerate(lineage)}  # [route, parent, ..., begin route]
-    matches = [rec for rec in list_cycle_records(root) if rec.get("route_id") in nearness]
+    matches = list_cycle_records(root, route_ids=nearness)
     opened = [rec for rec in matches if rec.get("state") == "open" and not rec.get("deleted_at")]
     if len(opened) > 1:
         raise ProducerError("route-cycle-binding-ambiguous", route.get("route_id", ""))
@@ -4734,7 +4771,6 @@ def _finalize_route(root: Path, record: Mapping[str, Any], *, deadline: Optional
     current = begin_route
     visited = {current["route_id"]}
     handed_over: Optional[frozenset] = None  # computed once, and only when a child begins another cycle
-    begin_ids: Optional[Set[Any]] = None
     while True:
         if deadline is not None and time.monotonic() >= deadline:
             raise ProducerError("scan-in-progress")
@@ -4742,9 +4778,9 @@ def _finalize_route(root: Path, record: Mapping[str, Any], *, deadline: Optional
                       if c.get("capability") == record.get("capability")
                       and c.get("effective_intensity") == record.get("intensity")]
         if candidates and handed_over is None:
-            if begin_ids is None:
-                begin_ids = {rec.get("route_id") for rec in list_cycle_records(root)
-                             if rec.get("cycle_id") != record.get("cycle_id")}
+            begin_ids = {rec.get("route_id") for rec in list_cycle_records(
+                root, route_ids={c["route_id"] for c in candidates})
+                         if rec.get("cycle_id") != record.get("cycle_id")}
             if any(c["route_id"] in begin_ids for c in candidates):
                 handed_over = _handed_over_routes(root, record)
         if handed_over:
@@ -9885,7 +9921,7 @@ def require_cycle_output(
         elif record is None:
             # Legacy records can lack a canonical route. Preserve only their
             # original exact begin-route match; continuation still needs proof.
-            candidates = [item for item in list_cycle_records(root) if item.get("route_id") == route_id]
+            candidates = list_cycle_records(root, route_ids={route_id})
             opened = [item for item in candidates if item.get("state") == "open"]
             candidates = opened or candidates
             if len(candidates) > 1:

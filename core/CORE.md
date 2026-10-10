@@ -116,6 +116,12 @@ locator and producer records are bookkeeping, not locks on the files. Recorded
 completion remains a past result, distinct from new completion or execution
 authority. Cleanup leaves running work and deleted payloads alone.
 
+Route-child and cycle-route lookups may keep a disposable on-disk index bound
+to the current directory listing digest. Writers maintain it as part of their
+ordinary publication; readers re-read and validate only the selected records.
+Missing, stale, corrupt or unwritable indexes fall back to the existing scan.
+The index grants no lineage or completion authority and adds no caller step.
+
 The canonical project artifact directory is:
 
 ```text

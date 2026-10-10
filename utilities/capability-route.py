@@ -5769,8 +5769,18 @@ def write_once(path, payload):
         fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     except FileExistsError:
         if path.read_text(encoding="utf-8") != data: raise ValueError("immutable route already exists with different content")
+        _index_published_route(path, payload)
         return
     with os.fdopen(fd,"w",encoding="utf-8") as fh: fh.write(data); fh.flush(); os.fsync(fh.fileno())
+    _index_published_route(path, payload)
+
+
+def _index_published_route(path, payload):
+    if isinstance(payload, dict) and payload.get("route_id") and "nodes" in payload:
+        import directory_record_index
+        directory_record_index.published(path, payload, kind="route-children",
+                                         classify=directory_record_index.route_keys,
+                                         ignored=directory_record_index.ROUTE_SIDECARS)
 
 def completion_dir(route_id, *, jobs=None):
     return resolve_dispatch_state_root(resolve_agent_home(), jobs)/"completion"/route_id
@@ -6602,7 +6612,7 @@ def route_sidecar_kind(path):
     return None
 
 
-def route_status(artifact_root, *, diagnostics=None):
+def route_status(artifact_root, *, diagnostics=None, open_only=False):
     """Report every compiled route under one artifact root and whether it is closed.
 
     Scans the canonical `.runtime/routes/` directory plus four legacy locations
@@ -6623,13 +6633,25 @@ def route_status(artifact_root, *, diagnostics=None):
     rows=[]
     for search_dir in search_dirs:
         if not search_dir.is_dir(): continue
-        for path in sorted(search_dir.glob("*.json")):
+        with os.scandir(search_dir) as stream:
+            entries = sorted(stream, key=lambda entry: entry.name)
+        closed_names = ({entry.name.removesuffix(".outcome.json") for entry in entries
+                         if entry.name.endswith(".outcome.json") and entry.is_file()}
+                        if open_only and diagnostics is None and search_dir == canonical else set())
+        for entry in entries:
+            if not entry.name.endswith(".json") or entry.name == ".route-children-index.json": continue
+            path = search_dir / entry.name
             # SD-OPEN-54 (#15): typed sidecars beside a route record (`.outcome.json`,
             # `.gate-release.json` -- the workflow-supervisor gate ledger) are never
             # route candidates; the ledger used to be read as a route, fail
             # `route-malformed-missing-required-keys`, and turn every quiescence
             # observation of the root fail-closed (hearting rt-5d862a3d..., cairn W15d).
             if route_sidecar_kind(path) is not None: continue
+            # Closed canonical records need no payload read for --open-only.
+            # Retain their filename identity for duplicate-location reporting.
+            if (ROUTE_RECORD_BASENAME.fullmatch(path.name) and path.stem in closed_names):
+                by_route_id.setdefault(path.stem, []).append(str(path))
+                continue
             # A canonical file that is not a route record by name (`rt-<16 hex>.json`)
             # may still be an alias route (drift, reported below); when it does not
             # parse as a route it is foreign evidence, not a malformed route, so its
@@ -6688,7 +6710,7 @@ def route_status(artifact_root, *, diagnostics=None):
         locations=by_route_id.get(row["route_id"],[])
         if len(locations) > 1: row["duplicate_locations"]=sorted(locations)
     rows.sort(key=lambda row:(_LOCATION_SORT_PRIORITY.get(row["location"],9),row["route_file"]))
-    return rows
+    return [row for row in rows if not row["closed"]] if open_only else rows
 
 def _marker_attempt_axes(node, attempt_id, attempt_metadata):
     if attempt_metadata is not None and attempt_metadata.get("stage_authority") == "owner-closure":
@@ -10966,8 +10988,7 @@ def main():
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
-        rows=route_status(a.artifact_root or _compose_artifact_root(os.getcwd()))
-        if a.open_only: rows=[row for row in rows if not row["closed"]]
+        rows=route_status(a.artifact_root or _compose_artifact_root(os.getcwd()), open_only=a.open_only)
         from parent_next_directive import resume_command
         for row in rows:
             if not row["closed"] and not row.get("read_only"):

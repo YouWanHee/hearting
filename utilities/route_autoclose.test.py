@@ -1085,7 +1085,7 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         self.assertEqual(route_autoclose._seal_cycle(self.root, c, False, record=record), "cycle-abandoned")
         self.assertEqual(self._record(cycle)["state"], "sealed")
 
-    def test_the_routes_directory_is_read_once_while_it_is_unchanged(self):
+    def test_unchanged_routes_read_only_the_selected_edges(self):
         a = self._root_route("leftover-edges")
         self._publish_root(a)
         b = self._continuation(a)
@@ -1111,8 +1111,10 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
             read_once = len(reads)
             self.assertGreaterEqual(read_once, 3)            # the scan really parsed the routes
             for _ in range(3):
+                before = len(reads)
                 self.assertEqual(walk(), first)
-            self.assertEqual(len(reads), read_once)          # an unchanged directory is not read again
+                self.assertLessEqual(len(reads) - before, 3)
+                self.assertLessEqual(set(reads[before:]), {b["route_id"], c["route_id"]})
             self.assertEqual(first[1], c["route_id"])
             d = self._continuation(c)                        # the listing changes: it is read again
             os.utime(directory, (stale - 100, stale - 100))
