@@ -191,8 +191,13 @@ module.main()
         data["review_independence"] = "independent"
         marker.write_text(json.dumps(data))
         marker.with_name('verify.1.json').write_text(json.dumps(data))
+        journal = ledger.journal_path.read_bytes()
         (output / "summary.json").write_text('{}')
-        self.assertIn("artifact-changed", self._settle_resource_owner(route, path, jobs)[0].detail)
+        # Marker currency or the bound-byte reader may reject this first,
+        # depending on the existing gate policy; both keep the failure intact.
+        result, commits = self._settle_resource_owner(route, path, jobs)
+        self.assertEqual((result.reason, commits), ('resource-failure-unresolved', 0))
+        self.assertEqual(ledger.journal_path.read_bytes(), journal)
 
     def update_marker(self, route, jobs, node, evidence):
         directory = SUP.route_module().completion_dir(route['route_id'], jobs=jobs)
