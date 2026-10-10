@@ -349,7 +349,7 @@ class SpecGroundingRenderTest(unittest.TestCase):
             source="artifact-inferred", stage_label="spec agent-fleet-dashboard ·dev")
         text = render._projection_stage_text(entity, max_width=24)
         self.assertLessEqual(render._dw(text), 24)
-        self.assertTrue(text.startswith("단계 "))
+        self.assertTrue(text.startswith("stage "))
         self.assertTrue(text.endswith("…"))
 
 

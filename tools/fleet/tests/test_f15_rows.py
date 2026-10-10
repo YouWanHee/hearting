@@ -249,7 +249,7 @@ class FoldingTest(unittest.TestCase):
         running_keys = [key for line in lines if line for t, key in line if t == "running"]
         preparing_keys = [key for line in lines if line for t, key in line if t == "preparing…"]
         self.assertIn("exec agent-first-home-c", text)
-        self.assertIn("구현", text)
+        self.assertIn("code-execute", text)
         self.assertNotIn("dev/refactor·strong·development", text)
         self.assertTrue(any(key in ("stg1_on", "stg1_off") for key in running_keys))
         self.assertTrue(any(key in ("stg0_on", "stg0_off") for key in preparing_keys))
@@ -508,7 +508,7 @@ class OptsDialHierarchyTest(unittest.TestCase):
         text, _key, _mark = render._route_node_text({
             "id": "test", "unit": "verify", "state": "pending",
         })
-        self.assertEqual(text, "검증[verify] ○")
+        self.assertEqual(text, "test[verify] ○")
 
     def test_entry_and_environment_tail_without_knobs(self):
         j = DispatchJob(key="code", slug="s", depth=1, profile="layer2")
