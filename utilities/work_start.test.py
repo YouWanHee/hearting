@@ -1089,6 +1089,20 @@ class WorkStartTest(unittest.TestCase):
             self.assertIn(token,result['next_step'])
         self.assertEqual(len(self.calls),3)   # nothing new launched while it waits
 
+    def test_a_readable_fail_after_spent_replacement_points_to_the_working_correction(self):
+        owner = self._parked_owner_row()
+        self.jobs.write_text(self.jobs.read_text().replace('dead-worker-blocked', 'dead-worker-fail')
+                             .replace('failure_class=blocked', 'failure_class=fail'))
+        with mock.patch('dispatch_replacement.advance', return_value={
+                'state': 'needs-attention', 'reason': 'automatic-replacement-exhausted'}):
+            result = self.start()
+        self.assertEqual((result['state'], result['reason'], result['required_action']),
+                         ('needs-attention', 'owner-failed', 'answer-failed-owner'), result)
+        self.assertIn('--attempt-id ' + owner, result['correction_command'])
+        self.assertIn('correction_command', result['next_step'])
+        self.assertIn('replacement owner', result['next_step'])
+        self.assertEqual(len(self.calls), 3)
+
     def test_released_parked_owner_continues_through_replacement(self):
         owner=self._parked_owner_row()
         row=next(line for line in self.jobs.read_text().splitlines() if 'attempt_id='+owner+',' in line)

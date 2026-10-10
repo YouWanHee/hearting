@@ -308,15 +308,12 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
         found = owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if found and found['status'] == 'proceed':
             return 'parked'
-        # A BLOCKED owner was waiting for an answer no declared gate carries; once a person
-        # sent one (`correct`), the same work continues with it. A gate park keeps its own answer.
-        if (found is None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
-                and _retained_corrections(jobs, meta.get('attempt_id'))):
-            return CORRECTED
+        if found is not None:
+            return None  # a declared gate keeps its own answer path
     if (jobs is not None and meta.get('worker_type') == 'owner'
-            and route_authority.answerable_owner_end(fields[1], meta) == 'FAIL'
+            and route_authority.answerable_owner_end(fields[1], meta)
             and _retained_corrections(jobs, meta.get('attempt_id'))):
-        return CORRECTED  # a person approved a fix for the FAIL it reported; no automatic retry
+        return CORRECTED  # an answered stop is a pause; no automatic retry of an unanswered FAIL
     if (jobs is not None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
             and meta.get('note') in RUNTIME_DEATH_NOTES
             and _retained_corrections(jobs, meta.get('attempt_id'))):
@@ -888,10 +885,6 @@ def claim(jobs: Path, aid: str) -> dict:
             answers, spent = route_authority.fix_answers(route, lines, jobs)
             if not answers and spent:
                 raise DC.DispatchContractError('replacement-fix-round-spent', ','.join(spent))
-            if not answers:
-                # Infrastructure/resource FAIL has no check round to answer.
-                # Use the ordinary one-replacement allowance, not a new pause family.
-                capacity = False
             proof['answers'] = answers
             proof['source_result'] = 'FAIL'
         logical = _logical_key(route, meta)
@@ -1501,7 +1494,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             replacement_fields, replacement_meta = rows[replacement]
             if replacement_fields[1] not in {'open','running'}:
                 if not DC.verdict_pass(replacement_meta):
-                    next_kind = death_kind(replacement_fields, replacement_meta)
+                    next_kind = death_kind(replacement_fields, replacement_meta, jobs=jobs)
                     if next_kind in PAUSE_KINDS or (next_kind and _is_capacity_record(record)):
                         # The replacement stopped at a limit too, or a limit resume died on its
                         # own: it is the next source, and claim() judges the node's budget.

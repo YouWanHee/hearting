@@ -164,6 +164,9 @@ or executable environment is absent, and compose it separately after approval.
 The resource runner continues to enforce route verification, hash-bound smoke
 attestation, config provenance, the governor, and its `supervised` continuation.
 
+For a failed resource run, use `<manifest_run_id>__a<N>` (N starts at 1) on the same route; reusing the previous run ID with a new owner conflicts with its existing watch binding (`resource-watch-binding-conflict`).
+`compute-hosts run` resolves the selected devices to host GPU indices and sets `CUDA_VISIBLE_DEVICES` to those indices (for example `0`), so owner scaffolds must not require that value to be a GPU UUID.
+
 This replaced a graph whose last node was the training process itself. On
 2026-08-04 the BC_ResNet_tf run finished training and its hard-negative loop, the
 wrapper contained no evaluation stage, the resource runner had no completion
