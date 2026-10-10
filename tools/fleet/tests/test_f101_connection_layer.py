@@ -359,8 +359,9 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     these four goldens record that intentional layout change.
     Exception on record: 2026-10-10 the approved P5 audit fixes add Korean
     vocabulary, named context and separate state legends; below 138 columns the
-    public renderer now uses the actual narrow layout. The fixed-clock goldens
-    record those R5/R7/R8 changes without adding absent connection rows."""
+    public renderer now uses the actual narrow layout. Later that day the user
+    requested original technical terms and removal of context/NOW labels. These
+    fixed-clock goldens retain the layout changes without absent connection rows."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

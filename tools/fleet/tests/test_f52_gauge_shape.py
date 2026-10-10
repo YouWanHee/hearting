@@ -316,7 +316,7 @@ class F52WidthLedgerTest(unittest.TestCase):
                 self.assertLessEqual(render._dw(visible), width)
                 self.assertEqual(render._dw(visible[:visible.index("herdr")]),
                                  render._CONTEXT_INDENT_W)
-                self.assertEqual(render._dw(visible[:visible.index("대기")]), render._NAME_COL)
+                self.assertEqual(render._dw(visible[:visible.index("마지막 요약")]), render._NAME_COL)
 
     def test_legend_gained_no_new_entry(self):
         """F-12(c): the lead cell is a STATE mark, already covered by the state legend — the
@@ -325,8 +325,8 @@ class F52WidthLedgerTest(unittest.TestCase):
                           slug="s", elapsed_min=1)
         lines = render._build_lines([session], [], "fleet", False, 0,
                                     layout="wide", term_width=168)
-        legend = next(render._plain(ln) for ln in lines if ln and "세션: " in render._plain(ln))
-        self.assertIn("대기", legend)
+        legend = next(render._plain(ln) for ln in lines if ln and "session: " in render._plain(ln))
+        self.assertIn("idle", legend)
         self.assertNotIn("context", legend)
         self.assertNotIn(FULL, legend)
         self.assertNotIn(EMPTY, legend)

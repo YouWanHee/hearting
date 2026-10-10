@@ -282,12 +282,8 @@ class F97dRowWidthRegressionTest(unittest.TestCase):
 
 
 class F97dLegendWidthTest(unittest.TestCase):
-    """Follow-up (c) / C11 — the legend now WRAPS instead of overflowing past
-    `term_width`. Baseline (no location glyphs seen) measures 52 cells and never
-    wraps at 60; F-97's conditional location legend entries (loc_foreign/loc_wt)
-    push the flat width to 67/69, which now wrap into two lines. This is a planned
-    assertion change, not a baseline regression — see plan.md §3 C11 and
-    dev_logs/slice-C.md for the measured numbers."""
+    """The session legend wraps within the viewport, including location entries.
+    Original technical terms change the measured widths, not the wrap contract."""
 
     def _legend_lines(self, location_kind, location_repo=None, location_wt=None,
                       term_width=60):
@@ -305,8 +301,8 @@ class F97dLegendWidthTest(unittest.TestCase):
             # Every trailing line from the first legend glyph ("working") onward is
             # a legend line — collect all of them, not `texts[-1]` alone (a wrapped
             # legend is now more than one physical line).
-            start = next(i for i, t in enumerate(texts) if "세션: " in t)
-            end = next(i for i in range(start + 1, len(texts)) if "프로젝트: " in texts[i])
+            start = next(i for i, t in enumerate(texts) if "session: " in t)
+            end = next(i for i in range(start + 1, len(texts)) if "project: " in texts[i])
             yield layout, texts[start:end]
 
     def test_legend_wraps_with_zero_overflow_at_every_width(self):
@@ -326,9 +322,9 @@ class F97dLegendWidthTest(unittest.TestCase):
 
     def test_measured_per_line_widths_at_60_columns(self):
         for kind, repo, wt, expect in (
-            ("primary", None, None, [53]),
-            ("isolated-wt", None, "isolated-wt", [50, 19]),
-            ("foreign-repo", "hearting", None, [50, 15]),
+            ("primary", None, None, [45, 12]),
+            ("isolated-wt", None, "isolated-wt", [45, 27]),
+            ("foreign-repo", "hearting", None, [45, 29]),
         ):
             for layout, legend_texts in self._legend_lines(kind, location_repo=repo,
                                                             location_wt=wt, term_width=60):
@@ -343,7 +339,7 @@ class F97dLegendWidthTest(unittest.TestCase):
                     "foreign-repo", location_repo="hearting", term_width=term_width):
                 self.assertEqual(len(legend_texts), 1,
                                  "unexpected wrap at %d cols/%s" % (term_width, layout))
-                self.assertEqual(render._dw(legend_texts[0]), 69)
+                self.assertEqual(render._dw(legend_texts[0]), 78)
 
 
 class F97cCampaignLabelTest(unittest.TestCase):

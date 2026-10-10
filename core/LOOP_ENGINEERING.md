@@ -191,9 +191,16 @@ recorded title and campaign title. Without a usable title, show a short readable
 name with locator dates and execution suffixes removed. Read titles in the
 existing detail pass; never wait for them before publishing basic observations.
 The name does not repeat the same command or execution identity on its line.
-Current execution or wait observations precede generated text. Older titles
-are labelled as previous subjects, and summaries as previous text with their
-own age, including sentences that say work is running or complete.
+Keep technical terms, capability/stage identifiers and short keyboard actions
+in their original notation; use natural Korean for time and brief factual
+explanations. Do not put a translation beside the same original term.
+Current execution or wait observations precede generated text. Session symbols
+already show state; NOW does not repeat a state word, and the context gauge and
+current subject need no labels. Mark a subject as previous only when its known
+successful generation predates a new work boundary or exceeds the existing
+24-hour title window; idle state or an unknown timestamp cannot prove this.
+Summaries remain previous text with their own age, including sentences that
+say work is running or complete. The symbol legend keeps its explanations.
 An incomplete observation cannot establish absence: publish the last observed
 work together with the failed source, its last success and the reason it is
 unconfirmed. Basic and detail refresh share this health vocabulary. Publish
