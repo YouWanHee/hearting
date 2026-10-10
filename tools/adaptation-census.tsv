@@ -22,6 +22,7 @@ shared-utility-deferred	artifact_workflow_group_review.py
 shared-utility-deferred	cairn-artifact-read.sh
 shared-utility-deferred	cairn-artifact-read.ts
 shared-utility-deferred	campaign_title_repair.py
+shared-utility-deferred	directory_record_index.py
 shared-utility-deferred	codex_permission_profile.py
 shared-utility-deferred	compute-hosts
 shared-utility-deferred	context_alert.py
