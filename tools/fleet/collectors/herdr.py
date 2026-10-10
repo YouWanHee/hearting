@@ -328,6 +328,20 @@ def pane_session_aliases(harness, sid, pane, cwd):
         return []
 
 
+def _lineage_attachment(sessions, lineage):
+    """Reuse launcher evidence when the pane surface cannot be observed."""
+    if lineage is None:
+        from . import procscan
+        lineage = procscan.provenance
+    for s in sessions:
+        if not _eligible(s):
+            continue
+        try:
+            s.herdr_attached = True if lineage(s.pid) == "herdr" else None
+        except Exception:
+            s.herdr_attached = None
+
+
 def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None):
     """Set ``herdr_attached`` on every eligible depth-0 session. ``agents`` = a
     pre-fetched ``list_agents()`` result (``None`` → probe once here); ``panes``/``pids``
@@ -340,19 +354,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     if agents is None:
         agents = list_agents()
     if agents is None:
-        if lineage is None:
-            try:
-                from . import procscan
-                lineage = procscan.provenance
-            except Exception:
-                lineage = None
-        for s in sessions:
-            if not _eligible(s) or lineage is None:
-                continue
-            try:
-                s.herdr_attached = True if lineage(s.pid) == "herdr" else None
-            except Exception:
-                s.herdr_attached = None
+        _lineage_attachment(sessions, lineage)
         # Agent-list failure does not erase a supplied foreground observation.
         # For a known herdr process, an absent pane observation cannot confirm
         # its older native registry identity either. Do not issue another probe.
@@ -367,6 +369,8 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         if panes is None:
             panes = list_panes()
         pids = pane_pids(panes, bindings=bindings) if panes is not None else None
+    if panes is None:
+        _lineage_attachment(sessions, lineage)
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None and getattr(pids, "complete", True)
     from ..process_identity import pane_process_claims

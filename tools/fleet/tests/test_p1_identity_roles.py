@@ -133,6 +133,17 @@ class CurrentSessionTest(unittest.TestCase):
         self.assertIsNone(s.status)
         self.assertEqual(s.session_identity_evidence["verdict"], "unobserved")
 
+    def test_pane_list_failure_does_not_reconfirm_herdr_registry(self):
+        s = Session(harness="claude", pid=self.pid, proc_start=self.start, cwd=self.cwd)
+        with mock.patch.object(procscan, "read_proc_start", return_value=self.start), \
+                mock.patch.object(herdr, "list_panes", return_value=None):
+            herdr.enrich([s], agents=[], lineage=lambda _pid: "herdr")
+            claude.enrich(s, tick={self.pid: getattr(s, "_pane_session_claim", None)})
+        self.assertIsNone(s.session_id)
+        self.assertIsNone(s.ctx_pct)
+        self.assertIsNone(s.status)
+        self.assertEqual(s.session_identity_evidence["verdict"], "unobserved")
+
     def test_agent_list_failure_preserves_already_observed_pane_identity(self):
         s = self._enrich_failed_agent_list("herdr", bound=True)
         self.assertEqual(s.session_id, "current")
