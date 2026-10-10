@@ -10,6 +10,19 @@ import resource_run_registry as registry
 
 
 class ResourceRegistryTest(unittest.TestCase):
+    def test_empty_log_has_no_output_timestamp_but_nonempty_log_does(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "resource.log"
+            log.touch()
+            raw = {"status": "succeeded", "log": str(log)}
+            row = registry.normalize_run("run", raw, Path(tmp) / "runs.json")
+            self.assertIsNone(row["log_updated_at"])
+            self.assertEqual(row["log_size"], 0)
+            log.write_text("observed output\n")
+            row = registry.normalize_run("run", raw, Path(tmp) / "runs.json")
+            self.assertEqual(row["log_updated_at"], log.stat().st_mtime)
+            self.assertGreater(row["log_size"], 0)
+
     def test_normalize_preserves_additive_artifact_attribution_fields(self):
         raw = {
             "status": "succeeded",

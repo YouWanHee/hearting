@@ -311,14 +311,20 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
     cwd = run.get("cwd") if isinstance(run.get("cwd"), str) else ""
     log_path = run.get("log") or run.get("log_path")
     log_updated_at = None
+    log_mtime = None
+    log_size = None
     if isinstance(log_path, str) and log_path:
         try:
-            log_updated_at = Path(log_path).stat().st_mtime
+            log_stat = Path(log_path).stat()
+            log_mtime = log_stat.st_mtime
+            log_size = log_stat.st_size
+            if log_stat.st_size > 0:
+                log_updated_at = log_mtime
         except OSError:
             pass
     started_at = _start_epoch(run)
     end = now if liveness == "working" else (
-        run.get("ended_at") if isinstance(run.get("ended_at"), (int, float)) else log_updated_at
+        run.get("ended_at") if isinstance(run.get("ended_at"), (int, float)) else log_mtime
     )
     elapsed_min = max(0, int((float(end) - started_at) / 60)) if started_at and end else None
     training_progress = None
@@ -340,7 +346,7 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "command": (run["command"] if isinstance(run.get("command"), list)
                     and all(isinstance(arg, str) for arg in run["command"]) else None),
         "registry_status": run.get("status"), "registry_path": str(registry),
-        "log_path": log_path, "log_updated_at": log_updated_at,
+        "log_path": log_path, "log_updated_at": log_updated_at, "log_size": log_size,
         "route": run.get("route"), "node": run.get("node"),
         # Root-scoped quiescence consumes these as additive attribution inputs.
         # Existing resource-runner rows carry only route/node; newer ad-hoc

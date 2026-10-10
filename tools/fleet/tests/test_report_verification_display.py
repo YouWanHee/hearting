@@ -95,7 +95,25 @@ class ReportVerificationDisplayTests(unittest.TestCase):
                     self.assertIsNone(self.job.work_projection.report_verification)
                     self.assertEqual(rows, [])
                 else:
-                    self.assertIn(reason, "".join(t for t, _ in rows[0]))
+                    self.assertNotIn(reason, "".join(t for t, _ in rows[0]))
+                    self.assertEqual(self.job.work_projection.report_verification["verification"]["reason"], reason)
+
+    def test_report_detail_stays_inside_owner_card_and_uses_korean_reason(self):
+        self.job.depth = self.job.dispatch_depth = 1
+        self.job.worker_type = "owner"
+        payload = report_verification_projection._display(
+            report_verification_projection._unresolved("report-cycle-unadmitted"))
+        with mock.patch.object(report_verification_projection, "project_route", return_value=payload):
+            projection.attach_projections([], [self.job], route_records={self.record["route_id"]: self.record},
+                                          artifact_root="/tmp", now=100.0)
+        for width in (60, 100, 180):
+            lines = render._build_lines([], [self.job], section="dispatch", narrow=width < 70,
+                                        malformed=0, layout="wide", term_width=width)
+            detail = next(render._plain(line) for line in lines if line and "보고서" in render._plain(line))
+            self.assertIn("│", detail[:detail.index("보고서")])
+            self.assertNotIn("report-cycle-unadmitted", detail)
+            header = next(render._plain(line) for line in lines if line and "╭" in render._plain(line))
+            self.assertLessEqual(render._dw(detail), render._dw(header))
 
 
 if __name__ == "__main__":
