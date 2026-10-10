@@ -113,6 +113,27 @@ loaded when its process started. Runtime-owned credentials, sessions, logs,
 caches, databases, and Codex `config.toml` remain outside this activation
 boundary.
 
+Release cleanup retains trees used by live processes, including their working
+directories and open files. Shared Python dispatch code holds its resolved code
+root open for the process lifetime, so a hook launched through a rotating runtime
+ projection still names the release that supplies its later imports. Older live
+projection processes without that reference conservatively retain their release family
+until they exit. This uses the installer's existing in-use judgment, with no
+additional registry or caller step.
+
+A route's `launch_compatibility_tuple.launch_home.path` is also the source of
+its contract read access. A replacement or child launched after activation
+retains read access to that sealed home's `capabilities/`, alongside its own
+launch home's contracts; it needs no file hash comparison or correction from
+the parent. The installer protects that same sealed home while its route is
+in use, including an unclosed route whose current owner awaits correction to
+a readable BLOCKED or FAIL result. A superseded owner's pause does not retain
+the release after its successor finishes, and closed routes and stale launch
+deaths still release it. Claude projects these directories with edit denies, OpenCode
+allows their external reads with edit denies, and Codex's sandbox already
+permits these reads without adding writable roots. No whole release tree or
+task write scope is granted by this contract access.
+
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
 different physical roots may compare equal only at an explicitly code-root-only
@@ -368,6 +389,15 @@ write admission and completion publication use the same cycle binding. A missing
 cycle environment can be recovered from the route's producer record. Refusals
 name the correct output directory, and node scopes are relative to that directory.
 Another open cycle or a matching filename suffix does not grant write authority.
+
+Cards, peer callbacks and pane reports use `utilities/pane_ownership.py` across
+Claude, Codex and OpenCode. It connects the caller's runtime to the live pane's
+foreground PID, controlling terminal and process-start identity. Environment,
+cwd, title, history and shared-daemon ancestry are lookup hints. Shared services
+and background attachments need exact native evidence of the current session;
+a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
+tidy at its existing project seat and pane hooks silent, without new user input
+or runtime-state migration.
 
 An OpenCode child inside a Codex owner's workspace sandbox receives per-attempt
 XDG data/cache/state/config directories beneath the worktree. User configuration
@@ -712,6 +742,18 @@ Runtime completion carriers report a bounded native log line for skipped deliver
 claims and prompt admission, with the session and reason. Observing transport never
 changes the settled result or grants another execution.
 
+An accepted Claude native wake is also retained as the existing outer manager's
+registered-batch duty. If its hook exits before delivery, that task runner checks
+the same current attempt and pending notice and hands it to the existing peer
+courier for the exact parent session. Native and recovery delivery share the
+notice claim; forms and busy turns use the courier's existing retained-message
+path. Codex and OpenCode keep their existing retained completion controllers.
+Confirmed session handover changes the recipient, while the signed notice stays
+under the registered parent's storage key. If an older outer observer cannot
+process this retained duty, its exact PID and existing lock identify a safe
+observer replacement: accepted records remain intact and the replacement takes
+the same lock. A supported observer and the native carrier stay alive.
+
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
 ledger does not overturn those settled facts. Parent delivery facts remain
@@ -764,6 +806,18 @@ denial has exited; a still-live denied environment remains unobservable.
 `start` distinguishes running, exited and unobservable owners.
 
 ### §5.11. Commit and Push Policy for `<agent-home>`
+
+Fleet's two-hex session numbers have one shared resolver,
+`tools/fleet/session_handle.py::resolve_tag`, consumed by Fleet, peer trailers
+and Herdr titles. Codex and OpenCode reserve distinct numbers among observed
+live sessions in a small XDG state assignment file; an existing live assignment
+keeps its number and a later session takes a free one. Initial collection orders
+unassigned sessions by their known start time. Claude's runtime-derived numbers
+are fixed reservations, so a conflicting Codex or OpenCode assignment moves.
+Collection refreshes these reservations automatically; no user input or flag is
+needed. Missing, corrupt or unwritable assignment state falls back to the original
+session-id hash. Exhaustion of the 256 values and duplicate fixed Claude numbers
+leave uniqueness unavailable.
 
 Merge with `hearting run merge-line <PR>`. This shared command queues sessions
 and worktrees for the same GitHub repository under a user-state `flock`, shows

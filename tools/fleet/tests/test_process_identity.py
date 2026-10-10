@@ -75,17 +75,22 @@ class StartedOnIsNotProofTest(unittest.TestCase):
             found = P.process_identity(os.getpid(), "opencode")
             self.assertEqual((found.session_id, found.confidence), (SID, P.STARTED_ON))
             with unittest.mock.patch.object(hp, "_comm", return_value="opencode"), \
-                    unittest.mock.patch("fleet.collectors.claude.session_id_of_process", return_value=None):
+                    unittest.mock.patch("fleet.collectors.claude.session_id_of_process", return_value=None), \
+                    unittest.mock.patch.object(hp, "verified_pane", return_value="fixture-pane"):
                 self.assertEqual(hp.runtime_identity(), ("opencode", None))
                 self.assertTrue(hp.may_report("opencode", "ses_switched", worker=False))
 
 
 class OpenCodeReportTest(unittest.TestCase):
     def test_a_proven_opencode_session_must_match_and_an_unproven_one_keeps_the_harness_check(self):
-        with unittest.mock.patch.object(hp, "runtime_identity", return_value=("opencode", SID)):
+        # Native SID policy on an admitted pane; real ownership is exercised in
+        # utilities/pane_ownership.test.py on separate foreground/background ptys.
+        with unittest.mock.patch.object(hp, "runtime_identity", return_value=("opencode", SID)), \
+                unittest.mock.patch.object(hp, "verified_pane", return_value="fixture-pane"):
             self.assertTrue(hp.may_report("opencode", SID, worker=False))
             self.assertFalse(hp.may_report("opencode", "ses_other", worker=False))
-        with unittest.mock.patch.object(hp, "runtime_identity", return_value=("opencode", None)):
+        with unittest.mock.patch.object(hp, "runtime_identity", return_value=("opencode", None)), \
+                unittest.mock.patch.object(hp, "verified_pane", return_value="fixture-pane"):
             self.assertTrue(hp.may_report("opencode", "ses_other", worker=False))
 
 

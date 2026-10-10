@@ -722,6 +722,58 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
             ("done", f"owner_route_id={self.ROUTE_ID},route_node=_owner,attempt_id=att-2"),
         ]))
 
+    def test_an_unclosed_owner_awaiting_correction_keeps_its_contract_release(self):
+        for note, failure in (("dead-worker-blocked", "blocked"), ("dead-worker-fail", "fail")):
+            with self.subTest(note=note):
+                self.assertTrue(self._pins([
+                    ("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,"
+                             f"attempt_id=att-2,note={note},failure_class={failure}"),
+                ]), "same-route correction still needs the sealed capabilities")
+
+    def test_a_finished_replacement_releases_a_historical_owner_pause(self):
+        self.assertFalse(self._pins([
+            ("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,attempt_id=att-1,"
+                     "note=dead-worker-blocked,failure_class=blocked"),
+            ("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,attempt_id=att-2,"
+                     "note=completed-marker,failure_class=pass"),
+            ("done", f"route_id={self.ROUTE_ID},worker_type=stage,attempt_id=att-3,"
+                     "note=dead-worker-blocked,failure_class=blocked"),
+        ]), "only the current owner decides whether correction is still awaited")
+
+    def test_a_closed_route_releases_even_an_answerable_owner(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        routes = self._routes_dir(base)
+        jobs = base / "jobs.log"
+        record = routes / f"{self.ROUTE_ID}.json"
+        self._record(record, str(base / "release"), str(jobs))
+        self._registry(jobs, [("done", f"owner_route_id={self.ROUTE_ID},worker_type=owner,"
+                             "attempt_id=att-1,note=dead-worker-blocked,failure_class=blocked")])
+        record.with_suffix(".outcome.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(self._scan(base), ([], ""))
+
+    def test_the_standalone_pause_projection_matches_same_route_correction(self):
+        # The embedded installer is stdlib-only. Check its projection against
+        # the runtime's existing answerable result policy, including deaths.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "utilities"))
+        import route_authority
+        for status in ("done", "killed", "cancelled", "open"):
+            for note, failure in (("dead-worker-blocked", "blocked"),
+                                  ("dead-worker-blocked", ""),
+                                  ("dead-worker-fail", "fail"),
+                                  ("dead-worker-fail", "runtime-error"),
+                                  ("dead-launch-runtime-root-mismatch", "runtime-error"),
+                                  ("dead-invalid-envelope", "fail"),
+                                  ("completed-marker", "pass")):
+                meta = {"worker_type": "owner", "owner_route_id": self.ROUTE_ID,
+                        "note": note, "failure_class": failure}
+                line = "\t".join(["date", status, "repo", "worktree", "att-1",
+                                  ",".join(f"{k}={v}" for k, v in meta.items())])
+                with self.subTest(status=status, note=note, failure=failure):
+                    paused = distribution._route_registry_index(line)["paused"]
+                    self.assertEqual(self.ROUTE_ID in paused,
+                                     bool(route_authority.answerable_owner_end(status, meta)))
+
     def test_the_status_vocabulary_is_an_allowlist(self):
         # Round 1 (blocking 2): written first as a denylist of live states, so a
         # status word this reader does not know -- a partially written field, a

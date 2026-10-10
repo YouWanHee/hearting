@@ -33,6 +33,7 @@ from fleet import projection         # noqa: E402
 from fleet import route              # noqa: E402
 from fleet import collectors as fleet_collectors  # noqa: E402
 from fleet.model import ATTEMPT_CLASSIFIER_SOURCE, DispatchJob, Session  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines, draw_observed
 
 REAL = os.path.join(os.path.dirname(__file__), "fixtures", "route", "real_claude_staged.json")
 COMPOSED = os.path.join(os.path.dirname(__file__), "fixtures", "route", "synth_composed_survey.json")
@@ -253,7 +254,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             key="code", slug="split-owner", cwd="/work/repo", harness="codex",
             depth=1, dispatch_depth=1, liveness="working", note="registry-split",
         )
-        lines = render._build_lines([], [job], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [job], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("registry-split", text)
@@ -266,7 +267,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                             parent_sid="codex-parent", is_child=True, harness="claude",
                             mode="qa/code-review", liveness="working")
 
-        lines = render._build_lines([parent], [child], section="both", narrow=False,
+        lines = build_observed_lines([parent], [child], section="both", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
@@ -315,7 +316,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         old = render._BLINK_ON
         render._BLINK_ON = blink
         try:
-            return render._build_lines([parent], [d1, d2], section="both", narrow=False,
+            return build_observed_lines([parent], [d1, d2], section="both", narrow=False,
                                        malformed=0, layout=layout, term_width=175)
         finally:
             render._BLINK_ON = old
@@ -350,7 +351,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
     def test_f64c_childless_dispatch_card_brackets_its_context_detail(self):
         parent, d1, _d2 = self._rail_fixture()
         d1.summary = None
-        lines = render._build_lines([parent], [d1], section="both", narrow=False,
+        lines = build_observed_lines([parent], [d1], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=175)
         owner = self._line_with(lines, "rail-owner (")
         owner_txt = "".join(p for p, _k in owner)
@@ -400,7 +401,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                     old = render._BLINK_ON
                     try:
                         render._BLINK_ON = blink
-                        lines = render._build_lines(
+                        lines = build_observed_lines(
                             [parent], [owner, child], section="both", narrow=False,
                             malformed=0, layout=layout, term_width=width)
                     finally:
@@ -479,7 +480,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         for width, layout in ((60, "stack"), (80, "narrow"), (140, "wide")):
             with self.subTest(width=width, layout=layout):
                 parent, d1, d2 = self._rail_fixture()
-                lines = render._build_lines(
+                lines = build_observed_lines(
                     [parent], [d1, d2], section="both", narrow=False,
                     malformed=0, layout=layout, term_width=width)
                 text_lines = [render._plain(line) for line in lines if line]
@@ -522,7 +523,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         for width, layout in ((80, "narrow"), (140, "wide")):
             with self.subTest(width=width):
                 parent, d1, d2 = self._rail_fixture()
-                lines = render._build_lines(
+                lines = build_observed_lines(
                     [parent], [d1, d2], section="both", narrow=False,
                     malformed=0, layout=layout, term_width=width)
                 framed = [render._plain(line) for line in lines if line
@@ -615,7 +616,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                               parent_sid=parent_sid, parent_cwd="/work/repo", is_child=True,
                               harness="codex", mode="debug", qa="standard",
                               qa_source="jobslog", liveness="working")
-            lines = render._build_lines(sessions, [job], section="both", narrow=False,
+            lines = build_observed_lines(sessions, [job], section="both", narrow=False,
                                         malformed=0, layout="wide")
             return "\n".join("".join(part for part, _key in line)
                              for line in lines if line)
@@ -628,7 +629,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # The top summary strip ("hearting …", "usage …", "fleet …") is fixed board chrome
         # unrelated to any one session/card — exclude it so a coincidental substring match
         # there (e.g. "plan quota is console-only") cannot contaminate a card-content count.
-        lines = render._build_lines([session], jobs, section="both", narrow=False,
+        lines = build_observed_lines([session], jobs, section="both", narrow=False,
                                     malformed=0, layout="wide")
         texts = ["".join(part for part, _key in line) for line in lines if line]
         return [t for t in texts
@@ -647,7 +648,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "plans", "2026-07-22_unresolved-parent", "execute"))
             session = Session(harness="claude", pid=500, proc_start="root", cwd=tmp,
                               session_id="sid-unresolved", slug="unresolved-parent",
-                              title="unresolved-parent", liveness="working")
+                              runtime_name="unresolved-parent", liveness="working")
             owner = DispatchJob(
                 key="code", slug="unresolved-owner", cwd="/work/repo",
                 parent_sid="sid-unresolved", is_child=True, harness="claude",
@@ -801,7 +802,8 @@ class RegistryHomeTest(unittest.TestCase):
                                return_value="/home/u/agent_setting/.dispatch/jobs.log"), \
              mock.patch("fleet.collectors.dispatch.os.path.expanduser",
                         side_effect=fake_expanduser), \
-             mock.patch("fleet.collectors.dispatch.os.path.exists", return_value=True):
+             mock.patch.object(dispatch, "_registry_file",
+                               side_effect=lambda path: path == "/home/u/.claude/.dispatch/jobs.log"):
             self.assertEqual(dispatch._candidate_jobs_paths(), [
                 "/home/u/agent_setting/.dispatch/jobs.log",
                 "/home/u/.claude/.dispatch/jobs.log",
@@ -2258,7 +2260,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
             )
             self.assertEqual(Path(jobs_log).read_bytes(), before)
             render.set_show_all(False)
-            lines = render._build_lines(
+            lines = build_observed_lines(
                 [], rows, section="dispatch", narrow=False, malformed=0, layout="wide"
             )
             text = "\n".join(
@@ -2370,7 +2372,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
             for retry in range(2, 6)
         ]
         render.set_show_all(False)
-        lines = render._build_lines([], jobs, section="dispatch", narrow=False,
+        lines = build_observed_lines([], jobs, section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("test-r5", text)
@@ -2389,7 +2391,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
                              route_id="rt-a", route_node="test", liveness="working",
                              attempt_id="att-0000000000000005", registry_order=5)
         render.set_show_all(False)
-        lines = render._build_lines([], [older, newest], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [older, newest], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("test-r5", text)
@@ -2464,7 +2466,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                           parent_sid="parent-sid", is_child=True, harness="codex",
                           mode="loop/drill", qa="quick", qa_source="jobslog",
                           liveness="working", worker_role="g9_cross_harness_depth2_dispatch")
-        lines = render._build_lines([sess], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([sess], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
@@ -2480,7 +2482,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                           parent_sid="stale-sid", parent_cwd="/work/agent_setting", is_child=True,
                           harness="codex", mode="loop/drill", qa="quick", qa_source="jobslog",
                           liveness="working", worker_role="g9_cross_harness_depth2_dispatch")
-        lines = render._build_lines([sess], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([sess], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
@@ -2494,7 +2496,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
         job = DispatchJob(key="drill", slug="drill-g9", cwd="/tmp/drill-g9-abcd/repo",
                           harness="codex", mode="loop/drill", qa="quick", qa_source="jobslog",
                           liveness="working", worker_role="g9_cross_harness_depth2_dispatch")
-        lines = render._build_lines([], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
@@ -2517,7 +2519,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                             is_child=True, depth=2, harness="opencode", mode="qa/test",
                             qa="standard", qa_source="jobslog", liveness="working",
                             worker_role="stage")
-        lines = render._build_lines([], [owner, child], section="both", narrow=False,
+        lines = build_observed_lines([], [owner, child], section="both", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(p for p, _k in line) for line in lines if line)
         self.assertIn("drill:g10/", text)                  # grouped under the case
@@ -2532,7 +2534,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                           parent_sid="dead-sid", is_child=True, depth=1, harness="claude",
                           mode="dev/refactor", qa="standard", qa_source="jobslog",
                           liveness="working", worker_role="owner")
-        lines = render._build_lines([], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(p for p, _k in line) for line in lines if line)
         self.assertIn("(orphan)", text)
@@ -2553,7 +2555,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
         self.assertFalse(parent.is_child)
         self.assertTrue(child_session.is_child)
 
-        lines = render._build_lines([parent, child_session], [job], section="both",
+        lines = build_observed_lines([parent, child_session], [job], section="both",
                                     narrow=False, malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("agent_setting/", text)
@@ -2777,7 +2779,7 @@ class StageWorkerRenderTest(unittest.TestCase):
             # D1 raw-prefix leak since "code: " looks like a legitimate label already.
             job = DispatchJob(key=worker_role, slug="stage-job", depth=2, worker_role=worker_role,
                               intensity="strong", liveness="working")
-            lines = render._build_lines([], [job], section="both", narrow=False, malformed=0,
+            lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                         layout="wide")
             text = "\n".join("".join(part for part, _key in line) for line in lines if line)
             self.assertIn(label + " stage-job", text)
@@ -2801,7 +2803,7 @@ class QuickDispatchRenderTest(unittest.TestCase):
                           liveness="working", worker_role="capability-owner")
         texts = []
         texts.append("\n".join("".join(part for part, _key in line)
-                                 for line in render._build_lines([], [job], section="both",
+                                 for line in build_observed_lines([], [job], section="both",
                                                                  narrow=False, malformed=0,
                                                                  layout="wide") if line))
         l1, l2 = render._dispatch_row_2line(job)
@@ -2839,7 +2841,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
 
         def status_keys(blink_on):
             with mock.patch.object(render, "_BLINK_ON", blink_on):
-                lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+                lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                             malformed=0, layout="wide")
             return ({t: k for line in lines if line for t, k in line
                      if t in ("preparing…", "running")})
@@ -2855,7 +2857,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
                             parent_slug="fleet-ui-v2", worker_role="code-execute",
                             liveness="working")
         with mock.patch.object(render, "_BLINK_ON", True):
-            lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+            lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                         malformed=0, layout="wide")
         # F-67: the working exec child makes the UNIT active, so the owner's
         # honest preparing token now pulses with the shared blink instead of
@@ -2877,7 +2879,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
         child = DispatchJob(key="code", slug="fleet-ui-v2-exec", depth=2,
                             parent_slug="fleet-ui-v2", worker_role="code-execute",
                             liveness="done")
-        lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+        lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                     malformed=0, layout="wide")
         self.assertEqual(self._stage_keys(lines, "owner"), {})
         self.assertEqual([k for line in lines if line for t, k in line if t == "preparing…"],
@@ -2890,7 +2892,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
                             parent_slug="fleet-ui-v2", worker_role="code-report",
                             liveness="working")
         with mock.patch.object(render, "_BLINK_ON", True):
-            lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+            lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                         malformed=0, layout="wide")
         self.assertEqual(self._stage_keys(lines, "owner"), {})
         self.assertEqual([k for line in lines if line for t, k in line if t == "running"],
@@ -2906,14 +2908,14 @@ class IntegratedAlertRemovalTest(unittest.TestCase):
     def test_dead_jobs_do_not_create_alert_strip(self):
         dead_a = DispatchJob(key="drill", slug="case-a-20260709-11111", liveness="dead")
         dead_b = DispatchJob(key="drill", slug="case-b-20260709-22222", liveness="dead")
-        lines = render._build_lines([], [dead_a, dead_b], section="both", narrow=False,
+        lines = build_observed_lines([], [dead_a, dead_b], section="both", narrow=False,
                                     malformed=0, layout="wide")
         self.assertNotIn("  alert ", self._text(lines))
         self.assertNotIn("dead jobs", self._text(lines))
 
     def test_stale_job_remains_visible_without_alert_strip(self):
         stale = DispatchJob(key="drill", slug="lone-case-20260709-33333", liveness="stale")
-        lines = render._build_lines([], [stale], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [stale], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = self._text(lines)
         self.assertNotIn("  alert ", text)
@@ -2960,7 +2962,7 @@ class ResidueDisplayTest(unittest.TestCase):
         job = DispatchJob(key="code", slug="slice", cwd="/work/repo", harness="claude",
                           depth=1, dispatch_depth=1, liveness="working",
                           residue_pids=[753216])
-        lines = render._build_lines([], [job], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [job], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("left pid 753216", text)

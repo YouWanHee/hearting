@@ -296,9 +296,9 @@ class DispatchRowTitleTest(unittest.TestCase):
     def test_wide_row_prefers_the_adopted_title_over_the_slug(self):
         job = DispatchJob(key="autopilot-code", slug="fix-x", cwd="/w/fix-x",
                           harness="claude", is_child=True, liveness="working",
-                          title="Fix refresher tests")
+                          title="Fix tests")
         text = _row_text(job)
-        self.assertIn("Fix refresher tests", text)
+        self.assertIn("이전 제목 · Fix tests", text)
         self.assertNotIn("fix-x", text.split("⎇")[0] if "⎇" in text else text)
 
     def test_wide_row_falls_back_to_the_slug_without_a_title(self):
@@ -317,15 +317,15 @@ class DispatchRowTitleTest(unittest.TestCase):
         self.assertNotIn(long_title, with_title)
         self.assertIn("…", with_title)
         # The name zone budget is unchanged: a titled row is as long as a slug row.
-        self.assertEqual(len(with_title), len(_row_text(job_slug)))
+        self.assertEqual(render._dw(with_title), render._dw(_row_text(job_slug)))
 
     def test_narrow_card_prefers_the_adopted_title(self):
         job = DispatchJob(key="autopilot-code", slug="fix-x", cwd="/w/fix-x",
                           harness="claude", is_child=True, liveness="working",
-                          title="Narrow card title")
+                          title="Card")
         l1, l2 = render._dispatch_row_2line(job)
         text = "".join(part for part, _key in l1 + l2)
-        self.assertIn("Narrow card title", text)
+        self.assertIn("이전 제목 · Card", text)
 
 
 if __name__ == "__main__":

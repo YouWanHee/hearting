@@ -649,6 +649,9 @@ def _projection_from_record(entity, record, route_id, jobs, node_evidence=None, 
         progress=ProgressProjection(sum(n.get("state") == "done" for n in work_nodes), len(work_nodes)),
         scope_node_ids=scope_ids,
         _route_view={"record": record, "nodes": nodes, "view": view},
+        result=route.result_projection(record, route.load_outcome(
+            _field(entity, "owner_route_file") or _field(entity, "route_file"),
+            record.get("route_id"), record.get("route_hash"))),
     )
 
 
@@ -1771,6 +1774,24 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     finally:
         _ROUND_SCOPE.reset(round_token)
     return sessions, jobs
+
+
+def terminal_route_entities(node_evidence, degradations=None):
+    """Project observed routes without rows before publishing the snapshot."""
+    carriers = []
+    for rid, nodes in (node_evidence or {}).items():
+        evidence = next(iter((nodes or {}).values()), {})
+        route_file = evidence.get("route_file") if isinstance(evidence, dict) else None
+        node = next(iter((nodes or {}).keys()), None)
+        if not route_file or not node:
+            continue
+        carrier = DispatchJob(key="", slug="", route_id=rid, route_file=route_file,
+                              route_hash=evidence.get("route_hash"), route_node=node,
+                              liveness="done")
+        attach_projections([], [carrier], node_evidence=node_evidence,
+                           degradations=degradations, now=time.time())
+        carriers.append(carrier)
+    return carriers
 
 
 attach_work_projections = attach_projections

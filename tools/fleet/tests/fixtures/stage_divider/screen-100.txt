@@ -13,7 +13,7 @@
 ● bundle/
 ▍ ⠋ [aa] claude     aa ▾4
 ▍    ⚑  3h 00m      Opus (high)              -
-▍    ┆              ────────────────   —    NOW owner work
+▍    ┆              ────────────────   —    작업 중 · 마지막 요약 · 시각 미확인 · NOW owner work
 ▍    ┆  ╭─  ⠋ claude   gpu-owner ─────────────────────────────────────────────────────────────────╮
 ▍    ┆  │  —        Opus (high)              code(std·owner)                                      │
 ▍    ┆  │           ────────────────   —    train train.py · gpu:0 · 2m · 로그 없음               │

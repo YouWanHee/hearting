@@ -1,4 +1,4 @@
-"""Passive live detail fills joined to exact basic observations.
+"""Live display detail fills joined to exact basic observations.
 
 The ordinary snapshot pump owns existence/liveness/resources. This module runs
 on one coalesced RefreshPump worker and can neither create rows nor change those
@@ -100,7 +100,7 @@ class DetailSnapshot:
 def _enrich(snapshot):
     """Fill copied rows with display detail; never rescan or reclassify work."""
     from .collectors import dispatch, _adopt_child_titles, apply_peer_rows
-    from . import projection, route_chain
+    from . import projection, route_chain, titles
     source_key = state_key(snapshot)
     value = copy.deepcopy(snapshot)
     sessions, jobs = value.sessions, value.jobs
@@ -121,6 +121,7 @@ def _enrich(snapshot):
         except Exception:
             pass
     _adopt_child_titles(sessions, jobs)
+    titles.annotate(sessions + jobs)
     route_chain.enrich(sessions, jobs=jobs, node_evidence=value.node_evidence, now=time.time())
     degradations = dispatch._scan_degradations(
         set(value.node_evidence) | {j.route_id for j in jobs if j.route_id}, jobs=jobs)
@@ -128,18 +129,22 @@ def _enrich(snapshot):
                                   degradations=degradations, resources=value.resources, now=time.time())
     # Optional header details retain their last observed value across cheap
     # ticks. Initial absence stays unknown; these observers never classify work.
-    dispatch.collect.last_degradations = degradations
+    value.degradations = degradations
     try:
-        dispatch.collect.last_pending_delivery = dispatch._pending_delivery_counts(
+        value.pending_delivery = dispatch._pending_delivery_counts(
             dispatch._candidate_jobs_paths())
     except Exception:
-        dispatch.collect.last_pending_delivery = None
+        value.pending_delivery = None
     try:
         from .collectors import peer_messages
         peer = peer_messages.collect()
         apply_peer_rows(sessions, (peer or {}).get("by_session") or {})
     except Exception:
         pass
+    # Pane metadata only: no runtime identity/lifecycle writes. The input was
+    # published with basic rows; slow panes occupy this existing detail worker.
+    from .herdr_projection import refresh_observed_tag_metadata
+    refresh_observed_tag_metadata(value.tag_metadata)
     return DetailSnapshot(source_key, value)
 
 
@@ -234,6 +239,7 @@ def merge(basic, detail):
             # the unobserved placeholder; do not replace a native current title.
             if not getattr(current, "title", None):
                 current.title = getattr(previous, "title", None)
+                current.title_ts = getattr(previous, "title_ts", None)
             same_activity = (getattr(row, "liveness", None) == getattr(previous, "liveness", None)
                              and getattr(row, "_detail_activity_key", None) ==
                                  getattr(previous, "_detail_activity_key", None)
@@ -275,6 +281,11 @@ def merge(basic, detail):
                         current.resource_wait = previous.resource_wait
             target.append(current)
     _rebind_projections(sessions + jobs)
+    evidence = {}
+    if current_state == detail.source_key:
+        evidence = {"degradations": value.degradations,
+                    "pending_delivery": value.pending_delivery,
+                    "route_entities": value.route_entities}
     return replace(basic, sessions=sessions, jobs=jobs,
                    memory=value.memory, governor=value.governor,
-                   hearting=value.hearting or basic.hearting)
+                   hearting=value.hearting or basic.hearting, **evidence)

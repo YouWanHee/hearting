@@ -220,6 +220,24 @@ class CompletionReadinessProjectionTest(unittest.TestCase):
         self.assertEqual((result.state, result.reason),
                          ("unknown", "registered-bindings-unavailable"))
 
+    def test_input_ignores_parent_work_but_completion_and_executor_keep_it(self):
+        from dataclasses import replace
+        for harness in ("claude", "codex", "opencode"):
+            for state, action in (("pending", "wait"), ("unknown", "recover")):
+                with self.subTest(harness=harness, state=state):
+                    work = POLICY.RegisteredWorkObservation(
+                        "att-child", POLICY.AttemptDecision(state, action, "owner", "fixture"),
+                        "live" if state == "pending" else "unverifiable", "fixture",
+                        pane_relation="parent")
+                    pane = self.pane(harness=harness, bound_work=(work,))
+                    self.assertEqual(POLICY.completion_readiness(pane).state, state)
+                    self.assertEqual(POLICY.completion_readiness(pane, purpose="input").state, "ready")
+                    executor = replace(pane, bound_work=(replace(work, pane_relation="executor"),))
+                    self.assertEqual(POLICY.completion_readiness(executor, purpose="input").state, state)
+                    busy = replace(pane, native_turn="working")
+                    self.assertEqual(POLICY.completion_readiness(busy, purpose="input").reason,
+                                     "native-turn-busy")
+
 
 if __name__ == "__main__":
     unittest.main()

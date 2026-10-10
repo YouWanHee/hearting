@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib.util
+import fcntl
 import json
 import os
 import signal
@@ -32,6 +34,34 @@ class ObligationStoreTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_current_runner_starts_once_while_legacy_runner_lock_is_held(self):
+        self.store.create("message-reconnect", "message", {"session_id": "parent"},
+                          {"ref": "a" * 32})
+        with (self.store.root / "runner.lock").open("w") as legacy, \
+             mock.patch.object(obligations.subprocess, "Popen") as spawn:
+            fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(obligations.ensure_runner(self.root))
+            spawn.assert_called_once()
+            argv = spawn.call_args.args[0]
+            self.assertEqual(argv[-2:], ["--state-root", str(self.root)])
+            with (self.store.root / obligations.RUNNER_LOCK_NAME).open("w") as current:
+                fcntl.flock(current, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(obligations.ensure_runner(self.root))
+                spawn.assert_called_once()
+
+    def test_retire_lock_waits_for_legacy_and_releases_after_processing_error(self):
+        self.store.root.mkdir(parents=True)
+        with (self.store.root / "runner.lock").open("w") as legacy:
+            fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with obligations.legacy_runner_lock(self.store) as acquired:
+                self.assertFalse(acquired)
+        with self.assertRaisesRegex(RuntimeError, "fixture"):
+            with obligations.legacy_runner_lock(self.store) as acquired:
+                self.assertTrue(acquired)
+                raise RuntimeError("fixture")
+        with obligations.legacy_runner_lock(self.store) as acquired:
+            self.assertTrue(acquired)
 
     def test_create_is_idempotent_and_keeps_body_out_of_duty_record(self):
         intent = {"ref": "a" * 32, "body_digest": "b" * 64}
@@ -71,6 +101,59 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertEqual((ready.state, ready.scope, ready.outcome),
                          ("ready", "native-turn", None))
 
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_unsupported_observer_releases_same_lock_without_losing_accepted_duties(self):
+        self._check_observer_handoff(supported=False)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_supported_observer_keeps_its_pid_and_same_lock(self):
+        self._check_observer_handoff(supported=True)
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
+    def test_a_legacy_observer_keeps_its_pid_while_current_runner_starts(self):
+        self._check_observer_handoff(supported=False, legacy=True)
+
+    def _check_observer_handoff(self, supported, legacy=False):
+        duty = self.store.create("registered-batch-fixture", "registered-batch",
+                                 {"session_id": "parent"}, {"carrier": "claude-parent-runtime"})
+        prior = self.store.create("message-fixture", "message", {"session_id": "other"}, {"ref": "old"})
+        script = self.root / "peer-steward.py"
+        source = "import time\nprint('ready', flush=True)\ntime.sleep(30)\n"
+        if supported:
+            source = "def _resume_registered_obligation(): pass\n" + source
+        script.write_text(source)
+        lock_path = self.store.root / ("runner.lock" if legacy else obligations.RUNNER_LOCK_NAME)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        process = subprocess.Popen([sys.executable, str(script), "__obligation-runner",
+                                    "--state-root", str(self.root), "--lock-fd", str(fd)],
+                                   pass_fds=(fd,), stdout=subprocess.PIPE, text=True)
+        os.close(fd)
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            with mock.patch.object(obligations.subprocess, "Popen") as spawned, \
+                    mock.patch.object(obligations, "_RUNNERS", []):
+                self.assertTrue(obligations.ensure_runner(self.root))
+                if legacy:
+                    self.assertIsNone(process.poll())
+                    spawned.assert_called_once()
+                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
+                    self.assertNotEqual(lock_path.name, obligations.RUNNER_LOCK_NAME)
+                elif supported:
+                    self.assertIsNone(process.poll())
+                    spawned.assert_not_called()
+                else:
+                    self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+                    spawned.assert_called_once()
+                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
+            self.assertEqual(self.store.get(duty["id"]), duty)
+            self.assertEqual(self.store.get(prior["id"]), prior)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+
     def test_observer_error_after_fulfillment_cannot_reopen_duty(self):
         self.store.create("retire-done", "retire", {"pane": "w1:p1"},
                           {"target": "worker"})
@@ -106,6 +189,34 @@ class ObligationStoreTest(unittest.TestCase):
         )
         self.assertEqual((ready.state, ready.reason),
                          ("unknown", "registered-bindings-unavailable"))
+
+    def test_foreground_tag_binds_executor_even_when_it_also_owns_children(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        jobs = self.root / "jobs.log"
+        for harness in ("claude", "codex", "opencode"):
+            jobs.write_text(
+                f"now\topen\trepo\t-\texec\tattempt_id=att-exec,harness={harness},parent_sid=other\n"
+                f"now\topen\trepo\t-\tchild\tattempt_id=att-child,parent_sid=sid,parent_harness={harness}\n")
+            with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                            ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
+                work, state = obligations.bound_work_for_pane(
+                    "pane", harness, "sid", jobs=jobs, execution_attempt_ids=("att-exec",))
+            self.assertEqual(state, "observed")
+            self.assertEqual([(w.attempt_id, w.pane_relation) for w in work],
+                             [("att-exec", "executor"), ("att-child", "parent")])
+
+    def test_foreground_tag_read_is_birth_checked_and_does_not_use_parent_tag(self):
+        with mock.patch("dispatch_contract._runtime_ancestry_proc_stat", return_value={"start": 7}), \
+             mock.patch.object(Path, "read_bytes", return_value=b"AGENT_DISPATCH_ATTEMPT_ID=att-own\0"):
+            self.assertEqual(obligations.execution_attempts_for_processes([{"pid": 123}]), ("att-own",))
+        with mock.patch("dispatch_contract._runtime_ancestry_proc_stat",
+                        side_effect=[{"start": 7}, {"start": 8}]), \
+             mock.patch.object(Path, "read_bytes", return_value=b"AGENT_DISPATCH_ATTEMPT_ID=att-own\0"):
+            self.assertEqual(obligations.execution_attempts_for_processes([{"pid": 123}]), ())
+        with mock.patch("dispatch_contract._runtime_ancestry_proc_stat", return_value={"start": 7}), \
+             mock.patch.object(Path, "read_bytes", side_effect=PermissionError()):
+            with self.assertRaisesRegex(obligations.ObligationError, "pane-execution-unavailable"):
+                obligations.execution_attempts_for_processes([{"pid": 123}])
 
 
 _FAKE_HERDR = r'''#!/usr/bin/env python3

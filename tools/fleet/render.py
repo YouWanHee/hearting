@@ -39,9 +39,9 @@ import time
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
-from . import gitinfo
+from . import gitinfo, titles
 from .collectors import compute_hosts as _compute_hosts
-from .refresh import LiveSnapshot, RefreshPump, background_read
+from .refresh import LiveSnapshot, RefreshPump, background_read, as_snapshot
 from .session_handle import sanitize_title as _sanitize_session_title
 from .session_handle import _cell_width as _session_handle_cell_width
 from .session_handle import clip_cells as _clip_cells
@@ -585,7 +585,6 @@ _COOL_WINDOW_MIN = 180
 # Shape-size gradient: recent active states are larger and filled; cold groups use a ring.
 _COOL_FILLED = "●"      # Recently completed directory within the cooling window.
 _COOL_RING = "○"        # Long-inactive directory.
-_COOL_TIME_ICON = "✓"   # Prefix for elapsed time since completion.
 
 
 _BLINK_ON = True     # shared manual blink: one second on, one second off
@@ -1544,6 +1543,37 @@ def _session_name(s):
     return ""
 
 
+def _display_session_subject(s):
+    if getattr(s, "runtime_name", None):
+        return _session_name(s)
+    return _subject_title(s)
+
+
+def _text_age(timestamp, now=None):
+    now = time.time() if now is None else now
+    if (not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool)
+            or not math.isfinite(timestamp) or timestamp > now):
+        return "시각 미확인"
+    minutes = int((now - timestamp) // 60)
+    if minutes >= 1440:
+        return "%d일 전" % (minutes // 1440)
+    if minutes >= 60:
+        return "%d시간 전" % (minutes // 60)
+    return "%d분 전" % minutes
+
+
+def _subject_title(entity):
+    title = _sanitize_session_title(getattr(entity, "title", None) or "")
+    if not title:
+        return ""
+    if _is_plugin_agent(entity):
+        return title
+    ts = getattr(entity, "title_ts", None)
+    if titles.current_text(entity, ts):
+        return "제목 · " + title
+    return "이전 제목 · " + title
+
+
 def _projection_stage_text(entity, max_width=24):
     """Render only the entity's attached projection, never a guessed child route."""
     projection = getattr(entity, "work_projection", None)
@@ -1977,7 +2007,7 @@ def _session_row(s, narrow, is_parent=False, child_count=0, name_width=None,
     # responsive name column. Calls without a terminal-derived width retain the
     # legacy 24-cell cap for hermetic/backward-compatible row construction.
     avail = max(3, name_width or _NW_S)
-    name_txt = _session_name(s)
+    name_txt = _display_session_subject(s)
     suffix = []
     suffix_w = 0
     if is_parent and child_count:
@@ -2868,7 +2898,7 @@ def _dispatch_row(j, orphan=False, parent_model=None, parent_harness=None, is_la
     # The dispatched session's own haiku sidecar title is its identity when present
     # (user 2026-07-16: the summary agent attaches to every dispatched session); the
     # slug stays the fallback — same title → name → slug chain as session rows.
-    slug_name = getattr(j, "title", None) or j.slug or key
+    slug_name = _subject_title(j) or j.slug or key
     gch, gkey = _glyph(j.liveness, dim=True)
     afterglow_j = bool(getattr(j, "afterglow", False))
     if afterglow_j:
@@ -3110,7 +3140,7 @@ def _session_row_2line(s, is_parent=False, child_count=0, _split=False, term_wid
         suffix.append(("  app-server", "dim"))
     if s.orphan:
         suffix.append(("  worktree-gone", "g_dead"))
-    name_txt = _session_name(s)
+    name_txt = _display_session_subject(s)
     if term_width:
         # A tinted L1 has 4 left cells (inset+padding) and a 2-cell right
         # inset. Reserve those six cells plus every suffix before clipping.
@@ -3193,7 +3223,7 @@ def _dispatch_row_2line(j, orphan=False, parent_model=None, parent_effort=None, 
     # The dispatched session's own haiku sidecar title is its identity when present
     # (user 2026-07-16: the summary agent attaches to every dispatched session); the
     # slug stays the fallback — same title → name → slug chain as session rows.
-    slug_name = getattr(j, "title", None) or j.slug or key
+    slug_name = _subject_title(j) or j.slug or key
     gch, gkey = _glyph(j.liveness, dim=True)
     afterglow_j = bool(getattr(j, "afterglow", False))
     if afterglow_j:
@@ -3329,7 +3359,7 @@ def _governor_segs(snapshot=_IO_UNSET):
     return [("  ⚙ ", "dim"), ("governor %d/%d" % (active, cap), "dim")]
 
 
-def _pulse_segs(sessions, jobs, loading=False):
+def _pulse_segs(sessions, jobs, loading=False, observations=None):
     """`  fleet ⠙ N working   ● N idle ...` — whole-board census. Extracted (F-30, v10) so both
     the group view and the process view (§5.1) render the EXACT same row — one source, shared
     by the header helper contract §5.2 asks for, instead of two independently-drifting copies."""
@@ -3357,7 +3387,11 @@ def _pulse_segs(sessions, jobs, loading=False):
         pulse += [(_LIVE_GLYPH["unused"] + " %d" % n_un, "g_unused"), (" unused   ", "dim")]
     if n_dt:
         pulse += [(_DETACHED_GLYPH + " %d" % n_dt, "g_work_off"), (" detached   ", "dim")]
-    if listed_jobs:
+    if _jobs_unconfirmed(observations):
+        pulse += [("↳ 작업 목록 미확인", "lvl_y")]
+        if listed_jobs:
+            pulse += [(" (마지막 관측 %d개)" % len(listed_jobs), "dim")]
+    elif listed_jobs:
         pulse += [("↳ %d" % len(listed_jobs), "dim"),
                   (" job%s (%d working)" % ("s" if len(listed_jobs) != 1 else "", jw), "dim")]
     return pulse
@@ -3479,13 +3513,43 @@ def _visible_group_jobs(jobs, show_sessions, show_jobs):
 
 def _group_activity_rank(g):
     members_live = [s.liveness for s in g["sessions"]] + [j.liveness for j in g["jobs"]]
-    if g.get("gpu") or g.get("resources"):
+    if g.get("gpu") or _group_running_resources(g):
         members_live.append("working")
     if "working" in members_live:
         return 0
     elif "idle" in members_live:
         return 1
     return 2
+
+
+def _group_running_resources(g):
+    """Rendering placement does not change the project's activity census."""
+    candidates = list(g.get("resources") or ())
+    candidates.extend(child for job in g["jobs"]
+                      for child in getattr(job, "resource_children", ()))
+    return {id(child): child for child in candidates if child.liveness == "working"}
+
+
+def _group_last_result(sessions, jobs, resources):
+    candidates = []
+    for entity in list(sessions) + list(jobs):
+        projection = getattr(entity, "work_projection", None)
+        candidates.append(getattr(projection, "result", None))
+        candidates.extend(node.get("result") for node in
+                          (getattr(entity, "route_chain", None) or {}).get("nodes", ()))
+    children = list(resources)
+    children.extend(child for job in jobs for child in getattr(job, "resource_children", ()))
+    for child in children:
+        if (child.liveness in ("exited", "dead") and type(child.exit_code) is int
+                and isinstance(child.ended_at, (int, float)) and not isinstance(child.ended_at, bool)):
+            candidates.append({"name": "자원 " + (child.node or child.run_id),
+                               "result": "failure" if child.exit_code else "success",
+                               "at": child.ended_at, "source": "resource-exit"})
+    return max((value for value in candidates if isinstance(value, dict)
+                and value.get("name") and value.get("result") in ("success", "failure")
+                and type(value.get("at")) in (int, float)
+                and math.isfinite(value["at"]) and value["at"] <= time.time()),
+               key=lambda value: value["at"], default=None)
 
 
 def _group_sort_key(name, g):
@@ -4210,7 +4274,7 @@ def _plugin_agent_row(job, orphan=False, term_width=None):
     elapsed = fmt_min(getattr(job, "elapsed_min", None))
     phase = _plugin_phase(job)
     orphan_text = "  (orphan)" if orphan else ""
-    title = getattr(job, "title", None) or getattr(job, "slug", None) or ""
+    title = _subject_title(job) or getattr(job, "slug", None) or ""
     fixed = (_dw(_SUBAGENT_IND) + _dw(_ICON_SUBAGENT) + _dw("codex task ")
              + _dw(marker) + _dw("  " + elapsed)
              + (_dw(" : " + phase) if phase else 0) + _dw(orphan_text))
@@ -4232,30 +4296,9 @@ _SUMMARY_FALLBACK_W = 60   # hermetic/no-terminal-width callers (mirrors the dim
                            # convention used elsewhere, e.g. the memory-row snippet cells)
 
 
-# F-63: a summary younger than this reads as "now" and carries no tag; past it the
-# text stays (24h sidecar window, titles.py) and this dim `(<elapsed>)` age tag keeps
-# it honest. 15 minutes is the pre-F-63 freshness cutoff, kept as the live threshold.
-_SUMMARY_AGE_TAG_SEC = 15 * 60
-
-
-def _summary_age_tag(summary_ts, now=None):
-    """`(<elapsed>)` for a summary older than the live window, else None.
-
-    F-76: the only elapsed on the board that does NOT sit in a column of its own — it
-    trails a Korean sentence, where a bare `38m` would read as a number glued onto the
-    prose. Parentheses do the separating that `⏳` used to, without an icon."""
-    if not isinstance(summary_ts, (int, float)) or isinstance(summary_ts, bool):
-        return None
-    now = time.time() if now is None else now
-    age = now - summary_ts
-    if age < _SUMMARY_AGE_TAG_SEC:
-        return None
-    return "(%s)" % fmt_min(int(age // 60))
-
-
 def _summary_row(summary, depth=0, term_width=None, start_col=None, summary_ts=None):
     """One dim subtitle row directly under a session/dispatch row (F-16/F-17 merge,
-    사용자 확정 2026-07-19): the live one-sentence status from the SAME haiku call that
+    사용자 확정 2026-07-19): the last recorded summary from the SAME haiku call that
     produced the title. Pure inset — no connector/icon, `_SUBAGENT_IND` + the same
     per-depth ladder `_subagent_strip` uses, so it reads as INSIDE its owner row and
     never collides with the sub-agent strip's own indent. Caller gates presence
@@ -4271,15 +4314,9 @@ def _summary_row(summary, depth=0, term_width=None, start_col=None, summary_ts=N
     segs = [(indent, None)]
     if padding:
         segs.append((" " * padding, None))
-    # F-63: the age tag reserves its own width so a long summary clips before the
-    # tag disappears — the reader always learns HOW old the sentence is first.
-    tag = _summary_age_tag(summary_ts)
-    tag_w = (_dw(tag) + 1) if tag else 0
-    if tag and maxw > tag_w:
-        segs.append((_clip_w(summary, maxw - tag_w), "now_sub"))
-        segs.append((" " + tag, "dim"))
-    else:
-        segs.append((_clip_w(summary, maxw), "now_sub"))
+    # The source and age precede the prose so clipping never makes it look live.
+    label = "마지막 요약 · %s · " % _text_age(summary_ts)
+    segs.append((_clip_w(label + summary, maxw), "now_sub"))
     return [segs]
 
 
@@ -4812,6 +4849,11 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     context = getattr(entity, "context", None)
     pct = getattr(context, "used_pct", None) if context is not None else getattr(entity, "ctx_pct", None)
     now_text = getattr(entity, "summary", None)
+    previous_summary = None
+    if now_text:
+        previous_summary = "마지막 요약 · %s · %s" % (
+            _text_age(getattr(entity, "summary_ts", None)), now_text)
+        now_text = None
     resource_now = _resource_now_text(entity)
     if resource_now is not None:
         now_text = resource_now
@@ -4820,6 +4862,11 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         # A basic observation is real state, but missing detail is not an idle
         # verdict or an empty NOW. Never invent a command/model turn here.
         now_text = "확인 중"
+    if previous_summary and resource_now is None and not now_text:
+        now_text = {"working": "작업 중", "idle": "대기", "detached": "분리됨"}.get(
+            getattr(entity, "liveness", None), "상태 미확인")
+    if previous_summary and resource_now is None:
+        now_text += " · " + previous_summary
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
@@ -4867,25 +4914,15 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             now_room -= exec_w
         if now_text:
             sep = "  " if tail else ""
-            # F-63: same reserved-width age tag as the dispatch subtitle row — the
-            # tag survives clipping; only when the zone cannot hold tag + any text
-            # does it drop and the bare NOW clip behaves exactly as before.
-            tag = None if resource_now is not None else _summary_age_tag(getattr(entity, "summary_ts", None))
+            # Observations and the summary's source/age precede the old prose.
             text_room = now_room - _dw(sep)
             if resource_now is not None:
                 now_text = _resource_now_text(entity, max(0, text_room))
-            tag_w = (_dw(tag) + 1) if tag else 0
-            if tag and text_room > tag_w:
-                clipped = _clip_w(str(now_text), text_room - tag_w)
-            else:
-                tag = None
-                clipped = _clip_w(str(now_text), text_room) if text_room > 0 else ""
+            clipped = _clip_w(str(now_text), text_room) if text_room > 0 else ""
             if clipped:
                 if sep:
                     tail.append((sep, None))
                 tail.append((clipped, now_key))
-                if tag:
-                    tail.append((" " + tag, "dim"))
         if tail:
             segs.append((" " * gap, None))
             segs.extend(tail)
@@ -4949,11 +4986,12 @@ def set_compute_hosts(value):
 _REFRESH_HEALTH = {}   # {"snapshot": health-dict|None, "compute_hosts": health-dict|None}
 
 
-def set_refresh_health(snapshot=None, compute_hosts=None):
+def set_refresh_health(snapshot=None, compute_hosts=None, details=None):
     global _REFRESH_HEALTH
     _REFRESH_HEALTH = {
         "snapshot": dict(snapshot) if isinstance(snapshot, dict) else None,
         "compute_hosts": dict(compute_hosts) if isinstance(compute_hosts, dict) else None,
+        "details": dict(details) if isinstance(details, dict) else None,
     }
 
 
@@ -4988,6 +5026,12 @@ def _refresh_health_segments(narrow=False):
         error = health.get("last_error") or ""
         limit = 20 if narrow else 40
         segs.append((" · error: " + error[:limit], "lvl_y"))
+    detail = _REFRESH_HEALTH.get("details")
+    if detail and detail.get("state") in ("failed", "stalled"):
+        cause = ("수집 지연" if detail.get("state") == "stalled" else
+                 str(detail.get("last_error") or "조회 실패")[:20 if narrow else 40])
+        segs.append((" · 상세 미확인 · 마지막 관측 " +
+                     _refresh_age_label(detail.get("age")) + " · " + cause, "lvl_y"))
     compute_hosts = (_REFRESH_HEALTH.get("compute_hosts")
                       if isinstance(_REFRESH_HEALTH, dict) else None)
     # Segment importance, in survival order: ① refreshed <age> ② state word
@@ -6320,7 +6364,8 @@ def _degrade_card(job, session_by_identity, term_width, gpu_resources=None):
 
 
 def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, term_width, layout,
-                         node_evidence=None, governor=_IO_UNSET, resources=None, loading=False):
+                         node_evidence=None, governor=_IO_UNSET, resources=None, loading=False,
+                         observations=None):
     """F-30 (prd.md:304-310) — the process view: one card per ACTIVE route (pipeline-centric
     regrouping) instead of the group view's per-project regrouping. Returns the SAME flat
     segment-line contract as `_build_lines` ([[(text,key),...]|None]) — `_draw`/`render_once`/
@@ -6334,7 +6379,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     for record lookup, and needs the identical fix for the SAME reason."""
     global _FOLDABLE
     _FOLDABLE = []
-    lines = [_pulse_segs(sessions, jobs, loading=loading)]
+    lines = [_pulse_segs(sessions, jobs, loading=loading, observations=observations)]
     _governor = _governor_segs(governor)
     if _governor is not None:
         lines.append(_governor)
@@ -6416,7 +6461,9 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     if (not real_views and not degrade_jobs and not agent_sessions and not plugin_orphans
             and not _orphan_resource_groups(resources, ())):
         # prd.md:310 — an honest "nothing is running" statement, never a blank screen.
-        lines.append([("  loading sessions…" if loading else "  no active route", "dim")])
+        message = ("  loading sessions…" if loading else "  작업 목록 미확인"
+                   if _jobs_unconfirmed(observations) else "  no active route")
+        lines.append([(message, "dim")])
         return lines
 
     seen_keys = set()
@@ -6501,7 +6548,7 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
             lines.append(None)
         first = False
         name_w = 40 if term_width is None else max(8, min(40, term_width - 6))
-        anchor = [("  ● ", "dim"), (_clip_w(_session_name(s), name_w), "name_dim")]
+        anchor = [("  ● ", "dim"), (_clip_w(_display_session_subject(s), name_w), "name_dim")]
         if getattr(s, "model", None):
             anchor.append(("  " + str(s.model), "dim"))
         lines.append(anchor)
@@ -6985,9 +7032,30 @@ def _group_emission(g, show_sessions, show_jobs, gpu_resources=None,
             "gpu_strip_keys": strip_keys, "classified": classified}
 
 
+def _jobs_unconfirmed(observations):
+    return (observations or {}).get("jobs", {}).get("state") in ("failed", "stalled")
+
+
+def _observation_lines(observations, term_width=None):
+    lines = []
+    for source, health in (observations or {}).items():
+        if health.get("state") not in ("failed", "stalled"):
+            continue
+        name = {"jobs": "작업", "herdr": "pane 연결", "governor": "실행 용량",
+                "compute hosts": "연산 장치"}.get(source, source)
+        age = health.get("age")
+        if health.get("last_success_at") is not None:
+            age = time.monotonic() - health["last_success_at"]
+        text = "  %s 미확인 · 마지막 관측 %s · %s" % (
+            name, _refresh_age_label(age), health.get("last_error") or "수집 지연")
+        lines.append([(_clip_w(text, term_width) if term_width else text, "lvl_y")])
+    return lines
+
+
 def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memory=None,
                  term_width=None, live_order=None, resources=None, usage_snapshots=None,
-                 governor=_IO_UNSET, loading=False):
+                 governor=_IO_UNSET, loading=False, node_evidence=None,
+                 route_entities=None, observations=None):
     """Return a flat list of segment-lines for the whole screen (None = blank line).
 
     Side effect: refreshes the module-level `_SELECTABLE` stash (F-27) — see its definition.
@@ -7001,61 +7069,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     global _SELECTABLE, _FOLDABLE
     _SELECTABLE = []     # reset before any early return — a stale target map must never survive
     _FOLDABLE = []
-    # Direct managed-row callers use the same parent decision as collect_all.
-    # Existing collector verdicts (including grace) never advance a second tick.
-    from .collectors import resolve_parent_edges
-    resolve_parent_edges(sessions, [j for j in jobs
-                                   if (getattr(j, "parent_managed_dir", None)
-                                       or getattr(j, "_registry_metadata", None))
-                                   and not hasattr(j, "_parent_edge_promoted_orphan")])
-    # Direct hermetic callers from pre-v16 tests may construct rows without running the
-    # collector boundary.  Use the same shared resolver as the snapshot path; never call
-    # live_stage() or a renderer-specific route resolver. Terminal node evidence is the
-    # collector's read-only input for routes whose live child has already disappeared.
-    _node_evidence = {}
-    _degradations = {}
-    try:
-        from .collectors import dispatch as _dispatch
-        # The first live frame has no published session snapshot yet. Dispatch
-        # can already be filling these side channels in its worker; treating
-        # them as a completed empty census projects every historical route on
-        # the curses thread and stalls adoption of the real first snapshot.
-        if not loading:
-            _node_evidence = getattr(_dispatch.collect, "last_route_nodes", None) or {}
-            _degradations = getattr(_dispatch.collect, "last_degradations", None) or {}
-    except Exception:
-        _node_evidence = {}
-        _degradations = {}
-    if jobs and all(getattr(entity, "work_projection", None) is None
-                    for entity in list(sessions) + list(jobs)):
-        try:
-            from .projection import attach_projections
-            attach_projections(sessions, jobs, node_evidence=_node_evidence, now=time.time(),
-                               degradations=_degradations, resources=resources)
-        except Exception:
-            pass
-    # A completed route can have no live entity at all.  Keep an ephemeral projection
-    # carrier so process rendering still consumes the common attached route view; it is
-    # never added to display_jobs and therefore cannot create a phantom job row.
-    _projection_entities = list(sessions) + list(jobs)
-    if not _projection_entities and _node_evidence:
-        try:
-            from .model import DispatchJob
-            from .projection import attach_projections
-            for _rid, _nodes in _node_evidence.items():
-                _ev = next(iter((_nodes or {}).values()), {})
-                _rf = _ev.get("route_file") if isinstance(_ev, dict) else None
-                _rn = next(iter((_nodes or {}).keys()), None)
-                if not _rf or not _rn:
-                    continue
-                _carrier = DispatchJob(key="", slug="", route_id=_rid, route_file=_rf,
-                                       route_hash=_ev.get("route_hash"), route_node=_rn,
-                                       liveness="done")
-                attach_projections([], [_carrier], node_evidence=_node_evidence, now=time.time(),
-                                   degradations=_degradations)
-                _projection_entities.append(_carrier)
-        except Exception:
-            pass
+    _node_evidence = node_evidence or {}
+    _projection_entities = list(sessions) + list(jobs) + list(route_entities or [])
     # v16: route authority is attached by collectors/projection.py before this surface.
     # Rendering never reopens a route file or calls dispatch-only stage discovery.
     _route_views_by_id = {}
@@ -7095,8 +7110,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         process_lines = _build_process_lines(
             sessions, display_jobs, _route_views_by_id, malformed, memory,
             term_width, layout, node_evidence=_node_evidence, governor=governor,
-            resources=resources, loading=loading)
-        top_rows = _top_rows(term_width, narrow)
+            resources=resources, loading=loading, observations=observations)
+        top_rows = _top_rows(term_width, narrow) + _observation_lines(observations, term_width)
         for entry in _FOLDABLE + _SELECTABLE:
             entry["line"] += len(top_rows)
         return top_rows + process_lines
@@ -7252,7 +7267,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
 
     # The product identity is a distinct, quiet title block. Keep one breathing row
     # before account usage begins instead of letting the two metadata zones touch.
-    lines = _top_rows(term_width, narrow)
+    lines = _top_rows(term_width, narrow) + _observation_lines(observations, term_width)
     _seen_glyphs = set()
     # F-98b's "both endpoints on screen" rule is retired (user 2026-09-09): an off-screen
     # peer now gets the same line, labelled by name or `<harness>:<sid8>` instead of a tag.
@@ -7266,7 +7281,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     # fleet pulse — htop's "Tasks: N, M running" analogue: whole-board census + live spend Σ
     # Show the row by default; counts skip app-server companions. Extracted into _pulse_segs
     # (F-30, v10) so the process view (§5.1) shares this EXACT row instead of a second copy.
-    lines.append(_pulse_segs(sessions, display_jobs, loading=loading))
+    lines.append(_pulse_segs(sessions, display_jobs, loading=loading, observations=observations))
     _governor = _governor_segs(governor)       # F-28c — snapshot-owned in the live loop
     if _governor is not None:                  # counts (I8); None = source absent or quiet.
         lines.append(_governor)
@@ -7346,12 +7361,9 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         # while the group works, plain bold otherwise. Doubles with the active card tint.
         n_work = sum(1 for s in live_sessions if s.liveness == "working") + \
                  sum(1 for j in group_jobs if j.liveness == "working") + \
-                 len(emission["gpu"]) + len(emission["resources"])
-        # cooling (round-6, user 2026-07-03): no active work, but the newest session transcript
-        # A write within the cooling window indicates a directory that just finished.
-        # state between hot (green ●) and cold (no glyph): a grey ring + time-since-done, so a
-        # just-finished repo reads as "done & waiting" rather than fully dormant. Sessions linger
-        # as idle (still within the 48h live window), so the group is not folded (R4).
+                 len(emission["gpu"]) + len(_group_running_resources(g))
+        # With no active work, a recent transcript write marks file activity only.
+        # Completion is shown separately from a recorded result and its event time.
         _last_act = max((s.mtime for s in group_sessions if s.mtime), default=None)
         _cool_min = None
         if not n_work and _last_act is not None:
@@ -7366,7 +7378,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
         if n_work:
             head_segs += [("●", "g_work" if _BLINK_ON else "g_work_off"), (" ", None)]
         elif _cool_min is not None:
-            # Recent completion uses a filled grey dot, distinct from dead and stale.
+            # Recent file activity uses a filled grey dot, distinct from dead and stale.
             head_segs += [(_COOL_FILLED, "grp_cool"), (" ", None)]
         else:
             # Long inactivity uses a grey ring.
@@ -7387,8 +7399,17 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
             head_segs += [(" 🧠 %d" % _nmem, "dim")]
             _seen_glyphs.add("mem")
         if _cool_min is not None:
-            # Prefix time since completion with a check mark.
-            head_segs += [("  ", None), ("%s %s" % (_COOL_TIME_ICON, fmt_min(_cool_min)), "grp_cool")]
+            head_segs += [("  파일 갱신 · " + _text_age(_last_act), "dim")]
+        last_result = _group_last_result(group_sessions, group_jobs, emission["resources"])
+        if last_result:
+            lead = "최근 결과 · %s · " % (
+                "성공" if last_result["result"] == "success" else "실패")
+            tail = " · " + _text_age(last_result["at"])
+            room = max(0, (term_width or 160) - sum(_dw(t) for t, _ in head_segs) - 2)
+            name_room = room - _dw(lead + tail)
+            if name_room > 0:
+                label = lead + _clip_w(last_result["name"], name_room) + tail
+                head_segs.append(("  " + label, "dim"))
         # The group header is the card's first title row.
         # tinted row of the panel, ▍ anchor on the card's padding edge; no floating label.
         _g0 = len(lines)                # panel start (title INCLUDED in the tint range)
@@ -7826,8 +7847,10 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                       (names[:90] + ("…" if len(names) > 90 else ""), "dim")])
 
     if not order:
-        lines.append([("  loading sessions…" if loading else
-                       "  (no active sessions or dispatch jobs)", "dim")])
+        message = ("  loading sessions…" if loading else "  작업 목록 미확인"
+                   if _jobs_unconfirmed(observations) else
+                   "  (no active sessions or dispatch jobs)")
+        lines.append([(message, "dim")])
 
     if malformed:
         lines.append(None)
@@ -7982,7 +8005,8 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     hosts_read = (background_read(compute_hosts_refresh)
                   if callable(compute_hosts_refresh) else None)
     try:
-        sessions, jobs = collect_all(harness_filter=hfilter)
+        snapshot = as_snapshot(collect_all(harness_filter=hfilter))
+        sessions, jobs = snapshot
     except BaseException:
         # Drain both reads. Preserve the original serial failure priority:
         # hosts before sessions before governor (normally fail-soft).
@@ -7996,12 +8020,20 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
     else:
         try:
             governor_snapshot = governor_read.result()
+        except Exception as exc:
+            governor_snapshot = None
+            snapshot.observations["governor"] = {
+                "state": "failed", "last_error": "%s: %s" % (type(exc).__name__, exc)}
         finally:
             if hosts_read is not None:
-                set_compute_hosts(hosts_read.result())
-    resources = list(getattr(collect_all, "last_resource_jobs", []))
-    usage_snapshots = dict(getattr(collect_all, "last_usage_snapshots", {}))
-    malformed = _malformed()
+                try:
+                    set_compute_hosts(hosts_read.result())
+                except Exception as exc:
+                    snapshot.observations["compute hosts"] = {
+                        "state": "failed", "last_error": "%s: %s" % (type(exc).__name__, exc)}
+    resources = snapshot.resources
+    usage_snapshots = snapshot.usage_snapshots
+    malformed = snapshot.malformed
     mem_snapshot = _collect_memory()
     gitinfo.enrich_entities(list(sessions) + list(jobs), schedule_ahead=False)
     try:
@@ -8015,7 +8047,8 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
         lines = _build_lines(sessions, jobs, section, narrow=False, malformed=malformed,
                              layout=_layout_mode(tw), memory=mem_snapshot, term_width=tw,
                              resources=resources, usage_snapshots=usage_snapshots,
-                             governor=governor_snapshot)
+                             governor=governor_snapshot, node_evidence=snapshot.node_evidence,
+                             route_entities=snapshot.route_entities, observations=snapshot.observations)
     finally:
         _GIT_TELEMETRY = previous_git_telemetry
     colored = bool(getattr(sys.stdout, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
@@ -8746,7 +8779,7 @@ def reset_scroll():
 
 
 def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=None,
-          resources=None, usage_snapshots=None, governor=None, loading=False):
+          resources=None, usage_snapshots=None, governor=None, loading=False, snapshot=None):
     global _OFFSET, _TOGGLE_ROWS, _CLICK_ROWS, _FOLD_ROWS, _PROMPT_HITS, _CURSOR_ID
     # reset before any early-return so a stale map never survives a click (§4.1 pattern) —
     # _PROMPT_HITS in particular must never carry the PRIOR stage's coordinates into this
@@ -8762,7 +8795,10 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     lines = _build_lines(sessions, jobs, section, narrow, malformed, layout=_layout_mode(w),
                          memory=memory, term_width=w, live_order=live_order,
                          resources=resources, usage_snapshots=usage_snapshots,
-                         governor=governor, loading=loading)
+                         governor=governor, loading=loading,
+                         node_evidence=snapshot.node_evidence if snapshot else None,
+                         route_entities=snapshot.route_entities if snapshot else None,
+                         observations=snapshot.observations if snapshot else None)
     body_h = max(1, h - 1)   # reserve 1 footer row
 
     # F-27: the cursor tracks a ROW, so the viewport follows it (not the reverse). Done before
@@ -8887,16 +8923,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     detail_generation = 0
 
     def collect_snapshot():
-        sessions, jobs = collect_all(harness_filter=hfilter, fast_first=True)
-        from .collectors import dispatch
-        snapshot = LiveSnapshot(
-            sessions=list(sessions), jobs=list(jobs),
-            resources=list(getattr(collect_all, "last_resource_jobs", [])),
-            usage_snapshots=dict(getattr(collect_all, "last_usage_snapshots", {})),
-            malformed=_malformed(),
-            node_evidence=getattr(dispatch.collect, "last_route_nodes", None) or {},
-            hearting=dict(_HEARTING) if isinstance(_HEARTING, dict) else None,
-        )
+        snapshot = as_snapshot(collect_all(harness_filter=hfilter, fast_first=True))
+        snapshot.hearting = dict(_HEARTING) if isinstance(_HEARTING, dict) else None
         # Publication makes these rows immutable to the detail worker. Every
         # basic tick stays cheap even while that worker is delayed on NAS.
         latest_basic[0] = snapshot
@@ -8906,10 +8934,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         source = latest_basic[0]
         governor = _collect_governor()
         detail_refresh = getattr(collect_all, "detail_refresh", None)
-        if source is None:
-            value = LiveSnapshot()
-            result = details.DetailSnapshot(None, value)
-        elif callable(detail_refresh):
+        if callable(detail_refresh):
             result = detail_refresh(source)
             value = result.snapshot
         else:
@@ -8934,7 +8959,6 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     pump.start()
     # Existing coalescing/last-good semantics, independent of basic refresh.
     detail_pump = RefreshPump(collect_details, interval, name="fleet-detail-refresh")
-    detail_pump.start()
     basic_snapshot = snapshot
     latest_detail = None
     compute_host_refresh = getattr(collect_all, "compute_hosts_refresh", None)
@@ -8958,12 +8982,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     governor_snapshot = snapshot.governor
     set_refresh_health(
         snapshot=pump.health(time.monotonic()),
+        details=detail_pump.health(time.monotonic()),
         compute_hosts=(compute_host_pump.health(time.monotonic())
                        if compute_host_pump is not None else None))
     stdscr.timeout(200)                     # getch blocks ≤200ms → responsive keys
     _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
           live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-          governor=governor_snapshot, loading=(generation == 0))
+          governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
     try:
         while True:
             # Wake at the next 0.1s spinner frame while staying key-responsive. Collection
@@ -8974,11 +8999,13 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             now = time.time()
             now_mono = time.monotonic()
             pump.request_due(now=now_mono)
-            detail_pump.request_due(now=now_mono)
+            if latest_basic[0] is not None:
+                detail_pump.request_due(now=now_mono)
             if compute_host_pump is not None:
                 compute_host_pump.request_due(now=now_mono)
             set_refresh_health(
                 snapshot=pump.health(now_mono),
+                details=detail_pump.health(now_mono),
                 compute_hosts=(compute_host_pump.health(now_mono)
                                if compute_host_pump is not None else None))
             update = pump.poll(generation)
@@ -9026,7 +9053,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _handle_prompt_key(ch)
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                      governor=governor_snapshot, loading=(generation == 0))
+                      governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
                 continue
             if _SELECT_MODE:
                 if _handle_select_key(ch):
@@ -9042,7 +9069,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _set_action("no selectable rows")
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                       live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                      governor=governor_snapshot, loading=(generation == 0))
+                      governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
                 continue
 
             # --- base mode: scroll keys UNCHANGED (F-27 regression budget = 0) ---
@@ -9064,7 +9091,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             # Redraw every wake for the spinner/blink; curses doupdate emits only changed cells.
             _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
                   live_order=live_order, resources=resources, usage_snapshots=usage_snapshots,
-                  governor=governor_snapshot, loading=(generation == 0))
+                  governor=governor_snapshot, loading=(generation == 0), snapshot=snapshot)
     finally:
         pump.stop(join_timeout=1.0)
         detail_pump.stop(join_timeout=1.0)

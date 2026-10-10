@@ -141,7 +141,15 @@ def runtime_identity():
     return ("codex", None) if codex_seen else (None, None)
 
 
-def may_report(harness: str, session_id: str, *, worker=None) -> bool:
+def verified_pane(pane, harness, session_id=None, **kwargs):
+    utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
+    from pane_ownership import verified_pane as verify
+    return verify(pane, harness, session_id, **kwargs)
+
+
+def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> bool:
     """The ONE decision whether this process may report ``session_id`` to herdr.
 
     - never for a registered/background worker (D-42);
@@ -162,9 +170,11 @@ def may_report(harness: str, session_id: str, *, worker=None) -> bool:
     runtime, own = runtime_identity()
     if runtime != harness:
         return False
-    if runtime == "opencode" and own is None:
-        return True
-    return own == session_id
+    if not (runtime == "opencode" and own is None) and own != session_id:
+        return False
+    if not verified_pane(pane_id or os.environ.get("HERDR_PANE_ID"), harness, session_id):
+        return False
+    return True
 
 
 def _runtime_name(harness: str, session_id: str) -> str:
@@ -218,6 +228,64 @@ def is_steward(harness: str, session_id: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _tag_metadata_identity(agent):
+    harness = agent.get("agent")
+    identity = agent.get("agent_session") or {}
+    pane = agent.get("pane_id")
+    if (harness not in {"codex", "opencode"} or not pane
+            or not isinstance(identity, dict) or identity.get("kind") != "id"
+            or identity.get("agent", harness) != harness):
+        return None
+    sid = identity.get("value")
+    return (pane, harness, sid) if isinstance(sid, str) and sid else None
+
+
+def refresh_observed_tag_metadata(agents) -> None:
+    """A delayed detail may update only the same currently observed pane.
+
+    This reads target identity immediately before each metadata attempt; it
+    never changes session identity/lifecycle or reclassifies Fleet rows.
+    """
+    from .collectors.herdr import list_agents
+    herdr = shutil.which("herdr")
+    if not herdr:
+        return
+    for observed in _tag_metadata_targets(agents):
+        pane, harness, sid = observed
+        metadata = _metadata_command(herdr, harness, sid, pane)
+        # Titles and personal formatters may be slow. Confirm the target after
+        # all preparation, immediately before sending the metadata command.
+        current = list_agents()
+        peers = [row for row in current or [] if row.get("pane_id") == observed[0]]
+        if len(peers) == 1 and _tag_metadata_identity(peers[0]) == observed:
+            prepared = re.match(r"^\[([0-9a-f]{2})\]",
+                                metadata[metadata.index("--display-agent") + 1])
+            if prepared and prepared.group(1) == resolve_tag(harness, sid):
+                _send_projection(metadata, None)
+
+
+def _tag_metadata_targets(agents):
+    for agent in agents:
+        identity = _tag_metadata_identity(agent)
+        if identity is None:
+            continue
+        _, harness, sid = identity
+        tag = resolve_tag(harness, sid)
+        shown = re.match(r"^\[([0-9a-f]{2})\]", str(agent.get("display_agent") or ""))
+        if tag and (not shown or shown.group(1) != tag):
+            yield identity
+
+
+def refresh_tag_metadata(agents) -> None:
+    """Refresh changed numbers on exactly identified panes, even while idle.
+
+    This reuses the regular metadata projection. It reports no runtime session
+    identity or lifecycle, and never prompts or wakes the pane's session.
+    """
+    for pane, harness, sid in _tag_metadata_targets(agents):
+        _report(harness, sid, pane, False)
 
 
 def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None,
@@ -355,24 +423,17 @@ def _codex_tui_pane(session_id: str):
     Two panes resolving to one session (same-cwd TUIs sharing the fallback candidate)
     stay None: a badge on the wrong pane also misdirects peer messages.
     """
-    from fleet.collectors import codex as codex_collector
     from fleet.collectors import procscan
-    live = []
-
-    def live_codex():
-        if not live:
-            live.append(procscan.scan(harness_filter={"codex"}))
-        return live[0]
-
     panes = set()
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or _comm(int(entry)) != "codex":
             continue
         pane = procscan.read_environ(int(entry)).get("HERDR_PANE_ID")
         try:
-            if pane and codex_collector.session_id_of_process(
-                    int(entry), live_codex) == session_id:
-                panes.add(pane)
+            if pane:
+                proven = verified_pane(pane, "codex", session_id, pid=int(entry))
+                if proven:
+                    panes.add(proven)
         except Exception:
             continue
     return panes.pop() if len(panes) == 1 else None
@@ -432,7 +493,7 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
         if codex_main:
             _defer_until_proven(session_id, report_session)
         return True
-    if not may_report(harness, session_id, worker=worker):
+    if not may_report(harness, session_id, worker=worker, pane_id=pane):
         if observation is not None:
             observation["reason"] = "guard-refused"
         if codex_main and runtime_identity() == ("codex", None):
@@ -460,6 +521,35 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
     return True
 
 
+def _send_projection(command, observation):
+    field = "session_report" if command[2] == "report-agent-session" else "metadata_report"
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=_HERDR_TIMEOUT, check=False)
+        if observation is not None:
+            observation[field] = "exit0" if result.returncode == 0 else "nonzero"
+            observation[field + "_rc"] = result.returncode
+    except subprocess.TimeoutExpired:
+        if observation is not None:
+            observation[field] = "timeout"
+    except Exception:
+        if observation is not None:
+            observation[field] = "spawn-error"
+
+
+def _metadata_command(herdr, harness, session_id, pane):
+    title = session_title(harness, session_id)
+    label, custom_title = _formatter_overrides(harness, session_id, title)
+    agent, shown_title = compose(harness, session_id, title=custom_title or title, label=label)
+    # Herdr replaces the whole metadata record, so send both fields together.
+    metadata = [herdr, "pane", "report-metadata", pane, "--source", "herdr:%s" % harness,
+                "--display-agent", agent]
+    header = header_title(agent, shown_title)
+    if header:
+        metadata += ["--title", header]
+    return metadata
+
+
 def _report(harness: str, session_id: str, pane: str, report_session: bool,
             observation=None, session_seq=None, session_start_source=None) -> None:
     herdr = shutil.which("herdr")
@@ -467,12 +557,7 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
         if observation is not None:
             observation["reason"] = "herdr-unavailable"
         return
-    title = session_title(harness, session_id)
-    label, custom_title = _formatter_overrides(harness, session_id, title)
-    agent, shown_title = compose(harness, session_id, title=custom_title or title,
-                                 label=label)
     source = "herdr:%s" % harness
-    commands = []
     lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
     if lifecycle is None:
         report_session = False
@@ -483,31 +568,13 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
             session_command += ["--seq", str(session_seq)]
         if session_start_source is not None:
             session_command += ["--session-start-source", session_start_source]
-        commands.append(session_command)
-    # Both fields go in the SAME report: herdr's metadata record is per-source and a
-    # report replaces it whole, so sending one alone clears the other (measured).
-    metadata = [herdr, "pane", "report-metadata", pane, "--source", source,
-                "--display-agent", agent]
-    header = header_title(agent, shown_title)
-    if header:
-        metadata += ["--title", header]
-    commands.append(metadata)
+        # Publish the exact native identity before the number resolver observes
+        # this new pane. Otherwise its first metadata report still uses the hash.
+        _send_projection(session_command, observation)
+    metadata = _metadata_command(herdr, harness, session_id, pane)
     if observation is not None and not report_session:
         observation["session_report"] = "skipped"
-    for command in commands:
-        field = "session_report" if command[2] == "report-agent-session" else "metadata_report"
-        try:
-            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    timeout=_HERDR_TIMEOUT, check=False)
-            if observation is not None:
-                observation[field] = "exit0" if result.returncode == 0 else "nonzero"
-                observation[field + "_rc"] = result.returncode
-        except subprocess.TimeoutExpired:
-            if observation is not None:
-                observation[field] = "timeout"
-        except Exception:
-            if observation is not None:
-                observation[field] = "spawn-error"
+    _send_projection(metadata, observation)
     if observation is not None:
         observation["reason"] = "report-attempts-finished"
 

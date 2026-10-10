@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,10 +26,12 @@ from dispatch_attempt_policy import (
 )
 
 SCHEMA_VERSION = 1
+RUNNER_LOCK_NAME = "runner-current.lock"
 _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
 _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch"})
+_RUNNERS: list[subprocess.Popen] = []
 
 
 class ObligationError(ValueError):
@@ -242,12 +246,52 @@ def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
     return kind + "-" + hashlib.sha256(raw).hexdigest()[:32]
 
 
+def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
+    """Replace only an exact observer whose old code cannot process this duty.
+
+    Accepted work stays in the existing store; the same flock fences its next
+    observer. A pidfd prevents a recycled PID from ever receiving the signal.
+    """
+    if not any(d.get("intent", {}).get("carrier") == "claude-parent-runtime"
+               for d in store.list()):
+        return False
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
+    state_root = str(store.root.parents[1])
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        pidfd = None
+        try:
+            pidfd = os.pidfd_open(int(proc.name))
+            argv = (proc / "cmdline").read_bytes().decode().rstrip("\0").split("\0")
+            if (len(argv) < 3 or Path(argv[1]).name != "peer-steward.py"
+                    or argv[2] != "__obligation-runner"
+                    or argv[argv.index("--state-root") + 1] != state_root):
+                continue
+            lock_fd = argv[argv.index("--lock-fd") + 1]
+            if (proc / "fd" / lock_fd).resolve() != lock_path.resolve():
+                continue
+            if "def _resume_registered_obligation(" in Path(argv[1]).read_text():
+                continue
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            return True
+        except (OSError, ValueError, IndexError, UnicodeError):
+            continue
+        finally:
+            if pidfd is not None:
+                os.close(pidfd)
+    return False
+
+
 def ensure_runner(root: str | Path | None = None) -> bool:
     """Start the existing peer-steward task runner once for actual open duties."""
     store = ObligationStore(root)
     if not store.list():
         return False
-    lock_path = store.root / "runner.lock"
+    # Legacy runners can remain alive through a long registered child. Their
+    # message claims still serialize transport; do not interrupt an in-flight send.
+    lock_path = store.root / RUNNER_LOCK_NAME
     store.root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if lock_path.is_symlink():
         raise ObligationError("peer-obligation-runner-lock-symlink")
@@ -256,18 +300,46 @@ def ensure_runner(root: str | Path | None = None) -> bool:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return True
+            if not _handoff_legacy_runner(store, lock_path):
+                return True
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(0.02)
         os.set_inheritable(fd, True)
         runner = Path(__file__).with_name("peer-steward.py")
-        subprocess.Popen(
+        _RUNNERS[:] = [process for process in _RUNNERS if process.poll() is None]
+        process = subprocess.Popen(
             [sys.executable, str(runner), "__obligation-runner", "--lock-fd", str(fd),
              "--state-root", str(Path(root).resolve()) if root else str(peer_state_root())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, pass_fds=(fd,), start_new_session=True,
         )
+        _RUNNERS.append(process)
         return True
     except (OSError, subprocess.SubprocessError):
         return False
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def legacy_runner_lock(store: ObligationStore):
+    """Serialize retire side effects with a runner from before input separation."""
+    path = store.root / "runner.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
     finally:
         os.close(fd)
 
@@ -286,6 +358,7 @@ def pane_readiness(
     bound_work: tuple[RegisteredWorkObservation, ...] = (),
     bindings_state: str = "observed",
     provenance: tuple[tuple[str, str], ...] = (),
+    purpose: str = "completion",
 ):
     observation = PaneObservation(
         server=server, pane=pane, harness=harness, session_id=session_id,
@@ -293,12 +366,46 @@ def pane_readiness(
         native_turn=native_turn, form_state=form_state, draft_state=draft_state,
         bound_work=bound_work, bindings_state=bindings_state, provenance=provenance,
     )
-    return completion_readiness(observation)
+    return completion_readiness(observation, purpose=purpose)
+
+
+def execution_attempts_for_processes(processes: Iterable[dict]) -> tuple[str, ...]:
+    """Read only the exact foreground processes' existing dispatch tags."""
+    from dispatch_contract import ATTEMPT_DESCENDANT_ENV, _runtime_ancestry_proc_stat
+
+    attempts = set()
+    key = ATTEMPT_DESCENDANT_ENV.encode() + b"="
+    for process in processes:
+        try:
+            pid = int(process["pid"])
+            before = _runtime_ancestry_proc_stat(pid)
+            if before is None:
+                continue
+            try:
+                raw = (Path("/proc") / str(pid) / "environ").read_bytes()
+            except OSError as exc:
+                if before == _runtime_ancestry_proc_stat(pid):
+                    raise ObligationError("pane-execution-unavailable") from exc
+                continue
+            if before != _runtime_ancestry_proc_stat(pid):
+                continue
+            for item in raw.split(b"\0"):
+                if item.startswith(key):
+                    attempt = item[len(key):].decode("utf-8")
+                    if _SAFE_ID.fullmatch(attempt):
+                        attempts.add(attempt)
+        except ObligationError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError, UnicodeError):
+            continue
+    return tuple(sorted(attempts))
 
 
 def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
-                        jobs: str | Path | None = None) -> tuple[tuple[RegisteredWorkObservation, ...], str]:
-    """Read registered-parent or handed-over attempts; an observed empty scan is valid."""
+                        jobs: str | Path | None = None,
+                        execution_attempt_ids: tuple[str, ...] = (),
+                        ) -> tuple[tuple[RegisteredWorkObservation, ...], str]:
+    """Read exact executor, registered-parent or handed-over attempt bindings."""
     from dispatch_contract import (
         observed_attempt_liveness,
         parse_registry_metadata,
@@ -326,9 +433,12 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             return (), "unknown"
         status = fields[1]
         metadata = parse_registry_metadata(fields[5])
-        if (not owns(metadata, session_id, jobs_path)
-                or (metadata.get("parent_harness") if metadata.get("parent_sid") == session_id
-                    else effective_parent_harness(metadata, jobs_path)) not in {None, "", harness}):
+        executor = (metadata.get("attempt_id") in execution_attempt_ids
+                    and metadata.get("harness") == harness)
+        parent = (owns(metadata, session_id, jobs_path)
+                  and (metadata.get("parent_harness") if metadata.get("parent_sid") == session_id
+                       else effective_parent_harness(metadata, jobs_path)) in {None, "", harness})
+        if not executor and not parent:
             continue
         attempt_id = metadata.get("attempt_id", "")
         if not attempt_id:
@@ -351,6 +461,7 @@ def bound_work_for_pane(pane: str, harness: str, session_id: str, *,
             evidence_state=metadata.get("receipt_state", metadata.get("note", "unclassified")),
             owner_completion_state=closure_state,
             cleanup_state=("pending" if metadata.get("cleanup_pending") == "1" else "settled"),
+            pane_relation="executor" if executor else "parent",
             provenance=(("jobs", str(jobs_path)), ("registry_status", status),
                         ("registry_state_root", str(state_root))),
         ))

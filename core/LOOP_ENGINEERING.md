@@ -182,6 +182,21 @@ defect. A slower or emptier view is a regression even when every check passes.
 Publish observed session identity, execution/wait reasons and resources first;
 campaign titles, route details and installation/git metadata fill asynchronously.
 Unknown observations stay unknown, and slow details must not stop basic refresh.
+Project activity includes running resources nested under an idle owner. A file
+update is labelled as a file update, never as completion. Recent results show
+the recorded task, result and event time; an unproven gate is not a failed task.
+Current execution or wait observations precede generated text. Older titles
+are labelled as previous subjects, and summaries as previous text with their
+own age, including sentences that say work is running or complete.
+An incomplete observation cannot establish absence: publish the last observed
+work together with the failed source, its last success and the reason it is
+unconfirmed. Basic and detail refresh share this health vocabulary. Publish
+route evidence and its projection in the same snapshot; rendering consumes
+that snapshot without rereading collector globals or redoing the judgment.
+Pane display updates belong to the existing detail pass; assigning a live
+session's number must not wait for pane metadata writes before basic publication.
+Delayed display writes check the pane's current exact session identity and
+assigned number; a changed or unconfirmed target receives no old metadata.
 
 ## Basis and current scope
 

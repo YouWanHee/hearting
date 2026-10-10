@@ -29,6 +29,14 @@ HELPER = ROOT / "adapters/claude/tools/fleet/session_handle.py"
 
 
 class RuntimeProjectionTest(unittest.TestCase):
+    def setUp(self):
+        # This suite verifies native session identity and metadata formatting.
+        # Physical ownership has its own real-pty regression suite.
+        sys.path.insert(0, str(ROOT / "utilities"))
+        import pane_ownership
+        proof = unittest.mock.patch.object(pane_ownership, "verified_pane", return_value="fixture-pane")
+        proof.start()
+        self.addCleanup(proof.stop)
     # Whoever runs this suite may themselves BE a registered worker (a dispatched
     # reviewer, the title refresher). Those markers gate the projection, so leaving them
     # inherited makes the result depend on who ran the test.
@@ -43,8 +51,21 @@ class RuntimeProjectionTest(unittest.TestCase):
                     "CLAUDE_CONFIG_DIR": str(root / "home" / ".claude"),
                     "HARNESS_CAPACITY_REFRESH_DISABLE": "1",
                     "CODEX_HOME": str(root / "codex"), "FLEET_TITLE_STATE_DIR": str(root / "titles"),
+                    "XDG_STATE_HOME": str(root / "state"),
+                    "FLEET_SESSION_REGISTRY_DIR": str(root / "registry"),
                     "PYTHONDONTWRITEBYTECODE": "1"})
         env.pop("CODEX_THREAD_ID", None)
+        fixture = root / "python-fixture"
+        fixture.mkdir(exist_ok=True)
+        (fixture / "sitecustomize.py").write_text(
+            f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
+            "import pane_ownership\n"
+            "def admitted(pane,harness,sid=None,*,pid=None,**kw):\n"
+            "    if pid is not None and sid and pane_ownership._native_session(pid,harness)!=sid:\n"
+            "        return ''\n"
+            "    return pane or ''\n"
+            "pane_ownership.verified_pane=admitted\n")
+        env["PYTHONPATH"] = str(fixture) + os.pathsep + env.get("PYTHONPATH", "")
         env.update(overrides)
         return env
 
@@ -119,6 +140,10 @@ class RuntimeProjectionTest(unittest.TestCase):
                     % (str(ROOT), harness, sid, worker))
         result = subprocess.run([interpreter, "-c", code], env=env, capture_output=True)
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+        # Allocation may probe the live inventory. Keep the exact publisher
+        # argv/order assertions independent of those read-only observations.
+        rows = [row for row in rows if row[:2] in
+                (["pane", "report-agent-session"], ["pane", "report-metadata"])]
         return result, rows
 
     def claude_hook(self, root, sid, payload=None, **env_overrides):
@@ -983,10 +1008,15 @@ class PaneHeaderIdentityTest(unittest.TestCase):
     def test_both_fields_are_reported_in_one_call(self):
         """herdr's metadata record is per-source and a report replaces it whole — sending
         `--title` alone clears `--display-agent` (measured on a live pane)."""
-        import inspect
         from tools.fleet import herdr_projection
-        body = inspect.getsource(herdr_projection._report)
-        metadata = body.split("metadata = [", 1)[1].split("\n\n", 1)[0]
+        with unittest.mock.patch.object(herdr_projection.shutil, "which", return_value="herdr"), \
+             unittest.mock.patch.object(herdr_projection, "session_title", return_value="summary"), \
+             unittest.mock.patch.object(herdr_projection, "_formatter_overrides", return_value=(None, None)), \
+             unittest.mock.patch.object(herdr_projection, "compose", return_value=("codex", "summary")), \
+             unittest.mock.patch.object(herdr_projection, "_send_projection", autospec=True) as send:
+            herdr_projection._report("codex", "sid", "pane", False)
+        self.assertEqual(send.call_count, 1)
+        metadata = send.call_args.args[0]
         self.assertIn("--display-agent", metadata)
         self.assertIn("--title", metadata)
 

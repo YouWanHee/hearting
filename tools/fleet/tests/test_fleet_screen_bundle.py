@@ -20,7 +20,7 @@ from fleet.model import DispatchJob, ResourceJob, Session, WorkProjection
 def session(sid, harness="codex", **kw):
     return Session(harness=harness, pid=100 + len(sid), proc_start=sid,
                    session_id=sid, session_tag=sid[:2], cwd="/work/bundle",
-                   title=sid, liveness="working", elapsed_min=180, **kw)
+                   runtime_name=sid, liveness="working", elapsed_min=180, **kw)
 
 
 def target(sid, harness="codex"):
@@ -214,7 +214,9 @@ class BundleTest(unittest.TestCase):
             {"host": "gpu", "reachable": True, "gpus": [{"index": 0, "processes": [
                 {"pid": 123, "proc_start": "456", "command": "python train.py",
                  "owner": {"kind": "run", "id": "golden-gpu"}}]}]}]})
-        with mock.patch("time.time", return_value=1700000000.0):
+        with mock.patch("time.time", return_value=1700000000.0), \
+                mock.patch.object(render, "_API_DISABLED", False), \
+                mock.patch.object(render, "_HEARTING", None):
             return "\n".join(row.rstrip() for row in
                              text(self.build([main, child], owners, width))) + "\n"
 
@@ -458,9 +460,10 @@ class BundleTest(unittest.TestCase):
         child = session("bb", model="MODEL", effort="high", herdr_attached=True, summary="NOWTEXT")
         for width in (60, 100, 168):
             rows = text(self.build([parent, child], width=width))
-            where = [row for row in rows if "herdr" in row and "NOWTEXT" in row]
+            where = [row for row in rows if "herdr" in row and "작업 중" in row]
             self.assertEqual([row.index("herdr") for row in where], [render._SESSION_DETAIL_COL] * 2)
-            self.assertEqual([row.index("NOWTEXT") for row in where], [render._NAME_COL] * 2)
+            self.assertEqual([render._dw(row[:row.index("작업 중")]) for row in where],
+                             [render._NAME_COL] * 2)
             self.assertEqual(where[0][render._STEWARD_LINE_COL], "⚑" if width == 168 else "┆")
             self.assertEqual(where[1][render._STEWARD_LINE_COL], " ")
             if width != 168:
