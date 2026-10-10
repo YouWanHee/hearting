@@ -1755,9 +1755,10 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                     cache_key = (str(root), work.route_id, work.route_hash, str(jobs_path or ""))
                     if cache_key not in report_verification_cache:
                         try:
-                            from utilities.report_verification_projection import project_route
-                            report_verification_cache[cache_key] = project_route(
-                                root, work.route_id, work.route_hash, jobs=jobs_path)
+                            from utilities.report_verification_projection import (
+                                project_route, report_detail_payload)
+                            report_verification_cache[cache_key] = report_detail_payload(project_route(
+                                root, work.route_id, work.route_hash, jobs=jobs_path))
                         except Exception:
                             report_verification_cache[cache_key] = None
                     if report_verification_cache[cache_key] is not None:

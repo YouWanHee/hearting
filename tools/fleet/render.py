@@ -4361,6 +4361,25 @@ def _resource_progress_tail(child, room=None):
     return count + suffix
 
 
+def _resource_process_location(child):
+    """Use existing exact local identity/placement, never GPU selection or log age."""
+    if type(child.pid) is not int or child.pid <= 0 or not str(child.starttime).isdigit():
+        return ""
+    placement = getattr(child, "local_placement", None) or {}
+    placed = any(isinstance(p, dict) and p.get("pid") == child.pid
+                 and str(p.get("starttime")) == str(child.starttime)
+                 for p in placement.get("processes", ()))
+    evidence = getattr(child, "state_evidence", None) or {}
+    current = evidence.get("current_identity") or {}
+    verified = (evidence.get("reason") == "exact-identity-match"
+                and current.get("pid") == child.pid
+                and str(current.get("starttime")) == str(child.starttime))
+    if child.liveness != "working" or not (placed or verified):
+        return ""
+    host = _gpu_safe_text(placement.get("hostname")) if placed else ""
+    return (host + " · " if host else "") + "PID %s" % child.pid
+
+
 def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_children=(),
                          children=None):
     """Observed resource children, never log-parsed progress or model dispatch rows."""
@@ -4374,18 +4393,26 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
         if not _SHOW_ALL and child.liveness != "working":
             continue
         glyph, key = _glyph(child.liveness if child.liveness != "exited" else "done")
-        node = child.route_node or child.node or child.run_id
-        tail = "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min))
-        # Keep the existing liveness/elapsed and at least a short node label;
-        # narrow widths clip the counter text before its update age, never wrap.
-        progress_room = (width - _dw(indent + glyph + " resource " + tail)
-                         - min(12, _dw(str(node))) - 2) if width else None
+        if child.liveness == "working":
+            glyph, key = "●", "g_work" if _BLINK_ON else "g_work_off"
+        node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+        tail = ("  " + fmt_min(child.elapsed_min) if child.liveness == "working"
+                else "  %s  %s" % (child.liveness, fmt_min(child.elapsed_min)))
+        # Name and elapsed survive first; placement then counters yield as needed.
+        # A long name keeps a useful 24-column prefix before optional details.
+        room = (max(0, width - _dw(indent + glyph + " resource " + tail)
+                    - min(24, _dw(node))) if width else None)
+        location = _resource_process_location(child)
+        if location and (room is None or room >= _dw("  " + location)):
+            tail += "  " + location
+            if room is not None:
+                room -= _dw("  " + location)
+        progress_room = max(0, room - 2) if room is not None else None
         progress = _resource_progress_tail(child, progress_room)
-        if not progress and width and getattr(child, "progress", None):
-            progress = _resource_progress_tail(
-                child, width - _dw(indent + glyph + " resource " + tail) - 3)
         if progress:
             tail += "  " + progress
+        if width:
+            tail = _clip_w(tail, max(0, width - _dw(indent + glyph + " resource ") - 1))
         budget = max(1, width - _dw(indent + glyph + " resource " + tail)) if width else 44
         rows.append([(indent, None), (glyph, key), (" resource ", "dim"),
                      (_clip_w(str(node), budget), "name_dim"), (tail, "dim")])

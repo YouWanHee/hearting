@@ -80,6 +80,23 @@ class ReportVerificationDisplayTests(unittest.TestCase):
         finally:
             render.set_process_view(False)
 
+    def test_absent_report_is_not_attached_but_integrity_failures_remain_visible(self):
+        for reason in ("report-source-unavailable", "route-hash-binding-mismatch",
+                       "artifact-revision-stale", "report-source-kind-invalid"):
+            payload = report_verification_projection._display(
+                report_verification_projection._unresolved(reason))
+            with self.subTest(reason=reason), mock.patch.object(
+                    report_verification_projection, "project_route", return_value=payload):
+                projection.attach_projections(
+                    [], [self.job], route_records={self.record["route_id"]: self.record},
+                    artifact_root="/tmp", now=100.0)
+                rows = render._report_verification_detail_row(self.job)
+                if reason == "report-source-unavailable":
+                    self.assertIsNone(self.job.work_projection.report_verification)
+                    self.assertEqual(rows, [])
+                else:
+                    self.assertIn(reason, "".join(t for t, _ in rows[0]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
