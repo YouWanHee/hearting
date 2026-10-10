@@ -182,6 +182,20 @@ class NVMLFallbackTest(unittest.TestCase):
         entries = compute_hosts.unregistered_gpu({"configured": True, "hosts": [host]})
         self.assertEqual(len(entries), 2)
 
+    def test_fleet_preserves_valid_fallback_after_slow_probe_preparation(self):
+        host = self.probe()
+        tool = self.root / "slow_probe.py"
+        tool.write_text("import json,time\ntime.sleep(5.2)\nprint(json.dumps(%r))\n" %
+                        {"hosts": [host]})
+        config = self.root / "compute-hosts.yaml"
+        config.write_text("schema_version: 1\n")
+        with mock.patch.dict(os.environ, {"COMPUTE_HOSTS_CONFIG": str(config),
+                                          "FLEET_COMPUTE_HOSTS_TOOL": str(tool)}):
+            snapshot = compute_hosts.collect()
+        self.assertNotIn("error", snapshot)
+        self.assertEqual(snapshot["hosts"][0]["gpu_status"]["running_count"], 2)
+        self.assertEqual([g["index"] for g in snapshot["hosts"][0]["gpus"]], [0, 1])
+
     def test_admission_refuses_unknown_measurement_even_with_share(self):
         host = self.probe()
         with mock.patch.object(CH, "probe_host", return_value=host):

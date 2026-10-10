@@ -1400,6 +1400,8 @@ including `--share`, and names observed occupancy without reporting free GPUs.
 Fallback GPU indexes identify physical device minors. Existing reservations
 whose NVML index cannot be mapped stay visible at host level with unknown
 device placement; they are not attached to a guessed GPU.
+Fleet's outer collection deadline includes local preparation and parallel host
+samples, with bounded headroom for proc fallback; per-host SSH waits stay bounded.
 
 Reservation lifetime follows the exact wrapper PID, start time and PID namespace,
 not its launching session. Normal exit releases it; the next launch removes

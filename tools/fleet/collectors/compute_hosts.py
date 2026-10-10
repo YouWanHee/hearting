@@ -17,7 +17,10 @@ import time
 from ..model import project_of
 
 
-COLLECT_TIMEOUT = 5.0
+# Covers interpreter/local preparation plus parallel bounded SSH samples.
+# The proc fallback can exceed the old 5s whole-cycle budget even when every
+# host answers within its own deadline. Live polling runs in its own pump.
+COLLECT_TIMEOUT = 20.0
 
 
 def _tool_argv():
