@@ -60,7 +60,11 @@ class RuntimeProjectionTest(unittest.TestCase):
         (fixture / "sitecustomize.py").write_text(
             f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
             "import pane_ownership\n"
-            "pane_ownership.verified_pane=lambda pane,*a,**kw: pane or ''\n")
+            "def admitted(pane,harness,sid=None,*,pid=None,**kw):\n"
+            "    if pid is not None and sid and pane_ownership._native_session(pid,harness)!=sid:\n"
+            "        return ''\n"
+            "    return pane or ''\n"
+            "pane_ownership.verified_pane=admitted\n")
         env["PYTHONPATH"] = str(fixture) + os.pathsep + env.get("PYTHONPATH", "")
         env.update(overrides)
         return env
