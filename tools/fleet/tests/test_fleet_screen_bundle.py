@@ -461,7 +461,7 @@ class BundleTest(unittest.TestCase):
         child = session("bb", model="MODEL", effort="high", herdr_attached=True, summary="NOWTEXT")
         for width in (60, 100, 168):
             rows = text(self.build([parent, child], width=width))
-            where = [row for row in rows if "herdr" in row and "작업 중" in row]
+            where = [row for row in rows if "herdr" in row and "문맥" in row and "작업 중" in row]
             self.assertEqual([row.index("herdr") for row in where], [render._SESSION_DETAIL_COL] * 2)
             self.assertEqual([render._dw(row[:row.index("작업 중")]) for row in where],
                              [render._NAME_COL] * 2)
