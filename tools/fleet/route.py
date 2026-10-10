@@ -50,6 +50,7 @@ import json
 import os
 import sys
 import time
+from .work_titles import readable
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -575,8 +576,9 @@ def result_projection(record, outcome):
     name = record.get("slug")
     if not isinstance(name, str) or not name.strip():
         return None
-    return {"name": name, "result": "success", "at": timestamp,
-            "source": "route-outcome", "route_id": record.get("route_id")}
+    return {"name": readable(record.get("display_title") or record.get("title") or name),
+            "result": "success", "at": timestamp, "source": "route-outcome",
+            "route_id": record.get("route_id"), "artifact_root": record.get("artifact_root")}
 
 
 def _valid_attempt_axes(marker, node):
