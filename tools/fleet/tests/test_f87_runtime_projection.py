@@ -51,6 +51,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                     "CLAUDE_CONFIG_DIR": str(root / "home" / ".claude"),
                     "HARNESS_CAPACITY_REFRESH_DISABLE": "1",
                     "CODEX_HOME": str(root / "codex"), "FLEET_TITLE_STATE_DIR": str(root / "titles"),
+                    "XDG_STATE_HOME": str(root / "state"),
+                    "FLEET_SESSION_REGISTRY_DIR": str(root / "registry"),
                     "PYTHONDONTWRITEBYTECODE": "1"})
         env.pop("CODEX_THREAD_ID", None)
         fixture = root / "python-fixture"
@@ -134,6 +136,10 @@ class RuntimeProjectionTest(unittest.TestCase):
                     % (str(ROOT), harness, sid, worker))
         result = subprocess.run([interpreter, "-c", code], env=env, capture_output=True)
         rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+        # Allocation may probe the live inventory. Keep the exact publisher
+        # argv/order assertions independent of those read-only observations.
+        rows = [row for row in rows if row[:2] in
+                (["pane", "report-agent-session"], ["pane", "report-metadata"])]
         return result, rows
 
     def claude_hook(self, root, sid, payload=None, **env_overrides):

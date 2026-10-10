@@ -759,6 +759,18 @@ for a second entry approval. Older sealed quick routes retain their
 
 ### §5.11. Commit and Push Policy for `<agent-home>`
 
+Fleet's two-hex session numbers have one shared resolver,
+`tools/fleet/session_handle.py::resolve_tag`, consumed by Fleet, peer trailers
+and Herdr titles. Codex and OpenCode reserve distinct numbers among observed
+live sessions in a small XDG state assignment file; an existing live assignment
+keeps its number and a later session takes a free one. Initial collection orders
+unassigned sessions by their known start time. Claude's runtime-derived numbers
+are fixed reservations, so a conflicting Codex or OpenCode assignment moves.
+Collection refreshes these reservations automatically; no user input or flag is
+needed. Missing, corrupt or unwritable assignment state falls back to the original
+session-id hash. Exhaustion of the 256 values and duplicate fixed Claude numbers
+leave uniqueness unavailable.
+
 Merge with `hearting run merge-line <PR>`. This shared command queues sessions
 and worktrees for the same GitHub repository under a user-state `flock`, shows
 the waiting position and preceding PR, then updates the branch only if it lacks

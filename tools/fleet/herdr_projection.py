@@ -230,6 +230,29 @@ def is_steward(harness: str, session_id: str) -> bool:
     return False
 
 
+def refresh_tag_metadata(agents) -> None:
+    """Refresh changed numbers on exactly identified panes, even while idle.
+
+    This reuses the regular metadata projection. It reports no runtime session
+    identity or lifecycle, and never prompts or wakes the pane's session.
+    """
+    for agent in agents:
+        harness = agent.get("agent")
+        identity = agent.get("agent_session") or {}
+        pane = agent.get("pane_id")
+        if (harness not in {"codex", "opencode"} or not pane
+                or not isinstance(identity, dict) or identity.get("kind") != "id"
+                or identity.get("agent", harness) != harness):
+            continue
+        sid = identity.get("value")
+        if not isinstance(sid, str) or not sid:
+            continue
+        tag = resolve_tag(harness, sid)
+        shown = re.match(r"^\[([0-9a-f]{2})\]", str(agent.get("display_agent") or ""))
+        if tag and (not shown or shown.group(1) != tag):
+            _report(harness, sid, pane, False)
+
+
 def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None,
             label=None) -> tuple:
     """→ ``(display_agent, title)`` in the fixed order number → harness → ⚑ → summary.
@@ -463,6 +486,22 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
     return True
 
 
+def _send_projection(command, observation):
+    field = "session_report" if command[2] == "report-agent-session" else "metadata_report"
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=_HERDR_TIMEOUT, check=False)
+        if observation is not None:
+            observation[field] = "exit0" if result.returncode == 0 else "nonzero"
+            observation[field + "_rc"] = result.returncode
+    except subprocess.TimeoutExpired:
+        if observation is not None:
+            observation[field] = "timeout"
+    except Exception:
+        if observation is not None:
+            observation[field] = "spawn-error"
+
+
 def _report(harness: str, session_id: str, pane: str, report_session: bool,
             observation=None, session_seq=None, session_start_source=None) -> None:
     herdr = shutil.which("herdr")
@@ -470,12 +509,7 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
         if observation is not None:
             observation["reason"] = "herdr-unavailable"
         return
-    title = session_title(harness, session_id)
-    label, custom_title = _formatter_overrides(harness, session_id, title)
-    agent, shown_title = compose(harness, session_id, title=custom_title or title,
-                                 label=label)
     source = "herdr:%s" % harness
-    commands = []
     lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
     if lifecycle is None:
         report_session = False
@@ -486,7 +520,13 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
             session_command += ["--seq", str(session_seq)]
         if session_start_source is not None:
             session_command += ["--session-start-source", session_start_source]
-        commands.append(session_command)
+        # Publish the exact native identity before the number resolver observes
+        # this new pane. Otherwise its first metadata report still uses the hash.
+        _send_projection(session_command, observation)
+    title = session_title(harness, session_id)
+    label, custom_title = _formatter_overrides(harness, session_id, title)
+    agent, shown_title = compose(harness, session_id, title=custom_title or title,
+                                 label=label)
     # Both fields go in the SAME report: herdr's metadata record is per-source and a
     # report replaces it whole, so sending one alone clears the other (measured).
     metadata = [herdr, "pane", "report-metadata", pane, "--source", source,
@@ -494,23 +534,9 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
     header = header_title(agent, shown_title)
     if header:
         metadata += ["--title", header]
-    commands.append(metadata)
     if observation is not None and not report_session:
         observation["session_report"] = "skipped"
-    for command in commands:
-        field = "session_report" if command[2] == "report-agent-session" else "metadata_report"
-        try:
-            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    timeout=_HERDR_TIMEOUT, check=False)
-            if observation is not None:
-                observation[field] = "exit0" if result.returncode == 0 else "nonzero"
-                observation[field + "_rc"] = result.returncode
-        except subprocess.TimeoutExpired:
-            if observation is not None:
-                observation[field] = "timeout"
-        except Exception:
-            if observation is not None:
-                observation[field] = "spawn-error"
+    _send_projection(metadata, observation)
     if observation is not None:
         observation["reason"] = "report-attempts-finished"
 
