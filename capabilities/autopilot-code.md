@@ -167,6 +167,13 @@ At `thorough+` the group realizes a third `simplicity-check` leg with `leg_class
 
 ## Guard Requirements
 
+A code one-shot owner owns the approved task's deliverables beneath its own
+bound cycle's `artifacts/`. The recipe's `plans/<cycle>/**` names its reporting
+folder, not an exclusion of other approved deliverables such as `approval/`.
+This applies to existing sealed one-shot routes too, without rewriting their
+scope or identity. Stage and review nodes keep their narrower declared ranges;
+other cycles, source scope and external execution access remain separate.
+
 Adapters must preserve the portable invariants relevant to this capability:
 
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;

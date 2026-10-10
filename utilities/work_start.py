@@ -1806,6 +1806,17 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     launched_now = aid not in rows
     if aid not in rows:
         owner_pin = route_authority.sealed_pin_harness(route, worker_type="owner")
+        view = route_authority.route_in_force(route)
+        if owner_pin and view.get("registered_headless_candidates") is None and not any(
+                row.get("parent_harness") == owner_pin and row.get("status") == "supported"
+                and row.get("launch_authority") == "conductor"
+                for row in (view.get("dispatch_evidence") or {}).get("tuples", [])):
+            # Older composes probed the caller instead of the fixed owner.
+            # Keep that route and its approval; ordinary start checks the owner
+            # and records the missing evidence with the existing pin writer.
+            module = _route_module()
+            result["pin_evidence"] = module._change_pins(route, jobs, RP.pin_tokens(
+                {"owner": (view.get("selection_pins") or {})["owner"]}))
         rows, refusal = _launch_admitted(route, path, jobs, "owner", owner_pin or request["owner_harness"], run, result,
                                           wait=wait, sleep=sleep, clock=clock)
     if aid not in rows:

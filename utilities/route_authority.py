@@ -268,6 +268,17 @@ def _tuple_key(row: dict) -> tuple:
         "parent_harness", "parent_transport", "parent_sandbox", "child_harness", "launch_authority"))
 
 
+def _merge_checked_tuple(rows, row):
+    for index, old in enumerate(rows):
+        if _tuple_key(row) == _tuple_key(old):
+            if row.get("status") == "supported" and (
+                    old.get("status") != "supported"
+                    or row.get("checked_worktree") != old.get("checked_worktree")):
+                rows[index] = dict(row)
+            return
+    rows.append(dict(row))
+
+
 def route_in_force(route):
     """The sealed route with its recorded pin changes applied: the pin in force, and the
     checked tuples probed for each new pin added to the route's dispatch evidence,
@@ -289,16 +300,14 @@ def route_in_force(route):
         for row in change.get("tuples") or []:
             if not isinstance(row, dict) or tuples is None:
                 continue
-            if all(_tuple_key(row) != _tuple_key(old) for old in tuples):
-                tuples.append(row)
+            _merge_checked_tuple(tuples, row)
             if row.get("launch_authority") != "conductor":
                 continue
             ordinal = 1 if row.get("child_harness") == row.get("parent_harness") else 2
             for node in view.get("nodes") or []:
                 for hop in node.get("fallback_hops") or []:
-                    if hop.get("ordinal") == ordinal and isinstance(hop.get("candidates"), list) \
-                            and all(_tuple_key(row) != _tuple_key(old) for old in hop["candidates"]):
-                        hop["candidates"].append(dict(row))
+                    if hop.get("ordinal") == ordinal and isinstance(hop.get("candidates"), list):
+                        _merge_checked_tuple(hop["candidates"], row)
         for row in change.get("candidates") or []:
             if isinstance(candidates, list) and isinstance(row, dict) and row not in candidates:
                 candidates.append(row)
@@ -308,7 +317,8 @@ def route_in_force(route):
 
 def changed_pin_harness(route, target: str) -> str | None:
     """The harness the route's parent last moved `target` to, or None when it never moved it."""
-    changes = [row for row in pin_changes(route) if row.get("target") == target]
+    changes = [row for row in pin_changes(route) if row.get("target") == target
+               and (row.get("previous") or {}).get("harness") != row["pin"]["harness"]]
     return changes[-1]["pin"]["harness"] if changes else None
 
 
@@ -322,7 +332,7 @@ def moved_owner_harness(route, launched_harness: str | None) -> str | None:
 
 def record_pin_change(route, *, target: str, pin: dict, by: dict, source: str,
                       tuples: list, candidates: list, now: float | None = None) -> dict | None:
-    """Append one pin change for this route; None when the pin in force is already `pin`."""
+    """Append a changed pin or its missing checked evidence; exact replay is None."""
     import fcntl
     import time
     if target not in PIN_CHANGE_TARGETS or pin.get("harness") not in PIN_HARNESSES:
@@ -333,10 +343,21 @@ def record_pin_change(route, *, target: str, pin: dict, by: dict, source: str,
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path.with_name(path.name + ".lock"), "a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        previous = (route_in_force(route).get("selection_pins") or {}).get(target)
+        view = route_in_force(route)
+        previous = (view.get("selection_pins") or {}).get(target)
         if isinstance(previous, dict) and {k: previous.get(k) for k in ("harness", "model", "effort")} \
                 == {k: pin.get(k) for k in ("harness", "model", "effort")}:
-            return None
+            existing = (view.get("dispatch_evidence") or {}).get("tuples", [])
+            current_candidates = view.get("registered_headless_candidates") or []
+            missing_tuple = any(row.get("status") == "supported" and not any(
+                _tuple_key(row) == _tuple_key(old) and old.get("status") == "supported"
+                and row.get("checked_worktree") == old.get("checked_worktree") for old in existing)
+                for row in tuples)
+            missing_candidate = any(row.get("status") == "supported" and not any(
+                row.get("harness") == old.get("harness") and old.get("status") == "supported"
+                for old in current_candidates) for row in candidates)
+            if not missing_tuple and not missing_candidate:
+                return None
         row = {"schema": PIN_CHANGE_SCHEMA, "route_id": route["route_id"], "route_hash": route["route_hash"],
                "target": target, "pin": {k: pin.get(k) for k in ("harness", "model", "effort")},
                "previous": previous, "by": dict(by), "source": source,

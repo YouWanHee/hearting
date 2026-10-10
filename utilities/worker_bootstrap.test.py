@@ -257,6 +257,25 @@ class NodeScopeTest(unittest.TestCase):
             )
             self.assertIn(str(cycle_dir / "artifacts" / "shards" / "research" / "notes.md"), prompt)
 
+    def test_code_one_shot_owns_approved_cycle_deliverables_and_source_is_not_an_artifact(self):
+        node = {"id": "one-shot", "kind": "capability-owner", "unit": "_kernel/owner",
+                "write_scope": ["source-scoped", "plans/<cycle>/**"]}
+        route = {"capability": "autopilot-code", "effective_intensity": "quick",
+                 "cwd": "/task/worktree", "nodes": [node]}
+        before = json.dumps(route, sort_keys=True)
+        env = {"AGENT_ARTIFACT_OUTPUT_DIR": "/primary/cycle/artifacts"}
+        scope = W.resolve_node_scope(route, "one-shot", env)
+        artifacts, source = W._resolved_write_scopes(scope)
+        self.assertEqual(artifacts, ["/primary/cycle/artifacts/**"])
+        self.assertEqual(source, ["/task/worktree/**"])
+        self.assertIn("approved task", W.node_scope_prompt(scope))
+        self.assertEqual(json.dumps(route, sort_keys=True), before)
+        for changed in ({"capability": "autopilot-lab"}, {"effective_intensity": "standard"}):
+            narrow = W.resolve_node_scope({**route, **changed}, "one-shot", env)
+            self.assertEqual(W._resolved_write_scopes(narrow)[0], ["/primary/cycle/artifacts/plans/<cycle>/**"])
+        unbound = W.resolve_node_scope(route, "one-shot", {})
+        self.assertIn("do not write durable artifacts", W.node_scope_prompt(unbound))
+
     def test_scope_resolves_from_producer_binding_without_env(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

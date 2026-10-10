@@ -144,6 +144,12 @@ hard eligibility.
 
 `utilities/dispatch-route.sh` is read-only and emits stable key/value trace, rejected, fallback, and unknown records. It does not register, launch, or mutate caches or worktrees. Without an adapter probe, OpenCode remains `unknown` rather than guessed.
 
+For a staged route with a fixed owner harness, readiness checks that owner as
+the conductor of its workers, even when a different harness composed the route
+or its frame supplied the first evidence. Ordinary start fills missing checked
+evidence through the existing pin journal, retaining the sealed route and intent.
+A repeated pin may supply missing evidence without changing the choice.
+
 ### §2.2. Adapter Mapping
 
 Every adapter maps portable roles and execution profiles to runtime models, tools, and prompt profiles as a quality-reproduction contract. A route-bound dispatch always carries both axes; wrappers do not infer the execution budget from role wording or silently inherit the interactive model; a model differs from the profile default only through a route-sealed pin (receipt `model_source=pin`, `model_pin_status=`) or a checked capacity retry, not through a launch-time flag. Update and read core before changing adapter maps or generated agents.
