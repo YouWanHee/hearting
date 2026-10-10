@@ -201,6 +201,8 @@ python3 "$MEM" reattribute j_ra >/dev/null
 seed j_del durable project note "$PKEY" 1 "$TODAY" "delete me body"
 python3 "$MEM" delete j_del >/dev/null
 [ "$(last_event_field action)" = delete ] && ok "delete → action=delete" || bad "delete journal mismatch"
+[ "$(last_event_field snippet)" = "delete me body" ] \
+  && ok "delete → 삭제 전 내용 보존" || bad "delete journal lost pre-delete content"
 
 python3 "$MEM" restore j_del >/dev/null
 [ "$(last_event_field action)" = restore ] && [ "$(last_event_field actor)" = restore ] \
@@ -664,6 +666,8 @@ POST_STORE="$ABSORB_TMP/post-store"; POST_PROJECTS="$ABSORB_TMP/post-projects"
 POST_PROFILE="$ABSORB_TMP/post-profile"; POST_ROOT="$ABSORB_TMP/sample-note"
 POST_WRONG="$ABSORB_TMP/post-wrong"; mkdir -p "$POST_PROJECTS" "$POST_PROFILE" \
   "$POST_ROOT/.agent_reports" "$POST_WRONG"
+# Own the grouping root even when a developer has a Git marker above TMPDIR.
+git init -q "$POST_ROOT"
 printf '%s\n' '## Decisions' \
   '- post-it normalized duplicate body for absorption event proof' \
   '- post-it  normalized duplicate body for absorption event proof' \

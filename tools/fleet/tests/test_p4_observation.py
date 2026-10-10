@@ -84,6 +84,15 @@ class ObservationTest(unittest.TestCase):
         self.assertTrue(all(render._dw(flatten([row])) <= 80 for row in rows))
         self.assertIn("출처 미확인", flatten(render._mem_event_rows({"recent": [{"snippet": "내용"}]})))
 
+    def test_legacy_delete_with_no_recorded_content_is_explicit(self):
+        event = {"id": "r1", "cwd": "/work/project", "snippet": "",
+                 "action": "delete", "actor": "manual", "tier": "working", "type": "decision"}
+        text = flatten(render._mem_event_rows({"recent": [event]}, term_width=80))
+        self.assertIn("기억 정리", text)
+        self.assertIn("내용 미확인", text)
+        self.assertIn("/work/project", text)
+        self.assertNotIn("manual", text)
+
     def test_equal_changes_count_once_only_with_the_same_observed_source(self):
         event = {"id": "r1", "cwd": "/work/project", "snippet": "선택",
                  "action": "decision-record"}
