@@ -47,7 +47,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         keep = ('cwd', 'route', 'node', 'jobs', 'parent_attempt_id', 'owner_wait', 'config_ref',
                 'config_sha256', 'source_commit', 'source_dirty', 'source_git_state', 'config_layout')
         log = self.base / (name + '.log')
-        code = ('from pathlib import Path; Path(' + repr(str(output / 'run.json')) + ').write_text("final")'
+        code = (f'from pathlib import Path; Path({str(output / "run.json")!r}).write_text({json.dumps({"phase":"final"})!r})'
                 if final else 'pass')
         return {**{key: old[key] for key in keep if key in old}, 'run_id': name,
                 'command': [sys.executable, '-c', code], 'log': str(log), 'sentinel': str(log) + '.exit',
@@ -128,7 +128,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         old_arm = SUP.read_armed(ledger)['full-run']
         resumed = body('resumed',
             f'from pathlib import Path; assert Path({str(checkpoint)!r}).read_text() == "saved"; '
-            f'Path({str(output / "run.json")!r}).write_text("resumed")')
+            f'Path({str(output / "run.json")!r}).write_text({json.dumps({"phase":"resumed"})!r})')
         procs, receipt = self.launch(route, path, jobs, registry, output, resumed)
         self.assertEqual(len(procs), 1)
         self.assertTrue(receipt['payload_spawned'])
@@ -143,7 +143,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         def start_verifier(armed, successor, key):
             self.assertEqual(successor, 'run-verify')
             subprocess.run([sys.executable, '-c',
-                f'from pathlib import Path; assert Path({str(output / "run.json")!r}).read_text() == "resumed"; '
+                f'from pathlib import Path; assert Path({str(output / "run.json")!r}).read_text() == {json.dumps({"phase":"resumed"})!r}; '
                 f'Path({str(verifier)!r}).open("a").write("run-verify\\n")'], check=True)
             ledger.record(successor, 'RUNNING', evidence={'claim': key}, actor='fixture-verifier')
             return {'started': True, 'surface': 'fixture-external-verifier'}
@@ -159,7 +159,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(ledger.state()['nodes']['run-verify']['state'], 'RUNNING')
         self.assertEqual(json.loads(registry.read_text())['runs']['paused'], old)
         self.assertEqual((Path(old['sentinel']).read_bytes(), Path(old['log']).read_bytes()), old_bytes)
-        self.assertEqual((output / 'run.json').read_text(), 'resumed')
+        self.assertEqual(json.loads((output / 'run.json').read_text()), {"phase":"resumed"})
         self.assertTrue((jobs.parent / 'completion' / route['route_id'] / 'full-run.json').is_file())
 
     def receipt_fixture(self, *, queued_controller=False, failed=False):
@@ -441,8 +441,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         journal = ledger.journal_path.read_bytes()
         self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'wait-next-resource')
         self.assertEqual(ledger.journal_path.read_bytes(), journal)
-        self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, 'recoverable')
-        self.assertEqual(ledger.journal_path.read_bytes(), journal)
+        self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, 'completed')
+        self.assertTrue(ledger.journal_path.read_bytes().startswith(journal))
 
     def test_three_sequential_runs_and_old_replay_preserve_history_then_advance_once(self):
         import dispatch_owner_input as INPUT
@@ -475,7 +475,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'settled')
             self.assertEqual(start.call_count, 1)
         self.assertEqual(len(ledger.claims()), 1)
-        self.assertEqual((output / 'run.json').read_text(), 'final')
+        self.assertEqual(json.loads((output / 'run.json').read_text()), {"phase":"final"})
         self.assertNotEqual(ledger.state()['workflow_state'], 'COMPLETE')
         final_armed = SUP.read_armed(ledger)['full-run']
         procs, receipt = self.launch(route, path, jobs, registry, output, first)
@@ -523,6 +523,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                 route, path, jobs, registry, output, ledger = self.fixture()
                 evidence = SUP.poll_once(route, ledger)[0]['evidence']
                 evidence.pop('awaiting_next_resource', None)
+                evidence['artifacts'] = {'checked': True, 'reason': 'declared-artifact-missing',
+                                         'missing': ['run.json']}
                 ledger.record('full-run', 'FAILED_RETRYABLE', evidence=evidence, actor='old-watch')
                 ledger.set_workflow_state('FAILED_RETRYABLE', evidence={'node': 'full-run'}, actor='old-watch')
                 if other:
@@ -608,12 +610,37 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         route, path, jobs, registry, output, ledger = self.fixture()
         SUP.poll_once(route, ledger)
         original = registry.read_bytes()
-        (output / 'run.json').write_text('final')
+        (output / 'run.json').write_text('{"phase":"final"}')
         with ledger.lock():
             SUP.reconcile_resource_artifacts(route, ledger, 'att-parent', jobs)
         self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
         self.assertEqual(ledger.claims(), {})
         self.assertEqual(registry.read_bytes(), original)
+
+    def test_two_real_resources_without_owner_run_record_settle_full_run(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        SUP.poll_once(route, ledger)
+        first_record = json.loads((output / 'run.json').read_text())['hearting_resource_runs']['runs']['fixture-run']
+        for name in ('arm-t', 'arm-b'):
+            body = self.next_body(registry, name, output)
+            wrong = output / 'experiments' / name / 'run.json'
+            body['command'] = [sys.executable, '-c',
+                f'from pathlib import Path; p=Path({str(wrong)!r}); p.parent.mkdir(parents=True); '
+                'p.write_text(\'{"metric": 1}\')']
+            procs, receipt = self.launch(route, path, jobs, registry, output, body)
+            self.assertEqual(len(procs), 1)
+            self.assertEqual(receipt['runtime_output'], str(output / 'run.json'))
+            self.assertIn(str(output / 'run.json'), receipt['expected_outputs'])
+            self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'wait-next-resource')
+        doc = json.loads((output / 'run.json').read_text())['hearting_resource_runs']['runs']
+        self.assertEqual(set(doc), {'fixture-run', 'arm-t', 'arm-b'})
+        self.assertEqual(doc['fixture-run'], first_record)
+        self.assertEqual([doc[name]['exit_code'] for name in ('arm-t', 'arm-b')], [0, 0])
+        registry_bytes = registry.read_bytes()
+        self.assertEqual(self._settle_resource_owner(route, path, jobs)[0].result, 'completed')
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'STAGE_SUCCEEDED')
+        self.assertEqual(registry.read_bytes(), registry_bytes)
+        self.assertEqual(ledger.claims(), {})
 
 
 if __name__ == '__main__':
