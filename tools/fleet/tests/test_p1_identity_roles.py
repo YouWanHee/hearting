@@ -126,6 +126,47 @@ class CurrentSessionTest(unittest.TestCase):
         self.assertEqual(s.session_id, "current")
         self.assertEqual(s.ctx_pct, 17)
 
+    def test_agent_list_failure_does_not_reconfirm_herdr_registry(self):
+        s = self._enrich_failed_agent_list("herdr")
+        self.assertIsNone(s.session_id)
+        self.assertIsNone(s.ctx_pct)
+        self.assertIsNone(s.status)
+        self.assertEqual(s.session_identity_evidence["verdict"], "unobserved")
+
+    def test_agent_list_failure_preserves_already_observed_pane_identity(self):
+        s = self._enrich_failed_agent_list("herdr", bound=True)
+        self.assertEqual(s.session_id, "current")
+        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.status)
+
+    def test_absent_herdr_preserves_plain_terminal_native_identity(self):
+        s = self._enrich_failed_agent_list("terminal")
+        self.assertEqual(s.session_id, "old")
+        self.assertEqual(s.ctx_pct, 26)
+
+    def test_standalone_failed_target_pane_is_unobserved(self):
+        with mock.patch.object(procscan, "_comm_of", return_value="claude"), \
+                mock.patch.object(procscan, "provenance", return_value="herdr"), \
+                mock.patch.object(procscan, "read_proc_start", return_value=self.start), \
+                mock.patch.object(procscan, "_read_cwd", return_value=(self.cwd, False)), \
+                mock.patch.object(herdr, "list_panes", return_value=None):
+            self.assertIsNone(claude.session_id_of_process(self.pid, str(self.home)))
+
+    def _enrich_failed_agent_list(self, lineage, bound=False):
+        s = Session(harness="claude", pid=self.pid, proc_start=self.start, cwd=self.cwd)
+        panes = [{"pane_id": "wB:p3N", "agent": "claude", "cwd": self.cwd,
+                  "agent_session": {"agent": "claude", "value": "current"}}] if bound else None
+        bindings = {self.pid: {"wB:p3N"}} if bound else {}
+        with mock.patch.object(procscan, "read_proc_start", return_value=self.start), \
+                mock.patch.object(herdr, "list_agents", return_value=None), \
+                mock.patch.object(herdr, "list_panes", side_effect=AssertionError("extra pane probe")), \
+                mock.patch.object(process_identity, "pane_session_successors", return_value={"old": {"current"}}):
+            herdr.enrich([s], lineage=lambda _pid: lineage, panes=panes,
+                         pids=herdr.PaneEvidence((set(), {self.pid})) if bound else None,
+                         pane_bindings=bindings)
+            claude.enrich(s, tick={self.pid: getattr(s, "_pane_session_claim", None)})
+        return s
+
     def test_folded_seat_history_retains_direction_into_explicit_clear(self):
         process_identity._record()
         import session_tidy

@@ -595,12 +595,14 @@ def session_id_of_process(pid, home=None):
     from . import herdr
     from ..process_identity import pane_process_claims
     panes = herdr.list_panes()
+    if panes is None:
+        sess.herdr_attached = True if procscan.provenance(pid) == "herdr" else None
     selected = [p for p in panes or [] if p.get("agent") == "claude"
                 and p.get("cwd") == cwd]
     bindings = {}
-    observation = herdr.pane_evidence(selected, bindings=bindings)
-    claims = pane_process_claims([sess], selected, bindings,
-                                 complete=getattr(observation, "complete", True))
+    observation = herdr.pane_evidence(selected, bindings=bindings) if panes is not None else None
+    claims = pane_process_claims([sess], selected if panes is not None else None, bindings,
+                                 complete=observation is not None and getattr(observation, "complete", True))
     return _current_identity(sess, home, record, claims.get(pid))[0]
 
 

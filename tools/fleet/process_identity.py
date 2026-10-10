@@ -93,7 +93,7 @@ def pane_process_claims(sessions, panes, bindings, *, complete=True):
             candidates = [p for p in panes or [] if p.get("agent") == s.harness
                           and p.get("cwd") and s.cwd
                           and os.path.realpath(p["cwd"]) == os.path.realpath(s.cwd)]
-            if not complete and candidates:
+            if not complete and (candidates or panes is None and s.herdr_attached is True):
                 out[s.pid] = {"verdict": "unobserved", "proc_start": s.proc_start}
             continue
         pane_id = next(iter(pane_ids))

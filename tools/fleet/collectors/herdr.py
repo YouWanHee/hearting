@@ -336,6 +336,7 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     for session in sessions:
         session._gpu_session_aliases = []
         session._herdr_name = None
+        session._pane_session_claim = None
     if agents is None:
         agents = list_agents()
     if agents is None:
@@ -352,6 +353,13 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
                 s.herdr_attached = True if lineage(s.pid) == "herdr" else None
             except Exception:
                 s.herdr_attached = None
+        # Agent-list failure does not erase a supplied foreground observation.
+        # For a known herdr process, an absent pane observation cannot confirm
+        # its older native registry identity either. Do not issue another probe.
+        from ..process_identity import pane_process_claims
+        claims = pane_process_claims(sessions, panes, pane_bindings or {}, complete=False)
+        for s in sessions:
+            s._pane_session_claim = claims.get(s.pid)
         return {"complete": False, "last_error": "herdr 조회 불가"}
     index = attached_index(agents)
     bindings = {} if pane_bindings is None else pane_bindings
