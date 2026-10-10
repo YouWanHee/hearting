@@ -361,6 +361,10 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         pids = pane_pids(panes, bindings=bindings) if panes is not None else None
     shells, fg = pids if pids else (set(), set())
     probe_ok = pids is not None and getattr(pids, "complete", True)
+    from ..process_identity import pane_process_claims
+    claims = pane_process_claims(sessions, panes, bindings)
+    for session in sessions:
+        session._pane_session_claim = claims.get(session.pid)
     # A native resume can run inside the still-live foreground runtime. Keep
     # one pane row instead of letting that detached companion make the same
     # display alias ambiguous. Independent live processes remain separate.

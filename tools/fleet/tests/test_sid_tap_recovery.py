@@ -97,12 +97,12 @@ class TitleTheftGuardTest(_HomeMixin, unittest.TestCase):
         claude.enrich(s)
         self.assertIsNone(s.title)                 # a title gap stays blank in Fleet
 
-    def test_sidless_row_still_borrows_mtime_for_liveness(self):
-        """Deliberately unchanged this cycle: the mtime borrow (liveness heuristic) stays."""
+    def test_sidless_row_does_not_borrow_mtime_for_liveness(self):
+        """A neighboring transcript cannot establish this process's activity."""
         self._transcript("/proj/x", "neighbor-sid", ai_title="Stolen Neighbor Title")
         s = Session(harness="claude", pid=999942, cwd="/proj/x", slug="x")
         claude.enrich(s)
-        self.assertIsNotNone(s.mtime)
+        self.assertIsNone(s.mtime)
 
     def test_own_transcript_ai_title_is_not_a_fleet_title(self):
         """Knowing the sid cannot turn a native title into a Fleet subject."""
@@ -150,22 +150,22 @@ class TapSidRecoveryTest(_HomeMixin, unittest.TestCase):
         claude.enrich(s)
         self.assertIsNone(s.session_id)
 
-    def test_registry_sid_wins_over_tap(self):
-        """Tier order (F-25): a present registry sessionId is never overridden."""
+    def test_unrelated_registry_and_tap_claims_conflict(self):
+        """Exact but unrelated claims do not select a current conversation."""
         self._registry(994242, {"pid": 994242, "sessionId": "registry-sid"})
         self._tap("tap-sid", {"session_id": "tap-sid", "pid": 994242, "proc_start": "777"})
         s = self._sess()
         claude.enrich(s)
-        self.assertEqual(s.session_id, "registry-sid")
+        self.assertIsNone(s.session_id)
 
-    def test_newest_matching_tap_wins(self):
+    def test_unrelated_matching_taps_cannot_be_ordered_by_mtime(self):
         self._tap("old-sid", {"session_id": "old-sid", "pid": 994242, "proc_start": "777"},
                   mtime=1000.0)
         self._tap("new-sid", {"session_id": "new-sid", "pid": 994242, "proc_start": "777"},
                   mtime=2000.0)
         s = self._sess()
         claude.enrich(s)
-        self.assertEqual(s.session_id, "new-sid")
+        self.assertIsNone(s.session_id)
 
     def test_malformed_tap_is_silence(self):
         sldir = os.path.join(self.home, ".statusline")

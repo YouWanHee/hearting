@@ -182,11 +182,11 @@ class ProjectionScopeTest(unittest.TestCase):
                                               spec_markers={}, capability_groundings={}, now=1000.0)
                 self.assertEqual(sessions[0].work_projection.source, "none")
                 self.assertIsNone(projection._spec_pipeline_state_path(tmp, "hot-path"))
-                # A directly scoped legacy directory remains available without a scan.
+                # A same-name legacy directory is still not a session/work binding.
                 (root / "plans" / "2026-09-14_hot-path" / "execute").mkdir(parents=True)
                 projection.attach_projections(sessions, [], artifact_root=root,
                                               spec_markers={}, capability_groundings={}, now=1000.0)
-                self.assertEqual(sessions[0].work_projection.source, "artifact-inferred")
+                self.assertEqual(sessions[0].work_projection.source, "none")
 
 
 class ProcessTableScanScopeTest(unittest.TestCase):

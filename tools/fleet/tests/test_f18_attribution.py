@@ -437,7 +437,7 @@ class ClaudeTranscriptAttributionTest(unittest.TestCase):
                 f.write("{}\n")
             self.assertEqual(claude_collector._newest_transcript_path(home, "/w/repo", "sid-a"), own)
 
-    def test_unknown_sid_still_falls_back_to_newest(self):
+    def test_unknown_sid_cannot_borrow_newest_neighbor(self):
         with tempfile.TemporaryDirectory() as home:
             proj = self._proj(home)
             older, newer = os.path.join(proj, "a.jsonl"), os.path.join(proj, "b.jsonl")
@@ -445,7 +445,7 @@ class ClaudeTranscriptAttributionTest(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("{}\n")
             os.utime(older, (1, 1))
-            self.assertEqual(claude_collector._newest_transcript_path(home, "/w/repo", None), newer)
+            self.assertIsNone(claude_collector._newest_transcript_path(home, "/w/repo", None))
 
 
 if __name__ == "__main__":

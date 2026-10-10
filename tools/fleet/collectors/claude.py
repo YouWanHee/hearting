@@ -7,8 +7,9 @@ Two on-disk sources per session:
      statusline.sh). Full telemetry: model, effort, context%, 5h/7d rate limits, cost.
      Absent until §5 has run for that session → those cells stay '—' (graceful).
 
-Liveness signal = newest transcript mtime (projects/<enc-cwd>/*.jsonl), falling back to
-sessions/<pid>.json statusUpdatedAt.
+Current identity joins the native registry/tap, exact foreground pane and recorded
+continuity before loading any telemetry. Liveness reads only that identity's transcript,
+falling back to the matching registry's statusUpdatedAt.
 """
 import datetime
 import json
@@ -46,8 +47,8 @@ def _mtime(path):
 
 def _newest_transcript_path(home, cwd, sid):
     """Transcript path for liveness/title extraction: `<sid>.jsonl` when the session id
-    is known, else the newest .jsonl in the project dir. Shared by mtime and ai-title
-    lookups so both use the same resolved path (one os.listdir scan, not two).
+    is known; absent identity never borrows a neighbor in the project dir. Shared by
+    mtime and ai-title lookups so both use the same exact path.
 
     A known sid whose transcript is MISSING returns None instead of falling back:
     borrowing the newest neighbor .jsonl stamps another same-cwd session's fresh
@@ -60,17 +61,7 @@ def _newest_transcript_path(home, cwd, sid):
     if sid:
         p = os.path.join(proj, sid + ".jsonl")
         return p if _mtime(p) is not None else None
-    best, best_m = None, None
-    try:
-        for name in os.listdir(proj):
-            if name.endswith(".jsonl"):
-                p = os.path.join(proj, name)
-                m = _mtime(p)
-                if m is not None and (best_m is None or m > best_m):
-                    best, best_m = p, m
-    except OSError:
-        pass
-    return best
+    return None
 
 
 def ai_title_for_session(sid, home=None):
@@ -476,91 +467,154 @@ def _apply_registry(sess, sj):
     session_registry.apply_to_session(sess, sj, "claude")
 
 
-def _tap_sid_by_pid(home, pid, proc_start):
-    """Tier-2 sid recovery from the per-session statusline tap (§5, F-25).
-
-    The pid registry can vanish while its process lives (observed 2026-07-20: three
-    long-lived teammate sessions lost `sessions/<pid>.json`, leaving their rows
-    sid-less for hours). The tap keeps updating for every live interactive session
-    and now carries the owning claude `pid` + `/proc` `proc_start` (statusline.sh),
-    so a tap whose BOTH halves match this row's live process identity recovers the
-    sid. proc_start absent or mismatched on either side → refuse: a recycled pid
-    would misattribute a neighbor's whole identity (F-26 — misattribution is worse
-    than absence). Newest matching tap wins; every failure path is silence."""
+def _tap_sids_by_pid(home, pid, proc_start):
+    """Exact PID/start claims; modification time cannot choose a conversation."""
     if pid is None or not proc_start:
-        return None
-    sldir = os.path.join(home, ".statusline")
+        return set()
     try:
-        names = os.listdir(sldir)
+        names = os.listdir(os.path.join(home, ".statusline"))
     except OSError:
-        return None
-    best_sid, best_m = None, None
+        return set()
+    found = set()
     for name in names:
         if not name.endswith(".json") or name.startswith("."):
             continue
-        path = os.path.join(sldir, name)
         try:
-            with open(path) as f:
-                d = json.load(f)
-        except Exception:
+            with open(os.path.join(home, ".statusline", name)) as handle:
+                row = json.load(handle)
+        except (OSError, ValueError):
             continue
-        if not isinstance(d, dict) or d.get("pid") is None:
+        if (isinstance(row, dict) and str(row.get("pid")) == str(pid)
+                and str(row.get("proc_start") or "") == str(proc_start)):
+            sid = row.get("session_id") or name[:-5]
+            if isinstance(sid, str) and sid:
+                found.add(sid)
+    return found
+
+
+def _tap_sid_by_pid(home, pid, proc_start):
+    ids = _tap_sids_by_pid(home, pid, proc_start)
+    return next(iter(ids)) if len(ids) == 1 else None
+
+
+_CONTINUATION_CACHE = {}
+
+
+def _continued_sessions(home, cwd, ids):
+    """Read native continued-in edges from exact transcripts, bounded and cached."""
+    successors, pending, seen = {}, list(ids), set()
+    while pending and len(seen) < 64:
+        sid = pending.pop()
+        if sid in seen or not isinstance(sid, str) or os.path.basename(sid) != sid:
             continue
-        if str(d.get("pid")) != str(pid) or str(d.get("proc_start") or "") != str(proc_start):
+        seen.add(sid)
+        path = _newest_transcript_path(home, cwd, sid)
+        if not path:
             continue
-        sid = d.get("session_id") or name[:-5]
-        m = _mtime(path)
-        if sid and m is not None and (best_m is None or m > best_m):
-            best_sid, best_m = sid, m
-    return best_sid
+        try:
+            st = os.stat(path)
+            key = (st.st_mtime_ns, st.st_size)
+            cached = _CONTINUATION_CACHE.get(path)
+            if cached and cached[0] == key:
+                linked = cached[1]
+            else:
+                linked = set()
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        # Avoid decoding ordinary messages in large transcripts.
+                        if '"continued-in"' not in line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        target = row.get("continuedInSessionId")
+                        if (row.get("type") == "continued-in" and row.get("sessionId") == sid
+                                and isinstance(target, str) and target and os.path.basename(target) == target):
+                            linked.add(target)
+                _CONTINUATION_CACHE[path] = (key, linked)
+            successors[sid] = linked
+            pending.extend(linked)
+        except OSError:
+            continue
+    return successors
+
+
+
+
+def _current_identity(sess, home, record, pane_claim=None):
+    from ..process_identity import resolve_session_claims
+    claims = {}
+    record_sid = (record or {}).get("sessionId")
+    claimed_start = (record or {}).get("procStart")
+    if record_sid and (claimed_start is None or str(claimed_start) == str(sess.proc_start)):
+        claims["registry"] = record_sid
+    for sid in _tap_sids_by_pid(home, sess.pid, sess.proc_start):
+        claims["tap:" + sid] = sid
+    if sess.session_id:
+        claims["session"] = sess.session_id
+    pane_sid, pane = None, None
+    if (pane_claim and pane_claim.get("proc_start") == sess.proc_start
+            and procscan.read_proc_start(sess.pid) == sess.proc_start):
+        pane_sid, pane = pane_claim.get("session_id"), pane_claim.get("pane")
+        if pane_sid:
+            claims["pane"] = pane_sid
+    successors = (_continued_sessions(home, sess.cwd, claims.values())
+                  if len(set(claims.values())) > 1 else {})
+    if pane_sid and pane:
+        from ..process_identity import pane_session_successors
+        try:
+            for older, newer in pane_session_successors("claude", pane, sess.cwd).items():
+                successors.setdefault(older, set()).update(newer)
+        except (OSError, ValueError, TypeError):
+            pass
+    sid, evidence = resolve_session_claims(claims, successors)
+    evidence.update(pid=sess.pid, proc_start=sess.proc_start, pane=pane)
+    return sid, evidence
 
 
 def session_id_of_process(pid, home=None):
-    """The session a live Claude process is on now, or None — the F-25 tier order.
-
-    Tier 1 is the runtime's own `sessions/<pid>.json` (rewritten on `/clear`, so it follows
-    the current session); tier 2 is the statusline tap matched by pid AND start time, for
-    the hours a live process's registry row goes missing. `enrich` resolves a board row
-    the same way; the herdr report gate (`herdr_projection.may_report`) calls this so a
-    pane and the board never disagree about which session a process is. A registry row
-    whose `procStart` names another process (a recycled pid) is not this process's.
-    """
+    """The same current identity used by Fleet and the pane reporting guard."""
+    from ..model import Session
     home = home or _home()
     start = procscan.read_proc_start(pid)
-    record = read_registry(pid, home) or {}
-    sid = record.get("sessionId")
-    claimed = record.get("procStart")
-    if isinstance(sid, str) and sid and (claimed is None or str(claimed) == str(start)):
-        return sid
-    return _tap_sid_by_pid(home, pid, start)
+    record = read_registry(pid, home)
+    cwd = (record or {}).get("cwd") or procscan._read_cwd(pid)[0]
+    sess = Session(harness="claude", pid=pid, proc_start=start, cwd=cwd)
+    # Guards walk every ancestor, including shells and other runtimes. Their
+    # own native registry/tap can prove a fixture or hook parent; a pane lookup
+    # is only meaningful for a live Claude process, not those other ancestors.
+    if procscan._comm_of(pid) != "claude":
+        return _current_identity(sess, home, record)[0]
+    # Standalone hook callers need only their own pane. Fleet reuses its already
+    # collected foreground observation instead of calling this probe per row.
+    from . import herdr
+    from ..process_identity import pane_process_claims
+    panes = herdr.list_panes()
+    selected = [p for p in panes or [] if p.get("agent") == "claude"
+                and p.get("cwd") == cwd]
+    bindings = {}
+    herdr.pane_evidence(selected, bindings=bindings)
+    claims = pane_process_claims([sess], selected, bindings)
+    return _current_identity(sess, home, record, claims.get(pid))[0]
 
 
-def enrich(sess):
+def enrich(sess, tick=None):
     home = _home()
-
-    # 1) native per-pid registry file — tier-1 source (F-26)
     sj = read_registry(sess.pid, home)
-    if sj is not None:
+    # Identity is settled before any identity-dependent name, state or telemetry.
+    sid, evidence = _current_identity(sess, home, sj, (tick or {}).get(sess.pid))
+    sess.session_id = sid
+    sess.session_identity_evidence = evidence
+    if sj is not None and sid and sid == sj.get("sessionId"):
         _apply_registry(sess, sj)
-
-    # 1a) tap-based sid recovery — only when the registry stayed silent about the sid;
-    # a present registry sessionId always wins the F-25 tier order over the tap.
-    if not sess.session_id:
-        recovered = _tap_sid_by_pid(home, sess.pid, sess.proc_start)
-        if recovered:
-            sess.session_id = recovered
-
-    # 1b) L3 (F-80): a dispatch worker session has no statusline tap (only interactive
-    # sessions write one), so the tap recovery above is structurally unreachable for it —
-    # a lost registry row leaves it sid-less with no §5 fallback. Recover from the owning
-    # process's own environment, the same CLAUDE_CODE_SESSION_ID a registered attempt
-    # already trusts for the parent link (§4 R2). Tap failure only — never overrides a tap
-    # hit — and read_environ() is /proc-scoped to the same uid, so a foreign process's
-    # environ is simply unreadable rather than misattributed.
-    if not sess.session_id and sess.pid is not None:
-        env_sid = procscan.read_environ(sess.pid).get("CLAUDE_CODE_SESSION_ID")
-        if env_sid:
-            sess.session_id = env_sid
+    else:
+        # The derived handle identifies the continuing seat, not the old task.
+        # Preserve just that handle after a resolved continuation, never its name/status.
+        if sj is not None and sid and sj.get("nameSource") == "derived":
+            from ..session_handle import derived_tag
+            sess.session_tag = derived_tag(sj.get("name") or "")
+        sj = None
 
     # 2) per-session statusline tap (§5) — telemetry; absent → '—'
     sid = sess.session_id

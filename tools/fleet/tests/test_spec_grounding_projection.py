@@ -254,15 +254,15 @@ class SpecMarkerAttributionTest(unittest.TestCase):
             )
             self.assertEqual(entity.work_projection.source, "artifact-inferred")
 
-    # (k) marker vs plans-glob freshness mediation
-    def test_k_plans_dir_newer_keeps_code_stage(self):
+    # (k) an exact SID marker outranks an unrelated same-name directory.
+    def test_k_plans_dir_newer_cannot_replace_exact_session_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             _make_plan_dir(tmp, "2026-07-24_proj-a", "test", NOW - 5)
             markers = {_marker_name("sid-a", tmp): NOW - 50}
             entity = _session(sid="sid-a", cwd=tmp, slug="proj-a")
             _attach_projections([entity], [], artifact_root=tmp, now=NOW, spec_markers=markers)
             self.assertEqual(entity.work_projection.source, "artifact-inferred")
-            self.assertEqual(entity.work_projection.stage_label, "test")
+            self.assertEqual(entity.work_projection.stage_label, "spec")
 
     def test_k_marker_newer_wins_spec_label(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -273,14 +273,15 @@ class SpecMarkerAttributionTest(unittest.TestCase):
             self.assertEqual(entity.work_projection.source, "artifact-inferred")
             self.assertEqual(entity.work_projection.stage_label, "spec")
 
-    def test_k_tie_is_unadopted(self):
+    def test_k_unrelated_directory_timestamp_cannot_create_marker_ambiguity(self):
         with tempfile.TemporaryDirectory() as tmp:
             _make_plan_dir(tmp, "2026-07-24_proj-a", "test", NOW - 5)
             markers = {_marker_name("sid-a", tmp): NOW - 5}
             entity = _session(sid="sid-a", cwd=tmp, slug="proj-a")
             _attach_projections([entity], [], artifact_root=tmp, now=NOW, spec_markers=markers)
-            self.assertEqual(entity.work_projection.source, "none")
-            self.assertEqual(entity.work_projection.ambiguity, projection.MARKER_ARTIFACT_TIE)
+            self.assertEqual(entity.work_projection.source, "artifact-inferred")
+            self.assertEqual(entity.work_projection.stage_label, "spec")
+            self.assertIsNone(entity.work_projection.ambiguity)
 
     def test_k_multiple_plans_candidates_marker_still_wins(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -323,7 +323,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 self.assertNotIn("quick/exec", visible)
                 self.assertNotIn("stage one-shot", visible)
 
-    def test_inline_main_session_uses_artifact_stage_without_dispatch(self):
+    def test_inline_main_session_without_work_binding_has_no_invented_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan = os.path.join(tmp, "plans", "2026-07-22_inline-main")
             os.makedirs(plan)
@@ -333,8 +333,8 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                               session_id="sid-inline", slug="inline-main",
                               liveness="working")
             projection.attach_projections([session], [], artifact_root=tmp, now=100.0)
-            self.assertEqual(session.work_projection.source, "artifact-inferred")
-            self.assertEqual(session.work_projection.stage_label, "exec")
+            self.assertEqual(session.work_projection.source, "none")
+            self.assertIsNone(session.work_projection.stage_label)
             for width in (168, 120, 100, 60):
                 lines = render._build_lines([session], [], "fleet", width < 70, 0,
                                             layout=render._layout_mode(width),
@@ -344,7 +344,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                     # F-52c: the context row leads with the session's liveness mark; its
                     # 16-cell baseline track is the stable marker that the row rendered.
                     self.assertIn(EMPTY * render._CTX_TRACK_MAX, visible)
-                    self.assertIn("stage exec", visible)      # stage rides the row's own column
+                    self.assertNotIn("stage exec", visible)
                     # An INFERRED inline stage carries NO dedicated detail row (2026-07-24): a
                     # main session must not show the `plan › exec › test` breadcrumb line.
                     self.assertNotIn("exec ● ←{plan}", visible)

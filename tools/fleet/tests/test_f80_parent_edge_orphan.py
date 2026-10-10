@@ -495,9 +495,9 @@ class KnownParentlessSupportTest(unittest.TestCase):
 
 
 class L3EnvSidRecoveryTest(unittest.TestCase):
-    """A tap-less dispatch worker session recovers its sid from /proc/<pid>/environ."""
+    """Inherited environment identity cannot prove a process's conversation."""
 
-    def test_env_recovery_only_after_tap_failure(self):
+    def test_env_without_native_process_identity_is_not_adopted(self):
         from fleet.collectors import claude
         sess = Session(harness="claude", pid=424242, cwd="/work/worker", session_id=None,
                        proc_start=None)
@@ -506,7 +506,7 @@ class L3EnvSidRecoveryTest(unittest.TestCase):
              mock.patch.object(claude.procscan, "read_environ",
                                return_value={"CLAUDE_CODE_SESSION_ID": "sid-from-env"}):
             claude.enrich(sess)
-        self.assertEqual(sess.session_id, "sid-from-env")
+        self.assertIsNone(sess.session_id)
 
     def test_tap_hit_wins_over_env_recovery(self):
         from fleet.collectors import claude
@@ -516,7 +516,7 @@ class L3EnvSidRecoveryTest(unittest.TestCase):
         sess = Session(harness="claude", pid=424243, cwd="/work/worker", session_id=None,
                        proc_start="777", title="already-titled")
         with mock.patch.object(claude, "read_registry", return_value=None), \
-             mock.patch.object(claude, "_tap_sid_by_pid", return_value="sid-from-tap"), \
+             mock.patch.object(claude, "_tap_sids_by_pid", return_value={"sid-from-tap"}), \
              mock.patch("fleet.titles.last_title", return_value="already-titled"), \
              mock.patch.object(claude.procscan, "read_environ") as mock_env:
             claude.enrich(sess)
