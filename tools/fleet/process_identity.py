@@ -81,7 +81,7 @@ def resolve_session_claims(claims, successors=None):
 
 def pane_process_claims(sessions, panes, bindings):
     """Consume the existing foreground pane observation; never issue another probe."""
-    from fleet.collectors import procscan
+    from .collectors import procscan
     out = {}
     for s in sessions:
         pane_ids = bindings.get(s.pid, set())
@@ -109,7 +109,7 @@ def pane_session_successors(harness, pane, cwd):
     """
     _record()  # make the common utilities importable
     import session_tidy
-    from fleet.gitinfo import resolve_gitdir
+    from .gitinfo import resolve_gitdir
     repository = resolve_gitdir(cwd)[1]
     if not repository:
         return {}
@@ -128,8 +128,8 @@ def pane_session_successors(harness, pane, cwd):
 
 def finalize_process_roles(sessions, jobs):
     """Publish one role after native identities and registered process rows are observed."""
-    from fleet.collectors import procscan, herdr
-    from fleet import session_registry
+    from .collectors import procscan, herdr
+    from . import session_registry
     for s in sessions:
         native = session_registry.read(s.harness, s.pid)
         proven = bool(native and native.get("sessionId") and s.proc_start
@@ -140,7 +140,7 @@ def finalize_process_roles(sessions, jobs):
         elif s.harness == "codex":
             proven = proven or bool(s.session_id and getattr(s, "_fd_owner", False))
         elif s.harness == "opencode" and not proven and getattr(s, "_tty", None) == "?":
-            from fleet.collectors import opencode
+            from .collectors import opencode
             _sid, source = opencode.session_of_process(s.pid)
             proven = bool(_sid and source == "opencode-tui-selection")
         registered = False
@@ -173,13 +173,13 @@ def process_identity(pid, harness, *, live_codex=None):
     session_id, source = None, ""
     try:
         if harness == "claude":
-            from fleet.collectors import claude
+            from .collectors import claude
             session_id, source = claude.session_id_of_process(pid), "claude-session-registry"
         elif harness == "codex":
-            from fleet.collectors import codex
+            from .collectors import codex
             session_id, source = codex.session_id_of_process(pid, live_codex), "codex-process"
         elif harness == "opencode":
-            from fleet.collectors import opencode
+            from .collectors import opencode
             session_id, source = opencode.session_of_process(pid)
     except Exception:
         session_id = None
