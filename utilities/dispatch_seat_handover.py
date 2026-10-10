@@ -158,15 +158,12 @@ def _seat_of(key: str, snapshot: Optional[dict] = None):
 
 
 def pane_seat(env=None, harness: Optional[str] = None, sid: Optional[str] = None):
-    """The pane seat of this process, or None outside a herdr pane (project seats never hand over).
-    A Codex session in the shared app-server daemon has no pane variable: its pane is found the way
-    ``session_tidy.resolve_seat`` finds it."""
+    """The proven pane seat of this process; project seats never hand over."""
     st = _st()
     env = os.environ if env is None else env
-    pane = (env.get("HERDR_PANE_ID") or "").strip()
-    if not pane and harness == "codex" and sid:
-        pane = st.codex_pane_for_session(sid)
-    return st.Seat("pane", st._digest("pane", pane), pane, "", "") if pane else None
+    detected, own_sid = st.session_from_env(harness, env)
+    seat = st.resolve_seat(harness or detected, env=env, sid=sid or own_sid)
+    return seat if seat.kind == "pane" else None
 
 
 # ---------------------------------------------------------------------------

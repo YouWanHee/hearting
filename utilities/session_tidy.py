@@ -39,7 +39,8 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
     clear/<seat>.json       the one pending auto-clear reservation (``session_tidy_clear.py``)
     watermarks/  decisions/pending/  runs/  queue/  runner.lock   (other slices)
 
-The seat is the herdr pane when ``HERDR_PANE_ID`` is set, else harness + project.
+The seat is the herdr pane only when ``pane_ownership`` verifies its live connection,
+else harness + project. ``HERDR_PANE_ID`` is only a lookup hint.
 A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
 pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
 caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
@@ -424,6 +425,8 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     pane = (env.get("HERDR_PANE_ID") or "").strip()
     if not pane and harness == "codex" and sid:
         pane = codex_pane_for_session(sid, str(cwd or ""), source)
+    from pane_ownership import verified_pane
+    pane = verified_pane(pane, harness, sid, executable=_herdr_executable())
     if pane:
         return Seat("pane", _digest("pane", pane), pane, harness or "", "")
     return seat_for_project(harness or "unknown", project_key_for(cwd))
