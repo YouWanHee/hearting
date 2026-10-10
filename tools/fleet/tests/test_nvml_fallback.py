@@ -179,6 +179,42 @@ class NVMLFallbackTest(unittest.TestCase):
                 resources = render._gpu_session_resources({"hosts": [host]})
                 self.assertEqual([r["index"] for r in resources[harness, "sid-exact"]], [0, 1])
                 self.assertIn("모름", "\n".join(render._plain(r) for r in render._gpu_resource_strip(resources[harness, "sid-exact"], 168)))
+
+    def test_reloaded_frame_yields_to_new_or_expired_gpu_observations(self):
+        names = ("_RELOAD_FRAME", "_RELOAD_FRAME_AT", "_RELOAD_FRAME_COMPUTE_AT",
+                 "_COMPUTE_HOSTS", "_COMPUTE_HOSTS_SET_AT", "_OFFSET", "_SELECT_MODE",
+                 "_RESUME_ORDER", "_ROUTE_FOLD", "_CURSOR_ID")
+        saved = {name: getattr(render, name, None) for name in names}
+        self.addCleanup(lambda: [setattr(render, name, value) for name, value in saved.items()])
+        host = self.probe()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = 100, 168
+        render._SELECT_MODE = False
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
+        with mock.patch.object(render.time, "monotonic", return_value=0):
+            render.set_compute_hosts({"configured": True, "hosts": [host]})
+            rows = render._compute_host_rows(168)
+            owned = render._gpu_session_resources()["claude", "sid-exact"]
+            rows += render._gpu_resource_strip(owned, 168)
+            with mock.patch.object(render, "_build_lines", return_value=rows), \
+                    mock.patch.object(render, "_addline"), mock.patch.object(render.curses, "doupdate"):
+                render._draw(screen, [], [], "both", 0)
+            handoff = json.loads(json.dumps(render.viewer_state(render._LiveOrderState())))
+        for age, replacement, expect_old in ((1, False, True), (1, True, False), (31, False, False)):
+            with self.subTest(age=age, replacement=replacement), \
+                    mock.patch.object(render.time, "monotonic", return_value=age):
+                render.reset_scroll()
+                render.set_compute_hosts(None)  # new interpreter starts without a GPU sample
+                render.restore_viewer_state(handoff)
+                if replacement:
+                    render.set_compute_hosts({"configured": True, "hosts": []})
+                with mock.patch.object(render, "_addline") as draw, \
+                        mock.patch.object(render.curses, "doupdate"):
+                    render._draw(screen, [], [], "both", 0, loading=True)
+                text = "\n".join(render._plain(call.args[2]) for call in draw.call_args_list)
+                self.assertEqual("fix.yaml" in text, expect_old)
+                self.assertEqual("varying.yaml" in text, expect_old)
+                self.assertEqual("실행 중 2개" in text, expect_old)
         entries = compute_hosts.unregistered_gpu({"configured": True, "hosts": [host]})
         self.assertEqual(len(entries), 2)
 

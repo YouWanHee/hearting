@@ -1402,6 +1402,8 @@ whose NVML index cannot be mapped stay visible at host level with unknown
 device placement; they are not attached to a guessed GPU.
 Fleet's outer collection deadline includes local preparation and parallel host
 samples, with bounded headroom for proc fallback; per-host SSH waits stay bounded.
+Rendered rows carried across a viewer replacement retain their observation age.
+A new GPU sample or expired evidence ends replay even while basic collection waits.
 
 Reservation lifetime follows the exact wrapper PID, start time and PID namespace,
 not its launching session. Normal exit releases it; the next launch removes

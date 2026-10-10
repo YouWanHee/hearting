@@ -8486,6 +8486,8 @@ def _addline(stdscr, row, segs, w):
 _OFFSET = 0                 # scroll offset — READ only in _draw (see module docstring)
 _RESUME_ORDER = None         # private state inherited only by this viewer's replacement
 _RELOAD_FRAME = None         # last rows remain visible until the first new observation
+_RELOAD_FRAME_AT = None      # replay never renews the underlying evidence lifetime
+_RELOAD_FRAME_COMPUTE_AT = None
 _SHELL_TTY_MODE = None       # original shell mode, rather than the old curses mode
 _TOGGLE_ROWS = {}            # screen_y -> True, reset at the top of every _draw (mouse click map)
 _CLICK_ROWS = {}             # screen_y -> _SELECTABLE entry (F-27 v9 row click map, §4.2.1 —
@@ -9021,8 +9023,10 @@ def _footer_segs(select_mode, parts, width=None):
 
 def reset_scroll():
     global _OFFSET, _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE
+    global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
     _OFFSET = 0
     _RESUME_ORDER = _RELOAD_FRAME = None
+    _RELOAD_FRAME_AT = _RELOAD_FRAME_COMPUTE_AT = None
     _SHELL_TTY_MODE = None
 
 
@@ -9032,6 +9036,7 @@ def viewer_state(live_order):
             "terminal_modes": _SHELL_TTY_MODE,
             "folds": list(_ROUTE_FOLD.items()), "select_mode": _SELECT_MODE,
             "cursor": _CURSOR_ID, "frame": _RELOAD_FRAME,
+            "frame_at": _RELOAD_FRAME_AT, "frame_compute_at": _RELOAD_FRAME_COMPUTE_AT,
             "order": {"groups": live_order.groups, "tiers": live_order.group_tiers,
                       "sessions": live_order.sessions}}
 
@@ -9039,6 +9044,7 @@ def viewer_state(live_order):
 def restore_viewer_state(value):
     global _OFFSET, _PROCESS_VIEW, _SHOW_ALL, _ROUTE_FOLD, _SELECT_MODE, _CURSOR_ID
     global _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE
+    global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
     global _LAYOUT
 
     def tuples(item):
@@ -9055,6 +9061,11 @@ def restore_viewer_state(value):
     _CURSOR_ID = tuples(value.get("cursor"))
     _RELOAD_FRAME = [[tuple(segment) for segment in row] if row else row
                      for row in value.get("frame") or []]
+    # Older handoffs have no age: preserve their UI state but rebuild their facts.
+    _RELOAD_FRAME_AT = value.get("frame_at")
+    if not isinstance(_RELOAD_FRAME_AT, (int, float)) or isinstance(_RELOAD_FRAME_AT, bool):
+        _RELOAD_FRAME_AT = None
+    _RELOAD_FRAME_COMPUTE_AT = value.get("frame_compute_at")
     order = value.get("order") or {}
     _RESUME_ORDER = _LiveOrderState()
     _RESUME_ORDER.groups = list(order.get("groups") or [])
@@ -9068,6 +9079,7 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
           resource_diagnostics=None):
     global _OFFSET, _TOGGLE_ROWS, _CLICK_ROWS, _FOLD_ROWS, _PROMPT_HITS, _CURSOR_ID
     global _RELOAD_FRAME
+    global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
     # reset before any early-return so a stale map never survives a click (§4.1 pattern) —
     # _PROMPT_HITS in particular must never carry the PRIOR stage's coordinates into this
     # draw (§4.4.1): that staleness is exactly what would defeat the confirm→confirm2
@@ -9079,16 +9091,25 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
     h, w = stdscr.getmaxyx()
     stdscr.erase()
     narrow = w < _NARROW_CUTOFF
-    lines = (_RELOAD_FRAME if loading and _RELOAD_FRAME else
-             _build_lines(sessions, jobs, section, narrow, malformed, layout=_layout_mode(w),
+    now = time.monotonic()
+    replay_fresh = (_RELOAD_FRAME_AT is not None
+                    and 0 <= now - _RELOAD_FRAME_AT <= 3 * _COMPUTE_HOST_INTERVAL)
+    same_gpu_sample = (_COMPUTE_HOSTS_SET_AT is None
+                       or _COMPUTE_HOSTS_SET_AT == _RELOAD_FRAME_COMPUTE_AT)
+    if loading and _RELOAD_FRAME and replay_fresh and same_gpu_sample:
+        lines = _RELOAD_FRAME
+    else:
+        lines = _build_lines(sessions, jobs, section, narrow, malformed, layout=_layout_mode(w),
                          memory=memory, term_width=w, live_order=live_order,
                          resources=resources, usage_snapshots=usage_snapshots,
                          governor=governor, loading=loading,
                          node_evidence=snapshot.node_evidence if snapshot else None,
                          route_entities=snapshot.route_entities if snapshot else None,
                          observations=snapshot.observations if snapshot else None,
-                         resource_diagnostics=snapshot.resource_diagnostics if snapshot else resource_diagnostics))
-    _RELOAD_FRAME = lines
+                         resource_diagnostics=snapshot.resource_diagnostics if snapshot else resource_diagnostics)
+        _RELOAD_FRAME = lines
+        _RELOAD_FRAME_AT = min(now, _COMPUTE_HOSTS_SET_AT) if _COMPUTE_HOSTS_SET_AT is not None else now
+        _RELOAD_FRAME_COMPUTE_AT = _COMPUTE_HOSTS_SET_AT
     body_h = max(1, h - 1)   # reserve 1 footer row
 
     # F-27: the cursor tracks a ROW, so the viewport follows it (not the reverse). Done before
