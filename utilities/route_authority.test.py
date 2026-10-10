@@ -181,6 +181,32 @@ class OwnerPinChangeTest(unittest.TestCase):
         self.assertIs(RA.route_in_force(self.route), self.route)
         self.assertEqual(RA.sealed_pin_harness(self.route, worker_type="owner"), "codex")
 
+    def test_same_owner_pin_adds_missing_checked_evidence_once_without_rewriting_route(self):
+        self.route["selection_pins"]["owner"]["harness"] = "opencode"
+        sealed = json.loads(json.dumps(self.route))
+        values = dict(target="owner", pin={"harness": "opencode", "model": None, "effort": None},
+                      by={"harness": "claude", "session_id": "parent"}, source="existing-intent",
+                      tuples=[_tuple("opencode", "codex")], candidates=[])
+        self.assertIsNotNone(RA.record_pin_change(self.route, **values))
+        self.assertEqual(self.route, sealed)
+        view = RA.route_in_force(self.route)
+        self.assertEqual(view["route_hash"], sealed["route_hash"])
+        self.assertIn("opencode", {row["parent_harness"] for row in view["dispatch_evidence"]["tuples"]})
+        self.assertIsNone(RA.changed_pin_harness(self.route, "owner"))
+        self.assertIsNone(RA.moved_owner_harness(self.route, "codex"))
+        self.assertIsNone(RA.record_pin_change(self.route, **values))
+        self.assertEqual(len(RA.pin_changes(self.route)), 1)
+
+    def test_same_pin_replaces_only_derived_unsupported_tuple_and_hop(self):
+        values = dict(target="owner", pin=self.route["selection_pins"]["owner"],
+                      by={}, source="checked", tuples=[_tuple("codex", "opencode")], candidates=[])
+        self.assertIsNotNone(RA.record_pin_change(self.route, **values))
+        view = RA.route_in_force(self.route)
+        for rows in (view["dispatch_evidence"]["tuples"], view["nodes"][0]["fallback_hops"][1]["candidates"]):
+            self.assertEqual(next(row["status"] for row in rows if row["child_harness"] == "opencode"), "supported")
+        self.assertEqual(self.route["dispatch_evidence"]["tuples"][-1]["status"], "unsupported")
+        self.assertIsNone(RA.record_pin_change(self.route, **values))
+
     def test_the_parent_moves_the_owner_and_the_worker_pin_stays(self):
         row = self.change()
         self.assertEqual((row["previous"]["harness"], row["pin"]["harness"], row["source"]), ("codex", "claude", "unattributed"))

@@ -273,6 +273,14 @@ def resolve_node_scope(
         node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
     outputs = tuple((node or {}).get("outputs", []))
     write_scope = tuple((node or {}).get("write_scope", []))
+    if (route.get("capability") == "autopilot-code"
+            and route.get("effective_intensity") == "quick"
+            and node_id == "one-shot" and (node or {}).get("kind") == "capability-owner"
+            and (node or {}).get("unit") == "_kernel/owner"
+            and set(write_scope) == {"source-scoped", "plans/<cycle>/**"}):
+        # The one-shot owns the approved deliverables in this cycle; plans is
+        # its reporting default. Retain the sealed route's bytes and identity.
+        write_scope = ("source-scoped", "**")
     env_output_dir = artifact_cycle_environment(environ)["AGENT_ARTIFACT_OUTPUT_DIR"]
     if env_output_dir:
         return NodeScope(env_output_dir, str(Path(route["cwd"]).resolve()) if route.get("cwd") else None,
@@ -347,7 +355,7 @@ def _resolved_write_scopes(scope: NodeScope) -> tuple[list[str], list[str]]:
         path = Path(value)
         if path.is_absolute():
             (source if scope.worktree_dir and path.is_relative_to(scope.worktree_dir) else artifact).append(str(path))
-        elif value in ("source/**", "source-alternative/**"):
+        elif value in ("source-scoped", "source/**", "source-alternative/**"):
             source.append(str(Path(scope.worktree_dir) / "**") if scope.worktree_dir else value)
         elif value.startswith("tests/"):
             source.append(str(Path(scope.worktree_dir) / value) if scope.worktree_dir else value)
@@ -379,6 +387,8 @@ def node_scope_prompt(scope: "NodeScope") -> str:
     lines = ["This node's declared scope:",
              f"outputs={json.dumps(outputs, ensure_ascii=False)}",
              f"artifact_write_scope={json.dumps(artifact_scope, ensure_ascii=False)}"]
+    if "**" in scope.write_scope:
+        lines.append("Cycle-wide artifact scope covers only the approved task's deliverables, not other work or cycles.")
     if source_scope:
         lines.append(f"worktree_source_scope={json.dumps(source_scope, ensure_ascii=False)}")
     if not scope.output_dir:

@@ -4058,11 +4058,24 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             dispatch_evidence = {**dispatch_evidence, "tuples": [
                 row for row in dispatch_evidence["tuples"] if row.get("parent_harness") != "codex"
             ] + readiness["tuples"]}
+    owner_pin = (selection_pins or {}).get("owner", {}).get("harness")
+    probe_parent = owner_pin if shape == "staged" and owner_pin else parent_harness
     if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
-        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
+        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), probe_parent,
                                        children or _compose_default_children(selection_pins),
                                        gpu_route=gpu_route if shape == "staged" else None)
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
+    elif shape == "staged" and not owner_only and owner_pin and not any(
+            row.get("parent_harness") == owner_pin and row.get("status") == "supported"
+            and row.get("launch_authority") == "conductor"
+            for row in (dispatch_evidence or {}).get("tuples", [])):
+        # A frame's evidence describes its conductor. Check the selected owner
+        # with its workers rather than relabelling that evidence.
+        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), owner_pin,
+                                       children or _compose_default_children(selection_pins),
+                                       gpu_route=gpu_route)
+        dispatch_evidence = {**dispatch_evidence,
+                             "tuples": dispatch_evidence["tuples"] + readiness["tuples"]}
     if (shape == "solo" or owner_only or resume_graph) and registered_headless_evidence is None:
         readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
                                                     parent_harness, children or _compose_default_children(selection_pins))

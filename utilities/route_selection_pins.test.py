@@ -137,7 +137,8 @@ class IsolatedCase(unittest.TestCase):
         arguments = dict(
             capability="autopilot-code", capability_mode="dev", shape="staged", graph=graph,
             slug="pins-fixture", cwd=R.ROOT, artifact_root=R.ROOT, spec_read="fixture",
-            drift_verdict="fixture", unassigned=True, dispatch_evidence=evidence(),
+            drift_verdict="fixture", unassigned=True,
+            dispatch_evidence=evidence(parent=(pins or {}).get("owner", {}).get("harness", "claude")),
             selection_pins=pins,
         )
         arguments.update(kw)
@@ -213,6 +214,22 @@ def reseal(route):
 
 
 class ComposeSealTest(IsolatedCase):
+    def test_pinned_owner_is_probed_as_conductor_for_new_and_frame_inherited_routes(self):
+        self.config(ALL_ENABLED)
+        for harness in ("claude", "codex", "opencode"):
+            for inherited in (None, evidence(parent="claude")):
+                with self.subTest(harness=harness, inherited=inherited is not None):
+                    pins = R._parse_selection_pins([f"owner={harness}"])
+                    with mock.patch.object(R, "_compose_readiness", return_value={
+                            "tuples": evidence(parent=harness)["tuples"]}) as probe:
+                        route = self.compose(pins=pins, dispatch_evidence=inherited)
+                    if inherited is None or harness != "claude":
+                        self.assertEqual(probe.call_args.args[2], harness)
+                    else:
+                        probe.assert_not_called()
+                    self.assertIn(harness, {row["parent_harness"] for row in route["dispatch_evidence"]["tuples"]})
+                    R.verify_route(route, R.ROOT)
+
     def test_no_pin_means_no_key_and_identical_bytes(self):
         self.config(ALL_ENABLED)
         first = self.compose()

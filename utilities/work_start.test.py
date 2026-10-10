@@ -1255,6 +1255,8 @@ class WorkStartTest(unittest.TestCase):
         pins = {"contract_version": 1,
                 "owner": {"harness": "opencode", "model": None, "effort": None}}
         self.route["selection_pins"] = pins
+        for row in self.route["dispatch_evidence"]["tuples"]:
+            row.update(parent_harness="opencode", launch_authority="conductor")
         self.start()
         # Both legs run on the one tool the caller named (SD-160 allows a shared
         # harness); with no pin they stay on automatic selection (no --adapter).
@@ -1267,11 +1269,39 @@ class WorkStartTest(unittest.TestCase):
         self.route["selection_pins"] = {"contract_version": 1,
             "owner": {"harness": "codex", "model": None, "effort": None},
             "frame": {"harness": "opencode", "model": "provider/model", "effort": "max"}}
+        for row in self.route["dispatch_evidence"]["tuples"]:
+            row.update(parent_harness="codex", launch_authority="conductor")
         self.start()
         self.assertEqual(self.adapters(), ["opencode", "opencode"])
         self.ready = True; self.released = True
         self.start()
         self.assertEqual(self.adapters()[2], "codex")
+
+    def test_start_repairs_missing_pinned_conductor_evidence_once_before_owner_launch(self):
+        import route_authority as RA
+        module = W._route_module()
+        self.route.update(cwd=self.tmp.name, artifact_root=self.tmp.name,
+                          capability="autopilot-code", capability_mode="debug", owner_model_profile="deep",
+                          nodes=[{"id": "test"}], selection_pins={"contract_version": 1,
+                              "owner": {"harness": "opencode", "model": None, "effort": None}})
+        self.route["dispatch_evidence"]["tuples"] = [{"parent_harness": "claude", "child_harness": "codex",
+                                                    "status": "supported", "launch_authority": "conductor"}]
+        self.path.write_text(json.dumps(self.route))
+        before = self.path.read_bytes()
+        checked = {"parent_harness": "opencode", "parent_transport": "headless", "parent_sandbox": "adapter-default",
+                   "child_harness": "codex", "status": "supported", "launch_authority": "conductor",
+                   "checked_worktree": self.tmp.name}
+        self.ready = self.released = True
+        with mock.patch.object(module, "_compose_readiness", return_value={"tuples": [checked]}) as probe, \
+             mock.patch.object(RA, "caller_identity", return_value=("claude", "parent")):
+            first = self.start()
+            second = self.start()
+        self.assertEqual(probe.call_count, 1)
+        self.assertTrue(first["pin_evidence"]["changed"])
+        self.assertTrue(second["owner_started"])
+        self.assertEqual(self.adapters(), ["opencode"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(RA.route_in_force(self.route)["dispatch_evidence"]["tuples"][-1], checked)
 
     def test_a_pinned_tool_the_route_never_probed_is_not_forced(self):
         self.route["selection_pins"] = {"contract_version": 1,
