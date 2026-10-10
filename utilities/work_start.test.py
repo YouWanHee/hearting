@@ -691,6 +691,22 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn("You are the parent session", result["next_step"])
         self.assertIn("Do not kill", result["next_step"])
 
+    def test_open_but_exited_or_unobservable_owner_is_never_reported_running(self):
+        import dispatch_contract as D
+        self.start(); self.ready = self.released = True; self.start()
+        self.jobs.write_text(self.jobs.read_text().replace(
+            'worker_type=owner', 'worker_type=owner,pid=99999999,pid_start=100'))
+        for state, reason in (('quiescent', 'owner-settlement-pending'),
+                              ('unverifiable', 'owner-process-unverifiable')):
+            with self.subTest(state=state), \
+                 mock.patch.object(W, 'join_selected_attempts', return_value={'state': 'timeout', 'children': []}), \
+                 mock.patch.object(D, 'attempt_process_quiescence',
+                                   return_value=D.ProcessQuiescence(state, 'fixture')):
+                result = self.start()
+                self.assertEqual((result['state'], result['reason']), ('needs-attention', reason), result)
+                self.assertNotIn('parent_next', result)
+        self.assertEqual(len(self.calls), 3)
+
     def test_start_with_a_changed_pin_diagnoses_a_live_owner_on_the_old_harness(self):
         self.start(); self.ready = self.released = True; created = self.start()
         owner = created['owner_attempt_id']
@@ -1072,6 +1088,20 @@ class WorkStartTest(unittest.TestCase):
         for token in ('correction_command','--message-file','replacement owner','Do not close or recompose'):
             self.assertIn(token,result['next_step'])
         self.assertEqual(len(self.calls),3)   # nothing new launched while it waits
+
+    def test_a_readable_fail_after_spent_replacement_points_to_the_working_correction(self):
+        owner = self._parked_owner_row()
+        self.jobs.write_text(self.jobs.read_text().replace('dead-worker-blocked', 'dead-worker-fail')
+                             .replace('failure_class=blocked', 'failure_class=fail'))
+        with mock.patch('dispatch_replacement.advance', return_value={
+                'state': 'needs-attention', 'reason': 'automatic-replacement-exhausted'}):
+            result = self.start()
+        self.assertEqual((result['state'], result['reason'], result['required_action']),
+                         ('needs-attention', 'owner-failed', 'answer-failed-owner'), result)
+        self.assertIn('--attempt-id ' + owner, result['correction_command'])
+        self.assertIn('correction_command', result['next_step'])
+        self.assertIn('replacement owner', result['next_step'])
+        self.assertEqual(len(self.calls), 3)
 
     def test_released_parked_owner_continues_through_replacement(self):
         owner=self._parked_owner_row()

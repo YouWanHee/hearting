@@ -17,7 +17,9 @@ import re
 import subprocess
 import sys
 
-from dispatch_supervisor_terminal import classify_session_result, opencode_terminal_boundary
+from dispatch_supervisor_terminal import (
+    classify_session_result, opencode_terminal_boundary, supervisor_terminal_from_event,
+)
 
 # OPERATIONS §5.10 "Review verdict is a result, not a worker death": a review
 # worker whose FAIL handoff names a readable in-root review artifact finished
@@ -213,6 +215,13 @@ def _codex_final_agent_message(
                     completed_inputs.clear()
                 continue
             return None
+        if row.get("type") == "dispatch.supervisor.terminal":
+            # This is the writer input logged just before registry settlement.
+            # It carries no final text: the native agent_message still supplies
+            # and validates the handoff below.
+            if supervisor_terminal_from_event(row) is None:
+                return None
+            continue
         if row.get("type") in _TERMINAL_TELEMETRY_TYPES:
             continue
         if completed_inputs or row.get("type") != "item.completed":

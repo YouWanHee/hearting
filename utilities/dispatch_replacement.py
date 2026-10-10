@@ -308,15 +308,16 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
         found = owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if found and found['status'] == 'proceed':
             return 'parked'
-        # A BLOCKED owner was waiting for an answer no declared gate carries; once a person
-        # sent one (`correct`), the same work continues with it. A gate park keeps its own answer.
-        if (found is None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
-                and _retained_corrections(jobs, meta.get('attempt_id'))):
-            return CORRECTED
+        if found is not None:
+            return None  # a declared gate keeps its own answer path
     if (jobs is not None and meta.get('worker_type') == 'owner'
-            and route_authority.answerable_owner_end(fields[1], meta) == 'FAIL'
+            and route_authority.answerable_owner_end(fields[1], meta)
             and _retained_corrections(jobs, meta.get('attempt_id'))):
-        return CORRECTED  # a person approved a fix for the FAIL it reported; no automatic retry
+        return CORRECTED  # an answered stop is a pause; no automatic retry of an unanswered FAIL
+    if (jobs is not None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
+            and meta.get('note') in RUNTIME_DEATH_NOTES
+            and _retained_corrections(jobs, meta.get('attempt_id'))):
+        return CORRECTED
     if (meta.get('note') == 'cancelled-receipt-unavailable'
             and meta.get('classifier_source') == DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return 'silent'
@@ -368,6 +369,8 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
         handoff = _blocked_handoff(fields, meta)
         if handoff:
             result['handoff'] = handoff
+        if meta.get('note') in RUNTIME_DEATH_NOTES:
+            result['source_result'] = 'EXITED'
     return result
 
 
@@ -882,10 +885,6 @@ def claim(jobs: Path, aid: str) -> dict:
             answers, spent = route_authority.fix_answers(route, lines, jobs)
             if not answers and spent:
                 raise DC.DispatchContractError('replacement-fix-round-spent', ','.join(spent))
-            if not answers:
-                # Infrastructure/resource FAIL has no check round to answer.
-                # Use the ordinary one-replacement allowance, not a new pause family.
-                capacity = False
             proof['answers'] = answers
             proof['source_result'] = 'FAIL'
         logical = _logical_key(route, meta)
@@ -1495,7 +1494,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             replacement_fields, replacement_meta = rows[replacement]
             if replacement_fields[1] not in {'open','running'}:
                 if not DC.verdict_pass(replacement_meta):
-                    next_kind = death_kind(replacement_fields, replacement_meta)
+                    next_kind = death_kind(replacement_fields, replacement_meta, jobs=jobs)
                     if next_kind in PAUSE_KINDS or (next_kind and _is_capacity_record(record)):
                         # The replacement stopped at a limit too, or a limit resume died on its
                         # own: it is the next source, and claim() judges the node's budget.
@@ -1772,7 +1771,10 @@ def recovery_instructions(args):
         opening = (f'The previous owner {prior} ended FAIL and a person approved a fix for it; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == CORRECTED:
-        opening = (f'The previous owner {prior} ended BLOCKED and a person has answered it; this continues '
+        ended = ('exited before settlement and received a correction'
+                 if record['proof'].get('source_result') == 'EXITED'
+                 else 'ended BLOCKED and a person has answered it')
+        opening = (f'The previous owner {prior} {ended}; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == 'capacity':
         opening = f'The previous attempt {prior} stopped at a usage limit; this resumes it on the existing route {record["route_id"]}.\n'
@@ -1862,6 +1864,9 @@ def _correction_context(jobs, prior, proof):
             raise DC.DispatchContractError('replacement-correction-drift', str(pinned.get('id')))
         items.append(item)
     handoff = proof.get('handoff')
+    if proof.get('source_result') == 'EXITED':
+        return ('The previous owner exited before settlement. The correction below names the remaining work; '
+                'preserve completed checks and continue the existing route.' + OwnerInput.text(items) + '\n')
     answer = ('The answer below is the fix a person approved for the failure it reported. Treat it as '
               'given: do not ask for it again; apply it, then continue through the remaining declared stages.'
               if proof.get('source_result') == 'FAIL' else
