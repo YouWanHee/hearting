@@ -182,7 +182,6 @@ from execution_access import (  # noqa: E402
     AccessContext,
     ExecutionAccessError,
     adapter_default_roots,
-    harness_source_read_roots,
     load_parent_effective_grant,
     publish_effective_grant,
     receipt_fragment as execution_access_receipt_fragment,
@@ -925,8 +924,9 @@ def _read_only_projection(args: argparse.Namespace) -> tuple[list[str], list[str
         *(() if home is None else route_authority.contract_read_roots(home)),
         *getattr(args, "contract_read_roots", ()),
     )))
-    writable = (Path(args.worktree).resolve(), Path(args.artifact_root).resolve(),
-                *(grant.writable_roots if grant else ()))
+    writable = [Path(args.worktree).resolve(), *(grant.writable_roots if grant else ())]
+    if getattr(args, "artifact_root", None) is not None:
+        writable.append(Path(args.artifact_root).resolve())
     source = tuple(root for root in source if root.is_dir() and not any(
         root.resolve().is_relative_to(area) or area.is_relative_to(root.resolve())
         for area in writable))

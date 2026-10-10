@@ -714,7 +714,8 @@ class SealedContractReadTest(unittest.TestCase):
             root = Path(td)
             old, new = root / "releases/v1", root / "releases/v2"
             for home in (old, new):
-                (home / "capabilities").mkdir(parents=True)
+                for name in ("capabilities", "core", "utilities"):
+                    (home / name).mkdir(parents=True)
                 (home / "capabilities/autopilot-lab.md").write_text("lab contract")
             route = {"route_id": "rt-contract", "launch_compatibility_tuple": {
                 "launch_home": {"path": str(old)}}}
@@ -737,14 +738,17 @@ class SealedContractReadTest(unittest.TestCase):
                     contract_read_roots=args.contract_read_roots, selected_agent="build"))
                 for rules in (config["permission"], config["agent"]["build"]["permission"]):
                     for home in (old, new):
-                        self.assertEqual(rules["external_directory"][str(home / "capabilities") + "/**"], "allow")
-                        self.assertEqual(rules["edit"][str(home / "capabilities") + "/**"], "deny")
+                        for name in ("capabilities", "core", "utilities"):
+                            self.assertEqual(rules["external_directory"][str(home / name) + "/**"], "allow")
+                            self.assertEqual(rules["edit"][str(home / name) + "/**"], "deny")
                     self.assertEqual(rules["external_directory"].get("*", config["permission"]["external_directory"]["*"]), "deny")
                     self.assertNotIn(str(old) + "/**", rules["external_directory"])
                 args.execution_access_grant = None
                 read_dirs, denies = self.claude._read_only_projection(args)
-                self.assertIn(str(old / "capabilities"), read_dirs)
-                self.assertIn(f"Edit(//{str(old / 'capabilities').lstrip('/')}/**)", denies)
+                for home in (old, new):
+                    for name in ("capabilities", "core", "utilities"):
+                        self.assertIn(str(home / name), read_dirs)
+                        self.assertIn(f"Edit(//{str(home / name).lstrip('/')}/**)", denies)
 
     def test_read_projection_preserves_the_approved_development_worktree(self):
         args = SimpleNamespace(worktree=str(ROOT), execution_access_grant=None,

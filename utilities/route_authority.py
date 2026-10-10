@@ -782,7 +782,7 @@ RELAUNCH_STABLE_KEYS = (
 
 
 # A path into the harness's own tree inside a permission value (`<root>/utilities/...`).
-_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:utilities|adapters|hooks|tools|capabilities)(?=/|[\"'])")
+_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:core|capabilities|roles|utilities|adapters|docs|hooks|profiles|tools)(?=/|[\"'])")
 RELEASE_ROOT_TOKEN = "<launch_home>"
 
 
