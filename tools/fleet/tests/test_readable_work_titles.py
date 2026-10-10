@@ -103,6 +103,30 @@ class WorkTitlesTest(unittest.TestCase):
             rows = render._gpu_resource_strip([gpu], term_width=160, resource_children=[child])
         self.assertEqual(render._plain(rows[0]).count('train.py'), 1)
 
+    def test_gpu_shared_cycle_title_once_keeps_each_run_progress(self):
+        title = '환경별 모델 비교'
+        children = [model.ResourceJob(run_id='run-' + node, node=node,
+            artifact_root=str(self.root), route_id='rt-one', display_title=title,
+            liveness='working', elapsed_min=elapsed,
+            progress=dict(completed=completed, total=10, unit='epoch', age_s=age))
+            for node, elapsed, completed, age in (('train', 3, 2, 120), ('eval', 10, 4, 180))]
+        gpu = dict(host='moving4', index=1, processes=[])
+        rows = render._gpu_resource_strip([gpu], term_width=240, resource_children=children)
+        text = render._plain(rows[0])
+        self.assertEqual(text.count(title), 1)
+        for fact in ('train 3m', 'eval 10m', '2/10 epoch', '4/10 epoch', '2m ago', '3m ago'):
+            self.assertIn(fact, text)
+        self.assertEqual([child.run_id for child in children], ['run-train', 'run-eval'])
+
+    def test_gpu_identical_titles_on_different_routes_remain_distinct(self):
+        for root, rid in ((str(self.root), 'rt-other'), ('/another/root', 'rt-one'), ('', 'rt-one')):
+            with self.subTest(root=root, route_id=rid):
+                children = [model.ResourceJob(run_id='run-' + str(index), node='train',
+                    artifact_root=child_root, route_id=child_rid, display_title='환경별 모델 비교',
+                    liveness='working', elapsed_min=3)
+                    for index, (child_root, child_rid) in enumerate(((str(self.root), 'rt-one'), (root, rid)))]
+                self.assertEqual(render._resource_gpu_suffix(children).count('환경별 모델 비교'), 2)
+
     def test_historical_result_keeps_its_exact_title_after_current_route_changes(self):
         result = route.result_projection(dict(slug=self.record['slug'], route_id='rt-one',
                                              artifact_root=str(self.root)),

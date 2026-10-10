@@ -36,6 +36,14 @@ def resource_name(child):
         child.route_node or child.node or child.run_id)
 
 
+def resource_title_key(child):
+    title = _text(getattr(child, 'display_title', None))
+    root, rid = getattr(child, 'artifact_root', None), getattr(child, 'route_id', None)
+    if title and isinstance(root, str) and root and isinstance(rid, str) and rid:
+        return root, rid, title
+    return None
+
+
 def subject_command(subject, command):
     """Do not repeat a command already contained in the work name."""
     command = _text(command)

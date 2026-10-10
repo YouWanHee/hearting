@@ -41,7 +41,7 @@ from .display import label as _user_label, project as _user_project, gpu_owner a
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
                     session_parent_visible)
 from . import gitinfo, titles
-from .work_titles import readable as _readable_name, resource_name as _resource_name, subject_command
+from .work_titles import readable as _readable_name, resource_name as _resource_name, resource_title_key, subject_command
 from .collectors import compute_hosts as _compute_hosts
 from .refresh import LiveSnapshot, RefreshPump, background_read, as_snapshot
 from .session_handle import sanitize_title as _sanitize_session_title
@@ -4544,11 +4544,28 @@ def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_child
 def _resource_gpu_suffix(children, room=None):
     """Resource identity once at the GPU line end; working is already implicit."""
     unique = {child.run_id: child for child in children}
+    title_groups = {}
+    for child in unique.values():
+        key = resource_title_key(child)
+        if key:
+            title_groups[key] = title_groups.get(key, 0) + 1
+    shown_titles = set()
     parts = []
     for child in unique.values():
         node = _gpu_safe_text(_resource_name(child))
+        key = resource_title_key(child)
+        if title_groups.get(key, 0) > 1:
+            # A shared cycle title names the work once; each execution still
+            # keeps its own short node, state, elapsed time and counters.
+            short_node = _gpu_safe_text(_readable_name(child.route_node or child.node))
+            short_node = "" if short_node == node else short_node
+            if key not in shown_titles:
+                shown_titles.add(key)
+                node += " · " + short_node if short_node else ""
+            else:
+                node = short_node
         state = "" if child.liveness == "working" else " " + _gpu_safe_text(child.liveness)
-        parts.append([child, node + state + " " + fmt_min(child.elapsed_min)])
+        parts.append([child, (node + state + " " + fmt_min(child.elapsed_min)).strip()])
     base = "".join(" · " + text for _child, text in parts)
     extra = max(0, room - _dw(base)) if room is not None else None
     out = ""
