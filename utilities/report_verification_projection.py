@@ -550,8 +550,10 @@ def _resolve_source(source: Path, root: Path, jobs: Path | None, snapshot: ReadS
         for name in ("REPORT.md", "index.html"):
             try:
                 info = (source / name).lstat()
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError as exc:
+                raise ProjectionProblem("report-input-unreadable") from exc
             if not stat.S_ISREG(info.st_mode):
                 raise ProjectionProblem("report-input-kind-invalid")
             if stat.S_ISREG(info.st_mode) and info.st_size > 0:
