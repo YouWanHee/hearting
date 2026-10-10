@@ -203,10 +203,25 @@ def _display(payload: dict[str, Any]) -> dict[str, Any]:
                          "unknown": "완료 미확정", "not-applicable": "완료 상태 해당 없음"}
     input_labels = {"confirmed": "필수 입력 확인", "failed": "필수 입력 확인 실패",
                     "unresolved": "필수 입력 미확정"}
+    reasons = payload.get("required_input_observation", {}).get("reasons") or []
+    reason = reasons[0] if reasons else payload.get("verification", {}).get("reason")
+    reason_labels = {
+        "report-cycle-unadmitted": "검증·마감 확인 대기",
+        "route-hash-binding-mismatch": "작업과 보고서 기록이 일치하지 않음 · 담당 작업 확인 필요",
+        "required-input-digest-mismatch": "검증 입력이 바뀜 · 담당 작업 재확인 필요",
+        "artifact-revision-stale": "보고서 변경 뒤 검증 기록 확인 필요",
+        "report-source-kind-invalid": "보고서 경로 확인 필요",
+    }
+    detail = None
+    if (reason == "report-cycle-unadmitted"
+            and payload.get("report_observation", {}).get("state") == "present"):
+        detail = "보고서 있음 · 검증·마감 확인 대기"
     payload["display"] = {
         "verification_label": verification_labels.get(verdict, "검증 미확정"),
         "completion_label": completion_labels.get(completion, "완료 미확정"),
         "required_input_label": input_labels.get(input_state, "필수 입력 미확정"),
+        "detail_label": detail,
+        "reason_label": reason_labels.get(reason, "보고서 상태 확인 필요") if reason else None,
         "limitations": [
             "기존 보고서·검토 본문과 원래 판정은 변경하지 않았습니다.",
             "조회는 새 과학 검증이나 매체 해독을 수행하지 않습니다.",
@@ -220,7 +235,7 @@ def report_detail_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
     """An absent report is normal; retain all observed verification problems."""
     if payload.get("verification", {}).get("reason") == "report-source-unavailable":
         return None
-    return payload
+    return _display(payload)
 
 
 def _route_nodes(route: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -522,12 +537,27 @@ def _resolve_source(source: Path, root: Path, jobs: Path | None, snapshot: ReadS
                     *, expected_artifact_id: str | None = None,
                     expected_digest: str | None = None,
                     bucket_matches: list[tuple[Path, Mapping[str, Any]]] | None = None) -> dict[str, Any]:
+    report_observation = {"state": "unknown"}
     try:
         if root.is_symlink() or not root.is_dir():
             raise ProjectionProblem("artifact-root-unavailable")
         if source.is_symlink() or (source.exists() and not source.is_dir()):
             raise ProjectionProblem("report-source-kind-invalid")
         if not source.is_dir():
+            raise ProjectionProblem("report-source-unavailable")
+        # File presence is an observation, not an admitted revision or a verdict.
+        report_files = []
+        for name in ("REPORT.md", "index.html"):
+            try:
+                info = (source / name).lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise ProjectionProblem("report-input-kind-invalid")
+            if stat.S_ISREG(info.st_mode) and info.st_size > 0:
+                report_files.append(name)
+        report_observation = {"state": "present" if report_files else "absent"}
+        if not report_files:
             raise ProjectionProblem("report-source-unavailable")
         root = root.resolve(strict=True)
         source = source.resolve(strict=True)
@@ -705,6 +735,7 @@ def _resolve_source(source: Path, root: Path, jobs: Path | None, snapshot: ReadS
         return _display(payload)
     except ProjectionProblem as exc:
         payload = _unresolved(exc.code)
+        payload["report_observation"] = report_observation
         payload["integrity"] = {"state": "unresolved", "reason": exc.code}
         return _display(payload)
     except Exception:

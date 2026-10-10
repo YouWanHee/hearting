@@ -614,6 +614,7 @@ class ResourceJob:
     registry_path: Optional[str] = None
     log_path: Optional[str] = None
     log_updated_at: Optional[float] = None
+    log_size: Optional[int] = None  # observed bytes; empty differs from unreadable
     route: Optional[str] = None
     node: Optional[str] = None
     config_ref: Optional[str] = None

@@ -4401,23 +4401,21 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
                         summary_ts=getattr(job, "summary_ts", None))
 
 
-def _report_verification_detail_row(job, depth=1, term_width=None):
+def _report_verification_detail_row(job, depth=1, term_width=None, in_card=False):
     """Render only the read-time payload attached by the detail collector."""
     projection = getattr(job, "work_projection", None)
     payload = getattr(projection, "report_verification", None)
     if not isinstance(payload, dict):
         return []
     display = payload.get("display") or {}
-    verification = payload.get("verification") or {}
-    required = payload.get("required_input_observation") or {}
-    text = ("  " * max(1, int(depth)) + "↳ 보고서 · "
+    detail = display.get("detail_label") or (
+            "보고서 · "
             + str(display.get("verification_label", "검증 미확정")) + " · "
             + str(display.get("completion_label", "완료 미확정")) + " · "
             + str(display.get("required_input_label", "필수 입력 미확정")))
-    reasons = required.get("reasons") or []
-    reason = (reasons[0] if reasons else verification.get("reason"))
-    if reason:
-        text += " · " + str(reason)
+    if not display.get("detail_label") and display.get("reason_label"):
+        detail += " · " + display["reason_label"]
+    text = _conn_indent(depth, in_card) + "↳ " + detail
     if term_width:
         text = _clip_w(text, max(1, term_width - 2))
     return [[(text, "dim")]]
@@ -4446,7 +4444,7 @@ def _resource_progress_tail(child, room=None):
     return count + suffix
 
 
-def _resource_process_location(child):
+def _resource_verified_process_location(child):
     """Use existing exact local identity/placement, never GPU selection or log age."""
     if type(child.pid) is not int or child.pid <= 0 or not str(child.starttime).isdigit():
         return ""
@@ -4463,6 +4461,14 @@ def _resource_process_location(child):
         return ""
     host = _gpu_safe_text(placement.get("hostname")) if placed else ""
     return (host + " · " if host else "") + "PID %s" % child.pid
+
+
+def _resource_process_location(child):
+    if child.liveness != "working":
+        return ""
+    snapshot, _age = _fresh_compute_hosts()
+    where, _resources = _resource_location(child, snapshot)
+    return "" if where == "호스트/GPU 미확인" else where
 
 
 def _resource_child_rows(job, term_width=None, depth=1, in_card=False, gpu_children=(),
@@ -4771,41 +4777,8 @@ def _resource_command_label(command):
     return _gpu_safe_text(os.path.basename(words[0])) if words else ""
 
 
-def _resource_now_text(entity, room=None):
-    """Current work of an exact resource-waiting owner, shared by every harness."""
-    wait = getattr(entity, "resource_wait", None)
-    observed = ((getattr(entity, "state_evidence", None) or {}).get("inputs") or {}).get(
-        "observed_liveness") or {}
-    parked = (getattr(entity, "liveness", None) == "idle"
-              and observed.get("state") == "parked-supervised")
-    attached = [child for child in getattr(entity, "resource_children", ())
-                if not wait or child.run_id in wait.get("run_ids", ())]
-    children = [child for child in attached if child.liveness == "working"]
-    summary = getattr(entity, "summary", None)
-    tool = getattr(entity, "exec_child", None) or getattr(entity, "exec_tool", None)
-    resource_context = (wait or parked
-                        or (children and (getattr(entity, "liveness", None) == "idle"
-                                          or not summary and not tool)))
-    if not children and tool:
-        return None
-    if not children and (resource_context or not summary):
-        terminal = [child for child in attached if child.liveness in ("exited", "dead")
-                    and type(getattr(child, "exit_code", None)) is int]
-        if terminal:
-            child = max(terminal, key=lambda c: getattr(c, "ended_at", None) or 0)
-            node = _gpu_safe_text(child.route_node or child.node or child.run_id)
-            command = _resource_command_label(getattr(child, "command", None))
-            state = "실패" if child.exit_code else "종료"
-            text = "마지막 %s%s · %s(exit %d) · %s" % (
-                node, " " + command if command else "", state, child.exit_code,
-                _resource_log_age(child))
-            return _clip_w(text, room) if room is not None else text
-    if not resource_context:
-        return None
-    if not children:
-        return "대기"
-    snapshot, _age = _fresh_compute_hosts()
-    child = children[0]
+def _resource_location(child, snapshot):
+    """One location observation for owner NOW and resource rows on all harnesses."""
     resources = _resource_gpu_resources(child, snapshot, commands=True)
     if resources:
         where = ",".join("%s:%s" % (r["host"], r["index"]) for r in resources)
@@ -4851,6 +4824,47 @@ def _resource_now_text(entity, room=None):
             where = "%s:%s 지정 · %s" % (host, ",".join(devices), state)
             if placement.get("io_wait"):
                 where += " · 입출력 대기"
+    if where == "호스트/GPU 미확인":
+        where = _resource_verified_process_location(child) or where
+    return where, resources
+
+
+def _resource_now_text(entity, room=None):
+    """Current work of an exact resource-waiting owner, shared by every harness."""
+    wait = getattr(entity, "resource_wait", None)
+    observed = ((getattr(entity, "state_evidence", None) or {}).get("inputs") or {}).get(
+        "observed_liveness") or {}
+    parked = (getattr(entity, "liveness", None) == "idle"
+              and observed.get("state") == "parked-supervised")
+    attached = [child for child in getattr(entity, "resource_children", ())
+                if not wait or child.run_id in wait.get("run_ids", ())]
+    children = [child for child in attached if child.liveness == "working"]
+    summary = getattr(entity, "summary", None)
+    tool = getattr(entity, "exec_child", None) or getattr(entity, "exec_tool", None)
+    resource_context = (wait or parked
+                        or (children and (getattr(entity, "liveness", None) == "idle"
+                                          or not summary and not tool)))
+    if not children and tool:
+        return None
+    if not children and (resource_context or not summary):
+        terminal = [child for child in attached if child.liveness in ("exited", "dead")
+                    and type(getattr(child, "exit_code", None)) is int]
+        if terminal:
+            child = max(terminal, key=lambda c: getattr(c, "ended_at", None) or 0)
+            node = _gpu_safe_text(child.route_node or child.node or child.run_id)
+            command = _resource_command_label(getattr(child, "command", None))
+            state = "실패" if child.exit_code else "종료"
+            text = "마지막 %s%s · %s(exit %d) · %s" % (
+                node, " " + command if command else "", state, child.exit_code,
+                _resource_log_age(child))
+            return _clip_w(text, room) if room is not None else text
+    if not resource_context:
+        return None
+    if not children:
+        return "대기"
+    snapshot, _age = _fresh_compute_hosts()
+    child = children[0]
+    where, resources = _resource_location(child, snapshot)
     node = _gpu_safe_text(child.route_node or child.node or child.run_id)
     command = _resource_command_label(getattr(child, "command", None))
     if resources:
@@ -4875,10 +4889,12 @@ def _resource_now_text(entity, room=None):
 
 
 def _resource_log_age(child):
+    if getattr(child, "log_size", None) == 0:
+        return "출력 없음"
     log_ts = getattr(child, "log_updated_at", None)
     return ("로그 " + _fmt_exec_age(max(0, time.time() - log_ts))
             if isinstance(log_ts, (int, float)) and not isinstance(log_ts, bool)
-            else "로그 없음")
+            else "출력 미확인" if getattr(child, "log_path", None) else "로그 없음")
 
 
 def _context_detail_row(entity, depth=0, term_width=None, dim=False,
@@ -7574,7 +7590,7 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
                 lines.extend(detail)
             report_detail = _report_verification_detail_row(
                 job, depth=max(1, int(getattr(job, "depth", 1) or 1)),
-                term_width=term_width)
+                term_width=term_width, in_card=in_card)
             if report_detail:
                 lines.extend(report_detail)
             # F-29 — the child session's own sub-agents, one strip directly under the

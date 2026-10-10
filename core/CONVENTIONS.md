@@ -316,7 +316,13 @@ project, experiment, and version values and never infer version from paths or
 timestamps.
 
 Read-only report status is a separate projection over recorded evidence. It
-keeps scientific verification (`PASS`, `FAIL`, or unresolved), operational
+distinguishes an absent report from an existing report whose work cycle is still
+open. Fleet shows meaningful observations in the user's language inside the
+owner card; internal reason codes remain available in structured diagnostics.
+The owner's NOW and resource rows share the same observed location judgment.
+An empty registered log has no output freshness; its creation time describes
+the file, without a progress claim.
+It keeps scientific verification (`PASS`, `FAIL`, or unresolved), operational
 completion (complete, pending, blocked, unknown, or not applicable), and
 required-input observation (confirmed, failed, or unresolved) as independent
 axes. A current authoritative `FAIL` remains `FAIL` when work completed or
