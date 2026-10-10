@@ -196,7 +196,7 @@ def refresh(sessions):
                     row["tag"] = tag
                     taken.add(tag)
             rows = [row for row in live.values() if row.get("tag")]
-            if old != {(row["harness"], row["session_id"]): row for row in rows}:
+            if not path.exists() or old != {(row["harness"], row["session_id"]): row for row in rows}:
                 fd, temp = tempfile.mkstemp(prefix=".tag-assignments-", dir=path.parent)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as output:
@@ -210,7 +210,9 @@ def refresh(sessions):
         # Metadata alone: no session identity, status, lifecycle or user input.
         # Retry mismatches on each normal refresh, including panes currently idle.
         from .herdr_projection import refresh_tag_metadata
-        refresh_tag_metadata(agents or [])
+        assigned = {(row["harness"], row["session_id"]) for row in rows}
+        refresh_tag_metadata([agent for agent in agents or []
+                              if (agent.get("agent"), (agent.get("agent_session") or {}).get("value")) in assigned])
     except (OSError, ValueError, TypeError, ImportError):
         pass  # observation must not block any session or consumer
 

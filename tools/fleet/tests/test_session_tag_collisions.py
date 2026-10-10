@@ -167,7 +167,24 @@ class SessionTagCollisionTest(unittest.TestCase):
     def test_unknown_identity_does_not_gain_a_number(self):
         self.tags([Session(harness="codex", pid=os.getpid())])
         self.assertIsNone(resolve_tag("codex", ""))
-        self.assertFalse(session_tags._path().exists())
+        self.assertEqual(session_tags._read(session_tags._path()), {})
+
+    def test_empty_first_inventory_does_not_disable_later_standalone_allocation(self):
+        self.assertEqual(resolve_tag("codex", self.a), minted_tag(self.a))
+        self.agents.return_value = [{"agent": "codex", "pane_id": "w:" + sid,
+                                    "agent_session": {"kind": "id", "value": sid}}
+                                   for sid in (self.a, self.b)]
+        self.assertNotEqual(resolve_tag("codex", self.a), resolve_tag("codex", self.b))
+
+    def test_herdr_capacity_exhaustion_uses_hash_without_recursive_refresh(self):
+        self.agents.return_value = [{"agent": "codex", "pane_id": "w:" + str(n),
+                                    "agent_session": {"kind": "id", "value": "live-%d" % n}}
+                                   for n in range(257)]
+        session_tags.refresh([])
+        rows = session_tags._read(session_tags._path())
+        self.assertEqual(len(rows), 256)
+        missing = next("live-%d" % n for n in range(257) if ("codex", "live-%d" % n) not in rows)
+        self.assertEqual(resolve_tag("codex", missing), minted_tag(missing))
 
     def test_uuid_creation_order_for_pre_install_herdr_pair(self):
         older = "01a1223d-621b-7908-8399-1f234f623c79"
