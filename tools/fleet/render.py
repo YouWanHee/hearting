@@ -7336,6 +7336,8 @@ def _build_lines(sessions, jobs, section, narrow, malformed, layout="wide", memo
     if _SHOW_ALL:
         _repo_ids = set()
         for name in order:
+            if emission_by_group[name]["empty"] or emission_by_group[name]["fold"]:
+                continue
             _events = (memory or {}).get("by_repo", {}).get(name, [])
             _shown_keys = {_memory_event_key(e) for e, _count in
                            _memory_event_groups(_events)[:_MEM_REPO_ROW_LIMIT]}

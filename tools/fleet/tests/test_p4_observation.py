@@ -11,6 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fleet import fleet, render
 from fleet.collectors import dispatch, memory, resource_runs
+from fleet.model import Session
 
 
 def flatten(rows):
@@ -90,6 +91,19 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("2회", flatten(rows))
         self.assertEqual(render._mem_event_rows({"recent": [event]}, excluded_ids={"r1"}), [])
+
+    def test_section_filter_never_hides_a_memory_change_or_displays_it_twice(self):
+        event = {"id": "r1", "cwd": "/work/project", "snippet": "저장된 선택",
+                 "action": "decision-record", "scope": "project"}
+        observed = {"recent": [event], "by_repo": {"project": [event]}}
+        session = Session(harness="claude", pid=1, cwd="/work/project", session_id="s1",
+                          slug="fixture", title="fixture", liveness="idle")
+        render.set_show_all(True)
+        for section in ("fleet", "both", "dispatch"):
+            with self.subTest(section=section):
+                text = flatten(render._build_lines([session], [], section, False, 0,
+                               memory=observed, term_width=120, governor=None))
+                self.assertEqual(text.count("저장된 선택"), 1)
 
 
 if __name__ == "__main__":
