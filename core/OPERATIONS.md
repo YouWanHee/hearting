@@ -1607,8 +1607,8 @@ compares that original lifetime before sending input. A proven-dead or reused
 agent PID completes the obligation as `target-already-gone`, without input,
 pane closure or handover to a later process in the same pane. Unreadable birth
 evidence remains unknown; a later observation cannot supply a missing original.
-Resumed retirement checks self-target against its recorded requester, never the
-observer's inherited session or pane. A cancelled request is terminal history:
+Resumed retirement determines self-target from its recorded requester's session
+and pane identity. A cancelled request is terminal history:
 a new explicit request for the same lifetime accepts a fresh duty while retaining
 the cancelled record; repeated active or completed requests share that fresh duty.
 When the retire succeeds from the pane started beside the predecessor, the
