@@ -845,7 +845,8 @@ input or approval. Interruption releases the OS lock; the next caller removes
 dead PID/start entries, resumes uncompleted requests and cleans abandoned
 integration PRs/branches. This is cooperative local serialization; outside
 merges are observed through head/base checks and rejected by the publication
-lease. Temporary branch deletion uses an exact-head lease too. All three
+lease. Temporary branch deletion uses an exact-head lease too and does not
+rerun source pre-push hooks: it publishes no source change. All three
 harnesses use the same implementation.
 
 Release publication uses immutable tags and the tested commit. Repeated or

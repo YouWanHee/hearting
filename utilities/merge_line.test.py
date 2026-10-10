@@ -544,6 +544,35 @@ class LeasePublication(unittest.TestCase):
         self.assertIn("--force-with-lease=refs/heads/merge-line/abc:checked-head", run.call_args.args[0])
         self.assertIn(":refs/heads/merge-line/abc", run.call_args.args[0])
 
+    def test_cleanup_does_not_run_source_push_hooks(self):
+        with tempfile.TemporaryDirectory() as td:
+            source, remote = Path(td) / "source", Path(td) / "remote.git"
+            source.mkdir()
+            def git(*args):
+                return subprocess.run(["git", "-C", str(source), "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.test", *args], check=True,
+                    capture_output=True, text=True).stdout.strip()
+            git("init", "-q", "-b", "main")
+            git("commit", "--allow-empty", "-qm", "base")
+            head = git("rev-parse", "HEAD")
+            git("branch", "merge-line/cleanup")
+            git("clone", "-q", "--bare", str(source), str(remote))
+            marker = source / "source-hook-ran"
+            hook = source / ".git/hooks/pre-push"
+            hook.write_text('#!/bin/sh\ntouch source-hook-ran\nexit 93\n')
+            hook.chmod(0o700)
+            client = M.GitHub.__new__(M.GitHub)
+            client.url = str(remote)
+            # Leave production's subprocess intact, changing only its cwd.
+            run = subprocess.run
+            with mock.patch.object(subprocess, "run", side_effect=lambda *a, **k: run(*a, cwd=source, **k)):
+                client.delete_branch("merge-line/cleanup", head)
+            self.assertFalse(marker.exists())
+            self.assertEqual(subprocess.run(["git", "-C", str(remote), "for-each-ref",
+                "refs/heads/merge-line/cleanup"], check=True, capture_output=True, text=True).stdout, "")
+            self.assertEqual(subprocess.run(["git", "-C", str(remote), "rev-parse", "main"],
+                check=True, capture_output=True, text=True).stdout.strip(), head)
+
 
 class WorkflowConclusion(unittest.TestCase):
     def plan(self, runs, *, tree="tested-tree", checks=None):
