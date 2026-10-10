@@ -49,6 +49,7 @@ class LiveSnapshot:
     route_entities: list = field(default_factory=list)
     observations: dict = field(default_factory=dict)
     pending_delivery: object = None
+    tag_metadata: list = field(default_factory=list)
     memory: object = None
     governor: object = None
     hearting: dict = None

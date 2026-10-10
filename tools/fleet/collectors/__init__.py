@@ -435,10 +435,11 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
 
     # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
+    tag_metadata = []
     try:
-        from ..session_tags import refresh
+        from ..session_tags import assign
         from ..session_handle import resolve_tag
-        refresh(sessions)
+        tag_metadata = assign(sessions)
         for s in sessions:
             if s.harness in {"codex", "opencode"} and s.session_id:
                 s.session_tag = resolve_tag(s.harness, s.session_id)
@@ -663,7 +664,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         usage_snapshots=usage_snapshots, node_evidence=node_evidence,
         degradations=degradations, pending_delivery=pending_delivery,
         malformed=malformed + collect_all.last_resource_malformed,
-        observations=observations,
+        observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
     )
     if not sessions and not jobs and node_evidence:
         from ..projection import terminal_route_entities
@@ -671,7 +672,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     if job_error is None:
         # Cache projected rows, not a reference later mutated by another reader.
         _JOB_OBSERVATIONS[job_key] = copy.deepcopy(replace(
-            snapshot, sessions=[], jobs=dispatch_rows, resources=[], usage_snapshots={}))
+            snapshot, sessions=[], jobs=dispatch_rows, resources=[], usage_snapshots={}, tag_metadata=[]))
         if len(_JOB_OBSERVATIONS) > 16:
             _JOB_OBSERVATIONS.pop(next(iter(_JOB_OBSERVATIONS)))
     return snapshot

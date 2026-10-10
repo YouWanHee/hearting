@@ -193,6 +193,10 @@ work together with the failed source, its last success and the reason it is
 unconfirmed. Basic and detail refresh share this health vocabulary. Publish
 route evidence and its projection in the same snapshot; rendering consumes
 that snapshot without rereading collector globals or redoing the judgment.
+Pane display updates belong to the existing detail pass; assigning a live
+session's number must not wait for pane metadata writes before basic publication.
+Delayed display writes check the pane's current exact session identity and
+assigned number; a changed or unconfirmed target receives no old metadata.
 
 ## Basis and current scope
 

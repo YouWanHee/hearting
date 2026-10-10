@@ -1,4 +1,4 @@
-"""Passive live detail fills joined to exact basic observations.
+"""Live display detail fills joined to exact basic observations.
 
 The ordinary snapshot pump owns existence/liveness/resources. This module runs
 on one coalesced RefreshPump worker and can neither create rows nor change those
@@ -141,6 +141,10 @@ def _enrich(snapshot):
         apply_peer_rows(sessions, (peer or {}).get("by_session") or {})
     except Exception:
         pass
+    # Pane metadata only: no runtime identity/lifecycle writes. The input was
+    # published with basic rows; slow panes occupy this existing detail worker.
+    from .herdr_projection import refresh_observed_tag_metadata
+    refresh_observed_tag_metadata(value.tag_metadata)
     return DetailSnapshot(source_key, value)
 
 

@@ -989,10 +989,15 @@ class PaneHeaderIdentityTest(unittest.TestCase):
     def test_both_fields_are_reported_in_one_call(self):
         """herdr's metadata record is per-source and a report replaces it whole — sending
         `--title` alone clears `--display-agent` (measured on a live pane)."""
-        import inspect
         from tools.fleet import herdr_projection
-        body = inspect.getsource(herdr_projection._report)
-        metadata = body.split("metadata = [", 1)[1].split("\n\n", 1)[0]
+        with unittest.mock.patch.object(herdr_projection.shutil, "which", return_value="herdr"), \
+             unittest.mock.patch.object(herdr_projection, "session_title", return_value="summary"), \
+             unittest.mock.patch.object(herdr_projection, "_formatter_overrides", return_value=(None, None)), \
+             unittest.mock.patch.object(herdr_projection, "compose", return_value=("codex", "summary")), \
+             unittest.mock.patch.object(herdr_projection, "_send_projection", autospec=True) as send:
+            herdr_projection._report("codex", "sid", "pane", False)
+        self.assertEqual(send.call_count, 1)
+        metadata = send.call_args.args[0]
         self.assertIn("--display-agent", metadata)
         self.assertIn("--title", metadata)
 
