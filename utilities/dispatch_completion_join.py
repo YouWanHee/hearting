@@ -3161,7 +3161,7 @@ def reconcile_exact_dead_attempt(jobs: Path, row: ChildRow) -> dict[str, object]
             raise ValueError("exact-death-contract-invalid")
         decision = decisions[0]
         closed = decision.get("closed") == 1
-        if closed and (decision.get("category") != "exact-dead"
+        if closed and (decision.get("category") not in {"exact-dead", "owner-terminal-settled"}
                        or decision.get("revalidated") is not True):
             raise ValueError("exact-death-proof-missing")
         return {"attempt_id": row.attempt_id, "closed": closed,
@@ -4206,6 +4206,43 @@ def apply_exact_route_free_review_classification(
     return "foreground-outcome-close-action-invalid"
 
 
+def settle_exited_owner_terminal(row: ChildRow, *, jobs: str | Path) -> str | None:
+    """Retry the supervisor's terminal writer from its retained open row.
+
+    Owners carry owner_route_file rather than a worker's route_file/node.
+    Their exact log and process observation are the same evidence the
+    post-exit watcher consumes; no new recovery record is needed.
+    """
+    from dispatch_contract import supervisor_lease_is_held
+    from dispatch_supervisor_terminal import classify_supervisor_log
+
+    meta = row.metadata
+    if (row.status not in OPEN_STATES or meta.get("worker_type") != "owner"
+            or meta.get("registered_worker") != "1" or meta.get("launch_started") != "1"
+            or not meta.get("pid_start") or not meta.get("pid") or not meta.get("log_file")):
+        return None
+    if supervisor_lease_is_held(jobs, meta):
+        return "supervisor-live"
+    process = attempt_process_quiescence(meta, terminal_receipt=True)
+    if process.state != "quiescent":
+        return process.reason
+    terminal = classify_supervisor_log(meta["log_file"], meta.get("harness", "unknown"))
+    if terminal.reconcile_reason == "terminal-log-unreadable":
+        return terminal.reconcile_reason
+
+    def still_exited(fields):
+        return (fields == row.raw.split("\t")
+                and not supervisor_lease_is_held(jobs, meta)
+                and attempt_process_quiescence(meta, terminal_receipt=True).state == "quiescent"
+                and classify_supervisor_log(meta["log_file"], meta.get("harness", "unknown")) == terminal)
+
+    closed = close_attempt_row_if(Path(jobs), row.attempt_id, terminal.note,
+                                  still_exited, evidence=terminal.evidence())
+    if closed:
+        materialize_after_terminal_close(Path(jobs), row.attempt_id)
+    return "" if closed else "owner-terminal-revalidation-pending"
+
+
 def close_finished_child(
     row: ChildRow, *, jobs: str | Path, classification: ExactReviewClassification | None = None,
     correct_recorded_move: bool = False,
@@ -4244,6 +4281,9 @@ def close_finished_child(
             materialize_after_terminal_close(Path(jobs), row.attempt_id)
             return ""
         return classification.reason
+    owner_terminal = settle_exited_owner_terminal(row, jobs=jobs)
+    if owner_terminal is not None:
+        return owner_terminal
     route_file = metadata.get("route_file")
     route_node = metadata.get("route_node")
     if not route_file or not route_node:

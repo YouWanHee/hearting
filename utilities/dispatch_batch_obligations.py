@@ -210,6 +210,7 @@ def ensure_observers(jobs: str | Path | None = None) -> int:
     launched = 0
     script = Path(__file__).with_name("codex-managed-completion.py")
     for jobs_path in _jobs_paths(jobs):
+        _resume_owner_settlements(jobs_path)
         try:
             root = _root(jobs_path)
             records = sorted(root.glob("batch-*.json")) if root.is_dir() else []
@@ -248,6 +249,36 @@ def ensure_observers(jobs: str | Path | None = None) -> int:
             except (OSError, ValueError, BatchObligationError):
                 continue
     return launched
+
+
+def _resume_owner_settlements(jobs: Path) -> None:
+    """The open registry row retains a failed supervisor settlement itself.
+
+    Resume through the same writer on ordinary reconnection, including older
+    owners with no batch sidecar record. Storage failure keeps it open for
+    the next existing callback; this never launches model work.
+    """
+    from dispatch_contract import parse_registry_metadata, supervisor_lease_is_held
+    from dispatch_completion_join import ChildRow, settle_finished_attempt
+    try:
+        lines = jobs.read_text().splitlines()
+    except OSError:
+        return
+    for order, raw in enumerate(lines):
+        fields = raw.split("\t")
+        if len(fields) != 6 or fields[1] not in {"open", "running"}:
+            continue
+        meta = parse_registry_metadata(fields[5])
+        if (meta.get("worker_type") != "owner" or meta.get("launch_started") != "1"
+                or not meta.get("log_file") or not meta.get("attempt_id")):
+            continue
+        try:
+            if supervisor_lease_is_held(jobs, meta):
+                continue
+            settle_finished_attempt(jobs, ChildRow(order, fields[1], fields[4],
+                                                 meta["attempt_id"], raw, meta))
+        except (OSError, ValueError):
+            continue
 
 
 def _pid_start(pid: int) -> str:

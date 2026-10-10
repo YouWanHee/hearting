@@ -1528,6 +1528,25 @@ class ReplacementTest(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
 
+    def test_runtime_death_receives_correction_on_the_same_route_without_replaying_reviews(self):
+        self._blocked_owner()
+        self.jobs.write_text(self.jobs.read_text().replace('dead-worker-blocked', 'dead-runtime-exit')
+                             .replace('failure_class=blocked', 'failure_class=runtime'))
+        answer = '이미 통과한 검토를 보존하고 남은 관찰과 verdict만 완료하세요.'
+        self.assertTrue(self._answer(text=answer)['retained'])
+        R._reuse_snapshot.return_value['completed'] = [{'node': 'independent-verify'}]
+        result, commands = self._launch()
+        self.assertEqual(len(commands), 1)
+        record = result['record']
+        self.assertEqual(record['route_id'], self.route['route_id'])
+        self.assertEqual(record['proof']['source_result'], 'EXITED')
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        for expected in (answer, 'independent-verify', 'Continue only unfinished work',
+                         'exited before settlement', 'existing route'):
+            self.assertIn(expected, text)
+        self.assertNotIn('ended BLOCKED', text)
+
     # -- an owner that ended with a readable FAIL, answered with a fix a person approved ----------
     def _failed_owner(self, test_fails=2):
         """BC rt-96bab699: the owner reported its test FAIL as its result; the check's rounds are spent."""

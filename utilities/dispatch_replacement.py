@@ -317,6 +317,10 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
             and route_authority.answerable_owner_end(fields[1], meta) == 'FAIL'
             and _retained_corrections(jobs, meta.get('attempt_id'))):
         return CORRECTED  # a person approved a fix for the FAIL it reported; no automatic retry
+    if (jobs is not None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
+            and meta.get('note') in RUNTIME_DEATH_NOTES
+            and _retained_corrections(jobs, meta.get('attempt_id'))):
+        return CORRECTED
     if (meta.get('note') == 'cancelled-receipt-unavailable'
             and meta.get('classifier_source') == DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return 'silent'
@@ -368,6 +372,8 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
         handoff = _blocked_handoff(fields, meta)
         if handoff:
             result['handoff'] = handoff
+        if meta.get('note') in RUNTIME_DEATH_NOTES:
+            result['source_result'] = 'EXITED'
     return result
 
 
@@ -1772,7 +1778,10 @@ def recovery_instructions(args):
         opening = (f'The previous owner {prior} ended FAIL and a person approved a fix for it; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == CORRECTED:
-        opening = (f'The previous owner {prior} ended BLOCKED and a person has answered it; this continues '
+        ended = ('exited before settlement and received a correction'
+                 if record['proof'].get('source_result') == 'EXITED'
+                 else 'ended BLOCKED and a person has answered it')
+        opening = (f'The previous owner {prior} {ended}; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == 'capacity':
         opening = f'The previous attempt {prior} stopped at a usage limit; this resumes it on the existing route {record["route_id"]}.\n'
@@ -1862,6 +1871,9 @@ def _correction_context(jobs, prior, proof):
             raise DC.DispatchContractError('replacement-correction-drift', str(pinned.get('id')))
         items.append(item)
     handoff = proof.get('handoff')
+    if proof.get('source_result') == 'EXITED':
+        return ('The previous owner exited before settlement. The correction below names the remaining work; '
+                'preserve completed checks and continue the existing route.' + OwnerInput.text(items) + '\n')
     answer = ('The answer below is the fix a person approved for the failure it reported. Treat it as '
               'given: do not ask for it again; apply it, then continue through the remaining declared stages.'
               if proof.get('source_result') == 'FAIL' else

@@ -748,6 +748,16 @@ for a second entry approval. Older sealed quick routes retain their
 `preview-disposition` release and current-preview digest checks;
 `capabilities/autopilot-refine.md` owns the commands.
 
+An open registered owner whose supervisor failed terminal settlement remains
+an unfinished settlement duty. Ordinary join, start, correction and session
+reconnection retry the same terminal writer after storage becomes writable.
+They use the exact PID/start, group and tagged-descendant observation, preserve
+committed results and completed stage markers, and retain corrections for the
+same route's continuation. Live or unobservable processes retain protection
+from closure and replacement. A process reobserved as a zombie after an environment read
+denial has exited; a still-live denied environment remains unobservable.
+`start` distinguishes running, exited and unobservable owners.
+
 ### §5.11. Commit and Push Policy for `<agent-home>`
 
 Merge with `hearting run merge-line <PR>`. This shared command queues sessions

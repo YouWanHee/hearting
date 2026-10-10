@@ -1899,6 +1899,17 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     status, metadata = _rows(jobs).get(aid, (status, metadata))
     if status == "done":
         return _exited_owner_response(route, result, jobs, aid, observation=joined)
+    if metadata.get("pid") and metadata.get("pid_start") and metadata.get("launch_started") == "1":
+        from dispatch_contract import attempt_process_quiescence
+        process = attempt_process_quiescence(metadata, terminal_receipt=True)
+        if process.state != "live":
+            return {**result, "state": "needs-attention",
+                    "reason": "owner-settlement-pending" if process.state == "quiescent"
+                              else "owner-process-unverifiable",
+                    "owner_process_state": process.state, "owner_process_reason": process.reason,
+                    "observation": joined,
+                    "next_step": "The owner is exited or unobservable. Its open row retains settlement; "
+                        "the ordinary start or correction retries it. Preserve existing results."}
     if wait:
         return _wait_expired({**result, "observation": joined})
     directive, reason, _ = parent_next(metadata.get("parent_completion_delivery", ""), aid, agent_home=ROOT)

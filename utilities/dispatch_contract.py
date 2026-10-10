@@ -3089,6 +3089,10 @@ def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
     try:
         raw = (entry / "stat").read_text(encoding="utf-8")
         tail = raw[raw.rfind(")") + 2:].split()
+        if tail[0] == "Z":
+            # exit_mm can revoke environ between the walk's stat read and
+            # this adjacent observation. A zombie cannot run or fork.
+            return "", ""
         current = tail[19]
         stable = start if start.isdigit() and current == start else ""
     except FileNotFoundError:

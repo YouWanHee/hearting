@@ -691,6 +691,22 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn("You are the parent session", result["next_step"])
         self.assertIn("Do not kill", result["next_step"])
 
+    def test_open_but_exited_or_unobservable_owner_is_never_reported_running(self):
+        import dispatch_contract as D
+        self.start(); self.ready = self.released = True; self.start()
+        self.jobs.write_text(self.jobs.read_text().replace(
+            'worker_type=owner', 'worker_type=owner,pid=99999999,pid_start=100'))
+        for state, reason in (('quiescent', 'owner-settlement-pending'),
+                              ('unverifiable', 'owner-process-unverifiable')):
+            with self.subTest(state=state), \
+                 mock.patch.object(W, 'join_selected_attempts', return_value={'state': 'timeout', 'children': []}), \
+                 mock.patch.object(D, 'attempt_process_quiescence',
+                                   return_value=D.ProcessQuiescence(state, 'fixture')):
+                result = self.start()
+                self.assertEqual((result['state'], result['reason']), ('needs-attention', reason), result)
+                self.assertNotIn('parent_next', result)
+        self.assertEqual(len(self.calls), 3)
+
     def test_start_with_a_changed_pin_diagnoses_a_live_owner_on_the_old_harness(self):
         self.start(); self.ready = self.released = True; created = self.start()
         owner = created['owner_attempt_id']

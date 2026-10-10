@@ -615,9 +615,13 @@ def classify_supervisor_log(path: str | Path | None, harness: str) -> Supervisor
     for index in range(len(rows) - 1, -1, -1):
         if rows[index].get("type") == "dispatch.supervisor.turn.failed":
             return codex_turn_failure_terminal(rows[index])
+    settlement_failure = None
     for index in range(len(rows) - 1, -1, -1):
         row = rows[index]
         event = row.get("type")
+        if settlement_failure is not None and event in {
+                "dispatch.supervisor.turn.started", "dispatch.supervisor.turn-started"}:
+            break  # an earlier turn's result cannot settle this failed turn
         if event == "result":
             return classify_claude_result(row, 0)
         if event == "turn.completed":
@@ -633,7 +637,14 @@ def classify_supervisor_log(path: str | Path | None, harness: str) -> Supervisor
                     break
             return classify_codex_result(final_text)
         if event == "dispatch.supervisor.error":
+            reason = str(row.get("reason") or "supervisor-error")
+            if reason.startswith("terminal-reconcile-failed-"):
+                # Failure to persist a result does not replace that result.
+                # Retain the error only when no native terminal preceded it.
+                if settlement_failure is None:
+                    settlement_failure = classify_supervisor_error(harness, reason)
+                continue
             return classify_supervisor_error(
-                harness, str(row.get("reason") or "supervisor-error")
+                harness, reason
             )
-    return classify_supervisor_error(harness, "terminal-event-missing")
+    return settlement_failure or classify_supervisor_error(harness, "terminal-event-missing")
