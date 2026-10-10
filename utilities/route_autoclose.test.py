@@ -530,10 +530,12 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertIsNone(RA.campaign_of_route(self.root, {"campaign_key": "other"}))
 
     def test_campaign_status_still_closes_routes_in_every_campaign(self):
+        # Pure `campaign-status` no longer sweeps; the writer `campaign-close`
+        # owns the sweep. This covers the same cross-campaign close via close.
         other_file, other, other_record = self._other_campaign_ended()
         mine_file, mine = self.compose("mine", "codex", "mine-session", campaign="scope-mine")
         self.assertIsNone(self.outcome(other_file))
-        done = self.campaign("campaign-status", self.cycle(mine)["campaign_id"])
+        done = self.campaign("campaign-close", self.cycle(mine)["campaign_id"], "--reason", "done")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "session-ended")
         self.assertEqual(self.cycle_record(other_record["cycle_id"])["state"], "sealed")
@@ -900,7 +902,7 @@ class RouteAutocloseTest(unittest.TestCase):
         before = {path: path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}
         index_before = (index.stat().st_mtime_ns, index.read_bytes())
         self.env["PATH"] = str(shim_dir) + os.pathsep + self.env["PATH"]
-        closed = self.campaign("campaign-status", campaign)
+        closed = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertIn("route_autoclose closed=1", closed.stderr)
         self.assertEqual({path: path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}, before)
         self.assertEqual((index.stat().st_mtime_ns, index.read_bytes()), index_before)
@@ -917,7 +919,7 @@ class RouteAutocloseTest(unittest.TestCase):
                     if path.is_file() and not path.is_relative_to(self.root) and not path.is_relative_to(self.repo)}
 
         before = snapshot()
-        done = self.campaign("campaign-status", campaign)
+        done = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertIn("route_autoclose closed=1", done.stderr)
         after = snapshot()
         self.assertEqual(sorted(key for key in after if before.get(key) != after[key]), [])

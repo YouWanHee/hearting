@@ -190,6 +190,9 @@ class ArtifactFreedomTest(FX.ProducerTestBase):
         first = self.finished()
         for name in ("INDEX.json", "INDEX.md"):
             (self.root / "campaigns" / name).unlink()
+        # Pure list observes without repairing; the writer-side reconcile
+        # owns the single heal, further pure lists stay write-free.
+        P.reconcile_root(self.root)
         P.list_campaign_summaries(self.root)
         P.list_campaign_summaries(self.root)
         self.assertEqual(len(self.control_events(first, "INDEX.json")), 1)
