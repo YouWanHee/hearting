@@ -249,7 +249,7 @@ class FoldingTest(unittest.TestCase):
         running_keys = [key for line in lines if line for t, key in line if t == "running"]
         preparing_keys = [key for line in lines if line for t, key in line if t == "preparing…"]
         self.assertIn("exec agent-first-home-c", text)
-        self.assertIn("code-execute(strong)", text)
+        self.assertIn("구현", text)
         self.assertNotIn("dev/refactor·strong·development", text)
         self.assertTrue(any(key in ("stg1_on", "stg1_off") for key in running_keys))
         self.assertTrue(any(key in ("stg0_on", "stg0_off") for key in preparing_keys))
@@ -412,13 +412,16 @@ class TitleCapTest(unittest.TestCase):
         self.assertLessEqual(len(name_text), render._TITLE_MAX)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class OptsDialHierarchyTest(unittest.TestCase):
     """user 2026-07-20: "계층적으로 code (mode inten) / boot 순" — the dial reads
     capability (behaviour knobs) / environment, not a flat '·' chain mixing the axes."""
 
     @staticmethod
     def _dial(j):
-        segs, w = render._opts_segs(j)
+        # Internal contracts remain available in the explicit detail surface.
+        with mock.patch.object(render, "_SHOW_ALL", True):
+            segs, w = render._opts_segs(j)
         text = "".join(t for t, _k in segs)
         assert w == len(text), "declared width must match rendered text"
         return text
@@ -505,7 +508,7 @@ class OptsDialHierarchyTest(unittest.TestCase):
         text, _key, _mark = render._route_node_text({
             "id": "test", "unit": "verify", "state": "pending",
         })
-        self.assertEqual(text, "test[verify] ○")
+        self.assertEqual(text, "검증[verify] ○")
 
     def test_entry_and_environment_tail_without_knobs(self):
         j = DispatchJob(key="code", slug="s", depth=1, profile="layer2")

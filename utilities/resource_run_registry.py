@@ -122,6 +122,34 @@ def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, di
     return "stale", current, "process-identity-mismatch"
 
 
+def resource_never_started(run: dict) -> bool:
+    """Read the runner's pre-release failure, never infer it from disappearance.
+
+    Old direct launchers wrote this failure before publishing any identity.
+    A controller's observed crash after claim uses the same failure class but
+    retains its claim; only the launcher itself can record `not-started` there.
+    """
+    if (run.get("resource_policy") not in {"verified-resume", "supervised-owner"}
+            or run.get("status") != "failed" or run.get("workflow_state") != "FAILED_RETRYABLE"
+            or run.get("failure_class") != "resource-launch-incomplete"
+            or run.get("exit_code") is not None or not run.get("sentinel")
+            or run.get("cancel_requested") or run.get("parent_close_requested")):
+        return False
+    try:
+        Path(run["sentinel"]).lstat()
+    except FileNotFoundError:
+        pass
+    except (OSError, TypeError, ValueError):
+        return False
+    else:
+        return False
+    identity = any(run.get(key) is not None for key in IDENTITY_KEYS)
+    if run.get("launch_state") == "not-started":
+        return not identity or classify_identity(run)[0] == "exited"
+    return (run.get("launch_state") is None and not identity
+            and not run.get("launch_controller") and not run.get("launch_argv"))
+
+
 def is_alive(run: dict, identity_reader=proc_identity) -> bool:
     return classify_identity(run, identity_reader=identity_reader)[0] == "working"
 

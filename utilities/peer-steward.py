@@ -1274,18 +1274,58 @@ def _start_layout(beside):
     return layout
 
 
-def _tab_placement(layout):
-    """One grid/shell decision for both the caller tab and its workspace peers."""
-    split = _grid_split(layout)
-    if split:
-        return "split", split[0], split[1]
-    for pane in layout["panes"]:
+def _empty_shell_placement(panes):
+    for pane in panes:
         pane_id = pane["pane_id"]
         if (_pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None
                 and _wait_for_shell_prompt(pane_id, timeout_ms=1)
                 and _pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None):
             return "reuse", pane_id, None
     return None
+
+
+def _tab_placement(layout):
+    """One grid/shell decision for both the caller tab and its workspace peers."""
+    split = _grid_split(layout)
+    if split:
+        return "split", split[0], split[1]
+    return _empty_shell_placement(layout["panes"])
+
+
+def _project_start_workspace():
+    """A directory match locates a workspace; it never proves caller ownership."""
+    hint = os.environ.get("HERDR_PANE_ID")
+    if not hint:
+        return None
+    try:
+        pane = _placement_result("agent", "get", hint).get("agent")
+        if not isinstance(pane, dict) or pane.get("pane_id") != hint:
+            return None
+        workspace, cwd = pane.get("workspace_id"), pane.get("foreground_cwd")
+        if (not isinstance(workspace, str) or not workspace.strip()
+                or not hint.startswith(workspace + ":") or not isinstance(cwd, str)
+                or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
+            return None
+        caller = INSTALL_PATHS.primary_checkout(os.getcwd()).resolve()
+        foreground = INSTALL_PATHS.primary_checkout(cwd).resolve()
+        return workspace if caller == foreground else None
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
+        return None
+
+
+def _start_workspace_placement(workspace):
+    """Project seats reuse empty shells or add a tab, without splitting a peer."""
+    try:
+        panes = _placement_result("pane", "list", "--workspace", workspace).get("panes")
+        if (not isinstance(panes, list) or not panes
+                or any(not isinstance(p, dict) or p.get("workspace_id") != workspace
+                       or not isinstance(p.get("pane_id"), str)
+                       or not p["pane_id"].startswith(workspace + ":") for p in panes)
+                or len({p["pane_id"] for p in panes}) != len(panes)):
+            return None
+        return _empty_shell_placement(reversed(panes)) or ("tab", workspace, None)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
 
 
 def _start_placement(beside):
@@ -1337,12 +1377,17 @@ def cmd_start(args):
         print(f"started=false reason=agent-name-too-long agent={args.kind} name={args.name} "
               "max_length=32 detail=이름은 최대 32자까지 사용할 수 있습니다")
         return 1
-    beside = args.beside or (_caller_pane() if not args.pane else None)
-    if not beside:
+    if not args.pane and not args.beside:
+        args.beside = _caller_pane() or None
+        if not args.beside:
+            args.project_workspace = _project_start_workspace()
+    workspace = (args.beside.split(":")[0] if args.beside else
+                 getattr(args, "project_workspace", None))
+    if not workspace:
         return _start_in_pane(args)
     # Hold the workspace claim until native start settles, including shell reuse.
     # A second start then reads the new layout instead of splitting the old cell.
-    key = hashlib.sha256(f"{_HERDR_SESSION or 'default'}:{beside.split(':')[0]}".encode()).hexdigest()
+    key = hashlib.sha256(f"{_HERDR_SESSION or 'default'}:{workspace}".encode()).hexdigest()
     root = peer_message.peer_state_root() / "peer-starts"
     root.mkdir(parents=True, exist_ok=True)
     with (root / f"{key}.lock").open("a") as lock:
@@ -1353,14 +1398,12 @@ def cmd_start(args):
 def _start_in_pane(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
-    if not args.pane and not args.beside:
-        # Beside the calling pane, the way a session starts its own peer.
-        args.beside = _caller_pane() or None
-        if not args.beside:
-            print(f"started=false reason=pane-unknown agent={args.kind} name={args.name} "
-                  "pane=- detail=name --pane or --beside outside a herdr pane")
-            return 1
-    if args.beside and not args.cwd:
+    workspace = getattr(args, "project_workspace", None)
+    if not args.pane and not args.beside and not workspace:
+        print(f"started=false reason=pane-unknown agent={args.kind} name={args.name} "
+              "pane=- detail=호출자의 창 또는 같은 프로젝트 작업공간을 확인하지 못했습니다")
+        return 1
+    if (args.beside or workspace) and not args.cwd:
         try:
             args.cwd = str(INSTALL_PATHS.primary_checkout(os.getcwd()))
         except OSError:
@@ -1417,8 +1460,9 @@ def _start_in_pane(args):
             note += " reuse_command=" + shlex.quote(shlex.join(retry))
         return note
 
-    if getattr(args, "beside", None):
-        placement = _start_placement(args.beside)
+    if args.beside or workspace:
+        placement = (_start_workspace_placement(workspace) if workspace else
+                     _start_placement(args.beside))
         if placement is None:
             print(f"started=false reason=pane-layout-unavailable agent={args.kind} "
                   f"name={args.name} pane=- beside={args.beside}")
@@ -1637,6 +1681,7 @@ def _start_in_pane(args):
         + cleanup_note
         + (f" tui_scoped={tui_scoped}" if tui_scoped else "")
         + (f" start_verify={start_verify}" if start_verify else "")
+        + (f" placement=project-workspace workspace={workspace}" if workspace else "")
     )
     return 0
 

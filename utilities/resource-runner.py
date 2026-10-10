@@ -12,6 +12,7 @@ from resource_run_registry import (
     is_alive,
     proc_identity,
     register_registry,
+    resource_never_started,
 )
 
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -62,6 +63,16 @@ def settle(registry, run_id, run):
     `running` that outlives its process is a defect, not a state, so termination is
     recorded by whoever notices it first and is idempotent afterwards.
     """
+    if resource_never_started(run):
+        def settle_unstarted(data):
+            row = data["runs"].get(run_id)
+            if row != run:
+                raise ValueError("resource-reservation-changed")
+            if row.get("ended_at") is not None:
+                return row, False
+            row.update(ended_at=time.time(), exit_code=None)
+            return row, True
+        return locked_update(registry, settle_unstarted)
     liveness,_current,reason=classify_identity(run)
     if liveness in {"working", "reaping"} or (run.get("resource_policy") in {"verified-resume", "supervised-owner"}
                               and run.get("status") == "launching"):
@@ -216,6 +227,14 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         register_registry(registry)
         artifacts = prepare_route_artifact_env(route_file, start=True, jobs=jobs)
         node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
+        # Native Codex tools record intent; their outer controller admits the
+        # devices before arming/releasing the actual execution.
+        queued_intent = (owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller"
+                         and controller is None)
+        if not queued_intent:
+            lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
+                node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
+                share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
         output_receipt = RUN_EVIDENCE.paths({"artifact_base": artifacts["AGENT_ARTIFACT_OUTPUT_DIR"],
             "declared_outputs": node.get("outputs", ["run.json"])}, prepare=True)
         ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
@@ -237,7 +256,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         with ledger.lock():
             if sup.resource_continuation_cancelled(route, ledger):
                 raise ValueError("resource-parent-close-requested")
-        if owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller" and controller is None:
+        if queued_intent:
             queued = {**placeholder, "launch_state": "queued"}
             publish_verified_run(registry, args.run_id, placeholder, queued)
             print(json.dumps({**queued, "payload_spawned": False, "supervisor_alive": False,
@@ -245,10 +264,6 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                               "required_action": "yield-owner-turn", "verification_admitted": False,
                               "workflow_complete": False}))
             return
-        node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
-        lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
-            node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
-            share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
         watch, supervision = start_watch(route_file, jobs, placeholder["cwd"], runtime)
         log = Path(placeholder["log"])
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -331,8 +346,18 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     data["runs"][args.run_id] = controller.expected
                 else:
                     current.update(status="failed", workflow_state="FAILED_RETRYABLE",
-                                   failure_class="resource-launch-incomplete")
-            locked_update(registry, mark_failed)
+                                   failure_class="resource-launch-incomplete",
+                                   launch_state="not-started", ended_at=time.time(), exit_code=None)
+                return current
+            failed = locked_update(registry, mark_failed)
+            if ledger and resource_never_started(failed):
+                # Settle only this exact armed run through the normal failure
+                # consumer, without polling or starting unrelated successors.
+                with ledger.lock():
+                    armed = sup.read_armed(ledger).get(args.node)
+                    if (armed and armed.get("predecessor_id") == args.run_id
+                            and not sup.resource_continuation_cancelled(route, ledger)):
+                        sup._evaluate(route, ledger, armed, [])
         raise
 
 

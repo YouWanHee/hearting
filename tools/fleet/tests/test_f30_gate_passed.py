@@ -473,11 +473,11 @@ class GateMarkRenderTest(unittest.TestCase):
     def test_passed_node_emits_mark_segment(self):
         lines = render._route_card_l2({"nodes": [self._node(gate_passed=True)]})
         segs = lines[0]
-        self.assertEqual(segs, [("plan ✓12m", "dim"), (render._GATE_MARK, "gate_t")])
+        self.assertEqual(segs, [("계획 ✓12m", "dim"), (render._GATE_MARK, "gate_t")])
 
     def test_no_claim_node_emits_no_mark(self):
         lines = render._route_card_l2({"nodes": [self._node()]})
-        self.assertEqual(lines[0], [("plan ✓12m", "dim")])
+        self.assertEqual(lines[0], [("계획 ✓12m", "dim")])
         self.assertNotIn(render._GATE_MARK, "".join(t for t, _k in lines[0]))
 
     def test_mark_never_shares_the_state_glyph_colour(self):
@@ -523,7 +523,7 @@ class GateMarkRenderTest(unittest.TestCase):
         for width in (30, 36, 37, 60, 200):
             with self.subTest(width=width):
                 lines, text = drawn(nodes, width)
-                for primary in ("plan ✓", "execute ●", "test ○"):
+                for primary in ("계획 ✓", "구현 ●", "검증 ○"):
                     self.assertEqual(text.count(primary), 1)
                 self.assertEqual([key for line in lines for value, key in line
                                   if value == render._GATE_MARK], ["gate_t", "gate_t"])
@@ -538,7 +538,7 @@ class GateDetailRowTest(GateMarkBase):
         views = route.build_views([], {}, {self.route_id: self.record}, 1_000_000.0, gate_marks)
         out, _meta = render._route_card(views[0], {}, 120, 1_000_000.0)
         rows = [segs for segs in out
-                if segs and isinstance(segs[0][0], str) and "gates: " in segs[0][0]]
+                if segs and isinstance(segs[0][0], str) and "완료 확인: " in segs[0][0]]
         return rows
 
     def test_gates_row_hidden_without_show_all(self):
@@ -555,8 +555,8 @@ class GateDetailRowTest(GateMarkBase):
             self.assertEqual(len(rows), 1)
             segs = rows[0]
             text = "".join(t for t, _k in segs)
-            self.assertEqual(text, "      gates: code-plan ⊸, code-execute, code-test, "
-                                   "code-report ⊸")
+            self.assertEqual(text, "      완료 확인: 계획 ⊸, 구현, 검증, "
+                                   "결과 전달 ⊸")
             self.assertEqual([k for t, k in segs if t == render._GATE_MARK],
                              ["gate_t", "gate_t"])
         finally:
@@ -567,7 +567,7 @@ class GateDetailRowTest(GateMarkBase):
         try:
             segs = self._card({})[0]
             self.assertEqual("".join(t for t, _k in segs),
-                             "      gates: code-plan, code-execute, code-test, code-report")
+                             "      완료 확인: 계획, 구현, 검증, 결과 전달")
         finally:
             render.set_show_all(False)
 
@@ -723,7 +723,7 @@ class ReconciliationRenderTest(unittest.TestCase):
 
     def test_process_node_uses_yellow_gate_pending_label(self):
         text, key, mark = render._route_node_text(self._node())
-        self.assertEqual((text, key, mark), ("frame …gate 3m", "lvl_y", ""))
+        self.assertEqual((text, key, mark), ("방향 검토 …종료 확인 3m", "lvl_y", ""))
 
     def test_breadcrumb_uses_yellow_ellipsis(self):
         breadcrumb = render._route_stage_segs([("frame", "reconciling"),

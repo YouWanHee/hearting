@@ -2452,6 +2452,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
 
 
 # --- D5: depth-2 registry metadata ---
+@mock.patch.object(render, "_SHOW_ALL", True)
 class DepthTwoRegistryMetadataTest(unittest.TestCase):
 
 
@@ -2759,6 +2760,7 @@ class TolerantPipeParsingTest(unittest.TestCase):
         self.assertEqual(fields["owner"], "autopilot-code")
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class StageWorkerRenderTest(unittest.TestCase):
     """SD-F1/F-15 — child name is humanized; its options cell names the assigned skill."""
 
@@ -2813,6 +2815,7 @@ class QuickDispatchRenderTest(unittest.TestCase):
             self.assertNotIn("test ›", text)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class ConductorBreadcrumbTest(unittest.TestCase):
     """A conductor breadcrumb is projection-backed and never selects a first child."""
 

@@ -308,7 +308,7 @@ class FirstSnapshotRenderTest(unittest.TestCase):
                     lines = render._build_lines([], [], "both", False, 0,
                                                 term_width=168, governor=None, loading=True)
                     text = "\n".join(render._plain(line) for line in lines if line)
-                    self.assertIn("loading sessions", text)
+                    self.assertIn("세션 확인 중", text)
                     self.assertNotIn("0 working", text)
                     self.assertNotIn("0 idle", text)
                     self.assertNotIn("no active", text)
@@ -320,7 +320,7 @@ class FirstSnapshotRenderTest(unittest.TestCase):
                 lines = render._build_lines([], [], "both", False, 0,
                                             term_width=168, governor=None)
                 text = "\n".join(render._plain(line) for line in lines if line)
-                self.assertIn("no active sessions or dispatch jobs", text)
+                self.assertIn("관측된 세션·작업 없음", text)
                 self.assertIn("0 working", text)
                 attach.assert_not_called()
 

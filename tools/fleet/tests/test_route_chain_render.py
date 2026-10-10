@@ -30,6 +30,7 @@ def _cell(chain, width=40, **kw):
     return None if segs is None else _text(segs)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class RouteChainCellTest(unittest.TestCase):
     def test_mockup_research_done_draft_open_apply_planned(self):
         nodes = [_node("research", "done"), _node("draft", "open", shape="solo"),
@@ -161,6 +162,7 @@ class RouteChainCellTest(unittest.TestCase):
         self.assertIn("+1?", current_only)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class OwnerDialShapeTest(unittest.TestCase):
     def _owner_job(self, shape="staged", route_origin="compose"):
         record = {"selection": {"route_origin": route_origin, "shape": shape}}
@@ -195,6 +197,7 @@ class OwnerDialShapeTest(unittest.TestCase):
         self.assertNotIn("staged", _text(segs))
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class MainStageCellTest(unittest.TestCase):
     def test_open_route_beats_marker_then_marker_then_dash(self):
         session = Session(harness="claude", pid=1, session_id="s1")
@@ -253,6 +256,7 @@ def _chain_session(nodes, current, sid="sid-chain", plan=()):
     return session
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class ChainInStageCellTest(unittest.TestCase):
     """User 2026-09-18: the chain takes the session's stage cell (the old `-` slot), up to
     40 cells, as a window of at most four nodes (one next plan step); no separate line."""

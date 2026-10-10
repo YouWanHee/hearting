@@ -2,6 +2,8 @@
 import os
 import sys
 import unittest
+import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -118,8 +120,12 @@ class OwnerFallbackTest(unittest.TestCase):
     def test_drill_unresolved_root_remains_standalone(self):
         work = self._route_projection("rt-drill")
         stage = self._stage("drill-claude-parent-session", work=work)
-        stage.cwd = "/tmp/drill-owner-fallback-abcd/repo"
-        rendered = self._render([], [stage])
+        with tempfile.TemporaryDirectory(prefix="drill-owner-fallback-") as root:
+            stage.cwd = root + "/repo"
+            # This synthetic fixture has no Git repository. Ignore an unrelated
+            # repository enclosing the machine's temporary directory.
+            with mock.patch("fleet.gitinfo.resolve_gitdir", return_value=(None, None)):
+                rendered = self._render([], [stage])
         self.assertNotIn("orphaned dispatch rows", rendered)
         self.assertNotIn("(orphan)", rendered)
         self.assertIn("stage-execute", rendered)
@@ -137,7 +143,7 @@ class OwnerFallbackTest(unittest.TestCase):
         self.assertNotIn("CX/", group)
 
         process = self._render([parent], [stage], process=True)
-        for node in ("plan", "execute", "test"):
+        for node in ("계획", "구현", "검증"):
             self.assertIn(node, process)
         self.assertNotIn("orphaned dispatch rows", process)
 

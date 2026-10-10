@@ -121,6 +121,16 @@ projection processes without that reference conservatively retain their release 
 until they exit. This uses the installer's existing in-use judgment, with no
 additional registry or caller step.
 
+The live Fleet viewer follows a committed forward managed installation by
+replacing its own process in the same terminal. It reads the existing distribution
+lock and installation record; an in-progress, failed, incomplete or rolled-back
+installation leaves the viewer on its source. Its view, explicit folds, scroll,
+selection and ordering pass to the new process as private viewer state. The last
+drawn frame stays visible until new observations arrive. Pending confirmation or
+process termination defers replacement. Snapshot modes and development checkouts
+keep their original source. This shared viewer behavior adds no option or step
+to any runtime, and does not move a pinned dispatch tree.
+
 A route's `launch_compatibility_tuple.launch_home.path` is also the source of
 its contract read access. A replacement or child launched after activation
 retains read access to that sealed home's `capabilities/`, alongside its own
@@ -398,6 +408,13 @@ and background attachments need exact native evidence of the current session;
 a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
+
+For an unproven background caller, default `peer-steward start` locates the
+inherited pane's workspace by its live foreground directory in the caller's
+repository (linked worktrees included). It reuses an observed empty shell or
+creates an unfocused tab, leaving existing panes and seat-successor records
+intact. Cards, watch and sender identity retain exact ownership checks; missing,
+foreign or unreadable hints leave placement unknown.
 
 An OpenCode child inside a Codex owner's workspace sandbox receives per-attempt
 XDG data/cache/state/config directories beneath the worktree. User configuration
@@ -996,6 +1013,13 @@ the same resource output reconciliation without payload replay.
 Registration and supervisor arming share the terminal-execution judgment for
 same-route/node retries. They retain the old row and predecessor binding;
 only that resource's failed/retryable state returns to running.
+The runner's failure before its private payload fence is released is a finished
+failure, including legacy direct-launch `resource-launch-incomplete` rows with
+no process identity, controller claim or sentinel. One shared judgment settles
+that failure and admits the ordinary `__a<N>` retry; a missing identity or a
+controller crash after claim alone proves nothing. Admission checks precede
+arming where possible, and an armed pre-release failure settles the workflow
+as `FAILED_RETRYABLE`, preserving its failed predecessor and starting no successor.
 
 GPU monitoring is observation, separate from payload completion. A generated
 resource bridge settles the exact payload exit and declared outputs even when
@@ -1377,7 +1401,8 @@ memory. Memory-holding idle processes are occupied too. An occupied explicit
 choice starts nothing and reports its owner, task, start time and free devices.
 `--share` is the single optional override for deliberate sharing; no reservation
 command or additional required input is involved. An explicit empty
-`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution. GPU measurement failure
+`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution; the CUDA spelling
+`CUDA_VISIBLE_DEVICES=-1` is also CPU-only. GPU measurement failure
 cannot establish availability. Receipts retain the observed memory/utilization.
 
 Reservation lifetime follows the exact wrapper PID, start time and PID namespace,

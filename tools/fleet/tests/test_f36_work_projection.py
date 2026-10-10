@@ -137,7 +137,8 @@ class WorkProjectionTest(unittest.TestCase):
                 with self.subTest(width=width):
                     self.assertIn("claim-a", text)
                     self.assertIn("claim-b", text)
-                    self.assertIn("{claim-a,claim-b}", text)
+                    if width >= 100:  # narrower rows keep each branch in its child row
+                        self.assertIn("{claim-a,claim-b}", text)
                     self.assertNotIn("stage autopilot-code", text)
         finally:
             render.set_process_view(False)
@@ -350,7 +351,7 @@ class WorkProjectionTest(unittest.TestCase):
             )
             render.set_process_view(False)
             self.assertIn("execute", group_text)
-            self.assertIn("execute", process_text)
+            self.assertIn("구현", process_text)
 
     def test_childless_abandoned_compile_does_not_pollute_linear_lineage(self):
         with tempfile.TemporaryDirectory() as tmp:

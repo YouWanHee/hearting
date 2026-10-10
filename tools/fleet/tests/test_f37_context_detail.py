@@ -35,7 +35,7 @@ FULL, EMPTY = render._BAR_FULL, render._BAR_EMPTY
 # F-55 (v39): the lead cell was the padded state WORD. F-100b (2026-09-03): it is the WHERE
 # chip — ` herdr ` reversed for a session herdr lists — in a slot of the same width. The
 # fixtures below are herdr-attached so the lead stays a distinctive marker in the text.
-LEAD = render._CTX_ON_TEXT.ljust(4 + render._HW - render._CONTEXT_INDENT_W)
+LEAD = render._CTX_ON_TEXT.ljust(4 + render._HW - render._CONTEXT_INDENT_W - 4) + "문맥"
 # F-52b: no measured `context_window_tokens` on these fixtures → the 16-cell baseline track.
 BASE = render._CTX_TRACK_MAX
 # A context gauge is the only place a bar track is immediately followed by its right-justified
@@ -100,7 +100,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 visible = text(row)
                 self.assertIsNotNone(CTX_GAUGE_RE.search(visible))
                 self.assertIn("85%", visible)
-                self.assertEqual(visible.index("작업 중"), render._NAME_COL)
+                self.assertEqual(render._dw(visible[:visible.index("작업 중")]), render._NAME_COL)
                 self.assertLessEqual(render._dw(visible), width)
 
                 rendered = text(render._build_lines(
@@ -133,7 +133,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
 
                 # F-100b: a worker's lead slot is blank (never a herdr pane), so the
                 # detail row's first ink is the gauge, one full slot past the indent.
-                leading = len(visible) - len(visible.lstrip(" "))
+                leading = render._dw(visible[:next(i for i, ch in enumerate(visible) if ch in (FULL, EMPTY))])
                 self.assertEqual(leading, indicator_col + 2 + render._CTX_LABEL_W)
                 self.assertNotIn("working", visible)
                 self.assertEqual(
@@ -344,7 +344,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                     # F-52c: the context row leads with the session's liveness mark; its
                     # 16-cell baseline track is the stable marker that the row rendered.
                     self.assertIn(EMPTY * render._CTX_TRACK_MAX, visible)
-                    self.assertNotIn("stage exec", visible)
+                    self.assertNotIn("단계 구현", visible)
                     # An INFERRED inline stage carries NO dedicated detail row (2026-07-24): a
                     # main session must not show the `plan › exec › test` breadcrumb line.
                     self.assertNotIn("exec ● ←{plan}", visible)
@@ -795,7 +795,7 @@ class ChildAssociationTest(unittest.TestCase):
         self.assertLess(visible.index("└▸🚀"), visible.index("NOW"))
         self.assertLess(visible.index("NOW"), visible.index("⚡tool"))
         now_line = next(line for line in visible.splitlines() if "NOW" in line)
-        self.assertEqual(now_line.index("작업 중"), render._NAME_COL)
+        self.assertEqual(render._dw(now_line[:now_line.index("작업 중")]), render._NAME_COL)
 
 
 class CodexAttemptTelemetryTest(unittest.TestCase):

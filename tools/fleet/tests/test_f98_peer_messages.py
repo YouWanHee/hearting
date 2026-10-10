@@ -80,7 +80,7 @@ class CollectorTest(unittest.TestCase):
         collectors.apply_peer_rows([session], result["by_session"])
         rendered = "".join(text for text, _ in render._peer_obligation_strip(
             session.peer_obligations, term_width=120)[0])
-        self.assertIn("retire 1", rendered)
+        self.assertIn("정리 1", rendered)
 
     def test_duty_scan_stops_before_enumerating_large_completed_history(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,8 +144,8 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(len(session.peer_obligations), 4)
         strip = render._peer_obligation_strip(session.peer_obligations, term_width=120)
         rendered = "".join(text for text, _style in strip[0])
-        self.assertIn("pending", rendered)
-        self.assertIn("retire 1", rendered)
+        self.assertIn("대기", rendered)
+        self.assertIn("정리 1", rendered)
 
     def test_three_record_fixture_badge_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
