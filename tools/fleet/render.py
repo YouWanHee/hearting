@@ -5519,13 +5519,16 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
             seen.add(exact)
             command = process["command"]
             name = _gpu_process_label(command)
+            dedup_name = name
             if name == command:
                 # Unknown argv has no observed run name. Fold only the full
                 # command; known names stay on the device line in either mode.
                 if _gpu_commands_folded(resource["host"], resource["index"]):
                     continue
                 name = _gpu_display_command(command)
-            if any(_resource_command_label(name).casefold() in _resource_name(child).casefold()
+                dedup_name = _resource_command_label(command)
+            # A shared word or prefix is not evidence of the same observed name.
+            if any(dedup_name.casefold() == _resource_name(child).casefold()
                    for child in resource_children):
                 continue
             if name not in names:
@@ -8155,7 +8158,7 @@ def _reading_legend(term_width, session=True):
     if session:
         rows.extend(_wrap_legend([('  session: ', "dim"), ('⠹ working  ● idle  ◑ blocked  ✕ dead', "dim")], term_width))
     for text in ('  project: ● 활동',
-                 '  resource: ● 실행 · UTIL/VRAM · ↳ command',
+                 '  resource: ● 실행 · ◇ 실행 미확인 · UTIL/VRAM · ↳ command',
                  "  stage: ● 현재  ✓ 완료  ✕ 실패  ○ 예정"):
         rows.extend(_wrap_route_node("", text, "dim", "", term_width, continuation="  "))
     return rows
