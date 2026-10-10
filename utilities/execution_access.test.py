@@ -1241,6 +1241,51 @@ class DerivedAccessTest(unittest.TestCase):
         self.assertEqual(prepare_task_request(route, self.jobs), prepared)
         self.assertEqual(self.prepared(prepared)[0], request)
 
+    def test_large_read_inventory_is_loadable_and_reused_after_preparation(self):
+        roots = [self.other / (f"project-{i:03d}-" + "x" * 100) / ".agent_reports"
+                 for i in range(256)]
+        for root in roots:
+            root.mkdir(parents=True)
+        inventory = self.worktree / "roots.json"
+        inventory.write_text(json.dumps({"roots": [str(root) for root in roots]}))
+        self.assertLess(inventory.stat().st_size, EA.MAX_ROOT_INVENTORY_BYTES)
+        route = self.route(f"입력: {inventory}", capability="audit")
+        prepared = prepare_task_request(route, self.jobs)
+        self.assertGreater(prepared.stat().st_size, 64 * 1024)
+        self.assertGreater(prepared.with_name("binding.json").stat().st_size, 64 * 1024)
+        context = AccessContext.build(worktree=self.worktree, artifact_root=self.artifact,
+                                      dispatch_state_root=self.state, agent_home=self.root / "install")
+        loaded = load_request(prepared, context=context)
+        self.assertEqual(set(loaded.read_roots), set(roots))
+        self.assertEqual(loaded.writable_roots, ())
+        inventory.write_text('{"roots": []}')
+        self.assertEqual(prepare_task_request(route, self.jobs), prepared)
+        self.assertEqual(load_request(prepared, context=context), loaded)
+
+    def test_read_upgrade_keeps_existing_writes_and_reads_at_the_read_limit(self):
+        inventory = self.inventory([])
+        route = self.route(f"Scope: {self.other}/out write, {self.other}/ref read\n입력: {inventory}")
+        with mock.patch.object(EA, "_root_inventory", return_value=()):
+            old = prepare_task_request(route, self.jobs)
+        old_request = self.prepared(old)[0]
+        binding = old.with_name("binding.json")
+        record = json.loads(binding.read_text())
+        record.pop("read_inputs_version")
+        binding.write_text(json.dumps(record))
+        old_bytes = old.read_bytes()
+        roots = [self.elsewhere / f"p{i:03d}" for i in range(256)]
+        for root in roots:
+            root.mkdir()
+        self.inventory(roots)
+        upgraded = prepare_task_request(route, self.jobs)
+        request, record = self.prepared(upgraded)
+        self.assertEqual(request["writable_roots"], old_request["writable_roots"])
+        self.assertTrue(set(old_request["read_roots"]).issubset(request["read_roots"]))
+        self.assertEqual(len(request["read_roots"]), EA.MAX_READ_ROOTS)
+        self.assertIn("root-limit", {row["reason"] for row in record["derivation"]["skipped"]})
+        self.assertEqual(old.read_bytes(), old_bytes)
+        self.assertEqual(prepare_task_request(route, self.jobs), upgraded)
+
     def test_source_contracts_read_without_runtime_state_or_write_derivation(self):
         install = self.home / ".local/share/hearting/releases/v-test"
         for name in ("utilities", "core", ".dispatch"):

@@ -444,6 +444,27 @@ class Case5ReadRootsTest(unittest.TestCase):
                 self.assertEqual(grant.unwritable_read_roots, (Path("/nas/records"),))
                 self.assertEqual((grant.read_enforcement, grant.unmet), (grade, ()))
 
+    def test_cross_harness_recovery_accepts_installed_source_reads_only(self):
+        wrapper = _load("owner_read_scope_opencode", "adapters/opencode/bin/dispatch-headless.py")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worktree, artifact, install = root / "worktree", root / "artifact", root / "install"
+            for path in (worktree, artifact, install / "core", install / "utilities"):
+                path.mkdir(parents=True)
+            history = {"harness": "codex", "worktree": str(worktree),
+                       "jobs": str(root / "state/jobs.log"), "applied_permissions": {}}
+            route = {"cwd": str(worktree), "artifact_root": str(artifact), "work_request": {"text": ""}}
+            with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "{}"}):
+                config = json.loads(wrapper.scoped_external_directory_config(
+                    str(artifact), agent_home=install, worktree=str(worktree), selected_agent="build"))
+            candidate = {"harness": "opencode", "launch_home": str(install),
+                         "applied_permissions": {"opencode_permission": config["permission"]}}
+            RA.require_recovery_grant_addresses(candidate, history, route=route)
+            config["permission"]["edit"][f"{install / 'utilities'}/**"] = "allow"
+            with self.assertRaises(DC.DispatchContractError) as refused:
+                RA.require_recovery_grant_addresses(candidate, history, route=route)
+            self.assertEqual(refused.exception.reason, "replacement-input-tuple-mismatch")
+
 
 class Case6UncappedAndEnvelopeTest(unittest.TestCase):
     """Case 6: an uncapped execute FAIL; envelopes are matched exactly.

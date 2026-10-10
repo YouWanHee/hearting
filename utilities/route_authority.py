@@ -629,9 +629,8 @@ def require_recovery_grant_addresses(candidate, history, *, route, access=None):
         context = EA.AccessContext.build(worktree=history["worktree"], artifact_root=route["artifact_root"],
             dispatch_state_root=Path(history["jobs"]).parent,
             agent_home=candidate.get("launch_home") or Path(__file__).resolve().parents[1])
-        # The normal OpenCode launcher grants the portable capability contracts
-        # read visibility, with edit denies. These are runtime support addresses,
-        # not an expansion of the task's writable scope.
+        # Ordinary launchers grant installed contracts and utilities read
+        # visibility with edit denies. Recovery uses the same source addresses.
         reads.extend(contract_read_roots(context.agent_home, route))
         targets = EA.resolve_task_targets(route)
         if targets:

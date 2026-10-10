@@ -714,11 +714,14 @@ def scoped_external_directory_config(
     # The worktree is a writable area too: a read root inside it stays writable there, as its
     # grant records (`read-only-root-writable`). A read root that holds a writable area keeps
     # its deny with the area re-allowed below; one holding the worktree is refused as too broad.
-    covered_roots = [str(root) for root in write_side] + ([str(worktree)] if worktree else []) + list(contract_roots)
+    writable_areas = [str(root) for root in write_side] + ([str(worktree)] if worktree else [])
+    contract_deny_roots = [root for root in contract_roots
+                          if not any(_covers(write, root) for write in writable_areas)]
+    covered_roots = writable_areas + list(contract_roots)
     read_deny_roots = [str(root) for root in execution_access_read_roots
                        if root and not any(_covers(cover, root) for cover in covered_roots)]
-    write_keep_roots = [str(root) for root in write_side
-                        if any(_strictly_under(read, root) for read in read_deny_roots)]
+    write_keep_roots = [root for root in writable_areas
+                        if any(_strictly_under(read, root) for read in (*contract_deny_roots, *read_deny_roots))]
     for root in read_deny_roots:
         for pattern in (root, f"{root}/**"):
             rules.pop(pattern, None)
@@ -726,7 +729,7 @@ def scoped_external_directory_config(
     if contract_roots:
         permission.pop("external_directory", None)
     permission["external_directory"] = rules
-    if contract_roots or read_deny_roots:
+    if contract_deny_roots or read_deny_roots:
         edit = effective_tool(original_permission, "edit", "allow")
         if isinstance(edit, str):
             edit_rules = {"*": edit}
@@ -734,7 +737,7 @@ def scoped_external_directory_config(
             edit_rules = dict(edit)
         else:
             raise ValueError("OpenCode edit permission must be a string or object")
-        for root in (*contract_roots, *read_deny_roots):
+        for root in (*contract_deny_roots, *read_deny_roots):
             # v1 native edit/write/patch ask against paths relative to the
             # worktree, unlike external_directory's absolute directory glob.
             edit_paths = (root,) if worktree is None else (
@@ -779,7 +782,7 @@ def scoped_external_directory_config(
         # earlier triple's unrelated patterns.
         overlaid: dict[str, dict] = {}
         for tool, action, roots in (("external_directory", "allow", contract_roots),
-                                    ("edit", "deny", contract_roots),
+                                    ("edit", "deny", contract_deny_roots),
                                     ("external_directory", "allow", read_deny_roots),
                                     ("edit", "deny", read_deny_roots)):
             if not roots:
