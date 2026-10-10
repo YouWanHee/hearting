@@ -95,6 +95,14 @@ class WorkTitlesTest(unittest.TestCase):
             text = render._resource_now_text(job)
         self.assertEqual(text.count('train.py'), 1)
 
+    def test_gpu_does_not_repeat_same_command_as_title(self):
+        child = model.ResourceJob(run_id='run', node='train', liveness='working',
+                                  display_title='train.py', elapsed_min=3)
+        gpu = dict(host='moving4', index=1, processes=[dict(pid=42, proc_start='100', command='python train.py')])
+        with mock.patch.object(render, '_gpu_commands_folded', return_value=False):
+            rows = render._gpu_resource_strip([gpu], term_width=160, resource_children=[child])
+        self.assertEqual(render._plain(rows[0]).count('train.py'), 1)
+
     def test_historical_result_keeps_its_exact_title_after_current_route_changes(self):
         result = route.result_projection(dict(slug=self.record['slug'], route_id='rt-one',
                                              artifact_root=str(self.root)),
@@ -117,11 +125,11 @@ class WorkTitlesTest(unittest.TestCase):
                 payload = json.dumps(dict(self.meta, **update))
                 self.meta_path.write_text(payload)
                 dispatch._campaign_labels([job := self.job()])
-                self.assertEqual(job.campaign_label, 'fleet freshness p2')
+                self.assertEqual(job.campaign_label, 'hot path fixture')
                 self.assertEqual(self.meta_path.read_text(), payload)
         self.meta_path.unlink()
         dispatch._campaign_labels([job])
-        self.assertEqual(job.campaign_label, 'fleet freshness p2')
+        self.assertEqual(job.campaign_label, 'hot path fixture')
 
     def test_detail_title_join_keeps_new_liveness_and_rejects_pid_reuse(self):
         child = model.ResourceJob(run_id='run', route_id='rt-one', artifact_root=str(self.root),
@@ -150,15 +158,31 @@ class WorkTitlesTest(unittest.TestCase):
         self.assertIs(merged.jobs[0].resource_children[0], merged.resources[0])
         self.assertEqual(merged.resources[0].display_title, '학습 비교')
 
-    def test_one_inventory_serves_many_titles_and_render_reads_no_metadata(self):
+    def test_known_campaign_reads_no_inventory_and_render_reads_no_metadata(self):
         reader = dispatch.artifact_reader
         jobs = [self.job(harness) for harness in ('claude', 'codex', 'opencode')]
         with mock.patch.object(reader.artifact_locator, 'scan_index', wraps=reader.artifact_locator.scan_index) as scan:
             dispatch._campaign_labels(jobs)
-        self.assertEqual(scan.call_count, 1)
+        self.assertEqual(scan.call_count, 0)
         child = model.ResourceJob(run_id='run', display_title=jobs[0].campaign_label, liveness='working')
         with mock.patch.object(work_titles, 'cycle_title', side_effect=AssertionError('render IO')):
             self.assertIn(child.display_title, render._plain(render._resource_child_rows(jobs[0], children=[child])[0]))
+
+    def test_invalid_route_title_falls_back_to_cleaned_slug(self):
+        result = route.result_projection(dict(slug=self.record['slug'], title=42),
+            dict(present=True, match=True, terminal_gate_proven=True, closed_at='2026-10-10T00:00:00Z'))
+        self.assertEqual(result['name'], 'fleet freshness p2')
+
+    def test_invalid_or_foreign_cycle_declaration_is_ignored(self):
+        self.meta_path.unlink()
+        identity = self.root / '.runtime/artifact-admission/v1/root-identity.json'
+        identity.write_text(json.dumps(dict(artifact_root_id=ROOT, repository_id='repo_' + 'd' * 32)))
+        declaration = self.root / '.runtime/artifact-producer/v1/cycle-display-titles.json'
+        for schema in ('invalid', 'hearting-cycle-display-titles/v1'):
+            declaration.write_text(json.dumps(dict(schema=schema, artifact_root_id=ROOT,
+                repository_id='foreign', entries=[dict(campaign_id=CAMP, cycle_id=CYC, display_title='무관한 제목')])))
+            dispatch._campaign_labels([job := self.job()])
+            self.assertEqual(job.campaign_label, 'hot path fixture')
 
 
 if __name__ == '__main__':

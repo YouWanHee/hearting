@@ -1,5 +1,6 @@
 """One readable work-name rule; metadata IO stays in Fleet's detail pass."""
 import re
+import json
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,20 +43,37 @@ def subject_command(subject, command):
 
 
 def cycle_title(root, record, read_json):
-    """Use existing verified inventory and metadata validation, without writes."""
+    """Read only this campaign's metadata; reuse canonical field validation."""
     from .collectors import dispatch
     cid, camp = record.get('cycle_id'), record.get('campaign_id')
-    cycle, campaign, declarations = {}, {}, {}
+    cycle, campaign, declarations, campaign_record = {}, {}, {}, {}
     if cid and camp and dispatch.artifact_reader is not None:
         try:
             import artifact_meta
-            mapping, rows = dispatch.artifact_reader._scan_index(Path(root))
-            rel = mapping.get(camp)
-            if rel and rows.get(cid, {}).get('campaign') == camp:
-                doc = read_json(str(Path(root) / rel / 'meta.json'))
-                identity = read_json(str(Path(root) / '.runtime/artifact-admission/v1/root-identity.json')) or {}
+            import artifact_cycle_titles
+            root = Path(root).resolve()
+            producer = root / '.runtime/artifact-producer/v1'
+            # INDEX is a path hint. The campaign record must confirm its ID;
+            # a stale/missing hint uses the existing read-only inventory.
+            mapping = read_json(str(root / 'campaigns/INDEX.json')) or {}
+            rel = mapping.get(camp) if isinstance(mapping, dict) else None
+            directory = (root / rel).resolve() if isinstance(rel, str) else root / 'campaigns' / camp
+            if directory.is_relative_to(root / 'campaigns'):
+                candidate = read_json(str(directory / 'campaign.json')) or {}
+                if candidate.get('campaign_id') == camp:
+                    campaign_record = candidate
+            if not campaign_record:
+                mapping, _rows = dispatch.artifact_reader._scan_index(root)
+                rel = mapping.get(camp)
+                directory = root / rel if rel else None
+                campaign_record = (read_json(str(directory / 'campaign.json')) or {}) if directory else {}
+            if campaign_record.get('campaign_id') == camp:
+                doc = read_json(str(directory / 'meta.json'))
+                identity = read_json(str(root / '.runtime/artifact-admission/v1/root-identity.json')) or {}
                 if isinstance(doc, dict) and identity.get('artifact_root_id'):
-                    members = {key: {'campaign_id': row.get('campaign')} for key, row in rows.items()}
+                    members = {key: read_json(str(producer / 'cycles' / (key + '.json'))) or {}
+                               for key in (doc.get('cycles') or {})
+                               if isinstance(key, str) and re.fullmatch(r'cyc_[0-9a-f]{32}', key)}
                     try:
                         foreign = artifact_meta._validate_meta_doc(doc, identity['artifact_root_id'], camp, members)
                         if not foreign:
@@ -63,14 +81,16 @@ def cycle_title(root, record, read_json):
                             campaign = doc.get('campaign', {})
                     except artifact_meta.MetaError:
                         pass
-                for filename, kind, identifier in (
-                        ('cycle-display-titles.json', 'cycle_id', cid),
-                        ('campaign-display-titles.json', 'campaign_id', camp)):
-                    sidecar = read_json(str(Path(root) / '.runtime/artifact-producer/v1' / filename)) or {}
-                    if identity.get('artifact_root_id') and sidecar.get('artifact_root_id') == identity['artifact_root_id']:
-                        declarations[kind] = next((_text(row.get('display_title'), 120) for row in sidecar.get('entries', ())
-                                         if isinstance(row, dict) and row.get(kind) == identifier
-                                         and row.get('campaign_id') == camp), '')
+                sidecar = read_json(str(producer / 'cycle-display-titles.json'))
+                if isinstance(sidecar, dict) and identity.get('artifact_root_id') and identity.get('repository_id'):
+                    try:
+                        declaration = artifact_cycle_titles.validate_declaration(json.dumps(sidecar).encode(),
+                            root_id=identity['artifact_root_id'], repository_id=identity['repository_id'])
+                        declarations['cycle_id'] = next((_text(row['display_title'], 120)
+                            for row in declaration['entries'] if row['cycle_id'] == cid and row['campaign_id'] == camp), '')
+                    except artifact_cycle_titles.CycleTitlesError:
+                        pass
+                declarations['campaign_id'] = artifact_meta.legacy_title(root, camp)[0]
         except Exception:
             pass
     # An automatically derived title equal to the slug is not a human title.
@@ -81,6 +101,7 @@ def cycle_title(root, record, read_json):
         _text(cycle.get('title'), 120), _text(cycle.get('summary')), declarations.get('cycle_id'),
         recorded, _text(campaign.get('title'), 120), _text(campaign.get('summary')),
         declarations.get('campaign_id'),
+        _text(campaign_record.get('title'), 120),
         readable(record.get('slug') or record.get('title'))) if value), '')
 
 

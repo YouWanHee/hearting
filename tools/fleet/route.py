@@ -576,7 +576,7 @@ def result_projection(record, outcome):
     name = record.get("slug")
     if not isinstance(name, str) or not name.strip():
         return None
-    return {"name": readable(record.get("display_title") or record.get("title") or name),
+    return {"name": readable(record.get("display_title")) or readable(record.get("title")) or readable(name),
             "result": "success", "at": timestamp, "source": "route-outcome",
             "route_id": record.get("route_id"), "artifact_root": record.get("artifact_root")}
 

@@ -5511,6 +5511,9 @@ def _gpu_resource_strip(resources, term_width=None, depth=0, in_card=False, reso
                 if _gpu_commands_folded(resource["host"], resource["index"]):
                     continue
                 name = _gpu_display_command(command)
+            if any(_resource_command_label(name).casefold() in _resource_name(child).casefold()
+                   for child in resource_children):
+                continue
             if name not in names:
                 names.append(name)
         labels[id(resource)] = ", ".join(names)
