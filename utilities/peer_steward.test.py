@@ -3126,23 +3126,51 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     def prompt(self, body="peer body"):
         return peer_steward.main(["prompt", "child", body])
 
-    def test_idle_prompt_with_bound_pending_or_unknown_work_sends_no_input(self):
+    def test_idle_parent_prompt_with_pending_or_unknown_children_accepts_input(self):
         from dispatch_contract import ObservedAttemptLiveness
         meta = ("attempt_id=att-bound,parent_sid=sid-child,parent_pane=w1:pX,"
                 "parent_harness=claude")
         self.jobs_path.write_text(f"2026-10-09T00:00:00Z\topen\trepo\t-\tslug\t{meta}\n")
-        for state, reason in (("live", "bound-registered-work-pending"),
-                              ("unverifiable", "bound-registered-work-unknown")):
+        for state in ("live", "unverifiable"):
             with self.subTest(process_state=state), mock.patch(
                     "dispatch_contract.observed_attempt_liveness",
                     return_value=ObservedAttemptLiveness(
                         "alive" if state == "live" else "unverifiable", "fixture", state, "fixture")):
-                self.assertEqual(self.prompt("preserve until bound work settles: " + state), 3)
+                self.assertEqual(self.prompt("parent input: " + state), 0)
+                self.assertEqual(len(self.messages), 1)
+                self.messages.clear()
+
+    def test_idle_executor_with_pending_or_unknown_attempt_sends_no_input(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        meta = "attempt_id=att-bound,harness=claude,parent_sid=other,parent_harness=claude"
+        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
+        for state, reason in (("live", "bound-registered-work-pending"),
+                              ("unverifiable", "bound-registered-work-unknown")):
+            with self.subTest(state=state), mock.patch(
+                    "peer_obligations.execution_attempts_for_processes", return_value=("att-bound",)), \
+                 mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                            ObservedAttemptLiveness("alive", "fixture", state, "fixture")):
+                self.assertEqual(self.prompt("executor input: " + state), 3)
                 self.assertEqual(self.messages, [])
-                self.assertEqual(self.keys, [])
                 ref = self._all_records()[-1]["transfer_ref"]
-                pending = peer_steward.peer_message._read_pending(ref)
-                self.assertEqual(pending["receipt"], reason)
+                self.assertEqual(peer_steward.peer_message._read_pending(ref)["receipt"], reason)
+
+    def test_reconnect_delivers_existing_parent_duty_while_child_runs(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        meta = "attempt_id=att-child,parent_sid=sid-child,parent_harness=claude"
+        self.jobs_path.write_text(f"now\topen\trepo\t-\tslug\t{meta}\n")
+        self.screen = CLAUDE_FORM
+        with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                        ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
+            self.assertEqual(self.prompt("original queued body"), 3)
+            ref = self._all_records()[-1]["transfer_ref"]
+            self.screen = CLAUDE_EMPTY
+            peer_steward.cmd_ensure_obligations(SimpleNamespace())
+            self.assertEqual(len(self.messages), 1)
+            self.assertIn("original queued body", self.messages[0])
+            self.assertIn(ref, self.messages[0])
+            peer_steward.cmd_ensure_obligations(SimpleNamespace())
+            self.assertEqual(len(self.messages), 1)
 
     def idle(self):
         # Run the actual existing receive callback entry, with native identity

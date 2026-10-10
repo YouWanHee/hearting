@@ -3375,7 +3375,8 @@ def _prompt_form_open(target, state_before):
     return _bottom_form_tokens(target)
 
 
-def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None):
+def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
+                    purpose="completion"):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session. The session the
@@ -3406,14 +3407,19 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
             and (expected_sid is None or sid == expected_sid)
             and (expected_pane is None or pane == expected_pane)
         )
-        bound, binding_state = (((), "observed") if unbound else
-                                peer_obligations.bound_work_for_pane(pane or "", harness or "", sid or ""))
+        execution_ids = peer_obligations.execution_attempts_for_processes(
+            info.get("foreground_processes", ()) if isinstance(info, dict) else ())
+        bound, binding_state = (((), "observed") if unbound and not execution_ids else
+                                peer_obligations.bound_work_for_pane(
+                                    pane or "", harness or "", sid or "",
+                                    execution_attempt_ids=execution_ids))
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
             identity_verified=exact, native_turn=observed_state,
             bound_work=bound, bindings_state=binding_state,
             provenance=(("target", target), ("observed_state", observed_state)),
+            purpose=purpose,
         )
     except Exception:
         return peer_obligations.pane_readiness(
@@ -3425,7 +3431,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
 
 def _prompt_input_reason(target, harness, state):
     """Withhold keyboard input when a form, draft or unreadable box is present."""
-    readiness = _pane_readiness(target, state, expected_harness=harness)
+    readiness = _pane_readiness(target, state, expected_harness=harness, purpose="input")
     if readiness.state == "unknown":
         return readiness.reason
     if readiness.reason.startswith("bound-registered-work") and readiness.state != "ready":
@@ -3699,7 +3705,7 @@ def _resume_message_obligation(duty, store):
             return
         readiness = _pane_readiness(target, state,
                                     expected_harness=recipient.get("harness"),
-                                    expected_sid=recipient.get("session_id"))
+                                    expected_sid=recipient.get("session_id"), purpose="input")
         if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
             if readiness.state != "ready":
                 store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
@@ -3766,6 +3772,15 @@ def cmd_ensure_obligations(_args):
     """Reconnect accepted peer duties from an existing harness lifecycle callback."""
     try:
         _ensure_watch_observers()
+        # Reconnect with the activated code, even if an older runner is still
+        # holding its lock. Existing transfer claims serialize submission.
+        store = peer_obligations.ObligationStore()
+        for duty in store.list():
+            if duty.get("intent", {}).get("kind") == "message":
+                try:
+                    _resume_message_obligation(duty, store)
+                except Exception:
+                    store.update(duty["id"], observer_error="observer-unavailable")
         peer_obligations.ensure_runner()
         dispatch_batch_obligations.ensure_observers()
     except Exception:

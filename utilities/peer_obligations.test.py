@@ -107,6 +107,34 @@ class ObligationStoreTest(unittest.TestCase):
         self.assertEqual((ready.state, ready.reason),
                          ("unknown", "registered-bindings-unavailable"))
 
+    def test_foreground_tag_binds_executor_even_when_it_also_owns_children(self):
+        from dispatch_contract import ObservedAttemptLiveness
+        jobs = self.root / "jobs.log"
+        for harness in ("claude", "codex", "opencode"):
+            jobs.write_text(
+                f"now\topen\trepo\t-\texec\tattempt_id=att-exec,harness={harness},parent_sid=other\n"
+                f"now\topen\trepo\t-\tchild\tattempt_id=att-child,parent_sid=sid,parent_harness={harness}\n")
+            with mock.patch("dispatch_contract.observed_attempt_liveness", return_value=
+                            ObservedAttemptLiveness("alive", "fixture", "live", "fixture")):
+                work, state = obligations.bound_work_for_pane(
+                    "pane", harness, "sid", jobs=jobs, execution_attempt_ids=("att-exec",))
+            self.assertEqual(state, "observed")
+            self.assertEqual([(w.attempt_id, w.pane_relation) for w in work],
+                             [("att-exec", "executor"), ("att-child", "parent")])
+
+    def test_foreground_tag_read_is_birth_checked_and_does_not_use_parent_tag(self):
+        with mock.patch("dispatch_contract._runtime_ancestry_proc_stat", return_value={"start": 7}), \
+             mock.patch.object(Path, "read_bytes", return_value=b"AGENT_DISPATCH_ATTEMPT_ID=att-own\0"):
+            self.assertEqual(obligations.execution_attempts_for_processes([{"pid": 123}]), ("att-own",))
+        with mock.patch("dispatch_contract._runtime_ancestry_proc_stat",
+                        side_effect=[{"start": 7}, {"start": 8}]), \
+             mock.patch.object(Path, "read_bytes", return_value=b"AGENT_DISPATCH_ATTEMPT_ID=att-own\0"):
+            self.assertEqual(obligations.execution_attempts_for_processes([{"pid": 123}]), ())
+        with mock.patch("dispatch_contract._runtime_ancestry_proc_stat", return_value={"start": 7}), \
+             mock.patch.object(Path, "read_bytes", side_effect=PermissionError()):
+            with self.assertRaisesRegex(obligations.ObligationError, "pane-execution-unavailable"):
+                obligations.execution_attempts_for_processes([{"pid": 123}])
+
 
 _FAKE_HERDR = r'''#!/usr/bin/env python3
 import json, os, sys

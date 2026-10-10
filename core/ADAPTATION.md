@@ -589,6 +589,13 @@ unmeasured; no always-on daemon or model polling loop is introduced. Watch obser
 continue to use bounded herdr calls. Idle/done receipts require the shared
 completion-readiness policy: exact registered-parent session or confirmed handover
 bindings take precedence over native idle, without requiring a parent-pane field.
+Peer input uses the same policy with an input purpose: a parent's idle native
+turn can receive messages while its registered children continue. Only work
+executed by that pane withholds input; exact foreground attempt tags distinguish
+execution from parent or handover bindings. Completion watches and retire keep
+all bindings. After installation, the existing reconnect callback retries accepted
+message duties with the activated code, even while an older runner holds its lock;
+the sealed transfer claim and receipt still prevent duplicate submission.
 Non-completion conditions such as working retain their native watch meaning.
 Duplicate watch requests resolve the current server/pane/harness/session before
 reusing a duty; a new session gets a separate duty while the old one is preserved.
