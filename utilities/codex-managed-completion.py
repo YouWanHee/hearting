@@ -1079,10 +1079,13 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if normalization_error:
             raise normalization_error[0]
         if normalized.get("state") == "watch-expired":
+            reason = normalized.get("reason") or "watch-deadline"
+            if reason == "watch-deadline":
+                reason = "termination-pending"
             if duty_id:
-                batch_obligations.update(args.jobs, duty_id, state="unknown", reason="termination-pending",
+                batch_obligations.update(args.jobs, duty_id, state="unknown", reason=reason,
                     outcome=None, delivery="pending", effective_attempts=sorted(attempts))
-            return {"schema_version": 1, "status": "retryable", "reason": "termination-pending"}, 75
+            return {"schema_version": 1, "status": "retryable", "reason": reason}, 75
         if duty_id:
             current = batch_obligations.read(args.jobs, duty_id) or {}
             lineage = normalized.get("replacement_lineage") or current.get("replacement_lineage") or []

@@ -10380,7 +10380,7 @@ def _legacy_inline_finish(a, route, route_file, api, entry_error=None, *, _admis
     _admission = _admission or inline_finish.admit(route, allow_legacy=True)
     node = route["nodes"][0]
     node_id = node["id"]
-    choice = route_authority.decide_continuation(route, action="finish-outcome",
+    choice = ROUTE_AUTHORITY.decide_continuation(route, action="finish-outcome",
         facts={"legacy": True, "closure": {} if api.outcome_path(Path(route_file)).exists() else None})
     if not choice.allowed:
         raise inline_finish.InlineFinishError(choice.reason)

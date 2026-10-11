@@ -1068,6 +1068,21 @@ class CancellationProofBoundaryTest(unittest.TestCase):
             self.assertEqual((choice.allowed, choice.state, choice.reason), (False, "wait", "child-not-quiescent"))
             self.assertTrue(choice.retry_when)
 
+    def test_quiet_cancel_request_still_requires_the_terminal_writer(self):
+        choice = RA.decide_continuation(action="terminal-child", status="open",
+            metadata={"parent_close_requested": "1"},
+            facts={"process": SimpleNamespace(state="quiescent", reason="exited")})
+        self.assertEqual((choice.allowed, choice.reason, choice.next_action),
+                         (False, "child-not-terminal", "same-command"))
+
+    def test_cancelled_record_keeps_conflict_obligation_and_existing_record_action(self):
+        metadata = {"note": "cancelled-by-parent", "failure_class": "cancelled", "terminal_conflict": "1"}
+        decision = RA.decide_continuation(action="attempt", status="done", metadata=metadata,
+            facts={"process_state": "quiescent"})
+        self.assertEqual(decision.next_action, "inspect-conflict")
+        self.assertEqual(RA.decide_continuation(action="attempt-action", status="done", metadata=metadata).next_action,
+                         "advance-completed")
+
 
 class InputContinuationBoundaryTest(unittest.TestCase):
     def test_only_original_input_admissions_pass_for_each_harness(self):

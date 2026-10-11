@@ -22,7 +22,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import NamedTuple
+from typing import Mapping, NamedTuple
 
 from dispatch_attempt_policy import committed_outcome, readable_result
 import review_round_cap as _ROUND
@@ -93,86 +93,70 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
 
 
 def _replacement_terminal_absent(fields, meta, *, capacity=False, runtime=False):
-    from codex_dispatch_terminal import inspect_terminal_attempt
-    result = inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
-                                      artifact_root_metadata=meta.get('artifact_root'))
-    if capacity and result.get('state') == 'invalid' and result.get('failure_class') == 'capacity':
-        return True  # A usage-limit result is the stop itself, not a handoff to settle.
-    if runtime and result.get('state') == 'invalid' and result.get('failure_class') == 'runtime':
-        return True  # So is a runtime error envelope (a provider 5xx): no handoff was ever written.
-    return result.get('state') == 'absent'
+    import dispatch_replacement as replacement
+    terminal = replacement.terminal_observation(fields, meta)
+    return decide_continuation(action="replacement-result", facts={"terminal": terminal,
+        "kind": "capacity" if capacity else "runtime" if runtime else "silent"}).allowed
 
 
-def _attempt_decision(
-    status: str, metadata: Mapping[str, str], *, process_state: str,
-    process_reason: str = "", terminal_observed: bool = False,
-    result_state: str | None = None,
-) -> AttemptDecision:
-    """Select the next obligation without changing a committed outcome.
+def _attempt_decision(status: str, metadata: Mapping[str, str], *, process_state: str | None,
+                      process_reason="", terminal_observed=False, result_state=None, record_only=False,
+                      require_quiescent=False):
+    """Select the attempt obligation and its record action from the same disposition.
 
-    A quiescent process with an open row needs the terminal writer. A process
-    that cannot be observed needs recovery or parent intervention, never a
-    fabricated terminal result. Only a closed failure plus quiescence may
-    authorize fallback; a completed review with findings remains a review.
+    A record-only projection has no process observation and grants no execution.
+    Runtime consumers keep committed results while observing their physical cleanup.
     """
     from dispatch_attempt_policy import (AttemptDecision, OPEN_STATES, TERMINAL_STATES,
         DEFERRED_COMPLETION_NOTE, REVIEW_BLOCKING_NOTE, terminal_conflict_pending)
     outcome = committed_outcome(status, metadata)
-    if status not in OPEN_STATES | TERMINAL_STATES:
-        return AttemptDecision(outcome, "recover", "supervision-controller", "registry-status-invalid")
-    if metadata.get("parent_close_requested") == "1":
-        return AttemptDecision(outcome, "settle-cancellation" if outcome == "cancelled" else "cancel",
-                               "execution-boundary", "cancelled-by-parent")
-    if process_state == "live":
-        return AttemptDecision(outcome, "wait", "execution-boundary", process_reason or "process-alive")
-    if process_state != "quiescent":
-        return AttemptDecision(outcome, "recover", "supervision-controller", process_reason or "process-unverifiable")
+    def result(action, responsible, reason, retry="", record="inspect-done-failure"):
+        return record if record_only else AttemptDecision(outcome, action, responsible, reason, retry)
+    if not record_only:
+        if status not in OPEN_STATES | TERMINAL_STATES:
+            return result("recover", "supervision-controller", "registry-status-invalid")
+        if metadata.get("parent_close_requested") == "1" and (not require_quiescent or process_state == "quiescent"):
+            return result("settle-cancellation" if outcome == "cancelled" else "cancel",
+                          "execution-boundary", "cancelled-by-parent")
+        if process_state == "live":
+            return result("wait", "execution-boundary", process_reason or "process-alive")
+        if process_state != "quiescent":
+            return result("recover", "supervision-controller", process_reason or "process-unverifiable")
     if status in OPEN_STATES:
         if result_state == "unverifiable":
-            return AttemptDecision(outcome, "recover", "supervision-controller", "terminal-evidence-unverifiable")
-        return AttemptDecision(outcome, "reconcile", "terminal-writer",
-                               "terminal-observed" if result_state == "settleable" or terminal_observed else
-                               "terminal-invalid" if result_state == "invalid" else "process-exited")
+            return result("recover", "supervision-controller", "terminal-evidence-unverifiable", record="complete-open")
+        return result("reconcile", "terminal-writer",
+            "terminal-observed" if result_state == "settleable" or terminal_observed else
+            "terminal-invalid" if result_state == "invalid" else "process-exited", record="complete-open")
     if terminal_conflict_pending(metadata):
-        return AttemptDecision(outcome, "inspect-conflict", "workflow-owner", "terminal-evidence-conflict")
+        return result("inspect-conflict", "workflow-owner", "terminal-evidence-conflict",
+                      record="advance-completed" if outcome == "cancelled" else "inspect-done-failure")
+    if outcome == "cancelled":
+        return result("inspect-failure", "workflow-owner", "terminal-outcome-unclassified", record="advance-completed")
     if outcome == "succeeded":
-        return AttemptDecision(outcome, "advance", "completion-controller", "registry-closed")
+        return result("advance", "completion-controller", "registry-closed", record="advance-completed")
     if outcome == DEFERRED_COMPLETION_NOTE:
-        # The transport, not the work, is what is unresolved -- no fallback
-        # retry is authorized, only the completion writer that already owns
-        # this row's marker publication.
-        return AttemptDecision(outcome, "complete", "completion-controller", DEFERRED_COMPLETION_NOTE)
+        return result("complete", "completion-controller", DEFERRED_COMPLETION_NOTE, record="complete-deferred")
     if outcome == "review-blocked":
-        return AttemptDecision(outcome, "review", "workflow-owner", REVIEW_BLOCKING_NOTE)
+        return result("review", "workflow-owner", REVIEW_BLOCKING_NOTE)
     if outcome == "failed":
         note = metadata.get("note", "")
-        # Cancellation is an explicit disposition, not automatic permission
-        # to resurrect the cancelled work. Its recovery claim has a separate
-        # user/route-authorized admission boundary.
-        # A worker's readable FAIL or BLOCKED is its result, not a death to retry.
         retry = ("" if status == "cancelled" or metadata.get("failure_class") == "cancelled" else
-                 "capacity" if note == "dead-capacity" else
-                 "" if readable_result(metadata) else
+                 "capacity" if note == "dead-capacity" else "" if readable_result(metadata) else
                  "fallback" if note.startswith("dead-") else "")
-        return AttemptDecision(outcome, "inspect-failure", "workflow-owner", note or status, retry)
-    return AttemptDecision(outcome, "inspect-failure", "workflow-owner", "terminal-outcome-unclassified")
+        return result("inspect-failure", "workflow-owner", note or status, retry)
+    return result("inspect-failure", "workflow-owner", "terminal-outcome-unclassified")
 
 
 def _attempt_action(status: str, metadata: Mapping[str, str]) -> str:
-    """The terminal writer/harvest instruction, before transport formatting."""
-    from dispatch_attempt_policy import OPEN_STATES, DEFERRED_COMPLETION_NOTE, terminal_conflict_pending
-    if committed_outcome(status, metadata) == "cancelled":
-        return "advance-completed"
-    if status in OPEN_STATES:
-        return "complete-open"
-    if terminal_conflict_pending(metadata):
-        return "inspect-done-failure"
-    outcome = committed_outcome(status, metadata)
-    if outcome == "succeeded":
-        return "advance-completed"
-    if outcome == DEFERRED_COMPLETION_NOTE:
-        return "complete-deferred"
-    return "inspect-done-failure"
+    return _attempt_decision(status, metadata, process_state=None, record_only=True)
+
+
+def _round_action(state, node_kind):
+    review = node_kind == "review-worker"
+    return {"admit": "dispatch", "blocked-live": "wait", "blocked-unsettled": "wait",
+            "exhausted": "owner-closure" if review else "report",
+            "verdictless-bound": "native-subagent" if review else "owner-inline"}[state]
 
 
 def require_continuation(decision):
@@ -270,11 +254,10 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         if facts.get("never_started"):
             return ContinuationDecision(True, "proved")
         process = facts["process"]
-        if process.state != "quiescent":
-            return ContinuationDecision(False, "wait", "child-not-quiescent", "same-command",
-                "The exact related child and cancellation cleanup are quiescent.", process.reason)
-        decision = _attempt_decision(status, metadata, process_state=process.state, process_reason=process.reason)
+        decision = _attempt_decision(status, metadata, process_state=process.state,
+                                     process_reason=process.reason, require_quiescent=True)
         reason = {"inspect-conflict": "transaction-conflict", "reconcile": "child-not-terminal",
+                  "cancel": "child-not-terminal", "complete": "child-not-terminal",
                   "wait": "child-not-quiescent", "recover": "child-not-quiescent"}.get(decision.action, "")
         return ContinuationDecision(not reason, "wait" if reason else "proved", reason, "same-command" if reason else "continue",
             "The exact related child is quiescent and its terminal result is committed." if reason else "",
@@ -436,6 +419,13 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             if kind in {"runtime", "unlaunched", "corrected"}:
                 return ContinuationDecision(False, "not-applicable", next_action="observe")
         return ContinuationDecision(True, "launch", next_action="start")
+    if action == "replacement-result":
+        terminal, kind = facts["terminal"], facts["kind"]
+        absent = terminal.get("state") == "absent" or (terminal.get("state") == "invalid" and
+            terminal.get("failure_class") == ("capacity" if kind == "frame-capacity" else kind)
+            and kind in {"capacity", "frame-capacity", "runtime"})
+        return ContinuationDecision(absent, "continue" if absent else "protected",
+            "" if absent else "replacement-result-settlement-required", "start" if absent else "settle")
     if action == "owner-start":
         # The existing atomic registry claim still protects the launch boundary.
         registered = facts.get("registered", False)
@@ -499,10 +489,11 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             return ContinuationDecision(False, "protected", "replacement-not-silent-death", "settle")
         kind = facts["death_kind"]
         if facts.get("fields") and kind not in {"parked", "unlaunched", "corrected"}:
-            from dispatch_replacement import _terminal_absent, FRAME_CAPACITY
-            if not _terminal_absent(facts["fields"], metadata,
-                    capacity=kind in {"capacity", FRAME_CAPACITY}, runtime=kind == "runtime"):
-                return ContinuationDecision(False, "protected", "replacement-result-settlement-required", "settle")
+            from dispatch_replacement import terminal_observation
+            choice = decide_continuation(action="replacement-result", facts={"kind": kind,
+                "terminal": terminal_observation(facts["fields"], metadata)})
+            if not choice.allowed:
+                return choice
         return ContinuationDecision(True, "continue", next_action="start")
     if action in {"owner", "owner-input"}:
         if cancellation is not None:
@@ -575,9 +566,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                                     answers=tuple(answers), fallback_nodes=tuple(fallback))
     if action == "round-recovery":
         state = facts["state"]
-        review = facts["node_kind"] == "review-worker"
-        return ContinuationDecision(True, state, next_action=("native-subagent" if review else "owner-inline")
-            if state == "verdictless-bound" else ("owner-closure" if review else "report"))
+        return ContinuationDecision(True, state, next_action=_round_action(state, facts["node_kind"]))
     if action not in {"round", "owner-closure", "complete-inline", "review-revision", "marker"}:
         raise ValueError("unknown continuation action: " + action)
     budget = facts.get("budget")
@@ -611,8 +600,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         budget = _ROUND.RoundBudget(len(verdicts), counted, kinds.count("verdict-less"), cap, state,
             len(rows) + 1, len(rows) + 1 if rows else 0,
             "closure-check" if closure else "correction" if rows else "first",
-            {"admit": "dispatch", "blocked-live": "wait", "blocked-unsettled": "wait",
-             "exhausted": "owner-closure", "verdictless-bound": "native-subagent"}[state], closure, counted < streak)
+            _round_action(state, node.get("kind")), closure, counted < streak)
     state = budget.state
     if action == "marker":
         site = facts["site"]

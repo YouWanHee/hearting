@@ -252,6 +252,12 @@ def launch_input(jobs, aid, meta):
     return value
 
 
+def terminal_observation(fields, meta):
+    from codex_dispatch_terminal import inspect_terminal_attempt
+    return inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
+                                    artifact_root_metadata=meta.get('artifact_root'))
+
+
 def _terminal_absent(fields, meta, *, capacity=False, runtime=False):
     return route_authority._replacement_terminal_absent(fields, meta, capacity=capacity, runtime=runtime)
 
