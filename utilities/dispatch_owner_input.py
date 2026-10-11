@@ -104,18 +104,9 @@ def _reachable(row, value, live):
 
 
 def _answers_blocked_owner(row, live, jobs=None):
-    """An owner that ended BLOCKED, or with a readable FAIL, waits for a person, not gone
-    (`route_authority.answerable_owner_end`): a correction sent to it is kept (`retained`) and
-    the next start continues the route with it (dispatch_replacement)."""
-    if live:
-        return False
-    if route_authority.answerable_owner_end(row.status, row.metadata):
-        return True
-    # A correction to an exactly exited owner belongs to the same continuation.
-    # Keep successful, cancelled, live and unobservable owners out of this path.
-    from route_parent_close import owner_continuation_processes
-    return (route_authority.runtime_owner_can_resume(row.status, row.metadata)
-            and owner_continuation_processes(row.metadata, jobs)[0].state == "quiescent")
+    choice = route_authority.decide_continuation(action="owner-input", jobs=jobs,
+        status=row.status, metadata=row.metadata, facts={"reachable": live})
+    return choice.allowed and choice.state == "retained"
 
 
 def _owner_phase(attempt):
@@ -206,12 +197,14 @@ def submit(jobs, attempt, text, request_id=None):
                         "request_id": request_id, "duplicate": True,
                         **_retained_fields(item)}
         live = supervisor_lease_is_held(jobs, row.metadata)
-        retain = False
-        if (not value["accepting"] or row.status not in {"open", "running"}
-                or not _reachable(row, value, live)):
-            if not _answers_blocked_owner(row, live, jobs):
-                raise InputError("owner-input-unavailable-retain-correction")
-            retain = True
+        choice = route_authority.decide_continuation(action="owner-input", jobs=jobs,
+            status=row.status, metadata=row.metadata,
+            facts={"accepting": value["accepting"], "reachable": _reachable(row, value, live)})
+        if not choice.allowed:
+            error = InputError("owner-input-unavailable-retain-correction")
+            error.retry_when, error.next_action = choice.retry_when, choice.next_action
+            raise error
+        retain = choice.state == "retained"
         item = {"id": request_id, "digest": digest, "text": text, "events": [],
                 "source_session": route_authority.correction_source_session()}
         _transition(item, "retained" if retain else "queued")

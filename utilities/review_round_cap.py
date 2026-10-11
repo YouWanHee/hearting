@@ -155,45 +155,20 @@ def logical_round_records(rows, *, jobs=None):
 
 
 def _base_recovery_fields(node_kind, state="exhausted"):
-    """A budget ends automatic review, not ownership of the findings.
-
-    `state` selects between the two distinct outcomes `round_budget` can stop
-    on: `"exhausted"` (the historical exhaustion guidance, unchanged) and
-    `"verdictless-bound"` (SD-153 rule 3 -- two silent rounds in a row, so the
-    next action is a hop already named in the sealed fallback chain, not a
-    registered retry).
-    """
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="round-recovery", facts={"state": state, "node_kind": node_kind})
+    review = node_kind == "review-worker"
+    fields = {"recovery_owner": "owner", "recovery_surface": "capability-route complete" + ("" if review else " --inline")}
     if state == "verdictless-bound":
-        if node_kind == "review-worker":
-            return {
-                "next_action": "native-subagent",
-                "recovery_owner": "owner",
-                "recovery_surface": "capability-route complete",
-                "recovery_hint": "Two rounds in a row ended with no verdict (a crashed or capacity-dead "
-                    "attempt, not a PASS/FAIL/blocking review) -- a third registered dispatch would only "
-                    "repeat the same silence. Route the review through the sealed fallback chain's remaining "
-                    "unregistered hop (a native subagent, then owner-inline) and record the outcome as "
-                    "evidence-bound owner-closure.",
-            }
-        return {
-            "next_action": "owner-inline",
-            "recovery_owner": "owner",
-            "recovery_surface": "capability-route continue",
-            "recovery_hint": "Two rounds in a row ended with no verdict. Hand the remaining verification to "
-                "the owner-inline fallback hop instead of spending a third registered round on the same "
-                "silence; preserve the exact failing evidence for that hop.",
-        }
-    if node_kind == "review-worker":
-        return {"required_action": "resolve-review-findings", "recovery_owner": "owner",
-                "recovery_surface": "capability-route complete",
-                "recovery_hint": "Read the blocking reviews and the corrected artifact. Record each finding's "
-                    "resolution in an evidence-bound .owner-closure.md and use the existing owner-closure "
-                    "completion path. This records owner judgment, not independent PASS. If findings remain "
-                    "unresolved, hand them to the parent with the existing artifacts; a fresh route is not required."}
-    return {"required_action": "report-unresolved-verification", "recovery_owner": "owner",
-            "recovery_surface": "capability-route continue",
-            "recovery_hint": "Preserve the completed stages and exact failing verification evidence. "
-                "Hand back the remaining verification for an explicit continuation; do not infer PASS from a corrected plan."}
+        fields.update(next_action=choice.next_action,
+            recovery_hint="Continue the remaining work through the existing unregistered fallback; "
+                "preserve prior FAILs and publish completion only after verification. No new registered round is admitted.")
+    else:
+        fields.update(required_action="resolve-review-findings" if review else "report-unresolved-verification",
+            recovery_hint="Preserve the prior results. " + ("Record dispositions in the existing owner-closure evidence; "
+                "this is owner judgment, not independent PASS." if review else
+                "The round limit does not stop remaining owner work. Report any unresolved verification without inferring PASS."))
+    return fields
 
 
 def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs=None, route_file=None):
@@ -235,8 +210,10 @@ def recovery_fields(node_kind, state="exhausted", *, route=None, node=None, jobs
             except DispatchContractError as exc:
                 fields["revision_unavailable"] = exc.reason
             else:
-                budget = round_budget(route, node, rows)
-                if budget.verdict_rounds < budget.cap + 1:
+                import route_authority
+                answer = route_authority.decide_continuation(route, action="round", node=node,
+                    rows=rows, revisions=[{"answers": [latest["attempt_id"]]}])
+                if answer.allowed and answer.budget.round_kind == "closure-check":
                     fields["recovery_revise_command"] = shlex.join([
                         "python3", str(Path(__file__).with_name("capability-route.py")), "revise",
                         "--route", str(route_path), "--node", node["id"], "--jobs", str(Path(jobs).resolve()),
@@ -319,95 +296,10 @@ class RoundBudget:
     progress_reset: bool = False
 
 
-_NEXT_ACTION_BY_STATE = {
-    "admit": "dispatch",
-    "blocked-live": "wait",
-    "blocked-unsettled": "wait",
-    "exhausted": "owner-closure",
-    "verdictless-bound": "native-subagent",
-}
 
-
-def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=()):
-    """The shared launch-admission decision for one route node's round history.
-
-    `rows` is the exact registry census for the node as `(status, metadata)`
-    pairs, oldest first -- the shape `capability-route.py`'s
-    `_review_round_rows` already returns, and dispatch-node.py's
-    `(cols, metadata)` census reduces to via `cols[1]`. `revisions` is the
-    node's SD-154 revision history (empty until `capability-route.py` grows
-    `publish_revision_locked` -- P3 always passes `()`, so `round_kind` never
-    resolves to `"closure-check"` from a P3 call site); once a caller
-    supplies it, a node whose last verdict is a blocking FAIL and whose
-    revision names that exact row as its answer gets one `closure-check`
-    round instead of an ordinary correction.
-    """
-    continuation_budget = route.get("continuation_budget") or {}
-    cap = continuation_budget.get("review_round_cap")
-    if cap is None:
-        cap = max_review_rounds(route["effective_intensity"])
-    worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
-    kinds = [
-        classify_round_row(status, meta, worker_type=meta.get("worker_type") or worker_type)
-        for status, meta in rows
-    ]
-    verdict_rounds = kinds.count("verdict")
-    verdictless_rounds = kinds.count("verdict-less")
-    verdictless_streak = 0
-    for kind in reversed(kinds):
-        if kind != "verdict-less":
-            break
-        verdictless_streak += 1
-    progress_reset = False
-    if verdictless_streak >= VERDICTLESS_BOUND and route.get("route_plan") is not None:
-        # RA-5: BLOCKED rounds that keep shrinking the leg's unmet items are progress (route_authority).
-        import route_authority
-        counted = route_authority.blocked_progress(route, rows, worker_type=worker_type)
-        progress_reset = counted < verdictless_streak
-        verdictless_streak = counted
-    if "live" in kinds:
-        state = "blocked-live"
-    elif "unsettled" in kinds:
-        state = "blocked-unsettled"
-    elif verdictless_streak >= VERDICTLESS_BOUND:
-        state = "verdictless-bound"
-    elif verdict_rounds >= cap:
-        state = "exhausted"
-    else:
-        state = "admit"
-    next_round = len(rows) + 1
-    correction_round = next_round if next_round >= 2 else 0
-    round_kind = "first" if next_round < 2 else "correction"
-    closure_check_used = False
-    # SD-161: labels on within-cap corrections do not spend the extra
-    # verdict. Only the lineage-wide verdict census does: at most cap + 1.
-    # A verdictless replacement tail can still answer the last real FAIL;
-    # live/unsettled rows and the verdictless bound always take precedence.
-    verdict_indexes = [index for index, kind in enumerate(kinds) if kind == "verdict"]
-    if state in ("admit", "exhausted") and verdict_rounds < cap + 1 and revisions and verdict_indexes:
-        last_row = rows[verdict_indexes[-1]]
-        _last_status, last_meta = last_row
-        last_blocking = _last_round_blocking_verdict([last_row], worker_type)
-        last_attempt = last_meta.get("attempt_id")
-        if last_blocking and last_attempt and any(
-            last_attempt in (revision.get("answers") or ()) for revision in revisions
-        ):
-            state = "admit"
-            round_kind = "closure-check"
-            closure_check_used = True
-    return RoundBudget(
-        verdict_rounds=verdict_rounds,
-        verdictless_streak=verdictless_streak,
-        verdictless_rounds=verdictless_rounds,
-        cap=cap,
-        state=state,
-        next_round=next_round,
-        correction_round=correction_round,
-        round_kind=round_kind,
-        next_action=_NEXT_ACTION_BY_STATE[state],
-        closure_check_used=closure_check_used,
-        progress_reset=progress_reset,
-    )
+def round_budget(route, node, rows, *, revisions=()):
+    from route_authority import decide_continuation
+    return decide_continuation(route, action="round", node=node, rows=rows, revisions=revisions).budget
 
 
 def last_verdict_blocking(rows, worker_type):
@@ -460,69 +352,12 @@ def _last_round_blocking_verdict(rows, worker_type):
 
 
 def marker_round_census(route, node, rows, *, site, revisions=(), independently_reviewed=False):
-    """The one derivation every capped-node marker writer calls for
-    `round_census` (SD-153 rule 5, 13.59.2). Returns `None` only when the
-    route's `effective_intensity` cannot derive a cap at all (`round_budget`'s
-    own `ValueError`); every other case -- including an empty `rows` (no
-    registry to read) -- returns a real census, so a marker is never silently
-    missing the field.
-
-    `site` names which writer is publishing, and fixes most of
-    `closure_class`:
-
-    * `"registered"` -- a registered worker's own completion. `rows` is the
-      node's PRIOR round history (the completing attempt's own row excluded,
-      exactly as `admit_round` saw it before this round ran); this landing
-      round is added back as one verdict round. `closure_class` is
-      `"closure-check"` when the prior budget already resolved this round to
-      `round_kind == "closure-check"` (13.59.3 rule 7), else
-      `"registered-verdict"`.
-    * `"owner-closure"` -- SD-124 owner-closure. Always `"owner-closure"`.
-    * `"revision"` -- SD-154 `publish_revision_locked` over a capped node.
-      Always `"revision"`.
-    * `"inline"` -- everything else (owner-inline, a claimed native-subagent,
-      owner-chain aggregation). `closure_class` is `"owner-override-unlinked"`
-      when the most recent terminated round is an unresolved blocking verdict
-      and this completion is not itself an independently-reviewed claim
-      (`independently_reviewed`, e.g. a verified native-subagent transcript --
-      that IS the sealed fallback chain's legitimate hop, not an override);
-      else the SD-153 rule 3 bound class (`"review-verdictless-bound"` for a
-      `kind == "review-worker"` node, `"owner-run-verdictless"` for every
-      other capped kind -- `test` included) when the budget is
-      `verdictless-bound`; else plain `"inline-no-unresolved-fail"`.
-    """
+    """Compatibility projection of the shared marker decision; no cap means no census."""
+    from route_authority import decide_continuation
     try:
-        budget = round_budget(route, node, rows, revisions=revisions)
-    except ValueError:
+        return decide_continuation(route, action="marker", node=node, rows=rows, revisions=revisions,
+            facts={"site": site, "independently_reviewed": independently_reviewed}).census
+    except ValueError as error:
+        if str(error).startswith("unknown round-census site:"):
+            raise
         return None
-    if site == "registered":
-        closure_class = "closure-check" if budget.round_kind == "closure-check" else "registered-verdict"
-        return {
-            "verdict_rounds": budget.verdict_rounds + 1,
-            "verdictless_rounds": budget.verdictless_rounds,
-            "cap": budget.cap,
-            "closure_class": closure_class,
-        }
-    if site == "owner-closure":
-        closure_class = "owner-closure"
-    elif site == "revision":
-        closure_class = "revision"
-    elif site == "inline":
-        worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
-        if not independently_reviewed and _last_round_blocking_verdict(rows, worker_type):
-            closure_class = "owner-override-unlinked"
-        elif budget.state == "verdictless-bound":
-            closure_class = (
-                "review-verdictless-bound" if node.get("kind") == "review-worker"
-                else "owner-run-verdictless"
-            )
-        else:
-            closure_class = "inline-no-unresolved-fail"
-    else:
-        raise ValueError(f"unknown round-census site: {site}")
-    return {
-        "verdict_rounds": budget.verdict_rounds,
-        "verdictless_rounds": budget.verdictless_rounds,
-        "cap": budget.cap,
-        "closure_class": closure_class,
-    }

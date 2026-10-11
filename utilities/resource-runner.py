@@ -6,6 +6,7 @@ import resource_resume as RESOURCE_RESUME
 import resource_run_evidence as RUN_EVIDENCE
 from resource_progress import environment as progress_environment
 import gpu_leases
+import route_authority
 from gpu_execution_sandbox import gpu_resource_nodes
 from resource_run_registry import (
     classify_identity,
@@ -375,6 +376,11 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     if (armed and armed.get("predecessor_id") == args.run_id
                             and not sup.resource_continuation_cancelled(route, ledger)):
                         sup._evaluate(route, ledger, armed, [])
+            decision = route_authority.decide_continuation(action="resource-failure", facts={
+                "not_started": resource_never_started(failed), "deferred": isinstance(error, LaunchDeferred)})
+            if decision.allowed:
+                print(json.dumps({**failed, "payload_spawned": False, "workflow_complete": False}))
+                return
         raise
 
 
@@ -438,6 +444,7 @@ def settle_queued_validation_failure(controller, error):
             # The existing reservation lock rejects a claim or foreign successor.
             publish_verified_run(controller.registry, expected["run_id"], expected, failed)
         sup._evaluate(route, ledger, armed, [])
+        return failed
 
 
 def main(argv=None, *, controller=None):
@@ -445,7 +452,13 @@ def main(argv=None, *, controller=None):
         return _main(argv, controller=controller)
     except (Exception, SystemExit) as error:
         if controller is not None and (not isinstance(error, SystemExit) or error.code == 65):
-            settle_queued_validation_failure(controller, error)
+            failed = settle_queued_validation_failure(controller, error)
+            decision = route_authority.decide_continuation(action="resource-failure", facts={
+                "not_started": failed is not None and resource_never_started(failed),
+                "deferred": isinstance(error, LaunchDeferred)})
+            if decision.allowed:
+                print(json.dumps({**failed, "payload_spawned": False, "workflow_complete": False}))
+                return
         raise
 
 

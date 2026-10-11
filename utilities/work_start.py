@@ -1391,30 +1391,22 @@ def _owner_parked_response(result, jobs, aid):
     release = shlex.join([sys.executable, entrypoint(ROOT, "utilities/workflow-supervisor.py"), "release",
                           "--route", parked["route_file"], "--jobs", str(jobs), "--gate", gate,
                           "--decision", "proceed"])
-    if parked["status"] == "blocked":
-        return {**result, **extra, "state": "waiting-human-gate", "reason": "owner-parked-at-human-gate",
-                "required_action": "answer-human-gate", "gate": gate,
-                "gate_artifact": parked["artifact"], "release_command": release,
-                "next_step": f"The owner paused at human gate {gate} and exited; this is not a failure. "
-                    "Show the person the gate artifact and ask for a decision. Record it with "
-                    "release_command (replace proceed with revise or stop when chosen). "
-                    + after_proceed
-                    + ((" owner_report is the owner's own account of what it already changed; show it "
-                        "with the preview, because the edit was made before this answer."
-                        if verdict_pass(owner_meta) else
-                        " owner_report is the owner's own account; show it with the preview.") if report else "")
-                    + " " + FI.PENDING_ANSWER_RULE}
-    if parked["status"] == "stop":
-        return {**result, **extra, "state": "stopped", "reason": "human-gate-stop", "gate": gate,
-                "next_step": f"The person stopped this work at gate {gate}. Report that; "
-                    "nothing is running and no replacement starts."}
-    if parked["status"] == "revise":
-        return {**result, **extra, "state": "needs-attention", "reason": "human-gate-revise-owner-parked",
-                "required_action": "report-gate-revision", "gate": gate,
-                "next_step": f"The person asked for a revision at gate {gate} while no owner is running. "
-                    "Report the feedback and ask how to proceed; no automatic continuation starts "
-                    "for a revise."}
-    return None
+    choice = route_authority.decide_continuation(action="owner", jobs=jobs, status="done", metadata=owner_meta,
+                                                facts={"parked": parked})
+    if choice.allowed:
+        return None
+    presentation = {
+        "blocked": {"state": "waiting-human-gate", "required_action": "answer-human-gate",
+            "gate_artifact": parked["artifact"], "release_command": release,
+            "next_step": f"The owner paused at human gate {gate}. Show the gate artifact"
+                + (" and owner_report" if report else "") + ", "
+                "record the person's decision with release_command. " + after_proceed + " " + FI.PENDING_ANSWER_RULE},
+        "stop": {"state": "stopped", "next_step": f"The person stopped this work at gate {gate}; no replacement starts."},
+        "revise": {"state": "needs-attention", "required_action": "report-gate-revision",
+            "next_step": "Report the recorded revision feedback; no automatic continuation starts."}}
+    return {**result, **extra, **presentation.get(choice.state, {"state": choice.state,
+                "required_action": choice.next_action}), "reason": choice.reason, "gate": gate,
+            "next_action": choice.next_action, "retry_when": choice.retry_when, "detail": choice.detail}
 
 
 def _exited_owner_response(route, result, jobs, aid, **extra):
@@ -1803,8 +1795,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     rows = _rows(jobs)
     aid = _slot(route, "owner", rows, jobs)
     refusal = None
-    launched_now = aid not in rows
-    if aid not in rows:
+    owner_start = route_authority.decide_continuation(route, action="owner-start",
+        facts={"registered": aid in rows})
+    launched_now = owner_start.state == "start"
+    if launched_now:
         owner_pin = route_authority.sealed_pin_harness(route, worker_type="owner")
         view = route_authority.route_in_force(route)
         if owner_pin and view.get("registered_headless_candidates") is None and not any(
@@ -1870,6 +1864,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         gate_response = _owner_gate_response(route, path, jobs, aid, _rows(jobs)[aid][1], result)
         if gate_response is not None:
             return gate_response
+    import dispatch_replacement
     from dispatch_replacement import advance, effective_attempts
     # Only an explicit start resumes an owner that stopped at a usage limit.
     replacement = advance(jobs, aid, run=run, resume_capacity=True)
@@ -1881,11 +1876,10 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                         interview=interview, answers=answers, decision=decision, run=run, sleep=sleep,
                         clock=clock)
     status, metadata = _rows(jobs).get(aid, (status, metadata))
-    owner_stop = route_authority.answerable_owner_end(status, metadata)
-    if (owner_stop
-            and not replacement.get("parked_gate")
-            and (replacement.get("state") == "not-applicable"
-                 or replacement.get("reason") == "automatic-replacement-exhausted")):
+    owner_choice = route_authority.decide_continuation(route, action="owner", jobs=jobs,
+        status=status, metadata=metadata, facts={"answered": bool(dispatch_replacement._retained_corrections(jobs, aid))})
+    if owner_choice.state == "answer" and not replacement.get("parked_gate"):
+        owner_stop = route_authority.answerable_owner_end(status, metadata)
         # It stopped for an answer no declared gate carries. The answer, sent to it, is the way on
         # (an answered stop is a pause, so a spent replacement budget does not end it).
         report = _owner_report(route, metadata)
@@ -1901,28 +1895,24 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         result["replacement_attention"] = [replacement]
         if replacement["reason"] == "replacement-capacity-wait":
             return _capacity_pause(result, replacement, resume)
-        if joined["state"] == "ready":
-            return {**result, "state": "needs-attention", "reason": replacement["reason"],
-                    "node": replacement.get("node", "")}
+        return {**result, "state": "needs-attention", "reason": replacement["reason"],
+                "node": replacement.get("node", ""),
+                "next_action": replacement.get("next_action", "same-command"),
+                "retry_when": replacement.get("retry_when", ""),
+                "next_step": replacement.get("retry_when") or replacement.get("next_step", "Retry resume_command after the exact launch settles.")}
+    if not owner_choice.allowed and owner_choice.state != "settle":
+        attention = {**result, "state": "needs-attention", "reason": owner_choice.reason,
+                "next_action": owner_choice.next_action, "retry_when": owner_choice.retry_when,
+                "detail": owner_choice.detail, "observation": joined,
+                "next_step": owner_choice.retry_when or "Preserve existing results and use resume_command after settlement."}
+        return _wait_expired(attention) if wait and owner_choice.state == "wait" else attention
     if joined["state"] == "ready":
         outcome = _outcome(jobs, aid)
         return _with_next_leg(route, {
             **result, "state": "completed" if outcome["classification"] == "success" else "needs-attention",
             "result": outcome})
-    status, metadata = _rows(jobs).get(aid, (status, metadata))
-    if status == "done":
+    if owner_choice.state == "settle":
         return _exited_owner_response(route, result, jobs, aid, observation=joined)
-    if metadata.get("pid") and metadata.get("pid_start") and metadata.get("launch_started") == "1":
-        from dispatch_contract import attempt_process_quiescence
-        process = attempt_process_quiescence(metadata, terminal_receipt=True)
-        if process.state != "live":
-            return {**result, "state": "needs-attention",
-                    "reason": "owner-settlement-pending" if process.state == "quiescent"
-                              else "owner-process-unverifiable",
-                    "owner_process_state": process.state, "owner_process_reason": process.reason,
-                    "observation": joined,
-                    "next_step": "The owner is exited or unobservable. Its open row retains settlement; "
-                        "the ordinary start or correction retries it. Preserve existing results."}
     if wait:
         return _wait_expired({**result, "observation": joined})
     directive, reason, _ = parent_next(metadata.get("parent_completion_delivery", ""), aid, agent_home=ROOT)

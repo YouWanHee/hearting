@@ -889,44 +889,17 @@ def main():
   raise SystemExit(65)
  round_budget=admission.budget
  if REVIEW_ROUND_CAP.is_round_capped_node(node) and not a.subsession_id and original_task is None:
-  if round_budget.state=="blocked-live":
-   print("check=failed")
-   print("reason=prior-attempt-still-live")
-   print(f"route_id={route['route_id']}")
-   print(f"route_node={a.node}")
-   print("child_spawned=0")
-   raise SystemExit(78)
-  if round_budget.state=="blocked-unsettled":
-   print("check=failed")
-   print("reason=round-unsettled")
-   print(f"route_id={route['route_id']}")
-   print(f"route_node={a.node}")
-   print("child_spawned=0")
-   raise SystemExit(65)
-  if round_budget.state=="exhausted":
-   print("check=failed")
-   print("reason=review-round-budget-exhausted")
-   print(f"route_id={route['route_id']}")
-   print(f"route_node={a.node}")
-   print(f"effective_intensity={route['effective_intensity']}")
-   print(f"round={round_budget.next_round}")
-   print(f"max_round={round_budget.cap}")
-   for key,value in review_budget_recovery_fields(node.get("kind"), route=route, node=node, jobs=registry.path, route_file=a.route).items():
-    print(f"{key}={value}")
-   print("child_spawned=0")
-   raise SystemExit(65)
-  if round_budget.state=="verdictless-bound":
-   print("check=failed")
-   print("reason=review-verdictless-bound")
-   print(f"route_id={route['route_id']}")
-   print(f"route_node={a.node}")
-   print(f"effective_intensity={route['effective_intensity']}")
-   print(f"round={round_budget.next_round}")
-   print(f"max_round={round_budget.cap}")
-   for key,value in review_budget_recovery_fields(node.get("kind"),"verdictless-bound", route=route, node=node, jobs=registry.path, route_file=a.route).items():
-    print(f"{key}={value}")
-   print("child_spawned=0")
-   raise SystemExit(65)
+  choice=ROUTE_AUTHORITY.decide_continuation(route, action="round", node=node, facts={"budget": round_budget})
+  if not choice.allowed:
+   fields={"check":"failed", "reason":choice.reason, "route_id":route['route_id'],
+           "route_node":a.node, "effective_intensity":route['effective_intensity'],
+           "round":round_budget.next_round, "max_round":round_budget.cap,
+           "next_action":choice.next_action, "retry_when":choice.retry_when, "child_spawned":0}
+   if choice.state in {"exhausted", "verdictless-bound"}:
+    fields.update(review_budget_recovery_fields(node.get("kind"),choice.state,
+                  route=route, node=node, jobs=registry.path, route_file=a.route))
+   for key,value in fields.items(): print(f"{key}={value}")
+   raise SystemExit(78 if choice.state=="blocked-live" else 65)
  try:
   retry_values=[]
   extra=strip_leading_separator(a.adapter_args)

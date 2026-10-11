@@ -347,12 +347,10 @@ def current_bindings(harness: str, sid: str, jobs=None) -> list:
         return []
     found = []
     for aid, (status, meta) in latest_rows(jobs).items():
-        if not eligible_row(meta):
-            continue
-        if not owns(meta, sid, jobs):
-            continue
-        if status not in OPEN_ROW_STATUSES and not (status == "done" and
-                (_delivery_open(jobs, meta) or _route_open(jobs, meta))):
+        import route_authority
+        choice = route_authority.decide_continuation(action="handover", status=status, metadata=meta, jobs=jobs,
+            facts={"actor": sid, "eligible": eligible_row(meta)})
+        if not choice.allowed:
             continue
         found.append(binding_of(jobs, meta))
     return found[-MAX_BINDINGS:]

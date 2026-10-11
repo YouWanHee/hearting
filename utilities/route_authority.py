@@ -34,6 +34,361 @@ def _contract_error(reason, detail=""):
     return DispatchContractError(reason, detail)
 
 
+class ContinuationDecision(NamedTuple):
+    allowed: bool
+    state: str
+    reason: str = ""
+    next_action: str = "continue"
+    retry_when: str = ""
+    detail: str = ""
+    budget: object = None
+    answers: tuple = ()
+    fallback_nodes: tuple = ()
+    census: object = None
+
+
+def _replacement_kind(status, meta, *, jobs=None, lines=None):
+    import dispatch_replacement as DR
+    import route_parent_close
+    if (meta.get('parent_close_requested') == '1' or
+            jobs is not None and route_parent_close.row_requested(meta, jobs)):
+        return None
+    if jobs is not None and meta.get('note') == 'dead-worker-blocked':
+        found = DR.owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
+        if found and found['status'] == 'proceed':
+            return 'parked'
+        if found is not None:
+            return None  # a declared gate keeps its own answer path
+    if (jobs is not None and meta.get('worker_type') == 'owner'
+            and answerable_owner_end(status, meta)
+            and DR._retained_corrections(jobs, meta.get('attempt_id'))):
+        return DR.CORRECTED  # an answered stop is a pause; no automatic retry of an unanswered FAIL
+    if (jobs is not None and runtime_owner_can_resume(status, meta)
+            and DR._retained_corrections(jobs, meta.get('attempt_id'))):
+        return DR.CORRECTED
+    if (meta.get('note') == 'cancelled-receipt-unavailable'
+            and meta.get('classifier_source') == DR.DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
+        return 'silent'
+    if meta.get('note') in DR.DEATH_NOTES and status not in {'cancelled', 'killed'}:
+        return 'silent'
+    if (meta.get('worker_type') == 'owner' and status == 'done'
+            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
+        return 'capacity'
+    if (meta.get('worker_type') == 'owner' and status == 'done'
+            and meta.get('launch_outcome') == 'never-launched' and meta.get('launch_claimed') == '0'
+            and meta.get('launch_started') != '1' and not meta.get('pid')):
+        return 'unlaunched'  # nothing ran: the log never existed and no process was ever bound
+    if meta.get('worker_type') == 'owner' and status == 'done' and meta.get('note') in DR.RUNTIME_DEATH_NOTES:
+        return 'runtime'  # the owner's runtime died under it; only an explicit `start` replaces it
+    if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'
+            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
+            and DR._frame_rule_top(jobs, meta)):
+        return DR.FRAME_CAPACITY
+    return None
+
+
+def _replacement_terminal_absent(fields, meta, *, capacity=False, runtime=False):
+    from codex_dispatch_terminal import inspect_terminal_attempt
+    result = inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
+                                      artifact_root_metadata=meta.get('artifact_root'))
+    if capacity and result.get('state') == 'invalid' and result.get('failure_class') == 'capacity':
+        return True  # A usage-limit result is the stop itself, not a handoff to settle.
+    if runtime and result.get('state') == 'invalid' and result.get('failure_class') == 'runtime':
+        return True  # So is a runtime error envelope (a provider 5xx): no handoff was ever written.
+    return result.get('state') == 'absent'
+
+
+def require_continuation(decision):
+    """Translate the one decision into the existing typed error protocol."""
+    if not decision.allowed:
+        error = _contract_error(decision.reason, decision.reason + ":" + decision.detail if decision.detail else "")
+        error.retry_when = decision.retry_when
+        error.next_action = decision.next_action
+        raise error
+    return decision
+
+
+def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
+                        status=None, metadata=None, node=None, rows=(), revisions=(), facts=None):
+    """Decide continuation from observations; never launch, wait or rewrite evidence.
+
+    A round limit chooses a fallback, not a veto of its owner's remaining work.
+    Unknown execution names the condition for replaying the same command. Transport,
+    locking and immutable publication stay with the existing consumers.
+    """
+    route, facts = route or {}, facts or {}
+    if owner_attempt_id is not None:
+        from dispatch_replacement import effective_attempts, _rows
+        try:
+            attempts, _ = effective_attempts(jobs, {owner_attempt_id})
+            found = _rows(Path(jobs).read_text().splitlines())
+        except OSError as error:
+            return ContinuationDecision(False, "wait", "replacement-source-missing", "same-command",
+                "The exact owner row is readable in the canonical registry.", str(error))
+        except Exception as error:
+            from dispatch_contract import DispatchContractError
+            if not isinstance(error, DispatchContractError):
+                raise
+            return ContinuationDecision(False, "protected", error.reason, "settle", detail=error.detail)
+        if len(attempts) != 1 or next(iter(attempts)) not in found:
+            return ContinuationDecision(False, "wait", "replacement-source-missing", "same-command",
+                                        "The exact owner row is readable in the canonical registry.")
+        fields, metadata = found[next(iter(attempts))]
+        status = fields[1]
+    metadata = metadata or {}
+    if action == "handover" and not facts.get("eligible", False):
+        return ContinuationDecision(False, "settled", next_action="settle")
+    if (action == "handover" or facts.get("actor")) and not owns(metadata, facts.get("actor"), jobs):
+        return ContinuationDecision(False, "protected", "work-parent-recovery-required", "report")
+    if facts.get("history_conflict"):
+        return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
+    if action == "replacement-progress":
+        from dispatch_contract import verdict_pass
+        from dispatch_replacement import (PAUSE_KINDS, _in_capacity_family, _is_capacity_record,
+                                          _replacement_in_flight)
+        if facts.get("record") is not None:
+            kind = _replacement_kind(status, metadata, jobs=jobs)
+            if status not in {"open", "running"}:
+                if verdict_pass(metadata):
+                    return ContinuationDecision(True, "reused", next_action="observe")
+                continuing = kind in PAUSE_KINDS or kind and _is_capacity_record(facts["record"])
+                return ContinuationDecision(bool(continuing), "advance" if continuing else "exhausted",
+                                            next_action="start" if continuing else "report")
+            if metadata.get("launch_claimed") == "1":
+                pin = facts.get("pin")
+                if pin and metadata.get("harness") != pin:
+                    return ContinuationDecision(False, "protected", "pin-ignored-for-replacement", "report",
+                                                detail="replacement already launched; its execution identity is retained")
+                return ContinuationDecision(True, "running", next_action="observe")
+            return ContinuationDecision(True, "launch", next_action="start")
+        if metadata.get("replacement_original_attempt_id") and status in {"open", "running"} and metadata.get("launch_claimed") != "1":
+            return ContinuationDecision(True, "advance", next_action="start")
+        kind = facts.get("kind")
+        if (metadata.get("replacement_original_attempt_id") and status not in {"open", "running"}
+                and not verdict_pass(metadata) and kind not in PAUSE_KINDS and not _in_capacity_family(jobs, metadata)):
+            return ContinuationDecision(False, "exhausted", "automatic-replacement-exhausted", "report")
+        if kind is None:
+            return ContinuationDecision(False, "not-applicable", next_action="observe")
+        if not facts.get("resume_capacity") and not _replacement_in_flight(jobs, facts["registry_rows"], metadata):
+            if kind == "capacity":
+                return ContinuationDecision(False, "capacity", "replacement-capacity-wait", "same-command")
+            if kind in {"runtime", "unlaunched", "corrected"}:
+                return ContinuationDecision(False, "not-applicable", next_action="observe")
+        return ContinuationDecision(True, "launch", next_action="start")
+    if action == "owner-start":
+        # The existing atomic registry claim still protects the launch boundary.
+        registered = facts.get("registered", False)
+        return ContinuationDecision(True, "existing" if registered else "start",
+                                    next_action="observe" if registered else "start")
+    if action == "owner-input":
+        # Keeping an answer cannot spawn an owner or disturb uncertain transport.
+        if answerable_owner_end(status, metadata):
+            return ContinuationDecision(True, "retained", next_action="correct")
+        if status in {"open", "running"} and facts.get("accepting", True) and facts.get("reachable"):
+            return ContinuationDecision(True, "queued", next_action="handback")
+    parked = facts.get("parked")
+    if action == "owner":
+        from route_parent_close import row_requested
+        closing = metadata.get("parent_close_requested") == "1" or jobs is not None and row_requested(metadata, jobs)
+        if closing or facts.get("cancelled") or status in {"cancelled", "killed"}:
+            return ContinuationDecision(False, "protected", "cancelled-by-parent", "settle")
+        if parked is None and jobs is not None and metadata.get("attempt_id"):
+            from dispatch_replacement import owner_parked_gate
+            parked = owner_parked_gate(jobs, metadata["attempt_id"])
+        if parked and parked["status"] != "proceed":
+            gate_state = parked["status"]
+            return ContinuationDecision(False, gate_state,
+                {"blocked": "owner-parked-at-human-gate", "stop": "human-gate-stop",
+                 "revise": "human-gate-revise-owner-parked"}[gate_state],
+                {"blocked": "answer-human-gate", "stop": "report", "revise": "report-gate-revision"}[gate_state])
+        stopped = answerable_owner_end(status, metadata)
+        if stopped and not parked and not facts.get("answered"):
+            return ContinuationDecision(False, "answer", "owner-" +
+                ("blocked" if stopped == "BLOCKED" else "failed"), "correct")
+    process = facts.get("process")
+    if action in {"replacement", "owner-input", "owner"}:
+        if process is None and jobs is not None and metadata.get("attempt_id"):
+            from route_parent_close import owner_continuation_processes
+            process, _ = owner_continuation_processes(metadata, jobs)
+        if process is not None and process.state != "quiescent":
+            if action == "owner" and process.state == "live" and status in {"open", "running"}:
+                return ContinuationDecision(True, "running", next_action="handback")
+            return ContinuationDecision(False, "wait", ("owner-process-" if action == "owner" else
+                "replacement-process-") + process.state,
+                "same-command", "The exact owner and unregistered children are observed quiescent; "
+                "registered payloads remain bound and running.", process.reason)
+    if action in {"replacement", "replacement-budget"}:
+        if facts.get("budget_exhausted") or facts.get("competing_successor"):
+            return ContinuationDecision(False, "protected", "automatic-replacement-exhausted", "report")
+        if facts.get("child_unsettled"):
+            return ContinuationDecision(False, "wait", "replacement-owner-child-unsettled", "same-command",
+                                        "The exact child is settled and quiescent.", facts["child_unsettled"])
+        if action == "replacement-budget":
+            return ContinuationDecision(True, "continue", next_action="start")
+        if facts.get("terminal_conflict"):
+            return ContinuationDecision(False, "protected", "replacement-terminal-conflict", "settle")
+        if status not in {"done", "cancelled", "killed"}:
+            return ContinuationDecision(False, "wait", "replacement-terminal-unsettled", "same-command",
+                                        "The exact attempt has settled its terminal result.")
+        if not facts.get("death_kind"):
+            return ContinuationDecision(False, "protected", "replacement-not-silent-death", "settle")
+        kind = facts["death_kind"]
+        if facts.get("fields") and kind not in {"parked", "unlaunched", "corrected"}:
+            from dispatch_replacement import _terminal_absent, FRAME_CAPACITY
+            if not _terminal_absent(facts["fields"], metadata,
+                    capacity=kind in {"capacity", FRAME_CAPACITY}, runtime=kind == "runtime"):
+                return ContinuationDecision(False, "protected", "replacement-result-settlement-required", "settle")
+        return ContinuationDecision(True, "continue", next_action="start")
+    if action in {"owner", "owner-input"}:
+        if facts.get("cancelled") or status in {"cancelled", "killed"}:
+            return ContinuationDecision(False, "protected", "cancelled-by-parent", "settle")
+        if parked and parked["status"] == "proceed":
+            return ContinuationDecision(True, "continue", next_action="start")
+        stopped = answerable_owner_end(status, metadata)
+        if stopped or runtime_owner_can_resume(status, metadata):
+            if action == "owner-input":
+                return ContinuationDecision(True, "retained", next_action="correct")
+            if facts.get("answered"):
+                return ContinuationDecision(True, "continue", next_action="start")
+            return ContinuationDecision(False, "answer", "owner-" +
+                ("blocked" if stopped == "BLOCKED" else "failed"), "correct")
+        if status == "done":
+            return ContinuationDecision(False, "settle", "owner-settlement-pending", "settle")
+        if action == "owner" and process is not None and process.state == "quiescent":
+            return ContinuationDecision(False, "wait", "owner-settlement-pending", "same-command",
+                "The exact owner's terminal observation is committed to the canonical registry.", process.reason)
+        if facts.get("reachable"):
+            return ContinuationDecision(True, "running", next_action="handback")
+        return ContinuationDecision(False, "wait", "owner-input-unsupported", "same-command",
+                                    "The same owner's input consumer is reachable or its terminal result settles.")
+    if action == "handover":
+        allowed = status in {"open", "running"}
+        if status == "done":
+            import dispatch_seat_handover as handover
+            allowed = (facts.get("delivery_open") if "delivery_open" in facts else
+                       handover._delivery_open(jobs, metadata)) or (
+                       facts.get("route_open") if "route_open" in facts else handover._route_open(jobs, metadata))
+        return ContinuationDecision(bool(allowed), "handover" if allowed else "settled",
+                                    next_action="handover" if allowed else "settle")
+    if action == "resource-failure":
+        allowed = facts.get("not_started", False) and facts.get("bound", True) and not facts.get("deferred", False)
+        return ContinuationDecision(bool(allowed), "not-started" if allowed else "unconfirmed",
+                                    next_action="return-to-owner" if allowed else "observe")
+    if action == "fix":
+        from dispatch_contract import parse_registry_metadata, owner_closure_shape
+        answers, fallback = [], []
+        for candidate in route.get("nodes") or []:
+            if not _ROUND.is_round_capped_node(candidate):
+                continue
+            census = []
+            for line in facts["lines"]:
+                fields = line.split("\t")
+                if len(fields) != 6:
+                    continue
+                meta = parse_registry_metadata(fields[5])
+                if ((meta.get("route_id") or meta.get("route")) == route.get("route_id")
+                        and meta.get("route_node") == candidate["id"] and not no_stage_authority(meta)):
+                    census.append((fields, meta))
+            history = [(f[1], m) for f, m in _ROUND.logical_round_records(census, jobs=jobs)]
+            worker = candidate.get("worker_type") or ("review" if candidate.get("kind") == "review-worker" else "test")
+            if not history or not _ROUND.last_verdict_blocking(history, worker):
+                continue
+            last = next(m for st, m in reversed(history) if _ROUND.classify_round_row(st, m,
+                        worker_type=m.get("worker_type") or worker) == "verdict")
+            failed = last.get("attempt_id", "")
+            choice = decide_continuation(route, action="round", node=candidate, rows=history,
+                                         revisions=[{"answers": [failed]}])
+            if failed and choice.budget.round_kind == "closure-check":
+                answers.append(failed)
+            elif owner_closure_shape(last) != "registered-review":
+                fallback.append(candidate["id"] + ":" + choice.state)
+        return ContinuationDecision(True, "continue", next_action="start",
+                                    answers=tuple(answers), fallback_nodes=tuple(fallback))
+    if action == "round-recovery":
+        state = facts["state"]
+        review = facts["node_kind"] == "review-worker"
+        return ContinuationDecision(True, state, next_action=("native-subagent" if review else "owner-inline")
+            if state == "verdictless-bound" else ("owner-closure" if review else "report"))
+    if action not in {"round", "owner-closure", "complete-inline", "review-revision", "marker"}:
+        raise ValueError("unknown continuation action: " + action)
+    budget = facts.get("budget")
+    if budget is None:
+        cap = (route.get("continuation_budget") or {}).get("review_round_cap")
+        if cap is None:
+            try:
+                cap = _ROUND.max_review_rounds(route["effective_intensity"])
+            except ValueError:
+                if action == "owner-closure":
+                    raise _contract_error("owner-closure-intensity-unknown", "owner-closure-intensity-unknown:" + route["effective_intensity"])
+                raise
+        worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+        kinds = [_ROUND.classify_round_row(s, m, worker_type=m.get("worker_type") or worker_type) for s, m in rows]
+        verdicts = [i for i, kind in enumerate(kinds) if kind == "verdict"]
+        streak = 0
+        for kind in reversed(kinds):
+            if kind != "verdict-less":
+                break
+            streak += 1
+        counted = blocked_progress(route, rows, worker_type=worker_type) if (
+            streak >= _ROUND.VERDICTLESS_BOUND and route.get("route_plan") is not None) else streak
+        state = ("blocked-live" if "live" in kinds else "blocked-unsettled" if "unsettled" in kinds else
+                 "verdictless-bound" if counted >= _ROUND.VERDICTLESS_BOUND else
+                 "exhausted" if len(verdicts) >= cap else "admit")
+        closure = bool(state in {"admit", "exhausted"} and len(verdicts) < cap + 1 and verdicts and
+            _ROUND._last_round_blocking_verdict([rows[verdicts[-1]]], worker_type) and
+            any(rows[verdicts[-1]][1].get("attempt_id") in (r.get("answers") or ()) for r in revisions))
+        if closure:
+            state = "admit"
+        budget = _ROUND.RoundBudget(len(verdicts), counted, kinds.count("verdict-less"), cap, state,
+            len(rows) + 1, len(rows) + 1 if rows else 0,
+            "closure-check" if closure else "correction" if rows else "first",
+            {"admit": "dispatch", "blocked-live": "wait", "blocked-unsettled": "wait",
+             "exhausted": "owner-closure", "verdictless-bound": "native-subagent"}[state], closure, counted < streak)
+    state = budget.state
+    if action == "marker":
+        site = facts["site"]
+        if site == "registered":
+            closure = "closure-check" if budget.round_kind == "closure-check" else "registered-verdict"
+        elif site in {"owner-closure", "revision"}:
+            closure = site
+        elif site == "inline":
+            worker = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+            closure = ("owner-override-unlinked" if not facts.get("independently_reviewed") and
+                       _ROUND._last_round_blocking_verdict(rows, worker) else
+                       ("review-verdictless-bound" if node.get("kind") == "review-worker" else "owner-run-verdictless")
+                       if state == "verdictless-bound" else "inline-no-unresolved-fail")
+        else:
+            raise ValueError("unknown round-census site: " + site)
+        return ContinuationDecision(True, state, budget=budget, census={
+            "verdict_rounds": budget.verdict_rounds + (site == "registered"),
+            "verdictless_rounds": budget.verdictless_rounds, "cap": budget.cap, "closure_class": closure})
+    if action == "owner-closure":
+        allowed = state in {"exhausted", "verdictless-bound"}
+        reason = {"blocked-live": "owner-closure-round-still-open", "blocked-unsettled": "owner-closure-round-unsettled",
+                  "admit": "owner-closure-round-budget-not-exhausted"}.get(state, "")
+    elif action == "review-revision":
+        allowed = state not in {"blocked-live", "blocked-unsettled"}
+        reason = "review-input-revision-" + state if not allowed else ""
+    elif action == "complete-inline":
+        allowed = state not in {"blocked-live", "blocked-unsettled"}
+        reason = "round-unsettled" if not allowed else ""
+    else:
+        allowed = state == "admit"
+        reason = {"blocked-live": "prior-attempt-still-live", "blocked-unsettled": "round-unsettled",
+                  "exhausted": "review-round-budget-exhausted", "verdictless-bound": "review-verdictless-bound"}.get(state, "")
+    detail = ""
+    if action == "owner-closure" and not allowed:
+        if state == "admit":
+            detail = f"rounds={budget.verdict_rounds};max_round={budget.cap};verdictless_streak={budget.verdictless_streak};bound={_ROUND.VERDICTLESS_BOUND}"
+        elif state == "blocked-live":
+            worker = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
+            detail = "attempt=" + "|".join(m.get("attempt_id") or "-" for s, m in rows
+                if _ROUND.classify_round_row(s, m, worker_type=worker) == "live")
+    return ContinuationDecision(allowed, state, reason, "same-command" if state.startswith("blocked-") else budget.next_action,
+        "The exact active round settles without overwriting its result." if state.startswith("blocked-") else "",
+        detail, budget)
+
+
 # ---------------------------------------------------------------------------
 # 1. Who continues the route
 # ---------------------------------------------------------------------------
@@ -1106,50 +1461,12 @@ def answerable_owner_end(status, meta) -> str:
     return "FAIL" if readable_result(meta) == "FAIL" else ""
 
 
-def fix_answers(route, lines, jobs=None) -> tuple[list[str], list[str]]:
-    """What a person's approved fix for a FAIL-ended owner answers: `(answers, spent)`.
-
-    For every round-capped node whose last full-stage verdict round is a blocking FAIL, the
-    fix answers that FAIL attempt, which gives the node the one closure-check round SD-154
-    admits for a revision that answers its last FAIL, within the verdict ceiling cap + 1
-    (SD-161). A node whose closure-check that answer would not admit (already at the ceiling,
-    or bound by BLOCKED rounds without progress) is `spent` as `<node>:<state>`: the fix makes
-    no round for it. A review already disposed by owner-closure gets no further round,
-    but does not prevent an approved answer continuing other unfinished work."""
-    from dispatch_contract import parse_registry_metadata, owner_closure_shape
-    answers, spent = [], []
-    for node in route.get("nodes") or []:
-        if not is_round_capped_node(node):
-            continue
-        worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
-        census = []
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 6:
-                continue
-            meta = parse_registry_metadata(fields[5])
-            if ((meta.get("route_id") or meta.get("route")) == route.get("route_id")
-                    and meta.get("route_node") == node.get("id") and not no_stage_authority(meta)):
-                census.append((fields, meta))
-        rows = [(fields[1], meta) for fields, meta in _ROUND.logical_round_records(census, jobs=jobs)]
-        if not rows or not last_verdict_blocking(rows, worker_type):
-            continue
-        verdicts = [meta for status, meta in rows if classify_round_row(
-            status, meta, worker_type=meta.get("worker_type") or worker_type) == "verdict"]
-        failed = verdicts[-1].get("attempt_id", "")
-        # Admission's own rule decides: the fix answers this FAIL only when that answer is
-        # what admits the closure-check round (not at cap + 1, not bound by BLOCKED rounds).
-        budget = round_budget(route, node, rows, revisions=[{"answers": [failed]}])
-        if not failed or budget.round_kind != "closure-check":
-            if owner_closure_shape(verdicts[-1]) != "registered-review":
-                spent.append(f"{node.get('id')}:{budget.state}")
-            continue
-        answers.append(failed)
-    return answers, spent
+def fix_answers(route, lines, jobs=None):
+    choice = decide_continuation(route, action="fix", jobs=jobs, facts={"lines": lines})
+    return list(choice.answers), list(choice.fallback_nodes)
 
 
-# The round budget already has one implementation (`review_round_cap`); these
-# are its names in this module, not copies.
+# Compatibility names; the round decision above is shared by every adapter.
 classify_round_row = _ROUND.classify_round_row
 round_budget = _ROUND.round_budget
 is_round_capped_node = _ROUND.is_round_capped_node
