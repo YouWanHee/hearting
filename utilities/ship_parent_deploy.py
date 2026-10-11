@@ -215,7 +215,8 @@ def prepare(jobs, attempt, command_file):
         value["parent_availability"] = availability
         write(request_path, value)
     return {"state": "prepared", "request": str(request_path), **value,
-            "run_command": shlex.join(["hearting", "run", "ship-parent-deploy", "run", "--request", str(request_path)])}
+            "run_command": shlex.join([sys.executable, str(Path(__file__).resolve().with_name("ship-parent-deploy.py")),
+                                       "run", "--request", str(request_path)])}
 
 
 def load_request(path):

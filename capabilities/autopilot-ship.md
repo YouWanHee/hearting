@@ -172,7 +172,7 @@ records whether that parent is on the host; a parent preparation before readines
 reviews supplies executor availability, not a deployment or review PASS. Give
 the exact request to the existing independent readiness reviews and finish them
 within their existing ceilings. While waiting for parent execution the owner
-uses its ordinary BLOCKED handoff. If upgrading an older owner runtime, name the
+uses its ordinary BLOCKED handoff. If upgrading an older owner or parent runtime, name the
 installed utility's absolute path in its existing correction; do not rewrite
 the sealed owner environment.
 
@@ -181,7 +181,7 @@ owner hands work back; an answerable BLOCKED/FAIL owner receives the existing
 correction with the deployment result. A wait, cancellation or settlement keeps
 that decision's existing next action and cannot execute deployment.
 
-The parent runs `hearting run ship-parent-deploy run --request <request> --check`
+The parent runs the returned `run_command` with `--check`
 to inspect readiness without mutation, then the same command without `--check`
 to execute the exact request once on the host. Current reviews, arbitration,
 stop/approval fences and command inputs are checked before spawn. Only that
