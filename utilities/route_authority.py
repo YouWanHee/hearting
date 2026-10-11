@@ -115,7 +115,8 @@ def _attempt_decision(status: str, metadata: Mapping[str, str], *, process_state
     if not record_only:
         if status not in OPEN_STATES | TERMINAL_STATES:
             return result("recover", "supervision-controller", "registry-status-invalid")
-        if metadata.get("parent_close_requested") == "1" and (not require_quiescent or process_state == "quiescent"):
+        if metadata.get("parent_close_requested") == "1" and (not require_quiescent or
+                outcome == "pending" and process_state == "quiescent"):
             return result("settle-cancellation" if outcome == "cancelled" else "cancel",
                           "execution-boundary", "cancelled-by-parent")
         if process_state == "live":

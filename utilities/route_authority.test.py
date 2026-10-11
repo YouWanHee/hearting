@@ -1083,6 +1083,23 @@ class CancellationProofBoundaryTest(unittest.TestCase):
         self.assertEqual(RA.decide_continuation(action="attempt-action", status="done", metadata=metadata).next_action,
                          "advance-completed")
 
+    def test_quiet_committed_results_do_not_wait_for_their_cancellation_intent_again(self):
+        for note, failure in (("completed-marker", "pass"), ("dead-worker-fail", "fail"),
+                              ("cancelled-by-parent", "cancelled")):
+            metadata = {"note": note, "failure_class": failure, "parent_close_requested": "1"}
+            original = dict(metadata)
+            choice = RA.decide_continuation(action="terminal-child", status="done", metadata=metadata,
+                facts={"process": SimpleNamespace(state="quiescent", reason="cleanup-settled")})
+            self.assertTrue(choice.allowed, note)
+            metadata["terminal_conflict"] = "1"
+            conflict = RA.decide_continuation(action="terminal-child", status="done", metadata=metadata,
+                facts={"process": SimpleNamespace(state="quiescent", reason="cleanup-settled")})
+            self.assertEqual((conflict.allowed, conflict.reason), (False, "transaction-conflict"))
+            self.assertEqual({k: v for k, v in metadata.items() if k != "terminal_conflict"}, original)
+            execution = RA.decide_continuation(action="attempt", status="done", metadata=original,
+                facts={"process_state": "live"})
+            self.assertIn(execution.next_action, {"cancel", "settle-cancellation"})
+
 
 class InputContinuationBoundaryTest(unittest.TestCase):
     def test_only_original_input_admissions_pass_for_each_harness(self):
