@@ -3777,7 +3777,9 @@ def _resume_message_obligation(duty, store):
     intent = duty.get("intent") or {}
     observation = duty.get("observation") or {}
     target = intent.get("target")
-    ref = intent.get("ref") or observation.get("transfer_ref")
+    # Later checkpoints replace the observation but carry the minted delay
+    # notice ref as "ref"; reading it keeps one notice per overdue message.
+    ref = intent.get("ref") or observation.get("transfer_ref") or observation.get("ref")
     delay_for = intent.get("delay_notice_for") or ""
     if delay_for and not ref:
         body = intent.get("body")
