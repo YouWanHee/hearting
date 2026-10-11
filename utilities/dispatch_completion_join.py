@@ -2958,10 +2958,9 @@ def current_delivery_state(
     if result.advanced:
         # SD-111 P2 trigger 1: the registry lock already released above.
         materialize_after_terminal_close(jobs, attempt_id)
-    from dispatch_terminal_commit import owner_completion_state
+    from dispatch_terminal_commit import CompletionState, owner_completion_state
     current = current_attempt_row(jobs, attempt_id) if result.advanced else snapshot
-    completion = owner_completion_state(jobs, current.status, current.metadata) if current is not None else None
-    workflow_complete = completion is None or completion.state in {"complete", "not-applicable"}
+    completion = owner_completion_state(jobs, current.status, current.metadata) if current is not None else CompletionState("not-applicable")
     return CurrentDeliveryState(
         marker=result.marker,
         marker_digest=result.marker_digest,
@@ -2974,9 +2973,9 @@ def current_delivery_state(
         advanced=result.advanced,
         completion_proven=result.completion_proven,
         terminal_conflict=result.terminal_conflict,
-        workflow_complete=workflow_complete,
-        workflow_state=completion.state if completion is not None else "not-applicable",
-        workflow_reason=completion.reason if completion is not None else "",
+        workflow_complete=completion.settled,
+        workflow_state=completion.state,
+        workflow_reason=completion.reason,
     )
 
 
@@ -4178,7 +4177,9 @@ def close_finished_child(
     """
 
     metadata = getattr(row, "metadata", {}) or {}
-    if (row.status not in OPEN_STATES and deferred_completion(metadata) != "pending"
+    from route_authority import decide_continuation
+    obligation = decide_continuation(action="attempt-action", status=row.status, metadata=metadata)
+    if (obligation.next_action not in {"complete-open", "complete-deferred"}
             and not (correct_recorded_move and row.status == "done"
                      and metadata.get("note") == "dead-invalid-envelope"
                      and metadata.get("reconcile_reason") == "terminal-invalid:artifact-missing")):
@@ -4224,7 +4225,6 @@ def close_finished_child(
         or not terminal.get("artifact_origin_path_b64")
     ):
         return "recorded-move-correction-evidence-unavailable"
-    from route_authority import decide_continuation
     choice = decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
     if not choice.allowed:
         if choice.next_action != "typed-close":

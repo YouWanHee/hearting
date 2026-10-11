@@ -159,6 +159,10 @@ def _round_action(state, node_kind):
             "verdictless-bound": "native-subagent" if review else "owner-inline"}[state]
 
 
+def completion_satisfied(state):
+    return state in {"complete", "not-applicable"}
+
+
 def require_continuation(decision):
     """Translate the one decision into the existing typed error protocol."""
     if not decision.allowed:
@@ -244,7 +248,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                 state, reason = "pending", "campaign-goal-close-pending"
             else:
                 state = "complete"
-        return ContinuationDecision(state == "complete", state, reason,
+        return ContinuationDecision(completion_satisfied(state), state, reason,
             "inspect-recovery" if state == "blocked" else "advance-completed" if state == "complete" else "same-command",
             "The exact terminal evidence, sealed transaction and pending publication/goal are settled."
             if state in {"pending", "unknown"} else "")

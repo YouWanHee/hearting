@@ -1295,7 +1295,6 @@ class ReplacementTest(unittest.TestCase):
         self.assertIsNone(R.death_kind(['now','done'],{**self.meta,'worker_type':'stage','dispatch_depth':'2','note':'dead-runtime-error'}))
 
     def test_runtime_death_is_settled_by_its_own_error_envelope(self):
-        self.absent.stop()
         meta={**self.meta,'worker_type':'owner','note':'dead-runtime-error','failure_class':'runtime'}
         fields=['now','done','',str(self.root)]
         def seen(state,failure_class):
@@ -1312,7 +1311,6 @@ class ReplacementTest(unittest.TestCase):
             self.assertFalse(R._terminal_absent(fields,meta))
 
     def test_capacity_death_with_invalid_capacity_terminal_is_settled_absent(self):
-        self.absent.stop()
         def settle(state,failure_class):
             return mock.patch('codex_dispatch_terminal.inspect_terminal_attempt',
                               return_value={'state':state,'failure_class':failure_class})
@@ -1420,7 +1418,6 @@ class ReplacementTest(unittest.TestCase):
                     log_file=str(self.root/'never-written.log'),**changes)
 
     def test_owner_closed_before_spawn_is_an_unlaunched_pause(self):
-        self.absent.stop()   # the real settlement check: this attempt never wrote a log
         self._unlaunched_owner()
         fields,meta=R._rows(self.jobs.read_text().splitlines())['att-source']
         self.assertEqual(R.death_kind(fields,meta),'unlaunched')

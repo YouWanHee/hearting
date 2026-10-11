@@ -1763,6 +1763,11 @@ class CompletionState:
     next_action: str = ""
     retry_when: str = ""
 
+    @property
+    def settled(self):
+        from route_authority import completion_satisfied
+        return completion_satisfied(self.state)
+
 
 from route_authority import PROVEN_BLOCKED_GATE_REASONS as _PROVEN_BLOCKED_GATE_REASONS
 
