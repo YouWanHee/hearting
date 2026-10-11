@@ -55,6 +55,11 @@ class ParentDeployTest(unittest.TestCase):
                                   completion_dir=lambda *args, **kwargs: self.markers,
                                   _marker_identity_row=lambda r, n, nid, gate, **kw: dict(self.proof[nid]),
                                   terminal_gate_observation=lambda *args, **kwargs: {})
+        self.real_decide = S.authority.decide_continuation
+        decision = patch.object(S.authority, "decide_continuation", return_value=
+            S.authority.ContinuationDecision(False, "answer", "owner-blocked", "correct"))
+        self.decider = decision.start()
+        self.addCleanup(decision.stop)
         for obj, name, value in [
             (S.DC, "_route_module", lambda: self.cr),
             (S, "exact_attempt_row", lambda jobs, aid: SimpleNamespace(status="done", raw=datetime.now(timezone.utc).isoformat()+"\t", metadata={"worker_type":"review"} if aid in {p["attempt_id"] for p in self.proof.values()} else self.meta)),
@@ -121,8 +126,66 @@ class ParentDeployTest(unittest.TestCase):
             request = self.prepared()
             auth.assert_called_once()
             self.assertIsNone(S.read(request)["parent_availability"])
+            self.assertEqual(self.decider.call_args.kwargs["facts"], {})
             with self.assertRaisesRegex(ValueError, "dispatch-child-forbidden"):
                 S.run(request)
+
+    def owner_row(self, status="done", note="dead-worker-blocked"):
+        meta = {**self.meta, "attempt_id": "owner", "note": note}
+        self.jobs.write_text(datetime.now(timezone.utc).isoformat()+"\t"+status+"\trepo\tworktree\towner\t" +
+                             ",".join(k+"="+v for k, v in meta.items())+"\n")
+
+    def test_common_owner_admission_observes_exact_process_and_same_actions(self):
+        self.decider.side_effect = self.real_decide
+        cases = [("open", "", "live", None),
+                 ("done", "dead-worker-blocked", "quiescent", None),
+                 ("done", "dead-worker-blocked", "unverifiable", "same-command"),
+                 ("open", "", "quiescent", "same-command"),
+                 ("cancelled", "", "quiescent", "settle"),
+                 ("done", "", "quiescent", "settle")]
+        for status, note, process, action in cases:
+            with self.subTest(status=status, process=process):
+                self.owner_row(status, note)
+                with patch("route_parent_close.owner_continuation_processes", return_value=(
+                        SimpleNamespace(state=process, reason="fixture observation"), [])) as observed:
+                    if action is None:
+                        S.context(self.jobs, "owner")
+                    else:
+                        with self.assertRaises(S.DC.DispatchContractError) as refused:
+                            S.context(self.jobs, "owner")
+                        self.assertEqual(refused.exception.next_action, action)
+                    observed.assert_called_once()
+        self.assertFalse(self.counter.exists())
+
+    def test_common_admission_binds_real_parent_identity_in_all_harnesses(self):
+        self.decider.side_effect = self.real_decide
+        for harness, variable in [("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"), ("opencode", "OPENCODE_SESSION_ID")]:
+            with self.subTest(harness=harness), patch.dict(os.environ, {variable: "parent"}, clear=True):
+                self.meta["parent_harness"] = harness
+                self.owner_row()
+                with patch("route_parent_close.owner_continuation_processes", return_value=(
+                        SimpleNamespace(state="quiescent", reason="fixture observation"), [])):
+                    S.context(self.jobs, "owner")
+                    self.assertEqual(self.decider.call_args.kwargs["facts"], {"actor": "parent"})
+                    self.assertEqual(self.decider.call_args.kwargs["owner_attempt_id"], "owner")
+                    with patch.dict(os.environ, {variable: "foreign"}):
+                        with self.assertRaisesRegex(S.DC.DispatchContractError, "work-parent-recovery-required"):
+                            S.context(self.jobs, "owner")
+
+    def test_cli_preserves_common_wait_action_and_observation_condition(self):
+        self.decider.side_effect = self.real_decide
+        self.owner_row()
+        with patch("route_parent_close.owner_continuation_processes", return_value=(
+                SimpleNamespace(state="unverifiable", reason="fixture observation"), [])), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            result = S.main(["prepare", "--jobs", str(self.jobs), "--attempt-id", "owner",
+                             "--command-file", str(self.command)])
+        self.assertEqual(result, 69)
+        failure = json.loads(output.getvalue())
+        self.assertEqual(failure["next_action"], "same-command")
+        self.assertTrue(failure["retry_when"])
+        self.assertEqual(failure["detail"], "fixture observation")
+        self.assertFalse(S.paths(self.jobs, "rt-test")[0].exists())
 
     def test_pending_or_overridden_review_stops_before_spawn(self):
         request = self.prepared()
@@ -205,8 +268,10 @@ class ParentDeployTest(unittest.TestCase):
         self.assertFalse(self.counter.exists())
 
     def test_owner_replacement_retains_exact_request_and_reviews(self):
-        request = self.prepared()
         self.cr._current_owner_attempt = lambda jobs, attempt: "replacement-owner"
+        request = self.prepared()
+        self.assertEqual(S.read(request)["owner_attempt_id"], "owner")
+        self.assertEqual(self.decider.call_args.kwargs["owner_attempt_id"], "owner")
         S.run(request)
         result = S.read(S.paths(self.jobs, "rt-test")[1])
         self.assertEqual(result["owner_attempt_id"], "replacement-owner")

@@ -176,6 +176,11 @@ uses its ordinary BLOCKED handoff. If upgrading an older owner runtime, name the
 installed utility's absolute path in its existing correction; do not rewrite
 the sealed owner environment.
 
+Owner status and parent admission use the common continuation decision. A live
+owner hands work back; an answerable BLOCKED/FAIL owner receives the existing
+correction with the deployment result. A wait, cancellation or settlement keeps
+that decision's existing next action and cannot execute deployment.
+
 The parent runs `hearting run ship-parent-deploy run --request <request> --check`
 to inspect readiness without mutation, then the same command without `--check`
 to execute the exact request once on the host. Current reviews, arbitration,

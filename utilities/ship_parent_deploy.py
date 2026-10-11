@@ -82,7 +82,7 @@ def locked(request):
         yield
 
 
-def context(jobs, attempt):
+def context(jobs, attempt, *, owner_prepare=False):
     cr = DC._route_module()
     current = cr._current_owner_attempt(jobs, attempt)
     row = exact_attempt_row(Path(jobs), current)
@@ -90,9 +90,6 @@ def context(jobs, attempt):
     if (meta.get("worker_type") != "owner" or meta.get("registered_worker") != "1"
             or meta.get("dispatch_depth") != "1"):
         raise ValueError("parent-deploy-registered-owner-required")
-    if row.status not in {"open", "running"} and not (
-            row.status == "done" and meta.get("note") == "dead-worker-blocked"):
-        raise ValueError("parent-deploy-owner-not-active-or-blocked")
     route_file, route = _route(Path(jobs), current, meta)
     nodes = [n for n in route["nodes"] if n.get("completion_gate") == "ship-deploy"]
     if (route.get("capability") != "autopilot-ship" or len(nodes) != 1
@@ -101,6 +98,15 @@ def context(jobs, attempt):
                                                          route.get("entry_execution_scope"))):
         raise ValueError("parent-deploy-approved-ship-scope-required")
     node = nodes[0]
+    facts = {} if owner_prepare else {"actor": authority.caller_identity()[1]}
+    decision = authority.decide_continuation(route, action="owner", jobs=Path(jobs),
+                                             owner_attempt_id=attempt, facts=facts)
+    if not ((decision.allowed and decision.next_action == "handback")
+            or (decision.state == "answer" and decision.next_action == "correct")):
+        # Preparing/executing the blocked owner's answer is not an owner start.
+        # All other states keep the common decision's existing continuation.
+        authority.require_continuation(decision._replace(
+            allowed=False, reason=decision.reason or "parent-deploy-owner-not-ready"))
     DC.owner_operation_fence(route, node, jobs=Path(jobs))
     DC.human_gate_entry_fence(route, node, jobs=Path(jobs))
     return current, meta, route_file, route, node
@@ -168,8 +174,8 @@ def record_path(route):
 
 
 def prepare(jobs, attempt, command_file):
-    current, meta, route_file, route, node = context(jobs, attempt)
     caller = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+    current, meta, route_file, route, node = context(jobs, attempt, owner_prepare=bool(caller))
     availability = None
     if caller:
         if caller != current:
@@ -183,7 +189,7 @@ def prepare(jobs, attempt, command_file):
         if result_path.exists():
             raise ValueError("parent-deploy-execution-already-recorded")
         value = {"schema": SCHEMA, "jobs": str(Path(jobs).resolve()), "route_id": route["route_id"],
-                 "route_hash": route["route_hash"], "route_file": str(route_file.resolve()), "owner_attempt_id": current,
+                 "route_hash": route["route_hash"], "route_file": str(route_file.resolve()), "owner_attempt_id": attempt,
                  "parent_session_id": meta["parent_sid"], "command": cmd,
                  "deploy_record": str(record_path(route)), "node_id": node["id"]}
         if request_path.exists():
@@ -459,7 +465,10 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result["state"] in {"prepared", "checked", "success"} else 3
     except (ValueError, OSError, KeyError, TypeError, DC.DispatchContractError, JoinContractError) as exc:
-        print(json.dumps({"state": "not-admitted", "reason": getattr(exc, "reason", str(exc))}, ensure_ascii=False))
+        failure = {"state": "not-admitted", "reason": getattr(exc, "reason", str(exc))}
+        failure.update({key: getattr(exc, key) for key in ("next_action", "retry_when", "detail")
+                        if getattr(exc, key, None)})
+        print(json.dumps(failure, ensure_ascii=False))
         return 69
 
 
