@@ -36,6 +36,7 @@ import re
 import shlex
 import sys
 import time
+from collections import Counter
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
 from .model import (fmt_min, dash, project_of, exec_child_is_wait,
@@ -6005,6 +6006,62 @@ def _gpu_reservation_rows(leases, indent, width, unplaced=False):
     return rows
 
 
+def _gpu_activity_summary(gpu, host):
+    """Count observed processes by full session identity, not saved badge text."""
+    def session_key(owner):
+        if (isinstance(owner, dict) and owner.get("kind") == "session"
+                and owner.get("harness") in {"claude", "codex", "opencode"}
+                and isinstance(owner.get("id"), str) and owner["id"]):
+            return owner["harness"], owner["id"]
+        return None
+
+    observed = Counter()
+    for process in gpu.get("processes") or ():
+        if isinstance(process, dict):
+            key = session_key(process.get("session_owner")) or session_key(process.get("owner"))
+            observed[key] += 1
+    reserved = Counter(session_key(lease.get("owner"))
+                       for lease in gpu.get("reservations") or () if isinstance(lease, dict))
+    groups = []
+    for key, count in observed.items():
+        tag = _resolve_session_tag(*key) if key else None
+        groups.append(("[%s]" % tag if tag else "?", count))
+    groups.sort(key=lambda group: (-group[1], group[0]))
+    warnings = []
+    # A failed process query or unmapped fallback cannot prove an empty GPU.
+    if not host.get("process_detail") and not gpu.get("observation_source"):
+        extra_reserved = sum((reserved - observed).values())
+        extra_observed = sum((observed - reserved).values())
+        if extra_reserved:
+            warnings.append("reserved+%d" % extra_reserved)
+        if extra_observed and not host.get("reservation_detail"):
+            warnings.append("unreserved+%d" % extra_observed)
+    return groups, warnings
+
+
+def _gpu_activity_tail(groups, warnings, available):
+    """Fit whole session entries; +N counts omitted sessions, not processes."""
+    warning = " ".join(warnings)
+    if _dw(" · " + warning) > available:
+        warning = warning.replace("unreserved+", "unres+").replace("reserved+", "res+")
+    warning_width = _dw(" · " + warning) if warning else 0
+    room = available - warning_width - 3
+    entries = ["%s×%d" % group for group in groups]
+    summary = ""
+    for kept in range(len(entries), -1, -1):
+        parts = entries[:kept]
+        if kept < len(entries):
+            parts = parts + ["+%d" % (len(entries) - kept)]
+        candidate = " ".join(parts)
+        if _dw(candidate) <= room:
+            summary = candidate
+            break
+    tail = [(" · " + summary, "dim")] if summary else []
+    if warning and warning_width <= available:
+        tail.append((" · " + warning, "lvl_y"))
+    return tail
+
+
 def _compute_host_rows(term_width=None, sessions=None, resources=None):
     _compute_host_rows.fold_rows = []
     snapshot = _COMPUTE_HOSTS
@@ -6138,12 +6195,17 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
             token = _gpu_token(gpu, max(12, width - _dw(indent) - chip_width), show_name=width >= 100,
                                sessions=sessions, index_width=gpu_index_width,
                                vram_slot=wide_vram_slot)
-            if count:
+            if count or gpu.get("reservations"):
                 _compute_host_rows.fold_rows.append({"line": len(rows),
                     "card_key": _gpu_fold_key(host.get("host"), gpu.get("index")), "folded": folded})
-            rows.append(_clip_segs([(indent, None)] + token + chip, width)[0])
-            rows.extend(_gpu_reservation_rows(gpu.get("reservations") or (), indent, width))
+            row = [(indent, None)] + token + chip
+            if folded:
+                groups, warnings = _gpu_activity_summary(gpu, host)
+                room = width - 1 - sum(_dw(text) for text, _key in row)
+                row += _gpu_activity_tail(groups, warnings, room)
+            rows.append(_clip_segs(row, width)[0])
             if not folded:
+                rows.extend(_gpu_reservation_rows(gpu.get("reservations") or (), indent, width))
                 rows.extend(_gpu_process_rows(gpu, indent, width))
     return rows
 

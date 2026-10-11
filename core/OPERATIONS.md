@@ -1518,9 +1518,17 @@ Reservation lifetime follows the exact wrapper PID, start time and PID namespace
 not its launching session. Normal exit releases it; the next launch removes
 proven-dead/reused-PID reservations, and read-only status omits them from its
 view, preserving unknown identity. Existing work is not adopted or interrupted: its probe processes mark
-the GPU occupied. `compute-hosts list` and Fleet's top compute panel show GPU
-reservations, including the session tag, task and start time, before CUDA has
-allocated memory. Host-local storage lets callers on different machines converge
+the GPU occupied. `compute-hosts list` shows GPU reservations before CUDA has
+allocated memory. Fleet's folded compute panel uses one row per GPU, appending
+observed process counts by session tag, largest count first. Only differences
+between reserved and observed counts per session add short `reserved+N` or
+`unreserved+N` labels; unavailable observation is not an empty process sample.
+The existing `p` expansion retains reservation owners, tasks, start times and
+process commands. The session summary shortens whole entries to `+N` at narrow
+widths without shifting the utilization and memory columns or adding rows.
+Reservations with unknown device placement remain visible at host level.
+This common read-only renderer applies to all three harnesses and adds no
+flag, setting or reservation mutation. Host-local storage lets callers on different machines converge
 without depending on a shared NAS mount or an installed harness on the target.
 
 `run` starts a command detached under a stable run id and writes its log and
