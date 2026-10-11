@@ -190,6 +190,7 @@ def prepare(jobs, attempt, command_file):
             previous, _ = load_request(request_path)
             # An ordinary owner replacement keeps exactly this request.
             value["owner_attempt_id"] = previous["owner_attempt_id"]
+            value["parent_session_id"] = previous["parent_session_id"]
             if availability is None:
                 availability = previous.get("parent_availability")
             unchanged = all(previous.get(k) == v for k, v in value.items())
