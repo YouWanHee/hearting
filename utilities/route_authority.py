@@ -597,9 +597,13 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         state = ("blocked-live" if "live" in kinds else "blocked-unsettled" if "unsettled" in kinds else
                  "verdictless-bound" if counted >= _ROUND.VERDICTLESS_BOUND else
                  "exhausted" if len(verdicts) >= cap else "admit")
-        closure = bool(state in {"admit", "exhausted"} and len(verdicts) < cap + 1 and verdicts and
-            _ROUND._last_round_blocking_verdict([rows[verdicts[-1]]], worker_type) and
-            any(rows[verdicts[-1]][1].get("attempt_id") in (r.get("answers") or ()) for r in revisions))
+        # A FAIL a revision answers, or a verdict whose marker an upstream
+        # revision tombstoned, gets its one check within the cap + 1 ceiling.
+        last_id = rows[verdicts[-1]][1].get("attempt_id") if verdicts else None
+        closure = bool(state in {"admit", "exhausted"} and len(verdicts) < cap + 1 and last_id and (
+            (_ROUND._last_round_blocking_verdict([rows[verdicts[-1]]], worker_type) and
+             any(last_id in (r.get("answers") or ()) for r in revisions)) or
+            any(last_id in (r.get("supersedes") or ()) for r in revisions)))
         if closure:
             state = "admit"
         budget = _ROUND.RoundBudget(len(verdicts), counted, kinds.count("verdict-less"), cap, state,
