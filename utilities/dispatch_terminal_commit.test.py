@@ -423,7 +423,8 @@ class RelatedOwnerDiscoveryTests(unittest.TestCase):
                 route_module.return_value.terminal_gate_observation.return_value = self.owner_gate()
                 transaction = T.settle_terminal_commit(self.request(), services)
             self.assertEqual((transaction.result, transaction.reason),
-                             ("ineligible", "child-not-quiescent"))
+                             ("recoverable", "child-not-quiescent"))
+            self.assertTrue(transaction.next_step["retry_when"])
             self.assertEqual(calls, [])
         finally:
             process.terminate()

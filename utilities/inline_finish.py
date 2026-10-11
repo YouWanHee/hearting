@@ -67,59 +67,57 @@ def _on_a_branch(cwd, commit) -> bool:
     return found.returncode == 0 and bool(found.stdout.strip())
 
 
-def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, Any]:
+def registered_route(route, jobs, inherited):
+    from dispatch_contract import parse_registry_metadata
+    try:
+        return any(route["route_id"] in {meta.get("route_id"), meta.get("owner_route_id")}
+            for fields in (line.split("\t") for line in _registry_lines(jobs, inherited))
+            for meta in [parse_registry_metadata(fields[5]) if len(fields) > 5 else {}])
+    except Exception as exc:
+        raise InlineFinishError("finish-registry-unreadable") from exc
+
+
+def admit(route, *, allow_legacy=False):
+    """Collect the current caller and registry; the common policy selects finish."""
+    from dispatch_contract import DispatchContractError, resolve_global_registry
+    from dispatch_parent_completion import interactive_parent_identity
+    from route_authority import decide_continuation
+    facts = {"allow_legacy": allow_legacy, "registered_caller": bool(
+        os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0")}
+    try:
+        _harness, facts["sid"] = interactive_parent_identity(os.environ)
+    except DispatchContractError as exc:
+        facts["identity_error"] = ("finish-caller-harness-ambiguous" if str(exc) == "caller-harness-ambiguous"
+                                   else "finish-caller-harness-invalid")
+    inherited = bool(os.environ.get("AGENT_DISPATCH_JOBS"))
+    jobs = resolve_global_registry(Path(__file__).resolve().parents[1], None, 0, "read").path
+    if inherited and not jobs.is_file():
+        raise InlineFinishError("finish-registry-unavailable")
+    facts["registered_route"] = registered_route(route, jobs, inherited)
+    choice = decide_continuation(route, action="finish", facts=facts)
+    if not choice.allowed:
+        raise InlineFinishError(choice.reason)
+    return choice, jobs, inherited
+
+
+def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=None) -> dict[str, Any]:
     root = Path(route["artifact_root"]).resolve(strict=True)
     route_file = Path(route_file)
     if route_file.is_symlink():
         raise InlineFinishError("finish-route-unsafe")
     route_file = route_file.resolve(strict=True)
-    if route.get("effective_intensity") != "direct":
-        raise InlineFinishError("finish-route-not-direct")
+    _choice, jobs, inherited_jobs = _admission or admit(route)
+    sid = _choice.census
     nodes = route.get("nodes") or []
-    if (len(nodes) != 1 or nodes[0].get("id") != "inline"
-            or nodes[0].get("kind") != "capability-owner"
-            or nodes[0].get("dispatch_depth") != 0
-            or nodes[0].get("execution_surface") != "inline"
-            or nodes[0].get("registered_worker") is not False
-            or nodes[0].get("terminal") is not True):
-        raise InlineFinishError("finish-inline-owner-sentinel-required")
-    # The interactive caller can be hosted by any supported runtime.  Keep the
-    # same ambiguity rule used by dispatch admission rather than guessing one
-    # session variable when a shell happens to inherit several.
-    from dispatch_parent_completion import interactive_parent_identity
-    from dispatch_contract import DispatchContractError
-    try:
-        _harness, sid = interactive_parent_identity(os.environ)
-    except DispatchContractError as exc:
-        if str(exc) == "caller-harness-ambiguous":
-            raise InlineFinishError("finish-caller-harness-ambiguous") from exc
-        raise InlineFinishError("finish-caller-harness-invalid") from exc
-    if not sid:
-        raise InlineFinishError("finish-current-session-missing")
-    if not sid or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0":
-        raise InlineFinishError("finish-registered-caller-ineligible")
     if dispatch_terminal_commit.require_current_cleanup("inline-finish", target=route_file) is not None:
         raise InlineFinishError("finish-foreign-cleanup-scope")
-    from dispatch_contract import resolve_global_registry
-    inherited_jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
-    jobs = resolve_global_registry(Path(__file__).resolve().parents[1], None, 0, "read").path
-    if inherited_jobs and not jobs.is_file():
-        raise InlineFinishError("finish-registry-unavailable")
-    try:
-        for line in _registry_lines(jobs, bool(inherited_jobs)):
-            fields = line.split("\t")
-            from dispatch_contract import parse_registry_metadata
-            metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}
-            if route["route_id"] in {metadata.get("route_id"), metadata.get("owner_route_id")}:
-                raise InlineFinishError("finish-registered-route-ineligible")
-    except InlineFinishError: raise
-    except Exception as exc: raise InlineFinishError("finish-registry-unreadable") from exc
     node = nodes[-1]
     if not isinstance(node, dict) or not node.get("id"):
         raise InlineFinishError("finish-terminal-node-missing")
     base = root / ".runtime" / "inline-finish" / "v1" / route["route_id"]
     state_path, lock_path = base / "finish.json", base / "finish.lock"
     prior_state = _read(state_path)
+    from route_authority import decide_continuation
     historical_false = None
     if not prior_state and api.outcome_path(route_file).exists():
         # Autoclose remains terminal. A historical false is consumable only
@@ -128,16 +126,16 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
             closure = json.loads(api.outcome_path(route_file).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             closure = {}
-        if closure.get("autoclose") and closure.get("route_hash") == route["route_hash"]:
+        choice = decide_continuation(route, action="finish-outcome", facts={"closure": closure})
+        if choice.state == "autoclosed":
             print("capability-route: route already closed automatically; nothing left to finish", file=sys.stderr)
             return {"schema": "finish_receipt_v1", "route_id": route["route_id"], "route_hash": route["route_hash"],
                     "state": "already-closed-automatically", "autoclose": closure["autoclose"]}
-        if (closure.get("terminal_gate_proven") is not False
+        if (not choice.allowed
                 or closure.get("route_id") != route["route_id"]
                 or closure.get("route_hash") != route["route_hash"]
                 or closure.get("route_file") != str(Path(route_file).resolve())
-                or closure.get("cwd") != route.get("cwd")
-                or closure.get("disposition") in ("abandoned", "operator-decision", "cancelled")):
+                or closure.get("cwd") != route.get("cwd")):
             raise InlineFinishError("finish-route-already-closed")
         # A registered owner's tuple is that owner's: an inline caller (never a registered one) cannot
         # take it over. An inline tuple is compared below with the intent, marker and binding this
@@ -160,7 +158,9 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
     admitted = artifact_producer.cycle_route_admission(root, record, route, finalize=True)
     if not admitted.allow:
         raise InlineFinishError("finish-route-cycle-" + admitted.reason)
-    if record.get("deleted_at") and not finished:
+    choice = decide_continuation(route, action="finish-cycle", facts={"deleted": bool(record.get("deleted_at")),
+        "finished": finished, "review_live": artifact_producer._live_review_lease(root, record["cycle_id"]) is not None})
+    if choice.state == "deleted":
         # The cycle was deleted while its route ran (§45 D-126): the route ends as a route with no output.
         return _finish_deleted_cycle(root, route, route_file, record, args, api)
     # A campaign deleted since the finish is the campaign it was; a cycle moved to another campaign is
@@ -169,8 +169,10 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
     if not campaign or not route.get("campaign_key") or (
             campaign.get("key") != route.get("campaign_key") and not record.get("moved_at") and not finished):
         raise InlineFinishError("finish-campaign-key-mismatch")
-    if artifact_producer._live_review_lease(root, record["cycle_id"]) is not None:
-        raise InlineFinishError("finish-active-review-lease")
+    if not choice.allowed:
+        error = InlineFinishError(choice.reason)
+        error.retry_when = choice.retry_when
+        raise error
     output = artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
     evidence = Path(args.evidence).absolute()
     # Nothing moves payloads now; a path an earlier release moved is translated
@@ -273,17 +275,11 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 locked_evidence, locked_summary = evidence_raw, summary_raw
             if not finished and (locked_evidence != evidence_raw or locked_summary != summary_raw):
                 raise InlineFinishError("finish-evidence-drift")
-            try:
-                for line in _registry_lines(jobs, bool(inherited_jobs)):
-                    fields = line.split("\t")
-                    from dispatch_contract import parse_registry_metadata
-                    metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}
-                    if route["route_id"] in {metadata.get("route_id"), metadata.get("owner_route_id")}:
-                        raise InlineFinishError("finish-registered-route-ineligible")
-            except InlineFinishError:
-                raise
-            except Exception as exc:
-                raise InlineFinishError("finish-registry-unreadable") from exc
+            from route_authority import decide_continuation
+            choice = decide_continuation(route, action="finish-registry",
+                facts={"registered_route": registered_route(route, jobs, bool(inherited_jobs))})
+            if not choice.allowed:
+                raise InlineFinishError(choice.reason)
             locked_dirty = subprocess.run(
                 ["git", "-C", route["cwd"], "status", "--porcelain", "--untracked-files=no"],
                 capture_output=True, text=True)
@@ -306,8 +302,12 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 raise InlineFinishError("finish-route-drift")
             if not _on_a_branch(route["cwd"], intent["commit"]):
                 raise InlineFinishError("finish-commit-drift")
-            if artifact_producer._live_review_lease(root, record["cycle_id"]) is not None:
-                raise InlineFinishError("finish-active-review-lease")
+            choice = decide_continuation(route, action="finish-cycle",
+                facts={"review_live": artifact_producer._live_review_lease(root, record["cycle_id"]) is not None})
+            if not choice.allowed:
+                error = InlineFinishError(choice.reason)
+                error.retry_when = choice.retry_when
+                raise error
             state = _read(state_path)
             if state and state.get("inline_finish_id") != intent_id:
                 prior_intent = state.get("intent") or {}

@@ -831,7 +831,9 @@ def drive_serial_chain(
             if row.metadata.get("session_chain_id") == chain_id and row.status in {"open", "running"}
         }
         if open_chain and reconcile(joined, open_chain):
-            receipt = join(set(attempts))
+            from dispatch_supervision import wait_for_batch
+            receipt = wait_for_batch(join=join, attempts=set(attempts), jobs=Path(jobs),
+                parent_attempt_id=parent_attempt_id, emit=emit)
             joined_rows = refresh(set(attempts))
             joined = {row.attempt_id: row for row in joined_rows}
         if allow_advance is not None and not allow_advance():

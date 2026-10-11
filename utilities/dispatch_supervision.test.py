@@ -566,5 +566,34 @@ class NamespaceExtinctObligationTest(unittest.TestCase):
             self.assertFalse(supervision._pending(supervision._rows(jobs), ["att-extinct"], jobs))
 
 
+class DeferredCollectorBoundaryTest(unittest.TestCase):
+    def test_deferred_projection_uses_deadline_backoff_and_never_replaces(self):
+        from dispatch_completion_join import CompletionDeferred
+        now = [100.0]
+        def pause(seconds):
+            now[0] += seconds
+        join, replace = mock.Mock(side_effect=CompletionDeferred("termination-pending")), mock.Mock()
+        with mock.patch.object(supervision.time, "monotonic", side_effect=lambda: now[0]), \
+             mock.patch.object(supervision.time, "sleep", side_effect=pause) as sleep, \
+             mock.patch.object(supervision, "materialize", return_value=[]):
+            result = supervision.wait_for_batch(join=join, attempts={"att-a", "att-b"}, jobs=Path("/unused"),
+                deadline=105.0, replacement_checkpoint=replace)
+        self.assertEqual(result["state"], "watch-expired")
+        self.assertEqual(join.call_args_list, [mock.call({"att-a", "att-b"}), mock.call({"att-a", "att-b"})])
+        sleep.assert_called_once_with(5.0)
+        replace.assert_not_called()
+
+    def test_deferred_projection_obeys_stop_and_replays_same_batch(self):
+        from dispatch_completion_join import CompletionDeferred
+        with mock.patch.object(supervision.time, "sleep"), mock.patch.object(supervision, "materialize", return_value=[]):
+            stopped = supervision.wait_for_batch(join=mock.Mock(side_effect=CompletionDeferred("termination-pending")),
+                attempts={"att-a"}, jobs=Path("/unused"), stop_check=lambda: "receiver-unavailable")
+            join = mock.Mock(side_effect=[CompletionDeferred("termination-pending"), {"state": "ready", "children": [{"attempt_id": "att-a"}]}])
+            settled = supervision.wait_for_batch(join=join, attempts={"att-a"}, jobs=Path("/unused"))
+        self.assertEqual(stopped["reason"], "receiver-unavailable")
+        self.assertEqual(settled["children"], [{"attempt_id": "att-a"}])
+        self.assertEqual(join.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

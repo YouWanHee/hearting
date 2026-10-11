@@ -28,6 +28,7 @@ from dispatch_completion_join import (  # noqa: E402
     consume_parent_session_attempt,
     JoinContractError,
     materialize_after_terminal_close,
+    harvest_open_attempt,
     parent_session_state_path,
     required_action_for_attempt,
     route_completion_evidence,
@@ -270,48 +271,30 @@ def main(argv: list[str]) -> int:
 
     marked_done = 0
     if args.mark_done:
-        live = [fields for fields in rows if fields[1] in {"open", "running"}]
-        if len(live) > 1:
-            print("check=failed\nreason=ambiguous-selector")
-            print(f"matched_live={len(live)}")
-            return 64
-        if live:
-            target = live[0]
-            metadata = parse_registry_metadata(target[5])
-            try:
-                validate_attempt_metadata(metadata)
-            except DispatchContractError as exc:
-                print(f"check=failed\nreason={exc.reason}\ndetail={exc.detail}")
-                return 65
-            attempt_id = metadata.get("attempt_id")
-            if not attempt_id:
-                print("check=failed\nreason=attempt-id-required")
-                return 65
-            try:
-                if metadata.get("route_id"):
-                    if args.completion:
-                        if not Path(args.completion).is_file():
-                            raise ValueError("route-completion-required")
-                        _complete_exact_routed_attempt(jobs, metadata, Path(args.completion))
-                    else:
-                        _complete_routed_attempt_from_terminal_evidence(
-                            jobs, metadata, target[3]
-                        )
-                elif close_attempt_row(jobs, attempt_id, "harvest-complete"):
-                    materialize_after_terminal_close(jobs, attempt_id)
-                else:
-                    raise ValueError("attempt-row-not-open")
-            except (KeyError, OSError, TypeError, ValueError) as exc:
-                print(f"check=failed\nreason={exc}")
-                return 65
-            marked_done = 1
+        def complete_routed(jobs, metadata, worktree, completion):
+            if completion:
+                if not Path(completion).is_file():
+                    raise ValueError("route-completion-required")
+                _complete_exact_routed_attempt(jobs, metadata, Path(completion))
+            else:
+                _complete_routed_attempt_from_terminal_evidence(jobs, metadata, worktree)
+        try:
+            marked_done, target, metadata = harvest_open_attempt(jobs, rows,
+                completion=args.completion, complete_routed=complete_routed)
+        except (DispatchContractError, JoinContractError, KeyError, OSError, TypeError, ValueError) as exc:
+            reason = getattr(exc, "reason", str(exc))
+            print(f"check=failed\nreason={reason}")
+            if reason == "ambiguous-selector":
+                print(f"matched_live={exc.matched_live}")
+                return 64
+            if getattr(exc, "detail", ""):
+                print(f"detail={exc.detail}")
+            return 65
 
-        if live and not args.keep_home:
+        if marked_done and not args.keep_home:
             profile_name = metadata.get("profile")
             if profile_name:
-                home = resolve_dispatch_state_root(resolve_agent_home()) / "homes" / (
-                    f"{target[4]}.{profile_name}"
-                )
+                home = resolve_dispatch_state_root(resolve_agent_home()) / "homes" / f"{target[4]}.{profile_name}"
                 if home.exists():
                     shutil.rmtree(home, ignore_errors=True)
 

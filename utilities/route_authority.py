@@ -22,7 +22,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import NamedTuple
+from typing import Mapping, NamedTuple
 
 from dispatch_attempt_policy import committed_outcome, readable_result
 import review_round_cap as _ROUND
@@ -45,6 +45,11 @@ class ContinuationDecision(NamedTuple):
     answers: tuple = ()
     fallback_nodes: tuple = ()
     census: object = None
+
+
+PROVEN_BLOCKED_GATE_REASONS = frozenset({
+    "completion-attempt-not-current", "completion-evidence-revised-unrecorded",
+})
 
 
 def _replacement_kind(status, meta, *, jobs=None, lines=None):
@@ -88,14 +93,75 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
 
 
 def _replacement_terminal_absent(fields, meta, *, capacity=False, runtime=False):
-    from codex_dispatch_terminal import inspect_terminal_attempt
-    result = inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
-                                      artifact_root_metadata=meta.get('artifact_root'))
-    if capacity and result.get('state') == 'invalid' and result.get('failure_class') == 'capacity':
-        return True  # A usage-limit result is the stop itself, not a handoff to settle.
-    if runtime and result.get('state') == 'invalid' and result.get('failure_class') == 'runtime':
-        return True  # So is a runtime error envelope (a provider 5xx): no handoff was ever written.
-    return result.get('state') == 'absent'
+    import dispatch_replacement as replacement
+    terminal = replacement.terminal_observation(fields, meta)
+    return decide_continuation(action="replacement-result", facts={"terminal": terminal,
+        "kind": "capacity" if capacity else "runtime" if runtime else "silent"}).allowed
+
+
+def _attempt_decision(status: str, metadata: Mapping[str, str], *, process_state: str | None,
+                      process_reason="", terminal_observed=False, result_state=None, record_only=False,
+                      require_quiescent=False):
+    """Select the attempt obligation and its record action from the same disposition.
+
+    A record-only projection has no process observation and grants no execution.
+    Runtime consumers keep committed results while observing their physical cleanup.
+    """
+    from dispatch_attempt_policy import (AttemptDecision, OPEN_STATES, TERMINAL_STATES,
+        DEFERRED_COMPLETION_NOTE, REVIEW_BLOCKING_NOTE, terminal_conflict_pending)
+    outcome = committed_outcome(status, metadata)
+    def result(action, responsible, reason, retry="", record="inspect-done-failure"):
+        return record if record_only else AttemptDecision(outcome, action, responsible, reason, retry)
+    if not record_only:
+        if status not in OPEN_STATES | TERMINAL_STATES:
+            return result("recover", "supervision-controller", "registry-status-invalid")
+        if metadata.get("parent_close_requested") == "1" and (not require_quiescent or
+                outcome == "pending" and process_state == "quiescent"):
+            return result("settle-cancellation" if outcome == "cancelled" else "cancel",
+                          "execution-boundary", "cancelled-by-parent")
+        if process_state == "live":
+            return result("wait", "execution-boundary", process_reason or "process-alive")
+        if process_state != "quiescent":
+            return result("recover", "supervision-controller", process_reason or "process-unverifiable")
+    if status in OPEN_STATES:
+        if result_state == "unverifiable":
+            return result("recover", "supervision-controller", "terminal-evidence-unverifiable", record="complete-open")
+        return result("reconcile", "terminal-writer",
+            "terminal-observed" if result_state == "settleable" or terminal_observed else
+            "terminal-invalid" if result_state == "invalid" else "process-exited", record="complete-open")
+    if terminal_conflict_pending(metadata):
+        return result("inspect-conflict", "workflow-owner", "terminal-evidence-conflict",
+                      record="advance-completed" if outcome == "cancelled" else "inspect-done-failure")
+    if outcome == "cancelled":
+        return result("inspect-failure", "workflow-owner", "terminal-outcome-unclassified", record="advance-completed")
+    if outcome == "succeeded":
+        return result("advance", "completion-controller", "registry-closed", record="advance-completed")
+    if outcome == DEFERRED_COMPLETION_NOTE:
+        return result("complete", "completion-controller", DEFERRED_COMPLETION_NOTE, record="complete-deferred")
+    if outcome == "review-blocked":
+        return result("review", "workflow-owner", REVIEW_BLOCKING_NOTE)
+    if outcome == "failed":
+        note = metadata.get("note", "")
+        retry = ("" if status == "cancelled" or metadata.get("failure_class") == "cancelled" else
+                 "capacity" if note == "dead-capacity" else "" if readable_result(metadata) else
+                 "fallback" if note.startswith("dead-") else "")
+        return result("inspect-failure", "workflow-owner", note or status, retry)
+    return result("inspect-failure", "workflow-owner", "terminal-outcome-unclassified")
+
+
+def _attempt_action(status: str, metadata: Mapping[str, str]) -> str:
+    return _attempt_decision(status, metadata, process_state=None, record_only=True)
+
+
+def _round_action(state, node_kind):
+    review = node_kind == "review-worker"
+    return {"admit": "dispatch", "blocked-live": "wait", "blocked-unsettled": "wait",
+            "exhausted": "owner-closure" if review else "report",
+            "verdictless-bound": "native-subagent" if review else "owner-inline"}[state]
+
+
+def completion_satisfied(state):
+    return state in {"complete", "not-applicable"}
 
 
 def require_continuation(decision):
@@ -116,7 +182,190 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
     Unknown execution names the condition for replaying the same command. Transport,
     locking and immutable publication stay with the existing consumers.
     """
-    route, facts = route or {}, facts or {}
+    route, facts, metadata = route or {}, facts or {}, metadata or {}
+    if action in {"finish", "finish-registry"}:
+        registered_reason = "finish-registered-route-ineligible" if facts.get("registered_route") else ""
+        if action == "finish-registry":
+            return ContinuationDecision(not registered_reason, "protected" if registered_reason else "continue", registered_reason)
+    if action == "finish":
+        nodes = route.get("nodes") or []
+        shape = (len(nodes) == 1 and isinstance(nodes[0], dict) and nodes[0].get("id")
+                 and nodes[0].get("execution_surface") == "inline"
+                 and nodes[0].get("dispatch_depth") == 0 and nodes[0].get("registered_worker") is False
+                 and nodes[0].get("terminal") is True)
+        modern = bool(shape and route.get("effective_intensity") == "direct"
+                      and nodes[0].get("id") == "inline" and nodes[0].get("kind") == "capability-owner")
+        reason = ("finish-route-not-direct" if route.get("effective_intensity") != "direct"
+                  else "finish-inline-owner-sentinel-required") if not modern and not (shape and facts.get("allow_legacy")) else ""
+        reason = reason or facts.get("identity_error", "") or (
+            "finish-current-session-missing" if not facts.get("sid") else
+            "finish-registered-caller-ineligible" if facts.get("registered_caller") else registered_reason)
+        return ContinuationDecision(not reason, "modern" if modern else "legacy", reason, census=facts.get("sid"))
+    if action == "finish-outcome":
+        closure = facts.get("closure")
+        if closure is None or facts.get("prior_state"):
+            return ContinuationDecision(True, "continue")
+        if facts.get("legacy"):
+            return ContinuationDecision(False, "closed", "finish-route-already-closed")
+        if closure.get("autoclose") and closure.get("route_hash") == route["route_hash"]:
+            return ContinuationDecision(False, "autoclosed")
+        historical = closure.get("terminal_gate_proven") is False and closure.get("disposition") not in {
+            "abandoned", "operator-decision", "cancelled"}
+        return ContinuationDecision(historical, "historical" if historical else "closed",
+                                    "" if historical else "finish-route-already-closed")
+    if action == "finish-cycle":
+        if facts.get("deleted") and not facts.get("finished"):
+            return ContinuationDecision(True, "deleted")
+        live = facts.get("review_live", False)
+        return ContinuationDecision(not live, "wait" if live else "continue",
+            "finish-active-review-lease" if live else "", "same-command" if live else "continue",
+            "The exact independent review process has ended and its lease is released." if live else "")
+    if action == "completion-owner":
+        from dispatch_attempt_policy import verdict_pass
+        applicable = not facts.get("closing") and metadata.get("workflow_completion") == "runtime-v1"
+        applicable = applicable and (status in {"open", "running"} if facts.get("executing") else
+            metadata.get("worker_type") == "owner" and metadata.get("dispatch_depth") == "1"
+            and status == "done" and verdict_pass(metadata))
+        return ContinuationDecision(bool(applicable), "applicable" if applicable else "not-applicable")
+    if action == "completion-state":
+        reason, state = facts.get("error", ""), "unknown"
+        if not reason:
+            if not facts.get("commit_exists") or facts.get("gate_only"):
+                missing = {node: proof.get("reason", "unproven") for node, proof in facts.get("gates", {}).items() if not proof.get("passed")}
+                reasons = set(missing.values())
+                blocked = reasons & PROVEN_BLOCKED_GATE_REASONS
+                state = "blocked" if blocked else "pending"
+                reason = sorted(blocked or {r for r in reasons if r})[0] if blocked or any(reasons) else ""
+                if facts.get("gate_only"):
+                    return ContinuationDecision(not missing, "proved" if not missing else state, reason,
+                        "continue" if not missing else "needs-owner", census=missing)
+            elif facts.get("checkpoint") != "owner-envelope-sealed":
+                state, reason = "pending", str(facts.get("checkpoint") or "")
+            elif not facts.get("forward_verified"):
+                state, reason = "pending", "forward-recovery-not-proved"
+            elif facts.get("publication_pending"):
+                state, reason = "pending", "shared-spec-publication-pending"
+            elif facts.get("goal_pending"):
+                state, reason = "pending", "campaign-goal-close-pending"
+            else:
+                state = "complete"
+        return ContinuationDecision(completion_satisfied(state), state, reason,
+            "inspect-recovery" if state == "blocked" else "advance-completed" if state == "complete" else "same-command",
+            "The exact terminal evidence, sealed transaction and pending publication/goal are settled."
+            if state in {"pending", "unknown"} else "")
+    if action == "terminal-child":
+        if facts.get("contradiction"):
+            return ContinuationDecision(False, "protected", "terminal-attempt-not-pass", "inspect-recovery")
+        if facts.get("never_started"):
+            return ContinuationDecision(True, "proved")
+        process = facts["process"]
+        decision = _attempt_decision(status, metadata, process_state=process.state,
+                                     process_reason=process.reason, require_quiescent=True)
+        reason = {"inspect-conflict": "transaction-conflict", "reconcile": "child-not-terminal",
+                  "cancel": "child-not-terminal", "complete": "child-not-terminal",
+                  "wait": "child-not-quiescent", "recover": "child-not-quiescent"}.get(decision.action, "")
+        return ContinuationDecision(not reason, "wait" if reason else "proved", reason, "same-command" if reason else "continue",
+            "The exact related child is quiescent and its terminal result is committed." if reason else "",
+            "child-terminal-conflict" if decision.action == "inspect-conflict" else process.reason if reason else "")
+    if action == "stage-settlement":
+        process = facts["process"]
+        decision = _attempt_decision(status, metadata, process_state=process.state, process_reason=process.reason)
+        eligible = metadata.get("worker_type") not in {"owner", "frame"} and decision.action == "reconcile"
+        if eligible:
+            return decide_continuation(action="terminal-evidence", metadata=metadata, facts=facts)
+        return ContinuationDecision(False, "wait", decision.reason, decision.action,
+            "The exact stage process is quiescent with its terminal result readable.")
+    if action == "owner-terminal":
+        from dispatch_contract import SUPERVISOR_LEASE_KIND
+        identity = (metadata.get("worker_type") == "owner" and metadata.get("supervisor_lease") == SUPERVISOR_LEASE_KIND
+            and metadata.get("supervisor_lease_file") and metadata.get("registered_worker") == "1"
+            and metadata.get("launch_started") == "1" and metadata.get("pid_start") and metadata.get("pid")
+            and metadata.get("log_file"))
+        if not identity or status not in {"open", "running"}:
+            return ContinuationDecision(False, "not-applicable")
+        if facts.get("lease_held"):
+            return ContinuationDecision(False, "wait", "supervisor-live", "same-command")
+        decision = _attempt_decision(status, metadata, process_state=facts["process"].state,
+                                    process_reason=facts["process"].reason)
+        return ContinuationDecision(decision.action == "reconcile", "continue" if decision.action == "reconcile" else "wait",
+            "" if decision.action == "reconcile" else facts["process"].reason, "same-command",
+            "The exact supervisor lease is released and its owner process is quiescent.")
+    if action == "delivery":
+        state = facts["state"]
+        if state.cancellation_requested and not state.cancelled:
+            return ContinuationDecision(False, "wait", "termination-pending", "complete-open",
+                "The exact cancellation and its owned processes are settled.")
+        complete = state.workflow_complete and not facts.get("blocked_reason")
+        success = (state.quiescent and state.owned_children == 0 and complete and
+                   (state.cancelled or state.completion_proven and state.status == "done"
+                    and state.verdict == "PASS" and not state.terminal_conflict))
+        return ContinuationDecision(success, "success" if success else "attention",
+            facts.get("blocked_reason", ""), "inspect-recovery" if facts.get("blocked_reason") else "advance-completed" if success else
+            "finish-workflow" if not complete else "complete-open" if state.status in {"open", "running"}
+            else "inspect-done-failure")
+    if action == "join":
+        observed, completion = facts["observed"], facts["completion"]
+        decision = _attempt_decision(status, metadata, process_state=observed.process_state,
+            process_reason=observed.process_reason, terminal_observed=observed.reason == "terminal-observed")
+        workflow_pending, blocked = completion.state in {"pending", "unknown"}, completion.state == "blocked"
+        reason = {"wait": "process-alive", "recover": "process-unverifiable", "complete": "completion-deferred"}.get(
+            decision.action, "registry-closed" if status == "done" else "terminal-observed")
+        ready = decision.action not in {"wait", "recover", "complete"}
+        settle = bool(facts.get("settlement_available")) and (
+            ready and status in {"open", "running"} or workflow_pending or decision.action == "complete") and decision.action != "inspect-conflict"
+        recover = reason == "process-unverifiable" or (settle and status in {"open", "running"}
+                    and metadata.get("pid", "").isdigit() and bool(metadata.get("pid_start")))
+        return ContinuationDecision(ready and not workflow_pending and not blocked,
+            "pending" if workflow_pending or blocked or not ready or settle else "ready",
+            "workflow-completion-pending" if workflow_pending or blocked else "completion-deferred" if settle and decision.action == "complete"
+            else "terminal-commit-pending" if settle else reason,
+            "finish-workflow" if workflow_pending or blocked else _attempt_action(status, metadata),
+            "The exact process, terminal writer and workflow settlement are observed complete." if not ready or workflow_pending else "",
+            census={"attempt": decision, "workflow_pending": workflow_pending, "blocked": blocked,
+                    "closure_eligible": blocked or ready and not workflow_pending, "settle": settle, "recover": recover})
+    if action == "terminal-evidence":
+        from codex_dispatch_terminal import review_blocking_handoff
+        from dispatch_attempt_policy import REVIEW_BLOCKING_NOTE
+        terminal = facts["terminal"]
+        state, verdict = str(terminal.get("state") or "absent"), str(terminal.get("verdict") or "")
+        if state != "valid":
+            reason = "terminal-" + state
+            if terminal.get("reason"):
+                reason += ":" + str(terminal["reason"])
+            return ContinuationDecision(False, state, reason, "typed-close", detail="dead-invalid-envelope")
+        if verdict in {"FAIL", "BLOCKED"}:
+            blocking = review_blocking_handoff(terminal, metadata.get("worker_type"))
+            return ContinuationDecision(False, "typed", "typed-review-blocking" if blocking else "typed-" + verdict.lower(),
+                "typed-close", detail=REVIEW_BLOCKING_NOTE if blocking else "dead-worker-" + verdict.lower(),
+                census={"review_artifact_b64": str(terminal.get("artifact_path_b64") or "")} if blocking else None)
+        if verdict != "PASS":
+            return ContinuationDecision(False, "invalid", "terminal-verdict-invalid", "typed-close", detail="dead-invalid-envelope")
+        if terminal.get("artifact_state") != "readable":
+            return ContinuationDecision(False, "evidence", "evidence-" + str(terminal.get("artifact_state") or "absent"),
+                                        "typed-close", detail="dead-invalid-envelope")
+        if terminal.get("review_verdict_conflict"):
+            return ContinuationDecision(False, "evidence", "evidence-review-verdict-conflict:" +
+                                        str(terminal["review_verdict_conflict"]), "inspect-recovery", detail="dead-invalid-envelope")
+        return ContinuationDecision(True, "pass")
+    if action == "terminal-result":
+        reason = facts.get("reason", "")
+        recoverable = reason in {"transaction-conflict", "child-not-quiescent", "child-not-terminal",
+                                "route-close-failed", "producer-finalize-failed", "recovery-unavailable"}
+        return ContinuationDecision(False, "recoverable" if recoverable else "ineligible", reason,
+            "same-command" if recoverable else "inspect-recovery",
+            "The exact process and terminal transaction can be reobserved and settled." if recoverable else "",
+            facts.get("detail", ""))
+    if action == "attempt":
+        decision = _attempt_decision(status, metadata or {}, **facts)
+        return ContinuationDecision(decision.action not in {"wait", "recover", "inspect-conflict"},
+                                    decision.outcome, decision.reason, decision.action, census=decision)
+    if action == "attempt-action":
+        return ContinuationDecision(True, committed_outcome(status, metadata or {}),
+                                    next_action=_attempt_action(status, metadata or {}))
+    if action == "harvest":
+        candidates = [fields for fields in rows if fields[1] in {"open", "running"}]
+        return ContinuationDecision(len(candidates) <= 1, "open" if candidates else "settled",
+            "ambiguous-selector" if len(candidates) > 1 else "", census=candidates)
     if owner_attempt_id is not None:
         from dispatch_replacement import effective_attempts, _rows
         try:
@@ -175,23 +424,35 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             if kind in {"runtime", "unlaunched", "corrected"}:
                 return ContinuationDecision(False, "not-applicable", next_action="observe")
         return ContinuationDecision(True, "launch", next_action="start")
+    if action == "replacement-result":
+        terminal, kind = facts["terminal"], facts["kind"]
+        absent = terminal.get("state") == "absent" or (terminal.get("state") == "invalid" and
+            terminal.get("failure_class") == ("capacity" if kind == "frame-capacity" else kind)
+            and kind in {"capacity", "frame-capacity", "runtime"})
+        return ContinuationDecision(absent, "continue" if absent else "protected",
+            "" if absent else "replacement-result-settlement-required", "start" if absent else "settle")
     if action == "owner-start":
         # The existing atomic registry claim still protects the launch boundary.
         registered = facts.get("registered", False)
         return ContinuationDecision(True, "existing" if registered else "start",
                                     next_action="observe" if registered else "start")
+    stopped = answerable_owner_end(status, metadata) if action in {"owner", "owner-input"} else ""
     if action == "owner-input":
         # Keeping an answer cannot spawn an owner or disturb uncertain transport.
-        if answerable_owner_end(status, metadata):
+        if stopped:
             return ContinuationDecision(True, "retained", next_action="correct")
         if status in {"open", "running"} and facts.get("accepting", True) and facts.get("reachable"):
             return ContinuationDecision(True, "queued", next_action="handback")
-    parked = facts.get("parked")
+    parked, cancellation = facts.get("parked"), None
     if action == "owner":
         from route_parent_close import row_requested
-        closing = metadata.get("parent_close_requested") == "1" or jobs is not None and row_requested(metadata, jobs)
+        closing = (metadata.get("parent_close_requested") == "1"
+                                         or jobs is not None and row_requested(metadata, jobs))
         if closing or facts.get("cancelled") or status in {"cancelled", "killed"}:
-            return ContinuationDecision(False, "protected", "cancelled-by-parent", "settle")
+            cancellation = ContinuationDecision(False, "protected", "cancelled-by-parent", "settle")
+    if action == "owner":
+        if cancellation is not None:
+            return cancellation
         if parked is None and jobs is not None and metadata.get("attempt_id"):
             from dispatch_replacement import owner_parked_gate
             parked = owner_parked_gate(jobs, metadata["attempt_id"])
@@ -201,7 +462,6 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                 {"blocked": "owner-parked-at-human-gate", "stop": "human-gate-stop",
                  "revise": "human-gate-revise-owner-parked"}[gate_state],
                 {"blocked": "answer-human-gate", "stop": "report", "revise": "report-gate-revision"}[gate_state])
-        stopped = answerable_owner_end(status, metadata)
         if stopped and not parked and not facts.get("answered"):
             return ContinuationDecision(False, "answer", "owner-" +
                 ("blocked" if stopped == "BLOCKED" else "failed"), "correct")
@@ -234,30 +494,35 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             return ContinuationDecision(False, "protected", "replacement-not-silent-death", "settle")
         kind = facts["death_kind"]
         if facts.get("fields") and kind not in {"parked", "unlaunched", "corrected"}:
-            from dispatch_replacement import _terminal_absent, FRAME_CAPACITY
-            if not _terminal_absent(facts["fields"], metadata,
-                    capacity=kind in {"capacity", FRAME_CAPACITY}, runtime=kind == "runtime"):
-                return ContinuationDecision(False, "protected", "replacement-result-settlement-required", "settle")
+            from dispatch_replacement import terminal_observation
+            choice = decide_continuation(action="replacement-result", facts={"kind": kind,
+                "terminal": terminal_observation(facts["fields"], metadata)})
+            if not choice.allowed:
+                return choice
         return ContinuationDecision(True, "continue", next_action="start")
     if action in {"owner", "owner-input"}:
-        if facts.get("cancelled") or status in {"cancelled", "killed"}:
-            return ContinuationDecision(False, "protected", "cancelled-by-parent", "settle")
+        if cancellation is not None:
+            return cancellation
         if parked and parked["status"] == "proceed":
             return ContinuationDecision(True, "continue", next_action="start")
-        stopped = answerable_owner_end(status, metadata)
-        if stopped or runtime_owner_can_resume(status, metadata):
+        if stopped and action == "owner" or runtime_owner_can_resume(status, metadata):
             if action == "owner-input":
                 return ContinuationDecision(True, "retained", next_action="correct")
             if facts.get("answered"):
                 return ContinuationDecision(True, "continue", next_action="start")
             return ContinuationDecision(False, "answer", "owner-" +
                 ("blocked" if stopped == "BLOCKED" else "failed"), "correct")
+        if action == "owner-input":
+            return ContinuationDecision(False, "wait" if status in {"open", "running"} else "settle",
+                "owner-input-unsupported", "same-command" if status in {"open", "running"} else "settle",
+                "The same owner's input consumer accepts input or its terminal result settles."
+                if status in {"open", "running"} else "")
         if status == "done":
             return ContinuationDecision(False, "settle", "owner-settlement-pending", "settle")
         if action == "owner" and process is not None and process.state == "quiescent":
             return ContinuationDecision(False, "wait", "owner-settlement-pending", "same-command",
                 "The exact owner's terminal observation is committed to the canonical registry.", process.reason)
-        if facts.get("reachable"):
+        if action == "owner" and facts.get("reachable"):
             return ContinuationDecision(True, "running", next_action="handback")
         return ContinuationDecision(False, "wait", "owner-input-unsupported", "same-command",
                                     "The same owner's input consumer is reachable or its terminal result settles.")
@@ -306,9 +571,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                                     answers=tuple(answers), fallback_nodes=tuple(fallback))
     if action == "round-recovery":
         state = facts["state"]
-        review = facts["node_kind"] == "review-worker"
-        return ContinuationDecision(True, state, next_action=("native-subagent" if review else "owner-inline")
-            if state == "verdictless-bound" else ("owner-closure" if review else "report"))
+        return ContinuationDecision(True, state, next_action=_round_action(state, facts["node_kind"]))
     if action not in {"round", "owner-closure", "complete-inline", "review-revision", "marker"}:
         raise ValueError("unknown continuation action: " + action)
     budget = facts.get("budget")
@@ -342,8 +605,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         budget = _ROUND.RoundBudget(len(verdicts), counted, kinds.count("verdict-less"), cap, state,
             len(rows) + 1, len(rows) + 1 if rows else 0,
             "closure-check" if closure else "correction" if rows else "first",
-            {"admit": "dispatch", "blocked-live": "wait", "blocked-unsettled": "wait",
-             "exhausted": "owner-closure", "verdictless-bound": "native-subagent"}[state], closure, counted < streak)
+            _round_action(state, node.get("kind")), closure, counted < streak)
     state = budget.state
     if action == "marker":
         site = facts["site"]
@@ -366,12 +628,9 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         allowed = state in {"exhausted", "verdictless-bound"}
         reason = {"blocked-live": "owner-closure-round-still-open", "blocked-unsettled": "owner-closure-round-unsettled",
                   "admit": "owner-closure-round-budget-not-exhausted"}.get(state, "")
-    elif action == "review-revision":
+    elif action in {"review-revision", "complete-inline"}:
         allowed = state not in {"blocked-live", "blocked-unsettled"}
-        reason = "review-input-revision-" + state if not allowed else ""
-    elif action == "complete-inline":
-        allowed = state not in {"blocked-live", "blocked-unsettled"}
-        reason = "round-unsettled" if not allowed else ""
+        reason = ("review-input-revision-" + state if action == "review-revision" else "round-unsettled") if not allowed else ""
     else:
         allowed = state == "admit"
         reason = {"blocked-live": "prior-attempt-still-live", "blocked-unsettled": "round-unsettled",
