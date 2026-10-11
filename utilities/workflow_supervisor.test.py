@@ -429,7 +429,7 @@ class TestSupervisorAdvance(WorkflowFixture):
         gates = {node: {"passed": passed} for node in WS.route_terminal_nodes(route)}
         with mock.patch.object(terminal, "_completion_request", return_value=request), \
                 mock.patch.object(terminal.dispatch_contract, "attempt_process_quiescence",
-                                  return_value=SimpleNamespace(state="quiescent")), \
+                                  return_value=terminal.dispatch_contract.ProcessQuiescence("quiescent", "fixture")), \
                 mock.patch.object(terminal, "_route_module", return_value=SimpleNamespace(
                     terminal_gate_observation=lambda *a, **kw: gates)), \
                 mock.patch.object(terminal, "settle_terminal_commit",
