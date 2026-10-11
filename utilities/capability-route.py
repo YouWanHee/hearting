@@ -10380,8 +10380,10 @@ def _legacy_inline_finish(a, route, route_file, api, entry_error=None, *, _admis
     _admission = _admission or inline_finish.admit(route, allow_legacy=True)
     node = route["nodes"][0]
     node_id = node["id"]
-    if api.outcome_path(Path(route_file)).exists():
-        raise inline_finish.InlineFinishError("finish-route-already-closed")
+    choice = route_authority.decide_continuation(route, action="finish-outcome",
+        facts={"legacy": True, "closure": {} if api.outcome_path(Path(route_file)).exists() else None})
+    if not choice.allowed:
+        raise inline_finish.InlineFinishError(choice.reason)
     evidence = Path(a.evidence).resolve()
     if not (evidence.is_file() or evidence.is_dir()):
         raise SystemExit("completion evidence missing")

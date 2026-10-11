@@ -696,10 +696,13 @@ class CurrentDeliveryState:
     workflow_complete: bool = True
     cancelled: bool = False
     cancellation_requested: bool = False
+    workflow_state: str = "complete"
+    workflow_reason: str = ""
 
 
 def _delivery_choice(state, *, blocked_reason=""):
     from route_authority import decide_continuation
+    blocked_reason = blocked_reason or ("closure-blocked:" + state.workflow_reason if state.workflow_state == "blocked" else "")
     choice = decide_continuation(action="delivery", facts={"state": state, "blocked_reason": blocked_reason})
     if choice.state == "wait":
         error = CompletionDeferred(choice.reason)
@@ -904,15 +907,13 @@ def settle_open_pass(jobs: Path, attempt_id: str) -> bool:
     except (JoinContractError, OSError):
         return False
     metadata = row.metadata
-    if row.status not in OPEN_STATES or metadata.get("worker_type") in {"owner", "frame"}:
-        return False
-    if attempt_process_quiescence(metadata).state != "quiescent":
-        return False
-    terminal = inspect_terminal_attempt(
-        metadata.get("log_file"), worktree=_row_worktree(row),
-        artifact_root_metadata=metadata.get("artifact_root"))
-    if (terminal.get("state") != "valid" or str(terminal.get("verdict")) != "PASS"
-            or terminal.get("artifact_state") != "readable"):
+    from route_authority import decide_continuation
+    process = attempt_process_quiescence(metadata)
+    terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=_row_worktree(row),
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+    choice = decide_continuation(action="stage-settlement", status=row.status, metadata=metadata,
+        facts={"process": process, "terminal": terminal})
+    if not choice.allowed:
         return False
     return bool(settle_finished_attempt(Path(jobs), row).get("closed"))
 
@@ -2959,7 +2960,8 @@ def current_delivery_state(
         materialize_after_terminal_close(jobs, attempt_id)
     from dispatch_terminal_commit import owner_completion_state
     current = current_attempt_row(jobs, attempt_id) if result.advanced else snapshot
-    workflow_complete = current is None or owner_completion_state(jobs, current.status, current.metadata).state in {"complete", "not-applicable"}
+    completion = owner_completion_state(jobs, current.status, current.metadata) if current is not None else None
+    workflow_complete = completion is None or completion.state in {"complete", "not-applicable"}
     return CurrentDeliveryState(
         marker=result.marker,
         marker_digest=result.marker_digest,
@@ -2973,6 +2975,8 @@ def current_delivery_state(
         completion_proven=result.completion_proven,
         terminal_conflict=result.terminal_conflict,
         workflow_complete=workflow_complete,
+        workflow_state=completion.state if completion is not None else "not-applicable",
+        workflow_reason=completion.reason if completion is not None else "",
     )
 
 
@@ -3367,16 +3371,16 @@ def _join_snapshot(
             from route_authority import decide_continuation
             completion_state = owner_completion_state(jobs, row.status, row.metadata)
             choice = decide_continuation(action="join", status=row.status, metadata=row.metadata,
-                facts={"observed": observed, "completion": completion_state})
+                facts={"observed": observed, "completion": completion_state, "settlement_available": settlement is not None})
             decision = choice.census["attempt"]
             workflow_pending, workflow_blocked = choice.census["workflow_pending"], choice.census["blocked"]
             if workflow_blocked:
                 blocked_attempt_ids.add(row.attempt_id)
                 blocked_reasons[row.attempt_id] = completion_state.reason
             readiness, reason = choice.state, choice.reason
-            pending = pending or not choice.allowed
+            pending = pending or choice.state == "pending"
             closure_eligible[row.attempt_id] = choice.census["closure_eligible"]
-            if settlement is not None and choice.census["settle"]:
+            if choice.census["settle"]:
                 # A repeated identical (closed, reason) outcome, or the
                 # registry not having changed at all since the last call,
                 # backs the retry interval off 2 -> 4 -> ... -> 60s instead
@@ -3405,13 +3409,6 @@ def _join_snapshot(
                     )
                     backoff["result"] = result_key
                     backoff["registry_key"] = registry_key
-                # A quiescent process is not a committed outcome. Keep the
-                # recovery obligation and its bounded parent notice active.
-                readiness, reason, pending = "pending", (
-                    "workflow-completion-pending" if workflow_pending
-                    else DEFERRED_COMPLETION_NOTE if decision.action == "complete"
-                    else "terminal-commit-pending"
-                ), True
             if (recovery is not None and choice.census["recover"]
                     and row.metadata.get("registered_worker") == "1"
                     and time.monotonic() - last_recovery.get(row.attempt_id, float("-inf")) >= 30):
@@ -4147,17 +4144,12 @@ def settle_exited_owner_terminal(row: ChildRow, *, jobs: str | Path) -> str | No
     from dispatch_supervisor_terminal import classify_supervisor_log
 
     meta = row.metadata
-    if (row.status not in OPEN_STATES or meta.get("worker_type") != "owner"
-            or meta.get("supervisor_lease") != SUPERVISOR_LEASE_KIND
-            or not meta.get("supervisor_lease_file")
-            or meta.get("registered_worker") != "1" or meta.get("launch_started") != "1"
-            or not meta.get("pid_start") or not meta.get("pid") or not meta.get("log_file")):
-        return None
-    if supervisor_lease_is_held(jobs, meta):
-        return "supervisor-live"
-    process = attempt_process_quiescence(meta, terminal_receipt=True)
-    if process.state != "quiescent":
-        return process.reason
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="owner-terminal", status=row.status, metadata=meta,
+        facts={"lease_held": supervisor_lease_is_held(jobs, meta),
+               "process": attempt_process_quiescence(meta, terminal_receipt=True)})
+    if not choice.allowed:
+        return None if choice.state == "not-applicable" else choice.reason
     terminal = classify_supervisor_log(meta["log_file"], meta.get("harness", "unknown"))
     if terminal.reconcile_reason == "terminal-log-unreadable":
         return terminal.reconcile_reason
@@ -4224,6 +4216,7 @@ def close_finished_child(
         metadata.get("log_file"),
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
+        worker_type=metadata.get("worker_type"),
     )
     if correct_recorded_move and (
         terminal.get("state") != "valid"
@@ -4234,6 +4227,8 @@ def close_finished_child(
     from route_authority import decide_continuation
     choice = decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
     if not choice.allowed:
+        if choice.next_action != "typed-close":
+            return choice.reason
         note, evidence, reason = choice.detail, choice.census, choice.reason
         if choice.state == "absent":
             missing = missing_result_terminal({**metadata, "worktree": _row_worktree(row),

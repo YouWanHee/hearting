@@ -3434,23 +3434,17 @@ class NextLegReceiptTest(unittest.TestCase):
     def test_the_observability_pass_adds_it_for_a_success_and_drops_it_otherwise(self):
         from types import SimpleNamespace
         jobs = Path("/tmp/next-leg-jobs.log")
-        state = lambda: SimpleNamespace(status="done", advanced=False)
+        state = lambda: JOIN.CurrentDeliveryState(None, "", "", "", "done", "PASS", True, 0, False, completion_proven=True)
         with mock.patch.object(JOIN, "current_delivery_state", side_effect=lambda *a, **k: state()), \
-                mock.patch.object(JOIN, "delivery_classification", return_value="success"), \
-                mock.patch.object(JOIN, "delivery_required_action", return_value="advance-completed"), \
                 mock.patch.object(JOIN, "_completed_next_leg", return_value=dict(self.NEXT_LEG)) as found:
             done = JOIN.receipt_with_delivery_observability(self._receipt(), jobs=jobs)
         self.assertEqual(done["children"][0]["next_leg"], self.NEXT_LEG)
         found.assert_called_once()
         with mock.patch.object(JOIN, "current_delivery_state", side_effect=lambda *a, **k: state()), \
-                mock.patch.object(JOIN, "delivery_classification", return_value="success"), \
-                mock.patch.object(JOIN, "delivery_required_action", return_value="advance-completed"), \
                 mock.patch.object(JOIN, "_completed_next_leg", return_value=None):
             stale = JOIN.receipt_with_delivery_observability(self._receipt(next_leg=self.NEXT_LEG), jobs=jobs)
         self.assertNotIn("next_leg", stale["children"][0])
-        with mock.patch.object(JOIN, "current_delivery_state", side_effect=lambda *a, **k: state()), \
-                mock.patch.object(JOIN, "delivery_classification", return_value="attention"), \
-                mock.patch.object(JOIN, "delivery_required_action", return_value="inspect-done-failure"), \
+        with mock.patch.object(JOIN, "current_delivery_state", return_value=JOIN.CurrentDeliveryState(None, "", "", "", "done", "FAIL", True, 0, False)), \
                 mock.patch.object(JOIN, "_completed_next_leg", side_effect=AssertionError("asked for a failure")):
             failed = JOIN.receipt_with_delivery_observability(self._receipt(next_leg=self.NEXT_LEG), jobs=jobs)
         self.assertNotIn("next_leg", failed["children"][0])
@@ -4428,6 +4422,18 @@ class RouteCompletionEvidenceReviewConflictTest(unittest.TestCase):
         self.assertEqual(
             reason, "evidence-review-verdict-conflict:artifact-fail-envelope-pass")
 
+    def test_join_keeps_conflicting_review_open_and_never_runs_completion(self):
+        self.artifact.write_text("## 평결: FAIL\n", encoding="utf-8")
+        metadata = {**self.metadata(worker_type="review"), "route_file": "/unused", "route_node": "review"}
+        child = JOIN.ChildRow(0, "open", "review", "att-review", "2026\topen\t/repo\t" + str(self.worktree) + "\treview\t", metadata)
+        with mock.patch.object(JOIN, "settle_exited_owner_terminal", return_value=None), \
+             mock.patch.object(JOIN, "_close_invalid_envelope_child") as close, \
+             mock.patch.object(JOIN.subprocess, "run") as execute:
+            reason = JOIN.close_finished_child(child, jobs=self.base / "jobs.log")
+        self.assertEqual(reason, "evidence-review-verdict-conflict:artifact-fail-envelope-pass")
+        close.assert_not_called()
+        execute.assert_not_called()
+
     def test_agreement_and_non_review_workers_are_untouched(self):
         self.artifact.write_text("## 평결: PASS\n", encoding="utf-8")
         agreed, reason = JOIN.route_completion_evidence(
@@ -4821,6 +4827,27 @@ class WorkContinuationReceiptTest(unittest.TestCase):
             text = self.render([("first","inspect-done-failure")])
             self.assertNotIn("capability-route.py start",text)
             self.assertIn("--attempt-id first --status done",text)
+
+
+class CompletionProjectionBoundaryTest(unittest.TestCase):
+    def test_projection_defers_once_without_sleep_or_internal_retry(self):
+        with mock.patch.object(JOIN, "receipt_with_delivery_observability", side_effect=JOIN.CompletionDeferred("termination-pending")) as observe, \
+             mock.patch.object(JOIN.time, "sleep") as sleep:
+            with self.assertRaises(JOIN.CompletionDeferred):
+                JOIN.wait_for_delivery_projection({}, jobs=Path("/unused"))
+        observe.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_current_blocked_completion_keeps_inspection_without_a_receipt_prefix(self):
+        state = JOIN.CurrentDeliveryState(None, "", "", "", "done", "PASS", True, 0, False,
+            completion_proven=True, workflow_complete=False, workflow_state="blocked",
+            workflow_reason="completion-attempt-not-current")
+        self.assertEqual(JOIN.delivery_classification(state), "attention")
+        self.assertEqual(JOIN.delivery_required_action(state), "inspect-recovery")
+        with mock.patch.object(JOIN, "current_delivery_state", return_value=state):
+            receipt = JOIN.receipt_with_delivery_observability({"children": [{"attempt_id": "att-owner"}]}, jobs=Path("/unused"))
+        self.assertEqual(receipt["children"][0]["reason"], "closure-blocked:completion-attempt-not-current")
+        self.assertEqual(receipt["children"][0]["required_action"], "inspect-recovery")
 
 
 if __name__ == "__main__":

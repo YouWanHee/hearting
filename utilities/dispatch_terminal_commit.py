@@ -997,8 +997,11 @@ def _prove_route_children(request, route, gates):
         # through owner_route_* and inline markers intentionally have no row.
         # A passed exact-terminal gate is itself the shared current/readiness
         # proof.
-        if not gate.get("passed"):
-            return _proof_failure("terminal-attempt-not-pass")
+
+    choice = decide_continuation(action="completion-state", facts={"gate_only": True,
+        "gates": {key: gate for key, gate in gates.items() if gate.get("source") != "owner-terminal"}})
+    if not choice.allowed:
+        return _proof_failure("terminal-attempt-not-pass")
     for status, meta, fields in related:
         never_started = status == "done" and dispatch_contract.attempt_row_never_started(fields)
         choice = decide_continuation(action="terminal-child", status=status, metadata=meta,
@@ -1712,7 +1715,10 @@ def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
         return None
     route = json.loads(Path(route_file).read_text())
     missing = owner_workflow_gaps(jobs, row.metadata, route)
-    if not missing:
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="completion-state", facts={"gate_only": True,
+        "gates": {node: {"passed": False, "reason": reason} for node, reason in missing.items()}})
+    if choice.allowed:
         return None
     return (
         "[workflow-completion-pending]\n"
@@ -1896,9 +1902,9 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
             prior_state = None
         if isinstance(prior_state, Mapping) and prior_state.get("state") == "owner-envelope-sealed":
             gates = _settled_gate_rows(route_module, route, request, gates)
-        missing = {node: proof.get("reason", "unproven") for node, proof in gates.items() if not proof.get("passed")}
-        if missing:
-            result = TerminalCommitResult("needs-owner", "terminal-marker-not-current", json.dumps(missing, sort_keys=True))
+        gate_choice = decide_continuation(action="completion-state", facts={"gate_only": True, "gates": gates})
+        if not gate_choice.allowed:
+            result = TerminalCommitResult(gate_choice.next_action, "terminal-marker-not-current", json.dumps(gate_choice.census, sort_keys=True))
         else:
             with ledger.lock():
                 from dispatch_resource_wait import supervisor

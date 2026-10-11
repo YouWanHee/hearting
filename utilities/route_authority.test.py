@@ -1059,5 +1059,41 @@ class RelocationCorrectionTest(unittest.TestCase):
             self.assertEqual(set(seen), set(result.route_ids))
 
 
+class CancellationProofBoundaryTest(unittest.TestCase):
+    def test_live_cancelled_related_child_never_becomes_a_terminal_proof(self):
+        for state in ("live", "unverifiable"):
+            choice = RA.decide_continuation(action="terminal-child", status="open",
+                metadata={"parent_close_requested": "1"},
+                facts={"process": SimpleNamespace(state=state, reason="cleanup-pending")})
+            self.assertEqual((choice.allowed, choice.state, choice.reason), (False, "wait", "child-not-quiescent"))
+            self.assertTrue(choice.retry_when)
+
+
+class InputContinuationBoundaryTest(unittest.TestCase):
+    def test_only_original_input_admissions_pass_for_each_harness(self):
+        quiet, unknown = SimpleNamespace(state="quiescent", reason="exited"), SimpleNamespace(state="unverifiable", reason="identity-missing")
+        cases = [
+            ("cancelled", {}, quiet, True, True, False, "settle"),
+            ("killed", {}, quiet, True, True, False, "settle"),
+            ("done", {"note": "completed-marker"}, quiet, True, True, False, "settle"),
+            ("open", {}, quiet, False, True, False, "wait"),
+            ("open", {}, unknown, True, False, False, "wait"),
+            ("done", {"note": "dead-worker-blocked"}, unknown, False, False, True, "retained"),
+            ("done", {"note": "dead-worker-fail", "failure_class": "fail", "worker_type": "owner"}, unknown, False, False, True, "retained"),
+            ("done", {"note": "dead-runtime-exit", "worker_type": "owner", "launch_started": "1",
+                      "supervisor_lease": "flock-v1", "supervisor_lease_file": "/unused"}, unknown, False, False, False, "wait"),
+        ]
+        for harness in ("claude", "codex", "opencode"):
+            for status, metadata, process, accepting, reachable, allowed, state in cases:
+                with self.subTest(harness=harness, status=status, note=metadata.get("note"), accepting=accepting):
+                    choice = RA.decide_continuation(action="owner-input", status=status,
+                        metadata={"harness": harness, **metadata}, facts={"process": process,
+                            "accepting": accepting, "reachable": reachable})
+                    self.assertEqual((choice.allowed, choice.state), (allowed, state))
+                    if state == "wait":
+                        self.assertEqual(choice.next_action, "same-command")
+                        self.assertTrue(choice.retry_when)
+
+
 if __name__ == "__main__":
     unittest.main()

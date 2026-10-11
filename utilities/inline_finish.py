@@ -107,6 +107,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
         raise InlineFinishError("finish-route-unsafe")
     route_file = route_file.resolve(strict=True)
     _choice, jobs, inherited_jobs = _admission or admit(route)
+    sid = _choice.census
     nodes = route.get("nodes") or []
     if dispatch_terminal_commit.require_current_cleanup("inline-finish", target=route_file) is not None:
         raise InlineFinishError("finish-foreign-cleanup-scope")
@@ -116,6 +117,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
     base = root / ".runtime" / "inline-finish" / "v1" / route["route_id"]
     state_path, lock_path = base / "finish.json", base / "finish.lock"
     prior_state = _read(state_path)
+    from route_authority import decide_continuation
     historical_false = None
     if not prior_state and api.outcome_path(route_file).exists():
         # Autoclose remains terminal. A historical false is consumable only
@@ -124,16 +126,16 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
             closure = json.loads(api.outcome_path(route_file).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             closure = {}
-        if closure.get("autoclose") and closure.get("route_hash") == route["route_hash"]:
+        choice = decide_continuation(route, action="finish-outcome", facts={"closure": closure})
+        if choice.state == "autoclosed":
             print("capability-route: route already closed automatically; nothing left to finish", file=sys.stderr)
             return {"schema": "finish_receipt_v1", "route_id": route["route_id"], "route_hash": route["route_hash"],
                     "state": "already-closed-automatically", "autoclose": closure["autoclose"]}
-        if (closure.get("terminal_gate_proven") is not False
+        if (not choice.allowed
                 or closure.get("route_id") != route["route_id"]
                 or closure.get("route_hash") != route["route_hash"]
                 or closure.get("route_file") != str(Path(route_file).resolve())
-                or closure.get("cwd") != route.get("cwd")
-                or closure.get("disposition") in ("abandoned", "operator-decision", "cancelled")):
+                or closure.get("cwd") != route.get("cwd")):
             raise InlineFinishError("finish-route-already-closed")
         # A registered owner's tuple is that owner's: an inline caller (never a registered one) cannot
         # take it over. An inline tuple is compared below with the intent, marker and binding this
@@ -156,7 +158,9 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
     admitted = artifact_producer.cycle_route_admission(root, record, route, finalize=True)
     if not admitted.allow:
         raise InlineFinishError("finish-route-cycle-" + admitted.reason)
-    if record.get("deleted_at") and not finished:
+    choice = decide_continuation(route, action="finish-cycle", facts={"deleted": bool(record.get("deleted_at")),
+        "finished": finished, "review_live": artifact_producer._live_review_lease(root, record["cycle_id"]) is not None})
+    if choice.state == "deleted":
         # The cycle was deleted while its route ran (§45 D-126): the route ends as a route with no output.
         return _finish_deleted_cycle(root, route, route_file, record, args, api)
     # A campaign deleted since the finish is the campaign it was; a cycle moved to another campaign is
@@ -165,8 +169,10 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
     if not campaign or not route.get("campaign_key") or (
             campaign.get("key") != route.get("campaign_key") and not record.get("moved_at") and not finished):
         raise InlineFinishError("finish-campaign-key-mismatch")
-    if artifact_producer._live_review_lease(root, record["cycle_id"]) is not None:
-        raise InlineFinishError("finish-active-review-lease")
+    if not choice.allowed:
+        error = InlineFinishError(choice.reason)
+        error.retry_when = choice.retry_when
+        raise error
     output = artifact_producer.cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
     evidence = Path(args.evidence).absolute()
     # Nothing moves payloads now; a path an earlier release moved is translated
@@ -296,8 +302,12 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
                 raise InlineFinishError("finish-route-drift")
             if not _on_a_branch(route["cwd"], intent["commit"]):
                 raise InlineFinishError("finish-commit-drift")
-            if artifact_producer._live_review_lease(root, record["cycle_id"]) is not None:
-                raise InlineFinishError("finish-active-review-lease")
+            choice = decide_continuation(route, action="finish-cycle",
+                facts={"review_live": artifact_producer._live_review_lease(root, record["cycle_id"]) is not None})
+            if not choice.allowed:
+                error = InlineFinishError(choice.reason)
+                error.retry_when = choice.retry_when
+                raise error
             state = _read(state_path)
             if state and state.get("inline_finish_id") != intent_id:
                 prior_intent = state.get("intent") or {}
