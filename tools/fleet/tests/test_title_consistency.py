@@ -223,6 +223,7 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
                      "Hearting runtime delivery (SD-111 durable pending records)",
                      "Hearting notice about work you started (a remote run ended)",
                      "Hearting human gate awaiting your decision (SD-123/129)",
+                     "Hearting supervision needs attention. This is not workflow completion. reason=join-deadline owner=att-example.",
                      "/quit", "<system-reminder>Hook output</system-reminder>",
                      "<hook-output>English output</hook-output>",
                      "Peer task\n(peer-from: codex [ab] peer ; ref=12345678)")
