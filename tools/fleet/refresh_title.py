@@ -166,6 +166,7 @@ def _human_language_text(text):
             or text.lstrip().startswith(("[notice]",
                                         "Hearting notice about work you started",
                                         "Hearting human gate awaiting your decision",
+                                        "Hearting supervision needs attention.",
                                         "Hearting runtime delivery", "<system-reminder>",
                                         "<hook-output>", "<hook_response>"))
             or re.match(r"^\s*/[A-Za-z][A-Za-z0-9_-]*(?:\s|$)", text)):
