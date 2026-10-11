@@ -33,6 +33,33 @@ def title_language():
         return "auto"
 
 
+def declared_language():
+    """One operator preference for all producers; native settings stay read-only."""
+    explicit = (os.environ.get("FLEET_NOW_LANG") or "").strip()
+    if explicit and explicit.lower() != "auto":
+        return explicit
+    language = title_language()
+    if language.lower() != "auto":
+        return language
+    # Claude currently exposes a native reply-language preference. It belongs
+    # to the operator, so Codex/OpenCode Fleet rows use it too. Their native
+    # config schemas expose no equivalent key; do not invent one.
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    try:
+        path = root / "settings.json"
+        if path.stat().st_size > 1 << 20:
+            return ""
+        value = json.loads(path.read_text(encoding="utf-8"))
+        language = value.get("language") if isinstance(value, dict) else None
+        if (isinstance(language, str) and 0 < len(language.strip()) <= 40
+                and all(ch.isalpha() or ch in " _-" for ch in language)
+                and language.strip().lower() != "auto"):
+            return language.strip()
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return ""
+
+
 def ensure(*, dry_run=False):
     path = config_path()
     if path.exists() or path.is_symlink():

@@ -19,6 +19,11 @@ from fleet.model import Session  # noqa: E402
 class QuotaTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        preferences = mock.patch.dict(os.environ, {
+            "CLAUDE_CONFIG_DIR": self.tmp.name + "/claude",
+            "XDG_CONFIG_HOME": self.tmp.name + "/config"})
+        preferences.start()
+        self.addCleanup(preferences.stop)
         self.old = {k: os.environ.get(k) for k in (
             "FLEET_TITLE_STATE_DIR", "FLEET_TITLE_COMMAND", "FLEET_TITLE_CONCURRENCY",
             "FLEET_TITLE_MAX_STARTS", "FLEET_TITLE_PRIORITY_MAX_STARTS",

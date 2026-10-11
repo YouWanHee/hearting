@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
@@ -104,6 +105,11 @@ class MainKeepsThePriorTitleTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        preferences = mock.patch.dict(os.environ, {
+            "CLAUDE_CONFIG_DIR": self._tmp.name + "/claude",
+            "XDG_CONFIG_HOME": self._tmp.name + "/config"})
+        preferences.start()
+        self.addCleanup(preferences.stop)
         self._prev_env = os.environ.get("FLEET_TITLE_STATE_DIR")
         os.environ["FLEET_TITLE_STATE_DIR"] = os.path.join(self._tmp.name, "titles")
         self.addCleanup(self._restore_env)
