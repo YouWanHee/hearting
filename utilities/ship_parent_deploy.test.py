@@ -11,6 +11,7 @@ import sys
 import tempfile
 import signal
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -29,8 +30,8 @@ class ParentDeployTest(unittest.TestCase):
         self.route = {"route_id": "rt-test", "route_hash": "sha256:sealed", "capability": "autopilot-ship",
                       "entry_scope_contract_version": 1, "entry_execution_scope": "complete",
                       "nodes": [{"id": "deploy", "completion_gate": "ship-deploy", "depends_on": ["security-review", "release-review"]},
-                                {"id": "security-review", "completion_gate": "security-pass"},
-                                {"id": "release-review", "completion_gate": "release-pass"}]}
+                                {"id": "security-review", "kind": "review-worker", "completion_gate": "security-pass"},
+                                {"id": "release-review", "kind": "review-worker", "completion_gate": "release-pass"}]}
         self.meta = {"parent_sid": "parent", "parent_harness": "codex", "worker_type": "owner",
                      "dispatch_depth": "1", "registered_worker": "1", "note": "dead-worker-blocked"}
         self.record = self.root / "cycle/artifacts/release-config/deploy-record.json"
@@ -43,14 +44,20 @@ class ParentDeployTest(unittest.TestCase):
         self.command.write_text(json.dumps({"argv": [sys.executable, str(self.script)], "cwd": str(self.root), "timeout_seconds": 3}))
         self.proof = {"security-review": {"passed": True, "attempt_id": "security", "marker_digest": "s"},
                       "release-review": {"passed": True, "attempt_id": "release", "marker_digest": "r"}}
+        self.markers = self.root / "markers"
+        self.markers.mkdir()
+        for node in self.proof:
+            S.write(self.markers / (node + ".json"), {"review_independence": "independent"})
         self.cr = SimpleNamespace(_current_owner_attempt=lambda jobs, attempt: "owner",
                                   valid_entry_execution_scope_marker=lambda v, s: (v, s) == (None, None) or (v == 1 and s in ("complete", "report")),
                                   owner_terminal_prerequisites=lambda *args: {},
+                                  _exclusive_lock=lambda path: S.locked(path),
+                                  completion_dir=lambda *args, **kwargs: self.markers,
                                   _marker_identity_row=lambda r, n, nid, gate, **kw: dict(self.proof[nid]),
                                   terminal_gate_observation=lambda *args, **kwargs: {})
         for obj, name, value in [
             (S.DC, "_route_module", lambda: self.cr),
-            (S, "exact_attempt_row", lambda jobs, aid: SimpleNamespace(status="done", metadata=self.meta if aid not in ("security", "release") else {"worker_type": "worker"})),
+            (S, "exact_attempt_row", lambda jobs, aid: SimpleNamespace(status="done", raw=datetime.now(timezone.utc).isoformat()+"\t", metadata={"worker_type":"review"} if aid in {p["attempt_id"] for p in self.proof.values()} else self.meta)),
             (S, "_route", lambda *args: (self.root / "route.json", self.route)),
             (S.DC, "owner_operation_fence", lambda *args, **kwargs: None),
             (S.DC, "human_gate_entry_fence", lambda *args, **kwargs: None),
@@ -127,6 +134,56 @@ class ParentDeployTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "independent-review-required"):
             S.run(request)
         self.assertFalse(S.paths(self.jobs, "rt-test")[1].exists())
+
+    def review_row(self, attempt="security", node="security-review"):
+        return datetime.now(timezone.utc).isoformat()+"\tdone\trepo\tworktree\treview\t" + ",".join(
+            ["attempt_id="+attempt,"route_id="+self.route["route_id"],"route_node="+node,"worker_type=review"]) + "\n"
+
+    def test_changed_request_rejects_existing_and_inflight_reviews_within_same_second(self):
+        request = self.prepared()
+        old = S.read(request)
+        self.jobs.write_text(self.review_row()+self.review_row("release", "release-review"))
+        # Same normalized request preserves its binding, even after review began.
+        self.prepared()
+        self.assertEqual(S.read(request)["request_digest"], old["request_digest"])
+        self.assertEqual(S.read(request)["prepared_at"], old["prepared_at"])
+        self.script.write_text("from pathlib import Path\nPath('effects').write_text('unreviewed')\n")
+        self.prepared()
+        changed = S.read(request)
+        self.assertNotEqual(changed["request_digest"], old["request_digest"])
+        self.assertIn("security", changed["prior_review_attempts"])
+        with self.assertRaisesRegex(ValueError, "review-precedes-request"):
+            S.run(request)
+        self.assertFalse(self.counter.exists())
+        self.proof["security-review"]["attempt_id"] = "new-security"
+        with self.assertRaisesRegex(ValueError, "review-precedes-request:release-review"):
+            S.run(request)
+        self.proof["release-review"]["attempt_id"] = "new-release"
+        with patch.object(S, "exact_attempt_row", side_effect=lambda jobs, aid: SimpleNamespace(
+                status="done", metadata={"worker_type":"review"} if aid in ("new-security","new-release") else self.meta,
+                raw=datetime.now(timezone.utc).isoformat()+"\t")):
+            self.assertEqual(S.run(request)["state"], "success")
+
+    def test_raw_registered_review_override_and_parallel_leg_are_consumed(self):
+        request = self.prepared()
+        S.write(self.markers / "release-review.json", {"review_independence":"owner-overridden"})
+        with self.assertRaisesRegex(ValueError, "independent-review-required"):
+            S.run(request)
+        S.write(self.markers / "release-review.json", {"review_independence":"independent"})
+        self.route["nodes"].append({"id":"security-alternative","kind":"review-worker","completion_gate":"security-pass"})
+        self.route["parallel_groups"] = [{"id":"security","members":["security-review","security-alternative"]}]
+        self.proof["security-alternative"] = {"passed":True,"attempt_id":"alternative","marker_digest":"a"}
+        S.write(self.markers / "security-alternative.json", {"review_independence":"owner-overridden"})
+        with self.assertRaisesRegex(ValueError, "independent-review-required:security-alternative"):
+            S.run(request)
+
+    def test_older_registered_review_start_is_refused(self):
+        request = self.prepared()
+        with patch.object(S, "exact_attempt_row", side_effect=lambda jobs, aid: SimpleNamespace(
+                status="done", metadata=self.meta if aid == "owner" else {"worker_type":"review"},
+                raw="2000-01-01T00:00:00Z\t")):
+            with self.assertRaisesRegex(ValueError, "review-precedes-request"):
+                S.run(request)
 
     def test_command_source_drift_and_route_report_scope_refuse(self):
         request = self.prepared()

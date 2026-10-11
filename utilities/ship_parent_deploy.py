@@ -179,7 +179,7 @@ def prepare(jobs, attempt, command_file):
         availability = parent(meta, jobs)
     cmd = command(read(command_file))
     request_path, result_path = paths(jobs, route["route_id"])
-    with locked(request_path):
+    with locked(request_path), DC._route_module()._exclusive_lock(Path(str(jobs) + ".lock")):
         if result_path.exists():
             raise ValueError("parent-deploy-execution-already-recorded")
         value = {"schema": SCHEMA, "jobs": str(Path(jobs).resolve()), "route_id": route["route_id"],
@@ -187,11 +187,23 @@ def prepare(jobs, attempt, command_file):
                  "parent_session_id": meta["parent_sid"], "command": cmd,
                  "deploy_record": str(record_path(route)), "node_id": node["id"]}
         if request_path.exists():
-            previous = read(request_path)
+            previous, _ = load_request(request_path)
             # An ordinary owner replacement keeps exactly this request.
             value["owner_attempt_id"] = previous["owner_attempt_id"]
             if availability is None:
                 availability = previous.get("parent_availability")
+            unchanged = all(previous.get(k) == v for k, v in value.items())
+        else:
+            unchanged = False
+        if unchanged:
+            value["prepared_at"] = previous["prepared_at"]
+            value["prior_review_attempts"] = previous["prior_review_attempts"]
+        else:
+            # The existing registry lock orders request publication before new
+            # review registration. A changed request cannot consume a review
+            # that was already registered, even within the same timestamp second.
+            value["prepared_at"] = datetime.now(timezone.utc).isoformat()
+            value["prior_review_attempts"] = review_attempts(route, jobs)
         value["request_digest"] = digest(value)
         value["parent_availability"] = availability
         write(request_path, value)
@@ -210,21 +222,55 @@ def load_request(path):
     return value, result
 
 
-def reviews(route, node, jobs):
+def review_attempts(route, jobs):
+    result = []
+    review_ids = {n["id"] for n in route["nodes"] if n.get("kind") == "review-worker"}
+    for line in Path(jobs).read_text().splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        meta = DC.parse_registry_metadata(fields[5])
+        if (meta.get("route_id") == route["route_id"] and meta.get("route_node") in review_ids
+                and meta.get("attempt_id")):
+            result.append(meta["attempt_id"])
+    return sorted(set(result))
+
+
+def reviews(route, node, jobs, request=None):
     cr = DC._route_module()
     missing = cr.owner_terminal_prerequisites(route, node, Path(jobs))
     if missing:
         raise ValueError("parent-deploy-reviews-pending:" + json.dumps(missing, sort_keys=True))
     proof = {}
-    for n in route["nodes"]:
-        if n["id"] in node.get("depends_on", []):
+    pending = list(node.get("depends_on", []))
+    nodes = {n["id"]: n for n in route["nodes"]}
+    seen = set()
+    while pending:
+        node_id = pending.pop()
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        n = nodes[node_id]
+        pending.extend(n.get("depends_on", []))
+        for group in route.get("parallel_groups", []):
+            if n["id"] in group.get("members", []):
+                pending.extend(group["members"])
+        if n.get("kind") == "review-worker":
             row = cr._marker_identity_row(route, n, n["id"], n.get("completion_gate"),
                                           jobs=Path(jobs), exact_terminal=True)
             if not row.get("passed") or row.get("review_independence") == "owner-overridden":
                 raise ValueError("parent-deploy-independent-review-required:" + n["id"])
-            reviewer = exact_attempt_row(Path(jobs), row.get("attempt_id", "")).metadata
-            if reviewer.get("worker_type") == "owner":
+            marker = read(cr.completion_dir(route["route_id"], jobs=Path(jobs)) / (n["id"] + ".json"))
+            reviewer = exact_attempt_row(Path(jobs), row.get("attempt_id", ""))
+            if (reviewer.metadata.get("worker_type") == "owner"
+                    or marker.get("review_independence") != "independent"):
                 raise ValueError("parent-deploy-independent-review-required:" + n["id"])
+            if request is not None:
+                began = datetime.fromisoformat(reviewer.raw.split("\t")[0].replace("Z", "+00:00"))
+                prepared = datetime.fromisoformat(request["prepared_at"])
+                if (began.tzinfo is None or row["attempt_id"] in request["prior_review_attempts"]
+                        or began < prepared.replace(microsecond=0)):
+                    raise ValueError("parent-deploy-review-precedes-request:" + n["id"])
             proof[n["id"]] = row
     for key, row in cr.terminal_gate_observation(route, jobs=Path(jobs), exact_terminal=True).items():
         if key.startswith("parallel_group:"):
@@ -243,7 +289,7 @@ def checked(value):
     for path, sha in value["command"]["inputs"].items():
         if hashlib.sha256(Path(path).read_bytes()).hexdigest() != sha:
             raise ValueError("parent-deploy-command-input-drift:" + path)
-    proof = reviews(route, node, value["jobs"])
+    proof = reviews(route, node, value["jobs"], value)
     return current, executor, proof
 
 
@@ -386,7 +432,7 @@ def validate_completion(route, jobs, evidence):
             or not authority.owns(owner, executor.get("session_id"), Path(jobs))):
         raise ValueError("parent-deploy-executor-unverified")
     node = next(n for n in route["nodes"] if n["id"] == value["node_id"])
-    if result.get("reviews") != reviews(route, node, jobs):
+    if result.get("reviews") != reviews(route, node, jobs, value):
         raise ValueError("parent-deploy-review-evidence-drift")
 
 

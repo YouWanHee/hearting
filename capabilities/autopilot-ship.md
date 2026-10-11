@@ -185,6 +185,15 @@ dispatch owners and workers cannot. No access request is broadened. A running,
 failed or interrupted request is never retried automatically; inspect its
 retained execution evidence and the project's rollback procedure.
 
+Preparation records the existing review attempts automatically under the normal
+registry lock. Only independent reviews registered after that exact request can
+authorize execution, including the realized parallel legs. Preparing the same
+normalized command and input hashes preserves this binding across an owner
+replacement; changing them requires fresh reviews within the existing ceilings.
+The original marker's independence record is consumed even when the registered
+review row was subsequently closed by an owner. This adds no review override,
+manual proof input or approval step.
+
 The utility writes the execution result in the existing `deploy-record.json`
 and prints one `correction_command`. The parent runs it to deliver the result
 through the existing owner input path, obeying its `parent_next` receipt. The
