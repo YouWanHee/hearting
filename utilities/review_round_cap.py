@@ -165,7 +165,7 @@ def _base_recovery_fields(node_kind, state="exhausted"):
                 "preserve prior FAILs and publish completion only after verification. No new registered round is admitted.")
     else:
         fields.update(required_action="resolve-review-findings" if review else "report-unresolved-verification",
-            recovery_hint="Preserve the prior results. " + ("Record dispositions in the existing owner-closure evidence; "
+            recovery_hint="Preserve the prior results. " + ("Record dispositions in the existing .owner-closure.md evidence; "
                 "this is owner judgment, not independent PASS." if review else
                 "The round limit does not stop remaining owner work. Report any unresolved verification without inferring PASS."))
     return fields
