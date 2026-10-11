@@ -81,6 +81,9 @@ class GPUOneLineTest(unittest.TestCase):
         self.assertIn("unreserved+1", self.rows(80)[2])
 
     def test_unknown_queries_do_not_claim_a_reservation_mismatch(self):
+        reservations = self.gpu.pop("reservations")
+        self.assertNotIn("unreserved+", self.rows(200)[2])
+        self.gpu["reservations"] = reservations
         self.gpu["processes"] = []
         self.host["process_detail"] = "query failed"
         self.assertNotIn("reserved+", self.rows(200)[2])

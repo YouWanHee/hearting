@@ -6029,7 +6029,9 @@ def _gpu_activity_summary(gpu, host):
     groups.sort(key=lambda group: (-group[1], group[0]))
     warnings = []
     # A failed process query or unmapped fallback cannot prove an empty GPU.
-    if not host.get("process_detail") and not gpu.get("observation_source"):
+    if (isinstance(gpu.get("processes"), (list, tuple))
+            and isinstance(gpu.get("reservations"), (list, tuple))
+            and not host.get("process_detail") and not gpu.get("observation_source")):
         extra_reserved = sum((reserved - observed).values())
         extra_observed = sum((observed - reserved).values())
         if extra_reserved:
