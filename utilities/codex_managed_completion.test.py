@@ -765,7 +765,8 @@ class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
         for resume in (False, True):
             with self.subTest(resume=resume):
                 args = SimpleNamespace(parent_attempt_id=PARENT, parent_session_id=None, thread_id=None,
-                    attempt_id=["att-child"], jobs=self.jobs, queue_socket=None, timeout=0,
+                    attempt_id=["att-child"], jobs=self.jobs, control_socket=Path(self.temp.name) / "control.sock",
+                    queue_socket=None, timeout=0,
                     _resume_execution=resume, _obligation_id="existing-duty")
                 now = [100.0]
                 def pause(seconds):

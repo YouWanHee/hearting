@@ -4428,7 +4428,7 @@ class RouteCompletionEvidenceReviewConflictTest(unittest.TestCase):
         child = JOIN.ChildRow(0, "open", "review", "att-review", "2026\topen\t/repo\t" + str(self.worktree) + "\treview\t", metadata)
         with mock.patch.object(JOIN, "settle_exited_owner_terminal", return_value=None), \
              mock.patch.object(JOIN, "_close_invalid_envelope_child") as close, \
-             mock.patch.object(JOIN.subprocess, "run") as execute:
+             mock.patch.object(JOIN, "complete_route_with_budget") as execute:
             reason = JOIN.close_finished_child(child, jobs=self.base / "jobs.log")
         self.assertEqual(reason, "evidence-review-verdict-conflict:artifact-fail-envelope-pass")
         close.assert_not_called()

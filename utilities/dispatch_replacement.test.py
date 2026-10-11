@@ -29,7 +29,6 @@ class ReplacementTest(unittest.TestCase):
         self.logical=mock.patch.object(R,'_logical_key',side_effect=lambda r,m:{'root_route_id':'rt-root','node':'__owner__' if m.get('worker_type')=='owner' else m['route_node']});self.logical.start();self.addCleanup(self.logical.stop)
         self.reuse=mock.patch.object(R,'_reuse_snapshot',return_value={'completed':[],'cycle_id':'cyc-test','producer_id':'prod-test','gate_releases':[]});self.reuse.start();self.addCleanup(self.reuse.stop)
         self.quiet=mock.patch.object(D,'attempt_process_quiescence',return_value=SimpleNamespace(state='quiescent',reason='process-absent'));self.quiet.start();self.addCleanup(self.quiet.stop)
-        self.absent=mock.patch.object(R,'_terminal_absent',return_value=True);self.absent.start();self.addCleanup(self.absent.stop)
         self.meta={'attempt_schema_version':'2','dispatch_depth':'1','transport':'headless',
              'execution_surface':'registered-headless','registered_worker':'1','fallback_hop':'same-harness-headless',
              'attempt_id':'att-source','route_id':'rt-test','route_hash':'sha256:test','route_node':'frame',
@@ -248,9 +247,10 @@ class ReplacementTest(unittest.TestCase):
         self.assertFalse((R._directory(self.jobs)/'claims').exists())
 
     def test_semantic_result_and_invalid_handoff_never_replace(self):
-        with mock.patch.object(R,'_terminal_absent',return_value=False):
-            with self.assertRaises(D.DispatchContractError) as caught:self.claim()
-        self.assertEqual(caught.exception.reason,'replacement-result-settlement-required')
+        for terminal in ({'state':'valid','verdict':'FAIL'}, {'state':'invalid','failure_class':'contract'}):
+            with self.subTest(terminal=terminal),mock.patch.object(R,'terminal_observation',return_value=terminal):
+                with self.assertRaises(D.DispatchContractError) as caught:self.claim()
+            self.assertEqual(caught.exception.reason,'replacement-result-settlement-required')
         for note in ['dead-worker-fail','completed-review-blocking','dead-invalid-envelope','cancelled-by-user']:
             self.write({**self.meta,'note':note})
             with self.subTest(note=note),self.assertRaises(D.DispatchContractError):self.claim()
@@ -1115,7 +1115,7 @@ class ReplacementTest(unittest.TestCase):
 
     def test_released_parked_owner_is_replaced_once_with_gate_proof(self):
         self._parked_owner(self._raise(),self._proceed())
-        with mock.patch.object(R,'_terminal_absent',return_value=False):
+        with mock.patch.object(R,'terminal_observation',return_value={'state':'valid','verdict':'BLOCKED'}):
             record=self.claim()
             self.assertEqual((record['proof']['parked_gate'],record['proof']['gate_epoch']),(self.GATE,1))
             self.assertEqual(self.claim(),record)
@@ -1166,7 +1166,7 @@ class ReplacementTest(unittest.TestCase):
 
     def test_parked_recovery_instructions_forbid_reraising_the_gate(self):
         self._parked_owner(self._raise(),self._proceed())
-        with mock.patch.object(R,'_terminal_absent',return_value=False):record=self.claim()
+        with mock.patch.object(R,'terminal_observation',return_value={'state':'valid','verdict':'BLOCKED'}):record=self.claim()
         text=R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source',worker_type='owner',
                                      jobs_path=self.jobs,attempt_id=record['replacement_attempt_id']))
         for expected in (f'Do not raise {self.GATE} again','await-release','--max 0','--answers-out',R.CONTINUATION_WAIT_NOTE):
@@ -1175,7 +1175,7 @@ class ReplacementTest(unittest.TestCase):
     def test_every_replacement_owner_is_told_to_wait_live_at_a_later_gate(self):
         def parked_record():
             self._parked_owner(self._raise(),self._proceed())
-            with mock.patch.object(R,'_terminal_absent',return_value=False):return self.claim()
+            with mock.patch.object(R,'terminal_observation',return_value={'state':'valid','verdict':'BLOCKED'}):return self.claim()
         def silent_record():
             self.write({**self.meta,'worker_type':'owner'});return self.claim()
         for name,build,parked in (('parked-original',parked_record,True),('silent-death-original',silent_record,False)):
