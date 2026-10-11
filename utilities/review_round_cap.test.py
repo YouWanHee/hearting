@@ -272,9 +272,9 @@ class RecoveryFieldsTest(unittest.TestCase):
         self.assertEqual(fields["recovery_surface"], "capability-route complete")
         self.assertEqual(fields["required_action"], "resolve-review-findings")
 
-    def test_exhausted_non_review_points_at_continuation(self):
+    def test_exhausted_non_review_names_existing_inline_completion(self):
         fields = CAP.recovery_fields("pipeline-stage")
-        self.assertEqual(fields["recovery_surface"], "capability-route continue")
+        self.assertEqual(fields["recovery_surface"], "capability-route complete --inline")
 
     def test_verdictless_bound_review_worker_names_native_subagent(self):
         fields = CAP.recovery_fields("review-worker", "verdictless-bound")

@@ -7088,14 +7088,12 @@ def write_completion_marker(
     round_census=None
     if REVIEW_ROUND_CAP.is_round_capped_node(node):
         rows=()
-        if jobs is not None:
-            jobs_path=Path(jobs)
-            if jobs_path.is_file():
-                lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
-                generations = (review_lineage_routes(route, node_id)
-                               if node.get("kind") == "review-worker" else [route])
-                rows = [row for generation in reversed(generations)
-                        for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=jobs)]
+        census_jobs=Path(jobs or _compose_default_jobs())
+        if census_jobs.is_file():
+            lines=census_jobs.read_text(encoding="utf-8",errors="replace").splitlines()
+            generations = review_lineage_routes(route, node_id) if node.get("kind") == "review-worker" else [route]
+            rows = [row for generation in reversed(generations)
+                    for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=census_jobs)]
         if owner_override:
             site="owner-closure"
         elif axes.get("registered_worker"):
@@ -7130,6 +7128,9 @@ def write_completion_marker(
             route,node,rows,site=site,revisions=revisions,
             independently_reviewed=review_identity.get("review_independence")=="independent",
         )
+    if REVIEW_ROUND_CAP.is_round_capped_node(node) and site == "inline":
+        ROUTE_AUTHORITY.require_continuation(ROUTE_AUTHORITY.decide_continuation(
+            route, action="complete-inline", node=node, rows=rows, revisions=revisions))
     sequence=_next_marker_sequence(directory,node_id)
     if expected_evidence_sha256 is not None and "sha256:"+evidence_digest(evidence) != expected_evidence_sha256:
         raise ValueError("recorded-move-evidence-drift")
@@ -7706,9 +7707,9 @@ def _review_input_revision_plan(route, node_id, evidence, *, answers, author_att
     lines = jobs.read_text(encoding="utf-8").splitlines()
     rows = [row for generation in reversed(lineage)
             for row in _review_round_rows(lines, generation["route_id"], node_id, jobs=jobs)]
-    budget = REVIEW_ROUND_CAP.round_budget(route, node, rows)
-    if budget.state in ("blocked-live", "blocked-unsettled"):
-        raise ValueError(f"review-input-revision-{budget.state}")
+    choice = ROUTE_AUTHORITY.require_continuation(ROUTE_AUTHORITY.decide_continuation(
+        route, action="review-revision", node=node, rows=rows))
+    budget = choice.budget
     verdicts = [(status, meta) for status, meta in rows
                 if REVIEW_ROUND_CAP.classify_round_row(status, meta, worker_type="review") == "verdict"]
     if not verdicts or verdicts[-1][1].get("note") != REVIEW_BLOCKING_NOTE:
@@ -8612,27 +8613,9 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
                f"kind={node.get('kind') or '-'};worker_type={row_metadata.get('worker_type') or '-'}")
     if rounds is None:
         rounds=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
-    # SD-153: `round_budget` is the one admission/closure decision every
-    # surface reads. Owner-closure is admitted once a real round budget is
-    # spent (`state="exhausted"`) OR two rounds in a row produced no verdict
-    # at all (`state="verdictless-bound"`) -- either way automatic retries
-    # are no longer the answer. `state="admit"` means the budget still has
-    # room for a registered round, so owner-closure would be premature.
-    try:
-        budget=REVIEW_ROUND_CAP.round_budget(route,node,rounds)
-    except ValueError:
-        refuse("intensity-unknown",str(route.get("effective_intensity")))
-    if budget.state=="blocked-live":
-        # A live review worker may still write a second blocking artifact
-        # nobody has read; the gate never closes over its head.
-        live=[metadata.get("attempt_id") or "-" for status,metadata in rounds if status in _LIVE_ROW_STATUSES]
-        refuse("round-still-open","attempt="+"|".join(live))
-    if budget.state=="blocked-unsettled":
-        refuse("round-unsettled")
-    if budget.state=="admit":
-        refuse("round-budget-not-exhausted",
-               f"rounds={budget.verdict_rounds};max_round={budget.cap};"
-               f"verdictless_streak={budget.verdictless_streak};bound={REVIEW_ROUND_CAP.VERDICTLESS_BOUND}")
+    choice = ROUTE_AUTHORITY.decide_continuation(route, action="owner-closure", node=node, rows=rounds)
+    ROUTE_AUTHORITY.require_continuation(choice)
+    budget = choice.budget
     terminated=[(status,metadata) for status,metadata in rounds if status not in _LIVE_ROW_STATUSES]
     max_round=budget.cap
     own=row_metadata.get("attempt_id")
@@ -10814,6 +10797,8 @@ def main():
                     if a.message_file else inspect(jobs,attempt))
         except InputError as exc:
             print(json.dumps({"state":"not-admitted","reason":str(exc),
+                              "retry_when":getattr(exc,"retry_when",""),
+                              "next_action":getattr(exc,"next_action","same-command"),
                               "next_step":"Retain the correction. Inspect the exact owner; do not restart it or treat a file edit as delivery."}))
             return 69
         if attempt!=a.attempt_id:

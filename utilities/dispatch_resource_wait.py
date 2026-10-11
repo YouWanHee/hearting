@@ -259,10 +259,12 @@ def admit_controller_launch(args, control, armed, row, delivered=()):
             # owner. Unsettled/foreign rows and errors after release still raise.
             from resource_run_registry import resource_never_started
             actual = json.loads(Path(armed["resource_registry"]).read_text())["runs"].get(row["run_id"])
-            if (not isinstance(actual, dict) or not resource_never_started(actual)
-                    or resource_body_digest(actual) != resource_body_digest(row)
-                    or actual.get("share") != row.get("share")
-                    or actual.get("launch_controller") != identity):
+            import route_authority
+            decision = route_authority.decide_continuation(action="resource-failure", facts={
+                "not_started": isinstance(actual, dict) and resource_never_started(actual),
+                "bound": isinstance(actual, dict) and resource_body_digest(actual) == resource_body_digest(row)
+                    and actual.get("share") == row.get("share") and actual.get("launch_controller") == identity})
+            if not decision.allowed:
                 raise
     if hasattr(controller, "children"):
         owned = getattr(args, "resource_children", None)
