@@ -1578,9 +1578,25 @@ def _with_lineage_access(state, rid, lineage):
     return {**state, "last_accessed": lineage[rid]}
 
 
+def _logical_project_namespace(con, serving_project):
+    """Derive the stable sync identity from the existing immutable rename ops."""
+    logical, identities = set(), []
+    for row in con.execute("SELECT o.project_key,o.payload_bytes,o.op_id FROM sync_objects o "
+                           "JOIN sync_applied a ON a.op_id=o.op_id "
+                           "WHERE o.kind='rekey' AND a.result IN ('local','folded')"):
+        payload = protocol_v2.canonical_loads(bytes(row[1]))
+        if payload["provenance"]["source"] == serving_project:
+            logical.add(row[0])
+            identities.append(row[2])
+    if len(logical) > 1:
+        raise sync_v2.SyncInvariantError("serving project has conflicting repository identities")
+    return next(iter(logical), serving_project), sorted(identities)
+
+
 def _capture_v2_operation(con, kind, *, post_ids=(), tombstones=None,
                           edges=None, target_ops=None, reason=None,
-                          prior_states=None, project_namespace=None):
+                          prior_states=None, project_namespace=None,
+                          source_namespace=None):
     """Capture one semantic command in the caller's open transaction.
 
     Semantic rows/derived mirrors must already hold their final state. The
@@ -1631,13 +1647,16 @@ def _capture_v2_operation(con, kind, *, post_ids=(), tombstones=None,
             "semantic operation must stay inside one logical project namespace"
         )
     namespace = next(iter(namespaces))
+    logical_namespace, identities = _logical_project_namespace(con, source_namespace or namespace)
+    frontier_projects = sync_v2.project_aliases(con, source_namespace or namespace)
+    placeholders = ','.join('?' for _ in frontier_projects)
     frontiers = []
     parents = set()
     mutations = []
     for ordinal, rid in enumerate(record_ids):
         heads = [row[0] for row in con.execute(
-            "SELECT op_id FROM sync_frontier WHERE project_key=? AND record_id=? "
-            "ORDER BY op_id", (namespace, rid)
+            f"SELECT op_id FROM sync_frontier WHERE project_key IN ({placeholders}) AND record_id=? "
+            "ORDER BY op_id", (*frontier_projects, rid)
         ).fetchall()]
         frontiers.append({"record_id": rid, "heads": heads})
         parents.update(heads)
@@ -1670,6 +1689,16 @@ def _capture_v2_operation(con, kind, *, post_ids=(), tombstones=None,
         "reason": str(reason or kind),
         "source": "mem.py",
     }
+    namespace_parents = set()
+    if kind != "rekey" and logical_namespace != namespace:
+        namespace_parents.add(identities[0])
+    for head in parents:
+        parent_project = con.execute("SELECT project_key FROM sync_objects WHERE op_id=?", (head,)).fetchone()
+        if parent_project and parent_project[0] != logical_namespace:
+            namespace_parents.add(head)
+    schema_minor = 1 if kind == "rekey" or logical_namespace != namespace or namespace_parents else 0
+    if schema_minor == 1:
+        provenance["source"] = namespace
     if kind == "force-tombstone":
         evidence = [mutations[record_ids.index(rid)]["tombstone"]["prior_digest"]
                     for rid in record_ids if rid in tombstones]
@@ -1679,18 +1708,21 @@ def _capture_v2_operation(con, kind, *, post_ids=(), tombstones=None,
                 protocol_v2.canonical_bytes(sorted(evidence))
             ).hexdigest(),
         })
-    operation = protocol_v2.build_operation({
+    operation_payload = {
         "protocol_major": 2,
-        "schema_minor": 0,
+        "schema_minor": schema_minor,
         "replica_id": replica_id,
         "counter": counter,
-        "parents": sorted(parents),
-        "project_key": namespace,
+        "parents": sorted(parents - namespace_parents),
+        "project_key": logical_namespace,
         "kind": kind,
         "frontiers": frontiers,
         "mutations": mutations,
         "provenance": provenance,
-    })
+    }
+    if schema_minor == 1:
+        operation_payload["namespace_parents"] = sorted(namespace_parents)
+    operation = protocol_v2.build_operation(operation_payload)
     sync_v2.record_local_operation(
         con, operation, installation_fingerprint=installation_fingerprint
     )
@@ -4617,7 +4649,7 @@ def _v2_restore_candidate(con, rid):
         # prior state; retain the causal tombstone ID without inventing a
         # predecessor operation. The remote gate prevents this unseeded object
         # from being exchanged.
-        return None, tombstone_id, tombstone_op.payload["project_key"]
+        return None, tombstone_id, protocol_v2.serving_project(tombstone_op.payload)
     closure = set()
     stack = list(frontier)
     while stack:
@@ -4646,7 +4678,7 @@ def _v2_restore_candidate(con, rid):
         raise sync_v2.SyncInvariantError(
             "restore prior state does not match tombstone evidence"
         )
-    return state, tombstone_id, tombstone_op.payload["project_key"]
+    return state, tombstone_id, protocol_v2.serving_project(tombstone_op.payload)
 
 
 def restore(rid):
@@ -4948,6 +4980,14 @@ def reattribute(rid):
     """Reattribute an orphan record to the current project without data loss."""
     con = get_con()
     try:
+        row = con.execute("SELECT scope,type,cwd_origin FROM records WHERE id=?", (rid,)).fetchone()
+        pkey = project_key(Path.cwd(), seed=True)
+        if row and row[0] == "project" and row[1] != "profile" \
+                and (row[2] or "").startswith("git:") and row[2] != pkey:
+            evidence = _repository_rename_evidence(row[2], pkey)
+            if evidence:
+                con.close()
+                return bool(_rekey_project(row[2], pkey, evidence))
         con.execute("BEGIN IMMEDIATE")
         row = con.execute(
             "SELECT scope, type, cwd_origin FROM records WHERE id=?", (rid,)).fetchone()
@@ -4991,6 +5031,106 @@ def reattribute(rid):
         return True
     finally:
         con.close()
+
+
+def _github_repository(key):
+    """Read repository identity through the user's existing gh authentication."""
+    match = re.fullmatch(r"git:github\.com/([^/]+)/([^/]+)", key or "")
+    if not match or not shutil.which("gh"):
+        return None
+    try:
+        result = subprocess.run(
+            ["gh", "api", "repos/" + "/".join(match.groups()),
+             "--jq", "{id,full_name}"], capture_output=True, text=True, timeout=5)
+        value = json.loads(result.stdout) if result.returncode == 0 else None
+        if (isinstance(value, dict) and type(value.get("id")) is int
+                and isinstance(value.get("full_name"), str)):
+            return value
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _repository_rename_evidence(old, current, current_repository=None):
+    if old == current:
+        return None
+    before = _github_repository(old)
+    after = current_repository or _github_repository(current)
+    if (before and after and before["id"] == after["id"]
+            and before["full_name"] == after["full_name"]
+            and "git:github.com/" + after["full_name"] == current):
+        return "github-repository-id:" + str(after["id"])
+    return None
+
+
+def _rekey_project(old, current, evidence):
+    """Preserve an entire renamed project's records in one normal v2 transaction."""
+    con = get_con()
+    try:
+        if not con.execute("SELECT 1 FROM records WHERE scope='project' AND cwd_origin=?",
+                           (old,)).fetchone():
+            return 0
+        # SQLite's backup API includes committed WAL state. A plain file copy
+        # would omit it. Keep the backup outside the synchronized operation tree.
+        fd, name = tempfile.mkstemp(prefix="memory-rekey-", suffix=".bak", dir=STORE)
+        os.close(fd)
+        with sqlite3.connect(name) as backup:
+            con.backup(backup)
+        con.execute("BEGIN IMMEDIATE")
+        rows = con.execute("SELECT id,type FROM records WHERE scope='project' AND cwd_origin=? ORDER BY id",
+                           (old,)).fetchall()
+        ids = [row[0] for row in rows]
+        if not ids:
+            con.rollback()
+            return 0
+        if any(row[1] == "profile" for row in rows):
+            raise sync_v2.SyncInvariantError("repository rekey cannot move profiles")
+        for rid in ids:
+            heads = con.execute("SELECT project_key,op_id FROM sync_frontier WHERE record_id=?", (rid,)).fetchall()
+            if not heads or any(key != old for key, _ in heads) \
+                    or con.execute("SELECT 1 FROM sync_conflicts WHERE record_id=? AND resolved_by IS NULL", (rid,)).fetchone():
+                # Let ordinary sync reconcile or expose these variants first.
+                # A rename must never prevent the sync needed to settle them.
+                con.rollback()
+                return 0
+        prior = {rid: _record_state(con, rid) for rid in ids}
+        # Protocol bounds determine batches, all within this one transaction.
+        for start in range(0, len(ids), protocol_v2.MAX_MUTATIONS):
+            batch = ids[start:start + protocol_v2.MAX_MUTATIONS]
+            con.executemany("UPDATE records SET cwd_origin=? WHERE id=?", ((current, rid) for rid in batch))
+            _capture_v2_operation(con, "rekey", post_ids=batch, prior_states=prior,
+                                  project_namespace=current, source_namespace=old, reason=evidence)
+        con.commit()
+        sys.stderr.write(f"[rekey] {len(ids)} records {old}→{current}; backup={name}\n")
+        return len(ids)
+    finally:
+        con.close()
+
+
+def _follow_repository_rename():
+    """Foreground sync follows verified renames without another operator command."""
+    current = project_key()
+    if not current.startswith("git:github.com/"):
+        return 0
+    con = get_con()
+    try:
+        owner = current.rsplit("/", 1)[0] + "/"
+        candidates = [row[0] for row in con.execute(
+            "SELECT DISTINCT cwd_origin FROM records WHERE scope='project'")
+                      if row[0] and row[0] != current and row[0].startswith(owner)]
+    finally:
+        con.close()
+    if not candidates:
+        return 0
+    repository = _github_repository(current)
+    if not repository:
+        return 0
+    moved = 0
+    for old in candidates:
+        evidence = _repository_rename_evidence(old, current, repository)
+        if evidence:
+            moved += _rekey_project(old, current, evidence)
+    return moved
 
 
 def _snap_label(body):
@@ -5316,18 +5456,34 @@ def log(limit=20, action=None, tier=None, actor=None, json_output=False):
     return 0
 
 
+def _visible_conflict_projects(con, current):
+    """A rename must not hide the sole conflicted record before it can move."""
+    visible = set(sync_v2.project_aliases(con, current)) | {'global'}
+    candidates = {row[0] for row in con.execute(
+        "SELECT DISTINCT project_key FROM sync_conflicts WHERE resolved_by IS NULL")}
+    owner = current.rsplit('/', 1)[0] + '/' if current.startswith('git:github.com/') else ''
+    candidates = {key for key in candidates - visible if owner and key.startswith(owner)}
+    repository = _github_repository(current) if candidates else None
+    if repository:
+        visible.update(key for key in candidates
+                       if _repository_rename_evidence(key, current, repository))
+    return tuple(sorted(visible))
+
+
 def conflicts(json_output=False):
     """List unresolved variants visible to the current project."""
     con = get_con()
     try:
         pkey = project_key(Path.cwd())
+        visible = _visible_conflict_projects(con, pkey)
+        placeholders = ','.join('?' for _ in visible)
         rows = con.execute(
             "SELECT project_key,record_id,COUNT(*),"
             "SUM(CASE WHEN provisional=1 THEN 1 ELSE 0 END) "
             "FROM sync_conflicts WHERE resolved_by IS NULL "
-            "AND (project_key=? OR project_key='global') "
+            f"AND project_key IN ({placeholders}) "
             "GROUP BY project_key,record_id ORDER BY project_key,record_id",
-            (pkey,),
+            visible,
         ).fetchall()
     finally:
         con.close()
@@ -5349,11 +5505,13 @@ def show_conflict(rid, json_output=False):
     con = get_con()
     try:
         pkey = project_key(Path.cwd())
+        visible = _visible_conflict_projects(con, pkey)
+        placeholders = ','.join('?' for _ in visible)
         rows = con.execute(
             "SELECT project_key,op_id,diagnostic_id,provisional,variant_bytes "
             "FROM sync_conflicts WHERE record_id=? AND resolved_by IS NULL "
-            "AND (project_key=? OR project_key='global') ORDER BY op_id",
-            (rid, pkey),
+            f"AND project_key IN ({placeholders}) ORDER BY op_id",
+            (rid, *visible),
         ).fetchall()
     finally:
         con.close()
@@ -5384,17 +5542,19 @@ def resolve_conflict(rid, body=None, *, parents=None, headline=None, aliases=Non
     try:
         con.execute("BEGIN IMMEDIATE")
         pkey = project_key(Path.cwd())
+        visible = _visible_conflict_projects(con, pkey)
+        placeholders = ','.join('?' for _ in visible)
         rows = con.execute(
             "SELECT project_key,op_id,provisional,variant_bytes FROM sync_conflicts "
             "WHERE record_id=? AND resolved_by IS NULL "
-            "AND (project_key=? OR project_key='global') ORDER BY op_id",
-            (rid, pkey),
+            f"AND project_key IN ({placeholders}) ORDER BY op_id",
+            (rid, *visible),
         ).fetchall()
         if not rows:
             print(f"[resolve] unresolved visible conflict not found: {rid}")
             return False
         projects = {item[0] for item in rows}
-        if len(projects) != 1:
+        if 'global' in projects and len(projects) != 1:
             print(f"[resolve] refused (ambiguous-project-namespace): {rid}")
             return False
         observed = sorted(row[1] for row in rows)
@@ -5403,6 +5563,12 @@ def resolve_conflict(rid, body=None, *, parents=None, headline=None, aliases=Non
             return False
         row = next((item for item in rows if item[2]), rows[-1])
         state = dict(protocol_v2.canonical_loads(bytes(row[3])))
+        # Before the first successful rename, resolve in the preserved address;
+        # the next ordinary sync can then rekey this now-settled record.
+        project_addresses = sync_v2.project_aliases(con, pkey)
+        namespace = pkey if projects.issubset(project_addresses) else row[0]
+        if namespace != 'global':
+            state['cwd_origin'] = namespace
         old_body = state["body"]
         body = old_body if body is None else body
         state.update({"body": body, "updated": today(), "last_accessed": today(),
@@ -5423,13 +5589,13 @@ def resolve_conflict(rid, body=None, *, parents=None, headline=None, aliases=Non
                 or _apid_set(json.loads(stored[1])) != _apid_set(state.get("artifact_refs", []))):
             raise ApidCapacityError("apid-exact-write-mismatch")
         operation = _capture_v2_operation(
-            con, "resolve", post_ids=[rid], project_namespace=row[0],
+            con, "resolve", post_ids=[rid], project_namespace=namespace,
             reason="explicit-conflict-resolution",
         )
         con.execute(
             "UPDATE sync_conflicts SET resolved_by=? WHERE record_id=? "
-            "AND project_key=? AND resolved_by IS NULL",
-            (operation["op_id"], rid, row[0]),
+            f"AND project_key IN ({placeholders}) AND resolved_by IS NULL",
+            (operation["op_id"], rid, *visible),
         )
         con.commit()
         print(f"[resolve] {rid} → {operation['op_id']}")
@@ -6217,9 +6383,9 @@ def _apply_fold(con, result, remote_tip, remote_ref, *, record_peer=True):
         )
     con.execute("DELETE FROM sync_frontier")
     for rid, heads in sorted(result.frontiers.items()):
-        project = (result.classification.operations[heads[0]].payload["project_key"]
-                   if heads else "")
         for head in heads:
+            payload = result.classification.operations[head].payload
+            project = protocol_v2.serving_project(payload)
             con.execute(
                 "INSERT INTO sync_frontier(project_key,record_id,op_id,source) "
                 "VALUES(?,?,?,?)", (project, rid, head, "folded"),
@@ -6245,7 +6411,7 @@ def _apply_fold(con, result, remote_tip, remote_ref, *, record_peer=True):
             con.execute(
                 "INSERT INTO sync_conflicts(project_key,record_id,op_id,diagnostic_id,"
                 "provisional,variant_bytes) VALUES(?,?,?,?,?,?)",
-                (op.payload["project_key"], rid, op_id, diagnostic.diagnostic_id,
+                (protocol_v2.serving_project(op.payload), rid, op_id, diagnostic.diagnostic_id,
                  int(op_id == conflict.provisional_op_id),
                  sqlite3.Binary(protocol_v2.canonical_bytes(state))),
             )
@@ -6555,6 +6721,13 @@ def _sync_process_lock(timeout=30.0):
 def sync(json_output=False):
     try:
         with _sync_process_lock():
+            con = get_con()
+            try:
+                remote_enabled = sync_v2.remote_policy(_sync_environment(), connection=con)["enabled"]
+            finally:
+                con.close()
+            if not remote_enabled:
+                _follow_repository_rename()
             return _sync_locked(json_output=json_output)
     except _SyncLockBusy as exc:
         return _emit_sync({
@@ -6701,18 +6874,21 @@ def _sync_locked(json_output=False, routine=False, apply_expiry=False):
             forbidden_roots=(*_synchronized_project_roots(), dump_repo),
             guard_tip=guard_tip,
         )
-        con = get_con()
-        try:
-            pending = [
-                {"op_id": op_id,
-                 "payload": protocol_v2.canonical_loads(bytes(payload))}
-                for op_id, payload in con.execute(
-                    "SELECT o.op_id,o.payload_bytes FROM sync_outbox b "
-                    "JOIN sync_objects o ON o.op_id=b.op_id "
-                    "WHERE b.state<>'confirmed' ORDER BY b.queued_at,o.op_id")
-            ]
-        finally:
-            con.close()
+        def pending_operations():
+            con = get_con()
+            try:
+                return [
+                    {"op_id": op_id,
+                     "payload": protocol_v2.canonical_loads(bytes(payload))}
+                    for op_id, payload in con.execute(
+                        "SELECT o.op_id,o.payload_bytes FROM sync_outbox b "
+                        "JOIN sync_objects o ON o.op_id=b.op_id "
+                        "WHERE b.state<>'confirmed' ORDER BY b.queued_at,o.op_id")
+                ]
+            finally:
+                con.close()
+
+        pending = pending_operations()
 
         def record_phase(phase, commit, op_ids):
             _record_outbox_exchange_phase(phase, commit, op_ids)
@@ -6728,6 +6904,13 @@ def _sync_locked(json_output=False, routine=False, apply_expiry=False):
         phases["remote-fetch-validate"] = "ok"
         result = _ingest_and_fold_snapshot(snapshot, ref)
         phases["remote-fold"] = "ok"
+        # Observe the current shared state before authoring an automatic rename;
+        # otherwise a stale local row can race a peer's ordinary resolution.
+        if not routine and not result.quarantined and not result.deferred:
+            if _follow_repository_rename():
+                pending = pending_operations()
+                exchange.render_operations(pending, phase_callback=record_phase)
+                result = _ingest_and_fold_snapshot(snapshot, ref)
         _exchange_note_receive()
         with contextlib.redirect_stdout(sink):
             export_dump()
@@ -6841,6 +7024,15 @@ def _sync_locked(json_output=False, routine=False, apply_expiry=False):
         finally:
             con.close()
         if isinstance(exc, git_exchange_v2.ExchangeUnavailable):
+            if not routine:
+                _follow_repository_rename()
+                with contextlib.redirect_stdout(sink):
+                    export_dump()
+                con = get_con()
+                try:
+                    status = sync_v2.sync_status(con, policy=policy)
+                finally:
+                    con.close()
             exchange_status = "queued-offline"
             reason = "remote-unavailable"
         elif isinstance(exc, git_exchange_v2.PushRetryExhausted):
