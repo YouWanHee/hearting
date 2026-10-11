@@ -10373,51 +10373,13 @@ def _close_route_argument(a):
     return str(path)
 
 
-def _legacy_inline_finish(a, route, route_file, api, entry_error=None):
-    """Close a legacy inline-shaped route with the one `finish` command.
-
-    The gate is the shape, not the intensity: one inline depth-0
-    unregistered terminal node has no stages to skip, so any intensity with
-    that shape is safe here. Anything else re-raises the entry refusal.
-    The caller's identity, registry, cycle-local evidence and
-    already-closed checks run here exactly as `inline_finish.finish` runs
-    them -- this path adds no bypass. Old explicit steps keep working.
-    """
+def _legacy_inline_finish(a, route, route_file, api, entry_error=None, *, _admission=None):
+    """Consume the common inline finish decision with the legacy writer."""
     import artifact_producer
     import inline_finish
-    nodes = [n for n in (route.get("nodes") or []) if isinstance(n, dict) and n.get("id")]
-    if (len(nodes) != 1 or nodes[0].get("execution_surface") != "inline"
-            or nodes[0].get("dispatch_depth") != 0
-            or nodes[0].get("registered_worker") is not False
-            or nodes[0].get("terminal") is not True):
-        if entry_error is not None:
-            raise entry_error
-        raise inline_finish.InlineFinishError("finish-inline-owner-sentinel-required")
-    node, node_id = nodes[0], nodes[0].get("id")
-    from dispatch_parent_completion import interactive_parent_identity
-    from dispatch_contract import DispatchContractError, resolve_global_registry
-    try:
-        _harness, sid = interactive_parent_identity(os.environ)
-    except DispatchContractError as exc:
-        if str(exc) == "caller-harness-ambiguous":
-            raise inline_finish.InlineFinishError("finish-caller-harness-ambiguous") from exc
-        raise inline_finish.InlineFinishError("finish-caller-harness-invalid") from exc
-    if not sid:
-        raise inline_finish.InlineFinishError("finish-current-session-missing")
-    if not sid or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0":
-        raise inline_finish.InlineFinishError("finish-registered-caller-ineligible")
-    jobs = resolve_global_registry(Path(__file__).resolve().parents[1], None, 0, "read").path
-    try:
-        for line in inline_finish._registry_lines(jobs, bool(os.environ.get("AGENT_DISPATCH_JOBS"))):
-            fields = line.split("\t")
-            from dispatch_contract import parse_registry_metadata
-            metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}
-            if route["route_id"] in {metadata.get("route_id"), metadata.get("owner_route_id")}:
-                raise inline_finish.InlineFinishError("finish-registered-route-ineligible")
-    except inline_finish.InlineFinishError:
-        raise
-    except Exception as exc:
-        raise inline_finish.InlineFinishError("finish-registry-unreadable") from exc
+    _admission = _admission or inline_finish.admit(route, allow_legacy=True)
+    node = route["nodes"][0]
+    node_id = node["id"]
     if api.outcome_path(Path(route_file)).exists():
         raise inline_finish.InlineFinishError("finish-route-already-closed")
     evidence = Path(a.evidence).resolve()
@@ -11019,12 +10981,11 @@ def main():
             if output is not None:
                 _require_entry_scope_review_preview(route, {"id": "one-shot"}, output)
         import inline_finish
-        try:
-            receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__])
-        except inline_finish.InlineFinishError as exc:
-            if str(exc) not in {"finish-route-not-direct", "finish-inline-owner-sentinel-required"}:
-                raise
-            receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__], entry_error=exc)
+        admission = inline_finish.admit(route, allow_legacy=True)
+        if admission[0].state == "modern":
+            receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__], _admission=admission)
+        else:
+            receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__], _admission=admission)
         print(json.dumps(receipt,sort_keys=True))
     else:
         if a.command=="close":

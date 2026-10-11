@@ -451,7 +451,7 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
     lineage = []
     attention = []
     while True:
-        observer_error = ""
+        observer_error, deferred = "", None
         try:
             receipt = join(set(attempts))
             if replacement_checkpoint is not None:
@@ -469,13 +469,10 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
         except Exception as exc:
             from dispatch_completion_join import CompletionDeferred
             if isinstance(exc, CompletionDeferred):
-                # The existing cancellation observer retains this exact batch;
-                # never project cleanup waiting as failure or parent recovery.
-                time.sleep(0.05)
-                continue
-            # Observation failure is not worker failure. Keep the exact wait
-            # and transfer the diagnostic, without fabricating completion.
-            observer_error = str(exc)
+                deferred = exc
+            else:
+                # Observation failure retains the exact batch and diagnostic.
+                observer_error = str(exc)
         ordinal += 1
         halt_reason = ""
         if not observer_error:
@@ -513,10 +510,14 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
             emit({"type": "dispatch.supervisor.reparked", "parent_attempt_id": parent_attempt_id,
                   "attempt_count": len(attempts), "repark_ordinal": ordinal,
                   "responsible": "supervision-controller", "notice_error": notice_error,
-                  "observer_error": observer_error})
+                  "observer_error": observer_error,
+                  **({"reason": str(deferred), "retry_when": getattr(deferred, "retry_when", "")} if deferred else {})})
         # A failed observer receives bounded backoff; execution budgets remain
         # the execution boundary's responsibility, never this observer's vote.
-        time.sleep(30.0 if observer_error else 0.05)
+        pause = 30.0 if observer_error or deferred else 0.05
+        if deadline is not None:
+            pause = min(pause, max(0.0, deadline - time.monotonic()))
+        time.sleep(pause)
 
 
 def wait_for_child_settlement(*, jobs: Path, attempts: set[str],

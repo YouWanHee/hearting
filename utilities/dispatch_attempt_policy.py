@@ -319,70 +319,15 @@ def completion_readiness(
                                identity, observation.form_state, observation.draft_state)
 
 
-def decide_attempt(
-    status: str, metadata: Mapping[str, str], *, process_state: str,
-    process_reason: str = "", terminal_observed: bool = False,
-    result_state: str | None = None,
-) -> AttemptDecision:
-    """Select the next obligation without changing a committed outcome.
-
-    A quiescent process with an open row needs the terminal writer. A process
-    that cannot be observed needs recovery or parent intervention, never a
-    fabricated terminal result. Only a closed failure plus quiescence may
-    authorize fallback; a completed review with findings remains a review.
-    """
-    outcome = committed_outcome(status, metadata)
-    if status not in OPEN_STATES | TERMINAL_STATES:
-        return AttemptDecision(outcome, "recover", "supervision-controller", "registry-status-invalid")
-    if metadata.get("parent_close_requested") == "1":
-        return AttemptDecision(outcome, "settle-cancellation" if outcome == "cancelled" else "cancel",
-                               "execution-boundary", "cancelled-by-parent")
-    if process_state == "live":
-        return AttemptDecision(outcome, "wait", "execution-boundary", process_reason or "process-alive")
-    if process_state != "quiescent":
-        return AttemptDecision(outcome, "recover", "supervision-controller", process_reason or "process-unverifiable")
-    if status in OPEN_STATES:
-        if result_state == "unverifiable":
-            return AttemptDecision(outcome, "recover", "supervision-controller", "terminal-evidence-unverifiable")
-        return AttemptDecision(outcome, "reconcile", "terminal-writer",
-                               "terminal-observed" if result_state == "settleable" or terminal_observed else
-                               "terminal-invalid" if result_state == "invalid" else "process-exited")
-    if terminal_conflict_pending(metadata):
-        return AttemptDecision(outcome, "inspect-conflict", "workflow-owner", "terminal-evidence-conflict")
-    if outcome == "succeeded":
-        return AttemptDecision(outcome, "advance", "completion-controller", "registry-closed")
-    if outcome == DEFERRED_COMPLETION_NOTE:
-        # The transport, not the work, is what is unresolved -- no fallback
-        # retry is authorized, only the completion writer that already owns
-        # this row's marker publication.
-        return AttemptDecision(outcome, "complete", "completion-controller", DEFERRED_COMPLETION_NOTE)
-    if outcome == "review-blocked":
-        return AttemptDecision(outcome, "review", "workflow-owner", REVIEW_BLOCKING_NOTE)
-    if outcome == "failed":
-        note = metadata.get("note", "")
-        # Cancellation is an explicit disposition, not automatic permission
-        # to resurrect the cancelled work. Its recovery claim has a separate
-        # user/route-authorized admission boundary.
-        # A worker's readable FAIL or BLOCKED is its result, not a death to retry.
-        retry = ("" if status == "cancelled" or metadata.get("failure_class") == "cancelled" else
-                 "capacity" if note == "dead-capacity" else
-                 "" if readable_result(metadata) else
-                 "fallback" if note.startswith("dead-") else "")
-        return AttemptDecision(outcome, "inspect-failure", "workflow-owner", note or status, retry)
-    return AttemptDecision(outcome, "inspect-failure", "workflow-owner", "terminal-outcome-unclassified")
+def decide_attempt(status: str, metadata: Mapping[str, str], *, process_state: str,
+                   process_reason: str = "", terminal_observed: bool = False,
+                   result_state: str | None = None) -> AttemptDecision:
+    from route_authority import decide_continuation
+    return decide_continuation(action="attempt", status=status, metadata=metadata,
+        facts=dict(process_state=process_state, process_reason=process_reason,
+                   terminal_observed=terminal_observed, result_state=result_state)).census
 
 
 def required_action(status: str, metadata: Mapping[str, str]) -> str:
-    """The terminal writer/harvest instruction, before transport formatting."""
-    if committed_outcome(status, metadata) == "cancelled":
-        return "advance-completed"
-    if status in OPEN_STATES:
-        return "complete-open"
-    if terminal_conflict_pending(metadata):
-        return "inspect-done-failure"
-    outcome = committed_outcome(status, metadata)
-    if outcome == "succeeded":
-        return "advance-completed"
-    if outcome == DEFERRED_COMPLETION_NOTE:
-        return "complete-deferred"
-    return "inspect-done-failure"
+    from route_authority import decide_continuation
+    return decide_continuation(action="attempt-action", status=status, metadata=metadata).next_action

@@ -67,53 +67,49 @@ def _on_a_branch(cwd, commit) -> bool:
     return found.returncode == 0 and bool(found.stdout.strip())
 
 
-def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, Any]:
+def registered_route(route, jobs, inherited):
+    from dispatch_contract import parse_registry_metadata
+    try:
+        return any(route["route_id"] in {meta.get("route_id"), meta.get("owner_route_id")}
+            for fields in (line.split("\t") for line in _registry_lines(jobs, inherited))
+            for meta in [parse_registry_metadata(fields[5]) if len(fields) > 5 else {}])
+    except Exception as exc:
+        raise InlineFinishError("finish-registry-unreadable") from exc
+
+
+def admit(route, *, allow_legacy=False):
+    """Collect the current caller and registry; the common policy selects finish."""
+    from dispatch_contract import DispatchContractError, resolve_global_registry
+    from dispatch_parent_completion import interactive_parent_identity
+    from route_authority import decide_continuation
+    facts = {"allow_legacy": allow_legacy, "registered_caller": bool(
+        os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0")}
+    try:
+        _harness, facts["sid"] = interactive_parent_identity(os.environ)
+    except DispatchContractError as exc:
+        facts["identity_error"] = ("finish-caller-harness-ambiguous" if str(exc) == "caller-harness-ambiguous"
+                                   else "finish-caller-harness-invalid")
+    inherited = bool(os.environ.get("AGENT_DISPATCH_JOBS"))
+    jobs = resolve_global_registry(Path(__file__).resolve().parents[1], None, 0, "read").path
+    if inherited and not jobs.is_file():
+        raise InlineFinishError("finish-registry-unavailable")
+    facts["registered_route"] = registered_route(route, jobs, inherited)
+    choice = decide_continuation(route, action="finish", facts=facts)
+    if not choice.allowed:
+        raise InlineFinishError(choice.reason)
+    return choice, jobs, inherited
+
+
+def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=None) -> dict[str, Any]:
     root = Path(route["artifact_root"]).resolve(strict=True)
     route_file = Path(route_file)
     if route_file.is_symlink():
         raise InlineFinishError("finish-route-unsafe")
     route_file = route_file.resolve(strict=True)
-    if route.get("effective_intensity") != "direct":
-        raise InlineFinishError("finish-route-not-direct")
+    _choice, jobs, inherited_jobs = _admission or admit(route)
     nodes = route.get("nodes") or []
-    if (len(nodes) != 1 or nodes[0].get("id") != "inline"
-            or nodes[0].get("kind") != "capability-owner"
-            or nodes[0].get("dispatch_depth") != 0
-            or nodes[0].get("execution_surface") != "inline"
-            or nodes[0].get("registered_worker") is not False
-            or nodes[0].get("terminal") is not True):
-        raise InlineFinishError("finish-inline-owner-sentinel-required")
-    # The interactive caller can be hosted by any supported runtime.  Keep the
-    # same ambiguity rule used by dispatch admission rather than guessing one
-    # session variable when a shell happens to inherit several.
-    from dispatch_parent_completion import interactive_parent_identity
-    from dispatch_contract import DispatchContractError
-    try:
-        _harness, sid = interactive_parent_identity(os.environ)
-    except DispatchContractError as exc:
-        if str(exc) == "caller-harness-ambiguous":
-            raise InlineFinishError("finish-caller-harness-ambiguous") from exc
-        raise InlineFinishError("finish-caller-harness-invalid") from exc
-    if not sid:
-        raise InlineFinishError("finish-current-session-missing")
-    if not sid or os.environ.get("AGENT_DISPATCH_ATTEMPT_ID") or os.environ.get("AGENT_DISPATCH_DEPTH", "0") != "0":
-        raise InlineFinishError("finish-registered-caller-ineligible")
     if dispatch_terminal_commit.require_current_cleanup("inline-finish", target=route_file) is not None:
         raise InlineFinishError("finish-foreign-cleanup-scope")
-    from dispatch_contract import resolve_global_registry
-    inherited_jobs = os.environ.get("AGENT_DISPATCH_JOBS", "")
-    jobs = resolve_global_registry(Path(__file__).resolve().parents[1], None, 0, "read").path
-    if inherited_jobs and not jobs.is_file():
-        raise InlineFinishError("finish-registry-unavailable")
-    try:
-        for line in _registry_lines(jobs, bool(inherited_jobs)):
-            fields = line.split("\t")
-            from dispatch_contract import parse_registry_metadata
-            metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}
-            if route["route_id"] in {metadata.get("route_id"), metadata.get("owner_route_id")}:
-                raise InlineFinishError("finish-registered-route-ineligible")
-    except InlineFinishError: raise
-    except Exception as exc: raise InlineFinishError("finish-registry-unreadable") from exc
     node = nodes[-1]
     if not isinstance(node, dict) or not node.get("id"):
         raise InlineFinishError("finish-terminal-node-missing")
@@ -273,17 +269,11 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api) -> dict[str, A
                 locked_evidence, locked_summary = evidence_raw, summary_raw
             if not finished and (locked_evidence != evidence_raw or locked_summary != summary_raw):
                 raise InlineFinishError("finish-evidence-drift")
-            try:
-                for line in _registry_lines(jobs, bool(inherited_jobs)):
-                    fields = line.split("\t")
-                    from dispatch_contract import parse_registry_metadata
-                    metadata = parse_registry_metadata(fields[5]) if len(fields) > 5 else {}
-                    if route["route_id"] in {metadata.get("route_id"), metadata.get("owner_route_id")}:
-                        raise InlineFinishError("finish-registered-route-ineligible")
-            except InlineFinishError:
-                raise
-            except Exception as exc:
-                raise InlineFinishError("finish-registry-unreadable") from exc
+            from route_authority import decide_continuation
+            choice = decide_continuation(route, action="finish-registry",
+                facts={"registered_route": registered_route(route, jobs, bool(inherited_jobs))})
+            if not choice.allowed:
+                raise InlineFinishError(choice.reason)
             locked_dirty = subprocess.run(
                 ["git", "-C", route["cwd"], "status", "--porcelain", "--untracked-files=no"],
                 capture_output=True, text=True)

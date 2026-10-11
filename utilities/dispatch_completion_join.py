@@ -698,39 +698,22 @@ class CurrentDeliveryState:
     cancellation_requested: bool = False
 
 
-def delivery_classification(state: CurrentDeliveryState) -> str:
-    """Return the sole shared success/attention decision for delivery writers."""
+def _delivery_choice(state, *, blocked_reason=""):
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="delivery", facts={"state": state, "blocked_reason": blocked_reason})
+    if choice.state == "wait":
+        error = CompletionDeferred(choice.reason)
+        error.retry_when, error.next_action = choice.retry_when, choice.next_action
+        raise error
+    return choice
 
-    if state.cancellation_requested and not state.cancelled:
-        raise CompletionDeferred("termination-pending")
-    if state.cancelled and state.quiescent and state.workflow_complete and state.owned_children == 0:
-        return "success"
-    return (
-        "success"
-        if (
-            state.completion_proven
-            and state.status == "done"
-            and state.verdict == "PASS"
-            and state.quiescent
-            and state.owned_children == 0
-            and not state.terminal_conflict
-            and state.workflow_complete
-        )
-        else "attention"
-    )
+
+def delivery_classification(state: CurrentDeliveryState) -> str:
+    return _delivery_choice(state).state
 
 
 def delivery_required_action(state: CurrentDeliveryState) -> str:
-    """Map the shared classification to its only legal parent action."""
-
-    classification = delivery_classification(state)
-    if classification == "success":
-        return "advance-completed"
-    if not state.workflow_complete:
-        return "finish-workflow"
-    if state.status in OPEN_STATES:
-        return "complete-open"
-    return "inspect-done-failure"
+    return _delivery_choice(state).next_action
 
 
 def completion_harvest_command(attempt_id: str, action: str, *, jobs: str, surface: str) -> str:
@@ -934,15 +917,35 @@ def settle_open_pass(jobs: Path, attempt_id: str) -> bool:
     return bool(settle_finished_attempt(Path(jobs), row).get("closed"))
 
 
+def harvest_open_attempt(jobs, rows, *, completion, complete_routed):
+    """Apply the common harvest selection through existing exact terminal writers."""
+    from route_authority import decide_continuation
+    from dispatch_contract import parse_registry_metadata, validate_attempt_metadata
+    choice = decide_continuation(action="harvest", rows=rows)
+    if not choice.allowed:
+        error = JoinContractError(choice.reason)
+        error.matched_live = len(choice.census)
+        raise error
+    if not choice.census:
+        return 0, None, {}
+    target = choice.census[0]
+    metadata = parse_registry_metadata(target[5])
+    validate_attempt_metadata(metadata)
+    attempt = metadata.get("attempt_id")
+    if not attempt:
+        raise JoinContractError("attempt-id-required")
+    if metadata.get("route_id"):
+        complete_routed(jobs, metadata, target[3], completion)
+    elif close_attempt_row(jobs, attempt, "harvest-complete"):
+        materialize_after_terminal_close(jobs, attempt)
+    else:
+        raise JoinContractError("attempt-row-not-open")
+    return 1, target, metadata
+
+
 def wait_for_delivery_projection(receipt, *, jobs, timing=None):
-    """Keep a queued receipt parked until existing cancellation cleanup settles."""
-    while True:
-        try:
-            return receipt_with_delivery_observability(receipt, jobs=jobs, timing=timing)
-        except CompletionDeferred:
-            # This carrier already owns completion observation. Retain only
-            # cancellation waiting here; ordinary contract errors propagate.
-            time.sleep(0.05)
+    """One observation; the existing batch collector owns deferred retry and deadlines."""
+    return receipt_with_delivery_observability(receipt, jobs=jobs, timing=timing)
 
 
 def receipt_with_delivery_observability(
@@ -966,19 +969,6 @@ def receipt_with_delivery_observability(
         attempt_id = raw_child.get("attempt_id")
         if not isinstance(attempt_id, str) or not attempt_id:
             raise JoinContractError("delivery-receipt-attempt-invalid")
-        if str(raw_child.get("reason", "")).startswith("closure-blocked:"):
-            # A proven-permanent owner_completion_state("blocked") gate (item
-            # 8, unfinishable-watch) never becomes "success" here -- the row's
-            # own workflow can never complete, so recomputing from
-            # current_delivery_state would fold it back into the ordinary
-            # finish-workflow loop this receipt exists to stop. Preserve the
-            # join's own typed verdict (reason/required_action) and classify
-            # it attention -- a human must inspect it, not retry it.
-            child = dict(raw_child)
-            child["delivery_classification"] = "attention"
-            children.append(child)
-            classifications.append("attention")
-            continue
         try:
             state = current_delivery_state(
                 jobs, attempt_id, parent_attempt_id=attempt_id
@@ -988,13 +978,16 @@ def receipt_with_delivery_observability(
         except (DispatchContractError, OSError) as exc:
             reason = exc.reason if isinstance(exc, DispatchContractError) else type(exc).__name__
             raise JoinContractError(f"delivery-transaction-failed:{reason}") from exc
-        classification = delivery_classification(state)
+        blocked_reason = str(raw_child.get("reason", ""))
+        blocked_reason = blocked_reason if blocked_reason.startswith("closure-blocked:") else ""
+        choice = _delivery_choice(state, blocked_reason=blocked_reason)
+        classification = choice.state
         child = dict(raw_child)
         child["status"] = state.status
         child["delivery_classification"] = classification
-        child["required_action"] = delivery_required_action(state)
+        child["required_action"] = choice.next_action
         if classification == "attention":
-            child["reason"] = "terminal-failure-or-unclosed"
+            child["reason"] = choice.reason or "terminal-failure-or-unclosed"
         elif state.advanced:
             child["reason"] = "row-advanced"
         # Information only: the approved route plan's next leg, never a launch or an action.
@@ -2964,9 +2957,9 @@ def current_delivery_state(
     if result.advanced:
         # SD-111 P2 trigger 1: the registry lock already released above.
         materialize_after_terminal_close(jobs, attempt_id)
-    from dispatch_terminal_commit import owner_completion_pending
+    from dispatch_terminal_commit import owner_completion_state
     current = current_attempt_row(jobs, attempt_id) if result.advanced else snapshot
-    workflow_complete = current is None or not owner_completion_pending(jobs, current.status, current.metadata)
+    workflow_complete = current is None or owner_completion_state(jobs, current.status, current.metadata).state in {"complete", "not-applicable"}
     return CurrentDeliveryState(
         marker=result.marker,
         marker_digest=result.marker_digest,
@@ -3370,56 +3363,20 @@ def _join_snapshot(
             )
             if row.status not in OPEN_STATES | {"done"}:
                 raise JoinContractError("owned-row-status-invalid")
-            decision = decide_attempt(
-                row.status, row.metadata,
-                process_state=observed.process_state,
-                process_reason=observed.process_reason,
-                terminal_observed=observed.reason == "terminal-observed",
-            )
             from dispatch_terminal_commit import owner_completion_state
+            from route_authority import decide_continuation
             completion_state = owner_completion_state(jobs, row.status, row.metadata)
-            workflow_pending = completion_state.state in {"pending", "unknown"}
-            # A proven-permanent block (item 8) is never worth another
-            # `settlement()` round trip -- unlike ordinary `workflow_pending`,
-            # no amount of retrying changes a `blocked` verdict. The receipt
-            # still reports this row `pending` (the shared reason vocabulary
-            # a raw join child must carry has no typed token for it), but a
-            # distinct supervision notice below tells a human it will never
-            # resolve on its own.
-            workflow_blocked = completion_state.state == "blocked"
+            choice = decide_continuation(action="join", status=row.status, metadata=row.metadata,
+                facts={"observed": observed, "completion": completion_state})
+            decision = choice.census["attempt"]
+            workflow_pending, workflow_blocked = choice.census["workflow_pending"], choice.census["blocked"]
             if workflow_blocked:
                 blocked_attempt_ids.add(row.attempt_id)
                 blocked_reasons[row.attempt_id] = completion_state.reason
-            if decision.action in {"wait", "recover"}:
-                readiness = "pending"
-                reason = "process-alive" if decision.action == "wait" else "process-unverifiable"
-                pending = True
-            elif decision.action == "complete":
-                # A `done` row closed typed-deferred (6번): the transport
-                # never confirmed the marker, so this is not yet a settled
-                # outcome -- drive the same settlement path a still-open row
-                # would take, instead of `registry-closed`'s ordinary "ready".
-                readiness = "pending"
-                reason = DEFERRED_COMPLETION_NOTE
-                pending = True
-            else:
-                readiness = "ready"
-                reason = "registry-closed" if row.status == "done" else "terminal-observed"
-            # Captured before the workflow override below folds every
-            # workflow_pending/workflow_blocked row into "pending": this is
-            # the one signal that tells a genuinely still-settling owner
-            # (workflow_pending) apart from a row that was already otherwise
-            # terminal-delivered, for the all-blocked-or-delivered check below.
-            closure_eligible[row.attempt_id] = workflow_blocked or (
-                readiness == "ready" and not workflow_pending
-            )
-            if workflow_pending or workflow_blocked:
-                readiness, reason, pending = "pending", "workflow-completion-pending", True
-            if (settlement is not None and (
-                    (readiness == "ready" and row.status in OPEN_STATES)
-                    or workflow_pending
-                    or decision.action == "complete"
-                ) and decision.action != "inspect-conflict"):
+            readiness, reason = choice.state, choice.reason
+            pending = pending or not choice.allowed
+            closure_eligible[row.attempt_id] = choice.census["closure_eligible"]
+            if settlement is not None and choice.census["settle"]:
                 # A repeated identical (closed, reason) outcome, or the
                 # registry not having changed at all since the last call,
                 # backs the retry interval off 2 -> 4 -> ... -> 60s instead
@@ -3455,12 +3412,7 @@ def _join_snapshot(
                     else DEFERRED_COMPLETION_NOTE if decision.action == "complete"
                     else "terminal-commit-pending"
                 ), True
-            if (recovery is not None and readiness == "pending"
-                    and (reason == "process-unverifiable" or (
-                        reason == "terminal-commit-pending"
-                        and row.status in OPEN_STATES
-                        and row.metadata.get("pid", "").isdigit()
-                        and row.metadata.get("pid_start")))
+            if (recovery is not None and choice.census["recover"]
                     and row.metadata.get("registered_worker") == "1"
                     and time.monotonic() - last_recovery.get(row.attempt_id, float("-inf")) >= 30):
                 last_recovery[row.attempt_id] = time.monotonic()
@@ -3474,8 +3426,7 @@ def _join_snapshot(
                     "status": row.status,
                     "readiness": readiness,
                     "reason": reason,
-                    "required_action": ("finish-workflow" if (workflow_pending or workflow_blocked)
-                                        else required_action_for_attempt(row.status, row.metadata)),
+                    "required_action": choice.next_action,
                 }
             )
         if recovered:
@@ -3837,7 +3788,7 @@ def typed_stage_advance_block(value: object) -> dict[str, object]:
 
 
 def route_completion_evidence(
-    metadata: dict[str, str], *, worktree: str
+    metadata: dict[str, str], *, worktree: str, terminal=None, decision=None
 ) -> tuple[str | None, str]:
     """Derive a readable in-root artifact path from a route-bound child's own
     terminal envelope, or ``(None, reason)`` when it cannot legally complete.
@@ -3855,29 +3806,16 @@ def route_completion_evidence(
     reader debugging a stuck row needs (round_1 review advisory 4).
     """
 
-    terminal = inspect_terminal_attempt(
-        metadata.get("log_file"),
-        worktree=worktree,
-        artifact_root_metadata=metadata.get("artifact_root"),
-        # Passing the worker type only adds evidence here: the review note
-        # upgrade it enables applies to FAIL envelopes, which this predicate
-        # already refuses one line below.
-        worker_type=metadata.get("worker_type"),
-    )
-    if terminal.get("state") != "valid":
-        return None, "evidence-not-valid"
-    if str(terminal.get("verdict")) != "PASS":
-        return None, "evidence-not-pass"
-    if terminal.get("artifact_state") != "readable":
-        return None, "evidence-not-readable"
-    # P-4: a review whose own artifact declares FAIL/BLOCKED cannot complete
-    # its node on the strength of a PASS envelope. The envelope keeps its
-    # authority -- nothing here re-verdicts the round -- but completion is
-    # evidence, and contradictory evidence is not evidence. The row stays
-    # open with this reason, which is the state an owner can act on.
-    conflict = str(terminal.get("review_verdict_conflict") or "")
-    if conflict:
-        return None, f"evidence-review-verdict-conflict:{conflict}"
+    if terminal is None:
+        terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=worktree,
+            artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+    from route_authority import decide_continuation
+    choice = decision or decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
+    if not choice.allowed:
+        reason = ("evidence-not-valid" if choice.state in {"absent", "invalid"} else
+                  "evidence-not-pass" if choice.state == "typed" else
+                  choice.reason if choice.reason.startswith("evidence-review-verdict-conflict:") else "evidence-not-readable")
+        return None, reason
     encoded = str(terminal.get("artifact_path_b64") or "")
     try:
         artifact = base64.urlsafe_b64decode(
@@ -4136,34 +4074,19 @@ def classify_exact_route_free_review_outcome(
         artifact_root_metadata=metadata.get("artifact_root"),
         worker_type=metadata.get("worker_type"),
     )
-    if terminal.get("state") != "valid":
-        state = str(terminal.get("state") or "absent")
-        reason = str(terminal.get("reason") or f"terminal-{state}")
-        if state == "absent":
-            result = missing_result_terminal({
-                **metadata, "worktree": _row_worktree(row), "started_at": raw_fields[0],
-            })
-            return ExactReviewClassification(
-                "terminal-handoff", reason, result.note, "typed-close", result.evidence()
-            )
-        return ExactReviewClassification("terminal-handoff", reason, "dead-invalid-envelope", "typed-close")
-    verdict = str(terminal.get("verdict") or "")
-    if verdict in {"FAIL", "BLOCKED"}:
-        if review_blocking_handoff(terminal, metadata.get("worker_type")):
-            return ExactReviewClassification(
-                "terminal-handoff", "typed-review-blocking", REVIEW_BLOCKING_NOTE, "typed-close"
-            )
-        note = "dead-worker-fail" if verdict == "FAIL" else "dead-worker-blocked"
-        return ExactReviewClassification("terminal-handoff", f"typed-{verdict.lower()}", note, "typed-close")
-    if verdict != "PASS":
-        return ExactReviewClassification("terminal-handoff", "terminal-verdict-invalid", "dead-invalid-envelope", "typed-close")
-    if terminal.get("artifact_state") != "readable":
-        return ExactReviewClassification(
-            "terminal-handoff", f"evidence-{terminal.get('artifact_state') or 'absent'}",
-            "dead-invalid-envelope", "typed-close"
-        )
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
+    if not choice.allowed:
+        note, evidence = choice.detail, choice.census
+        reason = choice.reason
+        if choice.state == "absent":
+            result = missing_result_terminal({**metadata, "worktree": _row_worktree(row), "started_at": raw_fields[0]})
+            note, evidence = result.note, result.evidence()
+        if choice.state in {"absent", "invalid"} and terminal.get("state") != "valid":
+            reason = str(terminal.get("reason") or "terminal-" + str(terminal.get("state") or "absent"))
+        return ExactReviewClassification("terminal-handoff", reason, note, "typed-close", evidence)
     artifact, evidence_reason = route_completion_evidence(
-        metadata, worktree=_row_worktree(row)
+        metadata, worktree=_row_worktree(row), terminal=terminal, decision=choice
     )
     if artifact is None:
         return ExactReviewClassification(
@@ -4308,79 +4231,25 @@ def close_finished_child(
         or not terminal.get("artifact_origin_path_b64")
     ):
         return "recorded-move-correction-evidence-unavailable"
-    if terminal.get("state") != "valid":
-        # Carry the inspector's own enum: a bare `terminal-invalid` sends the
-        # next reader back through the parser to learn whether the envelope was
-        # missing, malformed, or a runtime error.  The enum is a fixed vocabulary,
-        # never raw agent text.
-        skip = "terminal-%s" % (terminal.get("state") or "absent")
-        detail = terminal.get("reason")
-        reason = f"{skip}:{detail}" if detail else skip
-        if str(terminal.get("state")) == "absent":
-            missing = missing_result_terminal({
-                **metadata, "worktree": _row_worktree(row),
-                "started_at": row.raw.split("\t")[0],
-            })
-            if _close_invalid_envelope_child(
-                row,
-                jobs=jobs,
-                reason="terminal-envelope-absent",
-                note=missing.note,
-                classifier_source="completion-join-missing-result-v1",
-                terminal_envelope=False,
-                extra_evidence=missing.evidence(),
-            ):
-                return ""
-        if str(terminal.get("state")) == "invalid" and _close_invalid_envelope_child(
-            row, jobs=jobs, reason=reason,
-            extra_evidence={key: str(terminal.get(key) or "") for key in ARTIFACT_HINT_KEYS},
-        ):
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
+    if not choice.allowed:
+        note, evidence, reason = choice.detail, choice.census, choice.reason
+        if choice.state == "absent":
+            missing = missing_result_terminal({**metadata, "worktree": _row_worktree(row),
+                                              "started_at": row.raw.split("\t")[0]})
+            note, evidence, reason = missing.note, missing.evidence(), "terminal-envelope-absent"
+        elif choice.state in {"invalid", "evidence"}:
+            evidence = {key: str(terminal.get(key) or "") for key in ARTIFACT_HINT_KEYS}
+        if _close_invalid_envelope_child(row, jobs=jobs, reason=reason, note=note,
+            classifier_source="completion-join-terminal-verdict-v1" if choice.state == "typed"
+                              else "completion-join-missing-result-v1" if choice.state == "absent"
+                              else "completion-join-invalid-envelope-v1",
+            terminal_envelope=choice.state != "absent", extra_evidence=evidence):
             return ""
-        return reason
-    verdict = str(terminal.get("verdict"))
-    if verdict in ("BLOCKED", "FAIL"):
-        # SD-72/SD-78 (round_1 finding 1): a valid terminal handoff carrying
-        # BLOCKED or FAIL closes typed IMMEDIATELY on the verdict alone — this
-        # must run before the artifact_state branch below, because the
-        # inspector accepts a readable artifact independently of verdict
-        # (codex_dispatch_terminal.py). Without this ordering a readable
-        # BLOCKED/FAIL envelope would fall through to route completion and
-        # manufacture a PASS for a worker that never passed. Route completion
-        # is reachable only for a PASS verdict, never for BLOCKED/FAIL.
-        note = "dead-worker-blocked" if verdict == "BLOCKED" else "dead-worker-fail"
-        reason = "typed-%s" % verdict.lower()
-        extra_evidence = None
-        if review_blocking_handoff(terminal, metadata.get("worker_type")):
-            # OPERATIONS §5.10: a reviewer that recorded blocking findings in a
-            # readable in-root artifact finished its contract. The row closes
-            # typed-complete (never marker-eligible on its own -- only the
-            # owner-closure path in capability-route.py can complete it), the
-            # verdict axis stays FAIL, and the artifact it named is sealed on
-            # the row so the closure gate can re-verify it later.
-            note = REVIEW_BLOCKING_NOTE
-            reason = "typed-review-blocking"
-            extra_evidence = {
-                "review_artifact_b64": str(terminal.get("artifact_path_b64") or ""),
-            }
-        if _close_invalid_envelope_child(
-            row,
-            jobs=jobs,
-            reason=reason,
-            note=note,
-            classifier_source="completion-join-terminal-verdict-v1",
-            extra_evidence=extra_evidence,
-        ):
-            return ""
-        return reason
-    if terminal.get("artifact_state") != "readable":
-        reason = "evidence-%s" % (terminal.get("artifact_state") or "absent")
-        if verdict == "PASS" and _close_invalid_envelope_child(
-            row, jobs=jobs, reason=reason
-        ):
-            return ""
-        return reason
+        return choice.reason
     artifact, evidence_reason = route_completion_evidence(
-        metadata, worktree=_row_worktree(row)
+        metadata, worktree=_row_worktree(row), terminal=terminal, decision=choice
     )
     if artifact is None:
         return evidence_reason

@@ -1168,34 +1168,18 @@ def main(argv: list[str] | None = None) -> int:
             if active_outbox is not None:
                 if active_outbox.receipt is None:
                     raise SupervisorError("supervisor-outbox-receipt-missing")
-                # D3: a supervisor that restarts onto an open-but-finished
-                # child must not hand the owner an unsatisfiable receipt. The
-                # park path's own pre-receipt runtime_reconcile is already
-                # correct; this is the narrowed survivor of the assignment's
-                # D2 for the recovery path specifically.
-                runtime_reconcile(
-                    args,
-                    {
-                        row.attempt_id: row
-                        for row in current_children(
-                            Path(args.jobs),
-                            args.parent_attempt_id,
-                            set(active_outbox.attempt_ids),
-                        )
-                    },
-                    set(active_outbox.attempt_ids),
-                )
-                refreshed = refresh_supervisor_outbox_actions(
-                    state_path,
-                    args.parent_attempt_id,
-                    current_children(
-                        Path(args.jobs),
-                        args.parent_attempt_id,
-                        set(active_outbox.attempt_ids),
-                    ),
-                    jobs=Path(args.jobs),
-                )
-                active_outbox = refreshed.outbox
+                from dispatch_supervision import wait_for_batch
+                refreshed_state = []
+                def refresh_pending(selected):
+                    rows = current_children(Path(args.jobs), args.parent_attempt_id, selected)
+                    runtime_reconcile(args, {row.attempt_id: row for row in rows}, selected)
+                    state = refresh_supervisor_outbox_actions(state_path, args.parent_attempt_id,
+                        current_children(Path(args.jobs), args.parent_attempt_id, selected), jobs=Path(args.jobs))
+                    refreshed_state[:] = [state]
+                    return state.outbox.receipt
+                wait_for_batch(join=refresh_pending, attempts=set(active_outbox.attempt_ids),
+                    jobs=Path(args.jobs), parent_attempt_id=args.parent_attempt_id, emit=emit)
+                active_outbox = refreshed_state[0].outbox
                 next_prompt = completion_prompt(
                     active_outbox.receipt or {}, active_outbox, jobs=args.jobs
                 )
@@ -1586,10 +1570,16 @@ def main(argv: list[str] | None = None) -> int:
                 # about to receive, recorded exactly once regardless of how
                 # many internal advances the loop above just performed.
                 if runtime_reconcile(args, joined, set(new_attempts)):
-                    receipt = run_join(args, new_attempts)
+                    receipt = wait_for_batch(join=lambda selected: run_join(args, selected),
+                        attempts=set(new_attempts), jobs=Path(args.jobs),
+                        parent_attempt_id=args.parent_attempt_id, emit=emit)
                     joined_rows = current_children(
                         Path(args.jobs), args.parent_attempt_id, new_attempts
                     )
+                receipt = wait_for_batch(
+                    join=lambda selected: receipt_with_current_actions(receipt,
+                        current_children(Path(args.jobs), args.parent_attempt_id, selected), jobs=Path(args.jobs)),
+                    attempts=set(new_attempts), jobs=Path(args.jobs), parent_attempt_id=args.parent_attempt_id, emit=emit)
                 delivery_timing = validate_delivery_timing(
                     receipt["delivery_timing"]
                 )
@@ -1740,9 +1730,7 @@ def main(argv: list[str] | None = None) -> int:
                     state_path,
                     args.parent_attempt_id,
                     delivered,
-                    receipt_with_current_actions(
-                        receipt, joined_rows, jobs=Path(args.jobs)
-                    ),
+                    receipt,
                     joined_rows,
                 )
                 delivered = set(prepared.delivered_attempt_ids)
@@ -1884,11 +1872,9 @@ def main(argv: list[str] | None = None) -> int:
         if stream_session is not None:
             stream_session.close()
         try:
-            open_children = {
-                row.attempt_id
-                for row in current_children(Path(args.jobs), args.parent_attempt_id)
-                if row.status in {"open", "running"}
-            }
+            from dispatch_completion_join import supervisor_guarded_attempt_ids
+            open_children = supervisor_guarded_attempt_ids(
+                current_children(Path(args.jobs), args.parent_attempt_id), active_outbox)
         except Exception:
             open_children = set()
         resource_recovery = RESOURCE_WAIT.needs_recovery(state_path, args.parent_attempt_id, lease_exit[0] is not None)
