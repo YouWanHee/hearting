@@ -137,13 +137,14 @@ class ParentDeployTest(unittest.TestCase):
 
     def test_common_owner_admission_observes_exact_process_and_same_actions(self):
         self.decider.side_effect = self.real_decide
-        cases = [("open", "", "live", None),
-                 ("done", "dead-worker-blocked", "quiescent", None),
-                 ("done", "dead-worker-blocked", "unverifiable", "same-command"),
-                 ("open", "", "quiescent", "same-command"),
-                 ("cancelled", "", "quiescent", "settle"),
-                 ("done", "", "quiescent", "settle")]
-        for status, note, process, action in cases:
+        cases = [("open", "", "live", None, True),
+                 ("done", "dead-worker-blocked", "quiescent", None, False),
+                 ("done", "dead-worker-blocked", "unverifiable", None, False),
+                 ("done", "dead-worker-blocked", "live", None, False),
+                 ("open", "", "quiescent", "same-command", True),
+                 ("cancelled", "", "quiescent", "settle", False),
+                 ("done", "", "quiescent", "settle", True)]
+        for status, note, process, action, observes_process in cases:
             with self.subTest(status=status, process=process):
                 self.owner_row(status, note)
                 with patch("route_parent_close.owner_continuation_processes", return_value=(
@@ -154,7 +155,12 @@ class ParentDeployTest(unittest.TestCase):
                         with self.assertRaises(S.DC.DispatchContractError) as refused:
                             S.context(self.jobs, "owner")
                         self.assertEqual(refused.exception.next_action, action)
-                    observed.assert_called_once()
+                    if observes_process:
+                        observed.assert_called_once()
+                    else:
+                        # Keeping a blocked answer and honoring cancellation
+                        # are independent of uncertain execution observations.
+                        observed.assert_not_called()
         self.assertFalse(self.counter.exists())
 
     def test_common_admission_binds_real_parent_identity_in_all_harnesses(self):
@@ -174,7 +180,7 @@ class ParentDeployTest(unittest.TestCase):
 
     def test_cli_preserves_common_wait_action_and_observation_condition(self):
         self.decider.side_effect = self.real_decide
-        self.owner_row()
+        self.owner_row("open", "")
         with patch("route_parent_close.owner_continuation_processes", return_value=(
                 SimpleNamespace(state="unverifiable", reason="fixture observation"), [])), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
@@ -184,7 +190,7 @@ class ParentDeployTest(unittest.TestCase):
         failure = json.loads(output.getvalue())
         self.assertEqual(failure["next_action"], "same-command")
         self.assertTrue(failure["retry_when"])
-        self.assertEqual(failure["detail"], "fixture observation")
+        self.assertEqual(failure["detail"], failure["reason"] + ":fixture observation")
         self.assertFalse(S.paths(self.jobs, "rt-test")[0].exists())
 
     def test_pending_or_overridden_review_stops_before_spawn(self):
