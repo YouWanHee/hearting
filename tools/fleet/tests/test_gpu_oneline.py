@@ -105,19 +105,48 @@ class GPUOneLineTest(unittest.TestCase):
         self.host["reservation_detail"] = "leases unreadable"
         self.assertNotIn("unreserved+", self.rows(200)[2])
 
-    def test_expanded_detail_and_toggle_keep_original_payload(self):
+    def test_expanded_joins_each_reservation_and_its_command_on_one_row(self):
+        for n, (process, lease) in enumerate(zip(self.gpu["processes"], self.gpu["reservations"])):
+            process["pgid"] = lease["pid"] = 900 + n
         original = copy.deepcopy(self.gpu)
         render._FOLDABLE = list(render._compute_host_rows.fold_rows)
         render._toggle_gpu_commands()
         lines = self.rows(200)
-        self.assertEqual(len(lines), 11)
+        self.assertEqual(len(lines), 7)
         self.assertIn("▾ 4", lines[2])
-        self.assertEqual(sum("reserved saved" in line for line in lines), 4)
-        self.assertEqual(sum("↳" in line for line in lines), 4)
-        self.assertIn("10-04", "\n".join(lines))
-        self.assertIn("detailed task", "\n".join(lines))
-        self.assertIn("detailed-name.yaml", "\n".join(lines))
+        runs = lines[3:]
+        for line in runs:
+            self.assertIn("↳ ", line)
+            for detail in ("10-04", "detailed task", "detailed-name.yaml"):
+                self.assertIn(detail, line)
+            self.assertLessEqual(render._dw(line), 199)
+        self.assertEqual(sum("codex [bb]" in line for line in runs), 3)
+        self.assertNotIn("reserved", "\n".join(runs))
+        self.assertNotIn("saved", "\n".join(runs))
         self.assertEqual(original, self.gpu)
+
+    def test_unjoinable_runs_keep_their_own_rows(self):
+        # Without process-group evidence only [8e], its session's sole run, joins.
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
+        lines = [line.strip() for line in self.rows(200)[3:]]
+        self.assertEqual(len(lines), 7)
+        self.assertEqual(sum(line.startswith("↳ claude [8e] · ") and line.endswith(".yaml")
+                             for line in lines), 1)
+        self.assertEqual(sum(line.startswith("reserved codex [bb] · ") for line in lines), 3)
+        self.assertEqual(lines.count("↳ python train.py --config detailed-name.yaml"), 3)
+
+    def test_narrow_row_keeps_run_identity_and_counts_extra_processes(self):
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
+        for process in self.gpu["processes"]:
+            process["pgid"] = 900
+        self.gpu["reservations"] = [{**self.gpu["reservations"][0], "pid": 900}]
+        for width in (80, 200):
+            lines = self.rows(width)[3:]
+            self.assertEqual(len(lines), 1)
+            self.assertIn("↳ codex [bb] · 10-04", lines[0])
+            self.assertTrue(lines[0].endswith(" +3"))
+            self.assertLessEqual(render._dw(lines[0]), width - 1)
+        self.assertIn("detailed-name.yaml", self.rows(200)[3])
 
 
 if __name__ == "__main__":
