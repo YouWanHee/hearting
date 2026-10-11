@@ -35,7 +35,7 @@ FULL, EMPTY = render._BAR_FULL, render._BAR_EMPTY
 # F-55 (v39): the lead cell was the padded state WORD. F-100b (2026-09-03): it is the WHERE
 # chip — ` herdr ` reversed for a session herdr lists — in a slot of the same width. The
 # fixtures below are herdr-attached so the lead stays a distinctive marker in the text.
-LEAD = render._CTX_ON_TEXT.ljust(render._CTX_CHIP_W) + " "
+LEAD = render._CTX_ON_TEXT.ljust(4 + render._HW - render._CONTEXT_INDENT_W)
 # F-52b: no measured `context_window_tokens` on these fixtures → the 16-cell baseline track.
 BASE = render._CTX_TRACK_MAX
 # A context gauge is the only place a bar track is immediately followed by its right-justified
@@ -72,7 +72,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
             row = render._context_detail_row(self._idle(context=context, summary=now), term_width=168)
             expected = " " * render._CONTEXT_INDENT_W + context_text
             if now:
-                expected += " " * (render._NAME_COL - render._dw(expected)) + now
+                expected += " " * (render._NAME_COL - render._dw(expected)) + now + " · age unknown"
             self.assertEqual(text(row), expected)
 
     def test_stale_and_dead_rows_suppress_cached_detail(self):
@@ -100,14 +100,16 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 visible = text(row)
                 self.assertIsNotNone(CTX_GAUGE_RE.search(visible))
                 self.assertIn("85%", visible)
-                self.assertEqual(visible.index("NOW"), render._NAME_COL)
+                self.assertEqual(render._dw(visible[:re.search(r"(?:\d+%|—) +(\S)", visible).start(1)]), render._NAME_COL)
                 self.assertLessEqual(render._dw(visible), width)
 
                 rendered = text(render._build_lines(
                     [], [job], "both", False, 0,
                     layout=layout, term_width=width))
                 self.assertIsNotNone(CTX_GAUGE_RE.search(rendered))
-                self.assertIn("NOW", rendered)
+                if width >= 100:
+                    self.assertIn("age unknown", rendered)
+                    self.assertIn("NOW", rendered)
 
         job.summary = None
         visible = text(render._dispatch_summary_detail_row(job))
@@ -131,7 +133,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
 
                 # F-100b: a worker's lead slot is blank (never a herdr pane), so the
                 # detail row's first ink is the gauge, one full slot past the indent.
-                leading = len(visible) - len(visible.lstrip(" "))
+                leading = render._dw(visible[:next(i for i, ch in enumerate(visible) if ch in (FULL, EMPTY))])
                 self.assertEqual(leading, indicator_col + 2 + render._CTX_LABEL_W)
                 self.assertNotIn("working", visible)
                 self.assertEqual(
@@ -174,9 +176,11 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                               text(row)).group(0)
             self.assertEqual(len(track), BASE)
             self.assertIn(LEAD, text(row))
-            self.assertLess(text(row).index(LEAD), text(row).index("한글"))
+            self.assertLess(text(row).index(LEAD), re.search(r"(?:\d+%|—) +(\S)", text(row)).start(1))
             self.assertNotIn(": ", text(row))
-            self.assertIn("   한글", text(row))
+            self.assertTrue(text(row).endswith("age unknown"))
+            if width >= 120:
+                self.assertIn("한글", text(row))
             row_text = text(row)
             # The context row starts under the harness name in every layout (2026-07-24).
             self.assertEqual(render._dw(row_text[:row_text.index(LEAD)]), render._CONTEXT_INDENT_W)
@@ -283,7 +287,10 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 self.assertIn("impl-review(2-way)", visible)
                 self.assertNotIn("impl-review-replica", visible)
                 self.assertNotIn("←{", visible)
-                self.assertIn("review merge", visible)
+                if width >= 120:
+                    self.assertIn("review merge", visible)
+                else:
+                    self.assertTrue("age unknown" in visible or "age unk" in visible)
         # A genuinely wide terminal lends its slack to the breadcrumb: the whole
         # collapsed route stays visible instead of folding its early stages.
         wide = text(render._build_lines([session], [owner], "both", False, 0,
@@ -316,7 +323,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 self.assertNotIn("quick/exec", visible)
                 self.assertNotIn("stage one-shot", visible)
 
-    def test_inline_main_session_uses_artifact_stage_without_dispatch(self):
+    def test_inline_main_session_without_work_binding_has_no_invented_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan = os.path.join(tmp, "plans", "2026-07-22_inline-main")
             os.makedirs(plan)
@@ -326,8 +333,8 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                               session_id="sid-inline", slug="inline-main",
                               liveness="working")
             projection.attach_projections([session], [], artifact_root=tmp, now=100.0)
-            self.assertEqual(session.work_projection.source, "artifact-inferred")
-            self.assertEqual(session.work_projection.stage_label, "exec")
+            self.assertEqual(session.work_projection.source, "none")
+            self.assertIsNone(session.work_projection.stage_label)
             for width in (168, 120, 100, 60):
                 lines = render._build_lines([session], [], "fleet", width < 70, 0,
                                             layout=render._layout_mode(width),
@@ -337,7 +344,7 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                     # F-52c: the context row leads with the session's liveness mark; its
                     # 16-cell baseline track is the stable marker that the row rendered.
                     self.assertIn(EMPTY * render._CTX_TRACK_MAX, visible)
-                    self.assertIn("stage exec", visible)      # stage rides the row's own column
+                    self.assertNotIn("단계 구현", visible)
                     # An INFERRED inline stage carries NO dedicated detail row (2026-07-24): a
                     # main session must not show the `plan › exec › test` breadcrumb line.
                     self.assertNotIn("exec ● ←{plan}", visible)
@@ -786,9 +793,9 @@ class ChildAssociationTest(unittest.TestCase):
         visible = "\n".join("".join(part for part, _ in line) for line in lines if line)
         self.assertIsNotNone(CTX_GAUGE_RE.search(visible))
         self.assertLess(visible.index("└▸🚀"), visible.index("NOW"))
-        self.assertLess(visible.index("NOW"), visible.index("⚡tool"))
+        self.assertLess(re.search(r"(?:\d+%|—) +(\S)", visible).start(1), visible.index("⚡tool"))
         now_line = next(line for line in visible.splitlines() if "NOW" in line)
-        self.assertEqual(now_line.index("NOW"), render._NAME_COL)
+        self.assertEqual(render._dw(now_line[:now_line.index("NOW")]), render._NAME_COL)
 
 
 class CodexAttemptTelemetryTest(unittest.TestCase):

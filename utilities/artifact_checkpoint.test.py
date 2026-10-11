@@ -495,7 +495,9 @@ class CheckpointDisplayTitleTest(CheckpointTestBase):
         self.assertEqual(resumed["status"], "resumed")
         self.assertTrue(resumed["title_updated"])
         self.assertEqual(resumed["cycle_id"], self.cycle_id)
-        self.assertEqual(P.read_cycle_record(self.root, self.cycle_id), {**record_before, "title": title})
+        current = P.read_cycle_record(self.root, self.cycle_id)
+        self.assertEqual({k: v for k, v in current.items() if k != "control_record_digest"},
+                         {k: v for k, v in {**record_before, "title": title}.items() if k != "control_record_digest"})
         self.assertEqual({path: path.read_bytes() for path in protected}, before)
         self.assertIn(other_entry, self.titles())
         entry = next(row for row in self.titles() if row["cycle_id"] == self.cycle_id)

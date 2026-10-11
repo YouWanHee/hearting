@@ -3,7 +3,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REQUIRED_COMMIT = "1fa0d99e4b714b5ce305f78c8f7c7773255e8f87";
 const FORBIDDEN_KEY = /(^|[_-])(write|switch|apply|activate|deactivate|ingest|migrat(?:e|ion))($|[_-])/i;
@@ -61,6 +61,62 @@ function verifyErrorModule(value: unknown): asserts value is ErrorModule {
       || !errors.EXIT_CODES || codes.some((code, index) => errors.EXIT_CODES[code] !== index + 2)) {
     bootstrapFailure("INTERNAL_FAILURE", "Cairn W3a error contract is invalid");
   }
+}
+
+function unresolvedDisplay(reason: string): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    subject: { state: "unresolved" },
+    verification: { verdict: "unresolved", state: "unresolved", reason, peers: [], history: [] },
+    completion: { state: "unknown", reason, obligations: { state: "unknown", items: [] } },
+    required_input_observation: { state: "unresolved", reasons: [reason] },
+    integrity: { state: "unresolved", reason },
+    display: {
+      verification_label: "검증 미확정", completion_label: "완료 미확정",
+      required_input_label: "필수 입력 미확정", limitations: [], entrypoints: [],
+    },
+  };
+}
+
+function attachVerificationDisplay(response: Record<string, any>, request: Record<string, any>) {
+  if (!Array.isArray(response.rows)) return response;
+  const selectedRows = response.rows.filter((row: any) => row && typeof row === "object"
+    && typeof row.stable_id === "string").map((row: any) => ({
+      stable_id: row.stable_id,
+      artifact_root_id: row.artifact_root_id ?? request.artifact_root_id,
+      namespace_state: response.namespace_state,
+      degraded: response.degraded === true || row.degraded === true,
+      partial: response.partial === true || row.partial === true,
+      integrity: row.integrity,
+      freshness: row.freshness,
+    }));
+  if (selectedRows.length === 0) return { ...response, hearting_verification_display: [] };
+  const resolver = path.join(path.dirname(fileURLToPath(import.meta.url)), "report_verification_projection.py");
+  const childEnv: Record<string, string> = {
+    PATH: process.env.PATH ?? "",
+    PYTHONDONTWRITEBYTECODE: "1",
+  };
+  for (const name of ["AGENT_HOME", "CODEX_HOME", "AGENT_ARTIFACT_ROOT", "AGENT_DISPATCH_JOBS"]) {
+    const value = process.env[name];
+    if (value) childEnv[name] = value;
+  }
+  try {
+    const encoded = execFileSync(process.env.PYTHON ?? "python3", [resolver, "rows"], {
+      input: JSON.stringify({ rows: selectedRows }),
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      env: childEnv,
+    });
+    const display = JSON.parse(encoded);
+    if (Array.isArray(display)) return { ...response, hearting_verification_display: display };
+  } catch { /* Local uncertainty must not turn the successful W3a read into an error. */ }
+  return {
+    ...response,
+    hearting_verification_display: selectedRows.map((row: any) => ({
+      stable_id: row.stable_id,
+      payload: unresolvedDisplay("local-resolution-unavailable"),
+    })),
+  };
 }
 
 async function main(): Promise<void> {
@@ -157,7 +213,7 @@ async function main(): Promise<void> {
     if (response === null || typeof response !== "object" || Array.isArray(response)) {
       contractFailure(errors, "INTERNAL_FAILURE", "Cairn read returned an invalid response");
     }
-    writeObject(response);
+    writeObject(attachVerificationDisplay(response, readRequest as Record<string, any>));
   } catch (error: any) {
     const payload = error?.payload;
     if (payload && typeof payload.code === "string" && errors.READ_ERROR_CODES.includes(payload.code)) {

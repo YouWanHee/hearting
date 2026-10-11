@@ -91,6 +91,19 @@ class OwnerResourceChildrenTest(unittest.TestCase):
         # A route is shared by retries, but the parked activity belongs to its exact owner only.
         self.assertIsNotNone(self.owner.resource_wait)
 
+    def test_parked_owner_active_resource_uses_the_shared_manual_blink_phase(self):
+        self.attach()
+        phases = []
+        for phase in (True, False):
+            with mock.patch.object(render, "_BLINK_ON", phase):
+                lines = render._build_lines([], [self.owner], "both", False, 0,
+                                            layout="wide", term_width=180, resources=[self.resource])
+                phases.append([key for line in lines if line for text, key in line
+                               if text == "eval-run" and key and key.startswith("stg")])
+        self.assertTrue(phases[0] and phases[1])
+        self.assertNotEqual(phases[0], phases[1])
+        self.assertEqual(self.owner.liveness, "idle")
+
     def test_duplicate_exact_parent_rows_and_missing_parent_never_guess(self):
         duplicate = replace(self.owner)
         self.attach(jobs=[self.owner, duplicate])
@@ -145,6 +158,32 @@ class OwnerResourceChildrenTest(unittest.TestCase):
         self.attach(resources=[])
         self.assertEqual(self.owner.resource_children, [])
 
+    def test_resource_dot_reuses_gpu_blink_and_observed_host_pid_without_log_age(self):
+        self.attach()
+        self.resource.local_placement = {"hostname": "moving4.iip.lab", "processes": [
+            {"pid": self.resource.pid, "starttime": self.resource.starttime}]}
+        self.resource.log_updated_at = 1
+        for phase, key in ((True, "g_work"), (False, "g_work_off")):
+            with self.subTest(phase=phase), mock.patch.object(render, "_BLINK_ON", phase):
+                rows = render._resource_child_rows(self.owner, term_width=168)
+                self.assertIn(("●", key), rows[0])
+                self.assertIn("moving4.iip.lab", flatten(rows))
+                self.assertIn("PID 41", flatten(rows))
+                self.assertNotIn("ago", flatten(rows))
+        for width in (24, 36, 60, 80, 168):
+            rows = render._resource_child_rows(self.owner, term_width=width)
+            self.assertLessEqual(sum(render._dw(t) for t, _ in rows[0]), width)
+            if width >= 40:
+                self.assertIn("eval run", flatten(rows))
+                self.assertIn("6h 50m", flatten(rows))
+        self.resource.local_placement = None
+        self.assertNotIn("PID", flatten(render._resource_child_rows(self.owner, term_width=168)))
+        self.resource.state_evidence = {"reason": "exact-identity-match", "current_identity": {
+            "pid": self.resource.pid, "starttime": self.resource.starttime}}
+        self.assertEqual(render._resource_process_location(self.resource), "PID 41")
+        self.resource.state_evidence["current_identity"]["starttime"] = "456"
+        self.assertEqual(render._resource_process_location(self.resource), "")
+
     def test_working_owner_and_plain_idle_owner_are_not_labeled_parked(self):
         for liveness, evidence in (("working", self.owner.state_evidence), ("idle", {})):
             with self.subTest(liveness=liveness):
@@ -176,13 +215,14 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                                                 layout=layout, term_width=width,
                                                 resources=[self.resource], governor=None)
                     text = flatten(lines)
-                    self.assertIn("resource eval-run", text)
-                    self.assertIn("working  6h 50m", text)
+                    self.assertIn("resource eval run", text)
+                    self.assertIn("6h 50m", text)
                     self.assertNotIn("old model summary", text)
-                    self.assertEqual(text.count("resource eval-run"), 1)
-                    child_line = next(line for line in lines if line and "resource eval-run" in flatten([line]))
+                    self.assertEqual(text.count("resource eval run"), 1)
+                    child_line = next(line for line in lines if line and "resource eval run" in flatten([line]))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in child_line), width)
-                    self.assertIn("resource-parked", text)
+                    if width == 168:
+                        self.assertIn('no log', text)
         snap = json.loads(fleet._snapshot_json([], [self.owner], [self.resource]))
         self.assertEqual(len(snap["jobs"]), 1)
         job = snap["jobs"][0]
@@ -201,7 +241,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     rows = render._resource_child_rows(self.owner, term_width=width, in_card=True)
                     framed = [render._frame_dispatch_line(
                         row, render._dispatch_box_width(width), "mid", "frm_idle") for row in rows]
-                    self.assertIn("working  6h 50m", flatten(framed))
+                    self.assertIn("6h 50m", flatten(framed))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in framed[0]), width)
 
     def test_stage_divider_and_closing_rail_never_repeat_campaign_title(self):
@@ -246,7 +286,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                 gpu = [line for line in lines if line and "● GPU" in flatten([line])]
                 self.assertEqual(len(gpu), 1)
                 text = flatten(gpu)
-                self.assertEqual(text.count("eval-run 3h 23m"), 1)
+                self.assertEqual(text.count("eval run 3h 23m"), 1)
                 self.assertNotIn("working", text)
                 if width >= 80:
                     self.assertIn("2m ago", text)
@@ -254,14 +294,14 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     self.assertIn("12/50 epoch", text)
                     self.assertIn("GPU moving4:0", text)
                     self.assertIn("GPU moving4:1", text)
-                self.assertNotIn("resource eval-run", flatten(lines))
-                self.assertEqual(flatten(lines).count("resource eval-smoke"), 1)
+                self.assertNotIn("resource eval run", flatten(lines))
+                self.assertEqual(flatten(lines).count("resource eval smoke"), 1)
                 self.assertLessEqual(sum(render._dw(t) for t, _ in gpu[0]), width)
         self.assertEqual(snapshot, before)
         self.resource.liveness = "stale"
         rows, cpu_rows = render._owner_gpu_resource_rows(self.owner, {}, {}, 168)
-        self.assertIn("eval-run stale 3h 23m", flatten(rows))
-        self.assertNotIn("resource eval-run", flatten(cpu_rows))
+        self.assertIn("eval run stale 3h 23m", flatten(rows))
+        self.assertNotIn("resource eval run", flatten(cpu_rows))
 
     def test_remote_registered_run_matches_gpu_but_cwd_and_reused_pid_do_not(self):
         self.attach()
@@ -306,8 +346,8 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                         gpu = [line for line in lines if line and "● GPU" in flatten([line])]
                         self.assertEqual(len(gpu), 1)
                         self.assertIn("GPU xavier:0", flatten(gpu))
-                        self.assertIn("eval-run 12h", flatten(gpu))
-                        self.assertNotIn("resource eval-run", flatten(lines))
+                        self.assertIn("eval run 12h", flatten(gpu))
+                        self.assertNotIn("resource eval run", flatten(lines))
                         self.assertNotIn("job:", flatten(gpu))
                         self.assertNotIn("미등록", flatten(lines))
                         self.assertLessEqual(sum(render._dw(t) for t, _ in gpu[0]), width)
@@ -316,7 +356,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
             gpu["processes"] = []
         lines = render._build_lines([], [self.owner], "both", False, 0,
             term_width=168, resources=[self.resource], governor=None)
-        self.assertIn("resource eval-run", flatten(lines))
+        self.assertIn("resource eval run", flatten(lines))
 
     def test_remote_parent_match_requires_remote_host_and_exact_nonempty_attempt(self):
         process = {"pid": 900, "proc_start": 999, "pgid": 900,
@@ -358,7 +398,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                         term_width=168, resources=[self.resource], governor=None)
                     rows = [line for line in lines if line and "● GPU" in flatten([line])]
                     self.assertEqual(len(rows), 1)
-                    self.assertIn("eval-run", flatten(rows))
+                    self.assertIn("eval run", flatten(rows))
             extra = {"pid": 90, "proc_start": 456, "pgid": 90, "owner": claim,
                      "session_owner": claim, "used_memory_mib": 1024, "command": "python other.py"}
             gpu["processes"].append(extra)
@@ -369,7 +409,7 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     term_width=168, resources=[self.resource], governor=None)
                 rows = [line for line in lines if line and "● GPU" in flatten([line])]
                 self.assertEqual(len(rows), 2)
-                parent_rows = [line for line in rows if "eval-run" not in flatten([line])]
+                parent_rows = [line for line in rows if "eval run" not in flatten([line])]
                 self.assertIn("1 GB", flatten(parent_rows))
                 self.assertNotIn("7 GB", flatten(parent_rows))
             self.assertEqual(snapshot, before)
@@ -414,14 +454,14 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                 term_width=168, resources=[self.resource, second], governor=None)
             rows = [line for line in lines if line and "● GPU" in flatten([line])]
             self.assertEqual(len(rows), 2)
-            owner_rows = [line for line in rows if "eval-run" in flatten([line])]
-            parent_rows = [line for line in rows if "eval-run" not in flatten([line])]
+            owner_rows = [line for line in rows if "eval run" in flatten([line])]
+            parent_rows = [line for line in rows if "eval run" not in flatten([line])]
             self.assertIn("10 GB", flatten(owner_rows))
             self.assertIn("1 GB", flatten(parent_rows))
         self.assertEqual(snapshot, original_snapshot)
 
 
-    def test_declared_progress_stays_on_the_resource_row_in_every_view(self):
+    def test_declared_progress_reaches_now_and_resource_row_in_every_view(self):
         self.attach()
         progress = {"completed": 12, "total": 50, "unit": "epoch", "age_s": 120}
         for process in (False, True):
@@ -435,19 +475,19 @@ class OwnerResourceChildrenTest(unittest.TestCase):
                     actual = render._build_lines([], [self.owner], "both", width < 80, 0,
                         layout=layout, term_width=width, resources=[self.resource], governor=None)
                     self.assertEqual(len(actual), len(baseline))
-                    line = next(line for line in actual if line and "resource eval-run" in flatten([line]))
+                    line = next(line for line in actual if line and "resource eval run" in flatten([line]))
                     self.assertIn("2m ago", flatten([line]))
-                    self.assertIn("working  6h 50m", flatten([line]))
+                    self.assertIn("6h 50m", flatten([line]))
                     if width >= 80:
                         self.assertIn("12/50 epoch", flatten([line]))
                     self.assertLessEqual(sum(render._dw(t) for t, _ in line), width)
-                    self.assertEqual(flatten(actual).count("2m ago"), 1)
+                    self.assertEqual(flatten(actual).count("2m ago"), 2 if width == 168 else 1)
 
     def test_counter_without_total_and_old_age_do_not_change_resource_state(self):
         self.attach()
         self.resource.progress = {"completed": 12, "unit": "item", "age_s": 9900}
         text = flatten(render._resource_child_rows(self.owner, term_width=168))
-        self.assertIn("12 item · 2h 45m ago", text)
+        self.assertIn("12 item · 2h ago", text)
         self.assertEqual(self.resource.liveness, "working")
         self.assertEqual(self.owner.resource_wait["state"], "resource-parked")
         self.resource.progress = None
@@ -461,8 +501,9 @@ class OwnerResourceChildrenTest(unittest.TestCase):
             with self.subTest(width=width):
                 rows = render._resource_child_rows(self.owner, term_width=width, in_card=True)
                 self.assertEqual(len(rows), 1)
-                self.assertIn("2m ago", flatten(rows))
-                self.assertIn("working  6h 50m", flatten(rows))
+                if width >= 80:
+                    self.assertIn("2m ago", flatten(rows))
+                self.assertIn("6h 50m", flatten(rows))
                 self.assertLessEqual(sum(render._dw(t) for t, _ in rows[0]),
                                      render._dispatch_box_width(width) - 1)
 

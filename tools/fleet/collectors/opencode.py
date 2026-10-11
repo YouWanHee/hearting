@@ -499,6 +499,10 @@ def enrich(sess, tick=None):
             row = cur.execute("SELECT %s FROM session WHERE id=? LIMIT 1" % _COLS, (proven,)).fetchone()
             if row:
                 sess._opencode_bind_kind = "process"
+                directory = cur.execute("SELECT directory FROM session WHERE id=? LIMIT 1", (proven,)).fetchone()
+                if directory:
+                    from .. import session_cwd
+                    session_cwd.observe(sess, directory[0], proven)
         if row is None and start_ms is not None:
             row = _query_window(cur, sess.cwd, start_ms, (tick or {}).get(sess.pid))
             if row:
@@ -544,8 +548,8 @@ def enrich(sess, tick=None):
         sess.session_id = sid
         # F-100b — OpenCode has no derived session name either (Q-3: sqlite title/slug
         # only), so the `[xx]` badge tag is minted from the session id the same way.
-        from fleet.session_handle import minted_tag
-        sess.session_tag = minted_tag(sid)
+        from fleet.session_handle import resolve_tag
+        sess.session_tag = resolve_tag("opencode", sid)
     if slug:
         sess.slug = slug
     provider = None

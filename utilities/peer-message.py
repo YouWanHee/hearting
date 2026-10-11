@@ -7,6 +7,7 @@ messages alone retain bounded private runtime payloads until exact receipt.
 import argparse
 import functools
 import contextlib
+import errno
 import stat
 import math
 import tempfile
@@ -157,6 +158,18 @@ def _valid_transfer_endpoint(endpoint):
             and (name is None or isinstance(name, str)))
 
 
+def _unknown_sender(endpoint):
+    return (isinstance(endpoint, dict)
+            and endpoint.get("harness") in ("claude", "codex", "opencode", "unknown", None)
+            and endpoint.get("session_id") in (None, "")
+            and (endpoint.get("name") is None or isinstance(endpoint.get("name"), str)))
+
+
+def _valid_transfer_sender(endpoint):
+    # An external shell has no session to attribute; the recipient remains exact.
+    return _valid_transfer_endpoint(endpoint) or _unknown_sender(endpoint)
+
+
 def _prepare_peer_message(body, sender, recipient):
     """Seal a transmission intent before delivery (the receiver may run immediately).
 
@@ -218,8 +231,8 @@ def _pending_path(ref):
     return _pending_dir() / (ref + ".json")
 
 
-def _pending_endpoint(endpoint, state):
-    if _valid_transfer_endpoint(endpoint):
+def _pending_endpoint(endpoint, state, *, sender=False):
+    if _valid_transfer_endpoint(endpoint) or (sender and _valid_transfer_sender(endpoint)):
         return True
     return (state == "unverified" and isinstance(endpoint, dict)
             and endpoint.get("harness") in ("claude", "codex", "opencode", None)
@@ -246,7 +259,7 @@ def _read_pending(ref):
             or type(row.get("schema_version")) is not int or row["schema_version"] != 1
             or row.get("ref") != ref or row.get("from") != transfer.get("from")
             or row.get("to") != transfer.get("to") or row.get("body_sha256") != transfer.get("body_sha256")
-            or not _pending_endpoint(row.get("from"), row.get("state"))
+            or not _pending_endpoint(row.get("from"), row.get("state"), sender=True)
             or not _pending_endpoint(row.get("to"), row.get("state"))
             or row.get("state") not in ("pending", "queued", "unverified", "received")
             or type(row.get("created")) not in (int, float) or not math.isfinite(row["created"])):
@@ -264,6 +277,26 @@ def _read_pending(ref):
         body, sep, _trailer = text.rpartition("\n\n(peer-from:")
         if not sep or hashlib.sha256(body.encode("utf-8")).hexdigest() != row.get("source_sha256"):
             raise ValueError("peer-pending-source-invalid")
+    binding = row.get("dispatch_notice")
+    if binding is not None:
+        keys = {"duty_id", "jobs", "attempt_id", "carrier", "recipient_sid",
+                "storage_recipient", "delivery_id", "claim_owner"}
+        if (not isinstance(binding, dict) or set(binding) != keys
+                or any(not isinstance(value, str) or not value or len(value) > 4096 or "\0" in value
+                       for value in binding.values())
+                or not binding["duty_id"].startswith("registered-batch-")
+                or binding["duty_id"] not in row["refs"]
+                or binding["recipient_sid"] != row["to"].get("session_id")
+                or binding["claim_owner"] != "retained-rewake:" + binding["duty_id"]
+                or not Path(binding["jobs"]).is_absolute()):
+            raise ValueError("peer-dispatch-binding-invalid")
+    # Old writers marked an unsent shell notification unverified solely because
+    # its sender was absent. Keep the immutable endpoints/body and use the normal
+    # claim transition. Queued, attempted or ambiguous sends are never reset.
+    if (row["state"] == "unverified" and row.get("receipt") == "peer-endpoint-unverified"
+            and _unknown_sender(row["from"]) and _valid_transfer_endpoint(row["to"])
+            and not row.get("rpc_claim") and not row.get("actual_message_id")):
+        row = dict(row, state="pending")
     return row
 
 
@@ -283,20 +316,68 @@ def _save_pending(row):
             os.unlink(tmp)  # Own temporary payload only.
 
 
+def bind_dispatch_notice(ref, binding):
+    """Keep each transfer's exact notice binding through later gate/final transfers."""
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        if not row or (row.get("dispatch_notice") and row["dispatch_notice"] != binding):
+            raise ValueError("peer-dispatch-binding-conflict")
+        _save_pending(dict(row, dispatch_notice=dict(binding)))
+
+
+def _quarantine_pending(path, expected):
+    """Move one unchanged owned entry aside; never follow its target or overwrite."""
+    ref = path.stem if re.fullmatch(r"[0-9a-f]{32}", path.stem) else "invalid-ref"
+    key = ref if ref != "invalid-ref" else "quarantine-" + hashlib.sha256(path.name.encode()).hexdigest()
+    try:
+        with pending_lock(key):
+            current = path.lstat()
+            fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if (any(getattr(current, field) != getattr(expected, field) for field in fields)
+                    or current.st_uid != os.geteuid()
+                    or not (stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode))):
+                return False
+            directory = _pending_dir().parent / "quarantine"
+            directory.mkdir(mode=0o700, exist_ok=True)
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                return False
+            # A fresh private directory reserves this destination without
+            # replacing another quarantined record with the same ref.
+            destination = Path(tempfile.mkdtemp(prefix=ref + "-", dir=directory)) / path.name
+            os.rename(path, destination)
+            return True
+    except (OSError, ValueError):
+        return False
+
+
 def _pending_rows():
-    diagnosed = 0
     for path in sorted(_pending_dir().glob("*.json")):
+        expected = None
         try:
+            expected = path.lstat()
             row = _read_pending(path.stem)
-        except (OSError, ValueError):
-            # Preserve the damaged file without ack; unrelated valid refs proceed.
-            if diagnosed < 3:
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+                # A lock or temporary I/O failure proves no damage; the next
+                # ordinary callback can read this entry in its original place.
+                continue
+            # Preserve without ack. Only the successful move diagnoses the row,
+            # so concurrent callbacks and later commands do not repeat warnings.
+            if expected is not None and _quarantine_pending(path, expected):
                 ref = path.stem if re.fullmatch(r"[0-9a-f]{32}", path.stem) else "invalid-ref"
                 print(f"peer-pending-invalid ref={ref}", file=sys.stderr)
-                diagnosed += 1
             continue
-        if row and row["state"] != "received":
+        if row and row["state"] != "received" and not _registered_delivery_settled(row):
             yield row
+
+
+def _registered_delivery_settled(row):
+    try:
+        from peer_obligations import registered_delivery_settled
+        return registered_delivery_settled(row)
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def pending_messages(recipient):
@@ -312,7 +393,7 @@ def pending_messages(recipient):
 
 def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), receipt="target-form-open"):
     """A retry reuses a pending intent; ordinary sends need no preparation lock."""
-    endpoints_verified = _valid_transfer_endpoint(sender) and _valid_transfer_endpoint(recipient)
+    endpoints_verified = _valid_transfer_sender(sender) and _valid_transfer_endpoint(recipient)
     body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
 
     def existing():
@@ -365,6 +446,8 @@ def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
         if (not row or row["state"] != "pending" or row.get("rpc_claim")
                 or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id"))):
             return None
+        if _registered_delivery_settled(row):
+            return None
         claim = {"token": secrets.token_hex(16), "pid": os.getpid(),
                  "start": process_start_ticks(os.getpid())}
         _save_pending(dict(row, state="unverified", receipt=receipt, rpc_claim=claim))
@@ -394,7 +477,9 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             return {"status": "unsupported", "reason": "peer-pending-missing"}
         if row["state"] == "received":
             return {"status": "received", "reason": "exact-peer-ref"}
-        if not _valid_transfer_endpoint(row["from"]) or not _valid_transfer_endpoint(row["to"]):
+        if _registered_delivery_settled(row):
+            return {"status": "not-required", "reason": "dispatch-notice-consumed"}
+        if not _valid_transfer_sender(row["from"]) or not _valid_transfer_endpoint(row["to"]):
             return {"status": "unverified", "reason": "peer-endpoint-unverified"}
         if row["to"]["harness"] != "codex":
             return {"status": "unsupported", "reason": "peer-native-queue-unavailable"}
@@ -438,7 +523,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
         if result["status"] == "consumed":
             # Native input consumption is a transport observation, not semantic understanding.
             rc = 0 if _peer_notice_exists(ref, row["to"]) else cmd_record(argparse.Namespace(
-                from_harness=row["from"]["harness"], from_session_id=row["from"]["session_id"],
+                from_harness=row["from"].get("harness") or "unknown", from_session_id=row["from"].get("session_id") or "",
                 from_name=row["from"].get("name"), from_project="", to_harness="codex",
                 to_session_id=row["to"]["session_id"], to_name=None, kind="notice", surface="codex-queue",
                 status="received", receipt="exact-native-history", ref=[ref, *row["refs"]],
@@ -446,7 +531,9 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             if rc:
                 _save_pending(dict(current, rpc_claim=None))
                 return {"status": "unverified", "reason": "peer-receive-ledger-unavailable"}
-            _save_pending(dict(current, state="received", text=None, rpc_claim=None, receipt="exact-native-history"))
+            received = dict(current, state="received", text=None, rpc_claim=None, receipt="exact-native-history")
+            _save_pending(received)
+            _ack_registered_delivery(received)
             return {"status": "received", "reason": "exact-native-history"}
         _save_pending(dict(current, state="queued", rpc_claim=None, receipt="native-queue-accepted"))
         return {"status": "queued", "reason": "native-queue-accepted"}
@@ -532,14 +619,14 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
         try:
             record = _read_transfer_record(ref)
             sender, target = record["from"], record["to"]
-            if (not _valid_transfer_endpoint(sender) or not _valid_transfer_endpoint(target)
+            if (not _valid_transfer_sender(sender) or not _valid_transfer_endpoint(target)
                     or type(record.get("schema_version")) is not int or record["schema_version"] != 1
                     or record.get("message_id") != ref
                     or record.get("body_sha256") not in _arrived_body_digests(text, ref)
-                    or sender.get("harness") != result["harness"]
+                    or (sender.get("harness") or "unknown") != result["harness"]
                     or any(target.get(k) != recipient.get(k) for k in ("harness", "session_id"))):
                 return result
-            result.update(session_id=sender["session_id"], name=sender.get("name"))
+            result.update(session_id=sender.get("session_id") or None, name=sender.get("name"))
             if include_ref:
                 result["transfer_ref"] = ref
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -552,6 +639,14 @@ def _peer_notice_exists(ref, recipient):
         and (r.get("delivery") or {}).get("status") == "received"
         and all((r.get("to") or {}).get(k) == recipient.get(k) for k in ("harness", "session_id"))
         for r in _iter_records())
+
+
+def _ack_registered_delivery(received):
+    try:
+        from peer_obligations import acknowledge_registered_delivery
+        acknowledge_registered_delivery(received)
+    except (OSError, ValueError, KeyError):
+        pass  # The retained courier retries the same receipt, never another send.
 
 
 def receive_peer_message(text, recipient, project="", *, summary_text=""):
@@ -573,8 +668,10 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
             ref=[ref, *(pending.get("refs", []) if pending else [])] if ref else [], transfer_ref=ref,
             body_file=None, body_stdin=False, body_text=summary_text))
         if rc == 0 and pending:
-            _save_pending(dict(pending, state="received", text=None, rpc_claim=None,
-                               receipt="exact-peer-ref", received_at=time.time()))
+            received = dict(pending, state="received", text=None, rpc_claim=None,
+                            receipt="exact-peer-ref", received_at=time.time())
+            _save_pending(received)
+            _ack_registered_delivery(received)
         return rc
 
 
@@ -839,8 +936,35 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
         if not isinstance(targets, dict):
             targets = {}
         key = to.get("session_id") or to.get("name") or "-"
+        previous_entries = [targets.get(key)]
+        if to.get("session_id") and to.get("name"):
+            # A later observed SID completes the launch-time name-only entry.
+            for previous_key, entry in list(targets.items()):
+                if (previous_key != key and isinstance(entry, dict)
+                        and not entry.get("session_id")
+                        and entry.get("harness") == to.get("harness")
+                        and entry.get("name") == to.get("name")
+                        and entry.get("pane") in (None, to.get("pane"))):
+                    previous_entries.append(entry)
+                    targets.pop(previous_key)
+        missing = object()
+        start_ts = missing
+        for entry in previous_entries:
+            if isinstance(entry, dict) and entry.get("harness") == to.get("harness"):
+                if "start_ts" in entry:
+                    start_ts = entry["start_ts"]
+                    break
+                if entry.get("source") == "start":
+                    start_ts = entry.get("ts")
+                    break
+        if start_ts is missing and source == "start":
+            start_ts = ts
         targets[key] = {"harness": to.get("harness"), "session_id": to.get("session_id"),
-                        "name": to.get("name"), "kind": kind, "ts": ts, "source": source}
+                         "name": to.get("name"), "kind": kind, "ts": ts, "source": source}
+        if start_ts is not missing:
+            targets[key]["start_ts"] = start_ts
+        if to.get("pane"):
+            targets[key]["pane"] = to["pane"]
         if len(targets) > _STEWARD_TARGETS_MAX:
             oldest = sorted(targets, key=lambda k: targets[k].get("ts") or "")
             for k in oldest[: len(targets) - _STEWARD_TARGETS_MAX]:

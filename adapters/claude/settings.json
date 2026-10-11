@@ -319,6 +319,17 @@
         "hooks": [
           {
             "type": "command",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 dispatch-owner-rewake.py",
+            "asyncRewake": true,
+            "timeout": 21600
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py clear",
             "timeout": 10
           }

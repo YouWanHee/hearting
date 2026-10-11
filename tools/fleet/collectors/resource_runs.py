@@ -26,15 +26,14 @@ def collect(index_path=None):
             except Exception as exc:
                 diagnostics.append({
                     "kind": "resource-row-projection",
+                    "path": item.get("registry_path"),
                     "run_id": str(item.get("run_id")),
                     "error": str(exc),
                 })
     except Exception as exc:
         diagnostics.append({"kind": "resource-collector", "error": str(exc)})
     collect.last_diagnostics = diagnostics
-    collect.last_malformed = len(diagnostics)
     return rows
 
 
 collect.last_diagnostics = []
-collect.last_malformed = 0

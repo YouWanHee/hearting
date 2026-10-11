@@ -27,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
+from worker_runtime_home import prepare_worker_home, claude_worker_arguments
 from dispatch_contract import (
     _atomic_registry_replace,
     workflow_completion_receipt,  # noqa: E402
@@ -141,7 +142,7 @@ from owner_route_binding import (  # noqa: E402
 )
 from worker_bootstrap import (
     ARTIFACT_PRODUCER_CYCLE_ENV, artifact_cycle_environment, artifact_context_prompt, released_task_prompt, assignment_prompt, contract_read_prompt, unit_bootstrap_prompt,
-    supervised_owner_prompt,  # noqa: E402
+    supervised_owner_prompt, worker_ending_prompt,  # noqa: E402
     assigned_contract,
     profile_worker_type,
     render_worker_bootstrap,
@@ -588,16 +589,8 @@ def dispatch_prompt(
             "synchronously with utilities/dispatch-wait.sh in the current turn until terminal, "
             "then harvest. This fallback is not runtime completion parity (OPERATIONS.md §5.10).\n\n"
         )
-    # "nothing after it" alone reads as permission to put a summary sentence
-    # *before* the block, and that is how two 2026-07-28 pipelines lost their
-    # terminal envelope with correct artifacts already on disk. State both ends.
-    ending = (
-        "End a child-registration turn only with `runtime_wait: registered-children`. "
-        "When the full route is complete, end with the kernel's exact three-line handoff "
-        "as the entire final message — no summary sentence before it, nothing after it.\n"
-        if supervised and owner_standard_plus
-        else "End with the kernel's exact three-line handoff as the entire final message — "
-        "no summary sentence before it, nothing after it.\n"
+    ending = worker_ending_prompt(
+        supervised_owner=supervised and args.worker_type == "owner",
     )
     return (
         f"{sync_wait_clause}"
@@ -914,14 +907,25 @@ def _async_deny_tools(args: argparse.Namespace) -> tuple[str, ...]:
 
 
 def _read_only_projection(args: argparse.Namespace) -> tuple[list[str], list[str]]:
-    """The access request's read-only roots as Claude realizes them
+    """The route contracts and request's read-only roots as Claude realizes them
     (`harness_capabilities` access means): each root is an `--add-dir`, and the
     roots the grant keeps unwritten get an Edit deny rule (Edit rules also govern Write)."""
     grant = getattr(args, "execution_access_grant", None)
-    if grant is None:
-        return [], []
-    return ([str(root) for root in grant.read_roots],
-            [f"Edit(//{str(root).lstrip('/')}/**)" for root in grant.unwritable_read_roots])
+    home = getattr(args, "agent_home", None)
+    source = tuple(dict.fromkeys((
+        *(() if home is None else route_authority.contract_read_roots(home)),
+        *getattr(args, "contract_read_roots", ()),
+    )))
+    writable = [Path(args.worktree).resolve(), *(grant.writable_roots if grant else ())]
+    if getattr(args, "artifact_root", None) is not None:
+        writable.append(Path(args.artifact_root).resolve())
+    source = tuple(root for root in source if root.is_dir() and not any(
+        root.resolve().is_relative_to(area) or area.is_relative_to(root.resolve())
+        for area in writable))
+    reads = tuple(dict.fromkeys((*source, *(grant.read_roots if grant else ()))))
+    denied = tuple(dict.fromkeys((*source, *(grant.unwritable_read_roots if grant else ()))))
+    return ([str(root) for root in reads],
+            [f"Edit(//{str(root).lstrip('/')}/**)" for root in denied])
 
 
 def _async_wait_policy(args: argparse.Namespace) -> str:
@@ -1136,6 +1140,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
         "--output-format", "stream-json", "--verbose",
         "--no-session-persistence",
     ]
+    cmd += claude_worker_arguments(getattr(args, "worker_runtime_env", None))
     if getattr(args, "report_bundle_root", None) is not None:
         cmd += ["--add-dir", str(args.report_bundle_root)]
     if getattr(args, "execution_access_grant", None) is not None:
@@ -1639,7 +1644,7 @@ def main(argv: list[str]) -> int:
     )
     log_path = log_dir / log_name
     args.log_path = log_path
-    command = shell_command(args, prompt_path, log_path)
+    command = None if action == 'start' else shell_command(args, prompt_path, log_path)
 
     if action in ("register", "start"):
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1649,14 +1654,6 @@ def main(argv: list[str]) -> int:
         # Gate-first, then create -> register -> launch: a --check failure
         # must not leave an instance home behind (no leak on gate failure).
         rc = build_home_gate(agent_home, args.profile, ["--check"], "profile-check-failed")
-        if rc != 0:
-            return rc
-        rc = build_home_gate(
-            agent_home,
-            args.profile,
-            ["--instance", args.slug, "--home-root", str(home_root)],
-            "profile-build-failed",
-        )
         if rc != 0:
             return rc
 
@@ -1818,8 +1815,11 @@ def main(argv: list[str]) -> int:
             env["AGENT_DISPATCH_UNIT"] = args.unit
         else:
             env.pop("AGENT_DISPATCH_UNIT", None)
-        if args.profile:
-            env["CLAUDE_CONFIG_DIR"] = str(instance_dir)
+        args.worker_runtime_env = prepare_worker_home(args.agent_home, 'claude', args.worker_type,
+                                                       args.attempt_id, env=env, profile=args.profile)
+        env.update(args.worker_runtime_env)
+        instance_dir = Path(env["CLAUDE_CONFIG_DIR"])
+        command = shell_command(args, prompt_path, log_path)
         if args.resolved_completion_delivery == "session-resume-supervised":
             env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(
                 completion_state_path(args)
@@ -1916,6 +1916,7 @@ def main(argv: list[str]) -> int:
         launch_metadata = {
             **args.launch_lifecycle_resolution.metadata(),
             "runtime_sandbox": "adapter-default",
+            "runtime_home": env["CLAUDE_CONFIG_DIR"],
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("claude", env))
@@ -2296,6 +2297,8 @@ def main(argv: list[str]) -> int:
     print(f"prompt_source={prompt_source}")
     print(f"prompt_file={prompt_path}")
     print(f"log_file={log_path}")
+    if command is None:
+        command = shell_command(args, prompt_path, log_path)
     print(f"command={command}")
     return (
         75

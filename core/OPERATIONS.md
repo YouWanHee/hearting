@@ -113,6 +113,37 @@ loaded when its process started. Runtime-owned credentials, sessions, logs,
 caches, databases, and Codex `config.toml` remain outside this activation
 boundary.
 
+Release cleanup retains trees used by live processes, including their working
+directories and open files. Shared Python dispatch code holds its resolved code
+root open for the process lifetime, so a hook launched through a rotating runtime
+ projection still names the release that supplies its later imports. Older live
+projection processes without that reference conservatively retain their release family
+until they exit. This uses the installer's existing in-use judgment, with no
+additional registry or caller step.
+
+The live Fleet viewer follows a committed forward managed installation by
+replacing its own process in the same terminal. It reads the existing distribution
+lock and installation record; an in-progress, failed, incomplete or rolled-back
+installation leaves the viewer on its source. Its view, explicit folds, scroll,
+selection and ordering pass to the new process as private viewer state. The last
+drawn frame stays visible until new observations arrive. Pending confirmation or
+process termination defers replacement. Snapshot modes and development checkouts
+keep their original source. This shared viewer behavior adds no option or step
+to any runtime, and does not move a pinned dispatch tree.
+
+A route's `launch_compatibility_tuple.launch_home.path` is also the source of
+its contract read access. A replacement or child launched after activation
+retains read access to that sealed home's `capabilities/`, alongside its own
+launch home's contracts; it needs no file hash comparison or correction from
+the parent. The installer protects that same sealed home while its route is
+in use, including an unclosed route whose current owner awaits correction to
+a readable BLOCKED or FAIL result. A superseded owner's pause does not retain
+the release after its successor finishes, and closed routes and stale launch
+deaths still release it. Claude projects these directories with edit denies, OpenCode
+allows their external reads with edit denies, and Codex's sandbox already
+permits these reads without adding writable roots. No whole release tree or
+task write scope is granted by this contract access.
+
 Route validation distinguishes immutable code identity from path-bound state
 identity. A resolved-path alias of one code root is always the same root. Two
 different physical roots may compare equal only at an explicitly code-root-only
@@ -166,12 +197,30 @@ an already completed review follows the same recorded-history rule; the first
 completion still requires readable evidence, and gates on retain their live
 evidence check.
 
+A route-free detached review launched by the ordinary governor has no review
+watchdog outcome. Its readable terminal handoff and exact process/group drain
+prove completion through the shared review classifier. Only a review admitted
+through the watchdog requires that watchdog's sealed process outcome; a missing
+watchdog outcome must not be imposed on an ordinary review. Foreground reviews
+retain their sealed exit result, and live or unobservable processes stay pending.
+
 Each SD item below keeps the rule an agent acts on; its full decision record is verbatim in `core/ADAPTATION.md §8`.
 
 Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).
 
 Actual edits, tests, and QA run in isolated worktrees while the main session
-handles triage, dispatch, harvest, and reporting. Portable `dispatch_depth`
+handles triage, dispatch, harvest, and reporting. Source-changing non-direct compose starts
+prepare that worktree even when the primary checkout has local work: use its
+current HEAD in that case, preserve its uncommitted files in place, and bind the
+owner and every stage to the prepared cwd before launch. Clean primary checkouts
+continue to use the latest default-branch base; an explicitly chosen linked
+worktree is reused. Exact file inventories treat an existing file path literally,
+including `[id]`, `[...slug]`, and `(group)` components. Only a path that does not
+name an existing file is tested for glob syntax, by the shared stage-session
+contract used for subdivision and adapter binding. Containment and disjointness
+still compare canonical paths.
+
+Portable `dispatch_depth`
 describes logical route ownership independently of transport, process ancestry,
 runtime-native nesting, and registered-worker status:
 
@@ -191,7 +240,14 @@ An optional `allocation.owner_order` in the selected dispatch defaults orders el
 
 **Main/worker bootstrap boundary.** Every registered headless dispatch and repo-owned background model caller exports `AGENT_SESSION_ROLE=worker` before launch. Legacy adapter markers remain worker evidence and fail closed. The portable worker input is `roles/worker-bootstrap.md` plus exactly one `roles/worker-types/{owner,stage,review,support}.md` fragment and the assigned capability/stage contract. `worker_type` selects only that bootstrap fragment; `capability` plus `assigned_contract`/`route_node` select the work contract; `model_role` selects behavior; route-sealed `model_profile` selects the execution budget. These axes never select or rename a bootstrap. `worker_role` is legacy read-only metadata. Workers retain deterministic safety, permission, scope, route validation, handoff, liveness, and verification guards, but the harness does not add main response policy, entry confirmation, automatic memory/briefing injection, SessionEnd sync, Fleet title/token/UI context, the full capability catalog, unrelated stage contracts, integration, merge, push, cleanup, or user-facing explanation. A worker never manufactures a main session. This boundary applies to dispatch depth 1, dispatch depth 2, loop/drill invocations, title workers, and runtime-native subagents; dispatch depth, bootstrap type, assigned contract, model role, and model profile remain separate.
 
-Worker lifecycle suppression, harness-controlled prompt isolation, and physical runtime masking are separate support claims. An adapter removes any explicit full-main-bootstrap read it controls. If a runtime automatically inherits project instructions and offers no verified per-worker disable switch, document that residual input and use the minimal typed overlay as the checked fallback; never label it fully masked. Worker details go to the canonical artifact. The final worker output is exactly `artifact: <path|->`, `verdict: PASS|FAIL|BLOCKED`, and `blocker: none|<one line>` on three lines. Material registered work requires an artifact; `-` is limited to atomic read-only support.
+Worker lifecycle suppression, harness-controlled prompt isolation, and physical runtime masking are separate support claims. Every new worker starts in a role-scoped runtime home, built by the shared profile projector without another caller flag. It preserves login references, user guard hooks and permission rules, retaining existing approval and disabled states without writing user trust records, while replacing Hearting's global main bootstrap and excluding unrelated skills, agents, plugins and connectors. The dispatched prompt still owns the kernel, exactly one type and its assigned contract. Project instructions and managed policy remain runtime-owned; document any verified residual separately. Measure actual first-request usage and runtime input records before claiming isolation or reduced input; templates and hook suppression alone establish neither. Worker details go to the canonical artifact. The final worker output is exactly `artifact: <path|->`, `verdict: PASS|FAIL|BLOCKED`, and `blocker: none|<one line>` on three lines. Material registered work requires an artifact; `-` is limited to atomic read-only support.
+
+Concurrent preparation of the same worker home is idempotent in every harness:
+retain matching links, publish changed links and generated files atomically,
+and preserve foreign non-link collisions. Home preparation adds no waiting lock
+or caller step. The registry still admits exactly one child for an exact attempt;
+the observed runtime-home location is launch metadata, like its process identity,
+and does not turn a duplicate start into a different assignment.
 
 **Inline exceptions.** Main or a dispatch-depth-1 owner may run such work inline only when at least one holds: the work is `direct` scale or a micro-stage inside the checked `quick` one-shot owner; file or state boundaries make it genuinely non-separable; every route-sealed registered-headless candidate has a typed hard-unavailable result and the compiled fallback policy reaches inline; the work is tightly coupled to external GPU or process state a worker cannot reach; the user explicitly requires main-session execution; or the stage is so small that dispatch overhead clearly exceeds it. A native-subagent restriction is surface-local and is never evidence that registered headless is unavailable. A failed hook-trust or worktree-safety check is a stop/re-isolate condition, not inline authority; `failure_scope=exact-worktree,retry_on_isolated_worktree=1` retains the stricter fail-close rule below. Running `standard+` separable work inline without recording the concrete reason — in `plans/<slug>/_internal/metrics.md` for code cycles, or the experiment `_RUNLOG`/`_internal` for lab cycles — is a contract violation; this generalizes SD-17 beyond code stages.
 
@@ -240,6 +296,16 @@ owner-death evidence. Missing, foreign, nonce-mismatched, symlinked, unlocked,
 or terminal-row lease evidence fails closed. Phase edges append outer PID/start
 and before/after phase to the attempt-scoped transition audit. This shared rule
 supersedes the Codex-only lease wording later in this section.
+
+Owner supervision follows the owner's current adopted route through the shared
+owner-route lifecycle resolver, including a continuation adopted during a model
+turn. The launch route remains historical evidence, not the child-selection
+boundary. If the supervisor exits with a waiting child on that continuation,
+the existing post-exit watcher retains the child, waits for its exact settlement,
+and calls that continuation's normal `start` once. Normal start claims suppress
+duplicate owners. Explicit cancellation and a genuine FAIL/BLOCKED handoff keep
+their existing meaning. This repairs the BC spec owner that lost its continuation
+review on 2026-10-08; no extra caller command or recovery input is required.
 
 `AGENT_DISPATCH_JOBS` is the sole canonical dispatch registry. Its default
 fallback (SD-112 §13.33.2) is the canonical dispatch state root's `jobs.log`:
@@ -334,6 +400,22 @@ cycle environment can be recovered from the route's producer record. Refusals
 name the correct output directory, and node scopes are relative to that directory.
 Another open cycle or a matching filename suffix does not grant write authority.
 
+Cards, peer callbacks and pane reports use `utilities/pane_ownership.py` across
+Claude, Codex and OpenCode. It connects the caller's runtime to the live pane's
+foreground PID, controlling terminal and process-start identity. Environment,
+cwd, title, history and shared-daemon ancestry are lookup hints. Shared services
+and background attachments need exact native evidence of the current session;
+a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
+tidy at its existing project seat and pane hooks silent, without new user input
+or runtime-state migration.
+
+For an unproven background caller, default `peer-steward start` locates the
+inherited pane's workspace by its live foreground directory in the caller's
+repository (linked worktrees included). It reuses an observed empty shell or
+creates an unfocused tab, leaving existing panes and seat-successor records
+intact. Cards, watch and sender identity retain exact ownership checks; missing,
+foreign or unreadable hints leave placement unknown.
+
 An OpenCode child inside a Codex owner's workspace sandbox receives per-attempt
 XDG data/cache/state/config directories beneath the worktree. User configuration
 and existing authentication are linked for reading; generated dependency state
@@ -348,9 +430,9 @@ separate facts.
 |---|---|---|
 | Start and execution lifetime | Claimed execution boundary | Publish the actual runner identity, enforce its finite budget, and account for governed descendants before releasing resources. |
 | Completion | Exact terminal writer under the jobs lock | Preserve the committed result. A later process observation cannot turn success into failure. |
-| Wait, recovery, and retry eligibility | Shared attempt policy and supervision controller | Reconcile exact evidence, retry only a settled retryable failure, and transfer an unresolved decision to the parent through durable delivery. |
+| Wait, recovery, and retry eligibility | Shared attempt policy and supervision controller | Reconcile exact evidence, retry only a settled retryable failure, and retain the unresolved decision for the existing controller to deliver after an observation checkpoint or receiver restart. |
 | Failure cleanup and supervisor exit | Execution boundary, with the exact post-exit watcher as recovery owner | Finish or retain an explicit cleanup obligation. |
-| User notification | Shared pending-delivery record and recipient runtime carrier | Keep the obligation until accepted or explicitly handed back. A display update or expired polling interval is not delivery. |
+| User notification | Shared pending-delivery record and recipient runtime carrier | Keep the obligation through exact acceptance or receipt; reconnect the existing carrier after observer/session restart. A display update or expired polling interval is not delivery. |
 
 A blocked transition owes either a bounded recovery action or an actionable
 parent notice naming the unresolved attempts and the responsible component.
@@ -358,6 +440,17 @@ An elapsed join interval is a checkpoint, not child death or owner failure.
 Duplicate observations converge on the existing obligation; successful results
 and already accepted notifications are not replayed as retries. Read-only
 queries neither cancel work nor acquire these responsibilities.
+
+The completion duty belongs to the outer controller and durable pending record,
+not to the lifetime of one model turn, watcher process, or tab location. A
+timeout or unavailable observation leaves the same exact duty pending for the
+existing startup/recovery path to resume. Keep committed PASS/FAIL separate from
+delivery and cleanup state. An unknown native observation authorizes no prompt,
+exit key, signal, or pane close. Interactive readiness accepts either exact
+registered-work evidence or a verified native pane observation; an ordinary
+pane with no registered work can be ready for a native turn without implying a
+work result, while any bound unfinished or unobservable registered work keeps
+the common result pending or unknown.
 
 An awaited receipt contains only the exact route-bound batch, including its
 verified owner-route advance; unrelated attempts under the same parent retain
@@ -376,6 +469,10 @@ predecessor; a worker's readable `FAIL` or `BLOCKED` is its result, so the next
 launch of that node is new work on capped and uncapped nodes alike. An
 explicit new review round remains a workflow decision. Stage boundaries specify
 inputs and outcomes; they do not themselves imply another process launch.
+Within the admitted review budget, the same owner opens the next parallel
+review round with the existing group start command. Its attempt identities and
+launch-input binding belong to that round; earlier terminal attempts and sealed
+inputs remain intact. The census counts exact attempts regardless of display slugs.
 Conflicting terminal evidence preserves that result and receipt while pausing
 automatic consumption. `dispatch-registry.py resolve-terminal-conflict` previews
 the exact row and prints its `apply_command`, which carries that row's digest
@@ -405,6 +502,25 @@ canonical registry. Only a live, unexpired, exact binding whose current
 accumulation. Stale, foreign, reused-PID, changed-command, malformed, or expired
 leases fall back to ordinary no-progress handling, and the runner removes the
 lease when the command exits.
+
+Partial-group continuation launches retain the sealed source request as the
+raw assignment checked by every adapter. A changed retry brief is appended to
+the worker's recovery context, along with later-round guidance, without changing
+that assignment or its digest.
+The existing sealed launch input also retains this recovery guidance so an
+automatic replacement replays the same instructions and semantic round.
+An owner continuing an uncapped stage with a different nonempty request after
+the prior execution has settled opens new work under the same stage and gate;
+it does not inherit a transport retry link. Compare the existing sealed request,
+not the slug or request-file name. Identical requests retain the automatic
+replacement limit; unreadable inputs, unresolved cleanup and terminal conflicts
+retain their existing handling. Review-round and owner continuation budgets do
+not reset. Parent monitoring rechecks the exact admitted registry paths and
+process or supervisor lease, without repeating Git repository discovery: a Git
+timeout is not evidence that the parent ended.
+The replacement manifest binds the current owner attempt; successful peers keep
+their original owner and completion evidence. Launch refusals retain their
+field-level detail in both the batch receipt and its diagnostic ledger.
 
 Normal and capacity fallback attempt hashes include the exact
 `parent_attempt_id`. Retries under one parent remain idempotent; a successor
@@ -439,10 +555,11 @@ A legacy hash collision is diagnostic
      continues to encode this conductor with the compatibility owner worker
      type and `_kernel/owner`; standard+ capability ownership is a distinct
      semantic responsibility.
+   - **Partial parallel continuation:** the original immutable launch input, or the complete exact original registry rows for older batches, supplies the source manifest and its assignment hashes. Verify its sealed digest and each member binding before reserving the one failed leg. A current retry brief belongs to that leg's launch; the original group assignment and successful peer identities remain unchanged. The replacement keeps the source member fields except its attempt ID; its current parent and retry brief are recorded by the ordinary launch path. Reused PASS, quiescence, scope and independence checks remain in force on all three harnesses.
    - **Full headless ceremony:** launch an adapter-specific headless main in the worktree. It acts as a complete main for that runtime, including team roles, hooks or preflight, and plan artifacts. The adapter owns noninteractive tool and permission setup and documents its cost realization. The top-level dispatch is a dispatch-depth-1 capability owner that returns only synthesis to main.
    - At `standard+`, the dispatch-depth-1 owner is a thin conductor. It dispatches compiled `code-plan`, `plan-check`, `code-execute`, `impl-review`, `code-test`, and `code-report` nodes through dispatch-depth-2 headless sessions, reads verdict/status metadata rather than stage bodies, and passes context only through files. A route stage is the semantic work and completion-gate unit; a worker session is only an execution-capacity unit. They are not one-to-one. The owner may keep a stage in one session or declare bounded first-class sub-sessions below the same route node when scope size, context pressure, or round-trip cost warrants it. That choice is owner discretion and does not require route recompilation. A declared `parallel_group` replaces member-level starts with one exact `dispatch-batch --parallel-group` transaction. Before any stage, the owner verifies that the artifact root and `spec/` exist.
    - Artifact relocation uses that same authority to protect live work. A no-live history move does not transfer parent authority, and historical redirects never authorize root-local writes.
-   - **Route authority:** `utilities/route_authority.py` is the one place that answers who continues a route (the parent session and its successor), on which harness (sealed selection pins), how many attempts of which kind (sub-session standing, retry links, round budget, the result envelope), and what it may access (the execution access grant). Callers read these answers from it instead of keeping their own copy; the round budget (`review_round_cap`) and the access grant (`execution_access`) keep their implementation modules and are reached through it.
+   - **Route authority:** `utilities/route_authority.py` is the one place that answers who continues a route (the parent session and its successor), on which harness (sealed selection pins and their recorded changes), how many attempts of which kind (sub-session standing, retry links, round budget, the result envelope), and what it may access (the execution access grant). Frame proposals, later plan legs and continuations inherit the pins in force through this same judgment. If `start --pin owner=H` differs from a running owner's harness, its receipt gives the existing `close` command with resource preservation; settled close prepares the ordinary continuation from the first unfinished stage and gives its `start` command. The running identity stays intact, and completed stages stay reused. Callers read these answers from it instead of keeping their own copy; the round budget (`review_round_cap`) and the access grant (`execution_access`) keep their implementation modules and are reached through it.
    - **Stage-session separation:** every planned sub-session carries a stable `subsession_id`, ordered index/count, serial-or-parallel mode, fixed file list, narrow verification command, expected round trips, phase brief, and worker-state ledger. It retains the parent route id/hash/node, stage scope, and gate, but records `stage_authority=0`: it may produce a bounded handoff and terminal attempt result, never publish or satisfy the stage completion marker. The dispatch-depth-1 owner publishes exactly one stage marker only after all declared sub-sessions are semantic-terminal, execution-quiescent, and their combined stage evidence meets the original gate. Planned subdivision consumes no gate-failure retry budget. A later gate failure may open only a gap session containing unfinished items from the prior handoff; it is a retry, not retroactive subdivision. The runtime records a sub-session opened after the node's latest settled round failed or ended `BLOCKED` as `gap-retry` whatever its manifest says, and a dry-run preview of a declared sub-session reads the same no-stage-authority admission as its launch; the round cap keeps binding full-stage rounds only.
    - **Auxiliary legs are advisory, never gate-holding.** A declared `parallel_group` leg with `leg_class: auxiliary` widens the group with one closed narrow check on the `light` budget. Its unit verdict enum carries no blocking token, so an auxiliary finding can never satisfy or fail the stage gate alone — it exists to feed the arbiter's `auxiliary_findings_considered` merge (the completion gate compares the merged array length against the realized auxiliary leg count). The `all` join policy is a separate axis: it joins every realized leg, including auxiliary ones, but joining evidence is not the same as letting an auxiliary verdict block. At least one realized **peer** leg must land on a quality-peer harness (SD-100 ①) whenever the user's policy defines one (an unavailable defined peer still refuses; a policy that defines none — for example OpenCode-only — proceeds and records `sole-gate-non-peer-harness` instead of refusing); auxiliary legs may legitimately use any eligible harness including OpenCode.
    - **Who arbitrates, and when.** The arbiter of an auxiliary-bearing group is never the group's own anchor — the anchor is a sibling that runs *concurrently* with the auxiliary leg and cannot have read its output. The arbiter follows the anchor's kind: a `review-worker` anchor is merged by the owner (conductor); a `map-worker` anchor is read by its declared downstream consumer node; a `pipeline-stage` anchor by its direct downstream `review-worker`. A **node** arbiter carries `auxiliary_findings_considered` in its own completion evidence, with exactly one entry per realized auxiliary leg it arbitrates (summed when it arbitrates more than one group). For an **owner-merge** arbiter the owner waits for the group to join, writes the merge record with `auxiliary_findings_considered` in its frontmatter, and registers it:
@@ -499,6 +616,8 @@ A legacy hash collision is diagnostic
    - **Checked fallback chain under SD-50:** a standard+ stage ranks checked direct-headless candidates through its sealed quality bands, then falls through to `native-subagent -> inline`. The conductor invokes eligible adapter wrappers in that sealed order and proceeds to the next candidate only after a recorded launch failure. Native and inline degradation record skipped candidates, failure classes, registry attempt ids, allocation/headroom evidence, and assurance compensation without claiming Fleet parity.
    - **Direct headless launch under SD-61~63:** dispatch contract v3 has no resident launch broker: a standard+ dispatch-depth-1 conductor invokes the checked adapter wrapper directly for every dispatch-depth-2 attempt. A duplicate or already-started claim never creates another child. Production dispatch never calls the retired broker's `ensure`, `request`, or `serve`.
    - **Execution access is separate from permission posture:** an optional `execution_access_v1` file declares exact writable roots, read roots, and network need for one launch. Lab owner start/resume also prepares the initialized compute-hosts inventory's exact `run_root` through that request; this default is limited to lab owners. Explicit data roots use the existing request file, which lab preparation validates and preserves while adding run storage. Missing/template inventory supplies no guessed root, and invalid or broad roots retain pre-launch refusal ([usage and limits](../docs/lab-execution-access.md)). Without an explicit file, normal start/resume preparation carries what the approved task names through owner and child launches: its explicitly named target set, and the roots `execution_access.derive_task_access` derives from the sealed task text. Every existing absolute folder the text names (a file names its folder) is a read root; only a clause of the start card's `범위:` (`Scope:`) field that says it writes there and says nothing that reads or excludes supplies a write root, and only for the owner node; any other scope path is read, an excluded one is neither, and a doubtful reading falls toward less access. Sensitive paths (credentials, keys, user and runtime settings, system areas) and roots that are missing, too broad, or already granted are skipped; a derived root adds no refusal, a node derives once and keeps that result on resume, and each root names its source line in the request `justification` and the route's prepared `binding.json`. The route's parent may hand its next owner another request: the existing `AGENT_DISPATCH_EXECUTION_ACCESS_FILE` when it runs `start`, `correct` or `compose --start` becomes one `access` row in the route's append-only change record (`route_authority.record_access_change`, with who gave it and its source; a first derived request is a `derived` row), and the next owner, a replacement owner and their children launch with the latest row (`access_in_force`). Another session's request is not recorded, and one that does not validate meets the launch as before. Artifact-relative target-table input resolves from the route's current canonical artifact root (without repeating the `.agent_reports` prefix), while source-relative input stays under route `cwd`. If an explicit approved target cannot be prepared, start/resume returns its existing typed execution-access error before invoking a wrapper; it does not mark grants ready or fall back to default grants. Each child remains within the exact live parent's effective grant. The wrapper accepts the request through the existing `--execution-access-file` or `AGENT_DISPATCH_EXECUTION_ACCESS_FILE` surface, validates and hashes it before registration or model spawn, and refuses malformed, broad, symlink-escaping, parent-expanding, or unsupported requests instead of retrying without the request. When preparation yields no request, existing grants and argv stay byte-for-byte. Runtime projection is honest rather than flag-shaped, and each adapter declares it (`adapters/<harness>/config/harness-capabilities.json` `access`): Codex uses `--add-dir` for `codex exec` and `--writable-root` for App Server supervision; current Claude and OpenCode path controls are `tool-permission`, not OS sandboxes, and their network grade is `none`. Read roots are projected on every harness: the Codex sandbox reads everywhere and writes only to its writable roots, Claude adds each root with an Edit deny rule, OpenCode grants `external_directory` read-only; the grant records the guarantee (`read_enforcement`), and a read root that holds or lies inside a writable area stays writable there (`read-only-root-writable`). A boolean Codex network grant is not a host allowlist. Requests never merge with approval keys, enable blanket bypass/full-access, edit user config, or widen a child's inherited parent boundary. A nonessential herdr status observation that fails with `PermissionDenied` does not change the source result or block artifact completion; it grants no socket or runtime directory access.
+     Approved read inputs include the paths in a task-named JSON root inventory's `roots` list (`artifact_root_path` entries or absolute path strings). Hearting reads that bounded data without executing it, derives only read access, and applies the same exclusions, sensitive-path and containment checks as direct task paths. A read-only inventory under an installed application's `ops/` source directory is source data, not runtime configuration. The installed harness's source directories (`core`, `capabilities`, `roles`, `utilities`, `adapters`, `docs`, `hooks`, `profiles`, `tools`) are readable contracts on every harness; they grant no writes or access to runtime state. Source-directory symlinks remain inside those source areas, while an existing writable checkout retains its write access. Normal start on an upgraded release fills previously omitted read inputs once alongside an existing prepared request, preserving its bytes and every prior read/write decision before using the remaining read capacity. Further resumes reuse that read snapshot. The read list has its own bounded capacity (256); the existing 16-root write ceiling stays unchanged, and a large census retains exact read roots rather than granting a common writable ancestor. Root inventory input is bounded to 64 KiB; serialized requests and their bindings are bounded to 4 MiB so the supported read list can be stored and resumed.
+
      Normal start publishes the attempt's canonical effective grant with either its exact node route tuple or its validated node-less owner binding; the live parent's row supplies the same tuple when a child reads that grant. A worker dry-run with an access request resolves the same exact live parent and effective grant as start; a prospective dry-run without an access request keeps its existing behavior.
    - **GPU lab execution sandbox:** `autopilot-lab` execution and validation nodes (`smoke`, `full-run`, `run-verify`, including their parallel legs) select the existing Codex `danger-full-access` mode for their registered owner and node launches even without a promotion signal. Explicit typed GPU resources (`resource_class=gpu`, or the existing `gpu` promotion signal on a resource runner) keep the same selection. One selection feeds prospective readiness, sealed parent sandbox tuples and exec/App Server execution; caller sandbox choices and forced settings take precedence. Normal code, frames and non-execution lab children such as plan, report and handoff retain their defaults. Full access removes Codex filesystem and network enforcement; approved `enforcement_required=any` roots remain a logical parent/child request boundary, recorded with grade `none` and unmet enforcement. Strict OS enforcement requests retain refusal. Compose and launch receipts show the selection and the device limitation; an outer or managed runtime constraint still applies. GPU availability is measured by a read-only device query, rather than inferred from the selected mode. User configuration and existing routes remain untouched.
    - **Codex owner write advisory (SD-162):** mutating routes show a read-only sandbox/Git/external-path advisory in compose, explain and start/resume receipts; the Codex wrapper reports its applied sandbox and existing grants before registration. Primary protected `.git` and the linked-worktree owner's narrow Git grant remain distinct from the declared sub-session no-commit contract; this notice neither grants access nor changes approval, launch decisions, or user settings.
@@ -509,19 +628,22 @@ A legacy hash collision is diagnostic
    - **Successor readiness and parallel launch under SD-79/80/89:** a completion marker is semantic stage evidence, not proof that the governed process has released its lease; successor readiness is a checked gate (`prior-attempt-still-live` / `prior-attempt-unverifiable` block it) and is never replaced by a fixed sleep, a delayed marker, or a larger cap. An immutable `parallel_group` of 2–4 route-declared siblings starts only through one `dispatch-batch --parallel-group` transaction; omit `--log-dir` (the canonical `logs/` default) and copy evidence to cycle artifacts through a separate collector. Individual group-member `register`/`start` fails before row or process creation. SD-160 accepts separate executions with distinct personas on the same harness without degradation. Usage gates take precedence over optional harness diversity; historical sealed cross-harness axes remain provenance, while launch, completion and receipt consumers apply the same effective persona policy. Model-profile/perspective and actual harness realization remain recorded. OpenCode is eligible for registered standard+ dispatch-depth-2 dispatch: it implements exact parent binding, foreground lifecycle, and supervisor snapshot parity; its quick/relief surfaces remain a separate authorization path and do not substitute for this parity.
    - **Immediate limit-death handling under SD-15:** wrappers watch briefly after launch; a child that exits immediately on session, usage, or authentication limits is marked `done note=dead-<reason>` (plus `reset=<time>` when known). Launchers bind the authentication scope; the shared native-evidence reader feeds later selection without rewriting old rows. Unbound historical quota is diagnostic only. Wrappers do not retry; the existing owner/fallback controller retains cleanup and sealed quality-policy checks for redispatch.
    - **Canonical global attempt registry under SD-49 (amended by SD-112 §13.33.2-(8)):** `AGENT_DISPATCH_JOBS` is the sole canonical dispatch registry, resolved once at dispatch depth 0 from the install shape (never inside the active release tree) and passed immutably to every descendant. Its parent directory is the canonical dispatch state root — no reader reconstructs it as `$AGENT_HOME/.dispatch`. For a nested launch, `--jobs` may only repeat that inherited absolute path; a cycle-local override fails closed. Cycle-local files are audit mirrors, never authority.
-   - **SD-156 mutation-node in-place retry and declared sub-session lineage:** after an execute failure or partial completion, a mutation node may be redispatched on the same immutable route. `worker-route-guard.py` reads one shared lineage verdict (`capability-route.source_lineage_verdict`) against the sealed `source_commit`, for every node, regardless of position or prior registry attempts. `exact`/`descendant` `HEAD` both pass and are recorded onto the attempt row (`launch_head`, `source_commit_sealed`, `source_commit_distance`, `source_commit_branch`); a declared planned sub-session under a mutation node is covered by the same verdict, with no separate lineage proof to carry, and its `stage_authority=0` keeps it apart from gate retry accounting. A `diverged` `HEAD` is refused (`route-source-commit-mismatch`) with two named recoveries: return to the sealed line of work (switch back to the sealed branch, or use reflog to restore the sealed commit), or compose a new route with `--parent-cycle <current cycle>`; an `unverifiable` tree (mid-merge, detached, git timeout, non-repo) fails under its own reason and does not count as a pass. Do not recompile or re-pin the route, and never use `git reset --hard` to restore it. An SD-104 continuation now unconditionally re-pins to the observed `HEAD` when the verdict is `exact`/`descendant` of the inherited pin — the old decline branch that kept the inherited pin whenever a re-run node already had a lineage attempt is gone, since the guard itself adjudicates every moved `HEAD` the same way regardless of position; a `diverged` continuation source refuses outright (`continuation-source-commit-diverged`), and an `unverifiable` one leaves the inherited pin untouched. A continuation publish that lands inside an ancestor's still-open producer cycle binds into it: `bind_continuation_cycle` judges the new route as a D-120 cycle admission against that open cycle immediately after publish and appends an audit record (`route_bindings[]`) only when admission allows; a refusal leaves the publish standing and rides the reason along as a publish-time advisory, distinct from a write-time refusal (SD-155, artifact-path-contract D-120).
+   - **SD-156 mutation-node in-place retry and declared sub-session lineage:** after an execute failure or partial completion, a mutation node may be redispatched on the same immutable route. `worker-route-guard.py` reads one shared lineage verdict (`capability-route.source_lineage_verdict`) against the sealed `source_commit`, for every node, regardless of position or prior registry attempts. `exact`/`descendant` `HEAD` both pass and are recorded onto the attempt row (`launch_head`, `source_commit_sealed`, `source_commit_distance`, `source_commit_branch`); a declared planned sub-session under a mutation node is covered by the same verdict, with no separate lineage proof to carry, and its `stage_authority=0` keeps it apart from gate retry accounting. A `diverged` `HEAD` is refused (`route-source-commit-mismatch`) with two named recoveries: return to the sealed line of work (switch back to the sealed branch, or use reflog to restore the sealed commit), or compose a new route with `--parent-cycle <current cycle>`; an `unverifiable` tree (mid-merge, detached, git timeout, non-repo) fails under its own reason and does not count as a pass. Do not recompile or re-pin the route, and never use `git reset --hard` to restore it. An SD-104 continuation now unconditionally re-pins to the observed `HEAD` when the verdict is `exact`/`descendant` of the inherited pin — the old decline branch that kept the inherited pin whenever a re-run node already had a lineage attempt is gone, since the guard itself adjudicates every moved `HEAD` the same way regardless of position; a `diverged` continuation source refuses outright (`continuation-source-commit-diverged`), and an `unverifiable` one leaves the inherited pin untouched. A continuation publish records a candidate; the existing producer `begin` path records its admitted cycle lineage (`route_bindings[]`) when execution enters it. A closed candidate with no registry attempt, completion marker, or descendant does not displace the predecessor at cycle settlement. The same lineage judgment is used for admission and finalization; unreadable execution evidence stays attached (SD-155, artifact-path-contract D-120).
    - **Fleet observation:** tell the user once that Fleet shows background work, unless they already use it. Execution and pending delivery are independent: the supervisor records `running-turn` with its unacknowledged outbox and owns acknowledgement/recovery. Fleet consumes exact runtime/tool evidence for activity; observation confers no completion, cleanup, retry, or delivery authority. Unverified and stale evidence remain unknown. One collector projects each snapshot from the displayed rows' bindings and directly scoped artifacts. One live producer owns each refresh through its eventual result; collection delay and last-success age are visible while the TUI stays responsive. Settled failure permits retry; elapsed time alone does not replace a live producer.
    - **Stealth-death guard:** the adapter liveness wrapper diagnoses a silent child: Codex `adapters/codex/bin/preflight.sh liveness [jobs.log]`, OpenCode `adapters/opencode/bin/preflight.sh liveness [jobs.log]`, or Claude/shared `utilities/dispatch-liveness.sh [jobs.log]`. They report `ALIVE`, `SUSPECT`, `DEAD`, or `EXITED`; exit 3 means at least one suspicious or unharvested job. An exact-attempt wait or harvest surface owns normal diagnosis; a parked parent never tails a child transcript/log or searches source/artifacts for progress. Raw inspection is permitted only after that child row is terminal/closed or after an explicit operator recovery override. Exact recorded `pid` plus `/proc/<pid>/cmdline` is the strongest signal. An attempt carrying canonical identity never falls through to cwd-wide transcript activity when exact evidence is stale or terminal. Transcript or DB mtime is a fallback only for legacy identity-less rows because workers sharing a worktree can make each other's directories look fresh; path-based `pgrep` is rejected as false-positive prone. For interactive Codex sessions, a validated exact `task_started`/`task_complete`/`turn_aborted` lifecycle outranks rollout mtime; terminal lifecycle makes the live TUI idle immediately and mtime is consulted only when lifecycle is unavailable or ambiguous.
    - **Completion delivery is runtime-owned (SD-14/78/92/97/113):** a registered owner is launched under an adapter supervisor and the parent obeys the launch receipt's `parent_next` — `end-turn` (a carrier wakes this session once; start nothing) or `bounded-wait` (run the printed `parent_next_command` once). Which carrier delivers, and how, is specified in `core/ADAPTATION.md §7`, never in the model's prompt.
-   - **Post-exit parent-bound reconcile under SD-64/71/77:** a conductor that dies mid-pipeline is reconciled by a non-model watcher bound to its exact PID/start. Reconcile first preserves any exact completion marker or typed terminal handoff, then classifies exact process identity before consulting worktree integration state. An exact-PID death closes the row (`dead-exact-pid`, or `dead-parent-orphaned` with one bounded cascade over its open direct children). The watcher settles evidence and publishes the recovery obligation; a bound runtime controller automatically replaces a proven-dead stage, frame leg, or owner once under SD-157. A canonical, logical-node family claim precedes registration and fenced spawn and survives route changes, repeated calls and lost replies. Live or unobservable attempts, live/unobservable owned children, pending terminal commits, and human stop decisions forbid replacement. Preserve original failure rows, completed stage/frame evidence and same-scope human answers. A usage-limit death (`dead-capacity`) is a pause, not a replacement budget: while the usage gate reports the harness limited, `start` returns `waiting-capacity` and launches nothing; after it clears, one `start` resumes the owner under the installed runtime (a sealed-release difference is a same-work diagnostic unless gates are on). When the pause names its reset time (`retry_at`), the runtime runs that `start` itself shortly after it and leaves the session one notice of the result, which repeats the `start` command when that `start` failed (`utilities/capacity_auto_resume.py`; at most three automatic resumes in a row per route). An owner its launcher closed before spawning (`launch_outcome=never-launched`, for example an admission lock still held after the bounded launch wait) is likewise a pause: the `start` that saw it reports that nothing started, the runtime runs the next `start` itself about a minute later under the same bound and notice, and that `start` launches the same work again under its own family without spending the replacement budget. An owner that ended `BLOCKED` is waiting for an answer, not dead: `start` reports `owner-blocked` with the owner's report and its `correction_command`. The person's answer sent there is kept (`retained`), and the same `correct` call runs the shared `start`, which launches one replacement owner on the same route that receives the answer first (`death_kind=corrected`). An owner that ended with a readable FAIL (its own final envelope said FAIL) is answered the same way with a fix a person approved: the replacement reruns the stage that makes the fix and the checks after it, and each failed check the fix answers gets its one closure-check round within the verdict ceiling cap + 1; when every failed check already used that round, no replacement starts and the receipt says `replacement-fix-round-spent`. A readable FAIL is not retried automatically. When the route's parent moved the owner pin (`start --pin owner=<harness>`) before that replacement was claimed, the claim names the new harness and the replacement takes the ordinary owner launch there with the same task, route, worktree and access request instead of replaying the old harness's command. Like a usage-limit stop it is a pause: each answer may continue the work once, and it spends no replacement budget. An owner parked at a declared human gate keeps its own release path. Any other replacement failure ends in needs-attention with no further automatic launch. Capture the original task and validated launch tuple before the first registration and render the replacement under its own identity. The controller must carry the effective attempt mapping through exact join, supervisor parking and delivery; an old failed attempt must not be announced again after replacement success. An owner resumes its current verified active route and open cycle when valid, retaining completion markers and the existing gate journal; a new route is required only when the existing identity cannot be reused safely. A missing upstream is typed `no-upstream-configured` and never blocks registry hygiene.
+   - **Post-exit parent-bound reconcile under SD-64/71/77:** a conductor that dies mid-pipeline is reconciled by a non-model watcher bound to its exact PID/start. Reconcile first preserves any exact completion marker or typed terminal handoff, then classifies exact process identity before consulting worktree integration state. An exact-PID death closes the row (`dead-exact-pid`, or `dead-parent-orphaned` with one bounded cascade over its open direct children). The watcher settles evidence and publishes the recovery obligation; a bound runtime controller automatically replaces a proven-dead stage, frame leg, or owner once under SD-157. A canonical, logical-node family claim precedes registration and fenced spawn and survives route changes, repeated calls and lost replies. Live or unobservable attempts, live/unobservable owned children, pending terminal commits, and human stop decisions forbid replacement. Preserve original failure rows, completed stage/frame evidence and same-scope human answers. A usage-limit death (`dead-capacity`) is a pause, not a replacement budget: while the usage gate reports the harness limited, `start` returns `waiting-capacity` and launches nothing; after it clears, one `start` resumes the owner under the installed runtime (a sealed-release difference is a same-work diagnostic unless gates are on). When the pause names its reset time (`retry_at`), the runtime runs that `start` itself shortly after it and leaves the session one notice of the result, which repeats the `start` command when that `start` failed (`utilities/capacity_auto_resume.py`; at most three automatic resumes in a row per route). An owner its launcher closed before spawning (`launch_outcome=never-launched`, for example an admission lock still held after the bounded launch wait) is likewise a pause: the `start` that saw it reports that nothing started, the runtime runs the next `start` itself about a minute later under the same bound and notice, and that `start` launches the same work again under its own family without spending the replacement budget. An owner that ended `BLOCKED` is waiting for an answer, not dead: `start` reports `owner-blocked` with the owner's report and its `correction_command`. The person's answer sent there is kept (`retained`), and the same `correct` call runs the shared `start`, which launches one replacement owner on the same route that receives the answer first (`death_kind=corrected`). An owner that ended with a readable FAIL (its own final envelope said FAIL) is answered the same way with a fix a person approved: the replacement reruns the stage that makes the fix and the checks after it, and each failed check the fix answers gets its one closure-check round within the verdict ceiling cap + 1; when every unresolved failed check already used that round, no replacement starts and the receipt says `replacement-fix-round-spent`. A readable FAIL is not retried automatically. An answered stop uses the same pause judgment for BLOCKED and readable FAIL, including a resource or infrastructure FAIL with no failed check round: each exact answer continues the work once without spending the automatic replacement budget, while past FAIL results and scientific check ceilings remain unchanged. Every owner replacement takes the ordinary owner launch with the current parent pin, sealed candidates and live allocation, retaining the same task, profile, route, worktree, access request and corrections. A claim does not fix its launch harness; even an existing unlaunched claim follows the current pin. An unavailable pin is diagnosed before launch. A launched attempt keeps its execution identity, and a later conflicting pin returns a diagnostic rather than silently reporting that pin applied. Like a usage-limit stop it is a pause: each answer may continue the work once, and it spends no replacement budget. An owner parked at a declared human gate keeps its own release path. Any other replacement failure ends in needs-attention with no further automatic launch. Capture the original task and validated launch tuple before the first registration and render the replacement under its own identity. The controller must carry the effective attempt mapping through exact join, supervisor parking and delivery; an old failed attempt must not be announced again after replacement success. An owner resumes its current verified active route and open cycle when valid, retaining completion markers and the existing gate journal; a new route is required only when the existing identity cannot be reused safely. A missing upstream is typed `no-upstream-configured` and never blocks registry hygiene.
    - **Commit responsibility follows the sealed route:** a normal single-session mutation node with `commit_expected: true` commits its own validated work in the assigned worktree, including tracked documentation and configuration examples it changed. Source ownership follows assigned scope and tracked content, not filename extension. A declared sub-session (`subsession_id` / `stage_authority=0`) never commits; its owner closes the stage gate and commits after. Add only exact validated owned paths; artifact shadows, runtime state, and unrelated dirty files are excluded. For linked worktrees, wrappers grant commit-expected workers only the per-worktree Git metadata directory plus common `objects`, `refs`, and `logs`; common `config`, hooks, and the rest of `.git` remain outside the grant. Runtime sandbox support must be reported from an applied sandbox measurement, not inferred from argv or a full-access session.
    - **Completion marker bound to the exact attempt row under SD-70:** completing a node takes the canonical registry path and the current exact attempt id (`complete --jobs <registry> --attempt-id <id>`), not just the route/node pair. A registered worker completing its own node may omit both: with no attempt axes stated, `complete` reads `AGENT_DISPATCH_ATTEMPT_ID` when that registry row is this node's attempt, and `AGENT_DISPATCH_JOBS` once an attempt is named; an explicit value takes precedence, and the inline axes form takes nothing from the environment. An omitted `--jobs` on the other dispatch utilities takes `AGENT_DISPATCH_JOBS` when it is set; with nothing inherited, `--jobs` stays required. Completion never breadth-closes a prior `BLOCKED` row or a later retry. Marker write and row close are idempotent under retry; if the row close fails after the marker is written, the command returns a structured nonzero — rerun it rather than editing the registry.
    - **A sub-session slice reaches its own terminal (SD-130):** a `stage_authority=0` sub-session slice holds no stage gate authority, so `capability-route.py complete` refuses it (`subsession-has-no-stage-gate-authority`); a slice closes through the completion join instead and grants no marker eligibility. A slice may only start on a sealed chain: `dispatch-node.py --subsession-id --action start` requires the persisted chain manifest to name it, else `subsession-chain-manifest-unsealed`.
    - **Review verdict is a result, not a worker death (SD-94 owner-closure extension, SD-153 round budget):** a readable exact review FAIL is a completed blocking round, never a dead worker. The shared `review_round_cap.round_budget` is the one admission decision every registered launch surface (`dispatch-node.py`, `dispatch-batch.py`, `stage-dispatch-fallback.py`) and this owner-closure eligibility check now read: its budget unit is the **verdict round** (`classify_round_row` recognizes a success note, a blocking review, or a non-review explicit FAIL — not a crashed, capacity-dead, or invalid-envelope attempt, which is `verdict-less` and does not spend the cap by itself), and `B=2` consecutive verdict-less rounds bind the node to `verdictless-bound` (a BLOCKED round whose unmet `done_when` items, read from its `<artifact>.items.json`, are a strict subset of the previous BLOCKED round's starts that count again; items that cannot be read change nothing) instead of a third silent registered attempt. The shared `complete` writer admits an exhausted-round owner disposition only after verifying review identity, an exhausted verdict-round budget, every blocking finding's linked evidence, and the destination cycle. `dispatch_contract.owner_closure_shape` names the one closure shape a completion marker carries — `continuation` (`stage_authority=owner-closure`) or `registered-review` (`review_gate_closure=owner-closure` with `review_independence=owner-overridden`) — and every terminal-identity reader (`_marker_identity_row`, exact-terminal proof) consumes that shape instead of re-deriving it by hand. For an official continuation, the same operation verifies immutable source-route/hash and node-contract lineage, counts inherited rounds without resetting their verdict-round budget, and publishes an explicitly owner-overridden gate only in the continuation. Its current-cycle record cites the source reviews; source review rows, FAIL results, markers and sealed payloads remain unchanged. `complete --check` evaluates owner-closure admission without publication or state writes; normal completion rechecks before committing. A refusal reports the exact unsatisfied obligation.
    - **Gate-evidence revision is a marker transition, not a rewrite (SD-154):** once a completion marker's live evidence changes after publication, `dispatch_contract.gate_currency` is the one place that recomputes the evidence digest and walks a revision chain (`completion_marker_is_current` is now a one-line delegate to it, so its existing boolean call sites are unchanged); its `revised-unrecorded` state is the only one a person or the runtime may act on — every other non-`current` state (`superseded`, `completion-evidence-unreadable`, any `integrity-broken:*`) is a kept refusal, not something to record over. `capability-route.py revise --route <route> --node <node> --evidence <evidence-path> --basis review-findings|user-direction|owner-correction` is the one writer (`publish_revision_locked`): it publishes marker `k+1` with `stage_authority=revision` and, in the same critical section, tombstones every downstream node's canonical marker (`state=superseded-by-upstream-revision`) so a stale downstream marker is not read as current. Every kept integrity refusal raises before any marker is touched. `dispatch-node.py`'s `admit_round` auto-records this revision (`recorded_by=runtime-auto`) before admitting a dependent node's next round whenever that node's last round was a blocking FAIL that basis-verifies against the `revised-unrecorded` upstream; when that basis verification cannot run itself, the revision stays unrecorded and the dependent's launch is refused `completion-evidence-revised-unrecorded` with `next_action` naming the `revise` command above. After a round budget is exhausted, a node whose last verdict round was a blocking FAIL and whose FAIL a revision names as its `answers` is admitted exactly one more round, `round_kind=closure-check` — spent by that verdict attempt itself, not a standing exception to the cap. That refusal belongs to the opt-in gates (`HEARTING_GATES=on`). With gates off, the default, an evidence edit after its marker is not refused and prints no warning: the operations that proceed on the completion — `continuation`, a stage start, `complete`, a replacement owner's claim — keep it as one history line (`<node>.evidence-changes.jsonl` beside the marker: when, by whom, in which command, why, and the digest it replaced), and the closed route's `revisions` list it as `basis=automatic`. Reads (dry-run, `status`, Fleet) write nothing. `revise` stays the manual record and judges "unchanged" by that same comparison in both modes: the evidence it names against the digest the marker recorded (`revision-evidence-unchanged` only when they are equal).
+   - An owner-closed review keeps the reviewer's FAIL, identified by `failure_class=fail` and the owner-overridden closure even when its note is `completed-marker`. Approved-fix selection and its round admission use that same verdict. Existing approved claims recover omitted FAIL targets from their exact completion snapshots only while the shared budget still admits their closure-check, without rewriting claims, history or markers. The cap+1 ceiling and reduced independence remain. A review already disposed by owner-closure at that ceiling grants no further check round and does not block an approved answer continuing other unfinished work.
    - **Review input and closure preview (SD-161):** plan-check inputs have exact attempt-bound path/digest records. Separate input revisions admit bounded review without publishing a PASS marker; the lineage verdict ceiling is cap+1. An admitted verdict correction uses its stable round identity, not the prior worker's death/capacity replacement budget; original retry links remain historical. Current-route and ancestor owner-closure share the completion writer's read-only preview proof.
+   - A review superseded by an upstream revision is historical completion, not current review disposition. Once its existing round budget is spent, the latest blocking FAIL may receive the normal evidence-bound owner closure even when a later independent PASS was superseded. Readers prove a supersession against its unchanged predecessor and the recorded upstream revision; the original attempt link still names that predecessor, not the supersession sequence. This preserves the original FAIL/PASS, history and round ceiling, and publishes owner judgment with reduced independence rather than a new independent PASS. Gate settings remain unchanged.
    - **A review gate names its reviewer, and a self-review is degraded, not refused (SD-OPEN-41(b), SD-94 extension):** the completion marker of a `review-worker` node records `reviewer_kind` (`registered-worker` | `native-subagent` | `owner-inline`), `review_independence`, and the reviewer's identity; name it with `complete --reviewer-attempt <att>` (row must carry `worker_type=review`) or `--reviewer-subagent <transcript>` (readable file, digest recorded). A failed claim downgrades to `owner-inline` with a typed `reviewer_downgrade_reason` and never refuses; the `§0.5` completion card must then say the gate was not independently reviewed.
    - **An independent reviewer can be a registered review worker (SD-OPEN-40):** `dispatch-owner.py` accepts `--dispatch-depth 1 --worker-type review` alongside the owner tuple, and then requires `--unit` to name a catalog persona (never `_kernel/owner` or `_kernel/resource`) and refuses `--route-evidence` — a route node's reviewer is launched by stage dispatch with its node binding, and one node must have one launch path. The owner tuple is unchanged, including its refusal of a caller-supplied `--unit`.
+   - **Standalone worker completion:** a route-free registered depth-1 review or stage launched by the main session uses its exact attempt as its pending-delivery scope (`review:<attempt>`/`_review` or `stage:<attempt>`/`_stage`, with the existing no-parent sentinel). This is a delivery identity, not a route binding, stage completion proof, or write grant. Route-bound workers retain their declared identity, and incomplete depth-2 stage identity is still refused. On 2026-10-08 a standalone first-NOW verification stage finished, but its empty delivery identity prevented the parent notification; the existing terminal materializer handles this shape for all harnesses without another courier or recovery step.
    - **Legacy preview recovery:** an actual launch refused for an unraised preview gate may raise its question outside the jobs lock after proving the current predecessor marker, exact attempt readiness, and artifact. The launch stays refused; dry-run/preclaim stay read-only. Missing proof or carrier yields a typed recovery failure.
    - **Route-free reviewer report binding:** a registered depth-1 review may write durable output only when the caller opts into `--review-output` and the canonical jobs registry proves one unique open `worker_type=review` row with the sealed attempt/depth/transport/surface/unit/capability/worktree/artifact-root/cycle/producer axes and the exact output digest. The wrapper validates the cycle and its sealed route before registry mutation, and jobs carries only a canonical URL-safe base64 locator rather than a raw path whose comma, tab, or newline could change metadata fields. The binding authorizes that one `artifacts/plans/**` report file; it never fabricates route or marker evidence, promotes source-write rights, or permits sibling/foreign targets. A reviewer without the opt-in remains stdout-only. After the fenced process identity is published, only report launches drop the jobs lock for producer admission; they then reacquire it and revalidate the exact row, identity, status, and parent before releasing the launch fence, while ordinary launches retain the prior lock boundary. Schema-v2 report leases combine the exact launch identity with a summary-owned flock under the artifact root, so authorization and completed/abandoned sealing depend on the governed lifetime even when the worker PID is not visible across namespaces. Missing, released, expired, malformed, tampered, foreign-replay, or unlocked evidence fails closed; legacy schema-v1 leases retain their read-only compatibility behavior and are not report-write evidence. For detached reviews, the registered identity remains the finite watchdog; governor reservation transfer is proved against its separately sealed fence/runner child. On timeout, TERM, INT, or admission failure, the watchdog drains the exact child group and attempt-tagged descendants (including new sessions) before releasing the review lease. Unknown namespace or process evidence never authorizes cleanup or lease release. The launcher allows this bounded cleanup to finish before escalation; Linux parent-death signalling alone is not descendant-group cleanup.
    - **Supervisor exact terminal reconcile:** every registered owner supervisor exit classifies its final runtime envelope and process result, then atomically reconciles only its exact attempt before reporting success or typed failure. Capacity, auth, protocol, missing-result, signal/exit, and valid handoff outcomes cannot leave the row open. If the supervisor cannot reach its own finalizer, the exact post-exit owner watcher runs the same classifier-backed closure; neither path breadth-closes a slug/worktree retry.
@@ -616,7 +738,13 @@ recorded child cannot be its descendant, but a readable positive attempt tag
 takes priority. Recovery preserves the live owner, successful siblings and original
 execution evidence. Replacement launchers retain the selected foreground
 watchdog and cleanup grace rather than applying the detached admission timeout;
-automatic replacements also retain the route's allocation usage gate. A tap's
+Owner replacements use the ordinary owner selector at launch, including the
+current parent pin and sealed candidates. A replacement claim preserves the
+work and recovery lineage, not the original owner harness: an unlaunched claim
+follows a later pin, and an unpinned owner can move to an eligible candidate
+when the original harness meets only the allocation usage gate. Launched
+attempts keep their execution identity. Stage replacements retain the route's
+allocation usage gate. A tap's
 write time is not a new usage observation: one reset window cannot gain headroom
 from a lower stale value being written again.
 
@@ -643,6 +771,33 @@ and recovery — are runtime-owned and live in `core/ADAPTATION.md §7`.
 Runtime completion carriers report a bounded native log line for skipped delivery,
 claims and prompt admission, with the session and reason. Observing transport never
 changes the settled result or grants another execution.
+
+An accepted Claude native wake is also retained as the existing outer manager's
+registered-batch duty. If its hook exits before delivery, that task runner checks
+the same current attempt and pending notice and hands it to the existing peer
+courier for the exact parent session. Native and recovery delivery share the
+notice claim; forms and busy turns use the courier's existing retained-message
+path. Codex and OpenCode keep their existing retained completion controllers.
+Confirmed session handover changes the recipient, while the signed notice stays
+under the registered parent's storage key. If an older outer observer cannot
+process this retained duty, its exact PID and existing lock identify a safe
+observer replacement: accepted records remain intact and the replacement takes
+the same lock. A supported observer and the native carrier stay alive.
+
+Session activation is observation, not receipt: startup/resume context leaves
+pending notices and delivery leases untouched. Activation reconnects
+the existing retained courier for the exact current session, across all three
+harnesses. It wakes a restored recipient through the checked prompt surface;
+drafts, forms and changed session identities remain protected. With no recipient,
+the notice remains pending and Fleet shows the outstanding delivery. A real
+prompt or accepted runtime turn supplies receipt, independently of execution.
+The retained courier binds its peer transfer to that exact notice before sending;
+actual peer receipt can settle a still-live notice lease. A queued transfer stays
+owned by the existing message courier. Receipt of an earlier gate does not settle
+the owner's later completion notice.
+If another normal carrier consumes that notice first, the same bound peer payload
+is omitted from later sends and its existing message duty settles without a false
+peer-receipt claim.
 
 A replay that verifies the exact closed outcome, finalized cycle, sealed owner
 handoff and quiescent children reports completed work. A missing or stale progress
@@ -680,11 +835,109 @@ for a second entry approval. Older sealed quick routes retain their
 `preview-disposition` release and current-preview digest checks;
 `capabilities/autopilot-refine.md` owns the commands.
 
+An open registered supervised owner whose terminal settlement failed remains
+an unfinished settlement duty. Ordinary join, start, correction and session
+reconnection retry the same terminal writer after storage becomes writable.
+The writer retains its exact result in the existing log before settlement;
+recovery reads only the latest turn, including after finalization errors.
+Native turn completion alone is not the owner's final settlement. Older logs
+without its exact result retain the artifacts for the existing continuation.
+A launched supervised owner's runtime continuation retains the unclosed
+route's sealed contract root until its successor finishes or the route closes.
+Failures before owner launch remain reclaimable.
+Reconnection writes the canonical registry only; legacy roots remain read-only.
+They use the exact PID/start, group and tagged-descendant observation, preserve
+committed results and completed stage markers, and retain corrections for the
+same route's continuation. Live or unobservable processes retain protection
+from closure and replacement. A process reobserved as a zombie after an environment read
+denial has exited; a still-live denied environment remains unobservable.
+`start` distinguishes running, exited and unobservable owners.
+
 ### §5.11. Commit and Push Policy for `<agent-home>`
+
+Fleet's two-hex session numbers have one shared resolver,
+`tools/fleet/session_handle.py::resolve_tag`, consumed by Fleet, peer trailers
+and Herdr titles. Codex and OpenCode reserve distinct numbers among observed
+live sessions in a small XDG state assignment file; an existing live assignment
+keeps its number and a later session takes a free one. Initial collection orders
+unassigned sessions by their known start time. Claude's runtime-derived numbers
+are fixed reservations, so a conflicting Codex or OpenCode assignment moves.
+Collection refreshes these reservations automatically; no user input or flag is
+needed. Missing, corrupt or unwritable assignment state falls back to the original
+session-id hash. Exhaustion of the 256 values and duplicate fixed Claude numbers
+leave uniqueness unavailable.
+
+Merge with `hearting run merge-line <PR>`. Sessions and worktrees for the same
+GitHub repository share one user-state FIFO `flock`. A lone PR retains the
+existing latest-base/head-CI path. Multiple waiting PRs are merged in order into
+an isolated integration branch and tested together through a temporary PR. Only
+successful CI for that exact integration head and merge-result tree authorizes
+one fast-forward publication of the PRs' individual merge commits. GitHub marks
+the original PRs merged through commit ancestry; their heads, history and reviews
+remain intact. The publication lease pins the checked base, avoiding intermediate
+main CI runs and preserving any concurrent default-branch successor. Protected
+branches/rules use the original per-PR path rather than bypassing merge policy. A
+changed head or default branch restarts validation for the remaining work. PR
+and main Checks share the same authenticated validated-tree lookup: an identical
+tree reuses its completed successful full PR run, including across a rebase;
+changed, failed, partial or unverified trees retain full validation.
+CI failure splits the group automatically, excluding a failing singleton while
+continuing the others. Integration conflicts use the original single-PR path.
+Every caller receives its own result through the same command, without new
+input or approval. Interruption releases the OS lock; the next caller removes
+dead PID/start entries, resumes uncompleted requests and cleans abandoned
+integration PRs/branches. This is cooperative local serialization; outside
+merges are observed through head/base checks and rejected by the publication
+lease. Temporary branch deletion uses an exact-head lease too and does not
+rerun source pre-push hooks: it publishes no source change. All three
+harnesses use the same implementation.
+
+Release publication uses immutable tags and the tested commit. Repeated or
+out-of-order successful checks are ordinary observations: refresh tags before
+reserving a version, reuse a tag for the same commit, and skip a commit already
+included in a published stable release. A version occupied by another commit
+is replanned from the current version without moving tags or asking the caller
+to repair the release queue. The release policy owns the version rules.
 
 After validating changes to instructions, rules, hooks, preflight, or runtime status surfaces under `<agent-home>`, commit and push them in the same turn without a separate user signal. A work repository's push is separate and remains subject to its deployment gate.
 
 ### §5.12. Continuation Supervisor and Tracked-Workflow Completion
+
+Attention messages follow the stored receipt type and required action.
+Rendered wording grants no gate state. Closure-pending supervision is runtime
+recovery, not a human gate. Only an actual human-gate record carries decision
+and release instructions, including when several kinds share one wake.
+Read-only workflow status and survey prefer a matching closed outcome with
+current terminal gates over historical successor reservations. Such a claim
+is scheduling history, not proof of a live execution; it remains visible in
+the raw claims and journal fields. Current running or failed node evidence
+still prevents a completed projection. These observations rewrite no ledger,
+registry, claim, route or payload.
+
+**Parent close.** The existing `capability-route close --route <route>` also
+ends that parent's unfinished current owner, without waiting for another model
+turn. Before signalling, the shared controller records `cancelled-by-parent`
+intent in the existing workflow journal and exact attempt rows. This stops
+launch, replacement, chain advance and gate delivery. A committed normal result
+that precedes the intent keeps its result; a later PASS cannot replace an
+intentional cancellation. The controller revalidates PID/start and owned
+descendants, sends TERM, then KILL after a short grace, observes their end,
+folds never-launched successors, closes the attempts as `failure_class=cancelled`
+and the workflow as CANCELLED, and records the route outcome. Repeated close
+and the existing execution observers resume this same cleanup after interruption.
+Unknown process evidence stays termination-pending; it grants no signal or
+false completion and requires no new caller recovery ritual.
+
+Resource runs are preserved by default, including when they share an agent
+process group. Close returns their exact IDs and states; the existing resource
+supervisor records their results without starting successors on the cancelled
+route. The single optional `--stop-resources` flag uses existing resource/compute
+stop only for runs exactly bound to this route. Other routes and shared GPU
+processes are never targets. Close neither deletes nor moves artifacts, and
+later user deletion of artifacts cannot reopen cancellation or prevent replay.
+There is no artifact protection mechanism, required reason, new command or
+additional approval. Intentional cancellation produces no human gate,
+`inspect-done-failure`, replacement or start recommendation.
 
 `WORKFLOW §0.6` defines the portable state machine and the four continuation
 kinds. This section owns the mechanics, and it applies to every tracked
@@ -697,6 +950,31 @@ graph, terminal nodes, and human gates in `capabilities/topologies.json`; it
 never reimplements continuation. The supervisor is a non-model process: it
 holds no model turn, opens no dispatch depth, and has no launch authority
 beyond the successor its sealed route already declares.
+
+Resource watches follow exact resource identity rather than a 24-hour deadline.
+Start/resume and the parked owner controller reuse a live watch or reattach one
+under the existing resource-registry lock. Recovery changes only supervision
+metadata, never the payload, its identity, or producer outputs. A recovered watch
+whose owner already ended hands proven resource completion to that owner's
+existing parent carrier; it does not start a new training run. Explicit parent
+close suppresses this continuation and all cancelled successors.
+
+A supervised owner can register sequential resources for one route/node using
+the same `resource-runner start`. Exact replay preserves its run; a new run may
+replace the armed predecessor after an exact terminal exit, including a guard
+exit that saved a checkpoint, while that stage is failed/retryable or still
+waiting for its declared outputs. The current launch retains its normal live
+owner/session binding. The ledger lock serializes the binding change, preserves
+the prior execution evidence, and refuses active or unobservable identities,
+completed stages, existing successor claims, unrelated failures, and parent close.
+All prior bindings protect their log, sentinel and progress paths across registries
+and path aliases. Existing active workflow progress is preserved. The final payload
+release checks parent close under the same ledger lock before publishing identity
+and opening its private launch fence.
+The owner receives intermediate execution success with no successor admission;
+an unacknowledged success or failure remains recoverable from its original binding after the
+next registration, with no lifetime receipt-count ceiling.
+The resource that supplies the declared stage outputs can complete the stage.
 
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
@@ -715,6 +993,22 @@ A registered worker's `gate --block` on every harness takes its registry from
 refused before it mutates the ledger or creates delivery when it has neither;
 read-only no-jobs status/await/release compatibility remains available.
 
+**Later verification of failed resource outputs.** Ordinary terminal settlement
+can append a resolution of a retryable resource failure when its exact exited
+run and nonzero sentinel remain unchanged, a current resource-stage judgment
+accepts its preserved output bytes, and current downstream stages bind those
+same bytes through an independent PASS. The runtime records the run identity,
+consumed file hashes, stage-marker hashes and independent gate in the existing
+workflow journal as downstream consumption, preserving the original FAIL,
+exit, resource registry, artifacts and scientific result. Owner wording or
+downstream PASS alone is insufficient. Missing or
+different bindings retain failure and return an executable continuation using
+the existing compose surface: a new resource attempt with a distinct `__a<N>`
+identity and output directory, followed by revalidation of its downstream
+stages. Old PASS markers are provenance, not authority for the new bytes.
+The same judgment serves owner settlement and workflow completion on all three
+harnesses, without another flag, required input or approval.
+
 **Advance evidence is four-part and fail-closed.** Before a supervisor may
 start a successor it proves, for the predecessor: exact process identity
 (recorded `pid` plus `/proc` start time plus command-line hash, so a reused PID
@@ -724,6 +1018,9 @@ predecessor's declared output artifacts. Missing, unreadable, or
 namespace-unverifiable evidence is not success. A nonzero exit, a `FAIL`/
 `BLOCKED` verdict, or an absent declared artifact records `FAILED_RETRYABLE` or
 `FAILED_TERMINAL` and starts nothing downstream.
+For a supervised owner resource, successful exit with missing stage outputs
+instead records a wait for the next resource in the existing running stage;
+the output requirement for downstream work is unchanged.
 
 **Exactly-once is claim-based, not schedule-based.** The successor key is
 derived from the sealed `route_hash`, the predecessor node, the predecessor's
@@ -747,13 +1044,75 @@ the shared classifier — atomically persists the terminal row: `succeeded` or
 row is a defect, not a state; `working` is only ever recomputed from exact
 identity and is never read from the stored status word.
 
+The resource runtime owns deterministic execution evidence at
+`artifact_base/run.json`: exact PID/start/command identity, sentinel exit code,
+log, declared output paths and observed start/end times. Arming validates the
+known output directory before launch and returns these expected paths; launch
+receipts carry the same paths without new inputs. Runtime-authored documents
+put facts in a Hearting namespace; an existing owner document retains its
+bytes and is consumed after rechecking the runtime execution. An existing
+completion marker's evidence bytes are preserved. A runtime-only document
+proves execution, distinct from scientific verification. For a supervised owner it
+retains the existing next-resource wait until owner terminal settlement, so
+sequential runs stay possible without another owner-written run.json.
+
+A missing output after an exact successful resource exit is re-observed by
+poll. When the same execution and sentinel remain proven and the output arrives,
+the existing retry transitions append a new observation and advance once.
+Earlier FAIL journal entries survive; execution failure, cancellation and
+unknown identity remain unproven after a late file. Owner settlement uses
+the same resource output reconciliation without payload replay.
+
+Registration and supervisor arming share the terminal-execution judgment for
+same-route/node retries. They retain the old row and predecessor binding;
+only that resource's failed/retryable state returns to running.
+Queued input validation, including stale smoke attestations and configuration
+provenance, uses the same failure judgment. The leased launcher settles its
+unchanged pre-claim request through the existing owner result path, preserving
+input binding and diagnostic. Changed inputs use ordinary smoke verification
+and a distinct retry without locking another session's edits.
+The runner's failure before its private payload fence is released is a finished
+failure, including legacy direct-launch `resource-launch-incomplete` rows with
+no process identity, controller claim or sentinel. One shared judgment settles
+that failure and admits the ordinary `__a<N>` retry; a missing identity or a
+controller crash after claim alone proves nothing. Admission checks precede
+arming where possible, and an armed pre-release failure settles the workflow
+as `FAILED_RETRYABLE`, preserving its failed predecessor and starting no successor.
+
+GPU monitoring is observation, separate from payload completion. A generated
+resource bridge settles the exact payload exit and declared outputs even when
+a during-run or post-run probe is unavailable; it records the missing sample
+and diagnostic as a warning. It checks terminal payload evidence before taking
+another sample and saves partial monitoring records even after a probe error.
+Optional probe exceptions leave the resource's exit code unchanged.
+If the approved verification contract requires a GPU sample, its existing
+verification check reports that missing evidence as FAIL; resource success
+alone does not satisfy the verification gate. A nonzero bridge exit remains a
+resource failure: the runner cannot infer successful payloads from a traceback.
+
+The existing owner input state receives the verified native session identity
+as soon as the transport binds it, including during the first model turn.
+A registered resource launched in that turn uses the same live supervisor and
+session binding, available during the turn itself.
+
+A resource launch failure proven before payload release stays a resource
+outcome, with its original diagnostic. The supervising controller returns that
+outcome to the same owner instead of exiting or spending an owner replacement.
+The owner continues the already authorized work using the normal resource retry;
+failed rows and evidence remain intact. GPU admission concerns the host actually
+running CUDA: an orchestration bridge for `compute-hosts` uses the existing
+CPU-only CUDA visibility on its controller host, and the target-host launcher
+reserves the real devices. A GPU route label alone does not choose another host
+or authorize bypassing a local reservation failure.
+
 For the explicit `resume-run,run-verify` graph, `resource-runner start` also
 arms the shared supervisor and starts its watch, without a model waiting on the
 payload. The same route's normal `start` is the claimed successor: before the
 resource succeeds it reports resource readiness/liveness, and afterwards it
 starts only the independent verifier. The receipt distinguishes the resource,
 watch and verification identities. A repeated exact launch returns the existing
-run; a changed launch or another run for that route/node cannot duplicate it.
+run; a changed body under that run ID is refused, and another run ID cannot
+duplicate an active execution on that route/node.
 Exit failure, a missing sentinel or unverifiable identity starts no verifier.
 Verification completion retains the existing parent-delivery receipt and its
 supported fallback; watch startup or queue acceptance alone is not receipt.
@@ -793,7 +1152,18 @@ including existing `route`/`node` registries. A verified working resource lights
 its declared route node; a supervised parked owner shows that node and
 `resource-parked` instead of presenting an old model summary as current work.
 Resource liveness stays independent of the owner's model activity, and a missing
-progress declaration leaves only elapsed time and liveness (2026-10-07 SR eval-run).
+progress declaration leaves elapsed time, liveness and verified process placement.
+An active resource uses Fleet's existing green blinking dot. Its row retains the
+node name, elapsed time, observed host/PID and declared progress in that order
+as width permits; exact GPU matches reuse the GPU row instead of duplicating it.
+Registered log mtime is not workload progress or output freshness. Report detail
+is shown only when a report exists or a meaningful integrity problem is observed;
+an absent report preserves its unresolved reason and produces no report row.
+Verified working resources whose exact parent owner is no longer drawn
+remain on their project card in both Fleet views. The row reuses exact GPU
+identity and existing elapsed/progress; absent a fresh GPU match, it shows
+the resource row. Cwd places the card and never implies a session owner.
+Terminal/stale resources drop the fallback without reviving an ended owner.
 A worker card shows its assigned work, not every node in the
 route: a depth-1 frame owns only its exact frame node; the later owner owns the
 execution stages, excluding the separate pre-owner frame pair. Depth alone does
@@ -824,6 +1194,15 @@ PID/start/group, command, cwd, log, and registry identity for reattachment.
 
 
 Admission recovery is bounded: only a global/class-cap refusal from `acquire` or `reserve` triggers one `reclaim(root)` transaction after the failed admission has released its state lock. Only `reclaimed_count > 0` permits one complete admission retry. Kill switches, identity/validation errors, and rolling start budgets are never bypassed; start history is not refunded. `check` and refusal messages never scan witnesses. Reclaim returns only leases whose exact witness permits an exclusive nonblocking lock; live claimants, inherited descendant handles, foreign namespaces, and unprovable legacy records stay protected. No PID-only removal, state reset, or cap increase substitutes for this proof. A start-budget or cap refusal is typed on the governor's stdout (`refusal`, `retry_after_seconds`, `frees_at`) and carried onto the adapter's refusal receipt; when the refusal created no registry row, `start --wait` treats this as `waiting-capacity`, not a failed attempt, and waits at most one start window before relaunching the same attempt id exactly once, returning without arming another wait if refused again.
+
+Owner, resource and governor observations share the same previous-boot proof.
+A different boot UUID alone is insufficient on shared NAS state: the proof
+requires a matching recorded host or that UUID in this machine's boot journal
+including the current boot. Normal governor transactions return
+only leases, claims and unused reservations proven to belong to that previous
+boot. Claim receipts retain the observed failure for legacy resource recovery;
+start history and limits remain unchanged. Current, foreign, contradictory and
+unverifiable identities keep their existing protections.
 
 Each registered dispatch attempt also owns its summary lifecycle. While the governed worker remains behind its launch fence, the selected adapter starts one non-model summary supervisor bound to the exact attempt id, log path, and worker PID/start identity; the same registry transaction publishes that owner identity before releasing the worker. The supervisor requests one early summary, at most one ordinary update per 600 seconds (off the priority lane) while the exact worker lives, and one final update after log quiescence, then exits without completion, signal, retry, or launch authority. Initial and final requests may each use one durable `(harness, session, phase)` admission ticket when the ordinary rolling refresh budget is exhausted, but never bypass the provider kill switch, per-session lock, governor, or global concurrency cap. `dispatch-reconcile --apply` may idempotently restore a missing supervisor only for one open, exact, live attempt. An extinct registered namespace-local row from a pre-receipt runtime may be removed from the active Fleet set only through `dispatch-reconcile --attempt <id> --cancel-receiptless-namespace --apply`: this exact operator action records `failure_class=cancelled`, writes no PASS, marker, or reap receipt, and deliberately leaves successor readiness fail-closed. Fleet's explicit kill path likewise closes only the selected exact attempt as a typed cancellation; its wrapper remains responsible for the genuine post-exit receipt. Fleet is otherwise a pure observer of registry and stored summary sidecars: starting, refreshing, or closing Fleet never creates provider work. Interactive sessions use their runtime lifecycle bridge as the summary producer and follow the same bounded admission rules.
 
@@ -869,6 +1248,12 @@ join retains every owned attempt, including `done` rows, until the exact process
 group and tagged descendants are settled. `dispatch-reconcile --attempt <id>
 --apply` uses the same bounded cleanup proof authority on terminal rows; it
 preserves the result, marker, and delivery receipt and grants no retry credit.
+After the recorded leader has exited, the existing post-exit watcher and applied
+cleanup terminate its exact attempt-tagged leftovers with TERM, then bounded
+KILL. They revalidate the row, namespace and PID birth before signalling, and
+preserve resource/compute runs and their branches under the same protection as
+parent close. A live leader or unknown identity remains pending. This applies
+equally to all three harnesses and requires no caller input.
 An exact authenticated portable cleanup receipt remains settled when a later
 same-namespace tag scan cannot read an unrelated process and the current owned
 group is empty; any visible live leader, group member or tagged
@@ -980,7 +1365,17 @@ The static half — addresses, ports, environment roots, and the shared run root
 other cross-runtime policy files; install seeds it once as a commented template
 and neither install nor update ever rewrites it. `harness config status` shows
 its state next to the other user-owned config surfaces. The
-launcher is shared across runtimes, repairs only an exact owned link, preserves
+worker runtime preserves that exact inventory location through the existing
+`COMPUTE_HOSTS_CONFIG` environment value before isolating its XDG directories;
+it neither copies the inventory nor exposes the user's whole config home.
+GPU lab owners include the inventory directory as a read-only root and SSH
+network need in their normal execution-access request. Execution/validation
+children remain inside the parent's grant; non-execution nodes get no new
+automatic network request. The effective record reports this logical network
+grant separately from OS enforcement. An explicit network request still wins.
+An answered BLOCKED GPU lab owner prepares these same defaults for its
+replacement, retaining completed stages and the old request as history.
+The launcher is shared across runtimes, repairs only an exact owned link, preserves
 foreign collisions, and is removed only by a full uninstall. That file
 is byte-identical on every host: which entry is the local machine is discovered
 by matching its declared `hostname`, not written down, so promoting a different
@@ -989,6 +1384,14 @@ server. An inventory label and a system hostname need not agree, which is why
 the match is against a declared field. Live state is never recorded: `list` and
 `probe` measure reachability, CPU utilization, and GPU utilization/free memory
 at the moment they are asked.
+
+`probe --json` reports measurement availability in each host row (`reachable`,
+`detail`, and `process_detail`). Once it emits a valid snapshot it exits zero,
+including for unavailable measurements, and writes their warning to stderr.
+Zero means the snapshot was returned, not that the host or GPU was verified.
+Configuration/selection errors still fail; the human-readable probe retains
+its reachability exit status. Required measurements are checked from the JSON
+by their owning verification contract, separate from payload execution.
 
 A live direct SSH launch may cross the process boundary without forwarding its
 Claude Code, Codex, or OpenCode session variable. In that case the probe may
@@ -1066,13 +1469,50 @@ row uses the existing stalled-age warning rather than forcing fresh-age or
 basis explanations onto it. Original phase/metric names are preserved, and
 combined arm totals, ETA, speed and epoch-mean loss are not inferred.
 
-`run` measures the selected host through the existing bounded probe before
-launch, including for `--dry-run`. Its receipt and run metadata carry the
-observation time, GPU free memory and utilization. When the probe observes a
-GPU with zero utilization and no compute processes, it suggests the one with
-the most free memory. This is a snapshot, not a reservation: the caller's host
-and `--gpus` choice remain unchanged. An unavailable probe is reported as
-unknown and never blocks launch; no separate pre-launch `probe` is required.
+`run` and GPU `resource-runner start` automatically reserve their devices in
+one host-local `gpu-leases.json` beside the canonical dispatch registry. All
+launchers targeting that host share the same locked selection and publication;
+the harness never chooses a host. Without a device choice, launch selects one
+unreserved GPU with no compute processes and zero utilization, preferring free
+memory. Memory-holding idle processes are occupied too. An occupied explicit
+choice starts nothing and reports its owner, task, start time and free devices.
+`--share` is the single optional override for deliberate sharing; no reservation
+command or additional required input is involved. An explicit empty
+`CUDA_VISIBLE_DEVICES`/`--gpus` retains CPU-only execution; the CUDA spelling
+`CUDA_VISIBLE_DEVICES=-1` is also CPU-only. GPU measurement failure
+cannot establish availability. Receipts retain the observed memory/utilization.
+
+NVML failure does not erase known running work. The bounded, read-only probe
+uses NVIDIA's proc device information and stable same-EUID PID/start evidence,
+open `/dev/nvidiaN` descriptors, physical `/proc/<pid>/maps` device mappings
+or an unambiguous CUDA visibility/order mapping to place managed runs. A default
+numeric CUDA ordinal is not a device minor; ambiguous placement retains only
+device-access evidence. The probe collapses descendants
+of the same managed run already represented on those devices, preserves exact
+session attribution, and leaves NVML-only utilization and memory unknown.
+Device access without a resolvable visibility mask remains access evidence,
+not a claim that computation uses every opened device. Fleet and admission
+consume the probe's shared Korean diagnostic: an observed NVML mismatch,
+library and loaded module versions when readable, and the host's existing
+reboot-required signal. Missing signals remain unknown; no driver-update cause
+is inferred. GPU admission remains closed while measurement is unavailable,
+including `--share`, and names observed occupancy without reporting free GPUs.
+Fallback GPU indexes identify physical device minors. Existing reservations
+whose NVML index cannot be mapped stay visible at host level with unknown
+device placement; they are not attached to a guessed GPU.
+Fleet's outer collection deadline includes local preparation and parallel host
+samples, with bounded headroom for proc fallback; per-host SSH waits stay bounded.
+Rendered rows carried across a viewer replacement retain their observation age.
+A new GPU sample or expired evidence ends replay even while basic collection waits.
+
+Reservation lifetime follows the exact wrapper PID, start time and PID namespace,
+not its launching session. Normal exit releases it; the next launch removes
+proven-dead/reused-PID reservations, and read-only status omits them from its
+view, preserving unknown identity. Existing work is not adopted or interrupted: its probe processes mark
+the GPU occupied. `compute-hosts list` and Fleet's top compute panel show GPU
+reservations, including the session tag, task and start time, before CUDA has
+allocated memory. Host-local storage lets callers on different machines converge
+without depending on a shared NAS mount or an installed harness on the target.
 
 `run` starts a command detached under a stable run id and writes its log and
 exit code beneath the shared run root, so the session that launched the work
@@ -1143,10 +1583,30 @@ the existing supervision notice carrier. A host whose supervisor probe does not
 report support runs the owner as the existing one-shot, creates no input state,
 and `correct` reports `owner-input-unsupported` before queueing; an owner
 already running under an older supervisor behaves the same way.
+An interrupted launched supervisor with no terminal event also accepts the existing
+`correct` request once its owner execution and unregistered children are quiescent.
+Registered resource/compute payloads stay under their existing run records when
+the owner is replaced; their survival is not surviving owner execution. The
+shared parent-close classification separates them, with exact route/attempt
+binding and complete observation of the remaining process set. Recovery context
+passes their record locations to the new owner without relaunching or editing
+them. This is an answered continuation on the same route: keep the
+original failure, completed stages, permissions and review budgets. A valid
+terminal result, cancellation or unknown execution retains its existing path.
+Resource registration settles a positively observed previous-boot execution as
+retryable failure even when power loss left no exit sentinel. The same observation
+admits its successor while preserving logs, checkpoints and settled results; a
+missing sentinel or stale PID alone grants no such admission.
+
 An owner that already ended `BLOCKED`, or with a readable FAIL a person answers with an
 approved fix, keeps the answer (`retained`), and `correct`
 continues its route in the same call through a replacement owner that receives it
-(see the SD-157 replacement rule in §5.10). When the answer comes from a session
+(see the SD-157 replacement rule in §5.10). A readable FAIL with no failed
+round-capped check uses the existing ordinary replacement allowance once;
+absence of a failed check does not refuse the kept correction. Unresolved failed checks
+retain their closure-check ceiling, including refusal when that ceiling is spent.
+No check or extra verdict round is manufactured for an infrastructure correction.
+When the answer comes from a session
 that is not the route's parent, only the parent may launch that replacement: the
 answer stays kept and the parent receives one `answer-awaiting-parent` supervision
 notice. The parent's carrier that delivers it (the shared prompt sweep or the
@@ -1184,12 +1644,28 @@ starts stay exactly attributable; time-candidate threads stay out of Embedded
 attribution (unknown until its own fd proves it), and resume/fork keep theirs.
 
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
-which with no `--pane` or `--beside` opens the successor to the right of the
-calling pane (`HERDR_PANE_ID`) in the same tab without focus, in the Git primary
-checkout (the calling cwd outside Git) unless `--cwd` names another. The new pane's
+which with no `--pane` or `--beside` uses the calling pane (`HERDR_PANE_ID`)
+as its placement reference, in the Git primary checkout (the calling cwd outside
+Git) unless `--cwd` names another. On all three harnesses, `start` reads
+`herdr pane layout` and fills a 2×2 grid without focus: one pane splits right,
+two side-by-side panes split the right column down, and three panes split the
+remaining full column down. Each split uses ratio 0.5. Existing horizontal
+rows fill the equivalent grid by splitting right. `--beside` selects the reference
+tab/pane, not the direction; `--pane` retains explicit reuse. Placement in a full
+or irregular tab first reuses an agent-free foreground shell with an empty visible
+prompt there, then checks the other tabs in the same workspace, newest first,
+using the same grid-split and empty-shell decision. Only when none has room does
+it create a tab. Existing tab names and layouts are preserved apart from filling
+an available grid cell. Concurrent starts serialize placement
+through launch so they cannot claim the same shell or subdivide a stale layout.
+Names longer than Herdr's 32-character limit are explained before any placement
+or launch action, so a refused name leaves no extra pane.
+The start completes placement without a post-start pane move. The new pane's
 split-cwd and launcher preparation finish under one fixed
-monotonic deadline, including a stable foreground-shell snapshot after bootstrap,
+five-minute monotonic deadline, including a stable foreground-shell snapshot after bootstrap,
 before its single start request; caller-provided panes keep their existing path.
+An initializing shell may keep running its prompt children within that bound;
+the same shell lifetime, empty input and stable prompt are checked before launch.
 Uncertain readiness leaves the new pane retained with its reuse command in the receipt.
 The predecessor hands over its card and documents, receives the successor's ACK,
 leaves its last result and becomes idle; the successor then uses `retire <predecessor>` to send
@@ -1201,11 +1677,39 @@ its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
 Retirement refuses busy sessions, open forms, drafts, unknown process identity
 or an unconfirmed shell return; it has no retry, forced kill or forced close.
+An accepted retirement keeps the agent PID/start and shell PID/start observed
+when it was requested, including before a pane has a session. Reconnection
+compares that original lifetime before sending input. A proven-dead or reused
+agent PID completes the obligation as `target-already-gone`, without input,
+pane closure or handover to a later process in the same pane. Unreadable birth
+evidence remains unknown; a later observation cannot supply a missing original.
+Resumed retirement determines self-target from its recorded requester's session
+and pane identity. A cancelled request is terminal history:
+a new explicit request for the same lifetime accepts a fresh duty while retaining
+the cancelled record; repeated active or completed requests share that fresh duty.
 When the retire succeeds from the pane started beside the predecessor, the
 predecessor's open depth-1 routes pass to the successor, on any harness: it may
 `start` and `correct` them, and their stored completion records reach it
 (`retire ... handover=<n>`). Registry rows, their registered parent and worker
 identities stay as they are; cards and notices are not moved.
+Deferred retirement resolves succession from the recorded requester session and
+pane, with the original successor mark predating acceptance and matching both
+requester and predecessor. Proven loss of the booked predecessor
+lifetime can finish this same handover even when its pane has disappeared; it
+grants nothing to a later occupant. A completed retirement whose handover was
+missed is consumed by the ordinary lifecycle callback or the same
+`retire <predecessor>` call, without another exit action, pane closure, manual
+ledger edit or new recovery command. Cancelled and unverifiable requests grant
+no handover, and an existing transfer to another successor stays authoritative.
+Replacement admission and lineage use that same parent judgment: a depth-1
+replacement may be launched by the registered parent or its ledger-confirmed
+successor. Parent attempt bindings remain exact, as do route, node, depth,
+sub-session and input digests. A changed parent label on a depth-1 node replay
+is accepted only for that same parent; depth-2 parent bindings stay exact.
+The launch input follows the confirmed parent's session, harness and ordinary
+completion carrier. A later handover preserves an already registered replacement
+edge and its one semantic round; it does not authorize an intermediate parent
+to launch new work.
 An owner's terminal row and an acknowledged completion message do not close its
 route. Its verified open route still passes to the successor until the route's
 outcome is committed; an acknowledged message is never delivered again.
@@ -1267,6 +1771,13 @@ runtime `peer-messages/pending/` directory (0700, payload/lock files 0600).
 It is bound to the immutable transfer ref, actual sender/recipient and digest,
 not a public ledger field. Receipt removes the private body and retains the ref
 for replay deduplication; unknown, stale or ambiguous identities keep their binding.
+An external shell may have no sender session: `unknown`/empty and null sender
+fields mean an unattributed sender, not an invalid message. Its sealed ref/body
+and exact known recipient still govern delivery and receipt. Legacy unsent rows
+held only for that absent sender use the normal pending path; ambiguous sends
+remain unverified. Locked or temporarily unreadable rows stay in place for the
+next ordinary callback. Damaged private rows are moved aside with their bytes intact
+and diagnosed once, so unrelated messages proceed without repeated warnings.
 Late redelivery sends its delay notice and the sealed message in one prompt.
 The notice is transport context: receivers may remove only that recognized
 prefix with the matching transfer ref before checking the unchanged body digest.
@@ -1329,11 +1840,68 @@ steward on` (`source=explicit`), by `peer-steward.py wait`/`watch` once herdr an
 about a real target (`source=watch`; a mistyped target leaves no flag), or by a
 `peer-steward.py start` that launched a session (`source=start`). No `record` path and
 no send raises it — not a steer/handoff/gate-relay and not a `SendMessage` with `notify_when_idle`, which the
-Claude hook records as `kind=watch`. A session taking the role runs `peer-steward.py
-steward on` once. Fleet renders an evidenced marker
-as the bold-yellow tag badge and ignores one whose entries carry no such source;
+Claude hook records as `kind=watch`. Fleet renders an evidenced marker
+as the pink tag and model flag only for targets confirmed in the same repository.
+Fleet and herdr use `steward.role_targets` for that display decision, comparing
+Git common directories (so linked worktrees count as the same repository) from
+existing session metadata. Unknown or foreign repository targets grant no role,
+connector or pink tag; cross-repository messages remain communication (`✉`).
+No new role probe or execution authority follows from this projection. Fleet
+reads one supervisor per target: the newest same-repository start/watch/explicit
+evidence wins, with a stable identity tie-break. A session's watch of the
+same-repository supervisor that started it is reply-wait communication, not
+supervisor-role evidence. The common lookup excludes that reverse watch after
+resolving the start's exact/name/alias identities; the watch record and its actual
+wait/wake behavior stay intact. Each target entry retains its first `start_ts`
+through later watch/explicit updates and name-only-to-SID completion, so the
+common lookup can still identify the launcher after the latest evidence changes.
+Existing `source=start` entries remain readable without migration.
+Sessions with their own winning
+targets form separate supervisor groups; supervisor-to-supervisor relations
+remain communication (`✉`). This shared projection is a display handover, not a
+refusal or marker rewrite. Supervisor groups share one connector column under
+the first character inside `[id]`, drawn as a dashed `┆` on every row rather than
+a box border. Session detail text and box left edges clear that
+column by two spaces, even without a connector; model, routing, NOW and box
+right-edge anchors stay fixed. The supervisor flag appears once on the first row
+below its ID, in the connector column; subsequent rows use `┆`. A supervisor with
+no visible target keeps only that flag. Resource-waiting owners share a NOW projection across harnesses with
+the exact resource's node and command, observed host/GPU, declared counters
+when available, elapsed time and last-log age. Missing observations remain named
+(`대기`, `로그 없음`, or unknown host/GPU), without borrowed session activity or
+changes to resource liveness. Runtime maintenance in a private snapshot
+repository is plumbing, not a user tool call.
+After a resource exits, an owner without a current model summary or tool shows
+the last resource result and log age in NOW.
+For a live local resource, bounded reads of its exact process and descendants
+show GPU selection separately from use: `moving4:1 지정 · GPU 사용 전`.
+Observed GPU use takes precedence; selection alone creates no GPU usage
+row or memory total. The same NOW path serves every harness. Existing process
+state supplies `입출력 대기`. Observation uses targeted procfs reads within its
+process/time budget, without device queries or resource lifecycle changes.
+OpenCode headless owners use the native session announced by their exact attempt
+and that attempt's private runtime database for the same summary and command
+fields. Public assistant text supplies a bounded fallback while the summary is
+absent; only unfinished native tool state represents a running command. The
+first publication skips database snapshots, and later reads reuse unchanged
+source metadata. This observation leaves running owners and resources intact.
+Depth-1 frame cards use the owner model/gauge and routing layout on every harness.
+Owner stage/status labels share one right-aligned position: the owner/child
+divider when worker or resource children exist (including folded workers),
+otherwise the closing rail. The other rail stays bare; worker layouts retain
+their existing columns. Fleet ignores a marker whose entries carry no role source;
 `peer-message prune-steward-markers [--apply]` lists/removes those, and `peer-steward.py steward off` (or `peer-message release`)
 clears a marker.
+
+`peer-steward start` settles from the requested pane's actual agent when native
+startup reports a timeout or busy pane. A matching harness, requested directory
+and unclaimed or matching name can complete the existing start without another
+launch or keyboard input; an unclaimed name is assigned through herdr's rename
+API. The existing failed-start cleanup window bounds this last observation.
+Success records the pane and any SID already available in the same start marker;
+name-only targets continue to resolve through the common metadata join. A repeated
+observation that learns the SID completes the same name/pane entry, rather than
+leaving an extra anonymous target.
 
 **Prompt submission is verified, never assumed.** `peer-steward.py prompt`
 prints `prompted=true` only after the submission was observed, and every other verdict is typed:
@@ -1387,11 +1955,20 @@ detached watch receipt plus the adapter wake (the watching side reads screen/dis
 directly); `SendMessage` is secondary.
 
 **Detached watch (model-visible).** `peer-steward.py watch <target>` returns one typed
-`state=armed` line carrying the same `parent_next` directive a launch receipt does;
-`join`/`status`/`rearm`/`ack` read the watcher's disk receipt, and every line that is
-not a hook-armed watch (`wake=none`, a dedupe hit, a session-printed `rearm`) prints
-`bounded-wait` with a bounded `join <watch_id>`. Watcher, lock, receipt, and the Claude
-wake hook are runtime-owned (`core/ADAPTATION.md §7.3`).
+`state=armed` line carrying the same `parent_next` directive a launch receipt does.
+The exact server/pane/session obligation remains stored when a bounded observer
+times out, loses herdr, or exits; the existing startup/reconnect path replaces
+only that observer and continues the same watch id. `join`/`status`/`ack` report
+the stored obligation and its current observation; a fulfilled duty may be
+followed by an explicit new watch. A tab is a location hint, not identity.
+A target with no session yet (a Codex before its first input) is held by server
+and pane, and the observer continues on the first session that pane reports;
+`prompt` types into such a pane and `retire` exits it on its native turn and
+screen alone, since nothing can be bound to it yet. A session its foreground
+process already proves (Codex 0.162 opens one at start) is that pane's session
+until herdr reports one: registered work bound to it still withholds input.
+Watcher, lock, receipt, and available wake carriers are runtime-owned
+(`core/ADAPTATION.md §7.3`).
 
 Realization (Claude, measured): sending `SendMessage` fires; `PostToolUse(SendMessage)`
 writes one `peer_message_v1` record before the send completes; it lands in the ledger,

@@ -556,7 +556,7 @@ class GateDetailRowTest(GateMarkBase):
             segs = rows[0]
             text = "".join(t for t, _k in segs)
             self.assertEqual(text, "      gates: code-plan ⊸, code-execute, code-test, "
-                                   "code-report ⊸")
+                                  "code-report ⊸")
             self.assertEqual([k for t, k in segs if t == render._GATE_MARK],
                              ["gate_t", "gate_t"])
         finally:
@@ -723,7 +723,7 @@ class ReconciliationRenderTest(unittest.TestCase):
 
     def test_process_node_uses_yellow_gate_pending_label(self):
         text, key, mark = render._route_node_text(self._node())
-        self.assertEqual((text, key, mark), ("frame …gate 3m", "lvl_y", ""))
+        self.assertEqual((text, key, mark), ("frame …exit wait 3m", "lvl_y", ""))
 
     def test_breadcrumb_uses_yellow_ellipsis(self):
         breadcrumb = render._route_stage_segs([("frame", "reconciling"),

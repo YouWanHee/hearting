@@ -82,7 +82,20 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    turn; pending closure preserves PASS and carries a recovery notice.
    Inline work and legacy recovery retain explicit route close and producer
    finalize. Runtime-owned owners and their parents have no separate finalize
-   command to remember.
+   command to remember. The controller retains observation, terminal delivery,
+   follow-up, display, and cleanup duties after the model turn or bounded
+   observer exits; startup and reconnect resume the exact unfinished duty
+   without replaying the assignment or requiring a manual rearm.
+   Campaign satisfaction is a separate optional owner judgment. An exact owner
+   primary may contain a `campaign-goal` JSON fence with `campaign_id`,
+   `verdict: "satisfied"`, and optional `reason`; a JSON primary uses the
+   `campaign_goal` key. Normal completion records the official close through
+   the existing durable terminal transaction. Claude, Codex, and OpenCode use
+   this shared consumer. A missing, malformed, scoped, child, or ambiguous
+   judgment never infers campaign completion from PASS or sealed cycles.
+   Interrupted close retains PASS and its recovery duty; a later begin cannot
+   be closed again by an older goal judgment. No new confirmation or required
+   report field is introduced.
 5. **shared admission.** This capability's output is cycle-local; it is never admitted to `shared/` (only `spec`, `analysis`, and explicitly promoted `research` are shared kinds).
 
 ## Role Requirements
@@ -153,6 +166,13 @@ A declared `plan-check` parallel group is a 2-way read-only review: two plan-che
 At `thorough+` the group realizes a third `simplicity-check` leg with `leg_class: auxiliary`. Its arbiter is the **owner**, not the group's anchor — the anchor runs concurrently with it. After the group joins, the owner puts `auxiliary_findings_considered` in the merge memo's frontmatter with exactly one entry per realized auxiliary leg (adopted or rejected, with the reason) and registers it with `capability-route.py arbitrate --group plan-check`. Until that record exists, `code-execute` is refused at the start-gate with `auxiliary-arbitration-missing` and the route's terminal-gate observation carries a failed `parallel_group:plan-check` row. `core/OPERATIONS.md §5.10` owns the transaction and its typed refusals.
 
 ## Guard Requirements
+
+A code one-shot owner owns the approved task's deliverables beneath its own
+bound cycle's `artifacts/`. The recipe's `plans/<cycle>/**` names its reporting
+folder, not an exclusion of other approved deliverables such as `approval/`.
+This applies to existing sealed one-shot routes too, without rewriting their
+scope or identity. Stage and review nodes keep their narrower declared ranges;
+other cycles, source scope and external execution access remain separate.
 
 Adapters must preserve the portable invariants relevant to this capability:
 

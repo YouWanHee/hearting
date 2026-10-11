@@ -28,6 +28,32 @@ actual=$(env -u AGENT_ARTIFACT_ROOT "$RESOLVER" "$linked")
 [ "$actual" = "$repo/.agent_reports" ] || fail "linked worktree resolves primary artifact root"
 ok "linked worktree resolves primary artifact root"
 
+# A slow/inaccessible unrelated linked checkout must never be enumerated by
+# the ordinary path. The worker uses a fixed timeout; making that timeout
+# longer would merely hide this same regression.
+git_bin=$(command -v git)
+mkdir -p "$TMP/git-wrapper"
+cat > "$TMP/git-wrapper/git" <<'EOF'
+#!/bin/sh
+case " $* " in
+  *" worktree list "*) echo "unrelated worktree enumerated" >&2; exit 70;;
+esac
+exec "$ARTIFACT_TEST_GIT" "$@"
+EOF
+chmod +x "$TMP/git-wrapper/git"
+actual=$(env -u AGENT_ARTIFACT_ROOT PATH="$TMP/git-wrapper:$PATH" ARTIFACT_TEST_GIT="$git_bin" "$RESOLVER" "$linked")
+[ "$actual" = "$repo/.agent_reports" ] || fail "primary resolution avoids unrelated worktree enumeration"
+ok "primary resolution avoids unrelated worktree enumeration"
+
+# Custom git directory layouts keep the existing Git-owned worktree lookup.
+custom="$TMP/custom"
+mkdir -p "$custom"
+git -C "$custom" init -q --separate-git-dir "$TMP/custom-git"
+actual=$(env -u AGENT_ARTIFACT_ROOT "$RESOLVER" "$custom")
+custom_primary=$(git -C "$custom" worktree list --porcelain | awk '$1=="worktree"{print substr($0,10); exit}')
+[ "$actual" = "$custom_primary/.agent_reports" ] || fail "separate git directory keeps primary worktree"
+ok "separate git directory keeps primary worktree"
+
 override="$TMP/override/.agent_reports"
 mkdir -p "$(dirname "$override")"
 actual=$(env -u AGENT_ARTIFACT_ROOT AGENT_ARTIFACT_ROOT="$override" "$RESOLVER" "$linked")

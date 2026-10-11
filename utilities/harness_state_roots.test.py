@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,14 @@ from dispatch_contract import dispatch_state_root  # noqa: E402
 
 
 class HarnessStateRootsTest(unittest.TestCase):
+    def test_recursive_owner_can_append_route_history_without_granting_it_to_workers(self):
+        ledger = Path(self._tmp.name) / "route-chains"
+        with mock.patch.dict("os.environ", {"FLEET_ROUTE_CHAIN_DIR": str(ledger)}):
+            owner = self.args(nested_headless_network=True)
+            self.assertIn(ledger, H.route_bound_worker_writable_dirs(owner))
+            worker = self.args(route_id="rt-worker", nested_headless_network=False)
+            self.assertNotIn(ledger, H.route_bound_worker_writable_dirs(worker))
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -55,6 +64,12 @@ class HarnessStateRootsTest(unittest.TestCase):
                              ("_core_grounding_dir", H.core_grounding_dir)):
             with self.subTest(name=name):
                 self.assertIs(getattr(codex, name), shared)
+        ledger = Path(self._tmp.name) / "fresh-ledger"
+        with mock.patch.dict("os.environ", {"FLEET_ROUTE_CHAIN_DIR": str(ledger)}), \
+                mock.patch.object(codex, "owner_root", return_value=Path(self._tmp.name) / "titles"):
+            self.assertFalse(ledger.exists())
+            codex.ensure_owner_writable_dirs(self.args(nested_headless_network=True))
+            self.assertTrue(ledger.is_dir())
 
     def test_only_an_adapter_that_confines_writes_opens_them(self):
         # The rule is shared; opening the directories is the realization of an

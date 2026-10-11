@@ -1,0 +1,76 @@
+[
+  {
+    "harness": "claude",
+    "node": "full-run",
+    "elapsed_min": 75,
+    "command": [
+      "python3",
+      "-I",
+      "launch_payload.py",
+      "--manifest",
+      "full_run_s29.manifest.json",
+      "--manifest-sha256",
+      "80b30302f85dcea56b93d8b89b25d2e66a0094a6ef6b31258c48863940ae9cf1"
+    ],
+    "pid": 832643,
+    "starttime": "594127023",
+    "process_group": 832643,
+    "log_updated_at": 1791511460.1422236,
+    "gpu": 0
+  },
+  {
+    "harness": "opencode",
+    "node": "resume-run",
+    "elapsed_min": 95,
+    "command": [
+      "python",
+      "-I",
+      "-B",
+      "-u",
+      "resume_run.py"
+    ],
+    "pid": 582062,
+    "starttime": "594009112",
+    "process_group": 582062,
+    "log_updated_at": 1791511946.9177155,
+    "gpu": null
+  },
+  {
+    "harness": "opencode",
+    "node": "eval-run",
+    "elapsed_min": 18,
+    "command": [
+      "env",
+      "CUDA_VISIBLE_DEVICES=",
+      "OMP_NUM_THREADS=1",
+      "OPENBLAS_NUM_THREADS=1",
+      "MKL_NUM_THREADS=1",
+      "NUMEXPR_NUM_THREADS=1",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "nice",
+      "-n",
+      "10",
+      "ionice",
+      "-c",
+      "2",
+      "-n",
+      "7",
+      "python3",
+      "eval_v54.py",
+      "freeze-and-run",
+      "--config",
+      "workload.json",
+      "--out",
+      "artifacts",
+      "--smoke",
+      "smoke-attestation.json",
+      "--write-root",
+      "raw-results"
+    ],
+    "pid": 1072102,
+    "starttime": "594473388",
+    "process_group": 1072102,
+    "log_updated_at": 1791511841.791393,
+    "gpu": null
+  }
+]

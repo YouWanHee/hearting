@@ -271,7 +271,7 @@ def parser() -> argparse.ArgumentParser:
     mode = value.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--start", action="store_true")
-    value.add_argument("--pane", default=os.environ.get("HERDR_PANE_ID", ""))
+    value.add_argument("--pane")
     value.add_argument("--socket", default=os.environ.get("HERDR_SOCKET_PATH", ""))
     value.add_argument("--workspace", default=os.getcwd())
     value.add_argument(
@@ -284,6 +284,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.pane is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from session_tidy import session_from_env
+        from pane_ownership import verified_pane
+        harness, sid = session_from_env()
+        args.pane = verified_pane(os.environ.get("HERDR_PANE_ID", ""), harness, sid,
+                                  socket_path=args.socket)
     if not args.pane:
         print(_json({"status": "blocked", "reason": "pane-id-required"}))
         return EXIT_INVALID

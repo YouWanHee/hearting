@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Proof, race and crash falsifiers for automatic replacement (no model calls)."""
 import concurrent.futures
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,8 @@ class ReplacementTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.jobs=self.root/'jobs.log';self.jobs.touch()
+        seat_state=mock.patch('session_tidy.state_root',return_value=self.root/'seat-state')
+        seat_state.start();self.addCleanup(seat_state.stop)
         self.route={'route_id':'rt-test','route_hash':'sha256:test','artifact_root':str(self.root),
                     'cwd':str(self.root),'capability':'autopilot-code','nodes':[]}
         self.path=self.root/'route.json';self.path.write_text(json.dumps(self.route))
@@ -41,6 +44,172 @@ class ReplacementTest(unittest.TestCase):
         with self.jobs.open('a' if append else 'w') as f:f.write(line)
 
     def claim(self):return R.claim(self.jobs,'att-source')
+
+    def bind_source_parent(self, *, carrier=False):
+        self.args.dispatch_depth=1
+        self.args.execution_surface='registered-headless';self.args.registered_worker=True
+        R.route_authority.bind_runtime_parent(self.args,environ={'CODEX_THREAD_ID':'parent'})
+        if carrier:self.args.parent_completion_delivery='codex-native-queue'
+        self.meta['parent_harness']='codex'
+        # Replace the original temporary fixture before it has any claim or launch.
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args,'codex','the raw task')))
+        self.write(self.meta)
+
+    def parent_env(self, parent, harness):
+        from harness_capabilities import CARRIER_ENV, parent_completion
+        variable={'claude':'CLAUDE_SESSION_ID','codex':'CODEX_THREAD_ID','opencode':'OPENCODE_SESSION_ID'}[harness]
+        return {variable:parent,'AGENT_DISPATCH_CALLER_HARNESS':harness,
+                CARRIER_ENV:f"{parent_completion(harness)['carrier']}:{parent}"}
+
+    def handover(self, successor='successor', harness='claude', **binding_changes):
+        import dispatch_seat_handover as H
+        import session_tidy as S
+        seat=S.Seat('pane','replacement-test-seat','wY:p5')
+        binding={**H.binding_of(self.jobs,self.meta),**binding_changes}
+        snapshot={'schema':H.SCHEMA,'seat':{'kind':'pane','key':seat.key,'pane':seat.pane},
+                  'from':{'sid':self.meta['parent_sid']},'bindings':[binding]}
+        S.atomic_write_json(H._snapshot_path(seat.key),snapshot)
+        path=S._ledger_path(seat);path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(json.dumps({'event':'handover','from':self.meta['parent_sid'],
+                                   'sid':successor,'harness':harness,'ts':1,'bindings':[binding]})+'\n')
+
+    def replacement_candidate(self, record, parent='successor', harness='claude'):
+        source=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        replay=R.launch_input(self.jobs,'att-source',source)
+        args=SimpleNamespace(**vars(self.args));args.attempt_id=record['replacement_attempt_id']
+        args.replacement_input_argv=R._replacement_argv(record,source,replay)
+        if hasattr(args,'parent_session_id'):
+            with mock.patch.dict(os.environ,self.parent_env(parent,harness),clear=True):
+                R.route_authority.bind_runtime_parent(args)
+                if hasattr(args,'parent_completion_delivery'):
+                    from dispatch_parent_completion import resolve_parent_completion_delivery
+                    args.action='start';args.parent_completion_delivery=resolve_parent_completion_delivery(args)
+        candidate={**self.meta,'attempt_id':record['replacement_attempt_id'],
+                   'automatic_retry_of':'att-source','parent_sid':parent,'parent_harness':harness}
+        candidate.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
+        return candidate
+
+    def test_handover_owner_replacement_registers_and_lineage_reuses_the_same_claim(self):
+        import review_round_cap as ROUND
+        self.meta.update(worker_type='owner',owner_route_id='rt-test',owner_route_hash='sha256:test')
+        self.bind_source_parent()
+        self.handover()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        before=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        lines=self.jobs.read_text().splitlines()
+        self.assertEqual(R.admission(self.jobs,lines,candidate),record)
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\treplacement\t'+','.join(k+'='+v for k,v in candidate.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs,candidate['attempt_id'],row,launch=False))
+        self.assertFalse(D.claim_attempt_row(self.jobs,candidate['attempt_id'],row,launch=False))
+        registered=R._rows(self.jobs.read_text().splitlines())
+        self.assertEqual(registered['att-source'][1],before)
+        self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),registered[candidate['attempt_id']][1]),record)
+        effective,mapping=R.effective_attempts(self.jobs,{'att-source'})
+        self.assertEqual(effective,{candidate['attempt_id']})
+        self.assertEqual(mapping[0]['replacement_attempt_id'],record['replacement_attempt_id'])
+        projected=ROUND.logical_round_records(list(registered.values()),jobs=self.jobs)
+        self.assertEqual([meta['attempt_id'] for _,meta in projected],[candidate['attempt_id']])
+        self.assertEqual(self.claim(),record)
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+        # B's registered edge survives B -> C; B no longer admits a fresh launch.
+        import dispatch_seat_handover as H
+        import session_tidy as S
+        ledger=S._ledger_path(S.Seat('pane','replacement-test-seat','wY:p5'))
+        with ledger.open('a') as handle:
+            handle.write(json.dumps({'event':'handover','from':'successor','sid':'next-successor',
+                                     'harness':'opencode','ts':2,
+                                     'bindings':[H.binding_of(self.jobs,registered[candidate['attempt_id']][1])]})+'\n')
+        self.assertEqual(R.effective_attempts(self.jobs,{'att-source'}),(effective,mapping))
+        projected=ROUND.logical_round_records(list(registered.values()),jobs=self.jobs)
+        self.assertEqual([meta['attempt_id'] for _,meta in projected],[candidate['attempt_id']])
+        self.assertFalse(R.route_authority.replacement_parent_matches(registered['att-source'][1],candidate,self.jobs))
+        self.assertEqual(self.claim(),record)
+
+    def test_handover_replacement_admission_is_shared_by_all_parent_harnesses(self):
+        self.bind_source_parent(carrier=True)
+        record=self.claim()
+        for harness in ('claude','codex','opencode'):
+            with self.subTest(harness=harness):
+                (R._directory(self.jobs)/'inputs'/(record['replacement_attempt_id']+'.json')).unlink(missing_ok=True)
+                self.handover(harness=harness)
+                candidate=self.replacement_candidate(record,harness=harness)
+                from harness_capabilities import parent_completion
+                sealed=R.launch_input(self.jobs,candidate['attempt_id'],candidate)
+                self.assertEqual(sealed['resolved']['parent_completion_delivery'],parent_completion(harness)['carrier'])
+                with mock.patch.dict(os.environ,self.parent_env('successor',harness),clear=True):
+                    self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate),record)
+
+    def test_handover_launch_input_changes_only_the_confirmed_parent_values(self):
+        self.bind_source_parent();self.handover()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        path=R._directory(self.jobs)/'inputs'/(candidate['attempt_id']+'.json')
+        original=json.loads(path.read_text())
+        mutations=[('resolved',{key:'foreign'}) for key in
+                   ('parent_session_id','parent_harness','parent_attempt_id','parent_transport','parent_sandbox','sandbox')]
+        mutations += [('argv',R._canonical_argv(R._replace_options(original['argv'],{'--parent-session-id':'foreign'}))),
+                      ('applied_permissions',{'execution_access':{'request_sha256':'foreign'}})]
+        for field,value in mutations:
+            with self.subTest(field=field,value=value):
+                payload=json.loads(json.dumps(original))
+                if field=='resolved':payload[field].update(value)
+                else:payload[field]=value
+                path.write_text(json.dumps(payload))
+                changed={**candidate,'replacement_input_digest':R._digest(payload)}
+                with self.assertRaises(D.DispatchContractError) as refused:
+                    R.admission(self.jobs,self.jobs.read_text().splitlines(),changed)
+                self.assertEqual(refused.exception.reason,
+                                 'replacement-argv-mismatch' if field=='argv' else 'replacement-input-tuple-mismatch')
+        path.write_text(json.dumps(original))
+        self.assertEqual(R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate),record)
+
+    def test_handover_admission_keeps_unrelated_parents_and_other_bindings_strict(self):
+        self.bind_source_parent()
+        self.handover()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        lines=self.jobs.read_text().splitlines()
+        for change in ({'parent_sid':'foreign'},{'parent_attempt_id':'foreign-attempt'},
+                       {'route_hash':'sha256:other'},{'route_node':'other'},{'dispatch_depth':'2'},
+                       {'subsession_id':'other'},{'phase_brief_sha256':'other'},
+                       {'fixed_inputs_sha256':'other'},{'narrow_verify_sha256':'other'}):
+            with self.subTest(change=change),self.assertRaises(D.DispatchContractError) as refused:
+                R.admission(self.jobs,lines,{**candidate,**change})
+            self.assertEqual(refused.exception.reason,'replacement-launch-binding-mismatch')
+        self.assertFalse(any(fields[1]=='open' for fields,_ in R._rows(lines).values()))
+
+    def test_handover_for_a_different_route_node_or_registry_does_not_authorize(self):
+        self.bind_source_parent()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        for change in ({},{'route':'rt-other'},{'hash':'sha256:other'},{'node':'other'},
+                       {'jobs':str(self.root/'foreign-jobs.log')}):
+            with self.subTest(change=change):
+                if change:self.handover(**change)
+                with self.assertRaises(D.DispatchContractError) as refused:
+                    R.admission(self.jobs,self.jobs.read_text().splitlines(),candidate)
+                self.assertEqual(refused.exception.reason,'replacement-launch-binding-mismatch')
+
+    def test_node_replay_accepts_only_the_recorded_depth1_parent_when_its_label_changes(self):
+        spec=importlib.util.spec_from_file_location('replacement_handover_node',Path(__file__).with_name('dispatch-node.py'))
+        node_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(node_module)
+        self.meta['parent']='old-parent-label';self.write(self.meta)
+        self.handover()
+        record=self.claim()
+        args=SimpleNamespace(adapter_args=['--','--automatic-retry-of','att-source'],
+                             attempt_id=record['replacement_attempt_id'],adapter='codex',parent='new-parent-label')
+        for session in ('parent','successor'):
+            with self.subTest(session=session),mock.patch.object(node_module.ROUTE_AUTHORITY,'default_parent_session_id',return_value=session):
+                self.assertEqual(node_module.replacement_task(args,self.route,{'id':'frame'},self.jobs),'the raw task')
+        with mock.patch.object(node_module.ROUTE_AUTHORITY,'default_parent_session_id',return_value='foreign'):
+            with self.assertRaises(D.DispatchContractError) as refused:
+                node_module.replacement_task(args,self.route,{'id':'frame'},self.jobs)
+            self.assertEqual(refused.exception.reason,'replacement-launch-binding-mismatch')
+        # The same ledger is never authority to change a depth-2 owner's label or attempt.
+        self.meta.update(dispatch_depth='2',parent_attempt_id='att-owner');self.write(self.meta)
+        source={**self.meta}
+        with mock.patch.object(R,'validate_claim_source',return_value=([],source,{'task':'the raw task'})), \
+                mock.patch.object(node_module.ROUTE_AUTHORITY,'default_parent_session_id',return_value='parent'):
+            with self.assertRaises(D.DispatchContractError):
+                node_module.replacement_task(args,self.route,{'id':'frame'},self.jobs)
 
     def test_depth1_replacement_is_authorized_for_the_launching_session_or_its_same_seat_successor(self):
         import work_start
@@ -509,7 +678,7 @@ class ReplacementTest(unittest.TestCase):
              mock.patch.object(capacity,'capacity_report',return_value=report), \
              mock.patch.object(capacity,'gate_release_epoch',return_value=None):
             with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None):
-                for source in (owner,stage):
+                for source in (stage,):
                     hold=R._capacity_hold(self.jobs,source)
                     self.assertEqual((hold['label'],hold['until_epoch'],hold['usage_gate_used_percent']),
                                      ('allocation-usage-gate',None,85))
@@ -518,7 +687,7 @@ class ReplacementTest(unittest.TestCase):
                 for source in (owner,stage):                 # the pin starts despite the soft gate
                     self.assertIsNone(R._capacity_hold(self.jobs,source))
                 self.route['selection_pins']={'owner':{'harness':'claude'}}
-                self.assertEqual(R._capacity_hold(self.jobs,owner)['label'],'allocation-usage-gate')
+                self.assertIsNone(R._capacity_hold(self.jobs,owner))  # the ordinary selector honours the Claude pin
             self.route['selection_pins']={'owner':{'harness':'codex'},'worker':{'harness':'codex'}}
             with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=limited):
                 for source in (owner,stage):                 # a real usage limit still holds the pin
@@ -526,9 +695,10 @@ class ReplacementTest(unittest.TestCase):
             del self.route['selection_pins']
             with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
                  mock.patch.object(capacity,'gate_release_epoch',return_value=4102444800) as release:
-                self.assertEqual(R._capacity_hold(self.jobs,owner)['until_epoch'],4102444800)
+                self.assertIsNone(R._capacity_hold(self.jobs,owner))
+                self.assertEqual(R._capacity_hold(self.jobs,stage)['until_epoch'],4102444800)
                 release.assert_called_with('codex','live',usage_gate_used_percent=85)
-                self.assertEqual(R._capacity_wait(self.jobs,'att-source',owner)['retry_at'],'2100-01-01T00:00:00Z')
+                self.assertEqual(R._capacity_wait(self.jobs,'att-source',stage)['retry_at'],'2100-01-01T00:00:00Z')
 
     def test_an_io_failure_keeps_its_cause(self):
         with mock.patch.object(R,'_authorized'),mock.patch.object(R,'claim',side_effect=OSError('disk gone')):
@@ -627,6 +797,40 @@ class ReplacementTest(unittest.TestCase):
         self.assertNotIn('--prompt-text',cmd)
         self.assertEqual(Path(cmd[cmd.index('--prompt-file')+1]).read_text(),'the raw task')
         self.assertEqual(cmd.count('--start'),1)
+
+    def test_automatic_replacement_preserves_later_round_recovery_guidance(self):
+        brief = 'Recover the failed leg only.\n## Round protocol\nReview only the prior blocking findings.'
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_RETRY_BRIEF': brief}):
+            self.assertIn(brief, R.recovery_instructions(self.args))
+            self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args, 'codex', 'the raw task')))
+        self.write(self.meta)
+        record = self.claim()
+        source = R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        replay = R.launch_input(self.jobs, 'att-source', source)
+        self.assertEqual(replay['task'], 'the raw task')
+        command = R._command(self.jobs, record, source, replay)
+        self.assertEqual(Path(command[command.index('--prompt-file')+1]).read_text(), 'the raw task')
+        successor = SimpleNamespace(**{**vars(self.args), 'attempt_id': record['replacement_attempt_id'],
+                                      'automatic_retry_of': 'att-source', 'worker_type': 'stage',
+                                      'replacement_input_argv': R._replacement_argv(record, source, replay)})
+        del successor.replacement_retry_brief
+        with mock.patch.dict(os.environ, {}, clear=True):
+            guidance = R.recovery_instructions(successor)
+        self.assertIn(brief, guidance)
+        self.assertEqual(guidance.count('## Round protocol'), 1)
+        fragment = R.seal_launch_input(successor, 'codex', 'the raw task')
+        sealed = R.launch_input(self.jobs, successor.attempt_id, D.parse_registry_metadata(fragment))
+        self.assertEqual(sealed['retry_brief'], brief)
+        self.assertEqual(sealed['task'], 'the raw task')
+
+    def test_unstarted_attempt_cannot_reseal_changed_recovery_guidance(self):
+        self.args.replacement_retry_brief = 'Review only prior blocking findings.'
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        R.seal_launch_input(self.args, 'codex', 'the raw task')
+        self.args.replacement_retry_brief = 'Review a different scope.'
+        with self.assertRaises(D.DispatchContractError):
+            R.seal_launch_input(self.args, 'codex', 'the raw task')
 
     # SD106 writes retry_attempt_id on the original row only. These fixtures
     # deliberately retain that production shape, with no automatic_retry_of.
@@ -1179,6 +1383,7 @@ class ReplacementTest(unittest.TestCase):
 
     def test_capacity_wait_writes_nothing(self):
         self._capacity_owner()
+        self.route['selection_pins'] = {'owner': {'harness': 'codex'}}
         def files():return sorted(str(p.relative_to(R._directory(self.jobs))) for p in R._directory(self.jobs).rglob('*') if p.is_file())
         before=(files(),self.jobs.read_bytes())
         result=R.advance(self.jobs,'att-source',authority_check=lambda *_:True)
@@ -1323,6 +1528,75 @@ class ReplacementTest(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
 
+    def test_runtime_death_receives_correction_on_the_same_route_without_replaying_reviews(self):
+        meta = self._blocked_owner()
+        meta.pop('launch_outcome', None)
+        meta.update(note='dead-runtime-exit', failure_class='runtime', launch_started='1',
+                    supervisor_lease='flock-v1',
+                    supervisor_lease_file=str(D.supervisor_lease_path(self.jobs, meta['attempt_id'])))
+        self.write(meta)
+        answer = '이미 통과한 검토를 보존하고 남은 관찰과 verdict만 완료하세요.'
+        self.assertTrue(self._answer(text=answer)['retained'])
+        R._reuse_snapshot.return_value['completed'] = [{'node': 'independent-verify'}]
+        result, commands = self._launch()
+        self.assertEqual(len(commands), 1)
+        record = result['record']
+        self.assertEqual(record['route_id'], self.route['route_id'])
+        self.assertEqual(record['proof']['source_result'], 'EXITED')
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        for expected in (answer, 'independent-verify', 'Continue only unfinished work',
+                         'exited before settlement', 'existing route'):
+            self.assertIn(expected, text)
+        self.assertNotIn('ended BLOCKED', text)
+
+    def test_interrupted_supervisor_accepts_answer_after_previous_replacement(self):
+        import dispatch_owner_input as I
+        for harness in ('claude', 'codex', 'opencode'):
+            with self.subTest(harness=harness):
+                self.tearDown_case()
+                self.meta['harness'] = harness
+                meta = self._blocked_owner()
+                self._answer()
+                first = self.claim()
+                successor = self._successor(first, meta, status='open')
+                I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
+                ended = self._die(successor, note='dead-protocol', failure_class='protocol',
+                          reconcile_reason='terminal-event-missing', terminal_event='dispatch.supervisor.error',
+                          launch_started='1', supervisor_lease='flock-v1',
+                          supervisor_lease_file=str(D.supervisor_lease_path(self.jobs, successor['attempt_id'])))
+                before = self.jobs.read_bytes()
+                tick = R.advance(self.jobs, successor['attempt_id'], authority_check=lambda *_: True)
+                self.assertNotEqual(tick.get('state'), 'started')
+                self.assertEqual(self.jobs.read_bytes(), before)
+                self.assertTrue(self._answer(successor['attempt_id'], text='정전 뒤 남은 평가만 이어가세요.')['retained'])
+                record = R.claim(self.jobs, successor['attempt_id'])
+                self.assertEqual(record['proof']['source_result'], 'EXITED')
+                self.assertEqual(record['route_id'], first['route_id'])
+                self.assertNotEqual(record['family_id'], first['family_id'])
+                self.assertEqual(R.claim(self.jobs, successor['attempt_id']), record)
+
+    def test_interrupted_supervisor_correction_excludes_results_cancel_and_unknown_process(self):
+        import route_authority as RA
+        meta = self._blocked_owner()
+        meta.update(note='dead-protocol', failure_class='protocol', launch_started='1',
+                    supervisor_lease='flock-v1', supervisor_lease_file='lease',
+                    reconcile_reason='terminal-event-missing', terminal_event='dispatch.supervisor.error')
+        self.write(meta)
+        self.assertTrue(RA.runtime_owner_can_resume('done', meta))
+        for change in ({'note': 'dead-worker-fail'}, {'note': 'completed-supervisor'},
+                       {'reconcile_reason': 'terminal-envelope-invalid'}, {'launch_started': '0'},
+                       {'terminal_event': 'dispatch.supervisor.done'}):
+            self.assertFalse(RA.runtime_owner_can_resume('done', {**meta, **change}))
+        self.assertFalse(RA.runtime_owner_can_resume('cancelled', meta))
+        with mock.patch.object(RA, 'readable_result', return_value='PASS'):
+            self.assertFalse(RA.runtime_owner_can_resume('done', meta))
+        for state in ('live', 'unverifiable'):
+            with self.subTest(state=state), mock.patch.object(D, 'attempt_process_quiescence',
+                    return_value=SimpleNamespace(state=state, reason='fixture')):
+                with self.assertRaisesRegex(Exception, 'owner-input-unavailable'):
+                    self._answer()
+
     # -- an owner that ended with a readable FAIL, answered with a fix a person approved ----------
     def _failed_owner(self, test_fails=2):
         """BC rt-96bab699: the owner reported its test FAIL as its result; the check's rounds are spent."""
@@ -1368,6 +1642,257 @@ class ReplacementTest(unittest.TestCase):
         budget = review_round_cap.round_budget(self.route, node, rows, revisions=revisions)
         self.assertEqual((budget.state, budget.round_kind), ('admit', 'closure-check'))
         self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), (['att-test-2'], []))
+
+    def test_approved_fix_retains_owner_closed_review_and_repairs_old_claim_read_only(self):
+        import route_authority as RA
+        import review_round_cap as CAP
+        self._failed_owner()
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        closed = {'attempt_schema_version': '2', 'attempt_id': 'att-review-2',
+                  'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                  'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                  'note': 'completed-marker', 'failure_class': 'fail',
+                  'review_gate_closure': 'owner-closure', 'review_independence': 'owner-overridden'}
+        self.write({**closed, 'attempt_id': 'att-review-1', 'note': 'completed-review-blocking'}, append=True)
+        self.write(closed, append=True)
+        marker = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'node_id': 'impl-review',
+                  'attempt_id': 'att-review-2', 'review_gate_closure': 'owner-closure',
+                  'review_independence': 'owner-overridden', 'sequence': 1}
+        directory = D._route_module().completion_dir('rt-test', jobs=self.jobs)
+        directory.mkdir(parents=True)
+        (directory/'impl-review.1.json').write_text(json.dumps(marker))
+        (directory/'impl-review.json').write_text(json.dumps({**marker, 'state': 'superseded-by-upstream-revision'}))
+        pin = {'node': 'impl-review', 'attempt_id': 'att-review-2', 'marker_digest': R._digest(marker)}
+        R._reuse_snapshot.return_value['completed'] = [pin]
+        self.assertTrue(self._answer(text='approved fix: both failed checks', request_id='fix-1')['retained'])
+        # v3.27.5 omitted this completed-marker FAIL; preserve its immutable claim as written.
+        with mock.patch.object(RA, 'fix_answers', return_value=(['att-test-2'], [])):
+            record = self.claim()
+        self.assertEqual(record['proof']['answers'], ['att-test-2'])
+        before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertEqual(revisions[0]['answers'], ['att-test-2', 'att-review-2'])
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs),
+                         (['att-test-2', 'att-review-2'], []))
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('att-review-2', text)
+        self.assertIn('closure-check', text)
+        self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+        rows = R._rows(self.jobs.read_text().splitlines())
+        census = [(fields[1], meta) for fields, meta in rows.values() if meta.get('route_node') == 'impl-review']
+        budget = CAP.round_budget(self.route, node, census, revisions=revisions)
+        self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds), ('admit', 'closure-check', 2))
+        # Neither a foreign review, an unbound snapshot nor a new failed round gets this approval.
+        foreign = {**rows, 'att-review-2': (rows['att-review-2'][0], {**closed, 'route_id': 'rt-other'})}
+        self.assertEqual(R._approved_fix_answers(record, self.jobs, foreign), ['att-test-2'])
+        unbound = {**record, 'reuse': {**record['reuse'], 'completed': [{**pin, 'marker_digest': '0'*64}]}}
+        self.assertEqual(R._approved_fix_answers(unbound, self.jobs, rows), ['att-test-2'])
+        self.write({**closed, 'attempt_id': 'att-review-3', 'note': 'completed-review-blocking'}, append=True)
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertNotIn('att-review-3', revisions[0]['answers'])
+        rows = R._rows(self.jobs.read_text().splitlines())
+        census = [(fields[1], meta) for fields, meta in rows.values() if meta.get('route_node') == 'impl-review']
+        self.assertEqual(CAP.round_budget(self.route, node, census, revisions=revisions).state, 'exhausted')
+
+    def test_new_approved_claim_answers_owner_closed_fail_on_all_harnesses(self):
+        for harness in ('claude', 'codex', 'opencode'):
+            with self.subTest(harness=harness):
+                self.tearDown_case()
+                self.meta['harness'] = harness
+                self._failed_owner()
+                self.route['nodes'].append({'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'})
+                for number in (1, 2):
+                    self.write({'attempt_schema_version': '2', 'attempt_id': f'att-review-{number}',
+                                'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                                'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                                'note': 'completed-marker', 'failure_class': 'fail',
+                                'review_gate_closure': 'owner-closure', 'review_independence': 'owner-overridden'},
+                               append=True)
+                self.assertTrue(self._answer(text='approved fix: both checks', request_id='fix-1')['retained'])
+                record = self.claim()
+                self.assertEqual(record['proof']['answers'], ['att-test-2', 'att-review-2'])
+
+    def _legacy_closed_review_claim(self, verdicts=2, test_fails=0):
+        import route_authority as RA
+        self._failed_owner(test_fails=test_fails)
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        closed = {'attempt_schema_version': '2', 'attempt_id': f'att-review-{verdicts}',
+                  'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                  'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                  'note': 'completed-marker', 'failure_class': 'fail',
+                  'review_gate_closure': 'owner-closure', 'review_independence': 'owner-overridden'}
+        for number in range(1, verdicts):
+            self.write({**closed, 'attempt_id': f'att-review-{number}',
+                        'note': 'completed-review-blocking'}, append=True)
+        self.write(closed, append=True)
+        marker = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'node_id': 'impl-review',
+                  'attempt_id': closed['attempt_id'], 'review_gate_closure': 'owner-closure',
+                  'review_independence': 'owner-overridden', 'sequence': 1}
+        directory = D._route_module().completion_dir('rt-test', jobs=self.jobs)
+        directory.mkdir(parents=True)
+        (directory/'impl-review.json').write_text(json.dumps(marker))
+        R._reuse_snapshot.return_value['completed'] = [{'node': 'impl-review',
+            'attempt_id': closed['attempt_id'], 'marker_digest': R._digest(marker)}]
+        self.assertTrue(self._answer(text='approved fix: unfinished report', request_id='fix-1')['retained'])
+        with mock.patch.object(RA, 'fix_answers', return_value=(
+                [f'att-test-{test_fails}'] if test_fails else [], [])):
+            record = self.claim()  # A v3.27.5 claim that omitted the owner-closed review.
+        return record, node
+
+    def test_owner_closed_spent_review_does_not_block_an_approved_infra_or_report_fix(self):
+        import route_authority as RA
+        import review_round_cap as CAP
+        self._failed_owner(test_fails=0)
+        node = {'id': 'impl-review', 'kind': 'review-worker', 'worker_type': 'review'}
+        self.route['nodes'].append(node)
+        for number in (1, 2, 3):
+            self.write({'attempt_schema_version': '2', 'attempt_id': f'att-review-{number}',
+                        'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                        'worker_type': 'review', 'dispatch_depth': '2', 'parent_attempt_id': 'att-source',
+                        'note': 'completed-marker' if number == 3 else 'completed-review-blocking',
+                        'failure_class': 'fail', 'review_gate_closure': 'owner-closure',
+                        'review_independence': 'owner-overridden'}, append=True)
+        self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs), ([], []))
+        self.assertTrue(self._answer(text='approved fix: unfinished report', request_id='report-fix')['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        self.assertEqual(result['record']['proof']['answers'], [])
+        self.assertEqual(self.claim(), result['record'])
+        rows = R._rows(self.jobs.read_text().splitlines())
+        census = [(fields[1], meta) for fields, meta in rows.values() if meta.get('route_node') == 'impl-review']
+        budget = CAP.round_budget(self.route, node, census, revisions=[{'answers': ['att-review-3']}])
+        self.assertEqual((budget.state, budget.verdict_rounds), ('exhausted', 3))
+        self.assertEqual(rows['att-review-3'][1]['failure_class'], 'fail')
+
+    def test_old_claim_does_not_promise_a_closure_for_an_already_spent_owner_closed_review(self):
+        record, _ = self._legacy_closed_review_claim(verdicts=3)
+        before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        self.assertEqual(R.answered_fix_revisions(self.jobs, 'rt-test'), [])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('unfinished report', text)
+        self.assertNotIn('closure-check', text)
+        self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+
+    def test_old_claim_closure_admits_register_then_start_and_keeps_other_live_rounds_blocked(self):
+        record, node = self._legacy_closed_review_claim(test_fails=2)
+        spec = importlib.util.spec_from_file_location('registered_closure_dispatch_node',
+                                                      Path(__file__).with_name('dispatch-node.py'))
+        dispatch = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = dispatch
+        spec.loader.exec_module(dispatch)
+        registered = {'attempt_schema_version': '2', 'attempt_id': 'att-review-3',
+                      'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': 'impl-review',
+                      'worker_type': 'review', 'dispatch_depth': '2', 'launch_claimed': '0',
+                      'parent_attempt_id': record['replacement_attempt_id'], 'note': ''}
+        history = self.jobs.read_bytes()
+        # This isolated claim fixture has one route; use the real registry census and admission.
+        with mock.patch.object(dispatch.ROUTE, 'review_lineage_routes', return_value=[self.route]):
+            for status in ('open', 'running'):
+                with self.subTest(status=status):
+                    self.jobs.write_bytes(history)
+                    self.write(registered, status=status, append=True)
+                    before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+                    budget = dispatch.admit_round(self.route, node, self.jobs,
+                        exclude_attempt=registered['attempt_id'], record_auto_revisions=False).budget
+                    self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds, budget.next_round),
+                                     ('admit', 'closure-check', 2, 3))
+                    revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+                    self.assertEqual(revisions[0]['answers'], ['att-test-2', 'att-review-2'])
+                    budget = dispatch.admit_round(self.route, node, self.jobs,
+                                                   record_auto_revisions=False).budget
+                    self.assertEqual(budget.state, 'blocked-live')
+                    self.assertEqual({p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}, before)
+            self.write({**registered, 'attempt_id': 'att-other-live'}, status='open', append=True)
+            budget = dispatch.admit_round(self.route, node, self.jobs,
+                exclude_attempt=registered['attempt_id'], record_auto_revisions=False).budget
+            self.assertEqual(budget.state, 'blocked-live')
+            self.jobs.write_bytes(history)
+            self.write({**registered, 'note': 'completed-review-blocking', 'failure_class': 'fail'}, append=True)
+            self.write({**registered, 'attempt_id': 'att-review-4'}, status='open', append=True)
+            budget = dispatch.admit_round(self.route, node, self.jobs,
+                exclude_attempt='att-review-4', record_auto_revisions=False).budget
+            self.assertEqual((budget.state, budget.verdict_rounds), ('exhausted', 3))
+
+    def test_unrelated_duplicate_registry_rows_keep_an_approved_claim_original_answers(self):
+        record, _ = self._legacy_closed_review_claim(test_fails=2)
+        foreign = {'attempt_id': 'att-foreign', 'route_id': 'rt-other', 'route_node': 'test',
+                   'worker_type': 'stage', 'note': 'completed-marker'}
+        self.write(foreign, append=True)
+        self.write(foreign, append=True)
+        before = self.jobs.read_bytes()
+        revisions = R.answered_fix_revisions(self.jobs, 'rt-test')
+        self.assertEqual([item['answers'] for item in revisions], [['att-test-2']])
+        self.assertEqual(R._approved_fix_answers(record, self.jobs), ['att-test-2'])
+        self.assertEqual(self.jobs.read_bytes(), before)
+
+    def test_failed_owner_without_failed_checks_continues_once_per_answer(self):
+        import dispatch_owner_input as I
+        self._failed_owner(test_fails=0)
+        self.assertTrue(self._answer(text='approved fix: retain missing GPU observation',
+                                    request_id='infra-fix')['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        record = result['record']
+        self.assertEqual(record['proof']['source_result'], 'FAIL')
+        self.assertEqual(record['proof']['answers'], [])
+        self.assertEqual(record['logical_node']['after_capacity'], 'att-source')
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('retain missing GPU observation', text)
+        self.assertNotIn('closure-check', text)
+        self.assertEqual(R.answered_fix_revisions(self.jobs, 'rt-test'), [])
+        # Replay converges on the claim; the next FAIL waits for its own new answer.
+        self.assertEqual(self.claim(), record)
+        successor = self._successor(record, self.meta | {'worker_type': 'owner'}, status='open')
+        I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
+        successor = self._die(successor, note='dead-worker-fail', failure_class='fail')
+        retry, commands = self._launch(successor['attempt_id'])
+        self.assertEqual(commands, [])
+        self.assertNotEqual(retry.get('state'), 'running')
+        self.assertEqual(len(list((R._directory(self.jobs) / 'claims').glob('*.json'))), 1)
+        self.assertTrue(self._answer(aid=successor['attempt_id'], text='another fix',
+                                    request_id='infra-fix-2')['retained'])
+        # The route may still name the original owner: following lineage sees the new answer too.
+        retry, commands = self._launch('att-source')
+        self.assertEqual(len(commands), 1, retry)
+        second = retry['record']
+        self.assertEqual(second['logical_node']['after_capacity'], successor['attempt_id'])
+        self.assertNotEqual(second['family_id'], record['family_id'])
+        self.assertEqual(second['proof']['corrections'][0]['id'], 'infra-fix-2')
+        self.assertEqual(R.claim(self.jobs, successor['attempt_id']), second)
+        self.assertEqual(len(list((R._directory(self.jobs) / 'claims').glob('*.json'))), 2)
+        rows = R._rows(self.jobs.read_text().splitlines())
+        for aid in ('att-source', successor['attempt_id']):
+            self.assertEqual((rows[aid][0][1], rows[aid][1]['note'], rows[aid][1]['failure_class']),
+                             ('done', 'dead-worker-fail', 'fail'))
+
+    def test_resource_fail_answer_continues_after_the_silent_replacement_was_spent(self):
+        import dispatch_owner_input as I
+        self._owner(note='dead-exact-pid')
+        first = self.claim()
+        self.assertNotIn('after_capacity', first['logical_node'])
+        successor = self._successor(first, self.meta | {'worker_type': 'owner'}, status='open')
+        I.initialize_owner_input(self.jobs, successor['attempt_id'], 'claude-next-turn')
+        successor = self._die(successor, note='dead-worker-fail', failure_class='fail')
+        self.assertTrue(self._answer(aid=successor['attempt_id'], text='approved: fix GPU check and run __a2',
+                                    request_id='resource-fix')['retained'])
+        result, commands = self._launch('att-source')
+        self.assertEqual(len(commands), 1, result)
+        record = result['record']
+        self.assertEqual(record['route_id'], first['route_id'])
+        self.assertEqual(record['proof']['death_kind'], R.CORRECTED)
+        self.assertEqual(record['proof']['source_result'], 'FAIL')
+        self.assertEqual(record['proof']['answers'], [])
+        self.assertEqual(record['logical_node']['after_capacity'], successor['attempt_id'])
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of=successor['attempt_id'],
+                                       worker_type='owner', jobs_path=self.jobs,
+                                       attempt_id=record['replacement_attempt_id']))
+        self.assertIn('fix GPU check and run __a2', text)
+        self.assertNotIn('closure-check', text)
 
     def test_a_fix_for_a_check_that_used_its_closure_check_makes_no_round(self):
         import route_authority as RA
@@ -1416,10 +1941,11 @@ class ReplacementTest(unittest.TestCase):
         return RA.record_pin_change(self.route, target='owner', pin={'harness': harness}, by={'harness': 'codex',
                                     'session_id': 'parent'}, source='unattributed', tuples=[], candidates=[])
 
-    def _moved_successor(self, record, command, harness='claude'):
+    def _moved_successor(self, record, command, harness='claude', write=True):
         """The new harness's wrapper seals the forwarded owner command and registers the replacement."""
         aid = record['replacement_attempt_id']
         args = SimpleNamespace(**vars(self.args)); args.attempt_id = aid
+        args.automatic_retry_of = record['original_attempt_id']
         args.replacement_input_argv = command[3:]
         meta = {k: v for k, v in self.meta.items() if k not in ('note', 'failure_class', 'launch_outcome',
                                                                 'replacement_input_digest')}
@@ -1428,7 +1954,8 @@ class ReplacementTest(unittest.TestCase):
                     replacement_original_attempt_id='att-source', replacement_ordinal='1',
                     replacement_claim_digest=R._digest(record))
         meta.update(D.parse_registry_metadata(R.seal_launch_input(args, harness, 'the raw task')))
-        self.write(meta, 'open', append=True)
+        if write:
+            self.write(meta, 'open', append=True)
         return meta
 
     def test_a_parent_moved_owner_pin_continues_the_answered_owner_on_the_new_harness(self):
@@ -1441,7 +1968,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(record['harness'], 'claude')
         (command,) = commands
         self.assertTrue(command[1].endswith('utilities/dispatch-owner.py'))
-        self.assertEqual(command[command.index('--adapter') + 1], 'claude')
+        self.assertNotIn('--adapter', command)  # ordinary selector reads the current route pin
         self.assertEqual(command[command.index('--attempt-id') + 1], record['replacement_attempt_id'])
         self.assertEqual(command[command.index('--automatic-retry-of') + 1], 'att-source')
         self.assertEqual(Path(command[command.index('--prompt-file') + 1]).read_text(), 'the raw task')
@@ -1460,7 +1987,7 @@ class ReplacementTest(unittest.TestCase):
             with self.assertRaises(D.DispatchContractError) as refused:
                 R.admission(self.jobs, lines, wrong)
         self.assertEqual((refused.exception.reason, refused.exception.detail),
-                         ('replacement-input-tuple-mismatch', 'harness'))
+                         ('pin-ignored-for-replacement', 'claude'))
 
     def test_a_replacement_owner_runs_with_the_access_request_its_parent_handed_over(self):
         # BC rt-839dbd48: the parent handed a new request and answered; the replacement replayed the first one.
@@ -1531,22 +2058,138 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(json.loads(Path(access['request_path']).read_text())['read_roots'],
                          [str(data), str(self.root / 'more')])
 
-    def test_a_pin_moved_after_the_claim_leaves_that_replacement_on_its_harness(self):
+    def test_a_pin_moved_after_the_claim_controls_the_next_owner_launch(self):
         self._blocked_owner()
         self._answer()
         record = self.claim()
         self.assertNotIn('harness', record)
         self._move_owner()
         result, commands = self._launch()
-        self.assertTrue(commands[0][1].endswith('adapters/codex/bin/dispatch-headless.py'))
+        self.assertTrue(commands[0][1].endswith('utilities/dispatch-owner.py'))
+        self.assertEqual(result['record'], record)  # lineage remains immutable
+        moved = self._moved_successor(record, commands[0])
+        self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), moved), record)
+        self.assertIn('approved: start the full run', R.recovery_instructions(SimpleNamespace(
+            automatic_retry_of='att-source', worker_type='owner', jobs_path=self.jobs,
+            attempt_id=record['replacement_attempt_id'])))
 
-    def test_without_a_recorded_change_the_owner_replays_on_its_own_harness(self):
+    def test_an_unstarted_registered_owner_can_follow_a_later_pin(self):
+        self._blocked_owner(); self._answer()
+        record = self.claim()
+        _, commands = self._launch()
+        old = self._moved_successor(record, commands[0], harness='codex')
+        self._move_owner('opencode')
+        _, commands = self._launch()
+        candidate = self._moved_successor(record, commands[0], harness='opencode', write=False)
+        row = 'now\topen\t'+str(self.root)+'\t'+str(self.root)+'\ttask\t'+','.join(k+'='+v for k,v in candidate.items())
+        self.assertFalse(D.claim_attempt_row(self.jobs, candidate['attempt_id'], row, launch=False))
+        current = R._rows(self.jobs.read_text().splitlines())[candidate['attempt_id']][1]
+        self.assertEqual((current['harness'], current['launch_claimed']), ('opencode', '0'))
+        self.assertEqual(current['replacement_claim_digest'], old['replacement_claim_digest'])
+
+    def test_a_started_replacement_with_a_conflicting_pin_returns_a_diagnostic(self):
+        self._blocked_owner(); self._answer()
+        record = self.claim()
+        old = self._successor(record, self.meta | {'worker_type': 'owner'}, status='open')
+        self._move_owner('opencode')
+        result, commands = self._launch()
+        self.assertEqual(commands, [])
+        self.assertEqual((result['state'], result['reason'], result['requested_harness']),
+                         ('needs-attention', 'pin-ignored-for-replacement', 'opencode'))
+        self.assertEqual(R._rows(self.jobs.read_text().splitlines())[old['attempt_id']][1]['harness'], 'codex')
+        self.assertEqual(R.validate_attention(self.jobs, [result])[0]['reason'], 'pin-ignored-for-replacement')
+
+    def test_only_real_limits_on_every_selector_candidate_become_a_capacity_pause(self):
+        self._blocked_owner(); self._answer()
+        limited = {'label': 'limited', 'until_epoch': 4102444800}
+        diagnostic = 'reason=no-eligible-route-evidence-candidate\nconfigured_candidates=claude,codex,opencode\n'
+        for holds, expected in ((dict.fromkeys(('claude', 'codex', 'opencode'), limited), 'replacement-capacity-wait'),
+                                ({'claude': limited, 'codex': None, 'opencode': limited}, 'replacement-launch-pending')):
+            with self.subTest(expected=expected), mock.patch('dispatch_capacity_evidence.harness_hold',
+                    side_effect=lambda jobs, harness, **kw: holds[harness]):
+                result = R.advance(self.jobs, 'att-source', authority_check=lambda *_: True, resume_capacity=True,
+                                   run=lambda *a, **k: SimpleNamespace(returncode=65, stdout=diagnostic, stderr=''))
+            self.assertEqual(result['reason'], expected)
+        # A pin rejected by the actual launch seam retains its explicit diagnostic.
+        result = R.advance(self.jobs, 'att-source', authority_check=lambda *_: True, resume_capacity=True,
+                           run=lambda *a, **k: SimpleNamespace(returncode=64, stdout='reason=pin-ignored-for-replacement\n', stderr=''))
+        self.assertEqual(result['reason'], 'pin-ignored-for-replacement')
+
+    def test_a_registered_owner_cannot_reseal_after_launch_started(self):
+        self._blocked_owner(); self._answer()
+        record = self.claim()
+        _, commands = self._launch()
+        self._moved_successor(record, commands[0], harness='codex')
+        self.jobs.write_text(self.jobs.read_text().replace('launch_claimed=0', 'launch_claimed=1'))
+        self._move_owner('opencode')
+        before = (R._directory(self.jobs)/'inputs'/(record['replacement_attempt_id']+'.json')).read_bytes()
+        with self.assertRaises(D.DispatchContractError):
+            self._moved_successor(record, commands[0], harness='opencode', write=False)
+        self.assertEqual((R._directory(self.jobs)/'inputs'/(record['replacement_attempt_id']+'.json')).read_bytes(), before)
+
+    def test_the_replacement_command_uses_the_real_owner_selector(self):
+        spec = importlib.util.spec_from_file_location('replacement_owner_selector_test', Path(__file__).with_name('dispatch_owner.test.py'))
+        suite = importlib.util.module_from_spec(spec); spec.loader.exec_module(suite)
+        self._blocked_owner(); self._answer()
+        record = self.claim()  # the original Codex claim already exists
+        helper = suite.RouteOwnerPinTest()
+        for pin, scores, usage, expected in (
+                ('claude', {'claude': 1, 'codex': 80, 'opencode': 80}, None, 'claude'),
+                ('opencode', {'claude': 1, 'codex': 80, 'opencode': 1}, None, 'opencode'),
+                ('codex', {'claude': 80, 'codex': 1, 'opencode': 80}, None, 'codex'),
+                (None, {'claude': 80, 'codex': 1, 'opencode': 80}, None, 'claude'),
+                (None, {'claude': 80, 'codex': 80, 'opencode': 80}, {'claude': 'limited', 'codex': 'limited', 'opencode': 'limited'}, None)):
+            with self.subTest(pin=pin, expected=expected):
+                path = helper._route(pin=pin, sealed=('claude', 'codex', 'opencode'))
+                self.addCleanup(lambda p=path: __import__('shutil').rmtree(p.parent))
+                route = json.loads(path.read_text()); route['cwd'] = str(self.root)
+                path.write_text(json.dumps(route))
+                command = R._owner_command(self.jobs, {**record, 'route_file': str(path)},
+                                          self.meta | {'worker_type': 'owner'}, R.launch_input(self.jobs, 'att-source', self.meta))
+                extra = command[3:]
+                del extra[extra.index('--route-evidence'):extra.index('--route-evidence')+2]
+                with mock.patch.object(suite.OWNER._capacity, 'capacity_report',
+                                       return_value={'scores': scores, 'sources': dict.fromkeys(scores, 'fixture')}):
+                    selected = helper._launch(path, None, usage=usage, scores=scores, extra=extra)
+                self.assertEqual(selected.wrapper, expected, selected.out)
+                if expected:
+                    launched = selected.calls[0]
+                    self.assertEqual(launched[launched.index('--model-profile')+1], 'deep')
+                    self.assertEqual(launched[launched.index('--automatic-retry-of')+1], 'att-source')
+                else:
+                    self.assertIn('no-eligible-route-evidence-candidate', selected.out)
+
+    def test_gpu_lab_correction_prepares_compute_defaults_instead_of_replaying_old_access(self):
+        import execution_access as EA
+        inventory = self.root / 'config/hearting/compute-hosts.yaml'
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text(f'schema_version: 1\nrun_root: {self.root}/runs\nhosts:\n  fixture:\n    ssh_host: local\n')
+        route = {'route_id': 'rt-compute', 'route_hash': 'sha256:' + 'a' * 64,
+                 'artifact_root': str(self.root), 'cwd': str(self.root),
+                 'capability': 'autopilot-lab', 'nodes': [], 'work_request': {'text': 'GPU lab'}}
+        with mock.patch.dict(os.environ, {'COMPUTE_HOSTS_CONFIG': str(inventory)}):
+            old = EA.prepare_task_request(route, self.jobs, environment=False)
+            old_bytes = old.read_bytes()
+            route['nodes'] = [{'id': 'full-run', 'kind': 'resource-runner'}]
+            # No manual access-change row or extra parent input is required.
+            access = R._access_in_force(self.jobs, route)
+        request = json.loads(Path(access['request_path']).read_text())
+        self.assertTrue(request['network']['required'])
+        self.assertIn(str(inventory.parent), request['read_roots'])
+        self.assertEqual(access['source'], 'lab-runtime-defaults')
+        self.assertEqual(old.read_bytes(), old_bytes)
+        replay = {'argv': ['--execution-access-file', str(old)], 'harness': 'opencode'}
+        argv = R._replacement_argv({'execution_access': access}, {'worker_type': 'owner'}, replay)
+        self.assertEqual(argv[argv.index('--execution-access-file') + 1], access['request_path'])
+        self.assertNotIn(str(old), argv)
+
+    def test_a_sealed_pin_also_controls_the_replacement_launch(self):
         self._blocked_owner()
         self._answer()
         self.route['selection_pins'] = {'owner': {'harness': 'claude'}}   # sealed, never followed by the launch
         result, commands = self._launch()
         self.assertNotIn('harness', result['record'])
-        self.assertTrue(commands[0][1].endswith('adapters/codex/bin/dispatch-headless.py'))
+        self.assertTrue(commands[0][1].endswith('utilities/dispatch-owner.py'))
 
     def test_an_answer_queued_just_before_the_owner_ended_blocked_continues_it(self):
         import dispatch_owner_input as I

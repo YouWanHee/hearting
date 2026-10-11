@@ -257,6 +257,10 @@ def make_receipt(
 
 
 def _load_route(receipt: dict[str, Any]) -> dict[str, Any]:
+    import route_parent_close
+    if route_parent_close.intent({"route_id": receipt["route_id"], "route_hash": receipt["route_hash"]},
+                                 Path(receipt["job_registry"])):
+        raise HumanGateReceiptError("route-already-closed")
     path = Path(receipt["route_file"])
     try:
         route = json.loads(path.read_text(encoding="utf-8"))

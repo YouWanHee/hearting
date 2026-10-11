@@ -53,6 +53,7 @@ class SessionRowTitleTest(unittest.TestCase):
                         slug="repo-ab12cd34", title="개발 서버 시작", liveness="idle")
         text, _segs = self._row_text_and_width(sess)
         self.assertIn("개발 서버 시작", text)
+        self.assertNotIn("제목 ·", text)
         self.assertNotIn("repo-ab12cd34", text)
 
     def test_session_row_title_absent_stays_blank_without_slug(self):

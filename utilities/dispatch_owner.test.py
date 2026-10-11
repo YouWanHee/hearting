@@ -1840,8 +1840,9 @@ class RouteOwnerPinTest(unittest.TestCase):
         with mock.patch.object(OWNER.subprocess, "run",
                                side_effect=lambda cmd, **kw: (calls.append(cmd), SimpleNamespace(returncode=0))[1]), \
              mock.patch.object(OWNER, "_usage", return_value=usage or {"claude": "ok", "codex": "ok", "opencode": "ok"}), \
-             mock.patch.object(OWNER._capacity, "capacity_scores",
-                               return_value=scores or {"claude": 3.0, "codex": 80.0, "opencode": 80.0}), \
+             mock.patch.object(OWNER._capacity, "capacity_report",
+                               return_value={"scores": scores or {"claude": 3.0, "codex": 80.0, "opencode": 80.0},
+                                             "sources": {}}), \
              mock.patch.object(OWNER, "validate_owner_route_binding", return_value=binding), \
              mock.patch.object(OWNER, "export_owner_route_env", return_value=None), \
              mock.patch("artifact_producer.prepare_route_artifact_env", return_value={}), \

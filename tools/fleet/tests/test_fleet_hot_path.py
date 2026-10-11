@@ -182,11 +182,11 @@ class ProjectionScopeTest(unittest.TestCase):
                                               spec_markers={}, capability_groundings={}, now=1000.0)
                 self.assertEqual(sessions[0].work_projection.source, "none")
                 self.assertIsNone(projection._spec_pipeline_state_path(tmp, "hot-path"))
-                # A directly scoped legacy directory remains available without a scan.
+                # A same-name legacy directory is still not a session/work binding.
                 (root / "plans" / "2026-09-14_hot-path" / "execute").mkdir(parents=True)
                 projection.attach_projections(sessions, [], artifact_root=root,
                                               spec_markers={}, capability_groundings={}, now=1000.0)
-                self.assertEqual(sessions[0].work_projection.source, "artifact-inferred")
+                self.assertEqual(sessions[0].work_projection.source, "none")
 
 
 class ProcessTableScanScopeTest(unittest.TestCase):
@@ -558,7 +558,7 @@ class UnpairedBadgeTest(unittest.TestCase):
         steward.steward = True
         steward._session_tag_unpaired = True
         self.assertEqual(self._text(render._session_tag_chip(steward)),
-                         "[%s ] " % render._ICON_STEWARD)
+                         " " * render._TAG_W)
 
     def test_a_shared_tag_renders_exactly_like_a_minted_one(self):
         paired = _codex(100, app_server=True, managed_dir=_DIR_A, tag="9c")

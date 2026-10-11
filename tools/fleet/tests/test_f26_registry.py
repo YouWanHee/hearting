@@ -288,6 +288,7 @@ class DegradationLadderTest(unittest.TestCase):
             setattr(s, k, v)
         # These tests exercise width pressure with an existing successful title.
         s.title = s.registry_name
+        s.runtime_name = s.registry_name  # this width fixture is an explicit name, not generated prose
         return s
 
     def _wide(self, term_width):
@@ -302,7 +303,7 @@ class DegradationLadderTest(unittest.TestCase):
         txt = "".join(t for t, _k in render._session_row(
             s, narrow=False, name_width=render._wide_name_width(168)))
         self.assertIn(name, txt)                     # full name — never anonymous
-        self.assertIn("unused 3h 45m", txt)         # full badge — prd.md:248 shape
+        self.assertIn("unused 3h 45m", txt)         # full badge — same state/age cells
         self.assertNotIn("terminal", txt)           # provenance yielded first
 
     def test_badge_age_yields_before_the_name(self):
@@ -412,7 +413,7 @@ class UnusedVisibilityTest(unittest.TestCase):
     def test_legend_shows_unused_when_present(self):
         out = self._render()
         self.assertIn("◌", out)
-        self.assertIn("unused", out)
+        self.assertIn("◌ unused", out)
 
     def test_unused_and_detached_glyphs_are_distinguishable_side_by_side(self):
         """design_critic_step2 §4 — the live captures never had a detached session, so ◌ next

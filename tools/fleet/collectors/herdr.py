@@ -23,6 +23,9 @@ import os
 import shutil
 import subprocess
 import time
+from concurrent.futures import wait
+
+from ..refresh import background_read
 
 _TIMEOUT_S = 2.0
 def verified_id_harnesses():
@@ -86,6 +89,14 @@ def list_panes(runner=subprocess.run, which=shutil.which):
     return [p for p in panes if isinstance(p, dict)]
 
 
+class PaneEvidence(tuple):
+    """Unpackable PID evidence with the completeness needed for a negative fact."""
+    def __new__(cls, values, complete=True, errors=()):
+        result = super().__new__(cls, values)
+        result.complete, result.errors = complete, tuple(errors)
+        return result
+
+
 def pane_evidence(panes, runner=subprocess.run, bindings=None):
     """Return shell PIDs, foreground PIDs, and exact Codex PID → thread IDs.
 
@@ -95,21 +106,33 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None):
     """
     shells, fg = set(), set()
     identities = {}
-    for pane in panes or []:
-        if not pane.get("agent"):
-            continue
+    errors = []
+    selected = [pane for pane in panes or [] if pane.get("agent")]
+
+    def read(pane):
         pane_id = pane.get("pane_id")
         if not pane_id:
-            continue
+            raise ValueError("pane id missing")
+        proc = runner(["herdr", "pane", "process-info", "--pane", str(pane_id)],
+                      capture_output=True, text=True, timeout=_TIMEOUT_S)
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError("process-info exit %s" % proc.returncode)
+        info = (json.loads(proc.stdout or "").get("result") or {}).get("process_info")
+        if not isinstance(info, dict):
+            raise ValueError("process-info missing")
+        return info
+
+    # One shared deadline replaces N serial pane deadlines. Daemon reads never
+    # hold the TUI open; subprocess.run still owns each child's timeout/cleanup.
+    reads = [(pane, background_read(lambda pane=pane: read(pane))) for pane in selected]
+    if reads:
+        wait([future for _, future in reads], timeout=_TIMEOUT_S)
+    for pane, future in reads:
+        pane_id = pane.get("pane_id")
         try:
-            proc = runner(["herdr", "pane", "process-info", "--pane", str(pane_id)],
-                          capture_output=True, text=True, timeout=_TIMEOUT_S)
-            if getattr(proc, "returncode", 1) != 0:
-                continue
-            info = (json.loads(proc.stdout or "").get("result") or {}).get("process_info") or {}
-        except Exception:
-            continue
-        try:
+            if not future.done():
+                raise TimeoutError("process-info deadline")
+            info = future.result()
             if info.get("shell_pid"):
                 shells.add(int(info["shell_pid"]))
             for proc_rec in info.get("foreground_processes") or []:
@@ -125,16 +148,19 @@ def pane_evidence(panes, runner=subprocess.run, bindings=None):
                             and isinstance(agent_session.get("value"), str)
                             and proc_rec.get("name") == "codex"):
                         identities.setdefault(pid, set()).add(agent_session["value"])
-        except (TypeError, ValueError):
-            continue
-    return shells, fg, {pid: next(iter(sids)) for pid, sids in identities.items()
-                        if len(sids) == 1}
+        except Exception as exc:
+            errors.append("%s: %s: %s" % (pane_id, type(exc).__name__, str(exc)[:120]))
+    return PaneEvidence((shells, fg, {pid: next(iter(sids)) for pid, sids in identities.items()
+                                    if len(sids) == 1}),
+                        complete=panes is not None and not errors, errors=errors)
 
 
 def pane_pids(panes, runner=subprocess.run, bindings=None):
     """F-100c — ``(shell_pids, foreground_pids)`` for agent panes."""
-    shells, fg, _identities = pane_evidence(panes, runner=runner, bindings=bindings)
-    return shells, fg
+    evidence = pane_evidence(panes, runner=runner, bindings=bindings)
+    shells, fg, _identities = evidence
+    return PaneEvidence((shells, fg), complete=getattr(evidence, "complete", True),
+                        errors=getattr(evidence, "errors", ()))
 
 
 def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
@@ -262,6 +288,60 @@ def _clear_gpu_session_aliases(harness, sid, pane):
         return []
 
 
+def pane_session_metadata(harness, pane, cwd):
+    """Existing native seat metadata when the pane omits its session ID.
+
+    Read-only display context, not a process identity or a new probe. A foreign
+    repository record cannot identify the pane's current displayed project.
+    """
+    if not pane or harness not in {"claude", "codex", "opencode"}:
+        return None
+    try:
+        import sys
+        from pathlib import Path
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import session_tidy
+        from ..gitinfo import resolve_gitdir
+        seat = session_tidy.Seat("pane", session_tidy._digest("pane", pane), pane, harness)
+        row = session_tidy.latest_session(seat, harness)
+        repository = resolve_gitdir(cwd)[1]
+        if row and repository and resolve_gitdir(row.get("cwd"))[1] == repository:
+            return row
+    except Exception:
+        pass
+    return None
+
+
+def pane_session_aliases(harness, sid, pane, cwd):
+    """Reuse the common seat-history display join, without another pane probe."""
+    try:
+        import sys
+        from pathlib import Path
+        utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        import session_tidy
+        return session_tidy.pane_session_aliases(harness, sid, pane, cwd)
+    except Exception:
+        return []
+
+
+def _lineage_attachment(sessions, lineage):
+    """Reuse launcher evidence when the pane surface cannot be observed."""
+    if lineage is None:
+        from . import procscan
+        lineage = procscan.provenance
+    for s in sessions:
+        if not _eligible(s):
+            continue
+        try:
+            s.herdr_attached = True if lineage(s.pid) == "herdr" else None
+        except Exception:
+            s.herdr_attached = None
+
+
 def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bindings=None):
     """Set ``herdr_attached`` on every eligible depth-0 session. ``agents`` = a
     pre-fetched ``list_agents()`` result (``None`` → probe once here); ``panes``/``pids``
@@ -269,31 +349,65 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
     ``lineage`` = ``pid -> provenance`` callable used only when herdr is absent."""
     for session in sessions:
         session._gpu_session_aliases = []
+        session._herdr_name = None
+        session._pane_session_claim = None
     if agents is None:
         agents = list_agents()
     if agents is None:
-        if lineage is None:
-            try:
-                from . import procscan
-                lineage = procscan.provenance
-            except Exception:
-                lineage = None
+        _lineage_attachment(sessions, lineage)
+        # Agent-list failure does not erase a supplied foreground observation.
+        # For a known herdr process, an absent pane observation cannot confirm
+        # its older native registry identity either. Do not issue another probe.
+        from ..process_identity import pane_process_claims
+        claims = pane_process_claims(sessions, panes, pane_bindings or {}, complete=False)
         for s in sessions:
-            if not _eligible(s) or lineage is None:
-                continue
-            try:
-                s.herdr_attached = True if lineage(s.pid) == "herdr" else None
-            except Exception:
-                s.herdr_attached = None
-        return
+            s._pane_session_claim = claims.get(s.pid)
+        return {"complete": False, "last_error": "herdr 조회 불가"}
     index = attached_index(agents)
     bindings = {} if pane_bindings is None else pane_bindings
     if pids is None:
         if panes is None:
             panes = list_panes()
         pids = pane_pids(panes, bindings=bindings) if panes is not None else None
+    if panes is None:
+        _lineage_attachment(sessions, lineage)
     shells, fg = pids if pids else (set(), set())
-    probe_ok = pids is not None
+    probe_ok = pids is not None and getattr(pids, "complete", True)
+    from ..process_identity import pane_process_claims
+    claims = pane_process_claims(sessions, panes, bindings,
+                                 complete=pids is not None and getattr(pids, "complete", True))
+    for session in sessions:
+        session._pane_session_claim = claims.get(session.pid)
+    # A native resume can run inside the still-live foreground runtime. Keep
+    # one pane row instead of letting that detached companion make the same
+    # display alias ambiguous. Independent live processes remain separate.
+    from . import procscan
+    companions = set()
+    for owner in sessions:
+        owner_panes = bindings.get(owner.pid, set())
+        if not _eligible(owner) or len(owner_panes) != 1 or not owner.proc_start:
+            continue
+        pane = next(iter(owner_panes))
+        aliases = pane_session_aliases(owner.harness, owner.session_id, pane, owner.cwd)
+        for other in sessions:
+            agent = index.get((other.harness, other.session_id), {})
+            if (other is owner or not _eligible(other) or other.harness != owner.harness
+                    or not other.detached or other.session_id not in aliases
+                    or agent.get("pane_id") != pane or not other.proc_start
+                    or procscan.read_proc_start(owner.pid) != owner.proc_start
+                    or procscan.read_proc_start(other.pid) != other.proc_start
+                    or not pid_in_panes(other.pid, set(), {owner.pid})):
+                continue
+            companions.add(id(other))
+            owner.session_aliases = list(dict.fromkeys(
+                list(getattr(owner, "session_aliases", None) or []) + [other.session_id]))
+            for field in ("liveness", "mtime", "title", "summary", "summary_ts", "model", "effort",
+                          "ctx_pct", "context", "context_window_tokens", "exec_tool", "work_projection"):
+                value = getattr(other, field, None)
+                if value is not None:
+                    setattr(owner, field, value)
+    if companions:
+        sessions[:] = [s for s in sessions if id(s) not in companions]
     for s in sessions:
         if not _eligible(s):
             continue
@@ -301,24 +415,38 @@ def enrich(sessions, agents=None, lineage=None, panes=None, pids=None, pane_bind
         harness = str(getattr(s, "harness", "") or "").lower()
         if sid and (harness, sid) in index:
             s.herdr_attached = True
-        elif probe_ok and pid_in_panes(getattr(s, "pid", None), shells, fg):
+        elif pid_in_panes(getattr(s, "pid", None), shells, fg):
             s.herdr_attached = True
-        elif probe_ok or (sid and harness in verified_id_harnesses()):
+        elif probe_ok:
             # herdr answered on both surfaces (or on the id surface for a verified-id
             # harness) and nothing matched → a plain terminal, not a guess.
             s.herdr_attached = False
         else:
             s.herdr_attached = None
-        # Herdr may still name the pre-/clear id. Its exact foreground PID identifies
-        # the same pane; the native clear receipt identifies the current session there.
+        # Herdr can lag a native resume/clear. Its exact foreground PID (or an
+        # existing session match) identifies the pane; seat history joins its IDs.
         matching_panes = bindings.get(s.pid, set())
         if not matching_panes and sid and (harness, sid) in index:
             pane = index[(harness, sid)].get("pane_id")
             matching_panes = {pane} if pane else set()
         if len(matching_panes) == 1:
+            pane = next(iter(matching_panes))
+            names = {agent.get("name") for agent in agents
+                     if isinstance(agent, dict) and agent.get("pane_id") == pane
+                     and agent.get("agent") == harness
+                     and agent.get("name")}
+            if len(names) == 1:
+                s._herdr_name = names.pop()
             aliases = _clear_gpu_session_aliases(harness, sid, next(iter(matching_panes)))
-            if aliases:
+            pane_aliases = pane_session_aliases(harness, sid, pane, getattr(s, "cwd", None))
+            if aliases or pane_aliases:
                 from . import procscan
                 if getattr(s, "proc_start", None) and procscan.read_proc_start(s.pid) == s.proc_start:
                     live = {(other.harness, other.session_id) for other in sessions}
                     s._gpu_session_aliases = [old for old in aliases if (harness, old) not in live]
+                    s.session_aliases = list(dict.fromkeys(
+                        list(getattr(s, "session_aliases", None) or [])
+                        + [other for other in pane_aliases if (harness, other) not in live]))
+    errors = list(getattr(pids, "errors", ()))
+    return {"complete": probe_ok,
+            "last_error": "; ".join(errors) if errors else None if probe_ok else "pane 조회 불가"}

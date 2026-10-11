@@ -2,16 +2,15 @@
 """Route authority: the one place that answers four questions about a route.
 
 1. Who continues it (the parent session and its successor).
-2. On which harness (sealed selection pins).
+2. On which harness (sealed selection pins and the parent's recorded changes).
 3. How many attempts of which kind (sub-session standing, retry links,
    round budget, the result envelope).
 4. What it may access (execution access grant).
 
 Every judgment here used to be made at its call site, several of them in
 more than one copy. The old names stay where they were, as imports or thin
-wrappers, so existing callers and patches keep working. Copies that
-historically disagree keep distinct names here instead of being merged, so
-one judgment changes in one place.
+wrappers, so existing callers and patches keep working. Recovery separates
+stored work from current selection; consumers do not rebuild historical inputs.
 
 Top-level imports stay light (stdlib and two policy modules) so that
 `dispatch_contract`, `model_profile` and the adapters can import this module
@@ -130,6 +129,25 @@ def require_replacement_parent(jobs, rows, meta, *, current_session) -> None:
         raise _contract_error('replacement-parent-identity-unproven')
 
 
+def replacement_parent_matches(source, candidate, jobs, *, lineage=False) -> bool:
+    """Keep the parent attempt exact; a depth-1 session may be its recorded successor."""
+    if candidate.get('parent_attempt_id') != source.get('parent_attempt_id'):
+        return False
+    if candidate.get('parent_sid') == source.get('parent_sid'):
+        return True
+    if source.get('dispatch_depth') != '1':
+        return False
+    if owns(source, candidate.get('parent_sid'), jobs):
+        return True
+    if lineage and candidate.get('dispatch_depth') == '1':
+        # A registered A -> B edge survives a later B -> C handover. Admission
+        # still accepts only the registered parent or the current successor.
+        from dispatch_seat_handover import effective_parent
+        current = effective_parent(source, jobs)
+        return bool(current) and effective_parent(candidate, jobs) == current
+    return False
+
+
 def lineage_parent_matches(metadata, *, thread_id, parent_attempt_id) -> bool:
     """A replacement lineage row belongs to this receipt's parent: the exact
     registered session at depth 1, the exact parent attempt below it."""
@@ -176,6 +194,13 @@ def review_owner_authority(route, jobs, author_attempt_id) -> None:
 # pin per target in the route; every launch, resume, replacement and stage
 # fallback reads it from the route file the launch is bound to.
 PIN_TARGETS = ("owner", "frame", "worker")
+
+
+def selection_pin_rows(route) -> dict:
+    """Copied pins in force for a descendant route, without the schema envelope."""
+    pins = route_in_force(route).get("selection_pins") if isinstance(route, dict) else None
+    return {target: dict(pins[target]) for target in PIN_TARGETS
+            if isinstance(pins, dict) and isinstance(pins.get(target), dict)}
 
 
 def pin_target(worker_type: str | None) -> str:
@@ -243,6 +268,17 @@ def _tuple_key(row: dict) -> tuple:
         "parent_harness", "parent_transport", "parent_sandbox", "child_harness", "launch_authority"))
 
 
+def _merge_checked_tuple(rows, row):
+    for index, old in enumerate(rows):
+        if _tuple_key(row) == _tuple_key(old):
+            if row.get("status") == "supported" and (
+                    old.get("status") != "supported"
+                    or row.get("checked_worktree") != old.get("checked_worktree")):
+                rows[index] = dict(row)
+            return
+    rows.append(dict(row))
+
+
 def route_in_force(route):
     """The sealed route with its recorded pin changes applied: the pin in force, and the
     checked tuples probed for each new pin added to the route's dispatch evidence,
@@ -264,16 +300,14 @@ def route_in_force(route):
         for row in change.get("tuples") or []:
             if not isinstance(row, dict) or tuples is None:
                 continue
-            if all(_tuple_key(row) != _tuple_key(old) for old in tuples):
-                tuples.append(row)
+            _merge_checked_tuple(tuples, row)
             if row.get("launch_authority") != "conductor":
                 continue
             ordinal = 1 if row.get("child_harness") == row.get("parent_harness") else 2
             for node in view.get("nodes") or []:
                 for hop in node.get("fallback_hops") or []:
-                    if hop.get("ordinal") == ordinal and isinstance(hop.get("candidates"), list) \
-                            and all(_tuple_key(row) != _tuple_key(old) for old in hop["candidates"]):
-                        hop["candidates"].append(dict(row))
+                    if hop.get("ordinal") == ordinal and isinstance(hop.get("candidates"), list):
+                        _merge_checked_tuple(hop["candidates"], row)
         for row in change.get("candidates") or []:
             if isinstance(candidates, list) and isinstance(row, dict) and row not in candidates:
                 candidates.append(row)
@@ -283,21 +317,22 @@ def route_in_force(route):
 
 def changed_pin_harness(route, target: str) -> str | None:
     """The harness the route's parent last moved `target` to, or None when it never moved it."""
-    changes = [row for row in pin_changes(route) if row.get("target") == target]
+    changes = [row for row in pin_changes(route) if row.get("target") == target
+               and (row.get("previous") or {}).get("harness") != row["pin"]["harness"]]
     return changes[-1]["pin"]["harness"] if changes else None
 
 
 def moved_owner_harness(route, launched_harness: str | None) -> str | None:
     """The owner harness the route's parent moved to after an owner launched on
-    `launched_harness`, or None. Only a recorded change moves a replacement; a sealed pin the
-    original launch did not follow (a usage-limit fallback) keeps today's same-harness replay."""
+    `launched_harness`, or None. This is a historical observation; replacement launch
+    selection reads all current pins through `route_in_force`."""
     harness = changed_pin_harness(route, "owner")
     return harness if harness and harness != launched_harness else None
 
 
 def record_pin_change(route, *, target: str, pin: dict, by: dict, source: str,
                       tuples: list, candidates: list, now: float | None = None) -> dict | None:
-    """Append one pin change for this route; None when the pin in force is already `pin`."""
+    """Append a changed pin or its missing checked evidence; exact replay is None."""
     import fcntl
     import time
     if target not in PIN_CHANGE_TARGETS or pin.get("harness") not in PIN_HARNESSES:
@@ -308,10 +343,21 @@ def record_pin_change(route, *, target: str, pin: dict, by: dict, source: str,
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path.with_name(path.name + ".lock"), "a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        previous = (route_in_force(route).get("selection_pins") or {}).get(target)
+        view = route_in_force(route)
+        previous = (view.get("selection_pins") or {}).get(target)
         if isinstance(previous, dict) and {k: previous.get(k) for k in ("harness", "model", "effort")} \
                 == {k: pin.get(k) for k in ("harness", "model", "effort")}:
-            return None
+            existing = (view.get("dispatch_evidence") or {}).get("tuples", [])
+            current_candidates = view.get("registered_headless_candidates") or []
+            missing_tuple = any(row.get("status") == "supported" and not any(
+                _tuple_key(row) == _tuple_key(old) and old.get("status") == "supported"
+                and row.get("checked_worktree") == old.get("checked_worktree") for old in existing)
+                for row in tuples)
+            missing_candidate = any(row.get("status") == "supported" and not any(
+                row.get("harness") == old.get("harness") and old.get("status") == "supported"
+                for old in current_candidates) for row in candidates)
+            if not missing_tuple and not missing_candidate:
+                return None
         row = {"schema": PIN_CHANGE_SCHEMA, "route_id": route["route_id"], "route_hash": route["route_hash"],
                "target": target, "pin": {k: pin.get(k) for k in ("harness", "model", "effort")},
                "previous": previous, "by": dict(by), "source": source,
@@ -408,10 +454,334 @@ def pinned_launch_harness(route, *, worker_type: str | None, requested: str | No
     return pinned, (requested if requested not in (None, pinned) else None)
 
 
-# A replacement replays its source on the same harness, registry and worktree -- unless the
-# route's parent moved the owner pin before the claim (`moved_owner_harness`): that owner
-# replacement takes the ordinary owner launch on the new harness with the same work.
 REPLACEMENT_FIXED_KEYS = ("harness", "jobs", "worktree")
+
+# The task and scope survive recovery. Parent/owner/pin/model are current
+# execution choices; the ordinary launcher validates their realization.
+RECOVERY_SCOPE_KEYS = (
+    "route_node", "worker_type", "dispatch_depth", "session_chain_id",
+    "subsession_id", "subsession_index", "subsession_count", "subsession_mode",
+    "stage_authority", "fixed_inputs_sha256", "narrow_verify_sha256", "phase_brief_sha256",
+)
+RECOVERY_SELECTION_OPTIONS = frozenset({
+    "--parent-session-id", "--parent-harness", "--parent-completion-delivery",
+    "--route-file", "--route-id", "--route-hash", "--owner-route-file",
+    "--owner-route-id", "--owner-route-hash", "--model", "--reasoning",
+    "--model-profile", "--execution-access-file", "--reviewed-evidence",
+})
+RECOVERY_SELECTION_VALUES = frozenset({
+    "parent_completion_delivery",
+    "resolved_completion_delivery", "model", "reasoning", "resolved_model_settings",
+    "execution_surface", "fallback_hop", "model_role",
+})
+
+
+def recovery_task(record, source, history):
+    """Read the recorded work; a moved owner receives its bound continuation request."""
+    if (source.get("worker_type") == "owner"
+            and (source.get("owner_route_id") or source.get("route_id")) != record["route_id"]):
+        route = json.loads(Path(record["route_file"]).read_text(encoding="utf-8"))
+        if route.get("route_hash") != record["route_hash"]:
+            raise _contract_error("replacement-route-drift")
+        text = (route.get("work_request") or {}).get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise _contract_error("replacement-current-route-input-unproven")
+        return text
+    return history["task"]
+
+
+def require_recovery_binding(record, source, candidate, jobs):
+    """The same lineage check at task loading, registration and actual launch.
+
+    The caller has already read and digest-checked the claim and original input.
+    The record's current route was resolved through the registered owner lineage,
+    rather than through candidate-supplied ancestor IDs.
+    """
+    route_key = "owner_route_id" if source.get("owner_route_id") else "route_id"
+    hash_key = "owner_route_hash" if source.get("owner_route_id") else "route_hash"
+    if (candidate.get(route_key) != record["route_id"]
+            or candidate.get(hash_key) != record["route_hash"]
+            or not replacement_parent_matches(source, candidate, jobs)
+            or (source.get("dispatch_depth") != "1" and candidate.get("parent") != source.get("parent"))
+            or any(candidate.get(key) != source.get(key) for key in RECOVERY_SCOPE_KEYS)):
+        raise _contract_error("replacement-launch-binding-mismatch", source.get("attempt_id", ""))
+    if source.get("session_chain_id"):
+        from dispatch_replacement_subsession import SCOPE_KEYS
+        if any(candidate.get(key) != source.get(key) for key in SCOPE_KEYS):
+            raise _contract_error("replacement-subsession-scope-mismatch")
+    if source.get("review_input_digest") or candidate.get("review_input_digest"):
+        from review_input import read_binding
+        original = read_binding(jobs, source, verify_current=True)
+        successor = read_binding(jobs, candidate, verify_current=True)
+        if (any(successor.get(key) != original.get(key) for key in ("path", "sha256", "producer"))
+                or successor.get("source") != {
+                    "attempt_id": source["attempt_id"], "binding_digest": source["review_input_digest"]}):
+            raise _contract_error("reviewed-evidence-replacement-mismatch")
+
+
+def recovery_node_task(record, source, history, *, attempt_id, route, node, harness, parent, jobs):
+    """A node loader consumes the same claim binding as admission, before sealing its input."""
+    if record.get("replacement_attempt_id") != attempt_id:
+        raise _contract_error("replacement-launch-binding-mismatch")
+    candidate = dict(source, attempt_id=attempt_id, route_node=node["id"], parent=parent)
+    route_key = "owner_route_id" if source.get("owner_route_id") else "route_id"
+    hash_key = "owner_route_hash" if source.get("owner_route_id") else "route_hash"
+    candidate.update({route_key: route["route_id"], hash_key: route["route_hash"]})
+    if source.get("parent") != parent:
+        candidate["parent_sid"] = default_parent_session_id()
+    require_recovery_binding(record, source, candidate, jobs)
+    selected = sealed_pin_harness(route, worker_type=source.get("worker_type")) or source.get("harness")
+    if harness != selected:
+        raise _contract_error("replacement-launch-binding-mismatch")
+    return recovery_task(record, source, history)
+
+
+def _work_options(argv):
+    """Read stored semantic options, without synthesizing a new original argv."""
+    values = []; index = 0
+    while index < len(argv):
+        token = argv[index]; key = token.split("=", 1)[0]
+        group = token.split("=", 1) if "=" in token else [token]
+        if "=" not in token and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            index += 1; group.append(argv[index])
+        if key not in RECOVERY_SELECTION_OPTIONS:
+            values.append(group)
+        index += 1
+    return sorted(values, key=lambda value: value[0])
+
+
+def require_recovery_work(candidate, history, *, route=None, worker_type=None,
+                          transition=None, access=None, parent_values=None):
+    """Bind the candidate to stored work and grants, while selection follows current authority.
+
+    A route-less call is the compatibility check for an old standalone launch;
+    with a verified current route, its normal launcher owns model realization.
+    """
+    owner = worker_type == "owner"
+    pinned = sealed_pin_harness(route, worker_type=worker_type) if route else None
+    keys = ("jobs", "worktree") if owner or pinned else REPLACEMENT_FIXED_KEYS
+    for key in keys:
+        if candidate.get(key) != history.get(key):
+            raise _contract_error("replacement-input-tuple-mismatch", key)
+    if pinned and candidate.get("harness") != pinned:
+        raise _contract_error("pin-ignored-for-replacement", pinned)
+    drift = candidate.get("launch_home") != history.get("launch_home")
+    old, new = history.get("resolved") or {}, candidate.get("resolved") or {}
+    if transition and new.get("model_profile") != transition["to"]:
+        raise _contract_error("replacement-input-tuple-mismatch", "resolved")
+    ignored = RECOVERY_SELECTION_VALUES if route else frozenset()
+    if owner and route and candidate.get("harness") != history.get("harness"):
+        ignored = ignored | {"sandbox", "permission_mode", "parent_sandbox", "parent_transport"}
+    for key in sorted(set(old) | set(new)):
+        expected = (parent_values or {}).get(key, old.get(key))
+        if expected == new.get(key) or key in ignored:
+            continue
+        if (transition and key in {"model_profile", "model", "reasoning", "resolved_model_settings"}
+                and old.get("model_profile") == transition["from"]
+                and new.get("model_profile") == transition["to"]
+                and (key != "resolved_model_settings" or (new.get(key) or {}).get("profile") == transition["to"])):
+            continue
+        if not (drift and key in RELEASE_DERIVED_VALUES):
+            raise _contract_error("replacement-input-tuple-mismatch", "resolved")
+    # Sealing includes the raw argv as history. Check what the candidate will
+    # actually receive against its own checked current binding, rather than
+    # reconstructing the original command with today's values.
+    options = {}
+    argv = candidate.get("argv", []); index = 0
+    while index < len(argv):
+        token = argv[index]; key = token.split("=", 1)[0]
+        value = token.split("=", 1)[1] if "=" in token else None
+        if value is None and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            index += 1; value = argv[index]
+        options.setdefault(key, []).append(value); index += 1
+    current = {"--" + key.replace("_", "-"): value for key, value in new.items()}
+    if route:
+        current.update({"--route-id": route["route_id"], "--route-hash": route["route_hash"]})
+    for flag, expected in current.items():
+        if flag in RECOVERY_SELECTION_OPTIONS and flag in options and options[flag] != [str(expected)]:
+            raise _contract_error("replacement-argv-mismatch", flag)
+    granted = granted_permissions(candidate.get("applied_permissions"), candidate.get("launch_home"), candidate.get("worktree"))
+    sealed = granted_permissions(history.get("applied_permissions"), history.get("launch_home"), history.get("worktree"))
+    cross_owner = owner and candidate.get("harness") != history.get("harness")
+    if cross_owner:
+        require_recovery_grant_addresses(candidate, history, route=route, access=access)
+    if access:
+        if (granted.get("execution_access") or {}).get("request_sha256") != access["request_sha256"]:
+            raise _contract_error("replacement-input-tuple-mismatch", "execution_access")
+        granted, sealed = _without_recovery_access(granted), _without_recovery_access(sealed)
+    # A cross-harness owner goes through the ordinary access-grant launcher.
+    # Its runtime permission spelling differs, while the exact approved request
+    # and addresses above remain bound. Same-harness grants stay comparable.
+    if not cross_owner and granted != sealed:
+        if not drift:
+            raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
+        from hearting_gates import same_work_or_refuse
+        same_work_or_refuse("replacement-runtime-drift", "applied_permissions")
+    if not owner and _work_options(candidate.get("argv", [])) != _work_options(history.get("argv", [])):
+        raise _contract_error("replacement-argv-mismatch")
+
+
+def require_recovery_grant_addresses(candidate, history, *, route, access=None):
+    """Translate adapter grant spellings to the existing approved task addresses.
+
+    Legacy inputs without an execution-access envelope use the sealed worktree,
+    artifact root and the same task-target resolver as the normal launcher.
+    Nothing is persisted and no additional input is requested.
+    """
+    import execution_access as EA
+    import fnmatch
+    applied = candidate.get("applied_permissions") or {}
+    old_permissions = history.get("applied_permissions") or {}
+    original = old_permissions.get("execution_access") or {}
+    network_allowed = (original.get("network") in {"enforced", "granted-unenforced"}
+                       or old_permissions.get("nested_headless_network") is True)
+    if candidate.get("harness") == "codex":
+        from dispatch_contract import codex_standard_owner_network_enabled
+        selected = candidate.get("resolved") or {}
+        # This is the normal standard+ owner's existing dispatch support grant.
+        # Its intensity/depth are already bound to the approved work above.
+        network_allowed = network_allowed or codex_standard_owner_network_enabled(
+            dispatch_depth=int(selected.get("dispatch_depth") or 0),
+            worker_type=selected.get("worker_type", ""),
+            intensity=selected.get("intensity", ""), sandbox=selected.get("sandbox", ""))
+    writes = [history.get("worktree"), (route or {}).get("artifact_root"), *original.get("writable_roots", [])]
+    reads = [*writes, *original.get("read_roots", [])]
+    if route:
+        context = EA.AccessContext.build(worktree=history["worktree"], artifact_root=route["artifact_root"],
+            dispatch_state_root=Path(history["jobs"]).parent,
+            agent_home=candidate.get("launch_home") or Path(__file__).resolve().parents[1])
+        # Ordinary launchers grant installed contracts and utilities read
+        # visibility with edit denies. Recovery uses the same source addresses.
+        reads.extend(contract_read_roots(context.agent_home, route))
+        targets = EA.resolve_task_targets(route)
+        if targets:
+            writes.extend(targets.writable_roots)
+        derived = EA.derive_task_access(route, context, writable=tuple(Path(value) for value in writes if value))
+        writes.extend(derived.writable_roots); reads.extend(derived.read_roots)
+        if access:
+            request = EA.load_request(Path(access["request_path"]), context=context)
+            if request.request_sha256 != access["request_sha256"]:
+                raise _contract_error("replacement-input-tuple-mismatch", "execution_access")
+            writes.extend(request.writable_roots); reads.extend(request.read_roots)
+            network_allowed = request.network_required
+    writes = [Path(value).resolve(strict=False) for value in writes if value]
+    reads = [*writes, *(Path(value).resolve(strict=False) for value in reads if value)]
+
+    def require(value, roots, *, relative_to=None):
+        value = str(value)
+        path = Path(value.removesuffix("/**").removesuffix("/*"))
+        if not path.is_absolute() and relative_to is not None:
+            path = Path(relative_to) / path
+        path = path.resolve(strict=False)
+        if "*" in str(path) or not any(path == root or root in path.parents for root in roots):
+            raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
+
+    grant = applied.get("execution_access") or {}
+    if (not access and original.get("request_sha256")
+            and grant.get("request_sha256") != original["request_sha256"]):
+        raise _contract_error("replacement-input-tuple-mismatch", "execution_access")
+    if (grant.get("network") in {"enforced", "granted-unenforced"}
+            or applied.get("nested_headless_network") is True) and not network_allowed:
+        raise _contract_error("replacement-input-tuple-mismatch", "execution_access")
+    for key in ("writable_roots", "additional_writable_roots", "absorbed_writable_roots"):
+        for value in grant.get(key, []):
+            require(value, writes)
+    for value in grant.get("read_roots", []):
+        require(value, reads)
+    permissions = applied.get("opencode_permission") or {}
+    for category, roots in (("external_directory", reads), ("edit", writes)):
+        rules = permissions.get(category) or {}
+        if isinstance(rules, str):
+            if rules != "deny" and category != "edit":
+                raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
+            rules = {"*": rules}
+        for pattern, effect in rules.items():
+            if effect == "allow" and not (category == "edit" and pattern in {"*", "**"}):
+                require(pattern, roots, relative_to=history["worktree"] if category == "edit" else None)
+        if category == "edit":
+            # Native edit defaults apply within the externally scoped roots.
+            # Preserve the normal launcher's '*' allow, while requiring its
+            # read-only roots to retain their effective edit deny.
+            external = permissions.get("external_directory") or {}
+            if any(effect == "allow" for effect in rules.values()) and not isinstance(external, dict):
+                raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
+            for root in reads:
+                if any(root == write or write in root.parents for write in writes):
+                    continue
+                visible = "deny"
+                for pattern, candidate_effect in external.items():
+                    if fnmatch.fnmatchcase(str(root), pattern):
+                        visible = candidate_effect
+                if visible != "allow":
+                    continue
+                for path in (root, root / "__recovery_read_only_child__"):
+                    forms = (str(path), os.path.relpath(path, history["worktree"]))
+                    effect = "allow"
+                    for pattern, candidate_effect in rules.items():
+                        if any(fnmatch.fnmatchcase(form, pattern) for form in forms):
+                            effect = candidate_effect
+                    if effect != "deny":
+                        raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
+    for rule in (applied.get("claude") or {}).get("allowed_tools") or []:
+        match = re.fullmatch(r"(Read|Edit|Write)(?:\(([^)]+)\))?", rule)
+        if not match:
+            continue
+        tool, path = match.groups()
+        if not path:
+            raise _contract_error("replacement-input-tuple-mismatch", "applied_permissions")
+        require(path[1:] if path.startswith("//") else path,
+                reads if tool == "Read" else writes, relative_to=history["worktree"])
+
+
+def _without_recovery_access(permissions):
+    result = {key: value for key, value in permissions.items() if key != "execution_access"}
+    if isinstance(result.get("opencode_permission"), dict):
+        result["opencode_permission"] = {key: value for key, value in result["opencode_permission"].items()
+                                         if key not in ("external_directory", "edit")}
+    return result
+
+
+def continuation_attempt_state(metadata):
+    """Execution adopts a successor; preparation and an unconsumed claim do not.
+
+    A legacy row lacking launch evidence remains unknown, not an invented
+    no-spawn proof. PID-bound or unresolved claimed launches remain attached.
+    """
+    if metadata.get("launch_started") == "1":
+        return "started"
+    if metadata.get("pid"):
+        return "unknown"
+    if metadata.get("launch_outcome") == "never-launched":
+        return "unstarted"
+    if metadata.get("launch_claimed") == "0" and metadata.get("launch_started") != "1":
+        return "unstarted"
+    return "unknown"
+
+
+def resource_predecessor_finished(row):
+    """A resource's exact ended execution, independent of its scientific verdict."""
+    from resource_run_registry import classify_identity, resource_never_started, reboot_evidence
+    from dispatch_resource_wait import supervisor
+    if resource_never_started(row):
+        return True
+    if (row.get("status") == "launching" or row.get("cancel_requested")
+            or row.get("parent_close_requested") or classify_identity(row)[0] != "exited"):
+        return False
+    if (row.get('status') != 'succeeded' and row.get('exit_code') is None
+            and reboot_evidence(row)):
+        return True
+    code = supervisor().runner().read_sentinel(row.get("sentinel"))
+    return (code is not None and row.get("exit_code", code) == code
+            and not (row.get("status") == "failed" and code == 0)
+            and not (row.get("status") == "succeeded" and code != 0))
+
+
+def require_resource_predecessors(rows, candidate):
+    """Recheck execution and evidence-address protection within the existing reservation lock."""
+    from dispatch_resource_wait import resource_evidence_paths_conflict
+    if any(not resource_predecessor_finished(row) or resource_evidence_paths_conflict(row, candidate)
+           for row in rows):
+        raise ValueError("resource-route-body-conflict")
 
 
 # Same work, another launcher. Never-started work may be taken over by a launcher that runs
@@ -424,7 +794,7 @@ REPLACEMENT_FIXED_KEYS = ("harness", "jobs", "worktree")
 LAUNCH_LOCATION_VALUES = frozenset({"launch_lifecycle", "runtime_sandbox"})
 
 # The sealed launch input of one attempt: the work and its granted permissions.
-RESEAL_STABLE_KEYS = ("schema", "attempt_id", "harness", "jobs", "worktree", "argv", "task",
+RESEAL_STABLE_KEYS = ("schema", "attempt_id", "harness", "jobs", "worktree", "argv", "task", "retry_brief",
                       "route_id", "route_node", "owner_route_id")
 
 # The registry row of one never-started attempt. Per-launch values (lease nonce, release home,
@@ -438,11 +808,11 @@ RELAUNCH_STABLE_KEYS = (
 
 
 # A path into the harness's own tree inside a permission value (`<root>/utilities/...`).
-_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:utilities|adapters|hooks|tools)/")
+_RELEASE_TREE_PATH = re.compile(r"(/[^\s\"'()*]*?)/(?:core|capabilities|roles|utilities|adapters|docs|hooks|profiles|tools)(?=/|[\"'])")
 RELEASE_ROOT_TOKEN = "<launch_home>"
 
 
-def granted_permissions(applied, launch_home=None) -> dict:
+def granted_permissions(applied, launch_home=None, worktree=None) -> dict:
     """``applied_permissions`` without the values the launcher's location decides.
 
     With ``launch_home`` (the release the launch ran from), a path into the harness's own tree
@@ -462,6 +832,11 @@ def granted_permissions(applied, launch_home=None) -> dict:
     roots = {root for root in _RELEASE_TREE_PATH.findall(text)
              if root == str(launch_home) or os.path.realpath(root) == home
              or (managed and (root == pointer or os.path.dirname(os.path.realpath(root)) == releases))}
+    # OpenCode edit rules check the same directory relative to the worktree.
+    # Normalize only aliases of the identified launch roots, never arbitrary
+    # relative task paths or another development checkout.
+    if worktree:
+        roots.update(os.path.relpath(root, worktree) for root in tuple(roots))
     for root in sorted(roots, key=len, reverse=True):
         text = re.sub(r"(?<![^\s\"'(])" + re.escape(root) + "/", RELEASE_ROOT_TOKEN + "/", text)
     return json.loads(text)
@@ -475,10 +850,11 @@ def granted_permissions(applied, launch_home=None) -> dict:
 # managed release copy (`release_moved`). The launcher's location is `LAUNCH_LOCATION_VALUES`; the
 # process table yields to the drain receipt its watcher sealed
 # (`dispatch_contract._denied_process_outside_attempt`). The work, the permissions granted to
-# it and the route's own seal are still compared.
+# it and the route's own seal are still compared. The portable model profile
+# is approved work quality, not a value derived from the release.
 RELEASE_DERIVED_VALUES = frozenset({
     "model", "reasoning", "resolved_model_settings", "resolved_completion_delivery",
-    "parent_completion_delivery", "execution_surface", "fallback_hop", "model_role", "model_profile"})
+    "parent_completion_delivery", "execution_surface", "fallback_hop", "model_role"})
 RELEASE_LAUNCH_ROOTS = frozenset({"registry_root", "launch_home", "runtime_root", "wrapper_root"})
 _RELEASE_IDENTITY_FIELDS = frozenset({"release_id", "content_digest", "binding_digest"})
 _MANAGED_RELEASE_ID = re.compile(r"release:[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[0-9a-f]{12}")
@@ -518,11 +894,25 @@ def release_moved(sealed: dict, current: dict, *, managed_release) -> frozenset:
     return frozenset(moved)
 
 
-def same_sealed_work(previous, current) -> bool:
+def same_sealed_work(previous, current, *, recovery=None) -> bool:
     """Whether two sealed launch inputs describe the same work with the same granted permissions."""
-    return (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
-            and granted_permissions(previous.get("applied_permissions"), previous.get("launch_home"))
-            == granted_permissions(current.get("applied_permissions"), current.get("launch_home")))
+    exact = (all(previous.get(key) == current.get(key) for key in RESEAL_STABLE_KEYS)
+            and granted_permissions(previous.get("applied_permissions"), previous.get("launch_home"), previous.get("worktree"))
+            == granted_permissions(current.get("applied_permissions"), current.get("launch_home"), current.get("worktree")))
+    if exact or recovery is None:
+        return exact
+    record, source, history, route = recovery
+    if (source.get("worker_type") != "owner"
+            or any(previous.get(key) != current.get(key) for key in RESEAL_STABLE_KEYS
+                   if key not in {"harness", "argv"})
+            or current.get("task") != recovery_task(record, source, history)):
+        return False
+    from dispatch_contract import DispatchContractError
+    try:
+        require_recovery_work(current, history, route=route, worker_type="owner", access=record.get("execution_access"))
+    except DispatchContractError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -583,21 +973,50 @@ def declared_subsession(args) -> bool:
     return True
 
 
-def retry_predecessor(prior_rows):
+def new_owner_request(previous_row, *, jobs=None, task=None):
+    """A changed sealed assignment after a settled failure, without rewriting it."""
+    if (jobs is None or not isinstance(task, str) or not task.strip()
+            or previous_row.get("_status") not in {"done", "closed"}
+            or committed_outcome(previous_row["_status"], previous_row) != "failed"):
+        return False
+    from dispatch_contract import (
+        DispatchContractError, attempt_process_quiescence, terminal_conflict_pending,
+    )
+    from dispatch_replacement import launch_input
+    try:
+        previous = launch_input(jobs, previous_row["attempt_id"], previous_row)["task"]
+        return (isinstance(previous, str) and bool(previous.strip())
+                and " ".join(previous.split()) != " ".join(task.split())
+                and not terminal_conflict_pending(previous_row)
+                and attempt_process_quiescence(
+                    previous_row, terminal_receipt=True).state == "quiescent")
+    except (DispatchContractError, OSError, ValueError, KeyError, TypeError):
+        # Missing history cannot manufacture a new request boundary.
+        return False
+
+
+def retry_predecessor(prior_rows, *, jobs=None, task=None):
     """The transport retry a new launch of this node continues, or "".
 
     Only a transport failure (a death, a runtime error) is retried in place.
     A worker's readable FAIL or BLOCKED is its result, on a capped node or
     not: the next launch is new work, so it never inherits a retry link and
     never spends the node's one replacement. Capped nodes still count it as a
-    round through the shared round admission. No original row is changed.
+    round through the shared round admission. A different explicit request on
+    an uncapped stage is also new work once the old execution is quiescent.
+    Callers keep capped rounds on their existing admission path. No original
+    row or automatic replacement allowance is changed.
     """
     if not prior_rows:
         return ""
     latest = prior_rows[-1]
     status = latest["_status"]
     if committed_outcome(status, latest) == "failed":
-        return "" if readable_result(latest) else latest.get("attempt_id", "")
+        if readable_result(latest):
+            return ""
+        if new_owner_request(latest, jobs=jobs, task=task):
+            return ""
+        return latest.get("attempt_id", "")
     if status == "open" and latest.get("launch_claimed") == "0":
         # Register/start reuse the same unlaunched transport successor. A
         # semantic round has no such link and keeps its own round identity.
@@ -654,6 +1073,23 @@ def blocked_progress(route, rows, *, worker_type="test") -> int:
     return streak
 
 
+def runtime_owner_can_resume(status, meta) -> bool:
+    """A launched supervised owner's runtime end still has its same-route work.
+
+    Admission also checks actual process quiescence; this metadata judgment
+    keeps the route's sealed contract available while it awaits continuation.
+    """
+    return (status == "done" and meta.get("worker_type") == "owner"
+            and meta.get("launch_started") == "1"
+            and meta.get("supervisor_lease") == "flock-v1"
+            and bool(meta.get("supervisor_lease_file"))
+            and (meta.get("note") in {"dead-runtime-exit", "dead-runtime-error"}
+                 or (meta.get("note") == "dead-protocol"
+                     and meta.get("reconcile_reason") == "terminal-event-missing"
+                     and meta.get("terminal_event") == "dispatch.supervisor.error"
+                     and not readable_result(meta))))
+
+
 def answerable_owner_end(status, meta) -> str:
     """How an ended owner's result waits for a person, or "".
 
@@ -678,8 +1114,9 @@ def fix_answers(route, lines, jobs=None) -> tuple[list[str], list[str]]:
     admits for a revision that answers its last FAIL, within the verdict ceiling cap + 1
     (SD-161). A node whose closure-check that answer would not admit (already at the ceiling,
     or bound by BLOCKED rounds without progress) is `spent` as `<node>:<state>`: the fix makes
-    no round for it."""
-    from dispatch_contract import parse_registry_metadata
+    no round for it. A review already disposed by owner-closure gets no further round,
+    but does not prevent an approved answer continuing other unfinished work."""
+    from dispatch_contract import parse_registry_metadata, owner_closure_shape
     answers, spent = [], []
     for node in route.get("nodes") or []:
         if not is_round_capped_node(node):
@@ -704,7 +1141,8 @@ def fix_answers(route, lines, jobs=None) -> tuple[list[str], list[str]]:
         # what admits the closure-check round (not at cap + 1, not bound by BLOCKED rounds).
         budget = round_budget(route, node, rows, revisions=[{"answers": [failed]}])
         if not failed or budget.round_kind != "closure-check":
-            spent.append(f"{node.get('id')}:{budget.state}")
+            if owner_closure_shape(verdicts[-1]) != "registered-review":
+                spent.append(f"{node.get('id')}:{budget.state}")
             continue
         answers.append(failed)
     return answers, spent
@@ -883,6 +1321,26 @@ def access_grant(*args, **kwargs):
     return build_grant(*args, **kwargs)
 
 
+def contract_read_roots(agent_home: str | Path, route: dict | None = None) -> tuple[Path, ...]:
+    """Contract directories for an already validated launch binding.
+
+    Use the same sealed launch-home field the installer's in-use judgment
+    retains. A moving current pointer never replaces the route's contract
+    source. These are read addresses, not additional task write grants.
+    """
+    from execution_access import harness_source_read_roots
+    homes = [Path(agent_home)]
+    sealed = (route or {}).get("launch_compatibility_tuple") or {}
+    identity = sealed.get("launch_home") if isinstance(sealed, dict) else None
+    value = identity.get("path") if isinstance(identity, dict) else None
+    if isinstance(value, str) and os.path.isabs(value):
+        homes.append(Path(value))
+    roots = []
+    for home in homes:
+        roots.extend(harness_source_read_roots(home))
+    return tuple(dict.fromkeys(roots))
+
+
 def bind_launch_access(args, *, runtime: str, default_roots, network_available: bool = False,
                        parent_network: bool = False, effective_sandbox: str = "workspace-write",
                        gpu_resource_scope: bool = False, inherit_parent_sandbox: bool = False):
@@ -900,6 +1358,22 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
                                   dispatch_state_root=dispatch_state_root(args.jobs_path),
                                   agent_home=args.agent_home, environ=os.environ)
     parent = None
+    compute_scope = None
+    route_file = getattr(args, "route_file", None)
+    owner_binding = getattr(args, "owner_route_binding", None)
+    if not route_file and owner_binding is not None:
+        route_file = owner_binding.route_file
+    # Both owner and node bindings have passed the wrappers' existing route
+    # validation before access binding; contract reads do not need a request.
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8")) if route_file else None
+    except (OSError, ValueError) as exc:
+        raise ExecutionAccessError("route-record-unreadable", str(exc)) from exc
+    args.contract_read_roots = contract_read_roots(args.agent_home, route)
+    if route_file and request_path(args.execution_access_file, os.environ) is not None:
+        from gpu_execution_sandbox import select as gpu_selection
+        compute_scope = gpu_selection(route, node=getattr(args, "route_node", None),
+                                      owner=args.dispatch_depth == 1, environ={})["gpu_scope"]
     if args.dispatch_depth >= 2 and request_path(args.execution_access_file, os.environ) is not None:
         if args.parent_binding is None:
             # Prospective probes without an access request need no live owner.
@@ -936,7 +1410,7 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
         network_available=network_available or bool(parent_network and parent is not None
                                                      and parent.network_allowed),
         effective_sandbox=effective_sandbox, gpu_resource_scope=gpu_resource_scope,
-        inherit_parent_sandbox=inherit_parent_sandbox)
+        inherit_parent_sandbox=inherit_parent_sandbox, compute_execution_scope=compute_scope)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,3 +1531,194 @@ def relocation_admission(root, records, directories, *, selected_route_ids=(), e
     except Exception as exc:
         return RelocationDecision(False, "evidence-unreadable:" + str(exc), tuple(sorted(route_ids)))
     return RelocationDecision(True, None, tuple(sorted(route_ids)))
+
+
+def require_batch_reservation(
+    payload: dict[str, object], expected: dict[str, object] | None
+) -> None:
+    """The current launch grant; a historical manifest is read separately.
+
+    Called at registration and consumption of the existing atomic reservation.
+    Canonical digest checks compare the stored manifest to its stored digest.
+    """
+    import hashlib
+    from replica_batch_contract import DIGEST, ReplicaBatchContractError, verify_manifest
+    if expected is None:
+        if payload.get("reservation_kind") in {"replica-batch", "parallel-batch"}:
+            raise _contract_error(
+                "parallel-group-reservation-mismatch",
+                "parallel batch token cannot authorize a non-group start",
+            )
+        return
+    public_expected = {
+        key: value for key, value in expected.items() if not key.startswith("_")
+    }
+    mismatches = {
+        key: (value, payload.get(key))
+        for key, value in public_expected.items()
+        if payload.get(key) != value
+    }
+    for key in ("batch_manifest_sha256", "batch_leg_sha256"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not DIGEST.fullmatch(value):
+            mismatches[key] = ("sha256:<64 lowercase hex>", value)
+    manifest = payload.get("batch_manifest")
+    try:
+        verified, manifest_digest, leg_digests = verify_manifest(manifest)
+    except ReplicaBatchContractError as exc:
+        mismatches["batch_manifest"] = ("valid canonical manifest", str(exc))
+        verified, manifest_digest, leg_digests = {}, "", {}
+    if manifest_digest and payload.get("batch_manifest_sha256") != manifest_digest:
+        mismatches["batch_manifest_sha256"] = (
+            manifest_digest,
+            payload.get("batch_manifest_sha256"),
+        )
+    if verified:
+        common = {
+            "route_id": public_expected.get("batch_route_id"),
+            "parent_attempt_id": public_expected.get("batch_parent_attempt_id"),
+        }
+        manifest_group = verified.get("parallel_group") or verified.get("replica_group")
+        if manifest_group != public_expected.get("batch_group"):
+            mismatches["manifest.parallel_group"] = (
+                public_expected.get("batch_group"), manifest_group
+            )
+        for key, value in common.items():
+            if verified.get(key) != value:
+                mismatches[f"manifest.{key}"] = (value, verified.get(key))
+        route_nodes = sorted(str(member.get("route_node", "")) for member in verified["members"])
+        if route_nodes != expected.get("_batch_route_nodes"):
+            mismatches["manifest.route_nodes"] = (
+                expected.get("_batch_route_nodes"), route_nodes
+            )
+        allowed = expected.get("_batch_allowed_members", {})
+        for manifest_member in verified["members"]:
+            # A partial reservation launches only its selected gap. The other
+            # members are digest-bound historical peers already checked by the
+            # source reader and peer census, not new current launch candidates.
+            if (payload.get("batch_admission_count") == 1
+                    and manifest_member.get("attempt_id") != public_expected.get("batch_attempt_id")):
+                continue
+            member_node = str(manifest_member.get("route_node", ""))
+            profile_fields = expected.get("_batch_profile_selections", {}).get(member_node)
+            if profile_fields is not None:
+                for key, value in profile_fields.items():
+                    if manifest_member.get(key) != value:
+                        mismatches[f"manifest.member.{member_node}.{key}"] = (value, manifest_member.get(key))
+            allowed_for_member = (
+                allowed.get(member_node, []) if isinstance(allowed, dict) else []
+            )
+            member_tuple = {
+                "harness": manifest_member.get("harness"),
+                "fallback_hop": manifest_member.get("fallback_hop"),
+                "fallback_ordinal": manifest_member.get("fallback_ordinal"),
+            }
+            if member_tuple not in allowed_for_member:
+                mismatches[f"manifest.member.{member_node}.route_binding"] = (
+                    allowed_for_member, member_tuple
+                )
+        selected = [
+            member for member in verified["members"]
+            if member.get("attempt_id") == public_expected.get("batch_attempt_id")
+        ]
+        if len(selected) != 1:
+            mismatches["manifest.selected_member"] = (
+                public_expected.get("batch_attempt_id"), len(selected)
+            )
+        else:
+            member = selected[0]
+            member_expected = {
+                "route_node": public_expected.get("batch_route_node"),
+                "harness": public_expected.get("batch_harness"),
+                "fallback_hop": public_expected.get("batch_fallback_hop"),
+                "fallback_ordinal": public_expected.get("batch_fallback_ordinal"),
+            }
+            if int(verified.get("schema_version", 1)) >= 2:
+                member_expected.update({
+                    "model_profile": public_expected.get("batch_model_profile"),
+                    "perspective": public_expected.get("batch_perspective"),
+                    "parallel_leg_index": public_expected.get("batch_parallel_leg_index"),
+                })
+            for key, value in member_expected.items():
+                if member.get(key) != value:
+                    mismatches[f"manifest.member.{key}"] = (value, member.get(key))
+            expected_assignment = public_expected.get("batch_assignment_sha256")
+            if expected_assignment and member.get("assignment_sha256") != expected_assignment:
+                mismatches["manifest.member.assignment_sha256"] = (
+                    expected_assignment, member.get("assignment_sha256")
+                )
+            attempt = str(member.get("attempt_id", ""))
+            if payload.get("batch_leg_sha256") != leg_digests.get(attempt):
+                mismatches["batch_leg_sha256"] = (
+                    leg_digests.get(attempt), payload.get("batch_leg_sha256")
+                )
+        if payload.get("batch_independence") != verified.get("independence"):
+            mismatches["batch_independence"] = (
+                verified.get("independence"), payload.get("batch_independence")
+            )
+    declared_size = public_expected.get("batch_declared_size")
+    admission = payload.get("batch_admission_count")
+    if (isinstance(declared_size, bool) or not isinstance(declared_size, int)
+            or not 2 <= declared_size <= 4):
+        mismatches["batch_declared_size"] = ("integer 2..4", declared_size)
+        declared_size = 0
+    if isinstance(admission, bool) or admission not in {1, declared_size}:
+        mismatches["batch_admission_count"] = (f"1|{declared_size}", admission)
+    elif admission == 1:
+        selected_attempt = str(public_expected.get("batch_attempt_id", ""))
+        peer_members = (
+            [
+                member for member in verified.get("members", [])
+                if str(member.get("attempt_id", "")) != selected_attempt
+            ]
+            if verified
+            else []
+        )
+        expected_peers = sorted(str(member.get("attempt_id", "")) for member in peer_members)
+        proof_keys = {
+            "agent_home", "attempt_id", "jobs", "manifest_sha256",
+            "reason", "route", "state",
+        }
+        proofs = payload.get("batch_peer_set")
+        if payload.get("batch_peer_count") != len(expected_peers):
+            mismatches["batch_peer_count"] = (len(expected_peers), payload.get("batch_peer_count"))
+        if not isinstance(proofs, list) or len(proofs) != len(expected_peers):
+            mismatches["batch_peer_set"] = ("exact N-1 canonical proofs", proofs)
+        else:
+            actual_peers=[]
+            for index, proof in enumerate(proofs):
+                label=f"batch_peer_set[{index}]"
+                if not isinstance(proof, dict) or set(proof) != proof_keys:
+                    mismatches[label] = ("canonical peer proof", proof)
+                    continue
+                actual_peers.append(str(proof.get("attempt_id", "")))
+                if proof.get("manifest_sha256") != manifest_digest:
+                    mismatches[f"{label}.manifest_sha256"] = (manifest_digest, proof.get("manifest_sha256"))
+                if proof.get("state") not in {"active", "completed"}:
+                    mismatches[f"{label}.state"] = ("active|completed", proof.get("state"))
+                for key in ("agent_home", "jobs", "route"):
+                    value=proof.get(key)
+                    if not isinstance(value,str) or not Path(value).is_absolute():
+                        mismatches[f"{label}.{key}"] = ("absolute path", value)
+                if not isinstance(proof.get("reason"),str) or not proof.get("reason"):
+                    mismatches[f"{label}.reason"] = ("non-empty observation reason", proof.get("reason"))
+            if actual_peers != expected_peers:
+                mismatches["batch_peer_set.attempts"] = (expected_peers, actual_peers)
+            encoded=json.dumps(proofs,separators=(",",":"),sort_keys=True).encode("utf-8")
+            proof_digest="sha256:"+hashlib.sha256(encoded).hexdigest()
+            if payload.get("batch_peer_set_sha256") != proof_digest:
+                mismatches["batch_peer_set_sha256"] = (proof_digest,payload.get("batch_peer_set_sha256"))
+    elif admission == declared_size:
+        for key in (
+            "batch_peer_count", "batch_peer_set", "batch_peer_set_sha256",
+            "batch_peer_attempt_id", "batch_peer_state",
+            "batch_peer_proof", "batch_peer_proof_sha256",
+        ):
+            if key in payload:
+                mismatches[key] = ("absent for full batch", payload.get(key))
+    if mismatches:
+        detail = ";".join(
+            f"{key}:expected={wanted}:actual={actual}"
+            for key, (wanted, actual) in sorted(mismatches.items())
+        )
+        raise _contract_error("parallel-group-reservation-mismatch", detail)

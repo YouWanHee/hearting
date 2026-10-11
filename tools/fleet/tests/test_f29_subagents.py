@@ -842,7 +842,7 @@ class CodexSubagentTest(unittest.TestCase):
              mock.patch("fleet.collectors.dispatch.collect", return_value=[]):
             fleet_collectors.collect_all()
         codex_enrich.assert_called_once_with(codex_session, tick=tick)
-        claude_enrich.assert_called_once_with(claude_session)
+        claude_enrich.assert_called_once_with(claude_session, tick={2: None})
 
 
 def _tool_use_line(tid, agent_type, ts="2026-07-15T10:00:00Z", name="Task"):
@@ -1066,7 +1066,8 @@ class NoRegressionTest(unittest.TestCase):
         the 2-cell and 4-cell insets read as siblings, not children). depth-1 rows are
         arrowless since F-64c, so the anchor is the rail column the strip must clear."""
         self.assertEqual(render._SUBAGENT_IND.strip(), "")
-        self.assertGreaterEqual(len(render._SUBAGENT_IND), render._RAIL_COL + 2)
+        self.assertEqual(len(render._SUBAGENT_IND), render._SESSION_DETAIL_COL)
+        self.assertGreaterEqual(len(render._conn_indent(1, in_card=True)), render._RAIL_COL + 2)
 
     def test_strip_depth_pushes_the_inset_further_inward(self):
         """A dispatch-owned strip (depth ≥ 1) indents 2 more cells per level than a
@@ -1411,14 +1412,14 @@ class SubagentStripBudgetTest(unittest.TestCase):
 
     def test_completed_elapsed_stops_at_ended_at_and_gains_idle_tail(self):
         """사용자 2026-07-29 '언제 끝났는지': 30m runtime that finished 45m ago must
-        read `30m (45m)` — not a forever-growing 75m."""
+        read `30m · 45m ago` — not a forever-growing 75m."""
         now = time.time()
         sa = SubAgent(agent_type="explore", active=False,
                       started_at=now - 75 * 60, ended_at=now - 45 * 60)
         self.assertEqual(render._subagent_elapsed_min(sa), 30)
         self.assertEqual(render._subagent_idle_min(sa), 45)
         text = self._strip_text([sa])
-        self.assertIn("30m (45m)", text)
+        self.assertIn("30m · 45m ago", text)
 
     def test_completed_without_ended_at_keeps_the_old_tail_only(self):
         now = time.time()

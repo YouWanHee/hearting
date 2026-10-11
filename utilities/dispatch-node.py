@@ -309,7 +309,7 @@ def prior_round_attempts(jobs, route_id, node_id, *, exclude_slug=None, exclude_
  except OSError:
   return prior
  for cols, meta in ROUTE.review_round_records(lines, route_ids, node_id,jobs=jobs):
-  if exclude_slug and cols[4]==exclude_slug and (meta.get("route_id") or meta.get("route"))==route_id: continue
+  if not exclude_attempt and exclude_slug and cols[4]==exclude_slug and (meta.get("route_id") or meta.get("route"))==route_id: continue
   if exclude_attempt and meta.get("attempt_id")==exclude_attempt: continue
   prior.append((cols,meta))
  return prior
@@ -362,11 +362,15 @@ class RoundAdmission:
  `auto_revisions` contains every revision marker this call recorded (13.59.3
  rule 8). A read-only preview leaves that tuple empty and reports eligible
  nodes in `planned_revision_nodes`; the budget still accounts for them.
+ `prior_attempt_ids` is that same census, so batch input/identity consumers
+ can distinguish the admitted next round without a second history query.
  """
  budget: object
  auto_revisions: tuple = ()
  planned_revision_nodes: frozenset[str] = frozenset()
  reviewed_input: object = None
+ prior_attempt_ids: frozenset[str] = frozenset()
+ gate_unmet: bool = False
 
 
 def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
@@ -384,11 +388,7 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=
  )
  if last_kind != "verdict":
   return ()
- last_note = last_meta.get("note", "")
- last_blocking = (
-  last_note == ROUTE.REVIEW_BLOCKING_NOTE
-  or (last_note == "dead-worker-fail" and last_meta.get("failure_class") == "fail")
- )
+ last_blocking = REVIEW_ROUND_CAP.last_verdict_blocking([(last_status, last_meta)], worker_type)
  last_attempt = last_meta.get("attempt_id")
  if not last_blocking or not last_attempt:
   return ()
@@ -487,6 +487,9 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
    str(item["node_id"]) for item in auto_revisions if item.get("node_id") in dependency_ids
   ),
   reviewed_input=reviewed_input,
+  prior_attempt_ids=frozenset(meta["attempt_id"] for _cols,meta in rows if meta.get("attempt_id")),
+  gate_unmet=REVIEW_ROUND_CAP.gate_unmet(classified_rows,
+      node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test")),
  )
 
 
@@ -693,15 +696,10 @@ def replacement_task(args, route, node, jobs):
   if not reservation: return None  # Existing non-SD157 retry semantics are unchanged.
   record=replacement._read(replacement._record_path(jobs,reservation['family_id']))
   _fields,source,replay=replacement.validate_claim_source(jobs,lines,record)
-  if (record['replacement_attempt_id']!=args.attempt_id
-      or record['original_attempt_id']!=values[0]
-      or record['route_id']!=route['route_id']
-      or record['route_hash']!=route['route_hash']
-      or source.get('route_node')!=node['id']
-      or source.get('harness')!=args.adapter
-      or source.get('parent')!=args.parent):
-   raise DispatchContractError('replacement-launch-binding-mismatch')
-  return replay['task']
+  return ROUTE_AUTHORITY.recovery_node_task(
+      record,source,replay,attempt_id=args.attempt_id,route=route,node=node,
+      harness=args.adapter,parent=args.parent,jobs=jobs)
+
 
 
 def main():
@@ -943,11 +941,22 @@ def main():
   if review_candidate is not None: a.reviewed_evidence=review_candidate["path"]
  except DispatchContractError as e:
   print("check=failed");print(f"reason={e.reason}");print(f"detail={e.detail}");print("child_spawned=0");raise SystemExit(65)
- prompt_text=(original_task if original_task is not None else
-              a.prompt_text+round_protocol_block(round_budget,prior_rounds,worker_type,node["id"]))
+ round_context=round_protocol_block(round_budget,prior_rounds,worker_type,node["id"])
+ if original_task is None and group and os.environ.get(GOVERNOR_RESERVATION_ENV):
+  # The reservation seals the raw group assignment, including on a later
+  # round. Round guidance is recovery context, just like a partial retry brief.
+  if round_context:
+   os.environ["AGENT_DISPATCH_RETRY_BRIEF"]=os.environ.get("AGENT_DISPATCH_RETRY_BRIEF", "")+round_context
+  prompt_text=a.prompt_text
+ else:
+  prompt_text=original_task if original_task is not None else a.prompt_text+round_context
  if round_budget.correction_round: print(f"correction_round={round_budget.correction_round}")
  argv=[sys.executable,str(wrapper),"--"+a.action,"--worktree",launch_worktree,"--slug",a.slug,"--capability",route["capability"],"--capability-mode",route["capability_mode"],"--intensity",route["effective_intensity"],"--dispatch-depth",str(node.get("dispatch_depth",1)),"--worker-type",worker_type,"--unit",node.get("unit",""),"--assigned-contract",contract,"--owner",route["capability"],"--route-file",str(Path(a.route).resolve()),"--route-id",route["route_id"],"--route-hash",route["route_hash"],"--route-node",node["id"],"--registry-digest",route["registry_digest"],"--write-scope",";".join(node["write_scope"]),"--completion-gate",node["completion_gate"],"--jobs",str(registry.path),"--prompt-text",prompt_text]
  if a.reviewed_evidence: argv += ["--reviewed-evidence",a.reviewed_evidence]
+ # Reuse existing stage specialization declarations when they match this
+ # harness/type; every other launch still gets the default typed worker home.
+ if a.adapter=="claude" and worker_type=="stage" and (ROOT/"profiles"/(contract+".yaml")).is_file():
+  argv += ["--profile",contract]
  unit=node.get("unit","")
  if unit and not unit.startswith("_kernel/"):
   argv += ["--worker-mode",unit]

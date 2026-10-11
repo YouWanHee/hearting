@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
+from worker_runtime_home import prepare_worker_home
 from dispatch_contract import (
     _atomic_registry_replace,
     ensure_terminal_claim_absent,
@@ -140,6 +141,7 @@ from worker_bootstrap import (
     assigned_contract,
     render_worker_bootstrap,
     runtime_progress_prompt,
+    worker_ending_prompt,
     resolve_worker_type,
 )
 from stage_session_runtime import (  # noqa: E402
@@ -533,7 +535,11 @@ def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
     runtime = state_root / "opencode-runtime" / attempt_id
     if not runtime.resolve().is_relative_to(state_root):
         raise DispatchContractError("nested-opencode-runtime-outside-state-root")
-    values = {}
+    # Nested XDG isolation must retain the same user inventory as the typed
+    # worker home which is prepared from this environment afterwards.
+    config_root = Path(env.get("XDG_CONFIG_HOME") or Path(env.get("HOME") or Path.home()) / ".config")
+    inventory = env.get("COMPUTE_HOSTS_CONFIG") or config_root / "hearting/compute-hosts.yaml"
+    values = {"COMPUTE_HOSTS_CONFIG": str(Path(inventory).expanduser().absolute())}
     for kind in ("data", "cache", "state", "config"):
         directory = runtime / kind
         if not directory.resolve().is_relative_to(state_root):
@@ -591,6 +597,7 @@ def scoped_external_directory_config(
     execution_access_read_roots: tuple[Path, ...] = (),
     *,
     agent_home: Path | None = None,
+    contract_read_roots: tuple[Path, ...] = (),
     worktree: str | None = None,
     selected_agent: str | None = None,
 ) -> str:
@@ -663,9 +670,9 @@ def scoped_external_directory_config(
     # The launch environment and this permission projection use the same
     # resolved agent home. Keep its lexical alias as well as the canonical
     # directory: native tools can check either form of a symlinked install.
-    contract_roots = () if agent_home is None else tuple(dict.fromkeys((
-        str(agent_home / "capabilities"),
-        str((agent_home / "capabilities").resolve()),
+    contract_roots = tuple(str(root) for root in dict.fromkeys((
+        *(() if agent_home is None else route_authority.contract_read_roots(agent_home)),
+        *contract_read_roots,
     )))
     for root in (artifact_root, report_bundle_root, *execution_access_roots, *contract_roots):
         if not root:
@@ -707,11 +714,14 @@ def scoped_external_directory_config(
     # The worktree is a writable area too: a read root inside it stays writable there, as its
     # grant records (`read-only-root-writable`). A read root that holds a writable area keeps
     # its deny with the area re-allowed below; one holding the worktree is refused as too broad.
-    covered_roots = [str(root) for root in write_side] + ([str(worktree)] if worktree else []) + list(contract_roots)
+    writable_areas = [str(root) for root in write_side] + ([str(worktree)] if worktree else [])
+    contract_deny_roots = [root for root in contract_roots
+                          if not any(_covers(write, root) for write in writable_areas)]
+    covered_roots = writable_areas + list(contract_roots)
     read_deny_roots = [str(root) for root in execution_access_read_roots
                        if root and not any(_covers(cover, root) for cover in covered_roots)]
-    write_keep_roots = [str(root) for root in write_side
-                        if any(_strictly_under(read, root) for read in read_deny_roots)]
+    write_keep_roots = [root for root in writable_areas
+                        if any(_strictly_under(read, root) for read in (*contract_deny_roots, *read_deny_roots))]
     for root in read_deny_roots:
         for pattern in (root, f"{root}/**"):
             rules.pop(pattern, None)
@@ -719,7 +729,7 @@ def scoped_external_directory_config(
     if contract_roots:
         permission.pop("external_directory", None)
     permission["external_directory"] = rules
-    if contract_roots or read_deny_roots:
+    if contract_deny_roots or read_deny_roots:
         edit = effective_tool(original_permission, "edit", "allow")
         if isinstance(edit, str):
             edit_rules = {"*": edit}
@@ -727,7 +737,7 @@ def scoped_external_directory_config(
             edit_rules = dict(edit)
         else:
             raise ValueError("OpenCode edit permission must be a string or object")
-        for root in (*contract_roots, *read_deny_roots):
+        for root in (*contract_deny_roots, *read_deny_roots):
             # v1 native edit/write/patch ask against paths relative to the
             # worktree, unlike external_directory's absolute directory glob.
             edit_paths = (root,) if worktree is None else (
@@ -772,7 +782,7 @@ def scoped_external_directory_config(
         # earlier triple's unrelated patterns.
         overlaid: dict[str, dict] = {}
         for tool, action, roots in (("external_directory", "allow", contract_roots),
-                                    ("edit", "deny", contract_roots),
+                                    ("edit", "deny", contract_deny_roots),
                                     ("external_directory", "allow", read_deny_roots),
                                     ("edit", "deny", read_deny_roots)):
             if not roots:
@@ -932,8 +942,7 @@ def prompt(args: argparse.Namespace) -> tuple[str, str]:
         f"{released_task_prompt(args)}"
         f"{unit_bootstrap_prompt(args, task, os.environ)}"
         f"{assignment_prompt(args, task, os.environ)}"
-        "End with the kernel's exact three-line handoff as the entire final message — "
-        "no summary sentence before it, nothing after it.\n",
+        f"{worker_ending_prompt(supervised_owner=_supervised_owner(args))}",
         source,
     )
 
@@ -1432,18 +1441,17 @@ def main(argv: list[str]) -> int:
         default_roots = adapter_default_roots(args)
         args.execution_access_grant = route_authority.bind_launch_access(
             args, runtime="opencode", default_roots=default_roots)
-        if args.execution_access_grant is not None:
-            args.opencode_config_content = scoped_external_directory_config(
-                args.artifact_root,
-                str(args.report_bundle_root)
-                if args.report_bundle_root is not None
-                else None,
-                args.execution_access_grant.additional_writable_roots,
-                args.execution_access_grant.read_roots,
-                agent_home=args.agent_home,
-                worktree=args.worktree,
-                selected_agent=args.agent,
-            )
+        grant = args.execution_access_grant
+        args.opencode_config_content = scoped_external_directory_config(
+            args.artifact_root,
+            str(args.report_bundle_root) if args.report_bundle_root is not None else None,
+            grant.additional_writable_roots if grant is not None else (),
+            grant.read_roots if grant is not None else (),
+            agent_home=args.agent_home,
+            contract_read_roots=args.contract_read_roots,
+            worktree=args.worktree,
+            selected_agent=args.agent,
+        )
     except ExecutionAccessError as exc:
         return fail(exc.reason, 64, detail=exc.detail, child_spawned="0")
     except ValueError as exc:
@@ -1649,6 +1657,9 @@ def main(argv: list[str]) -> int:
             # secondary alive signal independent of the OpenCode SQLite mtime.
             "OPENCODE_DISPATCH_SLUG": args.slug,
         }
+        dispatch_env.update(prepare_worker_home(args.agent_home, 'opencode',
+                                                args.worker_type, args.attempt_id,
+                                                env=dispatch_env))
         if _supervised_owner(args):
             lease = supervisor_lease_path(jobs, args.attempt_id)
             dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))
@@ -1768,9 +1779,9 @@ def main(argv: list[str]) -> int:
             )
             launch_metadata["execution_access_effective_file"] = str(effective_path)
             launch_metadata["execution_access_effective_sha256"] = effective_sha256
-        if getattr(args, "nested_runtime_env", None):
-            launch_metadata["opencode_runtime_dir"] = str(
-                Path(args.nested_runtime_env["XDG_DATA_HOME"]).parent)
+        launch_metadata["opencode_runtime_dir"] = str(
+            Path(dispatch_env["XDG_DATA_HOME"]).parent)
+        launch_metadata["runtime_home"] = dispatch_env["OPENCODE_CONFIG_DIR"]
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
         try:

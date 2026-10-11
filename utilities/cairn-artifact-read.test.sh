@@ -15,6 +15,7 @@ cleanup() {
   rm -rf "$tmp"
 }
 trap cleanup EXIT HUP INT TERM
+mkdir -p "$tmp/fixture-root"
 
 cat >"$tmp/server.py" <<'PY'
 import json, sys
@@ -48,7 +49,12 @@ class Handler(BaseHTTPRequestHandler):
                 "total_estimate": 1,
                 "next_cursor": None,
                 "telemetry_ref": "telemetry-a",
-                "rows": [{"artifact_root_id": request["artifact_root_id"]}],
+                "rows": ([{"artifact_root_id": request["artifact_root_id"],
+                           "stable_id": "art-fixture", "integrity": {"verified": True,
+                           "expected_digest": "sha256:" + "a" * 64},
+                           "freshness": {"stale": False}}]
+                         if request.get("query") == "with-row" else
+                         [{"artifact_root_id": request["artifact_root_id"]}]),
             }).encode()
             self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -101,8 +107,10 @@ invoke() {
   expected_code=$2
   input=$3
   set +e
-  printf '%s' "$input" | env CAIRN_ROOT="$cairn" CAIRN_READ_ENDPOINT="$endpoint" \
-    CAIRN_READ_TOKEN=w3b-read-token-secret "$cli" >"$tmp/out" 2>"$tmp/err"
+  printf '%s' "$input" | env AGENT_ARTIFACT_ROOT="$tmp/fixture-root" \
+    AGENT_DISPATCH_JOBS="$tmp/fixture-jobs.log" CAIRN_ROOT="$cairn" \
+    CAIRN_READ_ENDPOINT="$endpoint" CAIRN_READ_TOKEN=w3b-read-token-secret \
+    "$cli" >"$tmp/out" 2>"$tmp/err"
   status=$?
   set -e
   test "$status" -eq "$expected_exit" || { cat "$tmp/out" >&2; cat "$tmp/err" >&2; return 1; }
@@ -126,7 +134,19 @@ assert value == {
     "next_cursor": None,
     "telemetry_ref": "telemetry-a",
     "rows": [{"artifact_root_id": "root-a"}],
+    "hearting_verification_display": [],
 }, value
+PY
+
+invoke 0 - '{"artifact_root_id":"root-a","resolve_active":true,"query":"with-row"}'
+python3 - "$tmp/out" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+assert value["rows"][0]["stable_id"] == "art-fixture", value
+display = value["hearting_verification_display"]
+assert len(display) == 1 and display[0]["stable_id"] == "art-fixture", value
+assert display[0]["payload"]["verification"]["verdict"] == "unresolved", value
+assert display[0]["payload"]["verification"]["reason"] == "remote-root-binding-mismatch", value
 PY
 
 while IFS="	" read -r code status; do

@@ -1,27 +1,13 @@
-"""F-75 (geometry) / F-81 (placement) — the depth-1 conductor breadcrumb's right-flush rail
-label geometry, and which rail actually carries it.
+"""OWNER rail geometry and status placement.
 
-User 2026-08-14: "박스를 만들면서 하단 가로줄이 한줄을 잡아먹는데, 거기에 … 우측 정렬 같은걸
-해서 놓는건 어떨까". Before F-75, the whole route rode the owner row, which is also the box's
-TOP edge: at 140 columns a 7-node strong route clipped to `re…`, and at 200 it shoved the frame
-around. F-75 moved it to the close rail (`╰───╯`), right-flushed.
-
-F-81 (user 2026-08-20 "파이프라인은 카드 헤더 밴드가 소유한다") moved the breadcrumb AGAIN, this
-time from the close rail to the header divider (`├───┤`) — the close rail reverted to a bare
-rule (F-75's four-cell stub, width, corner, and grain unchanged). The right-flush placement
-arithmetic itself (`_dispatch_rail_label_layout`) is shared by both rails and is unchanged by
-F-81, which is why `BottomRailGeometryTest` below still calls `_dispatch_box_bottom` directly
-and still pins the geometry it always pinned. Only `CardIntegrationTest`, which renders through
-the real card and checks WHICH rail shows the text, reflects the F-81 move.
-
-This suite pins the parts that silently regress: the flush geometry (every card's label ends on
-the same column), the ledger (a label never overruns the corner), and the two suppressions
-(one-node route, no sealed route).
+F-81: singleton/boot/done and full pipelines share the child divider, or the
+close rail when childless. Worker micro-status remains inline.
 """
 import os
 import re
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -55,6 +41,35 @@ def _owner(route_seq=LONG_ROUTE, done=3, total=7):
 
 
 class BottomRailGeometryTest(unittest.TestCase):
+    def test_shared_manual_phase_pulses_current_route_label_without_moving_the_rail(self):
+        seq = [("plan-check(R1)", "done"), ("execute(R2)", "active"),
+               ("parallel-check", "pending"), ("test", "pending"), ("report", "pending")]
+        for width in (60, 100, 120, 168):
+            with self.subTest(width=width):
+                labels = []
+                for phase in (True, False):
+                    with mock.patch.object(render, "_BLINK_ON", phase):
+                        labels.append(render._route_stage_segs(seq, working=True,
+                                      max_width=render.bottom_label_budget(width)))
+                self.assertNotEqual(labels[0], labels[1])
+                self.assertEqual(render._snapshot_line(labels[0]), render._snapshot_line(labels[1]))
+                self.assertNotIn("\033[5m", render._snapshot_line(labels[0], colored=True))
+                rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=labels[0])
+                other_rail = render._dispatch_box_bottom(width, "frm_idle", label_segs=labels[1])
+                self.assertEqual(_text(rail), _text(other_rail))
+                self.assertEqual(_w(rail), width)
+
+    def test_shared_blink_cycle_has_one_second_on_and_one_second_off(self):
+        self.assertEqual([render._blink_phase(t) for t in (0, 0.5, 0.999, 1, 1.5, 1.999, 2)],
+                         [True, True, True, False, False, False, True])
+
+    def test_done_pending_and_blocked_routes_have_no_native_blink(self):
+        for seq in ([("execute", "done"), ("test", "pending")],
+                    [("execute", "done"), ("test", "done")],
+                    [("execute", "attention"), ("test", "pending")]):
+            segs = render._route_stage_segs(seq, working=True, max_width=100)
+            self.assertNotIn("\033[5m", render._snapshot_line(segs, colored=True))
+
 
     def test_label_is_right_flushed_with_a_fixed_tail(self):
         """The user chose right flush over centering: the label's END lands on the same
@@ -109,16 +124,15 @@ class RouteShownExactlyOnceTest(unittest.TestCase):
     def test_multi_node_route_leaves_the_owner_slot_to_the_rail(self):
         self.assertTrue(render._route_rides_the_rail(_owner(), LONG_ROUTE, in_card=True))
 
-    def test_one_node_route_stays_on_the_owner_row(self):
-        """The rail suppresses a one-node breadcrumb, so the row must keep it — otherwise
-        the node would appear nowhere at all."""
-        seq = [("one-shot", "active")]
+    def test_one_node_route_moves_to_the_close_rail(self):
+        """A singleton OWNER route uses the same close rail as a full pipeline."""
+        seq = [("execute", "active")]
         job = _owner(route_seq=seq, done=0, total=1)
-        self.assertFalse(render._route_rides_the_rail(job, seq, in_card=True))
-        segs = render._dispatch_stage_segs(job, "code", "one-shot", "f75-owner",
+        self.assertTrue(render._route_rides_the_rail(job, seq, in_card=True))
+        segs = render._dispatch_stage_segs(job, "code", "execute", "f75-owner",
                                            working=True, route_seq=seq,
                                            route_zone=40, compact_route=True)
-        self.assertEqual(_text(segs), "one-shot 0/1")
+        self.assertEqual(_text(segs), "execute 0/1")
 
     def test_unframed_owner_keeps_its_route_on_the_row(self):
         self.assertFalse(render._route_rides_the_rail(_owner(), LONG_ROUTE, in_card=False))
@@ -272,14 +286,53 @@ class CardIntegrationTest(unittest.TestCase):
         self.assertTrue(any("(orphan)" in row and "f75-owner" in row for row in rows))
         self.assertFalse([row for row in rows if render._dw(row) > width])
 
-    def test_one_node_route_leaves_the_rail_bare(self):
-        """A one-node route is not a pipeline: its breadcrumb would spell the owner row's
-        own compact token a second time (the F-37 single-render contract)."""
-        seq = [("one-shot", "active")]
+    def test_one_node_route_labels_the_close_rail(self):
+        """A singleton appears only on the close rail."""
+        seq = [("execute", "active")]
         rows = self._render(_owner(route_seq=seq, done=0, total=1))
         rail = [r for r in rows if "╰" in r]
         self.assertTrue(rail)
-        self.assertEqual(set(self._rail_run(rail[0])), {"─"})
+        self.assertIn("execute", rail[0])
+
+    def test_one_shot_owner_label_is_once_on_the_close_rail_in_wide_and_narrow(self):
+        for width in (80, 168):
+            for state in ("active", "done"):
+                with self.subTest(width=width, state=state):
+                    seq = [("one-shot", state)]
+                    job = _owner(route_seq=seq, done=int(state == "done"), total=1)
+                    rows = self._render(job, width=width, layout=render._layout_mode(width))
+                    label = "one-shot" + (" ✓" if state == "done" else "")
+                    rails = [r for r in rows if "╰" in r]
+                    self.assertTrue(rails)
+                    self.assertIn(label, rails[0])
+                    self.assertEqual(sum(r.count("one-shot") for r in rows), 1)
+                    self.assertTrue(render._route_rides_the_rail(job, seq, in_card=True))
+                    for row in rows:
+                        self.assertLessEqual(render._dw(row), width)
+                    phases = []
+                    for phase in (True, False):
+                        with mock.patch.object(render, "_BLINK_ON", phase):
+                            phases.append(render._route_stage_segs(seq, True, 60))
+                    self.assertEqual(phases[0] != phases[1], state == "active")
+                    self.assertNotIn("\033[5m", render._snapshot_line(phases[0], colored=True))
+
+    def test_one_shot_resource_child_places_label_on_divider_not_close_rail(self):
+        from fleet.model import ResourceJob, Session
+        job = _owner(route_seq=[("one-shot", "active")], done=0, total=1)
+        job.attempt_id = "att-one-shot-resource"
+        job.parent_sid, job.is_child = "sid-parent", True
+        resource = ResourceJob(run_id="one-shot-run", cwd=job.cwd, node="one-shot",
+                               parent_attempt_id=job.attempt_id, liveness="working")
+        job.resource_children = [resource]
+        session = Session(harness="claude", pid=915, cwd=job.cwd, session_id="sid-parent",
+                          slug="main-parent", liveness="working")
+        for width in (60, 100, 168):
+            lines = render._build_lines([session], [job], "both", False, 0,
+                                        layout=render._layout_mode(width), term_width=width,
+                                        resources=[resource])
+            rows = [_text(line) for line in lines if line]
+            self.assertTrue(any("├" in row and "one-shot" in row for row in rows))
+            self.assertFalse(any("╰" in row and "one-shot" in row for row in rows))
 
     def test_breadcrumb_survives_when_every_descendant_folded_to_done(self):
         # F-81's own regression: an owner whose children are ALL `done` folds them out of
@@ -386,19 +439,20 @@ class CardIntegrationTest(unittest.TestCase):
                 rail = [r for r in rows if "╰" in r]
                 self.assertTrue(divider)
                 self.assertEqual(sum(r.count("plan-check ✓") for r in rows), 1)
+                self.assertIn("plan-check ✓", divider[0])
                 self.assertNotIn("plan-check ✓", rail[0])
                 for row in rows:
                     if any(mark in row for mark in ("╭", "│", "├", "╰")):
                         self.assertLessEqual(render._dw(row), width)
 
-    def test_routeless_card_keeps_a_bare_rail(self):
-        """F-3/F-42a: no sealed route means no track — never a fabricated one on the rule."""
+    def test_routeless_card_keeps_its_existing_boot_state_on_the_rail(self):
+        """No sealed route keeps its boot status without fabricating a pipeline."""
         job = DispatchJob(key="code", slug="f75-noroute", cwd="/tmp/f75", harness="claude",
                           depth=1, intensity="quick", liveness="working", stage="open")
         rows = self._render(job)
         rail = [r for r in rows if "╰" in r]
         self.assertTrue(rail)
-        self.assertEqual(set(self._rail_run(rail[0])), {"─"})
+        self.assertIn("quick/exec", rail[0])
 
 
 class FinishedRowNameHueTest(unittest.TestCase):

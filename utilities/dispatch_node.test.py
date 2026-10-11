@@ -1006,6 +1006,24 @@ class ReviewRoundCapTest(unittest.TestCase):
             prior = N.prior_round_attempts(jobs, "rt-fixture", "plan-check")
         self.assertEqual(len(prior), 2)
 
+    def test_exact_attempt_exclusion_keeps_older_rounds_with_the_same_slug(self):
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            rows = self._rows("plan-check", 2).splitlines()
+            first, current = [row.split("\t") for row in rows]
+            first[4] = current[4] = "same-display-slug"
+            jobs.write_text("\n".join("\t".join(row) for row in (first, current)) + "\n")
+            attempt = N.parse_registry_metadata(current[5])["attempt_id"]
+            prior = N.prior_round_attempts(jobs, "rt-fixture", "plan-check",
+                exclude_slug="same-display-slug", exclude_attempt=attempt)
+            self.assertEqual(len(prior), 1)
+            self.assertEqual(prior[0][0], first)
+            self.assertEqual(N.admit_round(
+                {"route_id": "rt-fixture", "effective_intensity": "strong", "nodes": []},
+                {"id": "plan-check", "kind": "pipeline-stage"}, jobs,
+                exclude_slug="same-display-slug", exclude_attempt=attempt,
+            ).budget.next_round, 2)
+
     def test_execute_and_report_are_not_capped(self):
         # Reproduces the rt-08dd7ba8 shape (12 execute rounds) for the anchor
         # nodes that stay outside the review budget: execute's own retry

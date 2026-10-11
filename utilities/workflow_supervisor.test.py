@@ -35,6 +35,8 @@ import workflow_state as WS  # noqa: E402
 import capability_topology as TOPO  # noqa: E402
 import dispatch_contract as DC  # noqa: E402
 import fixture_processes  # noqa: E402
+sys.path.insert(0, str(ROOT / "tools" / "memory" / "tests"))
+from tidy_isolation import memory_fixture_env  # noqa: E402
 
 
 # Completing nodes here must not launch detached open-cycle checkpoints into
@@ -96,6 +98,11 @@ class WorkflowFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
+        # Both workflow-supervisor and work-start answer tests share this fixture.
+        # A real release spawns tidy_decisions; never inherit the caller's store.
+        memory_environment = mock.patch.dict(os.environ, memory_fixture_env(self.base))
+        memory_environment.start()
+        self.addCleanup(memory_environment.stop)
         self.workflow_root = self.base / "workflow"
         self._previous = os.environ.get("AGENT_WORKFLOW_ROOT")
         os.environ["AGENT_WORKFLOW_ROOT"] = str(self.workflow_root)
@@ -400,10 +407,19 @@ class TestSupervisorAdvance(WorkflowFixture):
         armed = json.loads(arm_path.read_text())
         armed["resource_binding"] = OWNER_RESOURCE.resource_body_digest(row)
         arm_path.write_text(json.dumps(armed))
-        producer = output / "run.json"
-        original = producer.read_bytes()
-        producer.unlink()
-        self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halt-missing-artifact")
+        original = (output / "run.json").read_bytes()
+        (output / "run.json").unlink()
+        producer = output / "science.json"
+        armed["declared_outputs"].append("science.json")
+        arm_path.write_text(json.dumps(armed))
+        waiting = SUP.poll_once(route, ledger)[0]
+        self.assertEqual(waiting["action"], "wait-next-resource")
+        # Historical observers recorded this exact missing-output failure. Keep
+        # exercising settlement of those persisted records after the policy change.
+        evidence = dict(waiting["evidence"])
+        evidence.pop("awaiting_next_resource", None)
+        ledger.record("full-run", "FAILED_RETRYABLE", evidence=evidence, actor="old-watch")
+        ledger.set_workflow_state("FAILED_RETRYABLE", evidence={"node": "full-run"}, actor="old-watch")
         return route, path, jobs, registry, ledger, producer, original
 
     def _settle_resource_owner(self, route, path, jobs, *, passed=True):
@@ -654,6 +670,70 @@ class TestSupervisorAdvance(WorkflowFixture):
                 proc.stdin.close()
             proc.wait(timeout=5)
 
+    def test_payload_success_and_failed_gpu_probe_admit_verification_with_missing_sample(self):
+        route, path, jobs, registry, output = self._resume_fixture()
+        runner = _load("probe_fixture_runner", "utilities/resource-runner.py")
+        row = json.loads(registry.read_text())["runs"]["fixture-run"]
+        observation = output / "gpu-observation.json"
+        script = self.base / "probe-bridge.py"
+        script.write_text(f'''
+import importlib.util, io, json, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+# The payload has finished and its output check passes before post-run monitoring.
+assert json.loads(Path({str(output / 'run.json')!r}).read_text())["sum"] == 10
+spec = importlib.util.spec_from_file_location("compute", {str(HERE / 'compute-hosts.py')!r})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+snapshot = io.StringIO()
+config = {{"run_root": Path({str(self.base / 'compute')!r}), "hosts": {{"gpu": {{"ssh_host": "local"}}}}}}
+with mock.patch.object(module, "load_config", return_value=config), \\
+     mock.patch.object(module, "collect_ssh_session_bridges", return_value=[]), \\
+     mock.patch.object(module, "remote", return_value=subprocess.CompletedProcess([], 1, "", "post-run GPU probe failed")), \\
+     mock.patch("sys.stdout", snapshot):
+    code = module.cmd_probe(SimpleNamespace(hosts=["gpu"], json=True))
+Path({str(observation)!r}).write_text(snapshot.getvalue())
+raise SystemExit(code)
+''')
+        env = {**os.environ, "AGENT_RESOURCE_SENTINEL": row["sentinel"]}
+        with open(row["log"], "wb") as log:
+            proc = subprocess.Popen(["/bin/sh", "-c", "read launch; " + runner.SENTINEL_SCRIPT,
+                                     "probe-bridge", sys.executable, str(script)],
+                                    stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, env=env)
+            try:
+                identity = runner.proc_identity(proc.pid)
+                deadline = time.monotonic() + 5
+                while identity is None:
+                    self.assertLess(time.monotonic(), deadline, "wrapper identity unavailable")
+                    time.sleep(0.005)
+                    identity = runner.proc_identity(proc.pid)
+                row.update(identity, status="running")
+                registry.write_text(json.dumps({"schema_version": 1, "runs": {"fixture-run": row}}))
+                proc.communicate(b"start\n", timeout=10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+        ledger = SUP.ledger_for(route, jobs)
+        with mock.patch.object(SUP, "_start_successor", return_value={"started": True}) as launch:
+            result = SUP.poll_once(route, ledger)
+            self.assertEqual(result[0]["action"], "advanced", result)
+            self.assertEqual(result[0]["successors"][0]["successor"], "one-shot")
+            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "settled")
+            self.assertEqual(launch.call_count, 1)
+        settled = json.loads(registry.read_text())["runs"]["fixture-run"]
+        self.assertEqual((settled["status"], settled["exit_code"]), ("succeeded", 0))
+        self.assertFalse(json.loads(observation.read_text())[0]["reachable"])
+        self.assertIn("observation unavailable", Path(row["log"]).read_text())
+        import resource_resume
+        self.assertEqual(resource_resume.observation(route, jobs)["state"], "resource-succeeded")
+        self.assertIn("independent post-run verification", resource_resume.verification_prompt(route, jobs))
+        # Admission is not verification PASS. A required sample can fail its existing check.
+        ledger.record("one-shot", "FAILED_RETRYABLE", evidence={"reason": "required-gpu-sample-missing"})
+        self.assertEqual(json.loads(registry.read_text())["runs"]["fixture-run"], settled)
+        self.assertNotEqual(ledger.state()["workflow_state"], "COMPLETE")
+
     def test_verified_resume_exit_marker_claim_and_replay_are_not_workflow_complete(self):
         route, path, jobs, registry, output = self._resume_fixture()
         ledger = SUP.ledger_for(route, jobs)
@@ -683,7 +763,7 @@ class TestSupervisorAdvance(WorkflowFixture):
         self.assertEqual(resource_resume.observation(route, jobs)["state"], "needs-attention")
         self.assertEqual(jobs.read_text(), "")
 
-    def test_verified_resume_missing_producer_artifact_never_synthesizes_or_verifies(self):
+    def test_missing_run_record_is_runtime_authored_without_scientific_verification(self):
         for ordinary in (False, True):
             with self.subTest(ordinary=ordinary):
                 node = "full-run" if ordinary else "resume-run"
@@ -693,15 +773,17 @@ class TestSupervisorAdvance(WorkflowFixture):
                 ledger = SUP.ledger_for(route, jobs)
                 with mock.patch.object(SUP, "_start_successor") as launch:
                     result = SUP.poll_once(route, ledger)
-                    self.assertEqual(result[0]["action"], "halt-missing-artifact")
-                    self.assertEqual(result[0]["evidence"]["artifacts"]["missing"], ["run.json"])
-                    self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halted")
-                    self.assertEqual(launch.call_count, 0)
-                self.assertFalse(producer.exists())
+                    self.assertEqual(result[0]["action"], "wait-next-resource" if ordinary else "advanced")
+                    self.assertEqual(result[0]["evidence"]["artifacts"]["missing"], [])
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "wait-next-resource" if ordinary else "settled")
+                    self.assertEqual(launch.call_count, 0 if ordinary else 1)
+                self.assertTrue(producer.exists())
+                runtime = json.loads(producer.read_text())["hearting_resource_runs"]
+                self.assertEqual(runtime["runs"]["fixture-run"]["exit_code"], 0)
                 self.assertFalse(producer.with_suffix(".json.tmp").exists())
-                self.assertFalse((jobs.parent / "completion" / route["route_id"] / f"{node}.json").exists())
-                self.assertEqual(ledger.claims(), {})
-                self.assertEqual(ledger.state()["workflow_state"], "FAILED_RETRYABLE")
+                self.assertEqual((jobs.parent / "completion" / route["route_id"] / f"{node}.json").exists(), not ordinary)
+                self.assertEqual(len(ledger.claims()), 0 if ordinary else 1)
+                self.assertEqual(ledger.state()["nodes"][node]["state"], "RUNNING" if ordinary else "STAGE_SUCCEEDED")
                 self.assertEqual(jobs.read_text(), "")
 
     def test_verified_resume_changed_runtime_evidence_preserves_producer_and_refuses_marker(self):
@@ -900,6 +982,8 @@ class TestSupervisorAdvance(WorkflowFixture):
 
     def test_declared_artifact_absence_halts_the_advance(self):
         route, path = self.two_stage_route()
+        route["nodes"][0]["outputs"].append("metrics.json")
+        path.write_text(json.dumps(route))
         registry = self.resource_registry(exit_code=0)
         self.arm(path, registry, extra=["--artifact-base", str(self.base)])
         ledger = SUP.ledger_for(route)
@@ -1363,6 +1447,8 @@ class TestStatusProjection(WorkflowFixture):
         route, path = self.two_stage_route()
         ledger = SUP.ledger_for(route)
         ledger.root.mkdir(parents=True)
+        ledger.claim("a" * 32, {"predecessor": "eval-run", "successor": "verify",
+                                             "claimed_by_pid": 12345})
         gates = {"verify": {"passed": True}}
         outcome = {"route_id": route["route_id"], "route_hash": route["route_hash"],
                    "terminal_gate_proven": True}
@@ -1397,6 +1483,7 @@ class TestStatusProjection(WorkflowFixture):
             self.assertEqual(projection["current_stage"], [])
             self.assertEqual(projection["next_stage"], [])
         self.assertEqual(status["journal_workflow_state"], "CREATED")
+        self.assertTrue(status["claims"])
         self.assertEqual(before_registry, (self.base / "jobs.log").read_bytes()
                          if (self.base / "jobs.log").exists() else None)
         self.assertEqual(before_journal, ledger.journal_path.read_bytes()
@@ -3859,6 +3946,200 @@ class TestGateDeliveredInParentReceipt(WorkflowFixture):
 
 def gate_epoch(ledger, gate):
     return SUP.gate_raise_epoch(ledger, gate)
+
+
+class TestHarnessResourceEvidence(WorkflowFixture):
+    def test_owner_fields_added_to_runtime_document_preserve_exact_bytes(self):
+        route, path = self.two_stage_route()
+        registry = self.resource_registry(exit_code=0)
+        self.arm(path, registry, extra=['--artifact-base', str(self.base)])
+        armed = SUP.read_armed(SUP.ledger_for(route))['run']
+        evidence = SUP.resource_evidence(armed)
+        SUP.resource_output_evidence(route, armed, evidence)
+        output = self.base / 'run.json'
+        document = json.loads(output.read_bytes())
+        document['metric'] = 0.91
+        before = json.dumps(document, separators=(', ', ' : ')).encode()
+        output.write_bytes(before)
+        later = {**armed, 'node': 'later'}
+        self.assertFalse(SUP.resource_output_evidence(route, later, evidence)['runtime_only'])
+        self.assertEqual(output.read_bytes(), before)
+
+    def test_other_node_and_history_markers_preserve_bound_document(self):
+        for name in ('previous.json', 'run.1.json'):
+            with self.subTest(marker=name):
+                route, path = self.two_stage_route(route_id='rt-marker-' + name)
+                registry = self.resource_registry(exit_code=0)
+                jobs = self.base / 'jobs.log'
+                jobs.write_text('')
+                self.arm(path, registry, extra=['--artifact-base', str(self.base), '--jobs', str(jobs)])
+                armed = SUP.read_armed(SUP.ledger_for(route))['run']
+                evidence = SUP.resource_evidence(armed)
+                SUP.resource_output_evidence(route, armed, evidence)
+                output = self.base / 'run.json'
+                before = output.read_bytes()
+                marker = SUP.route_module().completion_dir(route['route_id'], jobs=jobs) / name
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(json.dumps({'evidence': {'path': str(output)}}))
+                # A later node would change the per-run facts without protection.
+                later = {**armed, 'node': 'later'}
+                SUP.resource_output_evidence(route, later, evidence)
+                self.assertEqual(output.read_bytes(), before)
+                output.unlink()
+
+    def test_output_write_error_keeps_actual_execution_failure(self):
+        for exit_code in (3, 0):
+            with self.subTest(exit_code=exit_code):
+                route, path = self.two_stage_route(route_id='rt-write-error-' + str(exit_code))
+                registry = self.resource_registry(exit_code=exit_code)
+                self.arm(path, registry, extra=['--artifact-base', str(self.base)])
+                ledger = SUP.ledger_for(route)
+                # The location was valid at arm time, then became unwritable.
+                (self.base / 'run.json').mkdir()
+                result = SUP.poll_once(route, ledger)[0]
+                self.assertEqual(result['action'], 'halt-failed' if exit_code else 'wait-resource-output')
+                state = ledger.state()
+                self.assertEqual(state['nodes']['run']['state'], 'FAILED_RETRYABLE' if exit_code else 'RUNNING')
+                if exit_code:
+                    self.assertEqual(state['workflow_state'], 'FAILED_RETRYABLE')
+                    self.assertEqual(state['nodes']['run']['evidence']['exit_code'], exit_code)
+                    self.assertIn('runtime_output_error', state['nodes']['run']['evidence'])
+                (self.base / 'run.json').rmdir()
+
+    def test_late_output_recovery_resumes_each_durable_transition(self):
+        for target in ('node-READY', 'node-RUNNING', 'workflow-READY', 'workflow-RUNNING'):
+            with self.subTest(target=target):
+                route, path = self.two_stage_route(route_id='rt-recover-' + target)
+                route['nodes'][0]['outputs'].append('science.json')
+                path.write_text(json.dumps(route))
+                registry = self.resource_registry(exit_code=0)
+                self.arm(path, registry, extra=['--artifact-base', str(self.base)])
+                ledger = SUP.ledger_for(route)
+                self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'halt-missing-artifact')
+                history = ledger.journal_path.read_bytes()
+                (self.base / 'science.json').write_text('{"score":1}')
+                method = 'record' if target.startswith('node') else 'set_workflow_state'
+                original = getattr(WS.WorkflowLedger, method)
+                def interrupted(instance, *args, **kwargs):
+                    result = original(instance, *args, **kwargs)
+                    state = args[1] if method == 'record' else args[0]
+                    if state == target.split('-')[1] and kwargs.get('actor') == 'resource-output-recovery':
+                        raise OSError('fixture interruption after durable append')
+                    return result
+                with mock.patch.object(WS.WorkflowLedger, method, interrupted):
+                    with self.assertRaises(OSError):
+                        SUP.poll_once(route, ledger)
+                with mock.patch.object(SUP, '_start_successor', return_value={'started': True}) as start:
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'advanced')
+                    self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'settled')
+                    self.assertEqual(start.call_count, 1)
+                self.assertTrue(ledger.journal_path.read_bytes().startswith(history))
+                (self.base / 'science.json').unlink()
+                (self.base / 'run.json').unlink()
+
+    def test_late_output_cannot_promote_failed_or_changed_execution(self):
+        for kind in ('failed', 'sentinel', 'identity', 'namespace', 'cancelled', 'other-failure'):
+            with self.subTest(kind=kind):
+                route, path = self.two_stage_route(route_id='rt-' + kind)
+                route['nodes'][0]['outputs'].append('science.json')
+                path.write_text(json.dumps(route))
+                registry = self.resource_registry(exit_code=3 if kind == 'failed' else 0)
+                self.arm(path, registry, extra=['--artifact-base', str(self.base)])
+                ledger = SUP.ledger_for(route)
+                SUP.poll_once(route, ledger)
+                old = ledger.journal_path.read_bytes()
+                row = json.loads(registry.read_text())['runs']['fixture-run']
+                if kind == 'sentinel':
+                    Path(row['sentinel']).write_text('7')
+                elif kind == 'identity':
+                    row['starttime'] = 'another-birth'
+                elif kind == 'namespace':
+                    row['pid_namespace'] = 'foreign-namespace'
+                elif kind == 'cancelled':
+                    ledger.record('run', 'CANCELLED', evidence={'explicit_stop': True})
+                    ledger.set_workflow_state('CANCELLED', evidence={'explicit_stop': True})
+                    old = ledger.journal_path.read_bytes()
+                elif kind == 'other-failure':
+                    ledger.record('verify', 'FAILED_RETRYABLE', evidence={'scientific_failure': True})
+                    old = ledger.journal_path.read_bytes()
+                registry.write_text(json.dumps({'runs': {'fixture-run': row}}))
+                (self.base / 'science.json').write_text('{"score":1}')
+                with mock.patch.object(SUP, '_start_successor') as launch:
+                    self.assertIn(SUP.poll_once(route, ledger)[0]['action'], ('halted', 'settled'))
+                    self.assertEqual(launch.call_count, 0)
+                self.assertEqual(ledger.journal_path.read_bytes(), old)
+                (self.base / 'science.json').unlink()
+                (self.base / 'run.json').unlink(missing_ok=True)
+
+    def test_marker_bound_runtime_document_stays_byte_identical(self):
+        route, path = self.two_stage_route()
+        registry = self.resource_registry(exit_code=0)
+        jobs = self.base / 'jobs.log'
+        jobs.write_text('')
+        self.arm(path, registry, extra=['--artifact-base', str(self.base), '--jobs', str(jobs)])
+        ledger = SUP.ledger_for(route)
+        armed = SUP.read_armed(ledger)['run']
+        evidence = SUP.resource_evidence(armed)
+        SUP.resource_output_evidence(route, armed, evidence)
+        before = (self.base / 'run.json').read_bytes()
+        marker = SUP.route_module().completion_dir(route['route_id'], jobs=jobs) / 'run.json'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"fixture": "bound"}')
+        SUP.resource_output_evidence(route, armed, evidence)
+        self.assertEqual((self.base / 'run.json').read_bytes(), before)
+
+    def test_wrong_owner_location_is_replaced_by_runtime_execution_evidence(self):
+        route, path = self.two_stage_route()
+        registry = self.resource_registry(exit_code=0)
+        wrong = self.base / "experiments" / "nested"
+        wrong.mkdir(parents=True)
+        (wrong / "run.json").write_text('{"metric": 0.91}')
+        self.arm(path, registry, extra=["--artifact-base", str(self.base)])
+        ledger = SUP.ledger_for(route)
+        with mock.patch.object(SUP, "_start_successor", return_value={"started": True}) as launch:
+            result = SUP.poll_once(route, ledger)
+            self.assertEqual(result[0]["action"], "advanced", result)
+            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "settled")
+        document = json.loads((self.base / "run.json").read_text())
+        execution = document["hearting_resource_runs"]["runs"]["fixture-run"]
+        self.assertEqual(execution["exit_code"], 0)
+        self.assertEqual(execution["pid"], 999999999)
+        self.assertEqual(execution["log"], str(self.base / "run.log"))
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(json.loads((wrong / "run.json").read_text()), {"metric": 0.91})
+
+    def test_late_required_output_repolls_without_erasing_failure(self):
+        route, path = self.two_stage_route()
+        route["nodes"][0]["outputs"].append("metrics.json")
+        path.write_text(json.dumps(route))
+        registry = self.resource_registry(exit_code=0)
+        self.arm(path, registry, extra=["--artifact-base", str(self.base)])
+        ledger = SUP.ledger_for(route)
+        self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "halt-missing-artifact")
+        original = ledger.journal_path.read_bytes()
+        (self.base / "metrics.json").write_text('{"score": 1}')
+        with mock.patch.object(SUP, "_start_successor", return_value={"started": True}) as launch:
+            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "advanced")
+            self.assertEqual(SUP.poll_once(route, ledger)[0]["action"], "settled")
+        self.assertEqual(launch.call_count, 1)
+        self.assertTrue(ledger.journal_path.read_bytes().startswith(original))
+        self.assertEqual(ledger.state()["nodes"]["run"]["state"], "STAGE_SUCCEEDED")
+
+    def test_arm_announces_and_checks_paths_before_any_execution(self):
+        route, path = self.two_stage_route()
+        registry = self.resource_registry(exit_code=0)
+        output = self.base / "output"
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            self.arm(path, registry, extra=["--artifact-base", str(output)])
+        receipt = json.loads(stream.getvalue())
+        self.assertEqual(receipt["runtime_output"], str(output / "run.json"))
+        self.assertEqual(receipt["expected_outputs"], [str(output / "run.json")])
+        self.assertTrue(output.is_dir())
+        bad = self.base / "not-a-directory"
+        bad.write_text("foreign")
+        with self.assertRaises((SUP.SupervisorError, OSError, ValueError)):
+            self.arm(path, registry, extra=["--artifact-base", str(bad)])
 
 
 if __name__ == "__main__":

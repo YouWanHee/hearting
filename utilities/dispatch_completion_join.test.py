@@ -1358,6 +1358,21 @@ class DispatchCompletionJoinTest(unittest.TestCase):
             path.write_text(json.dumps(bad))
             self.assertIsNone(JOIN.read_supervisor_phase_state(path,"att-parent"))
 
+        failed = {**receipt, "state": "needs-attention", "exit_code": None,
+                  "reason": "FAILED_RETRYABLE", "successors": [],
+                  "launch_error": {"type": "GPUUnavailable", "message": "Local GPU admission on controller: in use"}}
+        def diagnostic_state(error, state="needs-attention"):
+            message = {**failed, "state": state, "launch_error": error}
+            digest = RESOURCE.RESUME.row_digest(message)
+            return {"session_id": "same-native", "delivered": [], "outbox": {
+                "receipt_id": "resource-" + digest[:32], "digest": digest, "key": "a" * 64, "receipt": message}}
+        self.assertTrue(JOIN.valid_resource_state(diagnostic_state(failed["launch_error"])))
+        for error in ({}, {"type": "GPUUnavailable", "message": "x", "extra": True},
+                      {"type": "GPUUnavailable", "message": "x" * 2049},
+                      {"type": "GPUUnavailable", "message": None}):
+            self.assertFalse(JOIN.valid_resource_state(diagnostic_state(error)))
+        self.assertFalse(JOIN.valid_resource_state(diagnostic_state(failed["launch_error"], state="cancelled")))
+
     def test_supervisor_phase_state_is_atomic_bounded_and_parent_scoped(self):
         state = self.root / "runtime" / "parent.json"
         JOIN.write_supervisor_state(state, "att-parent", {"att-b", "att-a"})
@@ -3636,6 +3651,54 @@ class MaterializePendingDeliveryTest(unittest.TestCase):
                 JOIN.pending_record_identity(D.parse_registry_metadata(fields[5])),
                 ("rt-materialize-fixture", "execute", "att-materialize-parent"),
             )
+
+    def test_standalone_stage_terminal_materializes_for_each_harness_and_parent(self):
+        # 2026-10-08: the raw first-NOW verification stage had no owner route.
+        # A terminal intent alone left no ledger for the parent courier.
+        for harness in ("claude", "codex", "opencode"):
+            for delivery in ("claude-parent-runtime", "codex-native-queue"):
+                with self.subTest(harness=harness, delivery=delivery), \
+                        tempfile.TemporaryDirectory() as td:
+                    jobs = Path(td) / "jobs.log"
+                    attempt = f"att-standalone-{harness}"
+                    pipe = ",".join([
+                        self.CURRENT_METADATA.replace("dispatch_depth=2", "dispatch_depth=1"),
+                        f"attempt_id={attempt}", "worker_type=stage", "unit=qa/test",
+                        f"parent_completion_delivery={delivery}",
+                        "parent_sid=sess-standalone", f"harness={harness}",
+                    ])
+                    jobs.write_text(f"t\topen\t/r\t/w\tfirst-now\t{pipe}\n")
+                    self.assertTrue(D.close_attempt_row(jobs, attempt, "dead-exact-pid"))
+                    registry_before = jobs.read_bytes()
+                    path = JOIN.materialize_after_terminal_close(jobs, attempt)
+                    self.assertIsNotNone(path)
+                    record = json.loads(path.read_text())
+                    self.assertEqual(record["route_id"], f"stage:{attempt}")
+                    self.assertEqual(record["route_node"], "_stage")
+                    self.assertEqual(record["parent_attempt_id"], JOIN.NO_PARENT_ATTEMPT)
+                    self.assertEqual(record["recipient_kind"], delivery)
+                    self.assertEqual(record["attempt_ids"], [attempt])
+                    self.assertEqual(record["state"], "pending")
+                    self.assertEqual(record["receipt"]["delivery_classification"], "attention")
+                    # Existing trigger/backstop replay is idempotent and grants
+                    # neither a route binding nor a different terminal result.
+                    self.assertEqual(JOIN.materialize_after_terminal_close(jobs, attempt), path)
+                    self.assertEqual(jobs.read_bytes(), registry_before)
+                    self.assertEqual(len(list(path.parent.glob("delivery-*.json"))), 1)
+
+    def test_standalone_stage_scope_does_not_cover_incomplete_bound_stage(self):
+        metadata = D.parse_registry_metadata(",".join([
+            self.CURRENT_METADATA.replace("dispatch_depth=2", "dispatch_depth=1"),
+            "attempt_id=att-partial-stage", "worker_type=stage",
+            "route_id=rt-partial", "parent_sid=sess-standalone",
+        ]))
+        self.assertEqual(JOIN.pending_record_identity(metadata), ("rt-partial", "", ""))
+        metadata.pop("route_id")
+        metadata["dispatch_depth"] = "2"
+        self.assertEqual(JOIN.pending_record_identity(metadata), ("", "", ""))
+        metadata["dispatch_depth"] = "1"
+        metadata.pop("attempt_id")
+        self.assertEqual(JOIN.pending_record_identity(metadata)[0], "")
 
     def test_refused_materialize_leaves_a_durable_log_line(self):
         # A depth-2 row with no route identity is still refused, but the

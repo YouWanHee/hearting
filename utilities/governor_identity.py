@@ -46,9 +46,12 @@ def capture_local_identity() -> dict[str, Any]:
         boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
         if not boot:
             raise ValueError("missing boot id")
+        from resource_run_registry import boot_identity
+        host = boot_identity()
         return {"pid": pid, "starttime": _starttime(pid), "boot_id": boot,
                 "pid_namespace": os.stat("/proc/self/ns/pid").st_ino,
-                "NSpid": nspid, "NSpgid": nspgid}
+                "NSpid": nspid, "NSpgid": nspgid,
+                **({'boot_host': host['boot_host']} if host.get('boot_id') == boot else {})}
     try:
         before, after = sample(), sample()
         if before != after:

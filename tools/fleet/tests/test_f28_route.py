@@ -425,7 +425,7 @@ class OrphanConductorAnnotationTest(unittest.TestCase):
             json.dump(record, fh)
         return path
 
-    def test_dead_owner_with_open_child_is_stamped_orphaned(self):
+    def _owner_with_open_child(self, *, quiescent):
         with tempfile.TemporaryDirectory() as td:
             home = os.path.join(td, "home")
             marker_dir = os.path.join(home, ".dispatch", "completion", "rt-fleet-orphan")
@@ -453,13 +453,38 @@ class OrphanConductorAnnotationTest(unittest.TestCase):
                     "execution_surface=registered-headless,registered_worker=1,"
                     "fallback_hop=same-harness-headless\n" % route_file
                 )
+            # This annotation unit consumes the shared process verdict. A bare
+            # extinct PID does not establish that its original group is empty.
+            registry = dispatch._orphan_registry_module()
+            self.assertIsNotNone(registry)
+            contract = sys.modules["dispatch_contract"]
+            observation = contract.ProcessQuiescence(
+                "quiescent" if quiescent else "unverifiable",
+                "local-pid-gone" if quiescent else "process-group-missing")
+            with open(jobs_path, "rb") as fh:
+                before = fh.read()
             with mock.patch.object(dispatch.procscan, "_ps_lines", return_value=[]), \
+                 mock.patch.object(contract, "attempt_process_quiescence", return_value=observation), \
+                 mock.patch.object(dispatch, "observed_supervised_owner_liveness", return_value=None), \
                  mock.patch.dict(os.environ, {"AGENT_HOME": home}):
+                # Isolate the orphan annotator's coarse dead-job input. The
+                # shared registry verdict still decides whether it may stamp
+                # the unchanged original row; missing group evidence cannot.
                 jobs = dispatch.collect(jobs_path=jobs_path)
-            owner = next(j for j in jobs if j.slug == "owner")
-            self.assertEqual(owner.liveness, "dead")
-            self.assertEqual(owner.note, "dead-parent-orphaned")
-            self.assertEqual(owner.resume_boundary, "execute")
+            with open(jobs_path, "rb") as fh:
+                self.assertEqual(fh.read(), before)
+            return next(j for j in jobs if j.slug == "owner")
+
+    def test_dead_owner_with_open_child_is_stamped_orphaned(self):
+        owner = self._owner_with_open_child(quiescent=True)
+        self.assertEqual(owner.liveness, "dead")
+        self.assertEqual(owner.note, "dead-parent-orphaned")
+        self.assertEqual(owner.resume_boundary, "execute")
+
+    def test_missing_group_observation_keeps_the_same_original_row_unannotated(self):
+        owner = self._owner_with_open_child(quiescent=False)
+        self.assertIsNone(owner.note)
+        self.assertIsNone(owner.resume_boundary)
 
     def test_dead_owner_with_completed_route_is_never_stamped(self):
         with tempfile.TemporaryDirectory() as td:

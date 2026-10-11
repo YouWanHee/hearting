@@ -2,11 +2,14 @@
 import os
 import sys
 import unittest
+import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from fleet import render  # noqa: E402
 from fleet.model import ContextProjection, DispatchJob, ProgressProjection, Session, WorkProjection  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines
 
 
 def text(lines):
@@ -59,7 +62,7 @@ class OwnerFallbackTest(unittest.TestCase):
 
     def _render(self, sessions, jobs, process=False, term_width=168):
         render.set_process_view(process)
-        return text(render._build_lines(
+        return text(build_observed_lines(
             sessions, jobs, section="both", narrow=False, malformed=0,
             layout="wide", term_width=term_width,
         ))
@@ -117,8 +120,12 @@ class OwnerFallbackTest(unittest.TestCase):
     def test_drill_unresolved_root_remains_standalone(self):
         work = self._route_projection("rt-drill")
         stage = self._stage("drill-claude-parent-session", work=work)
-        stage.cwd = "/tmp/drill-owner-fallback-abcd/repo"
-        rendered = self._render([], [stage])
+        with tempfile.TemporaryDirectory(prefix="drill-owner-fallback-") as root:
+            stage.cwd = root + "/repo"
+            # This synthetic fixture has no Git repository. Ignore an unrelated
+            # repository enclosing the machine's temporary directory.
+            with mock.patch("fleet.gitinfo.resolve_gitdir", return_value=(None, None)):
+                rendered = self._render([], [stage])
         self.assertNotIn("orphaned dispatch rows", rendered)
         self.assertNotIn("(orphan)", rendered)
         self.assertIn("stage-execute", rendered)

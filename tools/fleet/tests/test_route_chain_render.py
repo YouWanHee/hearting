@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
@@ -29,6 +30,7 @@ def _cell(chain, width=40, **kw):
     return None if segs is None else _text(segs)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class RouteChainCellTest(unittest.TestCase):
     def test_mockup_research_done_draft_open_apply_planned(self):
         nodes = [_node("research", "done"), _node("draft", "open", shape="solo"),
@@ -123,7 +125,25 @@ class RouteChainCellTest(unittest.TestCase):
         self.assertIn((" ●", "g_work"), keyed)
         self.assertIn(("std", "dim"), keyed)            # the current node's knobs stay dim
         idle = render._route_chain_bodies(chain, working=False)[0]
-        self.assertIn(("lab", None), idle)               # plain, not dim, while idle
+        self.assertIn(("lab", None), idle)              # base remains plain while idle
+
+    def test_current_open_item_blinks_while_idle_and_working_but_closed_or_planned_does_not(self):
+        for working in (False, True):
+            node = {"label": "code", "state": "open"}
+            phases, past = [], []
+            for phase in (True, False):
+                with mock.patch.object(render, "_BLINK_ON", phase):
+                    phases.append(render._route_chain_node_segs(node, False, {}, is_current=True, working=working))
+                    past.append(render._route_chain_node_segs(node, False, {}, is_current=False, working=working))
+            self.assertNotEqual(phases[0], phases[1])
+            self.assertEqual(past[0], past[1])
+            self.assertEqual(render._snapshot_line(phases[0]), "code ●")
+            self.assertEqual(render._snapshot_line(phases[0]), render._snapshot_line(phases[1]))
+            self.assertNotIn("\033[5m", render._snapshot_line(phases[0], colored=True))
+        for state in ("done", "planned", "failed"):
+            segs = render._route_chain_node_segs({"label": "code", "state": state}, False, {},
+                                                is_current=True, working=True)
+            self.assertNotIn("\033[5m", render._snapshot_line(segs, colored=True))
 
     def test_failed_past_node_keeps_its_red_glyph(self):
         nodes = [_node("code", "failed"), _node("lab", "open")]
@@ -142,6 +162,7 @@ class RouteChainCellTest(unittest.TestCase):
         self.assertIn("+1?", current_only)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class OwnerDialShapeTest(unittest.TestCase):
     def _owner_job(self, shape="staged", route_origin="compose"):
         record = {"selection": {"route_origin": route_origin, "shape": shape}}
@@ -176,6 +197,7 @@ class OwnerDialShapeTest(unittest.TestCase):
         self.assertNotIn("staged", _text(segs))
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class MainStageCellTest(unittest.TestCase):
     def test_open_route_beats_marker_then_marker_then_dash(self):
         session = Session(harness="claude", pid=1, session_id="s1")
@@ -234,6 +256,7 @@ def _chain_session(nodes, current, sid="sid-chain", plan=()):
     return session
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class ChainInStageCellTest(unittest.TestCase):
     """User 2026-09-18: the chain takes the session's stage cell (the old `-` slot), up to
     40 cells, as a window of at most four nodes (one next plan step); no separate line."""

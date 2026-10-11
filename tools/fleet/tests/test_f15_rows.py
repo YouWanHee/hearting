@@ -16,6 +16,7 @@ if _TOOLS_DIR not in sys.path:
 from fleet import render               # noqa: E402
 from fleet.collectors import dispatch  # noqa: E402
 from fleet.model import DispatchJob, Session  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines
 
 
 class SlugStemTest(unittest.TestCase):
@@ -200,7 +201,7 @@ class FoldingTest(unittest.TestCase):
     def _emit(self, conductor, children, show_all=False):
         render.set_show_all(show_all)
         try:
-            lines = render._build_lines([], [conductor] + children, section="dispatch",
+            lines = build_observed_lines([], [conductor] + children, section="dispatch",
                                         narrow=False, malformed=0, layout="wide")
         finally:
             render.set_show_all(False)
@@ -239,7 +240,7 @@ class FoldingTest(unittest.TestCase):
                             worker_role="development", liveness="working")
         render.set_show_all(False)
         try:
-            lines = render._build_lines([], [conductor, child], section="dispatch",
+            lines = build_observed_lines([], [conductor, child], section="dispatch",
                                         narrow=False, malformed=0, layout="wide",
                                         term_width=240)
         finally:
@@ -248,7 +249,7 @@ class FoldingTest(unittest.TestCase):
         running_keys = [key for line in lines if line for t, key in line if t == "running"]
         preparing_keys = [key for line in lines if line for t, key in line if t == "preparing…"]
         self.assertIn("exec agent-first-home-c", text)
-        self.assertIn("code-execute(strong)", text)
+        self.assertIn("code-execute", text)
         self.assertNotIn("dev/refactor·strong·development", text)
         self.assertTrue(any(key in ("stg1_on", "stg1_off") for key in running_keys))
         self.assertTrue(any(key in ("stg0_on", "stg0_off") for key in preparing_keys))
@@ -290,7 +291,7 @@ class FoldingTest(unittest.TestCase):
                             parent_slug="missing-owner", worker_role="code-plan",
                             liveness="working", cwd="/tmp/project")
         render.set_show_all(False)
-        lines = render._build_lines([], [child], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [child], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(t for t, _k in line) for line in lines if line)
         self.assertIn("plan live-depth-two", text)
@@ -306,13 +307,13 @@ class FoldingTest(unittest.TestCase):
                                 parent_slug="missing-owner", worker_role="code-exec",
                                 liveness=finished, cwd="/tmp/project")
             render.set_show_all(False)
-            lines = render._build_lines([], [child], section="dispatch", narrow=False,
+            lines = build_observed_lines([], [child], section="dispatch", narrow=False,
                                         malformed=0, layout="wide")
             text = "\n".join("".join(t for t, _k in line) for line in lines if line)
             self.assertNotIn("finished-depth-two", text, finished)
             render.set_show_all(True)
             try:
-                lines = render._build_lines([], [child], section="dispatch", narrow=False,
+                lines = build_observed_lines([], [child], section="dispatch", narrow=False,
                                             malformed=0, layout="wide")
                 text = "\n".join("".join(t for t, _k in line) for line in lines if line)
                 self.assertIn("finished-depth-two", text, finished)
@@ -411,13 +412,16 @@ class TitleCapTest(unittest.TestCase):
         self.assertLessEqual(len(name_text), render._TITLE_MAX)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class OptsDialHierarchyTest(unittest.TestCase):
     """user 2026-07-20: "계층적으로 code (mode inten) / boot 순" — the dial reads
     capability (behaviour knobs) / environment, not a flat '·' chain mixing the axes."""
 
     @staticmethod
     def _dial(j):
-        segs, w = render._opts_segs(j)
+        # Internal contracts remain available in the explicit detail surface.
+        with mock.patch.object(render, "_SHOW_ALL", True):
+            segs, w = render._opts_segs(j)
         text = "".join(t for t, _k in segs)
         assert w == len(text), "declared width must match rendered text"
         return text
@@ -426,6 +430,14 @@ class OptsDialHierarchyTest(unittest.TestCase):
         j = DispatchJob(key="code", slug="s", depth=1, mode="dev",
                         intensity="standard", profile="boot")
         self.assertEqual(self._dial(j), "code(dev·std) / boot")
+
+    def test_normal_owner_uses_original_term_once(self):
+        for key, expected in (("code", "code owner"), ("owner", "owner")):
+            with self.subTest(key=key), mock.patch.object(render, "_SHOW_ALL", False):
+                job = DispatchJob(key=key, slug="s", depth=1, worker_type="owner")
+                segs, width = render._opts_segs(job)
+                self.assertEqual(render._plain(segs), expected)
+                self.assertEqual(width, render._dw(expected))
 
     def test_depth2_worker_shows_assigned_skill_not_parent_mode(self):
         j = DispatchJob(key="code-test", slug="s", depth=2, mode="dev/refactor",

@@ -40,7 +40,8 @@ TWO_HOURS, TWO_DAYS, EIGHT_DAYS = 2 * 3600, 2 * 24 * 3600, 8 * 24 * 3600
 # Only these reach the commands under test; everything else is set explicitly,
 # so a caller running inside a dispatch worker (AGENT_ARTIFACT_*, AGENT_WORKFLOW_ROOT,
 # session ids, XDG state) cannot steer a test write into a real artifact root.
-INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR", "USER", "LOGNAME", "SHELL")
+INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR", "USER", "LOGNAME", "SHELL",
+             "GIT_CONFIG_GLOBAL")  # Preserve the official runner's private safe.directory.
 
 
 def isolated_env(**explicit) -> dict:
@@ -529,14 +530,46 @@ class RouteAutocloseTest(unittest.TestCase):
         # A key that only prefixes another stream's folder name finds nothing.
         self.assertIsNone(RA.campaign_of_route(self.root, {"campaign_key": "other"}))
 
-    def test_campaign_status_still_closes_routes_in_every_campaign(self):
+    def test_campaign_status_observes_and_writer_closes_its_selected_campaign(self):
+        # Query leaves ended routes alone; the existing writer owns the sweep.
         other_file, other, other_record = self._other_campaign_ended()
         mine_file, mine = self.compose("mine", "codex", "mine-session", campaign="scope-mine")
         self.assertIsNone(self.outcome(other_file))
-        done = self.campaign("campaign-status", self.cycle(mine)["campaign_id"])
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        observed = self.campaign("campaign-status", self.cycle(mine)["campaign_id"])
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(before, {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
+        self.assertIsNone(self.outcome(other_file))
+        done = self.campaign("campaign-close", other_record["campaign_id"], "--reason", "done")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "session-ended")
+        self.assertEqual(self.outcome(other_file)["autoclose"]["reason"], "campaign-close")
         self.assertEqual(self.cycle_record(other_record["cycle_id"])["state"], "sealed")
+
+    def test_campaign_close_preserves_unrelated_stale_routes_and_empty_controls(self):
+        other_file, _other, other_record = self._other_campaign_ended()
+        self.claude_crashed("empty-session")
+        empty_file, empty = self.compose("empty-other", "claude", "empty-session",
+                                         campaign="empty-other-stream")
+        empty_record = self.cycle(empty)
+        self.age(empty_file, "claude", "empty-session", TWO_HOURS)
+        self.claude_crashed("mine-ended")
+        mine_file, mine = self.compose("close-mine", "claude", "mine-ended",
+                                      campaign="close-selected-stream")
+        mine_record = self.write_artifact(mine)
+        self.age(mine_file, "claude", "mine-ended", TWO_HOURS)
+        protected = [other_file, empty_file]
+        for record in (other_record, empty_record):
+            protected.extend(p for p in self.cycle_dir(record).rglob("*") if p.is_file())
+            protected.append(artifact_producer.cycle_record_path(self.root, record["cycle_id"]))
+        before = {str(path): path.read_bytes() for path in protected}
+        done = self.campaign("campaign-close", mine_record["campaign_id"], "--reason", "done")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout)["status"], "satisfied")
+        self.assertEqual(before, {str(path): path.read_bytes() for path in protected})
+        self.assertIsNone(self.outcome(other_file))
+        self.assertIsNone(self.outcome(empty_file))
+        self.assertEqual(self.cycle_record(empty_record["cycle_id"])["state"], "open")
+        self.assertEqual(self.outcome(mine_file)["autoclose"]["reason"], "campaign-close")
 
     def test_r6_sub_agent_sharing_the_session_id_leaves_the_parent_route_alone(self):
         self.claude_alive("parent")
@@ -900,7 +933,7 @@ class RouteAutocloseTest(unittest.TestCase):
         before = {path: path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}
         index_before = (index.stat().st_mtime_ns, index.read_bytes())
         self.env["PATH"] = str(shim_dir) + os.pathsep + self.env["PATH"]
-        closed = self.campaign("campaign-status", campaign)
+        closed = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertIn("route_autoclose closed=1", closed.stderr)
         self.assertEqual({path: path.read_bytes() for path in self.repo.rglob("*") if path.is_file()}, before)
         self.assertEqual((index.stat().st_mtime_ns, index.read_bytes()), index_before)
@@ -917,7 +950,7 @@ class RouteAutocloseTest(unittest.TestCase):
                     if path.is_file() and not path.is_relative_to(self.root) and not path.is_relative_to(self.repo)}
 
         before = snapshot()
-        done = self.campaign("campaign-status", campaign)
+        done = self.campaign("campaign-close", campaign, "--reason", "done")
         self.assertIn("route_autoclose closed=1", done.stderr)
         after = snapshot()
         self.assertEqual(sorted(key for key in after if before.get(key) != after[key]), [])
@@ -1038,6 +1071,11 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         self.P._write_cycle_record(self.root, record, exclusive=False)
         for cycle in (first, second):
             self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        # This case represents used fork branches, not merely published candidates.
+        self.jobs.write_text("".join(
+            f"2026-10-09\tdone\t{self.R.ROOT}\t{self.R.ROOT}\tchild\t"
+            f"route_id={route['route_id']},attempt_id=att-{route['route_id']},launch_started=1\n"
+            for route in (x, y)))
         for route in (a, x, y):
             self._close_unproven(route)
         summary = self._sweep()
@@ -1045,6 +1083,18 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
                                                   second["cycle_id"]: "cycle-abandoned"})
         self.assertEqual(self._manifest_routes(first), [x["route_id"]])
         self.assertEqual(self._manifest_routes(second), [y["route_id"]])
+
+    def test_closed_unused_fork_keeps_predecessor_as_manifest_route(self):
+        a = self._root_route("leftover-unused-fork")
+        self._publish_root(a)
+        x = self._continuation(a, reason="unused-x")
+        y = self._continuation(a, reason="unused-y")
+        cycle = self._begin(a)
+        self.write_output(cycle, "plans/leftover/note.md", b"predecessor work\n")
+        for route in (a, x, y):
+            self._close_unproven(route)
+        self.assertEqual(self._results(self._sweep()), {cycle["cycle_id"]: "cycle-abandoned"})
+        self.assertEqual(self._manifest_routes(cycle), [a["route_id"]])
 
     def test_a_lineage_walk_past_its_deadline_leaves_the_cycle_open_and_completes_without_one(self):
         import route_autoclose
@@ -1054,6 +1104,8 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         c = self._continuation(b)
         cycle = self._begin(a)
         self.write_output(cycle, "plans/leftover/note.md", b"leftover\n")
+        self.jobs.write_text(f"2026-10-09\tdone\t{self.R.ROOT}\t{self.R.ROOT}\tchild\t"
+                             f"route_id={c['route_id']},attempt_id=att-deadline-child,launch_started=1\n")
         for route in (a, b, c):
             self._close_unproven(route)
         record = self._record(cycle)
@@ -1066,7 +1118,7 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
         self.assertEqual(route_autoclose._seal_cycle(self.root, c, False, record=record), "cycle-abandoned")
         self.assertEqual(self._record(cycle)["state"], "sealed")
 
-    def test_the_routes_directory_is_read_once_while_it_is_unchanged(self):
+    def test_unchanged_routes_read_only_the_selected_edges(self):
         a = self._root_route("leftover-edges")
         self._publish_root(a)
         b = self._continuation(a)
@@ -1092,8 +1144,10 @@ class LeftoverCyclesTest(PRODUCER_FIXTURE.ProducerTestBase):
             read_once = len(reads)
             self.assertGreaterEqual(read_once, 3)            # the scan really parsed the routes
             for _ in range(3):
+                before = len(reads)
                 self.assertEqual(walk(), first)
-            self.assertEqual(len(reads), read_once)          # an unchanged directory is not read again
+                self.assertLessEqual(len(reads) - before, 3)
+                self.assertLessEqual(set(reads[before:]), {b["route_id"], c["route_id"]})
             self.assertEqual(first[1], c["route_id"])
             d = self._continuation(c)                        # the listing changes: it is read again
             os.utime(directory, (stale - 100, stale - 100))

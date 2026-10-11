@@ -174,13 +174,19 @@ def seal_launch_input(args, harness: str, task: str) -> str:
         'route_node': getattr(args, 'route_node', None) or '',
         'owner_route_id': getattr(getattr(args, 'owner_route_binding', None), 'route_id', ''),
     }
+    if getattr(args, 'replacement_retry_brief', ''):
+        payload['retry_brief'] = args.replacement_retry_brief
     path = _directory(jobs)/'inputs'/(aid+'.json')
     try:
         _once(path, payload)
     except DC.DispatchContractError as exc:
-        if exc.reason != 'replacement-record-conflict' or not _reseal_allowed(jobs, aid, path, payload):
+        if exc.reason != 'replacement-record-conflict':
             raise
-        _replace_record(path, payload)
+        with _locked(jobs) as lines:
+            if not _reseal_allowed(jobs, aid, path, payload, lines=lines,
+                                   prior=getattr(args, 'automatic_retry_of', None)):
+                raise
+            _replace_record(path, payload)
     return ',replacement_input_digest='+_digest(payload)
 
 
@@ -191,14 +197,26 @@ def seal_launch_input(args, harness: str, task: str) -> str:
 _RESEAL_STABLE_KEYS = route_authority.RESEAL_STABLE_KEYS
 
 
-def _reseal_allowed(jobs, aid, path, payload):
+def _reseal_allowed(jobs, aid, path, payload, *, lines=None, prior=None):
     """A launcher stopped before its claim sealed this input; the next one may reseal it."""
     previous = _read(path)
     stored = json.loads(_bytes(payload))  # compare in the stored form: a tuple reads back as a list
-    if not previous or not route_authority.same_sealed_work(previous, stored):
+    if not previous:
         return False
+    lines = jobs.read_text(encoding='utf-8', errors='replace').splitlines() if lines is None else lines
+    same_work = route_authority.same_sealed_work(previous, stored)
+    if not same_work:
+        reservation = source_reservation(jobs, prior) if prior else None
+        record = _read(_record_path(jobs, reservation['family_id'])) if reservation else None
+        if not record or record.get('replacement_attempt_id') != aid:
+            return False
+        _, source, replay = validate_claim_source(jobs, lines, record)
+        _, current_route = _route(jobs, prior, source)
+        if not route_authority.same_sealed_work(previous, stored,
+                recovery=(record, source, replay, current_route)):
+            return False
     rows = []
-    for line in jobs.read_text(encoding='utf-8', errors='replace').splitlines():
+    for line in lines:
         fields = line.split('\t')
         if len(fields) == 6:
             meta = DC.parse_registry_metadata(fields[5])
@@ -282,19 +300,23 @@ def death_kind(fields, meta, *, jobs=None, lines=None):
     Only a route owner pauses on capacity: a stage worker's limit stays with its owner's
     own fallback, so one row never has two successors.
     """
+    import route_parent_close
+    if (meta.get('parent_close_requested') == '1' or
+            jobs is not None and route_parent_close.row_requested(meta, jobs)):
+        return None
     if jobs is not None and meta.get('note') == 'dead-worker-blocked':
         found = owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if found and found['status'] == 'proceed':
             return 'parked'
-        # A BLOCKED owner was waiting for an answer no declared gate carries; once a person
-        # sent one (`correct`), the same work continues with it. A gate park keeps its own answer.
-        if (found is None and meta.get('worker_type') == 'owner' and fields[1] == 'done'
-                and _retained_corrections(jobs, meta.get('attempt_id'))):
-            return CORRECTED
+        if found is not None:
+            return None  # a declared gate keeps its own answer path
     if (jobs is not None and meta.get('worker_type') == 'owner'
-            and route_authority.answerable_owner_end(fields[1], meta) == 'FAIL'
+            and route_authority.answerable_owner_end(fields[1], meta)
             and _retained_corrections(jobs, meta.get('attempt_id'))):
-        return CORRECTED  # a person approved a fix for the FAIL it reported; no automatic retry
+        return CORRECTED  # an answered stop is a pause; no automatic retry of an unanswered FAIL
+    if (jobs is not None and route_authority.runtime_owner_can_resume(fields[1], meta)
+            and _retained_corrections(jobs, meta.get('attempt_id'))):
+        return CORRECTED
     if (meta.get('note') == 'cancelled-receipt-unavailable'
             and meta.get('classifier_source') == DC.AUTOMATIC_RECEIPTLESS_CLASSIFIER):
         return 'silent'
@@ -325,7 +347,8 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
     kind = death_kind(fields, meta, jobs=jobs, lines=lines)
     if kind is None:
         raise DC.DispatchContractError('replacement-not-silent-death')
-    proof = DC.attempt_process_quiescence(meta, terminal_receipt=True)
+    from route_parent_close import owner_continuation_processes
+    proof, preserved = owner_continuation_processes(meta, jobs)
     if proof.state != 'quiescent':
         raise _process_error(proof, meta)
     if kind not in {'parked', 'unlaunched', CORRECTED} and not _terminal_absent(
@@ -334,6 +357,8 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
     result = {'state': proof.state, 'reason': proof.reason, 'death_kind': kind,
               'note': meta.get('note', ''), 'cleanup_receipt_digest': meta.get('cleanup_receipt_digest', ''),
               'cancellation_receipt_digest': meta.get('cancellation_receipt_digest', '')}
+    if preserved:
+        result['preserved_resources'] = preserved
     if kind == 'parked':
         parked = owner_parked_gate(jobs, meta.get('attempt_id'), lines=lines)
         if not parked:
@@ -346,6 +371,8 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
         handoff = _blocked_handoff(fields, meta)
         if handoff:
             result['handoff'] = handoff
+        if route_authority.runtime_owner_can_resume(fields[1], meta):
+            result['source_result'] = 'EXITED'
     return result
 
 
@@ -656,8 +683,9 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         _, prior = references[0]
         if (prior.get('retry_ordinal') != '1' or not prior.get('recovery_id')
                 or DC._stable_recovery_attempt_id(prior['recovery_id']) != aid
+                or not route_authority.replacement_parent_matches(prior, source, jobs, lineage=True)
                 or any(prior.get(key) != source.get(key) for key in
-                       ('route_node', 'parent_attempt_id', 'parent_sid',
+                       ('route_node',
                         'worker_type', 'dispatch_depth'))):
             raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
         # The current SD104/106 gap executes on the original source route.
@@ -758,10 +786,10 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         previous = lineage.get(prior_id)
         direct = (previous is not None or other in reference_ids or other == aid
                   or prior.get('automatic_retry_of') == aid)
-        if prior.get('automatic_retry_of') == aid and any(
-                prior.get(key) != source.get(key) for key in
-                ('route_id', 'route_hash', 'route_node', 'parent_attempt_id',
-                 'parent_sid', 'worker_type', 'dispatch_depth')):
+        if prior.get('automatic_retry_of') == aid and (
+                not route_authority.replacement_parent_matches(source, prior, jobs, lineage=True)
+                or any(prior.get(key) != source.get(key) for key in
+                       ('route_id', 'route_hash', 'route_node', 'worker_type', 'dispatch_depth'))):
             raise DC.DispatchContractError('replacement-legacy-budget-link-unproven')
         try:
             if previous is not None:
@@ -857,8 +885,8 @@ def claim(jobs: Path, aid: str) -> dict:
             # The approved fix answers each failed check's last FAIL: one closure-check round each,
             # within the verdict ceiling cap + 1. A check that already used it gets no new round.
             answers, spent = route_authority.fix_answers(route, lines, jobs)
-            if not answers:
-                raise DC.DispatchContractError('replacement-fix-round-spent', ','.join(spent) or 'no-failed-check')
+            if not answers and spent:
+                raise DC.DispatchContractError('replacement-fix-round-spent', ','.join(spent))
             proof['answers'] = answers
             proof['source_result'] = 'FAIL'
         logical = _logical_key(route, meta)
@@ -894,7 +922,7 @@ def claim(jobs: Path, aid: str) -> dict:
         moved = route_authority.moved_owner_harness(route, replay.get('harness')) \
             if meta.get('worker_type') == 'owner' else None
         if moved:
-            # The route's parent moved the owner pin before this claim: the replacement runs there.
+            # Historical observation; the ordinary owner selector reads the pin at launch.
             record['harness'] = moved
         access = _access_in_force(jobs, route) if meta.get('worker_type') == 'owner' else None
         if access:
@@ -907,6 +935,55 @@ def claim(jobs: Path, aid: str) -> dict:
         return record
 
 
+def _approved_fix_answers(record, jobs, rows=None):
+    """Read the FAILs an approved claim already pinned, including owner-closed reviews.
+
+    Older claims omitted those reviews because their completion note masked the FAIL.
+    Their exact reuse snapshot still binds the historical marker and verdict; it can
+    restore an admissible target without editing the claim or adopting any later failed round.
+    """
+    proof = record.get('proof') or {}
+    answers = list(proof.get('answers') or [])
+    if (proof.get('death_kind') != CORRECTED or proof.get('source_result') != 'FAIL'
+            or not (record.get('reuse') or {}).get('completed')):
+        return answers
+    try:
+        rows = _rows(Path(jobs).read_text().splitlines()) if rows is None else rows
+        source = rows[record['original_attempt_id']][1]
+        _, route = _route(jobs, record['original_attempt_id'], source)
+        eligible, _ = route_authority.fix_answers(route, ['\t'.join(fields) for fields, _ in rows.values() if fields[1] not in ('open', 'running')], jobs)
+    except (OSError, ValueError, KeyError, DC.DispatchContractError):
+        # Supplemental historical targets cannot break an existing approved claim.
+        return answers
+    import review_round_cap
+    directory = DC._route_module().completion_dir(record['route_id'], jobs=jobs)
+    for pin in (record.get('reuse') or {}).get('completed') or []:
+        attempt = pin.get('attempt_id')
+        if not attempt or attempt in answers or attempt not in eligible:
+            continue
+        fields, meta = rows[attempt]
+        if (meta.get('route_id') != record['route_id']
+                or meta.get('route_hash') != record['route_hash']
+                or meta.get('route_node') != pin.get('node')
+                or meta.get('worker_type') != 'review'
+                or not review_round_cap.last_verdict_blocking([(fields[1], meta)], 'review')):
+            continue
+        for path in directory.glob(f"{pin['node']}*.json"):
+            try:
+                marker = _read(path)
+            except DC.DispatchContractError:
+                continue
+            if (marker and _digest(marker) == pin.get('marker_digest')
+                    and marker.get('route_id') == record['route_id']
+                    and marker.get('route_hash') == record['route_hash']
+                    and marker.get('node_id') == pin['node']
+                    and marker.get('attempt_id') == attempt
+                    and DC.owner_closure_shape(marker) == 'registered-review'):
+                answers.append(attempt)
+                break
+    return answers
+
+
 def answered_fix_revisions(jobs, route_id):
     """The approved fixes that answer a route's failed checks: one revision-like entry per
     claim that continued a FAIL-ended owner of this route with a person's answer, naming the
@@ -917,15 +994,26 @@ def answered_fix_revisions(jobs, route_id):
     except OSError:
         return []
     found = []
+    rows = None
     for path in paths:
         try:
             record = _read(path)
+            if record:
+                _check_record(record, record.get('family_id'))
         except DC.DispatchContractError:
             continue
         proof = (record or {}).get('proof') or {}
         if (record and record.get('route_id') == route_id and proof.get('death_kind') == CORRECTED
-                and proof.get('source_result') == 'FAIL' and proof.get('answers')):
-            found.append({'basis': 'user-direction', 'answers': list(proof['answers']),
+                and proof.get('source_result') == 'FAIL'):
+            if rows is None:
+                try:
+                    rows = _rows(Path(jobs).read_text().splitlines())
+                except (OSError, DC.DispatchContractError):
+                    rows = {}  # Keep the claim's original answers when enrichment is unavailable.
+            answers = _approved_fix_answers(record, jobs, rows)
+            if not answers:
+                continue
+            found.append({'basis': 'user-direction', 'answers': answers,
                           'corrections': [item.get('id') for item in proof.get('corrections') or []],
                           'family_id': record.get('family_id')})
     return found
@@ -1096,46 +1184,28 @@ def admission(jobs, lines, metadata):
     if (not record or record.get('original_attempt_id') != prior
             or record.get('replacement_attempt_id') != metadata.get('attempt_id')):
         raise DC.DispatchContractError('automatic-replacement-exhausted', prior)
-    route_key = 'owner_route_id' if source.get('owner_route_id') else 'route_id'
-    hash_key = 'owner_route_hash' if source.get('owner_route_id') else 'route_hash'
-    if (metadata.get(route_key) != record['route_id'] or metadata.get(hash_key) != record['route_hash']
-            or any(metadata.get(k) != source.get(k) for k in
-                   ('route_node', 'parent_attempt_id', 'parent_sid', 'worker_type', 'dispatch_depth',
-                    'session_chain_id','subsession_id','subsession_index','subsession_count',
-                    'subsession_mode','stage_authority','fixed_inputs_sha256',
-                    'narrow_verify_sha256','phase_brief_sha256'))):
-        raise DC.DispatchContractError('replacement-launch-binding-mismatch', prior)
-    if source.get('session_chain_id'):
-        from dispatch_replacement_subsession import SCOPE_KEYS
-        if any(metadata.get(key) != source.get(key) for key in SCOPE_KEYS):
-            raise DC.DispatchContractError('replacement-subsession-scope-mismatch')
+    route_authority.require_recovery_binding(record, source, metadata, jobs)
     _, source, replay = validate_claim_source(jobs, lines, record)
     candidate = launch_input(jobs, metadata['attempt_id'], metadata)
-    if source.get('review_input_digest') or metadata.get('review_input_digest'):
-        from review_input import read_binding
-        original_input = read_binding(jobs, source, verify_current=True)
-        replacement_input = read_binding(jobs, metadata, verify_current=True)
-        if (any(replacement_input.get(k) != original_input.get(k) for k in ('path', 'sha256', 'producer'))
-                or replacement_input.get('source') != {
-                    'attempt_id': source['attempt_id'], 'binding_digest': source['review_input_digest']}):
-            raise DC.DispatchContractError('reviewed-evidence-replacement-mismatch')
-    expected_task = _replacement_task(record, source, replay)
-    moved = _moved_harness(record, replay)
-    if moved:
-        # The route's parent moved the owner before this claim: the same work on the new harness.
-        # Its command, resolved settings and permission realization are the new harness's own.
-        if candidate.get('harness') != moved:
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'harness')
-        for key in ('jobs', 'worktree'):
-            if candidate.get(key) != replay.get(key):
-                raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
-    else:
-        _check_tuple(candidate, replay, _transition_of(record), record.get('execution_access'))
+    parent_values = {}
+    if source.get('dispatch_depth') == '1' and metadata.get('parent_sid') != source.get('parent_sid'):
+        from dispatch_seat_handover import effective_parent_harness
+        parent_values = {'parent_session_id': metadata['parent_sid'],
+                         'parent_harness': effective_parent_harness(source, jobs)}
+        if 'parent_completion_delivery' in (candidate.get('resolved') or {}):
+            from types import SimpleNamespace
+            from dispatch_parent_completion import resolve_parent_completion_delivery
+            parent_args = SimpleNamespace(**{**candidate['resolved'], **parent_values,
+                                            'action': 'start', 'dispatch_depth': 1})
+            parent_values['parent_completion_delivery'] = resolve_parent_completion_delivery(parent_args)
+    expected_task = route_authority.recovery_task(record, source, replay)
+    _, current_route = _route(jobs, prior, source)
+    route_authority.require_recovery_work(
+        candidate, replay, route=current_route, worker_type=source.get('worker_type'),
+        transition=_transition_of(record), access=record.get('execution_access'),
+        parent_values=parent_values)
     if candidate.get('task') != expected_task:
         raise DC.DispatchContractError('replacement-task-mismatch')
-    expected_argv = _replacement_argv(record, source, replay)
-    if not moved and candidate.get('argv') != expected_argv:
-        raise DC.DispatchContractError('replacement-argv-mismatch')
     if Path(record['route_file']).with_suffix('.outcome.json').exists():
         raise DC.DispatchContractError('replacement-route-closed')
     route = _read(Path(record['route_file']))
@@ -1148,50 +1218,10 @@ def admission(jobs, lines, metadata):
 RUNTIME_DERIVED_KEYS = route_authority.RELEASE_DERIVED_VALUES
 
 
-# What a verified profile transition lets the candidate resolve differently from the sealed launch.
-PROFILE_DERIVED_KEYS = frozenset({'model_profile', 'model', 'reasoning', 'resolved_model_settings'})
-
-
-def _check_tuple(candidate, replay, transition=None, access=None):
-    """The candidate must match the sealed input; only runtime-derived values may follow a new release,
-    and only the profile-derived ones may follow a verified profile transition."""
-    for key in route_authority.REPLACEMENT_FIXED_KEYS:
-        if candidate.get(key) != replay.get(key):
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', key)
-    # Each input keeps the release it ran from (`launch_home`); a different one is not a change of work.
-    drift = candidate.get('launch_home') != replay.get('launch_home')
-    old, new = replay.get('resolved') or {}, candidate.get('resolved') or {}
-    for key in sorted(set(old) | set(new)):
-        if old.get(key) != new.get(key):
-            if (transition and key in PROFILE_DERIVED_KEYS and old.get('model_profile') == transition['from']
-                    and new.get('model_profile') == transition['to']
-                    and (key != 'resolved_model_settings'
-                         or (new.get(key) or {}).get('profile') == transition['to'])):
-                continue  # the one lower launch the frame rule allows
-            if not (drift and key in RUNTIME_DERIVED_KEYS):
-                raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'resolved')
-    # Where the replacement's launcher runs, and how it spelled its release, is not a permission
-    # change (route_authority).
-    granted = route_authority.granted_permissions(candidate.get('applied_permissions'), candidate.get('launch_home'))
-    sealed = route_authority.granted_permissions(replay.get('applied_permissions'), replay.get('launch_home'))
-    if access:
-        # The access request the claim recorded replaces the source's, and what realizes it.
-        if (granted.get('execution_access') or {}).get('request_sha256') != access['request_sha256']:
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'execution_access')
-        granted, sealed = (_without_access(granted), _without_access(sealed))
-    if granted != sealed:
-        if not drift:
-            raise DC.DispatchContractError('replacement-input-tuple-mismatch', 'applied_permissions')
-        from hearting_gates import same_work_or_refuse
-        same_work_or_refuse('replacement-runtime-drift', 'applied_permissions')
-
-
-def _without_access(permissions):
-    result = {key: value for key, value in permissions.items() if key != 'execution_access'}
-    if isinstance(result.get('opencode_permission'), dict):
-        result['opencode_permission'] = {key: value for key, value in result['opencode_permission'].items()
-                                         if key not in ('external_directory', 'edit')}
-    return result
+def _check_tuple(candidate, replay, transition=None, access=None, parent_values=None):
+    """Compatibility entry for stored standalone inputs; policy lives in route authority."""
+    return route_authority.require_recovery_work(
+        candidate, replay, transition=transition, access=access, parent_values=parent_values)
 
 
 def replacement_row(jobs, lines, row):
@@ -1254,23 +1284,19 @@ def _authorized(jobs, rows, meta):
 
 
 def _replacement_task(record, source, replay):
-    task = replay['task']
-    if source.get('worker_type') == 'owner':
-        original_route = source.get('owner_route_id') or source.get('route_id')
-        if original_route != record['route_id']:
-            route = _read(Path(record['route_file']))
-            request = route.get('work_request') or {}
-            if not isinstance(request.get('text'), str) or not request['text'].strip():
-                raise DC.DispatchContractError('replacement-current-route-input-unproven')
-            task = request['text']
-    return task
+    return route_authority.recovery_task(record, source, replay)
 
 
 def _access_in_force(jobs, route):
     """The prepared request the route's parent last handed its owner (`route_authority.access_in_force`),
-    with its digest; None while the request its first owner launched with stands."""
+    with its digest. GPU lab replacements also prepare the current runtime's
+    normal compute defaults instead of replaying an older owner's request."""
     change = route_authority.access_in_force(route)
-    if change is None or change.get('source') == 'derived':
+    from gpu_execution_sandbox import select as gpu_selection
+    runtime_defaults = ((change is None or change.get('source') == 'derived')
+                        and route.get('capability') == 'autopilot-lab'
+                        and gpu_selection(route, environ={})['gpu_scope'])
+    if not runtime_defaults and (change is None or change.get('source') == 'derived'):
         return None
     import execution_access as EA
     try:
@@ -1284,11 +1310,15 @@ def _access_in_force(jobs, route):
     if request is None:
         return None
     return {'request_path': str(path), 'request_sha256': request.request_sha256,
-            'source': change['source'], 'at': change['at']}
+            'source': 'lab-runtime-defaults' if runtime_defaults else change['source'],
+            'at': change['at'] if change else None}
 
 
-def _replacement_argv(record, source, replay):
+def _replacement_argv(record, source, replay, parent_values=None):
     options = {}
+    for key in ('parent_session_id', 'parent_harness'):
+        if key in (parent_values or {}):
+            options['--'+key.replace('_','-')] = parent_values[key]
     access = record.get('execution_access')
     if access:
         options['--execution-access-file'] = access['request_path']
@@ -1318,12 +1348,6 @@ def _command(jobs, record, source, replay):
     return [sys.executable,str(root/f'adapters/{replay["harness"]}/bin/dispatch-headless.py'),*argv]
 
 
-def _moved_harness(record, replay):
-    """The harness a claim moved this replacement to, or None when it replays its source's."""
-    harness = record.get('harness')
-    return harness if harness and harness != replay.get('harness') else None
-
-
 def _argv_value(argv, flag):
     for index, arg in enumerate(argv):
         if arg == flag and index + 1 < len(argv):
@@ -1333,10 +1357,10 @@ def _argv_value(argv, flag):
     return None
 
 
-def _moved_owner_command(jobs, record, source, replay):
-    """A replacement owner on the harness its route's parent moved the pin to.
+def _owner_command(jobs, record, source, replay):
+    """Resolve a replacement through the ordinary owner launch, including an old claim.
 
-    The source command belongs to another harness, so it is not replayed: the same work (task,
+    The source command may belong to another harness, so it is not replayed: the same work (task,
     route, worktree, access request, parent session) takes the ordinary owner launch path, which
     builds the new harness's own command from the route in force."""
     task = _replacement_task(record, source, replay)
@@ -1346,7 +1370,7 @@ def _moved_owner_command(jobs, record, source, replay):
     if prompt.is_symlink() or (not _write_once(prompt.parent,prompt,raw) and prompt.read_bytes()!=raw):
         raise DC.DispatchContractError('replacement-task-conflict')
     command = [sys.executable, str(ROOT.resolve()/'utilities/dispatch-owner.py'), '--start',
-               '--adapter', record['harness'], '--route-evidence', record['route_file'],
+               '--route-evidence', record['route_file'],
                '--jobs', str(Path(jobs).resolve()), '--worktree', replay['worktree'],
                '--slug', _argv_value(replay['argv'], '--slug') or record['replacement_attempt_id'],
                '--attempt-id', record['replacement_attempt_id'],
@@ -1370,6 +1394,10 @@ def _capacity_wait(jobs, aid, source, hold=None):
               'harness': source.get('harness') or source.get('owner_harness') or ''}
     if hold is None:
         hold = _capacity_hold(jobs, source)
+        if hold is None and source.get('worker_type') == 'owner':
+            # Preserve reset evidence for a capacity-dead owner before an explicit resume.
+            from dispatch_capacity_evidence import harness_hold
+            hold = harness_hold(jobs, result['harness'], model=source.get('model'))
     if hold:
         result['usage_state'] = hold['label']
         for key in ('headroom', 'usage_gate_used_percent', 'capacity_source'):
@@ -1388,22 +1416,28 @@ def _capacity_reader():
 
 def _capacity_hold(jobs, source, model=None):
     from dispatch_capacity_evidence import harness_hold, usage_states
+    _, route = _route(jobs, source.get('attempt_id'), source)
+    from model_profile import sealed_pin_harness
+    pin = sealed_pin_harness(route_authority.route_in_force(route), worker_type=source.get('worker_type'))
     harness = source.get('harness') or source.get('owner_harness')
+    if source.get('worker_type') == 'owner':
+        # The ordinary selector judges all candidates; the old owner's limit or
+        # soft allocation gate cannot prevent that selection. A named pin waits
+        # only at a real limit, and admission refuses a silently ignored pin.
+        return harness_hold(jobs, pin, model=model) if pin else None
     if not harness:
         return None
     hold = harness_hold(jobs, harness, model=model or source.get('model'))
     if hold:
         return hold
-    _, route = _route(jobs, source.get('attempt_id'), source)
-    from model_profile import sealed_pin_harness
-    if sealed_pin_harness(route, worker_type=source.get('worker_type')) == harness:
+    if pin == harness:
         # A sealed pin moves only for a real usage limit (harness_hold above), as at its
         # first launch and on the stage path; the soft allocation gate does not move it.
         return None
     allocation = route.get('dispatch_allocation') or {}
     if allocation.get('strategy') not in {'balanced', 'capacity-aware'}:
         return None  # legacy routes keep their existing hard-quota contract
-    policy = route.get('owner_harness_policy') if source.get('worker_type') == 'owner' else next(
+    policy = next(
         (node.get('harness_policy') for node in route.get('nodes', [])
          if node.get('id') == source.get('route_node')), None)
     if not isinstance(policy, dict):
@@ -1428,7 +1462,6 @@ def _capacity_hold(jobs, source, model=None):
         affinity_weight=allocation.get('depth_affinity_weight', .5),
         headroom_exponent=allocation.get('usage_headroom_exponent', 1),
         harness_weights=allocation.get('harness_weights'),
-        preference_order=allocation.get('owner_order') if source.get('worker_type') == 'owner' else None,
     )
     if selected == harness:
         return None  # original all-gated recovery, quality bands and relief remain intact
@@ -1523,7 +1556,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             replacement_fields, replacement_meta = rows[replacement]
             if replacement_fields[1] not in {'open','running'}:
                 if not DC.verdict_pass(replacement_meta):
-                    next_kind = death_kind(replacement_fields, replacement_meta)
+                    next_kind = death_kind(replacement_fields, replacement_meta, jobs=jobs)
                     if next_kind in PAUSE_KINDS or (next_kind and _is_capacity_record(record)):
                         # The replacement stopped at a limit too, or a limit resume died on its
                         # own: it is the next source, and claim() judges the node's budget.
@@ -1532,10 +1565,19 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                     return exhausted_attention(jobs, replacement, replacement_meta)
                 return {'state':'reused','attempt_id':replacement,'record':record}
             if replacement_meta.get('launch_claimed') == '1':
+                if source.get('worker_type') == 'owner':
+                    _, route = _route(jobs, aid, source)
+                    from model_profile import sealed_pin_harness
+                    pinned = sealed_pin_harness(route_authority.route_in_force(route), worker_type='owner')
+                    if pinned and replacement_meta.get('harness') != pinned:
+                        return {'state': 'needs-attention', 'reason': 'pin-ignored-for-replacement',
+                                'attempt_id': replacement, 'harness': replacement_meta.get('harness'),
+                                'source_attempt_id': aid, 'node': source.get('route_node') or '__owner__',
+                                'requested_harness': pinned, 'detail': 'replacement already launched; its execution identity is retained'}
                 return {'state':'running','attempt_id':replacement,'record':record}
         replay = launch_input(jobs,aid,source)
         from dispatch_replacement_batch import command as batch_command
-        command = (_moved_owner_command(jobs, record, source, replay) if _moved_harness(record, replay)
+        command = (_owner_command(jobs, record, source, replay) if source.get('worker_type') == 'owner'
                    else batch_command(jobs, record, source, replay) or _command(jobs,record,source,replay))
         env = dict(os.environ)
         # The old launcher reservation/owner tuple is not a grant for its successor.
@@ -1581,8 +1623,21 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                     'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
         if current and current[1].get('launch_claimed') == '1':
             return {'state':'running','attempt_id':replacement,'record':record}
-        output = ''.join(str(getattr(completed, name, '') or '') for name in ('stdout', 'stderr'))
-        return {'state':'needs-attention','reason':'replacement-launch-pending',
+        output = '\n'.join(str(getattr(completed, name, '') or '') for name in ('stdout', 'stderr'))
+        diagnostic = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+        if source.get('worker_type') == 'owner' and diagnostic.get('reason') in {
+                'no-eligible-candidate', 'no-eligible-route-evidence-candidate'}:
+            # Use the ordinary selector's candidates. Only real limits on all of
+            # them mean a pause; auth/unknown/policy failures keep their diagnostic.
+            from dispatch_capacity_evidence import harness_hold
+            candidates = [h for h in diagnostic.get('configured_candidates', '').split(',') if h]
+            holds = [(h, harness_hold(jobs, h)) for h in candidates]
+            if holds and all(hold for _, hold in holds):
+                harness, hold = min(holds, key=lambda item: item[1].get('until_epoch') or float('inf'))
+                return _capacity_wait(jobs, aid, {**source, 'harness': harness}, hold)
+        reason = ('pin-ignored-for-replacement' if diagnostic.get('reason') == 'pin-ignored-for-replacement'
+                  else 'replacement-launch-pending')
+        return {'state':'needs-attention','reason':reason,
                 'attempt_id':replacement,'record':record,'launcher_exit':completed.returncode,
                 'launcher_diagnostic':'\n'.join(output.splitlines()[-20:]),
                 'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
@@ -1590,7 +1645,15 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         reason = getattr(exc,'reason','replacement-observation-unavailable')
         if reason == 'automatic-replacement-exhausted':
             family_record = None
-            if not _budget_exhausted(jobs, source, capacity=kind in PAUSE_KINDS):
+            binding = source_binding(jobs, source)
+            family = binding[0] if binding else source.get('replacement_family_id')
+            if family:
+                # The exact existing claim owns the allowance. A corrected FAIL
+                # may belong to an ordinary family, so do not reconstruct it as a pause.
+                digest = binding[2] if binding else source.get('replacement_claim_digest')
+                family_record = _check_record(_read(_record_path(jobs, family)), family,
+                                             {'replacement_claim_digest': digest or None})
+            elif not _budget_exhausted(jobs, source, capacity=kind in PAUSE_KINDS):
                 _, route = _route(jobs, aid, source)
                 logical = _logical_key(route, source)
                 if kind in PAUSE_KINDS:
@@ -1599,7 +1662,7 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
             return exhausted_attention(jobs, aid, source, family_record=family_record)
         result = {'state':'needs-attention','reason':reason,'source_attempt_id':aid,
                   'node': source.get('route_node') or '__owner__'}
-        if reason.startswith('replacement-') and getattr(exc,'detail',reason) != reason:
+        if (reason.startswith('replacement-') or reason == 'pin-ignored-for-replacement') and getattr(exc,'detail',reason) != reason:
             result['detail'] = str(exc.detail)[:240]
         elif not isinstance(exc, DC.DispatchContractError):
             result['detail'] = f'{type(exc).__name__}: {exc}'[:240]
@@ -1631,7 +1694,8 @@ def effective_attempts(jobs, attempts):
         if (target.get('replacement_claim_digest') != _digest(record)
                 or target.get('replacement_family_id') != family or target.get('automatic_retry_of') != aid
                 or target.get('replacement_original_attempt_id') != aid
-                or any(target.get(k) != source.get(k) for k in ('parent_sid','parent_attempt_id','worker_type','dispatch_depth'))):
+                or not route_authority.replacement_parent_matches(source, target, jobs, lineage=True)
+                or any(target.get(k) != source.get(k) for k in ('worker_type','dispatch_depth'))):
             raise DC.DispatchContractError('replacement-lineage-unproven',replacement)
         effective.discard(aid); effective.add(replacement)
         mapping.append({'original_attempt_id':aid,'replacement_attempt_id':replacement,
@@ -1744,16 +1808,24 @@ def validate_attention(jobs, attention, *, allowed_attempts=None):
 
 def recovery_instructions(args):
     """Fresh rendering adds resume context without modifying the sealed raw task."""
+    brief = os.environ.pop('AGENT_DISPATCH_RETRY_BRIEF', '')
     prior = getattr(args, 'automatic_retry_of', None)
-    if not prior or getattr(args, 'worker_type', '') != 'owner':
-        return ''
-    jobs = Path(args.jobs_path)
-    index = source_reservation(jobs, prior)
-    if not index:
-        return ''
-    record = _check_record(_read(_record_path(jobs, index['family_id'])),index['family_id'])
-    if record['replacement_attempt_id'] != args.attempt_id:
-        raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
+    record = None
+    if prior:
+        jobs = Path(args.jobs_path)
+        index = source_reservation(jobs, prior)
+        if index:
+            record = _check_record(_read(_record_path(jobs, index['family_id'])),index['family_id'])
+            if record['replacement_attempt_id'] != args.attempt_id:
+                raise DC.DispatchContractError('replacement-instructions-binding-mismatch')
+            # The caller's environment is transient; replay guidance from the
+            # original digest-checked input, just like its raw task.
+            source = _rows(jobs.read_text().splitlines())[prior][1]
+            brief = launch_input(jobs, prior, source).get('retry_brief', brief)
+    args.replacement_retry_brief = brief
+    retry_context = ('\n\n## Partial-group retry brief\n' + brief + '\n') if brief else ''
+    if not record or getattr(args, 'worker_type', '') != 'owner':
+        return retry_context
     completed = ', '.join(str(row['node']) for row in record['reuse']['completed']) or '(none)'
     kind = (record.get('proof') or {}).get('death_kind')
     fix = kind == CORRECTED and (record.get('proof') or {}).get('source_result') == 'FAIL'
@@ -1761,7 +1833,10 @@ def recovery_instructions(args):
         opening = (f'The previous owner {prior} ended FAIL and a person approved a fix for it; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == CORRECTED:
-        opening = (f'The previous owner {prior} ended BLOCKED and a person has answered it; this continues '
+        ended = ('exited before settlement and received a correction'
+                 if record['proof'].get('source_result') == 'EXITED'
+                 else 'ended BLOCKED and a person has answered it')
+        opening = (f'The previous owner {prior} {ended}; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == 'capacity':
         opening = f'The previous attempt {prior} stopped at a usage limit; this resumes it on the existing route {record["route_id"]}.\n'
@@ -1769,8 +1844,10 @@ def recovery_instructions(args):
         opening = f'The previous attempt {prior} never started (its launcher stopped before spawning); this starts the same work on the existing route {record["route_id"]}.\n'
     else:
         opening = f'You replace exact-dead attempt {prior} once, on the existing route {record["route_id"]}.\n'
+    answers = _approved_fix_answers(record, jobs) if fix else []
+    check_fix = fix and bool(answers)
     rerun = ('Rerun the stage that makes the approved fix and every check after it; reuse everything '
-             'else. ' if fix else
+             'else. ' if check_fix else
              'Continue only unfinished work. Do not rerun completed nodes, successful siblings, or completed prefixes. ')
     text = ('\n\n## Verified recovery context\n'
             + opening +
@@ -1778,9 +1855,18 @@ def recovery_instructions(args):
             + rerun +
             'Keep existing human answers and gate releases; do not ask the same scope again. '
             'Preserve the original failure and report any second failure as needs-attention.\n')
-    if fix:
+    preserved = (record.get('proof') or {}).get('preserved_resources', [])
+    if preserved:
+        text += ('Registered payloads from the previous owner are preserved under their existing '
+                 'run records. Continue supervising those runs; do not relaunch a resource node '
+                 'because its owner changed. Inspect these records for their current identities '
+                 'and state; this list is not completion or launch authority.\n')
+        for resource in preserved:
+            text += ('- ' + resource['kind'] + ' ' + resource['run_id'] + ': '
+                     + (resource.get('registry') or resource.get('record') or '') + '\n')
+    if check_fix:
         text += ('The failed checks this fix answers ('
-                 + ', '.join(record['proof']['answers']) +
+                 + ', '.join(answers) +
                  ') each get one more verdict round (closure-check) once the fix is in; there is no '
                  'further round after it.\n')
     # A replacement that never started showed its answers and gate to no model,
@@ -1801,7 +1887,7 @@ def recovery_instructions(args):
                 text += (f'The owner {answered} ended BLOCKED and a person has answered it; '
                          'that answer is for this work.\n')
             text += _correction_context(jobs, answered, proof)
-    return text + CONTINUATION_WAIT_NOTE
+    return text + CONTINUATION_WAIT_NOTE + retry_context
 
 
 def _gate_context(jobs, record):
@@ -1850,6 +1936,9 @@ def _correction_context(jobs, prior, proof):
             raise DC.DispatchContractError('replacement-correction-drift', str(pinned.get('id')))
         items.append(item)
     handoff = proof.get('handoff')
+    if proof.get('source_result') == 'EXITED':
+        return ('The previous owner exited before settlement. The correction below names the remaining work; '
+                'preserve completed checks and continue the existing route.' + OwnerInput.text(items) + '\n')
     answer = ('The answer below is the fix a person approved for the failure it reported. Treat it as '
               'given: do not ask for it again; apply it, then continue through the remaining declared stages.'
               if proof.get('source_result') == 'FAIL' else

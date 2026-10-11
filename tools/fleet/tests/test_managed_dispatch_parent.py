@@ -14,6 +14,7 @@ if str(TOOLS) not in sys.path:
 from fleet import fleet, render, model  # noqa: E402
 from fleet.collectors import dispatch, resolve_parent_edges, _mark_dispatch_child_sessions  # noqa: E402
 from fleet.model import DispatchJob, Session  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines
 
 
 MANAGED = "/home/u/.codex/.harness/managed-sessions/session-live"
@@ -48,7 +49,7 @@ class ManagedDispatchParentTest(unittest.TestCase):
         )
 
     def rendered(self, sessions, job):
-        return flatten(render._build_lines(
+        return flatten(build_observed_lines(
             sessions, [job], "both", False, 0, layout="wide", term_width=180,
         ))
 

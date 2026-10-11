@@ -7,7 +7,9 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +17,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 from fleet import render  # noqa: E402
+from fleet import collectors  # noqa: E402
 from fleet.collectors import peer_messages  # noqa: E402
 from fleet.model import Session  # noqa: E402
 
@@ -59,6 +62,91 @@ def _rec(from_sid, to_sid=None, to_name=None, kind="steer", summary="hi",
 
 
 class CollectorTest(unittest.TestCase):
+    def test_persisted_retire_identity_reaches_session_display_without_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = peer_steward.peer_obligations.ObligationStore(tmp)
+            store.create("retire-persisted", "retire",
+                         {"server": "fixture", "pane": "w1:p1", "harness": "codex",
+                          "session_id": "thread-retiring"},
+                         {"target": "worker", "body": "PRIVATE_RETIRE_SENTINEL"})
+            path = store._record_path("retire-persisted")
+            before = (path.read_bytes(), path.stat().st_mtime_ns)
+            result = peer_messages.collect(state_roots=[tmp])
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        pending = result["by_session"][("codex", "thread-retiring")]["pending_obligations"]
+        self.assertEqual([(row["kind"], row["state"]) for row in pending], [("retire", "pending")])
+        self.assertNotIn("PRIVATE_RETIRE_SENTINEL", json.dumps(pending))
+        session = Session(harness="codex", pid=1, session_id="thread-retiring")
+        collectors.apply_peer_rows([session], result["by_session"])
+        rendered = "".join(text for text, _ in render._peer_obligation_strip(
+            session.peer_obligations, term_width=120)[0])
+        self.assertIn("retire 1", rendered)
+
+    def test_duty_scan_stops_before_enumerating_large_completed_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = peer_steward.peer_obligations.ObligationStore(tmp)
+            identity = {"harness": "claude", "session_id": "sid-a"}
+            store.create("completed", "retire", identity, {"target": "old"})
+            store.update("completed", state="complete")
+            store.create("000-pending", "retire", identity, {"target": "current"})
+            examined = []
+
+            def entries():
+                # Pending is behind many complete records in a much larger directory.
+                for i in range(10000):
+                    if i >= peer_messages._MAX_PENDING_DUTIES * 4:
+                        self.fail("collector enumerated beyond its directory budget")
+                    examined.append(i)
+                    path = store._record_path("000-pending" if i == 64 else "completed")
+                    yield SimpleNamespace(name=path.name, path=str(path))
+
+            with mock.patch.object(peer_messages.os, "scandir",
+                                   return_value=nullcontext(entries())):
+                result = peer_messages._pending_obligations([tmp], time.time())
+        self.assertEqual(len(examined), peer_messages._MAX_PENDING_DUTIES * 4)
+        self.assertEqual([row["kind"] for row in result[("claude", "sid-a")]], ["retire"])
+
+    def test_pending_duties_are_read_only_bounded_and_body_free(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            obligations = root / "peer-steward" / "obligations"
+            obligations.mkdir(parents=True)
+            now = time.time()
+            duties = [
+                {"id": "message-ref-a", "state": "pending", "accepted_at": now - 120,
+                 "identity": {"harness": "claude", "session_id": "sid-a"},
+                 "intent": {"kind": "message", "to": {"harness": "claude", "session_id": "sid-a"},
+                            "ref": "ref-a", "body": "PRIVATE_BODY_SENTINEL"}},
+                {"id": "delay-ref-a", "state": "delivery-pending", "accepted_at": now - 60,
+                 "identity": {"recipient_harness": "claude", "recipient_session_id": "sid-a"},
+                 "intent": {"kind": "message", "to": {"harness": "claude", "session_id": "sid-a"},
+                            "delay_notice_for": "ref-a"}},
+                {"id": "retire-a", "state": "cleanup-pending", "accepted_at": now - 30,
+                 "identity": {"harness": "claude", "session_id": "sid-a"},
+                 "intent": {"kind": "retire"}},
+            ]
+            for duty in duties:
+                (obligations / f"{duty['id']}.json").write_text(json.dumps(duty), encoding="utf-8")
+            watch_root = root / "peer-watches"
+            watch_root.mkdir()
+            (watch_root / "watch-a.json").write_text(json.dumps({
+                "watch_id": "watch-a", "armed_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                "agent": {"harness": "claude", "session_id": "sid-a"},
+            }), encoding="utf-8")
+
+            result = peer_messages.collect(state_roots=[str(root)])
+
+        pending = result["by_session"][("claude", "sid-a")]["pending_obligations"]
+        self.assertEqual({item["kind"] for item in pending}, {"message", "delay", "retire", "watch"})
+        self.assertNotIn("PRIVATE_BODY_SENTINEL", json.dumps(pending))
+        session = Session(harness="claude", pid=1, session_id="sid-a")
+        collectors.apply_peer_rows([session], result["by_session"])
+        self.assertEqual(len(session.peer_obligations), 4)
+        strip = render._peer_obligation_strip(session.peer_obligations, term_width=120)
+        rendered = "".join(text for text, _style in strip[0])
+        self.assertIn("pending", rendered)
+        self.assertIn("retire 1", rendered)
+
     def test_three_record_fixture_badge_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             _write_ledger(tmp, "sid-a", [

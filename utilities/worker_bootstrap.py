@@ -273,6 +273,14 @@ def resolve_node_scope(
         node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
     outputs = tuple((node or {}).get("outputs", []))
     write_scope = tuple((node or {}).get("write_scope", []))
+    if (route.get("capability") == "autopilot-code"
+            and route.get("effective_intensity") == "quick"
+            and node_id == "one-shot" and (node or {}).get("kind") == "capability-owner"
+            and (node or {}).get("unit") == "_kernel/owner"
+            and set(write_scope) == {"source-scoped", "plans/<cycle>/**"}):
+        # The one-shot owns the approved deliverables in this cycle; plans is
+        # its reporting default. Retain the sealed route's bytes and identity.
+        write_scope = ("source-scoped", "**")
     env_output_dir = artifact_cycle_environment(environ)["AGENT_ARTIFACT_OUTPUT_DIR"]
     if env_output_dir:
         return NodeScope(env_output_dir, str(Path(route["cwd"]).resolve()) if route.get("cwd") else None,
@@ -347,7 +355,7 @@ def _resolved_write_scopes(scope: NodeScope) -> tuple[list[str], list[str]]:
         path = Path(value)
         if path.is_absolute():
             (source if scope.worktree_dir and path.is_relative_to(scope.worktree_dir) else artifact).append(str(path))
-        elif value in ("source/**", "source-alternative/**"):
+        elif value in ("source-scoped", "source/**", "source-alternative/**"):
             source.append(str(Path(scope.worktree_dir) / "**") if scope.worktree_dir else value)
         elif value.startswith("tests/"):
             source.append(str(Path(scope.worktree_dir) / value) if scope.worktree_dir else value)
@@ -379,6 +387,8 @@ def node_scope_prompt(scope: "NodeScope") -> str:
     lines = ["This node's declared scope:",
              f"outputs={json.dumps(outputs, ensure_ascii=False)}",
              f"artifact_write_scope={json.dumps(artifact_scope, ensure_ascii=False)}"]
+    if "**" in scope.write_scope:
+        lines.append("Cycle-wide artifact scope covers only the approved task's deliverables, not other work or cycles.")
     if source_scope:
         lines.append(f"worktree_source_scope={json.dumps(source_scope, ensure_ascii=False)}")
     if not scope.output_dir:
@@ -563,6 +573,64 @@ def plan_leg_prompt(route, node_id=None) -> str:
     return "Plan for this leg (approved in the frame interview; base the verdict on it):\n" + "\n".join(lines) + "\n\n"
 
 
+def auxiliary_arbitration_prompt(route, node_id, artifact="artifact") -> str:
+    """Explain the existing gate using only the sealed realized groups and legs."""
+    import dispatch_contract
+    resolver = dispatch_contract._route_module()
+    groups, required = resolver._auxiliary_groups_arbitrated_by(route, node_id)
+    if not groups:
+        return ""
+    legs = [leg for group in groups for leg in resolver._realized_auxiliary_nodes(route, group)]
+    lines = [
+        f"Auxiliary arbitration for groups {', '.join(groups)}: {required} realized auxiliary leg(s) "
+        f"({', '.join(leg['id'] for leg in legs)}). The {artifact} must carry "
+        f"auxiliary_findings_considered with exactly {required} entries, one per auxiliary leg, "
+        "stating how its findings affected the conclusion. Use Markdown frontmatter as follows:",
+        "---", "auxiliary_findings_considered:",
+        *(f'  - "{leg["id"]}: <finding and disposition>"' for leg in legs), "---",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def automatic_consumer_prompt(route, node_id) -> str:
+    additions = ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", [])
+    addition = next((row for row in additions if row["id"] == node_id
+                     and row["reason"] != "terminal-anchor"), None)
+    if addition is None:
+        return ""
+    node = next(node for node in route["nodes"] if node["id"] == node_id)
+    return (
+        f"Your automatic registry consumer {node_id}: read every predecessor result "
+        f"({', '.join(node.get('depends_on') or [])}) and complete the existing "
+        f"{node['completion_gate']} gate using only your sealed inputs, outputs and write scope.\n"
+        + auxiliary_arbitration_prompt(route, node_id) + "\n")
+
+
+def owner_close_prompt(args) -> str:
+    """Project the automatic closing node and its existing arbitration obligation."""
+    if getattr(args, "worker_type", None) != "owner":
+        return ""
+    route_file = getattr(args, "route_file", None) or getattr(getattr(args, "owner_route_binding", None), "route_file", None)
+    if not route_file:
+        return ""
+    try:
+        route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""  # Preview-only bindings retain the existing prompt fallback.
+    lines = []
+    for node in route.get("nodes") or []:
+        if node.get("completion_gate") != "compose-owner-close":
+            continue
+        lines.append(
+            f"Your automatic closing node {node['id']}: finish every predecessor "
+            f"({', '.join(node.get('depends_on') or [])}), read all their results, reconcile findings, "
+            f"and write only {', '.join(node['outputs'])}. No publication, synchronization, or edits to prior artifacts.")
+        arbitration = auxiliary_arbitration_prompt(route, node['id'], "closing summary")
+        if arbitration:
+            lines.append(arbitration.rstrip())
+    return "\n".join(lines) + ("\n\n" if lines else "")
+
+
 def assignment_prompt(args, task: str, environ) -> str:
     """Project the route's input/output boundary, rather than ask a caller to copy it.
 
@@ -573,7 +641,7 @@ def assignment_prompt(args, task: str, environ) -> str:
     if getattr(args, "worker_type", None) != "frame":
         route_file = getattr(args, "route_file", None)
         if not route_file:
-            return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}"
+            return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}"
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         scope = resolve_node_scope(
             route, getattr(args, "route_node", None), environ,
@@ -581,7 +649,8 @@ def assignment_prompt(args, task: str, environ) -> str:
         )
         return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
-                f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}")
+                f"{automatic_consumer_prompt(route, getattr(args, 'route_node', None))}"
+                f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
     outputs = []
     route_file = getattr(args, "route_file", None)
     if route_file:
@@ -601,6 +670,21 @@ def assignment_prompt(args, task: str, environ) -> str:
         "task; this frame produces only its own declared brief.\n"
         + ("This frame's declared output: " + json.dumps(outputs, ensure_ascii=False) + "\n" if outputs else "")
         + "\n"
+    )
+
+
+def worker_ending_prompt(*, supervised_owner: bool = False) -> str:
+    """One ending rule for every adapter; supervised wait turns are nonterminal."""
+    wait = (
+        "End an intermediate child-registration or resource-wait turn only with the "
+        "standalone line `runtime_wait: registered-children`, without a three-line handoff. "
+        if supervised_owner else ""
+    )
+    # State both ends: "nothing after it" alone allowed a summary before the
+    # envelope in two 2026-07-28 pipelines, losing their terminal handoff.
+    return (
+        wait + "For the terminal final response, end with the kernel's exact three-line "
+        "handoff as the entire message — no summary sentence before it, nothing after it.\n"
     )
 
 

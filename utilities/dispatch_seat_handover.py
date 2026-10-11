@@ -152,21 +152,17 @@ def _seat_of(key: str, snapshot: Optional[dict] = None):
     st = _st()
     data = (snapshot or {}).get("seat") if snapshot else None
     if isinstance(data, dict) and data.get("key") == key:
-        return st.Seat(str(data.get("kind") or "pane"), key, str(data.get("pane") or ""),
-                       str(data.get("harness") or ""), str(data.get("project_key") or ""))
+        return st.seat_from_dict(data)
     return st.Seat("pane", key)
 
 
 def pane_seat(env=None, harness: Optional[str] = None, sid: Optional[str] = None):
-    """The pane seat of this process, or None outside a herdr pane (project seats never hand over).
-    A Codex session in the shared app-server daemon has no pane variable: its pane is found the way
-    ``session_tidy.resolve_seat`` finds it."""
+    """The proven pane or exact native seat; project seats never hand over."""
     st = _st()
     env = os.environ if env is None else env
-    pane = (env.get("HERDR_PANE_ID") or "").strip()
-    if not pane and harness == "codex" and sid:
-        pane = st.codex_pane_for_session(sid)
-    return st.Seat("pane", st._digest("pane", pane), pane, "", "") if pane else None
+    detected, own_sid = st.session_from_env(harness, env)
+    seat = st.resolve_seat(harness or detected, env=env, sid=sid or own_sid)
+    return seat if seat.kind in ("pane", "native") else None
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +362,7 @@ def write_snapshot_locked(seat, harness: str, sid: str, *, now: Optional[float] 
     """Take (or drop) the seat's snapshot at enqueue; returns the number of bindings.  Caller holds the seat lock."""
     st = _st()
     now = st.now_epoch() if now is None else now
-    if seat.kind != "pane":
+    if seat.kind not in ("pane", "native"):
         return 0
     bindings = current_bindings(harness, sid, jobs)
     if not bindings:
@@ -383,7 +379,7 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
     """Append the A -> B row when ``sid`` is the confirmed successor of the snapshot's session
     (caller holds the seat lock).  Returns the row, or None (nothing to do / not confirmed)."""
     st = _st()
-    if seat.kind != "pane" or event not in ("start", "prompt"):
+    if seat.kind not in ("pane", "native") or event not in ("start", "prompt"):
         return None
     snap = read_snapshot(seat.key)
     if not snap:
@@ -422,7 +418,7 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
 
 def record_retire_handover(predecessor_sid: str, predecessor_harness: str, successor_sid: str,
                            successor_harness: str, *, env=None, jobs=None,
-                           now: Optional[float] = None) -> Optional[dict]:
+                           now: Optional[float] = None, successor_seat=None) -> Optional[dict]:
     """Hand a retired predecessor's routes to its seat successor, across harnesses.
 
     Called after ``peer-steward retire`` proved the predecessor exited and the caller runs in the
@@ -432,12 +428,14 @@ def record_retire_handover(predecessor_sid: str, predecessor_harness: str, succe
     naming the successor) that lets :func:`effective_parent` find it.  Registry rows are untouched.
     Returns the row (the existing one when repeated), or None when there is nothing to hand over
     -- including attempts the predecessor already handed to another session.
+    A deferred retire supplies the seat proven by its immutable requester and
+    original successor mark; its observer need not own that physical pane.
     """
     if not predecessor_sid or not successor_sid or predecessor_sid == successor_sid:
         return None
     st = _st()
-    seat = pane_seat(env, successor_harness, successor_sid)
-    if seat is None:
+    seat = successor_seat or pane_seat(env, successor_harness, successor_sid)
+    if seat is None or seat.kind != "pane":
         return None
     jobs = jobs or _default_jobs()
     now = st.now_epoch() if now is None else now

@@ -1415,8 +1415,12 @@ def build_continuation_route(
         # An approved route plan's leg keeps pointing at its plan when it resumes.
         "route_plan",
     )
-    route={key:json.loads(json.dumps(source_route[key]))
-           for key in inherited_keys if key in source_route}
+    inheritance=ROUTE_AUTHORITY.route_in_force(source_route)
+    route={key:json.loads(json.dumps(inheritance[key]))
+           for key in inherited_keys if key in inheritance}
+    pins=ROUTE_AUTHORITY.selection_pin_rows(source_route)
+    if pins:
+        route["selection_pins"]={"contract_version":SELECTION_PIN_CONTRACT_VERSION,**pins}
     route.update(result)
     if route.get("profile_selection_contract_version") == 1:
         retained = {node["id"] for node in route_nodes} | {"__owner__"}
@@ -2148,7 +2152,8 @@ def _expand_parallel_groups(nodes, parallel_groups, effective_intensity,
                 node["depends_on"] = list(node["depends_on"]) + [
                     member["id"] for member in members[1:]
                 ]
-                if base.get("kind") != "review-worker":
+                if (base.get("kind") != "review-worker"
+                        or node.get("completion_gate") == "compose-owner-close"):
                     node["inputs"] = list(node.get("inputs", [])) + [
                         output for member in members[1:] for output in member["outputs"]
                     ]
@@ -2863,8 +2868,121 @@ def _unarbitrated_auxiliary_legs(registry, group, anchor, consumers):
     return auxiliary
 
 
+def _compose_unarbitrated_groups(registry, recipe):
+    nodes = recipe["standard_plus"]["nodes"]
+    for group in recipe["standard_plus"].get("parallel_groups", []):
+        anchor = next(node for node in nodes if node["id"] == group["node"])
+        consumers = [node for node in nodes if anchor["id"] in node.get("depends_on", [])]
+        missing = _unarbitrated_auxiliary_legs(registry, group, anchor, consumers)
+        if missing:
+            yield {"id": group["id"], "reason": "auxiliary-arbiter-not-selected", "legs": missing}
+
+
+def _complete_compose_group_consumers(registry, base, graph, find_input, **kwargs):
+    """Restore missing safe registry consumers through the ordinary part assembler.
+
+    Replaying the original selection remains possible: historical recipes do not
+    ask for this completion, and new recipes record the inserted nodes rather
+    than treating them as caller-selected stages.
+    """
+    recipe = compose_subgraph_recipe(registry, base, graph, find_input, **kwargs)
+    original = json.loads(json.dumps(recipe["compose"]))
+    additions = []
+    contracts = registry.get("completion_gate_contracts") or {}
+    while True:
+        nodes = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
+        completed = False
+        pending = recipe["compose"].get("omitted_parallel_presets", []) + list(
+            _compose_unarbitrated_groups(registry, recipe))
+        for omission in pending:
+            anchor = nodes.get(omission["id"])
+            if anchor is None:
+                declared = next((row for row in base["standard_plus"].get("parallel_groups", [])
+                                 if row["id"] == omission["id"]), {})
+                anchor = nodes.get(declared.get("node"))
+            if anchor is None:
+                continue
+            part_id = anchor.get("part")
+            found = TOPO.part_recipe(registry, part_id) if part_id else (base, anchor)
+            if found is None:
+                continue
+            origin, source = found
+            group = next((row for row in origin["standard_plus"].get("parallel_groups", [])
+                          if row["node"] == source["id"]), None)
+            if group is None or ORDER[kwargs["group_intensity"]] < ORDER[group["min_intensity"]]:
+                continue
+            reason = omission["reason"]
+            if reason == "terminal-anchor" and anchor["kind"] == "pipeline-stage":
+                reason = "review-consumer-not-selected"
+            if reason not in ("review-consumer-not-selected", "auxiliary-arbiter-not-selected"):
+                continue
+            consumers = [node for node in origin["standard_plus"]["nodes"]
+                         if source["id"] in node.get("depends_on", [])]
+            if anchor["kind"] == "pipeline-stage":
+                consumers = [node for node in consumers if node["kind"] == "review-worker"]
+            if any(leg.get("leg_class") == "auxiliary" for leg in group["legs"]):
+                consumers = [node for node in consumers
+                             if contracts[node["completion_gate"]].get("auxiliary_arbiter") is True]
+            if len(consumers) != 1:
+                continue
+            consumer = consumers[0]
+            if (consumer["kind"] not in ("review-worker", "pipeline-stage")
+                    or consumer.get("resource_class") != "normal"
+                    or consumer.get("dispatch_depth") != 2 or consumer.get("commit_expected")
+                    or any(worktree_mutating_scope(scope) for scope in consumer["write_scope"])
+                    or (consumer.get("continuation") or {}).get("kind") != "inline-next"):
+                continue
+            key = f"{origin['capability']}:{consumer['id']}" if part_id else consumer["id"]
+            consumer_id = key.replace(":", "-") if part_id else key
+            if consumer_id in nodes or part_id and TOPO.resolve_shared_part(registry, base, key) is None:
+                continue  # Never duplicate or move a caller-selected stage.
+            selected = recipe["compose"]["graph"]
+            anchor_key = part_id or anchor["id"]
+            if anchor_key not in selected:
+                continue
+            augmented = list(selected)
+            augmented.insert(augmented.index(anchor_key) + 1, key)
+            overrides = recipe["compose"]["unit_overrides"]
+            try:
+                candidate = compose_subgraph_recipe(registry, base,
+                    [(stage, overrides.get(stage)) for stage in augmented], find_input, **kwargs)
+            except ValueError:
+                continue  # A declared consumer may conflict with a selected dependency.
+            if any(row["id"] == omission["id"]
+                   for row in candidate["compose"].get("omitted_parallel_presets", []) + list(
+                       _compose_unarbitrated_groups(registry, candidate))):
+                continue  # Declared ordering/extra stages may make completion unsafe.
+            additions.append({"id": consumer_id, "reason": reason, "anchors": [anchor["id"]],
+                              "intensity": kwargs["group_intensity"]})
+            recipe, completed = candidate, True
+            break
+        if not completed:
+            break
+    # Host groups historically kept auxiliary declarations even without their
+    # arbiter and then failed topology validation. Strong+ uses the same safe
+    # omission as borrowed groups when the declared consumer cannot be restored.
+    missing = list(_compose_unarbitrated_groups(registry, recipe))
+    for omission in missing:
+        group = next(row for row in recipe["standard_plus"]["parallel_groups"] if row["id"] == omission["id"])
+        group["legs"] = [leg for leg in group["legs"] if leg["suffix"] not in omission["legs"]]
+        group["width_by_intensity"] = {
+            tier: min(width, len(group["legs"])) for tier, width in group["width_by_intensity"].items()}
+        recipe["compose"].setdefault("omitted_parallel_presets", []).append(omission)
+    if missing:
+        # Assembly metadata only, so this new omission can replay without
+        # reinterpreting historical graphs that never requested completion.
+        recipe["compose"]["group_completion_intensity"] = kwargs["group_intensity"]
+    if additions:
+        recipe["compose"]["graph"] = original["graph"]
+        recipe["compose"]["unit_overrides"] = original["unit_overrides"]
+        recipe["compose"]["auto_completed_nodes"] = additions + recipe["compose"].get("auto_completed_nodes", [])
+    if (additions or missing) and kwargs.get("preserve_base_dependencies"):
+        recipe["compose"]["preserve_base_dependencies"] = True
+    return recipe
+
+
 def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, *, preserve_base_dependencies=False,
-                            extra_stages=None):
+                            extra_stages=None, group_intensity=None, complete_group_consumers=False):
     """Cut the caller's stage subgraph out of the capability's own recipe.
 
     The nodes keep their unit, kind, gate, write scope, profile and permissions;
@@ -2872,7 +2990,9 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
     last node becomes the terminal, a human gate a kept node raised is rebound
     to the entry of the node that now follows it (dropped when nothing
     follows), and a parallel group survives only when its anchor is kept and is
-    not the new terminal (G6). Validation stays with `_validate_recipe` --
+    not the new terminal (G6). Strong+ may append a side-effect-free owner close
+    to keep eligible terminal review/map groups. An absent group_intensity
+    replays the historical assembly. Validation stays with `_validate_recipe` --
     this function never re-implements a rule, it only assembles.
 
     SD-165: a graph key is a host stage id, an optional catalog part of the host
@@ -2881,6 +3001,10 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
     inside the host's own artifact scope; the name mapping is sealed as
     `part_io`. A graph that names none of these assembles exactly as before.
     """
+    if complete_group_consumers and group_intensity is not None and ORDER[group_intensity] >= ORDER["strong"]:
+        return _complete_compose_group_consumers(registry, base_recipe, graph_spec, find_input,
+            preserve_base_dependencies=preserve_base_dependencies,
+            extra_stages=extra_stages, group_intensity=group_intensity)
     host = base_recipe["capability"]
     base_nodes = {node["id"]: node for node in base_recipe["standard_plus"]["nodes"]}
     optional = dict(TOPO.recipe_optional_parts(registry, base_recipe))
@@ -3106,11 +3230,51 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         for original, sealed in zip(info["originals"], node["outputs"]):
             if not TOPO._is_semantic_output(original):
                 produced[original] = sealed
+    declared_groups = [(group, False) for group in base_recipe["standard_plus"].get("parallel_groups") or []]
+    for _, node_id, _, part in rows:
+        if part:  # a borrowed anchor brings its own group, re-keyed to the borrowed node id
+            declared_groups.extend(
+                (dict(json.loads(json.dumps(group)), id=node_id, node=node_id), True)
+                for group in part["recipe"]["standard_plus"].get("parallel_groups") or []
+                if group["node"] == part["stage"])
     if preserve_base_dependencies:
         terminal_ids = {node["id"] for node in nodes
                         if not any(node["id"] in (other.get("depends_on") or []) for other in nodes)}
     else:
         terminal_ids = {nodes[-1]["id"]}
+    auto_completed = []
+    closing_boundaries = set()
+    if group_intensity is not None and ORDER[group_intensity] >= ORDER["strong"]:
+        eligible = {group["node"] for group, _ in declared_groups
+                    if ORDER[group_intensity] >= ORDER[group["min_intensity"]]}
+        anchors = [node for node in nodes if node["id"] in terminal_ids & eligible
+                   and node["kind"] in ("review-worker", "map-worker")]
+        if anchors:
+            closing_boundaries = set(terminal_ids)
+            owner_id, suffix = "owner-close", 1
+            occupied = {node["id"] for node in nodes} | {out for node in nodes for out in node["outputs"]}
+            while owner_id in occupied or owner_id + ".md" in occupied:
+                suffix += 1
+                owner_id = f"owner-close-{suffix}"
+            terminals = [node for node in nodes if node["id"] in terminal_ids]
+            owner = {
+                "id": owner_id, "kind": "capability-owner", "unit": "_kernel/owner",
+                "depends_on": [node["id"] for node in terminals], "role": "deep orchestrator",
+                "inputs": list(dict.fromkeys(item for node in terminals
+                                             for item in node["inputs"] + node["outputs"])),
+                "outputs": [owner_id + ".md"], "write_scope": [owner_id + ".md"],
+                "resource_class": "normal", "completion_gate": "compose-owner-close",
+                "dispatch_depth": 1, "model_profile": registry["owner_profile_by_intensity"]["standard"],
+                "fallback_hops": ["same-harness-headless", "cross-harness-headless", "inline"],
+                "advance_class": "model-required", "model_required_reason": "terminal-report",
+                "commit_expected": False,
+            }
+            nodes.append(owner)
+            source_of[owner_id] = owner
+            terminal_ids = {owner_id}
+            auto_completed.append({"id": owner_id, "reason": "terminal-anchor",
+                                   "anchors": [node["id"] for node in anchors],
+                                   "intensity": group_intensity})
     for terminal in nodes:
         if terminal["id"] not in terminal_ids:
             continue
@@ -3135,7 +3299,9 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
             continue
         base = source_of[node["id"]]
         continuation = base.get("continuation") or {}
-        if continuation.get("kind") == "human-gate":
+        # A closing summary is not the omitted transaction: the old terminal
+        # boundary still drops its approval rather than rebinding it to the close.
+        if continuation.get("kind") == "human-gate" and node["id"] not in closing_boundaries:
             gate = continuation["gate"]
             if gate not in gate_anchor:
                 gates.append(gate)
@@ -3159,13 +3325,6 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
                 and row.get("gate") not in gates):
             bindings.append({"gate": row["gate"], "node": node_id, "position": "entry"})
             gates.append(row["gate"])
-    declared_groups = [(group, False) for group in base_recipe["standard_plus"].get("parallel_groups") or []]
-    for _, node_id, _, part in rows:
-        if part:  # a borrowed anchor brings its own group, re-keyed to the borrowed node id
-            declared_groups.extend(
-                (dict(json.loads(json.dumps(group)), id=node_id, node=node_id), True)
-                for group in part["recipe"]["standard_plus"].get("parallel_groups") or []
-                if group["node"] == part["stage"])
     groups, omitted_groups = [], []
     for group, borrowed in declared_groups:
         anchor = next((n for n in nodes if n["id"] == group["node"]), None)
@@ -3218,7 +3377,7 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         "completion_gates": sorted({node["completion_gate"] for node in nodes}),
         "human_gates": sorted(set(gates)),
         "human_gate_bindings": bindings,
-        "resume_retry_boundaries": list(ids),
+        "resume_retry_boundaries": list(ids) + [row["id"] for row in auto_completed],
         "compose": {"origin": "compose", "shape": "staged",
                     "graph": [row[0] for row in rows if not (row[3] and row[3].get("plan_stage"))],
                     "unit_overrides": overrides, "base_capability": base_recipe["capability"]},
@@ -3232,6 +3391,10 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
         recipe["standard_plus"]["parallel_groups"] = groups
     if omitted_groups:
         recipe["compose"]["omitted_parallel_presets"] = omitted_groups
+    if auto_completed:
+        recipe["compose"]["auto_completed_nodes"] = auto_completed
+        if preserve_base_dependencies:
+            recipe["compose"]["preserve_base_dependencies"] = True
     return recipe
 
 
@@ -3249,8 +3412,13 @@ def _versioned_subgraph(registry, recipe):
             if isinstance(node.get("input_sources"), dict):
                 for name, source in node["input_sources"].items():
                     sealed.setdefault(name, source)
+        auto = meta.get("auto_completed_nodes") or []
         expected = compose_subgraph_recipe(registry, base, graph, sealed.get if sealed else None,
-                                           extra_stages=meta.get("extra_stages"))
+                                           extra_stages=meta.get("extra_stages"),
+                                           group_intensity=meta.get("group_completion_intensity") or (auto[0]["intensity"] if auto else None),
+                                           complete_group_consumers=bool(meta.get("group_completion_intensity")) or any(
+                                               row["reason"] != "terminal-anchor" for row in auto),
+                                           preserve_base_dependencies=meta.get("preserve_base_dependencies", False))
         if expected == recipe:
             return True
         # Pre-notice routes already had this identical graph, but did not
@@ -3264,6 +3432,32 @@ def _versioned_subgraph(registry, recipe):
         return expected == recipe
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         return False
+
+
+def _validate_compose_owner_close(registry, recipe, intensity=None):
+    """Automatic closing/consumer nodes must be the exact registry-derived assembly."""
+    carries = any(node.get("completion_gate") == "compose-owner-close"
+                  for node in recipe["standard_plus"]["nodes"])
+    meta = recipe.get("compose") or {}
+    auto = meta.get("auto_completed_nodes")
+    selected = {key.replace(":", "-") for key in meta.get("graph", [])}
+    # Consumer completion is strong+ only; lower intensities retain the
+    # existing profile-demand validation of an inexact subgraph marker.
+    extra = intensity not in ("direct", "quick", "standard") and bool(meta.get("graph")) and any(
+        node["id"] not in selected and not node.get("plan_stage")
+        for node in recipe["standard_plus"]["nodes"])
+    completion_intensity = meta.get("group_completion_intensity")
+    nodes = {node["id"]: node for node in recipe["standard_plus"]["nodes"]}
+    host_omission = any(row["reason"] == "auxiliary-arbiter-not-selected"
+                        and row["id"] in nodes and not nodes[row["id"]].get("part")
+                        for row in meta.get("omitted_parallel_presets", []))
+    if carries or auto or extra or completion_intensity or host_omission:
+        if ((carries or auto or extra) and not auto
+                or carries != any(row["reason"] == "terminal-anchor" for row in auto or [])
+                or not _versioned_subgraph(registry, recipe)
+                or intensity is not None and (any(row["intensity"] != intensity for row in auto or [])
+                                             or completion_intensity and completion_intensity != intensity)):
+            raise ValueError("compose-owner-close-differs-from-assembly")
 
 
 def _compose_default_jobs():
@@ -3815,6 +4009,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     capabilities = {recipe["capability"] for recipe in registry["recipes"]
                     if recipe["capability"] != ROUTE_FRAME_CAPABILITY}
     if find_input is not None and frameless:
+        if parent_cycle_id is None and route_plan is None:
+            find_input = _without_implicit_frame_briefs(registry, find_input)
         find_input = _frame_brief_finder(registry, capability, find_input)
     if planned_full:
         # No graph: the recipe's own order, minus the frame nodes the plan already ran.
@@ -3831,7 +4027,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         extra_stages = route_plan["leg"].get("extra_stages")   # the plan's own stages, from the sealed leg
     selected_recipe = (compose_subgraph_recipe(registry, base, graph_spec, find_input,
                                                 preserve_base_dependencies=execution_scope == "report",
-                                                extra_stages=extra_stages)
+                                                extra_stages=extra_stages, group_intensity=requested,
+                                                complete_group_consumers=True)
                        if graph_spec is not None else base)
     if execution_scope == "report" and shape == "staged" and graph_spec is not None and profile is None:
         # The narrowed graph is made only from existing recipe/catalog parts. Keep each
@@ -3861,11 +4058,24 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             dispatch_evidence = {**dispatch_evidence, "tuples": [
                 row for row in dispatch_evidence["tuples"] if row.get("parent_harness") != "codex"
             ] + readiness["tuples"]}
+    owner_pin = (selection_pins or {}).get("owner", {}).get("harness")
+    probe_parent = owner_pin if shape == "staged" and owner_pin else parent_harness
     if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
-        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
+        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), probe_parent,
                                        children or _compose_default_children(selection_pins),
                                        gpu_route=gpu_route if shape == "staged" else None)
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
+    elif shape == "staged" and not owner_only and owner_pin and not any(
+            row.get("parent_harness") == owner_pin and row.get("status") == "supported"
+            and row.get("launch_authority") == "conductor"
+            for row in (dispatch_evidence or {}).get("tuples", [])):
+        # A frame's evidence describes its conductor. Check the selected owner
+        # with its workers rather than relabelling that evidence.
+        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), owner_pin,
+                                       children or _compose_default_children(selection_pins),
+                                       gpu_route=gpu_route)
+        dispatch_evidence = {**dispatch_evidence,
+                             "tuples": dispatch_evidence["tuples"] + readiness["tuples"]}
     if (shape == "solo" or owner_only or resume_graph) and registered_headless_evidence is None:
         readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
                                                     parent_harness, children or _compose_default_children(selection_pins))
@@ -3921,6 +4131,30 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
     return route
 
 
+def _without_implicit_frame_briefs(registry, finder):
+    """Keep campaign lookup for ordinary results, but do not infer frame lineage from it.
+
+    The blocked names come from the frame contract, including capability-specific consumer names
+    and the borrowed-part relocation form used by `_compose_inputs`. An explicit parent or route
+    proposal bypasses this wrapper at the compose call site and keeps the existing mapping.
+    """
+    catalog = TOPO.part_catalog(registry)
+    frame = catalog.get("frame") or {}
+    names = set(frame.get("brief_outputs") or [])
+    names.update(name for brief in (frame.get("briefs") or {}).values()
+                 for name in brief.get("inputs", []))
+    blocked = set(names)
+    aliases = frame.get("aliases") or []
+    for part_id in (catalog.get("parts") or {}):
+        part_capability = part_id.partition(":")[0]
+        blocked.update(f"parts/{part_capability}/{producer}/{name}"
+                       for producer in aliases for name in names)
+
+    def find(name):
+        return None if name in blocked else finder(name)
+    return find
+
+
 def _frame_brief_finder(registry, capability, finder):
     """Let a leg of an approved plan find the frame cycle's two briefs under the names its recipe reads.
 
@@ -3938,10 +4172,8 @@ def _frame_brief_finder(registry, capability, finder):
 
 
 def _frame_pin_rows(frame_route):
-    """A copy of the frame route's sealed pin rows (`{target: pin}`), without `contract_version`."""
-    pins = frame_route.get("selection_pins")
-    return {target: dict(pins[target]) for target in SELECTION_PIN_TARGETS
-            if isinstance(pins, dict) and isinstance(pins.get(target), dict)}
+    """Compatibility name; all descendants read the same pins in force."""
+    return ROUTE_AUTHORITY.selection_pin_rows(frame_route)
 
 
 def proposal_readiness(frame_route, jobs):
@@ -3952,10 +4184,12 @@ def proposal_readiness(frame_route, jobs):
 
 
 def _leg_compose_kwargs(leg_args, *, frame_route, frame_cycle_id, slug):
+    import route_plan as RP
     spec = ((frame_route.get("tracked_gate_evidence") or {}).get("spec_read") or {}).get("source") or "auto"
     return dict(
         capability=leg_args["capability"], capability_mode=leg_args["capability_mode"], shape=leg_args["shape"],
-        graph=leg_args["graph"], intensity=leg_args["intensity"], slug=slug, cwd=frame_route["cwd"],
+        graph=leg_args["graph"], intensity=leg_args["intensity"], slug=slug,
+        cwd=RP.leg_cwd(leg_args, frame_route["cwd"]),
         artifact_root=frame_route["artifact_root"],
         spec_read="auto" if str(spec).startswith("compose-auto:") else spec,
         campaign_key=frame_route.get("campaign_key"), parent_cycle_id=frame_cycle_id,
@@ -3970,10 +4204,11 @@ def compile_proposal_leg(leg, index, *, frame_route, frame_cycle_id, readiness):
     The registry, graph, order, unit, scope and gate rules are the ones compose applies when it seals.
     """
     import route_plan as RP
-    return compose_route(
-        **_leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
-                              slug=f"{frame_route.get('slug') or 'framed'}-leg{index}"),
-        **_leg_evidence(leg, readiness), frameless=True, extra_stages=leg.get("extra_stages"))
+    kwargs = _leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
+                                 slug=f"{frame_route.get('slug') or 'framed'}-leg{index}")
+    probe = (lambda: readiness(kwargs["cwd"])) if leg.get("cwd") else readiness
+    return compose_route(**kwargs, **_leg_evidence(leg, probe), frameless=True,
+                         extra_stages=leg.get("extra_stages"))
 
 
 def _leg_evidence(leg, readiness):
@@ -3994,12 +4229,14 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     import route_plan as RP
     kwargs = _leg_compose_kwargs(RP.leg_arguments(leg), frame_route=frame_route, frame_cycle_id=frame_cycle_id,
                                  slug=f"{context['slug']}-leg{index}")
-    owner = context.get("owner") or ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness")
+    kwargs["cwd"] = RP.leg_cwd(leg, frame_route["cwd"], base_cwd=context["cwd"])
+    owner = ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness") or context.get("owner")
     if work_request is not None:
-        work_request = {**work_request, "owner_harness": work_request.get("owner_harness") or owner}
-    route = compose_route(**kwargs, **_leg_evidence(leg, readiness), work_request=work_request, route_plan=binding,
-                           parent_harness=owner or "claude")
-    if leg["shape"] != "direct" and _isolates_worktree(route):
+        work_request = {**work_request, "owner_harness": owner or work_request.get("owner_harness")}
+    probe = (lambda: readiness(kwargs["cwd"])) if leg.get("cwd") else readiness
+    route = compose_route(**kwargs, **_leg_evidence(leg, probe), work_request=work_request, route_plan=binding,
+                            parent_harness=owner or "claude")
+    if not leg.get("cwd") and leg["shape"] != "direct" and _isolates_worktree(route):
         # Every leg of one decision shares the frame's worktree, prepared by the first leg that changes source.
         worktree = prepare_isolated_worktree(frame_route["cwd"], frame_route.get("slug"))
         if worktree.get("cwd"):
@@ -4442,6 +4679,10 @@ def compose_decision_lines(route):
     resources = [n["id"] for n in nodes if n.get("kind") == "resource-runner"]
     lines.append(f"  규모: nodes={len(nodes)} worker_dispatches={workers} owner_dispatches={owners} "
                  f"resource(측정)={','.join(resources) or '없음'} (초기 실행 예상, 재시도·후속 route 제외)")
+    for row in ((route.get("composed_recipe") or {}).get("compose") or {}).get("auto_completed_nodes", []):
+        purpose = "owner closing summary" if row["reason"] == "terminal-anchor" else "registry consumer"
+        lines.append(f"  {row['intensity']} group {','.join(row['anchors'])}: "
+                     f"auto-added {row['id']} ({row['reason']}; {purpose})")
     return lines + compose_omission_lines(route)
 
 
@@ -4521,6 +4762,8 @@ def compile_composed_route(composed_recipe, capability_mode, requested_intensity
     # SAME validator means gates too: without this, a composed recipe could carry a
     # forged completion gate that no registry contract backs (2026-07-22 verify finding).
     TOPO._validate_gate_contracts(composed_recipe, registry)
+    _validate_compose_owner_close(registry, composed_recipe,
+                                 "standard" if requested_intensity == "auto" else requested_intensity)
     if capability_mode not in composed_recipe.get("modes", []):
         raise ValueError("composed recipe does not declare the requested capability mode")
     return _compile_from_recipe(
@@ -5097,6 +5340,7 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             composed_recipe, registry,
             registry["owner_profile_by_intensity"]["standard"],
         )
+        _validate_compose_owner_close(registry, composed_recipe, route["effective_intensity"])
         if resume_recipe and not _versioned_subgraph(registry, composed_recipe):
             raise ValueError("resume recipe differs from the declared catalog")
         expected_nodes=(RESOURCE_RESUME.nodes(composed_recipe, registry["owner_profile_by_intensity"]["quick"])
@@ -5538,8 +5782,18 @@ def write_once(path, payload):
         fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     except FileExistsError:
         if path.read_text(encoding="utf-8") != data: raise ValueError("immutable route already exists with different content")
+        _index_published_route(path, payload)
         return
     with os.fdopen(fd,"w",encoding="utf-8") as fh: fh.write(data); fh.flush(); os.fsync(fh.fileno())
+    _index_published_route(path, payload)
+
+
+def _index_published_route(path, payload):
+    if isinstance(payload, dict) and payload.get("route_id") and "nodes" in payload:
+        import directory_record_index
+        directory_record_index.published(path, payload, kind="route-children",
+                                         classify=directory_record_index.route_keys,
+                                         ignored=directory_record_index.ROUTE_SIDECARS)
 
 def completion_dir(route_id, *, jobs=None):
     return resolve_dispatch_state_root(resolve_agent_home(), jobs)/"completion"/route_id
@@ -6143,6 +6397,9 @@ def close_route(route, route_file, commit=None, summary=None, publication=None,
                 terminal_commit_id=None, expected_owner_attempt_id=None,
                 expected_producer_binding_digest=None, inline_finish_id=None,
                 expected_summary_digest=None, inline_commit=None, autoclose=None):
+    import route_parent_close
+    if route_parent_close.intent(route, jobs):
+        raise ValueError("cancelled-by-parent")
     try:
         import inline_finish
         pending=inline_finish.pending_state(Path(route["artifact_root"]),route["route_id"])
@@ -6368,7 +6625,7 @@ def route_sidecar_kind(path):
     return None
 
 
-def route_status(artifact_root, *, diagnostics=None):
+def route_status(artifact_root, *, diagnostics=None, open_only=False):
     """Report every compiled route under one artifact root and whether it is closed.
 
     Scans the canonical `.runtime/routes/` directory plus four legacy locations
@@ -6389,13 +6646,25 @@ def route_status(artifact_root, *, diagnostics=None):
     rows=[]
     for search_dir in search_dirs:
         if not search_dir.is_dir(): continue
-        for path in sorted(search_dir.glob("*.json")):
+        with os.scandir(search_dir) as stream:
+            entries = sorted(stream, key=lambda entry: entry.name)
+        closed_names = ({entry.name.removesuffix(".outcome.json") for entry in entries
+                         if entry.name.endswith(".outcome.json") and entry.is_file()}
+                        if open_only and diagnostics is None and search_dir == canonical else set())
+        for entry in entries:
+            if not entry.name.endswith(".json") or entry.name == ".route-children-index.json": continue
+            path = search_dir / entry.name
             # SD-OPEN-54 (#15): typed sidecars beside a route record (`.outcome.json`,
             # `.gate-release.json` -- the workflow-supervisor gate ledger) are never
             # route candidates; the ledger used to be read as a route, fail
             # `route-malformed-missing-required-keys`, and turn every quiescence
             # observation of the root fail-closed (hearting rt-5d862a3d..., cairn W15d).
             if route_sidecar_kind(path) is not None: continue
+            # Closed canonical records need no payload read for --open-only.
+            # Retain their filename identity for duplicate-location reporting.
+            if (ROUTE_RECORD_BASENAME.fullmatch(path.name) and path.stem in closed_names):
+                by_route_id.setdefault(path.stem, []).append(str(path))
+                continue
             # A canonical file that is not a route record by name (`rt-<16 hex>.json`)
             # may still be an alias route (drift, reported below); when it does not
             # parse as a route it is foreign evidence, not a malformed route, so its
@@ -6454,7 +6723,7 @@ def route_status(artifact_root, *, diagnostics=None):
         locations=by_route_id.get(row["route_id"],[])
         if len(locations) > 1: row["duplicate_locations"]=sorted(locations)
     rows.sort(key=lambda row:(_LOCATION_SORT_PRIORITY.get(row["location"],9),row["route_file"]))
-    return rows
+    return [row for row in rows if not row["closed"]] if open_only else rows
 
 def _marker_attempt_axes(node, attempt_id, attempt_metadata):
     if attempt_metadata is not None and attempt_metadata.get("stage_authority") == "owner-closure":
@@ -8109,6 +8378,10 @@ def complete_node(
             raise ValueError(f"{exc.reason}:{exc.detail}") from exc
     # This completion proceeds on its predecessors: keep any gates-off edit of their evidence as history.
     _note_evidence_changes(route,node.get("depends_on",[]) if isinstance(node,dict) else [],jobs=jobs)
+    if node.get("completion_gate") == "compose-owner-close":
+        missing = owner_terminal_prerequisites(route, node, jobs or _compose_default_jobs())
+        if missing:
+            raise ValueError("compose-owner-close-before-join:" + ",".join(sorted(missing)))
     artifact_root=route.get("artifact_root")
     route_id=route.get("route_id")
     pending=None
@@ -8378,6 +8651,14 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
         # they stay current here and still refuse.
         superseded=(_registered_marker_fence(route,node,existing,lines)=="completion-attempt-not-current"
                     and _registered_marker_fence(route,node,{"attempt_id":own},lines) is None)
+        if existing.get("state")=="superseded-by-upstream-revision":
+            from dispatch_contract import gate_currency
+            currency=gate_currency(route,node,canonical,existing,observe=True)
+            if currency.state!="superseded":
+                refuse("canonical-marker-unproven",currency.reason)
+            latest_blocking=next((metadata.get("attempt_id") for status,metadata in reversed(terminated)
+                                  if status=="done" and metadata.get("note")==REVIEW_BLOCKING_NOTE),None)
+            superseded=superseded or own==latest_blocking
         if existing.get("attempt_id")!=own and not superseded:
             refuse("node-already-complete",f"attempt={existing.get('attempt_id') or '-'}")
     terminal=inspect_terminal_attempt(
@@ -8919,6 +9200,9 @@ def _complete_node_locked(
                 )
             raise ValueError(f"row-close-failed:{exc.reason}") from exc
         with _exclusive_lock(Path(f"{jobs_path}.lock")) as jobs_lock:
+            import route_parent_close
+            if route_parent_close.intent(route, jobs_path):
+                raise ValueError("cancelled-by-parent")
             # Existing jobs lock is the sole terminal-claim serialization point.
             ensure_terminal_claim_absent(jobs_path, route["route_id"], attempt_id)
             lines=jobs_path.read_text(encoding="utf-8",errors="replace").splitlines()
@@ -9608,9 +9892,10 @@ def prepare_isolated_worktree(cwd, slug):
     """The isolated worktree a source-changing route runs in, when `cwd` is a primary checkout.
 
     `<repo>-wt/<slug>` (OPERATIONS §5.9 naming) on a new branch `<slug>` from the latest
-    `origin/<default>`, or the existing worktree at that path, reused as it is. Returns
+    `origin/<default>` (the primary's current HEAD when it has local work), or
+    the existing worktree at that path, reused as it is. Returns
     `{state: created|reused, path, cwd, branch, base}`, or `{state: skipped, reason}` when the
-    caller's cwd stays the route cwd (not a primary checkout, local work the base lacks, or the path
+    caller's cwd stays the route cwd (not a primary checkout, or the path
     or branch is taken).
     Nothing here refuses: a skipped preparation leaves the work where it was asked to run."""
     if OWNER_WRITE_ADVISORY.git_topology(cwd) != "primary":
@@ -9630,11 +9915,12 @@ def prepare_isolated_worktree(cwd, slug):
     default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
     _git(top, "fetch", "-q", "origin", default)
     base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
-    # Work in progress in the checkout (uncommitted or new files, or commits the base lacks) is what the
-    # work may build on; a worktree from the base would leave it behind, so the cwd stays as asked.
+    # Local work must not pin a source-changing owner to the shared primary.
+    # Keep its committed baseline, without copying or changing uncommitted files.
+    # The prepared cwd is sealed before launch, so every stage shares it naturally.
     if (_git(top, "status", "--porcelain") != ""
             or _git(top, "merge-base", "--is-ancestor", "HEAD", base) is None):
-        return {"state": "skipped", "reason": "primary-has-local-work"}
+        base = _git(top, "rev-parse", "HEAD") or "HEAD"
     if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
         made = _git(top, "worktree", "add", str(path), slug)
     else:
@@ -9905,7 +10191,7 @@ def _continue_after_answer(jobs, attempt_id, correction):
 
 
 def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None):
-    """Append one route-chain ledger line. Every failure is silent — route creation/start
+    """Append one route-chain ledger line. Failures report their cause — route creation/start
     must never fail because of this sidecar (plan §3 B-1.3). Success/failure is only
     ever observable on stderr."""
     try:
@@ -9935,10 +10221,12 @@ def _record_route_chain(route, route_file, event, *, plan=None, plan_source=None
             route, event=event, harness=harness, session_id=sid, route_file=route_file,
             plan=plan, plan_source=plan_source, dispatch_depth=depth, by_attempt=by_attempt,
         )
-        if rc.append(harness, sid, line):
+        append_errors = []
+        if rc.append(harness, sid, line, on_error=append_errors.append):
             print(f"route_chain_written=1 harness={harness}", file=sys.stderr)
         else:
-            print("route_chain_written=0 reason=append-failed", file=sys.stderr)
+            detail = append_errors[0] if append_errors else "unknown"
+            print(f"route_chain_written=0 reason=append-failed detail={detail}", file=sys.stderr)
     except Exception as exc:
         try:
             print(f"route_chain_written=0 reason={exc}", file=sys.stderr)
@@ -10355,6 +10643,8 @@ def main():
                     help="for a route id: default AGENT_ARTIFACT_ROOT, else utilities/artifact-root.sh for the current directory")
     cl.add_argument("--commit",help="result commit; defaults to HEAD in the route cwd")
     cl.add_argument("--summary",help="one line naming what the route produced")
+    cl.add_argument("--stop-resources", action="store_true",
+                    help="also stop resource runs exactly linked to this route; default preserves them")
     cl.add_argument("--allow-unproven",action="store_true",
                      help="accepted for compatibility; close always records terminal_gate_proven=false with a "
                           "terminal-gate-unproven warning when the terminal node has not completed")
@@ -10436,6 +10726,9 @@ def main():
         if route_plan_binding is not None:
             # A continuation leg keeps the pins its frame was composed with; a pin given here replaces only its own target.
             pins={**_inherited_selection_pins(route_plan_binding,artifact_root),**pins}
+            if a.cwd is None:
+                context=route_plan_binding["record"]["decision"]["first_leg_compose"]["context"]
+                cwd=RP.leg_cwd(route_plan_binding["leg"],cwd,base_cwd=context["cwd"])
         pins,pin_warnings=_filter_top_pins(pins)
         owner_pin=(pins.get("owner") or {}).get("harness")
         compose_args=dict(
@@ -10461,6 +10754,7 @@ def main():
         route=compose_route(**compose_args)
         worktree=None
         if (a.start and a.cwd is None and a.dispatch_evidence is None and shape!="direct"
+                and not (route_plan_binding or {}).get("leg",{}).get("cwd")
                 and _isolates_worktree(route)):
             # Work that changes source runs in its own worktree, not in the shared primary checkout.
             worktree=prepare_isolated_worktree(cwd,a.slug)
@@ -10708,16 +11002,14 @@ def main():
         # which is honest — nothing here claims progress the owner has not proven).
         if os.environ.get("AGENT_DISPATCH_DEPTH") != "1" or advance is not None:
             _record_route_chain(route, str(output_path.resolve()), "continuation")
-        # D-120: the source's open cycle, if any, extends to this continuation.
-        cycle_bind=bind_continuation_cycle(artifact,source,route)
-        print(f"cycle_binding_bound={1 if cycle_bind['bound'] else 0}",file=sys.stderr)
-        if cycle_bind.get("advisory"):
-            print(f"cycle_binding_advisory={cycle_bind['advisory']}",file=sys.stderr)
+        # Publication is a candidate. The existing producer begin path records
+        # cycle admission when execution enters it; a refused batch never
+        # transfers the predecessor's closing responsibility.
+        print("cycle_binding_bound=0 cycle_binding_deferred=1 basis=execution-begin",file=sys.stderr)
         print(f"route_file={output_path.resolve()}",file=sys.stderr)
         print(json.dumps(route,sort_keys=True))
     elif a.command=="status":
-        rows=route_status(a.artifact_root or _compose_artifact_root(os.getcwd()))
-        if a.open_only: rows=[row for row in rows if not row["closed"]]
+        rows=route_status(a.artifact_root or _compose_artifact_root(os.getcwd()), open_only=a.open_only)
         from parent_next_directive import resume_command
         for row in rows:
             if not row["closed"] and not row.get("read_only"):
@@ -10818,7 +11110,18 @@ def main():
         elif a.command=="close":
             # An unproven terminal gate is recorded and warned about below, never refused:
             # the refusal was bypassed almost every time it fired.
-            outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=True)
+            import route_parent_close
+            outcome=route_parent_close.close(route, a.route, stop_resources=a.stop_resources,
+                                            summary=a.summary, commit=a.commit)
+            if outcome is None:
+                outcome,created=close_route(route,a.route,a.commit,a.summary,allow_unproven=True)
+            else:
+                created=True
+                from work_start import pin_handoff_continuation
+                outcome=pin_handoff_continuation(route, a.route, route_parent_close.jobs_path(),
+                                                {**outcome,"summary":a.summary or outcome.get("summary")})
+                print(json.dumps(outcome,sort_keys=True))
+                return
             print(json.dumps(outcome,sort_keys=True))
             if not created: print("capability-route: route already closed",file=sys.stderr)
             if outcome.get("review_independence_degraded"):

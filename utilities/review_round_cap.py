@@ -67,6 +67,7 @@ def is_round_capped_node(node):
     """
     return isinstance(node, Mapping) and (
         node.get("id") in ROUND_CAPPED_NODE_IDS
+        or node.get("parallel_anchor") in ROUND_CAPPED_NODE_IDS
         or (node.get("kind") == "review-worker" and node.get("unit") == "qa/plan-review")
         # A stage a plan added is shaped on a catalog stage and keeps that stage's budget.
         or (isinstance(node.get("plan_stage"), Mapping)
@@ -102,6 +103,7 @@ def logical_round_records(rows, *, jobs=None):
     """
     if jobs is None:
         return rows  # No registry binding grants no census-reduction authority.
+    from route_authority import replacement_parent_matches
     by_id = {}
     for fields, meta in rows:
         by_id.setdefault(meta.get('attempt_id'), []).append((fields, meta))
@@ -129,8 +131,9 @@ def logical_round_records(rows, *, jobs=None):
                 or candidate.get('replacement_claim_digest') != digest
                 or candidate.get('replacement_ordinal') != '1'
                 or candidate_fields[2:4] != fields[2:4]
+                or not replacement_parent_matches(source, candidate, jobs, lineage=True)
                 or any(candidate.get(key) != source.get(key) for key in
-                       ('route_node', 'parent_attempt_id', 'parent_sid', 'worker_type', 'dispatch_depth'))):
+                       ('route_node', 'worker_type', 'dispatch_depth'))):
             continue
         # Metadata is reciprocal, but the immutable canonical claim must still
         # agree. Read-only and lock-free: callers may already hold the jobs lock.
@@ -382,11 +385,9 @@ def round_budget(route, node, rows: Sequence[tuple[str, Mapping]], *, revisions=
     # live/unsettled rows and the verdictless bound always take precedence.
     verdict_indexes = [index for index, kind in enumerate(kinds) if kind == "verdict"]
     if state in ("admit", "exhausted") and verdict_rounds < cap + 1 and revisions and verdict_indexes:
-        _last_status, last_meta = rows[verdict_indexes[-1]]
-        last_note = last_meta.get("note", "")
-        last_blocking = last_note == REVIEW_BLOCKING_NOTE or (
-            last_note == "dead-worker-fail" and last_meta.get("failure_class") == "fail"
-        )
+        last_row = rows[verdict_indexes[-1]]
+        _last_status, last_meta = last_row
+        last_blocking = _last_round_blocking_verdict([last_row], worker_type)
         last_attempt = last_meta.get("attempt_id")
         if last_blocking and last_attempt and any(
             last_attempt in (revision.get("answers") or ()) for revision in revisions
@@ -449,6 +450,10 @@ def _last_round_blocking_verdict(rows, worker_type):
     if kind != "verdict":
         return False
     note = metadata.get("note", "")
+    if (note == "completed-marker" and metadata.get("failure_class") == "fail"
+            and (metadata.get("worker_type") or worker_type) == "review"):
+        from dispatch_contract import owner_closure_shape
+        return owner_closure_shape(metadata) == "registered-review"
     return note == REVIEW_BLOCKING_NOTE or (
         note == "dead-worker-fail" and metadata.get("failure_class") == "fail"
     )

@@ -33,6 +33,12 @@ state and parent links to prevent overwrites and ad hoc loss. Automatically read
 the user's existing layer, prefix, and config patterns priority. Graduate
 refinement or library work to autopilot-code.
 
+Within `eval`, the named **Existing-result analysis** default composes
+`metrics → diagnose → report`. At strong or higher, include `independent-verify`
+with its declared two-way group and automatic owner close. For one requested
+new measurement, add `eval-run` with its existing inputs and sealed raw-result
+write scope. The mode-specific examples below cover both compositions.
+
 Adapters may expose this capability through native commands, skill files, prompt instructions, or explicit wrappers. The adapter must report unsupported runtime mechanics instead of silently treating another runtime's native file format as portable.
 
 ## Artifact Ownership
@@ -101,6 +107,42 @@ shape, the derivation and current runtime limits.
 | `setup` | Experiment spec, scaffold, run commands, pending `_RUNLOG` row, birth `run.json`, post-run verification, and a recorded handoff naming the successor workflow. |
 | `eval` | Eval spec, evaluation execution or guidance, metrics and per-array analysis, figures/media, report, `_RUNLOG` completion, lineage finalization. |
 
+### Existing-result analysis (eval default composition)
+
+For a request that analyzes existing results without a new measurement, default
+to the named **Existing-result analysis** composition: `metrics → diagnose → report`.
+At `strong` or higher, include `independent-verify`; its declared two-way group
+feeds the automatic owner close, which reconciles both verdicts in one summary.
+This uses the existing `eval` recipe and `--graph`, with the same `setup`/`eval`
+modes. A frame uses this default when assembling that work; an already decided
+route can use this staged example:
+
+```sh
+hearting run capability-route compose --prompt-file <task> \
+  --shape staged --capability autopilot-lab --capability-mode eval \
+  --intensity strong --graph metrics,diagnose,report,independent-verify --explain
+```
+
+Reuse the existing `raw-results/**` and `run.json`; omit already completed
+aggregation when its metrics are sufficient. At standard or lower, the default
+graph is `metrics,diagnose,report`. Selected inputs, report provenance and
+completion contracts still apply.
+
+For **analysis plus one small measurement**, add the existing `eval-run` before
+metrics. With the required checkpoint, eval spec, smoke attestation and config
+provenance already available, use the same command with
+`--graph eval-run,metrics,diagnose,report,independent-verify`. If the measurement
+needs a new contract or smoke attestation, use
+`--graph eval-spec,eval-smoke,eval-run,metrics,diagnose,report,independent-verify`.
+Both strong graphs retain the two-way verification and automatic owner close.
+
+Bound a single CPU inference by its sample, checkpoint, count and output paths
+in the eval spec and approved task. Run it through `eval-run`, whose write scope
+already covers `run.json`, `raw-results/**` and `logs/**`; it retains the registry
+resource class, hash-bound smoke/config requirements and supervised continuation.
+The `metrics` stage, including `metrics:qa/ml-debug`, writes only `metrics.jsonl`
+and `summary-stats.json`. It cannot create the new raw results.
+
 ### Setup does not end at the training process
 
 The existing start choice may select `report`, which ends successfully after
@@ -122,6 +164,9 @@ or executable environment is absent, and compose it separately after approval.
 The resource runner continues to enforce route verification, hash-bound smoke
 attestation, config provenance, the governor, and its `supervised` continuation.
 
+For a failed resource run, use `<manifest_run_id>__a<N>` (N starts at 1) on the same route; reusing the previous run ID with a new owner conflicts with its existing watch binding (`resource-watch-binding-conflict`).
+`compute-hosts run` resolves the selected devices to host GPU indices and sets `CUDA_VISIBLE_DEVICES` to those indices (for example `0`), so owner scaffolds must not require that value to be a GPU UUID. Explicit `CUDA_VISIBLE_DEVICES=` or `CUDA_VISIBLE_DEVICES=-1` selects CPU-only execution without GPU admission.
+
 This replaced a graph whose last node was the training process itself. On
 2026-08-04 the BC_ResNet_tf run finished training and its hard-negative loop, the
 wrapper contained no evaluation stage, the resource runner had no completion
@@ -136,6 +181,15 @@ Workload progress is optional. The resource runner supplies
 Lab scripts may call `resource_progress.write_progress(completed, "epoch", total=50)`
 from the shared `utilities/` helper to atomically publish a short counter; a missing
 or invalid observation never interrupts the workload or changes exit/sentinel completion.
+
+The same separation applies to GPU monitoring. Generated execution bridges
+read the payload's terminal evidence before sampling again and retain partial
+samples plus a warning when a probe fails. `compute-hosts probe --json` returns
+availability in the snapshot; a zero command exit does not prove GPU identity
+or headroom. Optional monitoring never raises the payload's exit code, and
+prelaunch identity/headroom requirements remain explicit checks. A required
+during-run sample belongs to the existing `run-verify`/evaluation verification
+check: missing evidence can fail that check without changing resource success.
 
 ### Parts (SD-165)
 
@@ -164,7 +218,7 @@ stay as they are; the following appear only in an explicit `--graph`:
 | `autopilot-lab:diagnose` | review-worker, `qa/ml-debug` | After `metrics`: `reviews/diagnosis.md` with hypotheses, reproduction conditions, verdict and a falsifying experiment. Optional external inputs (field samples, reproduction conditions) are named in the assignment. Shareable. |
 | `metrics:qa/ml-debug` | unit choice | Runs `metrics` with the diagnosing unit instead of `material/data-script`. |
 
-Example: `--graph eval-spec,eval-smoke,eval-run,metrics,diagnose,report`. When
+The analysis and new-measurement examples above use these existing parts. When
 `eval-spec` or `eval-smoke` is left out of a partial graph, `eval-run`'s
 `eval-spec` and `smoke-attestation` inputs are filled from the prior cycle under
 the catalog's name mapping (`eval-spec.md`, `reviews/smoke-attestation.json`);
@@ -198,6 +252,10 @@ opening one session per stage:
 | closing stage | `autopilot-spec` update when applicable (a research-mode blueprint advances as a roadmap: close the step with its verdict and evidence, re-plan the tail), then offer only `bundle_id`, version, and `report/index.html` to the optional app-neutral sink; unavailable records `skipped/extension-unavailable` | 9 |
 
 This is a stage catalog, not a requirement to repeat completed computation.
+Browser verification writes its screenshots, logs and verdict in its review
+folder, using a process-owned temporary Chromium profile outside cycle
+`artifacts/`. Existing `reviews/**/browser/profile/` and `profile-*/` runtime
+directories are left in place and excluded by the producer on close and refresh.
 For reporting or media work on fixed results, use `WORKFLOW §0.2.1` to select
 the needed subgraph (for example `report,independent-verify,publish,sync` for a publishable
 report from existing inputs). Reuse metrics, checkpoints, and media; omit

@@ -40,6 +40,16 @@ def args(parent="codex", **values):
 
 
 class ParentDeliveryContract(unittest.TestCase):
+    def setUp(self):
+        original = dict(os.environ)
+        for key in tuple(os.environ):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_")):
+                os.environ.pop(key, None)
+        for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
+                    "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG"):
+            os.environ.pop(key, None)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(original)))
+
     def test_identity_failure_names_native_parent_without_gateway_recovery(self):
         request = args(parent_completion_delivery="poll-fallback")
         with self.assertRaises(P.DispatchContractError) as raised:

@@ -31,6 +31,7 @@ T = _load("producer_test_for_sd163", "artifact_producer.test.py")
 OWNER_T = _load("owner_test_for_sd163", "dispatch_owner.test.py")
 R, P, TOPO = T.R, T.P, T.R.TOPO
 import dispatch_stage_advance as ADVANCE  # noqa: E402
+import route_plan as RP  # noqa: E402
 
 PARENT_VAR = "AGENT_ARTIFACT_PARENT_OUTPUT_DIR"
 SIX = ["AGENT_ARTIFACT_ROOT", "AGENT_ARTIFACT_CAMPAIGN_ID", "AGENT_ARTIFACT_CYCLE_ID",
@@ -82,6 +83,21 @@ class SourceBase(T.ProducerTestBase):
 
 
 class NoSourceRegressionTest(SourceBase):
+    def test_implicit_frame_filter_uses_catalog_names_and_borrowed_relocations(self):
+        registry = TOPO.load_registry()
+        catalog = TOPO.part_catalog(registry)
+        frame = catalog["frame"]
+        names = set(frame["brief_outputs"])
+        names.update(name for brief in frame["briefs"].values() for name in brief["inputs"])
+        part_capability = next(iter(catalog["parts"])).partition(":")[0]
+        borrowed_name = f"parts/{part_capability}/{frame['aliases'][0]}/{next(iter(names))}"
+        found = {name: {"cycle_id": "cyc_" + "1" * 32, "path": name}
+                 for name in (*names, borrowed_name, "ordinary/frame-context.md")}
+        finder = R._without_implicit_frame_briefs(registry, found.get)
+        for name in (*names, borrowed_name):
+            self.assertIsNone(finder(name), name)
+        self.assertEqual(finder("ordinary/frame-context.md"), found["ordinary/frame-context.md"])
+
     def test_patch_target_is_the_module_compose_imports(self):
         self.assertIs(P, sys.modules["artifact_producer"])
         self.cycle()
@@ -126,6 +142,62 @@ class NoSourceRegressionTest(SourceBase):
 
 
 class SealedSourceTest(SourceBase):
+    FRAME_BRIEFS = ("shards/frame/direction-brief.md",
+                    "shards/frame-alternative/direction-brief.md")
+
+    def frame_cycle(self):
+        return self.cycle(files=self.FRAME_BRIEFS)
+
+    def assert_frame_sources(self, route, cycle):
+        node = self.node(route, "plan")
+        folder = Path(cycle["cycle_dir"]).relative_to(self.root) / "artifacts"
+        expected = {name: {"cycle_id": cycle["cycle_id"], "path": (folder / name).as_posix()}
+                    for name in self.FRAME_BRIEFS}
+        self.assertEqual(node["input_sources"], expected)
+
+    def test_a_fresh_frameless_graph_drops_campaign_frame_briefs_but_keeps_partial_outputs(self):
+        unrelated = self.cycle(files=(*self.FRAME_BRIEFS, "plan.md", "checklist.md"))
+        with_campaign = self.compose(graph="plan,execute,test,report", campaign_key="k163")
+        self.assertNotIn("input_sources", self.node(with_campaign, "plan"))
+        self.assertTrue(all(source["cycle_id"] != unrelated["cycle_id"]
+                            for node in with_campaign["nodes"]
+                            for source in node.get("input_sources", {}).values()))
+
+        partial = self.compose(graph="execute,test,report", campaign_key="k163")
+        sources = {name: source for node in partial["nodes"]
+                   for name, source in node.get("input_sources", {}).items()}
+        self.assertEqual(sources["plan.md"]["cycle_id"], unrelated["cycle_id"])
+        self.assertEqual(sources["checklist.md"]["cycle_id"], unrelated["cycle_id"])
+
+    def test_an_explicit_parent_keeps_its_frame_briefs_ahead_of_unrelated_campaign_briefs(self):
+        parent = self.frame_cycle()
+        self.frame_cycle()  # Newer campaign history must not replace the selected parent.
+        route = self.compose(graph="plan,execute,test,report", campaign_key="k163",
+                             parent_cycle_id=parent["cycle_id"])
+        self.assert_frame_sources(route, parent)
+
+    def test_route_plan_proposal_keeps_its_frame_briefs_ahead_of_unrelated_campaign_briefs(self):
+        parent = self.frame_cycle()
+        self.frame_cycle()  # Newer campaign history must not replace the proposal's frame.
+        cycle_record = P.read_cycle_record(self.root, parent["cycle_id"])
+        decision = RP.build_decision(
+            frame_route={"route_id": cycle_record["route_id"], "route_hash": cycle_record["route_hash"],
+                         "cycle_id": parent["cycle_id"]},
+            selected="proposal", reason="fixture proposal", briefs=[], intent={},
+            proposal={"summary": "fixture", "legs": [{"capability": "autopilot-code", "mode": "dev",
+                                                          "shape": "staged", "graph": [
+                                                              "plan", "execute", "test", "report"]}],
+                      "entry_approvals": []},
+            first_leg_compose={})
+        record_path = self.root / "shards" / "frame" / "route-decision.json"
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_bytes(RP.render(RP.build_record(decision)))
+        binding = RP.read_route_plan("shards/frame/route-decision.json#0", self.root)
+        route = self.compose(graph="plan,execute,test,report", campaign_key="k163",
+                             parent_cycle_id=parent["cycle_id"], route_plan=binding)
+        self.assertEqual(route["route_plan"], RP.sealed_form(binding))
+        self.assert_frame_sources(route, parent)
+
     def test_a163_2_parent_cycle_fills_inputs_card_brief_and_reproduces(self):
         prior = self.cycle()
         route = self.compose(parent_cycle_id=prior["cycle_id"])

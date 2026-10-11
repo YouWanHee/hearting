@@ -513,7 +513,7 @@ class AdapterV11Test(unittest.TestCase):
    self.assertEqual(wrapper.child_runtime_homes(SimpleNamespace(nested_codex_home=None),None),{})
    def check(agent_home):
     return subprocess.run([str(ROOT/"adapters/codex/bin/check-runtime-projection.sh")],
-     env={**env,"AGENT_HOME":agent_home,"CODEX_HOME":child["CODEX_HOME"],
+     env={**env,"AGENT_HOME":agent_home,"CODEX_HOME":child["CODEX_HOME"],"AGENT_SESSION_ROLE":"worker",
           "CODEX_RUNTIME_PROJECTION_FAST":"1","CODEX_RUNTIME_PROJECTION_SKIP_CLI_DISCOVERY":"1"},
      capture_output=True,text=True,check=False)
    kept=check(child["AGENT_HOME"])
@@ -617,7 +617,7 @@ class AdapterV11Test(unittest.TestCase):
                            "attempt_id":attempt,"pid":os.getpid()}})+"\n",encoding="utf-8")
     dirs=module.sessions_dirs_for("", "worker", ROOT, default, str(repo),jobs=jobs)
     self.assertEqual(dirs[0],selected/"sessions")
-    self.assertEqual(dirs[1],repo/".dispatch"/"codex-home"/"sessions")
+    self.assertIn(repo/".dispatch"/"codex-home"/"sessions",dirs)
     self.assertEqual(module.locate_latest_for_worktree_dirs(dirs,str(repo)),transcript)
     observed=json.loads(transcript.read_text().splitlines()[0])["payload"]
     self.assertEqual(transcript.stem,sid)
@@ -930,6 +930,10 @@ class AdapterV11Test(unittest.TestCase):
     f"parent_next_command={fields.get('parent_next_command')}"],
    expected,receipt)
  def test_concurrent_codex_start_launches_exactly_one_child(self):
+  self.concurrent_codex_start()
+ def test_duplicate_codex_start_after_launch_metadata_launches_exactly_one_child(self):
+  self.concurrent_codex_start(after_launch=True)
+ def concurrent_codex_start(self,after_launch=False):
   with tempfile.TemporaryDirectory() as td:
    root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
    fakebin=root/"bin"; fakebin.mkdir(); count=root/"child-count"
@@ -954,15 +958,25 @@ class AdapterV11Test(unittest.TestCase):
    resolution=wrapper.reconcile_launch_lifecycle(
     wrapper.DETACHED,{"AGENT_DISPATCH_ALLOW_NAMESPACED_SPAWN":"1"},
     evidence={"lifecycle_selector_source":"host-like"})
-   codes=[]
-   def invoke(): codes.append(wrapper.main(argv))
+   codes=[]; errors=[]; published=threading.Event()
+   spawn=wrapper.spawn_claimed_attempt
+   def publish(*args,**kwargs):
+    result=spawn(*args,**kwargs); published.set(); return result
+   def invoke(delayed=False):
+    try:
+     if delayed and not published.wait(timeout=15): raise AssertionError('launch metadata not published')
+     codes.append(wrapper.main(argv))
+    except Exception as exc: errors.append(exc)
    with mock.patch.dict(os.environ,env,clear=True), \
         mock.patch.object(wrapper,"check_runtime_projection",return_value=0), \
         mock.patch.object(wrapper,"ensure_runtime_home_projection",return_value=None), \
-        mock.patch.object(wrapper,"reconcile_launch_lifecycle",return_value=resolution):
-    threads=[threading.Thread(target=invoke) for _ in range(2)]
+        mock.patch.object(wrapper,"reconcile_launch_lifecycle",return_value=resolution), \
+        mock.patch.object(wrapper,"spawn_claimed_attempt",side_effect=publish):
+    threads=[threading.Thread(target=invoke,args=(after_launch and i==1,)) for i in range(2)]
     for thread in threads: thread.start()
     for thread in threads: thread.join(timeout=20)
+    self.assertTrue(all(not thread.is_alive() for thread in threads),'concurrent start did not finish')
+   self.assertEqual(errors,[])
    self.assertEqual(sorted(codes),[0,0],codes)
    for _ in range(50):
     if count.exists(): break

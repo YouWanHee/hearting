@@ -27,7 +27,7 @@ from fleet.collectors import steward                              # noqa: E402
 
 
 def _text(segs):
-    return "".join(t for t, _k in segs)
+    return render._plain(segs)
 
 
 class StewardChipTest(unittest.TestCase):
@@ -36,6 +36,10 @@ class StewardChipTest(unittest.TestCase):
                     elapsed_min=1)
         base.update(over)
         return Session(**base)
+
+    def _rows(self, session, width=168):
+        return [row for row in render._build_lines([session], [], "fleet", False, 0,
+                                   layout=render._layout_mode(width), term_width=width) if row]
 
     def test_steward_tag_is_bold_pink_text_and_keeps_the_slot_width(self):
         segs = render._session_tag_chip(self._s(session_tag="46", steward=True))
@@ -73,7 +77,9 @@ class StewardChipTest(unittest.TestCase):
         for harness in ("codex", "opencode"):
             with self.subTest(harness=harness):
                 segs = render._session_tag_chip(self._s(harness=harness, steward=True))
-                self.assertEqual(segs[1], (render._ICON_STEWARD + " ", "tag_steward"))
+                self.assertEqual(segs, [(" " * render._TAG_W, None)])
+                rows = self._rows(self._s(harness=harness, steward=True))
+                self.assertEqual(sum(_text(row).count("⚑") for row in rows), 1)
                 self.assertEqual(sum(render._dw(t) for t, _k in segs), render._TAG_W)
                 self.assertNotIn("*", "".join(t for t, _k in segs))
 
@@ -86,32 +92,30 @@ class StewardChipTest(unittest.TestCase):
                                         dim=True)
         self.assertEqual(segs[1], ("46", "tag_dim"))
 
-    def test_model_flag_follows_effort_for_all_harnesses_and_layouts(self):
+    def test_flag_starts_under_id_for_all_harnesses_and_layouts(self):
         for harness, model in (("claude", "claude-opus-5.5"),
                                ("codex", "gpt-6.1-sol"),
                                ("opencode", "openai/gpt-6.1-sol")):
             s = self._s(harness=harness, model=model, effort="xhigh",
                         session_tag="46", steward=True)
-            for layout in ("wide", "narrow", "stack"):
-                with self.subTest(harness=harness, layout=layout):
-                    if layout == "wide":
-                        row = render._session_row(s, narrow=False)
-                    elif layout == "narrow":
-                        row = render._session_row_2line(s, term_width=100)[1]
-                    else:
-                        row = render._session_row_stack(s, term_width=60)[1]
-                    self.assertIn(") ⚑", _text(row))
-                    self.assertEqual(_text(row).count("⚑"), 1)
-                    self.assertIn((" ⚑", "tag_steward"), row)
+            for width in (168, 100, 60):
+                with self.subTest(harness=harness, width=width):
+                    rows = self._rows(s, width)
+                    identity = next(i for i, row in enumerate(rows) if "[46]" in _text(row))
+                    self.assertNotIn("⚑", _text(rows[identity]))
+                    self.assertEqual(_text(rows[identity + 1])[render._STEWARD_LINE_COL], "⚑")
+                    self.assertIn(("⚑", "tag_steward"), rows[identity + 1])
+                    self.assertEqual(sum(_text(row).count("⚑") for row in rows), 1)
+                    self.assertFalse(any("┆" in _text(row) for row in rows))  # off-screen target
 
-    def test_model_flag_keeps_the_following_columns_fixed(self):
+    def test_role_keeps_model_and_following_columns_fixed(self):
         for harness, model in (("claude", "claude-opus-5.5"),
                                ("codex", "gpt-6.1-sol"),
                                ("opencode", "provider/a-very-long-model-name")):
             for width in (70, 100, 137, 168):
                 with self.subTest(harness=harness, width=width):
                     s = self._s(harness=harness, model=model, effort="xhigh",
-                                session_tag="46", title="column-marker")
+                                session_tag="46", runtime_name="column-marker")
                     plain = render._session_row(s, narrow=False)
                     plain_l2 = render._session_row_2line(s, term_width=width)[1]
                     s.steward = True
@@ -123,14 +127,25 @@ class StewardChipTest(unittest.TestCase):
                                      sum(render._dw(t) for t, _ in marked_l2))
                     stage_col = render._NARROW_L2_STAGE_COL
                     self.assertEqual(_text(plain_l2)[stage_col:], _text(marked_l2)[stage_col:])
-                    self.assertIn("⚑", _text(marked_l2)[:stage_col])
+                    self.assertNotIn("⚑", _text(marked_l2))
 
-    def test_model_flag_uses_the_existing_dim_role_color(self):
+    def test_flag_uses_the_existing_dim_role_color(self):
         s = self._s(model="claude-opus-5.5", effort="xhigh", steward=True,
                     session_tag="46", liveness="stale")
-        for row in (render._session_row(s, narrow=False),
-                    render._session_row_2line(s, term_width=100)[1]):
-            self.assertIn((" ⚑", "tag_dim"), row)
+        with mock.patch.object(render, "_SHOW_ALL", True):
+            for width in (168, 100):
+                rows = self._rows(s, width)
+                self.assertTrue(any(("⚑", "tag_dim") in row for row in rows))
+
+    def test_flag_width_preserves_following_anchors(self):
+        original = [(" " * 8, None), ("anchor", "dim")]
+        self.assertEqual(render._dw("⚑"), 1)
+        measure = render._dw
+        for width in (1, 2):
+            with mock.patch.object(render, "_dw", side_effect=lambda text: width if text == "⚑" else measure(text)):
+                marked = render._under_id_connector(original, "⚑", "tag_steward")
+                self.assertEqual(sum(render._dw(t) for t, _ in marked[:-1]), 8)
+                self.assertEqual(sum(render._dw(t) for t, _ in marked), 14)
 
     def test_regular_session_model_has_no_role_flag(self):
         s = self._s(model="claude-opus-5.5", effort="xhigh", session_tag="46")
@@ -145,7 +160,7 @@ class StewardChipTest(unittest.TestCase):
             base.update(over)
             lines = render._build_lines([Session(**base)], [], "fleet", False, 0,
                                         layout="wide", term_width=168)
-            return _text([ln for ln in lines if ln][-1])
+            return "\n".join(_text(ln) for ln in lines if ln and any("session: " in part for part, _key in ln))
         self.assertNotIn("steward", legend(session_tag="46"))
         self.assertIn("steward", legend(session_tag="46", steward=True))
 
@@ -186,11 +201,31 @@ class StewardOrderTest(unittest.TestCase):
 
 
 class StewardCollectorTest(unittest.TestCase):
+    def setUp(self):
+        repository = mock.patch.object(steward, "_repository_key", side_effect=lambda cwd: cwd or None)
+        repository.start()
+        self.addCleanup(repository.stop)
+        registry = mock.patch.object(steward, "_registry_sessions", return_value=[])
+        self.registry = registry.start()
+        self.addCleanup(registry.stop)
+        native = mock.patch.object(steward, "_native_role_sessions", return_value=[])
+        native.start()
+        self.addCleanup(native.stop)
+        projection = mock.patch.object(steward, "_projection_sessions",
+                                       side_effect=lambda: self.registry.return_value)
+        projection.start()
+        self.addCleanup(projection.stop)
+        cwd = mock.patch.object(herdr_projection.os, "getcwd", return_value="/x")
+        cwd.start()
+        self.addCleanup(cwd.stop)
+
     def test_confirmed_clear_keeps_the_same_role_in_fleet_and_herdr(self):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
-                session = Session(harness=harness, pid=1, session_id="new")
+                session = Session(harness=harness, pid=1, session_id="new", cwd="/x")
                 session._gpu_session_aliases = ["old"]
+                self.registry.return_value = [session, Session(harness="codex", pid=2,
+                                               session_id="ended-target", cwd="/x")]
                 markers = {(harness, "old"): {"session_id": "old", "targets": {
                     "ended-target": {"harness": "codex", "session_id": "ended-target",
                                      "kind": "watch", "source": "watch"}}}}
@@ -206,10 +241,12 @@ class StewardCollectorTest(unittest.TestCase):
                     self.assertFalse(herdr_projection.is_steward(harness, "unrelated"))
 
     def test_join_is_exact_on_harness_and_session_id(self):
-        sessions = [Session(harness="claude", pid=1, session_id="sid-a"),
-                    Session(harness="codex", pid=2, session_id="sid-a"),
-                    Session(harness="claude", pid=3, session_id="sid-b"),
-                    Session(harness="claude", pid=4)]
+        sessions = [Session(harness="claude", pid=1, session_id="sid-a", cwd="/x"),
+                    Session(harness="codex", pid=2, session_id="sid-a", cwd="/x"),
+                    Session(harness="claude", pid=3, session_id="sid-b", cwd="/x"),
+                    Session(harness="claude", pid=4, cwd="/x")]
+        self.registry.return_value = [Session(harness="codex", pid=5, session_id="x", cwd="/x"),
+                                      Session(harness="claude", pid=6, session_id="y", cwd="/x")]
         markers = {("claude", "sid-a"): {"session_id": "sid-a", "targets": {
             "x": {"harness": "codex", "session_id": "x", "name": "w", "kind": "start", "ts": "2",
                   "source": "start"},
@@ -225,10 +262,12 @@ class StewardCollectorTest(unittest.TestCase):
         entries are steer/handoff/gate-relay sends — new (source absent, kind=handoff) or
         old (no source at all) — leaves steward=False; a mixed marker keeps only the
         evidence entries in `steward_targets`."""
-        sessions = [Session(harness="claude", pid=1, session_id="worker"),
-                    Session(harness="claude", pid=2, session_id="legacy-steward"),
-                    Session(harness="claude", pid=3, session_id="mixed"),
-                    Session(harness="opencode", pid=4, session_id="empty")]
+        sessions = [Session(harness="claude", pid=1, session_id="worker", cwd="/x"),
+                    Session(harness="claude", pid=2, session_id="legacy-steward", cwd="/x"),
+                    Session(harness="claude", pid=3, session_id="mixed", cwd="/x"),
+                    Session(harness="opencode", pid=4, session_id="empty", cwd="/x")]
+        self.registry.return_value = [Session(harness="codex", pid=5, session_id="c", cwd="/x"),
+                                      Session(harness="claude", pid=6, session_id="s", cwd="/x")]
         markers = {
             ("claude", "worker"): {"session_id": "worker", "targets": {
                 "w1:p15": {"harness": "claude", "session_id": "steward", "name": "hearting-b0",
@@ -249,7 +288,7 @@ class StewardCollectorTest(unittest.TestCase):
         self.assertEqual([s.steward for s in sessions], [False, True, True, False])
         self.assertIsNone(sessions[0].steward_targets)
         self.assertEqual([t["session_id"] for t in sessions[1].steward_targets], ["c"])
-        self.assertEqual([t["session_id"] for t in sessions[2].steward_targets], [None, "s"])
+        self.assertEqual([t["session_id"] for t in sessions[2].steward_targets], ["s"])
         self.assertIsNone(sessions[3].steward_targets)
 
     def test_without_the_ledger_module_nothing_is_claimed(self):
@@ -293,7 +332,9 @@ class StewardCollectorTest(unittest.TestCase):
                                                 "2026-09-06T00:00:00Z", source="watch"))
                 markers = steward.read_markers()
                 self.assertIn(("claude", "sid-a"), markers)
-                sessions = [Session(harness="claude", pid=1, session_id="sid-a")]
+                sessions = [Session(harness="claude", pid=1, session_id="sid-a", cwd="/x")]
+                self.registry.return_value = [Session(harness="codex", pid=2,
+                                                       session_id="sid-c", cwd="/x")]
                 steward.enrich(sessions, markers=markers)
                 self.assertTrue(sessions[0].steward)
                 self.assertEqual(sessions[0].steward_targets[0]["session_id"], "sid-c")
@@ -360,6 +401,17 @@ class StewardReverseIndexTest(unittest.TestCase):
     could not answer "who is watching me". The reverse index is derived from the same
     evidence entries, never from a second marker."""
 
+    def setUp(self):
+        repository = mock.patch.object(steward, "_repository_key", side_effect=lambda cwd: cwd or None)
+        repository.start()
+        self.addCleanup(repository.stop)
+        registry = mock.patch.object(steward, "_registry_sessions", return_value=[])
+        registry.start()
+        self.addCleanup(registry.stop)
+        native = mock.patch.object(steward, "_native_role_sessions", return_value=[])
+        native.start()
+        self.addCleanup(native.stop)
+
     def _enrich(self, sessions, marker_targets):
         markers = {("claude", "sidP"): {"session_id": "sidP", "targets": marker_targets}}
         with mock.patch.object(steward, "_peer_message_module") as module:
@@ -384,7 +436,7 @@ class StewardReverseIndexTest(unittest.TestCase):
         solo = Session(harness="claude", pid=1, cwd="/x", slug="p", session_id="sidP")
         self._enrich([solo],
                      {"sidP": {"harness": "claude", "kind": "watch", "source": "watch"}})
-        self.assertTrue(solo.steward)
+        self.assertFalse(solo.steward)
         self.assertIsNone(solo.steward_parents)
 
     def test_a_resumed_target_still_joins_through_its_alias(self):

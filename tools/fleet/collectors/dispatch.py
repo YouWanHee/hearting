@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import sqlite3
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -61,6 +62,7 @@ from .. import model
 from ..model import ContextEvidence, DispatchJob, etime_to_min, project_of
 from ..token_budget import parse_codex_token_count, telemetry_from_explicit
 from . import procscan
+from . import parse_cache
 
 _AUTOPILOT = re.compile(r"/autopilot-([a-z-]+)")
 _LOOPS = re.compile(r"loops/(oncall|note|study|drill|runtime-watch)")
@@ -564,6 +566,9 @@ def _codex_sessions_dirs_for_profile(profile, slug, job=None):
 
 
 def _codex_sessions_dir(profile=None, slug=None, job=None):
+    actual_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home") if job is not None else None
+    if actual_home:
+        return os.path.join(actual_home, "sessions")
     if profile and slug:
         return _codex_sessions_dirs_for_profile(profile, slug, job=job)[0]
     return os.path.join(_codex_home(), "sessions")
@@ -577,6 +582,9 @@ def _codex_sessions_dirs(cwd, profile=None, slug=None, job=None):
     so inspect the deterministic local projection before the Fleet process' own home.
     Profile jobs remain isolated to their explicit profile home.
     """
+    actual_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home") if job is not None else None
+    if actual_home:
+        return [os.path.join(actual_home, "sessions")]
     if profile and slug:
         return _codex_sessions_dirs_for_profile(profile, slug, job=job)
 
@@ -717,6 +725,9 @@ def _opencode_job_liveness(cwd, now, stale_min=15, slug=None, job=None):
     if not cwd:
         return "unknown"
     db = _opencode_db()
+    runtime_dir = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir") if job is not None else None
+    if runtime_dir:
+        db = os.path.join(runtime_dir, "data", "opencode", "opencode.db")
     if not os.path.exists(db):
         return "unknown"
     con = None
@@ -1037,6 +1048,14 @@ def _opencode_config_home():
     return os.path.expanduser("~/.config/opencode")
 
 
+def _registry_file(path):
+    """Only absence is an empty source; inaccessible registry paths fail observation."""
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except FileNotFoundError:
+        return False
+
+
 def _installed_registry_paths():
     """Installed per-runtime-home dispatch registries that exist as files.
 
@@ -1055,7 +1074,7 @@ def _installed_registry_paths():
         if not home:
             continue
         path = os.path.join(home, ".harness", "dispatch", "jobs.log")
-        if os.path.isfile(path):
+        if _registry_file(path):
             out.append(path)
     return out
 
@@ -1091,7 +1110,7 @@ def _candidate_jobs_paths(override=None):
     default_home = Path(default).expanduser().parent.parent
     paths = [] if _is_versioned_source_home(default_home) else [default]
     legacy = os.path.expanduser("~/.claude/.dispatch/jobs.log")
-    if legacy and not any(_same_path(legacy, path) for path in paths) and os.path.exists(legacy):
+    if legacy and not any(_same_path(legacy, path) for path in paths) and _registry_file(legacy):
         paths.append(legacy)
     paths.extend(_installed_registry_paths())
     if not paths:
@@ -1121,9 +1140,9 @@ _CLAUDE_STREAM_TAIL_BYTES = 512 * 1024
 _CLAUDE_SUPERVISOR_HEAD_BYTES = 64 * 1024
 _CLAUDE_SUBAGENT_SCAN_BYTES = 8 * 1024 * 1024
 _CLAUDE_DISPATCH_CONTEXT_WINDOW_DEFAULT = 1_000_000
-_CLAUDE_STREAM_CACHE = {}       # path -> (mtime_ns, size, parsed)
-_CODEX_ATTEMPT_CACHE = {}       # path -> (mtime_ns, size, parsed)
-_OPENCODE_ATTEMPT_CACHE = {}    # path -> (mtime_ns, size, parsed)
+_CLAUDE_STREAM_CACHE = {}       # path -> ((mtime_ns, size, dev, ino), parsed)
+_CODEX_ATTEMPT_CACHE = {}       # path -> ((mtime_ns, size, dev, ino), parsed)
+_OPENCODE_ATTEMPT_CACHE = {}    # path -> ((mtime_ns, size, dev, ino), parsed)
 # Every registry attempt is re-observed each tick, so the FIFO bound must exceed the
 # attempt count; a smaller bound evicts each entry before its next hit.
 _ATTEMPT_PARSE_CACHE_LIMIT = 4096
@@ -1214,10 +1233,8 @@ def _enrich_attempt_summary(job, fast_first=False):
     under an attempt-scoped key. Fleet never starts the producer. This never
     guesses by cwd or pid and therefore cannot borrow another child's NOW.
 
-    ``fast_first`` (first live publication only) still exposes the exact path
-    and sid but skips the sidecar title/summary reads; render already shows
-    those rows the same way it shows attempts with no sidecar yet, and the
-    next full snapshot fills them.
+    Basic live snapshots retain the small exact summary sidecar: NOW is basic
+    state, not campaign detail. ``fast_first`` defers the title only.
     """
     path = _owned_attempt_log_path(job)
     sid = _attempt_summary_sid(job)
@@ -1225,15 +1242,14 @@ def _enrich_attempt_summary(job, fast_first=False):
         return
     job._transcript_path = path
     job._summary_sid = sid
-    if fast_first:
-        return
     try:
         from .. import titles
-        if not getattr(job, "title", None):
+        if not fast_first and not getattr(job, "title", None):
             job.title = titles.fresh_title(sid, harness=job.harness)
         if not getattr(job, "summary", None):
-            job.summary, job.summary_ts = titles.fresh_summary_with_ts(
-                sid, harness=job.harness)
+            job.summary, job.summary_ts = titles.fresh_summary_with_ts(sid, harness=job.harness)
+            if not job.summary and getattr(job, "_native_now", None):
+                job.summary, job.summary_ts = job._native_now
     except Exception:
         pass
 
@@ -1344,10 +1360,18 @@ def _parse_claude_stream_tail(path):
         st = os.stat(path)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size)
+    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _CLAUDE_STREAM_CACHE.get(path)
-    if cached and cached[:2] == cache_key:
-        return cached[2]
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    disk_key = parse_cache.key("claude-attempt", path, cache_key,
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES))
+    parsed = parse_cache.load(disk_key)
+    if isinstance(parsed, dict):
+        _CLAUDE_STREAM_CACHE[path] = (cache_key, parsed)
+        if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+            _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
+        return parsed
     start = max(0, st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
     try:
         with open(path, "rb") as stream:
@@ -1434,7 +1458,8 @@ def _parse_claude_stream_tail(path):
         "session_output_tokens": _counter(cumulative.get("output_tokens")),
         "exec_tool": next(reversed(open_tools.values())) if open_tools else None,
     }
-    _CLAUDE_STREAM_CACHE[path] = (cache_key[0], cache_key[1], parsed)
+    _CLAUDE_STREAM_CACHE[path] = (cache_key, parsed)
+    parse_cache.save(disk_key, parsed, path, cache_key)
     if len(_CLAUDE_STREAM_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CLAUDE_STREAM_CACHE.pop(next(iter(_CLAUDE_STREAM_CACHE)))
     return parsed
@@ -1445,8 +1470,7 @@ def _enrich_claude_stream_session(job, fast_first=False):
 
     ``fast_first`` keeps the exact session association (the field the single
     classifier reads) but skips the native sub-agent tail scan; those child
-    details ride the next full snapshot like any attempt whose log has not
-    been scanned yet.
+    details ride the independent detail refresh.
     """
     path = _owned_claude_stream_path(job)
     if path is None:
@@ -1475,6 +1499,10 @@ def _enrich_claude_stream_session(job, fast_first=False):
             return
         parsed = resolved
         telemetry_path = transcript
+    receipt_key = _CLAUDE_STREAM_CACHE.get(path)
+    transcript_key = _CLAUDE_STREAM_CACHE.get(telemetry_path)
+    job._detail_activity_key = (receipt_key[0] if receipt_key else None,
+                                transcript_key[0] if transcript_key else None)
     # User 2026-10-07: owner/worker aliases must show the actual logged version,
     # through render's existing model formatter, never a guessed alias mapping.
     model = parsed.get("model")
@@ -1569,10 +1597,18 @@ def _parse_codex_attempt_tail(path):
         st = os.stat(path)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size)
+    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _CODEX_ATTEMPT_CACHE.get(path)
-    if cached and cached[:2] == cache_key:
-        return cached[2]
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    disk_key = parse_cache.key("codex-attempt", path, cache_key,
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES))
+    parsed = parse_cache.load(disk_key)
+    if isinstance(parsed, dict):
+        _CODEX_ATTEMPT_CACHE[path] = (cache_key, parsed)
+        if len(_CODEX_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+            _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
+        return parsed
     head_bytes = _CLAUDE_SUPERVISOR_HEAD_BYTES
     tail_bytes = _CLAUDE_STREAM_TAIL_BYTES
     head_thread_ids = set()
@@ -1662,7 +1698,8 @@ def _parse_codex_attempt_tail(path):
               "thread_ambiguity": len(thread_ids) > 1,
               "activity": activity if len(thread_ids) == 1 else None,
               "exec_tool": next(reversed(open_commands.values())) if open_commands else None}
-    _CODEX_ATTEMPT_CACHE[path] = (cache_key[0], cache_key[1], parsed)
+    _CODEX_ATTEMPT_CACHE[path] = (cache_key, parsed)
+    parse_cache.save(disk_key, parsed, path, cache_key)
     if len(_CODEX_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _CODEX_ATTEMPT_CACHE.pop(next(iter(_CODEX_ATTEMPT_CACHE)))
     return parsed
@@ -1695,13 +1732,15 @@ def _enrich_codex_attempt_session(job, fast_first=False):
     ``fast_first`` keeps the exact thread/activity association (the fields the
     single classifier reads) but skips the rollout-file fallback discovery;
     the attempt-log telemetry already attached stays authoritative, and the
-    next full snapshot re-resolves the fallback like any unscanned attempt.
+    passive detail collection re-resolves that display fallback.
     """
     job._runtime_activity = None
     path = _owned_attempt_log_path(job)
     if getattr(job, "harness", None) != "codex" or path is None:
         return
     parsed = _parse_codex_attempt_tail(path)
+    cached = _CODEX_ATTEMPT_CACHE.get(path)
+    job._detail_activity_key = cached[0] if cached else None
     if parsed is None:
         return
     job._dispatch_context_owned = True
@@ -1781,7 +1820,7 @@ def _parse_opencode_attempt_tail(path):
     the session-level opencode collector uses.  ``output``/``reasoning`` are excluded, and
     the per-step numbers are never summed: a bounded tail cannot prove a session total.
 
-    No ``exec_tool`` is derived here, and that is a schema fact rather than an omission:
+    No ``exec_tool`` is derived from the stream:
     opencode publishes a ``tool_use`` event only once the call has already finished.
     Across six real attempt logs every one of 400+ tool events carried a ``state.status``
     of ``completed`` or ``error`` and never an in-flight state, so claude's tool_use ↔
@@ -1792,13 +1831,22 @@ def _parse_opencode_attempt_tail(path):
         st = os.stat(path)
     except OSError:
         return None
-    cache_key = (st.st_mtime_ns, st.st_size)
+    cache_key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     cached = _OPENCODE_ATTEMPT_CACHE.get(path)
-    if cached and cached[:2] == cache_key:
-        return cached[2]
+    if cached and cached[0] == cache_key:
+        return cached[1]
+    disk_key = parse_cache.key("opencode-attempt", path, cache_key,
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES, "native-session-v3"))
+    parsed = parse_cache.load(disk_key)
+    if isinstance(parsed, dict):
+        _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
+        if len(_OPENCODE_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+            _OPENCODE_ATTEMPT_CACHE.pop(next(iter(_OPENCODE_ATTEMPT_CACHE)))
+        return parsed
     start = max(0, st.st_size - _CLAUDE_STREAM_TAIL_BYTES)
     try:
         with open(path, "rb") as stream:
+            head = stream.read(_CLAUDE_SUPERVISOR_HEAD_BYTES)
             stream.seek(start)
             raw = stream.read(_CLAUDE_STREAM_TAIL_BYTES)
     except OSError:
@@ -1807,6 +1855,22 @@ def _parse_opencode_attempt_tail(path):
     if start > 0 and lines:
         lines = lines[1:]                       # a seek mid-file truncates the first line
     session_ids = set()
+    announced_attempts = set()
+    announced_cwds = set()
+    for line in head.decode("utf-8", "replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(event, dict) and event.get("type") == "dispatch.supervisor.session"
+                and event.get("runtime") == "opencode"):
+            sid = event.get("session_id")
+            if isinstance(sid, str) and re.fullmatch(r"ses_[A-Za-z0-9]+", sid):
+                session_ids.add(sid)
+                if event.get("parent_attempt_id"):
+                    announced_attempts.add(str(event["parent_attempt_id"]))
+                if event.get("cwd"):
+                    announced_cwds.add(str(event["cwd"]))
     active = None
     for line in lines:
         line = line.strip()
@@ -1836,8 +1900,11 @@ def _parse_opencode_attempt_tail(path):
         "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
         "ambiguity": "multiple-stream-session-ids" if len(session_ids) > 1 else None,
         "active_context_tokens": active,
+        "announced_attempts": sorted(announced_attempts),
+        "announced_cwds": sorted(announced_cwds),
     }
-    _OPENCODE_ATTEMPT_CACHE[path] = (cache_key[0], cache_key[1], parsed)
+    _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
+    parse_cache.save(disk_key, parsed, path, cache_key)
     if len(_OPENCODE_ATTEMPT_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
         _OPENCODE_ATTEMPT_CACHE.pop(next(iter(_OPENCODE_ATTEMPT_CACHE)))
     return parsed
@@ -1856,25 +1923,78 @@ def _opencode_job_context_window(job):
         return None
 
 
+_OPENCODE_ACTIVITY_CACHE = {}
+_OPENCODE_ACTIVITY_BYTES = 32 * 1024 * 1024
+
+
+def _enrich_opencode_native_activity(job, session_id, fast_first=False):
+    """Observe only the attempt-private DB; first publication remains log-only."""
+    if fast_first or not session_id:
+        return
+    runtime = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir")
+    if not isinstance(runtime, str) or not os.path.isabs(runtime):
+        return
+    db = os.path.join(runtime, "data", "opencode", "opencode.db")
+    try:
+        from .. import refresh_title
+        signatures = refresh_title._opencode_source_signatures(db)
+        if (not signatures[""] or signatures["-journal"] or
+                sum(info[2] for suffix, info in signatures.items()
+                    if info and suffix in ("", "-wal")) > _OPENCODE_ACTIVITY_BYTES):
+            return
+        key = (db, session_id)
+        cached = _OPENCODE_ACTIVITY_CACHE.get(key)
+        if cached and cached[0] == signatures:
+            activity = cached[1]
+        else:
+            with refresh_title._opencode_snapshot(db, max_bytes=_OPENCODE_ACTIVITY_BYTES) as connection:
+                deadline = time.monotonic() + .05
+                connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+                activity = refresh_title.read_opencode_activity(connection, session_id)
+            if signatures != refresh_title._opencode_source_signatures(db):
+                return
+            _OPENCODE_ACTIVITY_CACHE[key] = (signatures, activity)
+            if len(_OPENCODE_ACTIVITY_CACHE) > _ATTEMPT_PARSE_CACHE_LIMIT:
+                _OPENCODE_ACTIVITY_CACHE.pop(next(iter(_OPENCODE_ACTIVITY_CACHE)))
+        job.exec_tool = None
+        tool = activity.get("tool")
+        if tool:
+            label = _tool_label(tool.get("name"), tool.get("input"))
+            job.exec_tool = {"name": label} if label else None
+        if activity.get("summary"):
+            job._native_now = (activity["summary"], activity.get("summary_ts"))
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return
+
+
 def _enrich_opencode_attempt_session(job, fast_first=False):
     """Attach exact session identity and prompt telemetry.
 
-    ``fast_first`` is accepted for a uniform fast-first call site but defers
-    nothing here: the tail parse is mtime-cached and already yields the exact
-    session association the single classifier reads.
+    ``fast_first`` retains the cached, bounded log association and defers the
+    private native database snapshot until detail collection.
     """
     path = _owned_attempt_log_path(job)
     if getattr(job, "harness", None) != "opencode" or path is None:
         return
     parsed = _parse_opencode_attempt_tail(path)
+    # Reuse the exact parse observation to reject delayed native NOW when the
+    # attempt log has advanced; this adds no filesystem observation.
+    cached = _OPENCODE_ATTEMPT_CACHE.get(path)
+    job._detail_activity_key = cached[0] if cached else None
     if not parsed:
         return
     if parsed.get("ambiguity"):
         job.association_ambiguity = parsed["ambiguity"]
         return
+    if (any(attempt != job.attempt_id for attempt in parsed.get("announced_attempts", ()))
+            or any(not _same_path(cwd, job.cwd) for cwd in parsed.get("announced_cwds", ())
+                   if getattr(job, "cwd", None))):
+        job.association_ambiguity = "opencode-announcement-identity-mismatch"
+        return
     job._dispatch_context_owned = True
     if parsed.get("session_id"):
         job._runtime_session_id = parsed["session_id"]
+        _enrich_opencode_native_activity(job, parsed["session_id"], fast_first=fast_first)
     telemetry = telemetry_from_explicit(
         adapter="opencode", session_id=parsed.get("session_id"),
         active_context_tokens=parsed.get("active_context_tokens"),
@@ -1962,7 +2082,10 @@ def _job_liveness(path, now, stale_min=15, profile=None, slug=None, job=None):
     profile-less job case) → unchanged runtime-home path."""
     if not path:
         return "unknown"
-    if profile and slug:
+    actual_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home") if job is not None else None
+    if actual_home:
+        candidates = [os.path.join(actual_home, "projects", _enc(path))]
+    elif profile and slug:
         candidates = [
             os.path.join(root, "homes", "%s.%s" % (slug, profile), "projects", _enc(path))
             for root in _row_state_roots(job)
@@ -2164,7 +2287,10 @@ def resolve_plan_qa_artifact(job):
         roots.extend((root, os.path.join(root, ".agent_reports"),
                       os.path.join(root, ".claude_reports")))
     candidates = set()
-    for root in roots:
+    for root in dict.fromkeys(roots):
+        if not (os.path.isdir(os.path.join(root, "campaigns"))
+                or os.path.isdir(os.path.join(root, "plans"))):
+            continue
         # W7D: cycle plans dirs plus the legacy top-level plans/ read-only fallback.
         matches = (artifact_reader.glob_bucket(Path(root), "plans", "*_%s" % slug)
                    if artifact_reader is not None
@@ -2204,16 +2330,18 @@ _QA_DEFAULT = {
 
 
 def effective_qa(argv_qa, pipe_qa, jcwd, slug, key, capability=None, worker_role=None,
-                 artifact_root=None):
+                 artifact_root=None, lookup_plan=True):
     """Layered qa resolver, first-hit precedence: argv > jobslog(pipe) > plan artifact >
     CONVENTIONS default. Returns (qa, source) — source in argv|jobslog|plan|default|None."""
     if argv_qa:
         return argv_qa, "argv"
     if pipe_qa:
         return pipe_qa, "jobslog"
-    v = resolve_plan_qa_artifact({"cwd": jcwd, "slug": slug, "key": key,
-                                  "artifact_root": artifact_root,
-                                  "capability": capability, "worker_role": worker_role})
+    v = None
+    if lookup_plan:
+        v = resolve_plan_qa_artifact({"cwd": jcwd, "slug": slug, "key": key,
+                                      "artifact_root": artifact_root,
+                                      "capability": capability, "worker_role": worker_role})
     if v:
         return v, "plan"
     v = _QA_DEFAULT.get(key)
@@ -2605,7 +2733,7 @@ def _scan_processes():
             })
             is_child = env.get("AGENT_SESSION_ROLE", "").lower() == "worker" or env.get("CLAUDE_CODE_CHILD_SESSION") == "1" or bool(parent_slug or parent_sid)
             q, qsrc = effective_qa(qa, None, jcwd, slug, key,
-                                   artifact_root=env.get("AGENT_ARTIFACT_ROOT"))
+                                   artifact_root=env.get("AGENT_ARTIFACT_ROOT"), lookup_plan=False)
             jobs.append(DispatchJob(
                 key=key, stage=None, mode=mode,
                 capability_mode=capability_mode, worker_mode=worker_mode,
@@ -2613,6 +2741,7 @@ def _scan_processes():
                 elapsed_min=etime_to_min(etime), slug=slug, cwd=jcwd,
                 parent_sid=parent_sid, parent_slug=parent_slug, is_child=is_child,
                 qa_source=qsrc, source="proc", harness=proc_harness or "claude",
+                artifact_root=env.get("AGENT_ARTIFACT_ROOT"),
                 pid=int(pid_s) if pid_s.isdigit() else None,
                 proc_start=procscan.read_proc_start(pid_s) if pid_s.isdigit() else None,
                 model=_claude_job_model(pid_s, jcwd), depth=depth,
@@ -2697,7 +2826,7 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
         if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
             continue
         real = os.path.realpath(raw_path)
-        if real in canonical or not os.path.isfile(raw_path):
+        if real in canonical or not _registry_file(raw_path):
             continue
         latest = {}
         try:
@@ -2710,7 +2839,7 @@ def _validated_split_registry_paths(canonical_paths, observed=None, session_rows
                     attempt = meta.get("attempt_id")
                     if attempt in attempts:
                         latest[attempt] = meta
-        except OSError:
+        except FileNotFoundError:
             continue
         matched = {attempt for attempt, meta in latest.items()
                    if (meta.get("parent_sid") or meta.get("parent_session_id")) in parent_ids}
@@ -2744,7 +2873,7 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             rows = f.read().splitlines()
-    except OSError:
+    except FileNotFoundError:
         return jobs, 0
     # Reconcile each job to its LATEST row before deciding live-ness. Identity key = slug,
     # NOT the worktree path: a terminal (done/killed/cancelled) row drops the worktree to '-'
@@ -2859,7 +2988,7 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
         capability = meta.get("capability")
         worker_role = meta.get("worker_role")
         q, qsrc = effective_qa(None, meta.get("qa"), cwd, slug, pname, capability, worker_role,
-                               artifact_root=meta.get("artifact_root"))
+                               artifact_root=meta.get("artifact_root"), lookup_plan=False)
         parent_slug = meta.get("parent") or meta.get("parent_slug") or None
         parent_sid = meta.get("parent_sid") or meta.get("parent_session_id") or None
         parent_cwd = meta.get("parent_cwd") or meta.get("parent_worktree") or None
@@ -2882,6 +3011,8 @@ def _scan_jobs_log(path, seen_slugs, seen_keys=None, registry_priority=0,
             mode_axis_conflict=mode_axis_conflict, qa=q,
             elapsed_min=row_age_min, slug=slug or worktree or repo,
             cwd=cwd, parent_sid=parent_sid, parent_cwd=parent_cwd,
+            caller_sid=meta.get("caller_sid") or None, caller_harness=meta.get("caller_harness") or None,
+            caller_pane=meta.get("caller_pane") or None, caller_cwd=meta.get("caller_cwd") or None,
             parent_managed_dir=parent_managed_dir,
             parent_slug=parent_slug,
             is_child=bool(parent_slug or parent_sid or parent_cwd or parent_managed_dir),
@@ -3000,7 +3131,7 @@ def _jobs_log_fields(paths):
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 rows = f.read().splitlines()
-        except OSError:
+        except FileNotFoundError:
             continue
         path_attempts = {}
         for line in rows:
@@ -3315,6 +3446,12 @@ def _pending_delivery_counts(paths):
     silently invisible -- reproducing in miniature the exact problem
     SD-111 exists to fix. `expired` is exposed as its own count; expired
     records are never deleted, so this only counts, never removes.
+    `retained_batch_duties` counts unfinished registered-batch obligation
+    records (`supervisor-state/obligations/batch-*.json` in an observing,
+    delivery-pending, or unknown state): duties the existing controller
+    resumes after an observer restart, shown here so a retained
+    late-completion duty is never invisible while it has no delivery
+    record yet.
 
     Enumeration failure fails open: a bad line, an unreadable directory, or
     a corrupt record is skipped, never raised -- the caller keeps every row
@@ -3343,6 +3480,7 @@ def _pending_delivery_counts(paths):
 
     pending = 0
     expired = 0
+    retained_batch_duties = 0
     all_records = set()
     seen_roots = set()
     for path in paths:
@@ -3353,6 +3491,21 @@ def _pending_delivery_counts(paths):
         if root in seen_roots:
             continue
         seen_roots.add(root)
+        obligation_root = root / "supervisor-state" / "obligations"
+        try:
+            duty_files = sorted(obligation_root.glob("batch-*.json"))[:128]
+        except OSError:
+            duty_files = []
+        for duty_file in duty_files:
+            try:
+                if duty_file.is_symlink():
+                    continue
+                duty = json.loads(duty_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(duty, dict) and duty.get("state") in {
+                    "observing", "delivery-pending", "unknown"}:
+                retained_batch_duties += 1
         pending_root = root / "pending-delivery"
         if not pending_root.is_dir():
             continue
@@ -3386,7 +3539,8 @@ def _pending_delivery_counts(paths):
         if (delivery_id, recipient_digest) not in all_records:
             unmaterialized += 1
 
-    return {"pending": pending + unmaterialized, "expired": expired}
+    return {"pending": pending + unmaterialized, "expired": expired,
+            "retained_batch_duties": retained_batch_duties}
 
 
 def _fill_locations(jobs):
@@ -3442,48 +3596,89 @@ def _read_cycle_record(path):
         return None
 
 
+_CYCLE_LABEL_INVENTORIES = {}  # root -> (directory stamp, names, next offset)
+_CYCLE_ROUTE_PATHS = {}       # (root, route id) -> exact observed cycle path
+
+
 def _campaign_labels(jobs):
-    """F-97c: bind an owner job's route to its producer cycle title, read-only and
-    bounded. No IO at all when no job carries a route id."""
-    route_ids = {_label_route_id(j) for j in jobs}
-    route_ids.discard(None)
-    route_ids.discard("")
-    if not route_ids:
-        return
-    try:
-        artifact_roots = {getattr(j, "artifact_root", None) for j in jobs}
-        artifact_roots.discard(None)
-        titles = {}
+    if artifact_reader is None:
+        return _campaign_labels_read(jobs)
+    with artifact_reader.read_scope(_ARTIFACT_READ_CACHE):
+        return _campaign_labels_read(jobs)
+
+
+def _campaign_labels_read(jobs):
+    """Read exact labels through the existing admission index or bounded cache.
+
+    Open cycles may precede admission. Their fallback inventories names once,
+    reads at most 200 records per pass, and continues on the next detail tick.
+    Never stat every historical record merely to select that bounded batch.
+    """
+    from ..work_titles import cycle_title
+    read_json = lambda path: _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
+    by_root = {}
+    for job in jobs:
+        rid, root = _label_route_id(job), getattr(job, "artifact_root", None)
+        if isinstance(rid, str) and rid and isinstance(root, str) and root:
+            by_root.setdefault(root, set()).add(rid)
+    titles = {}
+    for root, route_ids in by_root.items():
+        cycles_dir = os.path.join(root, ".runtime", "artifact-producer", "v1", "cycles")
         remaining = set(route_ids)
-        for root in artifact_roots:
-            if not remaining:
-                break
-            cycles_dir = os.path.join(root, ".runtime", "artifact-producer", "v1", "cycles")
-            try:
-                entries = sorted(
-                    os.scandir(cycles_dir), key=lambda e: e.stat().st_mtime, reverse=True
-                )
-            except OSError:
-                continue
-            for entry, _ in zip(entries, range(200)):
-                if not remaining:
-                    break
-                if not entry.name.endswith(".json"):
-                    continue
-                rec = _stat_memo(_CYCLE_RECORD_CACHE, entry.path, _read_cycle_record)
-                if rec is None:
+        index_path = os.path.join(root, ".runtime", "artifact-admission", "v1", "index.json")
+        index = _stat_memo(_CYCLE_RECORD_CACHE, index_path, _read_cycle_record) or {}
+        if not isinstance(index, dict):
+            index = {}
+        routes = index.get("routes") or {}
+        own_routes = routes.get(index.get("artifact_root_id"), {}) if isinstance(routes, dict) else {}
+        if not isinstance(own_routes, dict):
+            own_routes = {}
+        for rid in route_ids:
+            row = own_routes.get(rid) or {}
+            cycle_id = row.get("cycle_id") if isinstance(row, dict) else None
+            if isinstance(cycle_id, str) and re.fullmatch(r"[A-Za-z0-9_-]+", cycle_id):
+                _CYCLE_ROUTE_PATHS[(root, rid)] = os.path.join(cycles_dir, cycle_id + ".json")
+            path = _CYCLE_ROUTE_PATHS.get((root, rid))
+            if path:
+                rec = _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
+                if isinstance(rec, dict) and rec.get("route_id") == rid:
+                    titles[(root, rid)] = cycle_title(root, rec, read_json)
+                    remaining.discard(rid)
+                else:
+                    _CYCLE_ROUTE_PATHS.pop((root, rid), None)
+        if not remaining:
+            continue
+        try:
+            stamp = _stat_stamp(cycles_dir)
+            inventory = _CYCLE_LABEL_INVENTORIES.get(root)
+            # Finish the bounded inventory before accepting a changed directory.
+            # A producer adding files each tick must not reset us to the first
+            # 200 names forever. The next completed sweep sees all new names.
+            if not inventory or (inventory[0] != stamp and inventory[2] == 0):
+                names = sorted(name for name in os.listdir(cycles_dir) if name.endswith(".json"))
+                inventory = (stamp, names, 0)
+            stamp, names, offset = inventory
+            batch = names[offset:offset + 200]
+            _CYCLE_LABEL_INVENTORIES[root] = (stamp, names, 0 if offset + 200 >= len(names) else offset + 200)
+            for name in batch:
+                path = os.path.join(cycles_dir, name)
+                rec = _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
+                if not isinstance(rec, dict):
                     continue
                 rid = rec.get("route_id")
                 if rid in remaining:
-                    titles[rid] = (rec.get("title") or "")[:24]
+                    _CYCLE_ROUTE_PATHS[(root, rid)] = path
+                    titles[(root, rid)] = cycle_title(root, rec, read_json)
                     remaining.discard(rid)
-        if titles:
-            for job in jobs:
-                rid = _label_route_id(job)
-                if rid in titles:
-                    job.campaign_label = titles[rid]
-    except Exception:
-        pass
+        except (OSError, TypeError, ValueError):
+            continue
+    for job in jobs:
+        key = (getattr(job, "artifact_root", None), _label_route_id(job))
+        job.campaign_label = titles.get(key)
+    # These are display caches, with the same bounded lifetime as record parsing.
+    for cache in (_CYCLE_ROUTE_PATHS, _CYCLE_LABEL_INVENTORIES):
+        while len(cache) > _STAT_MEMO_LIMIT:
+            cache.pop(next(iter(cache)))
 
 
 def _attach_execution_evidence(jobs, session_rows):
@@ -3508,16 +3703,16 @@ def _attach_execution_evidence(jobs, session_rows):
             job.exec_child = candidates[0]
 
 
-def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
+def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
     """Return merged [DispatchJob]. harness_filter does not restrict dispatch — the section
     is cross-harness by design (jobs, not sessions).
 
-    ``fast_first`` serves the first live publication only: exact PID/start,
+    ``fast_first`` serves basic live publications: exact PID/start,
     registry tuples, and every field the single classifier reads are attached
     exactly as in a full pass, but display-only detail fills (sidecar
-    titles/summaries, rollout fallback, native sub-agent scans) stay empty the
-    way unscanned attempts already look — the next full snapshot fills them.
-    ``--once``/JSON and every later tick use the full pass, so their final
+    titles, rollout fallback, native sub-agent scans) fill independently.
+    Exact NOW summary sidecars stay in this path. ``--once``/JSON use the full
+    pass, so their final
     output is unchanged."""
     proc_jobs = _scan_processes()
     paths = _candidate_jobs_paths(jobs_path)
@@ -3575,8 +3770,12 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
                 twin._proc_liveness = getattr(job, "liveness", None)
         proc_jobs = kept_proc
     jobs = proc_jobs + log_jobs
-    _fill_locations(jobs)          # F-97a; own try/except inside, never raises
-    _campaign_labels(jobs)         # F-97c; own try/except inside, never raises
+    # F-83 retention uses registry/route evidence, never stream telemetry. Apply
+    # that existing rule before any location/title/log reads for discarded owners.
+    jobs = _retain_dead_terminal_owners(jobs, time.time(), jobs_path=jobs_path)
+    if not fast_first:
+        _fill_locations(jobs)      # explanatory metadata, filled by live details
+        _campaign_labels(jobs)
     # Typed-mode+profile backfill for proc jobs whose argv/env omitted metadata.
     # Legacy mode backfill is read-only; profile=None backfill IS spec §7-mandated —
     # a proc-scanned profile job has no argv signal for --profile at all).
@@ -3702,6 +3901,16 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
             j.liveness = _dispatch_liveness(j, now, codex_index=codex_index)
         jobs = _retain_dead_terminal_owners(jobs, now, jobs_path=jobs_path)
         _annotate_orphan_conductors(jobs, now, jobs_path=jobs_path)
+    # Plan QA is display detail. Resolve it only after dedup/retention and the
+    # single liveness pass, never for old rows the normal board does not draw.
+    for j in jobs:
+        if (not fast_first and j.qa_source in (None, "default") and
+                (j.liveness != "dead" or j.afterglow
+                 or getattr(j, "_dead_terminal_owner", False))):
+            j.qa, j.qa_source = effective_qa(
+                None, None, j.cwd, j.slug, j.key,
+                getattr(j, "capability_owner", None), j.worker_role,
+                artifact_root=j.artifact_root)
     # F-15c(a): a registry-only row (source="jobs") that turns out to be genuinely working
     # re-derives its breadcrumb from the real plan artifacts instead of the raw jobs.log
     # status word ("open"/"running") — otherwise a live job with real progress shows a
@@ -3718,20 +3927,32 @@ def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fal
     collect.last_registry_splits = {
         path: sorted(attempts) for path, attempts in split_registries.items()
     }
-    collect.last_degradations = _scan_degradations(
-        set(route_nodes) | {
-            getattr(j, "route_id", None) for j in jobs if getattr(j, "route_id", None)
-        },
-        jobs=jobs,
-    )
+    if not fast_first:
+        collect.last_degradations = _scan_degradations(
+            set(route_nodes) | {
+                getattr(j, "route_id", None) for j in jobs if getattr(j, "route_id", None)
+            }, jobs=jobs)
     # SD-111 P6: same "stash on the module for the render header" pattern as
     # last_malformed/last_route_nodes above -- additive, no return-signature
     # change. Enumeration failure fails open: keep every job row, drop the count.
     try:
-        collect.last_pending_delivery = _pending_delivery_counts(paths)
+        if not fast_first:
+            collect.last_pending_delivery = _pending_delivery_counts(paths)
     except Exception:
         collect.last_pending_delivery = None
     return jobs
+
+
+_ARTIFACT_READ_CACHE = artifact_reader.ReadCache() if artifact_reader is not None else None
+
+
+def collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=False):
+    """One inventory observation per root/tick; unchanged records reuse it live."""
+    args = (jobs_path, harness_filter, session_rows, fast_first)
+    if artifact_reader is None:
+        return _collect(*args)
+    with artifact_reader.read_scope(_ARTIFACT_READ_CACHE):
+        return _collect(*args)
 
 
 collect.last_malformed = 0

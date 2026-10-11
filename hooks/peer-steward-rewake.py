@@ -219,7 +219,9 @@ def main() -> int:
         if code == 6:                                 # hook budget exhausted
             return emit(
                 f"[peer-steward-rewake] watch_id={watch_id} state=hook-budget-expired "
-                f"target={target} — watcher may still be alive; join or rearm from the session"
+                f"target={target} — watcher may still be alive; the retained duty resumes "
+                f"automatically through observer recovery, a foreground join from the session "
+                f"is optional finite observation only"
             )
 
         if code != 5:                                 # unclassified: stay silent

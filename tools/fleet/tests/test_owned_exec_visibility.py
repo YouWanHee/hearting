@@ -90,7 +90,7 @@ class OwnedExecutionTest(unittest.TestCase):
         self.assertEqual(evidence["source"], "owned-exec")
         for change in ({"proc_start": "other"}, {"exec_child": owned_child("sleep")},
                        {"exec_child": {"pid": 108, "comm": "node", "etime_s": 120}}):
-            self.assertEqual(model.classify_session({**ev, **change}, 5000)[0], "idle")
+            self.assertEqual(model.classify_session({**ev, **change}, 5000)[0], "unknown")
 
     def test_attempt_waiting_and_tool_running_are_distinct(self):
         ev = dict(pid=99, proc_start="199", attempt_id=ATTEMPT,

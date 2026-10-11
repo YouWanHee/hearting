@@ -43,7 +43,10 @@ def _sha(path: Path) -> str:
 
 
 def _snapshot(root: Path, *, skip=(".runtime/artifact-producer/v1/journal", ".runtime/artifact-producer/v1/migrations",
-                                    ".runtime/artifact-admission", "campaigns/INDEX")):
+                                    ".runtime/artifact-admission", "campaigns/INDEX",
+                                    ".runtime/artifact-locator/index-observation.json")):
+    # Rollback rebuilds indexes and their optional observation digests.
+    # Every source record, binding and payload remains in the exact snapshot.
     out = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.is_symlink():

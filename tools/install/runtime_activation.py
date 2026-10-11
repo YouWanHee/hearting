@@ -3196,6 +3196,25 @@ def _executable_ingress_report(runtime: str) -> dict:
     return {"owner": "vendor", "hearting_ingress": "none"}
 
 
+def reconnect_peer_obligations(active_root: str | Path) -> bool:
+    """Reuse the existing reconnect callback after a successful activation."""
+    root = Path(active_root).resolve()
+    utility = root / "utilities" / "peer-steward.py"
+    if not utility.is_file():
+        return False
+    env = os.environ.copy()
+    env["AGENT_HOME"] = str(root)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(utility), "__ensure-obligations"], env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=True,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def refresh(runtime: str, scope: str = "global") -> dict:
     _validate_scope(runtime, scope)
     state = _load_json(_state_path(runtime, scope))

@@ -48,6 +48,8 @@ _PM_SPEC.loader.exec_module(peer_message)
 sys.path.insert(0, str(_UTILITIES_DIR))
 from dispatch_contract import process_start_ticks  # noqa: E402
 from parent_next_directive import steward_fields  # noqa: E402
+import peer_obligations  # noqa: E402
+import dispatch_batch_obligations  # noqa: E402
 
 _DEFAULTS_SPEC = importlib.util.spec_from_file_location(
     "dispatch_defaults", str(_UTILITIES_DIR / "dispatch-defaults.py")
@@ -270,6 +272,14 @@ def _project_of(cwd):
     return os.path.basename(str(cwd).rstrip("/"))
 
 
+def _caller_pane():
+    """The common live ownership judgment, never the inherited pane label."""
+    from pane_ownership import verified_pane
+    sid, harness = _current_session_identity()
+    return verified_pane(os.environ.get("HERDR_PANE_ID", ""), harness, sid,
+                         server=_HERDR_SESSION)
+
+
 def _caller_is_claude():
     from session_identity import identity
     return identity().harness == "claude"
@@ -441,7 +451,7 @@ def _run_herdr_wait(target, until, timeout_ms):
     return None
 
 
-_AGENT_STATES = ("idle", "done", "blocked", "working", "unknown")
+_AGENT_STATES = ("idle", "done", "blocked", "working", "finalizing", "unknown")
 _LAST_HERDR_EXIT = None          # real `herdr agent wait` return code of the last call (m3)
 _HERDR_GET_TIMEOUT_SECONDS = 15  # `watch` pre-check must never hang the caller (M3)
 _CLAIM_TIMEOUT_MS = 15_000       # dedupe claim acquisition bound (M3)
@@ -971,7 +981,9 @@ def _start_shell_snapshot(pane, original_shell, deadline=None):
     return None
 
 
-_BESIDE_READY_SECONDS = 15
+# NAS-backed prompt initialization can spend minutes in a git child. Keep one
+# finite deadline and the same shell/prompt checks through bootstrap and start.
+_BESIDE_READY_SECONDS = 300
 
 
 def _wait_for_created_shell(pane, cwd, original_shell, deadline):
@@ -1006,29 +1018,38 @@ def _wait_for_created_shell(pane, cwd, original_shell, deadline):
     return "beside-shell-readiness-timeout", original_shell
 
 
-def _failed_start_cleanup(pane, original_shell, original_screen):
+def _failed_start_cleanup_observation(pane, original_shell, original_screen):
+    if (_pane_has_agent(pane) is not None
+            or _proc_start_ticks(original_shell[0]) != original_shell[1]):
+        return "retained"
+    info = _retire_pane_info(pane)
+    if info is None or info["shell_pid"] != original_shell[0]:
+        return "retained"
+    if _start_shell_identity(pane) == original_shell:
+        if _start_pane_screen(pane) != original_screen:
+            return "retained"
+        if (_start_shell_identity(pane) != original_shell
+                or _pane_has_agent(pane) is not None
+                or _start_pane_screen(pane) != original_screen):
+            return "retained"
+        return "closed" if _close_pane(pane) else "close-failed"
+    return None
+
+
+def _failed_start_cleanup(pane, original_shell, original_screen, deadline=None):
     # Never close a caller-provided pane, a replaced shell or a late-starting
     # agent. The fresh split is the only pane owned by this failed invocation.
     if original_shell is None or original_screen is None:
         return "retained"
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 5 if deadline is None else deadline
     while time.monotonic() < deadline:
-        if (_pane_has_agent(pane) is not None
-                or _proc_start_ticks(original_shell[0]) != original_shell[1]):
-            return "retained"
-        info = _retire_pane_info(pane)
-        if info is None or info["shell_pid"] != original_shell[0]:
-            return "retained"
-        if _start_shell_identity(pane) == original_shell:
-            if _start_pane_screen(pane) != original_screen:
-                return "retained"
-            if (_start_shell_identity(pane) != original_shell
-                    or _pane_has_agent(pane) is not None
-                    or _start_pane_screen(pane) != original_screen):
-                return "retained"
-            return "closed" if _close_pane(pane) else "close-failed"
+        result = _failed_start_cleanup_observation(pane, original_shell, original_screen)
+        if result is not None:
+            return result
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
-    return "retained"
+    # If late-start observation spent the shared wait budget, still perform the
+    # ordinary last cleanup observation, without another wait or a new deadline.
+    return _failed_start_cleanup_observation(pane, original_shell, original_screen) or "retained"
 
 
 def _opencode_tui_scoped_config():
@@ -1088,65 +1109,350 @@ def _seat_successor_path(pane):
     return peer_message.peer_state_root() / "seat-successors" / f"{digest}.json"
 
 
+def _seat_successor_lock(pane):
+    import session_tidy
+    return session_tidy.seat_lock("peer-successor-" + _seat_successor_path(pane).stem)
+
+
 def _mark_seat_successor(pane, beside, kind, session_id):
     """`start --beside`: the started pane is the seat successor of the agent beside it.
 
     The one fact a later `retire` from this pane needs to hand that agent's routes on
     (OPERATIONS same-seat change). Best effort: a missing mark only means no handover."""
     try:
-        path = _seat_successor_path(pane)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"schema": 1, "pane": pane, "beside": beside,
-                                   "successor": {"harness": kind, "session_id": session_id or ""},
-                                   "at": time.time()}, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, path)
+        with _seat_successor_lock(pane):
+            path = _seat_successor_path(pane)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"schema": 1, "pane": pane, "beside": beside,
+                                       "server": _HERDR_SESSION or "default",
+                                       "successor": {"harness": kind, "session_id": session_id or ""},
+                                       "at": time.time()}, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, path)
     except OSError:
         pass
 
 
-def _seat_handover(ident, own_sid, own_harness):
+def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None):
     """After `retire` proved the predecessor exited: when this session runs in the pane started
     beside the predecessor, its routes become this session's, across harnesses
     (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
     this is not a seat change (the receipt then stays as it was); it never fails the retire."""
-    pane = os.environ.get("HERDR_PANE_ID", "")
+    pane = requester.get("pane") if requester is not None else _caller_pane()
     if not pane:
         return None
+    try:
+        with _seat_successor_lock(pane):
+            return _seat_handover_locked(ident, own_sid, own_harness, pane,
+                                         requester=requester, accepted_at=accepted_at)
+    except OSError:
+        return "error"
+
+
+def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, accepted_at=None):
     path = _seat_successor_path(pane)
     try:
-        mark = json.loads(path.read_text(encoding="utf-8"))
+        mark_bytes = path.read_bytes()
+        mark = json.loads(mark_bytes)
     except (OSError, ValueError):
         return None
     if not isinstance(mark, dict) or mark.get("pane") != pane or mark.get("beside") != ident["pane"]:
         return None
-    recorded = (mark.get("successor") or {}).get("session_id")
-    if not own_sid or own_harness not in {"claude", "codex", "opencode"} or (recorded and recorded != own_sid):
+    server = requester.get("server", "default") if requester is not None else _HERDR_SESSION or "default"
+    if mark.get("server", "default") != server:
         return "skipped:successor-unverified"
+    successor = mark.get("successor") or {}
+    recorded = successor.get("session_id")
+    if (not own_sid or own_sid == "-" or ident.get("session_id") in {None, "", "-"}
+            or own_harness not in {"claude", "codex", "opencode"}
+            or successor.get("harness") != own_harness or (recorded and recorded != own_sid)):
+        return "skipped:successor-unverified"
+    if requester is not None:
+        try:
+            if not accepted_at or not (0 < float(mark.get("at", 0)) <= float(accepted_at)):
+                return "skipped:successor-unverified"
+        except (TypeError, ValueError):
+            return "skipped:successor-unverified"
     try:
         import dispatch_seat_handover as handover
+        booked = {}
+        if requester is not None:
+            import session_tidy
+            booked["successor_seat"] = session_tidy._pane_seat_of(pane)
         row = handover.record_retire_handover(
-            ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ)
+            ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ, **booked)
     except Exception:  # noqa: BLE001 - the retire itself already succeeded
         return "error"
     try:
-        path.unlink()
+        if row is not None and path.read_bytes() == mark_bytes:
+            path.unlink()
     except OSError:
         pass
     return str(len(row["bindings"])) if row else "none"
 
 
+def _retire_handover(duty):
+    """Consume only the accepted retirement's original succession, on any observer."""
+    intent = duty.get("intent") or {}
+    requester = intent.get("requester") or {}
+    foreground = _retire_booked_foreground(duty)
+    if (not isinstance(foreground, dict) or not foreground.get("pid") or not foreground.get("start")
+            or (intent.get("identity") or {}).get("session_id") in {None, "", "-"}):
+        return None
+    return _seat_handover(intent.get("identity") or {}, requester.get("session_id"),
+                          requester.get("harness"), requester=requester,
+                          accepted_at=duty.get("accepted_at"))
+
+
+def _observed_start_agent(args, deadline=None, wait=False):
+    """Settle an existing/late start from this pane; never launch or type again."""
+    deadline = time.monotonic() + 5 if deadline is None else deadline
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            proc = subprocess.run(_herdr_argv("agent", "get", args.pane),
+                                  capture_output=True, text=True,
+                                  timeout=max(.01, min(_herdr_get_timeout(), remaining)))
+            payload = json.loads(proc.stdout or "")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            payload = None
+        result = payload.get("result") if isinstance(payload, dict) else None
+        agent = result.get("agent") if isinstance(result, dict) else None
+        if isinstance(agent, dict) and proc.returncode == 0 and not payload.get("error"):
+            if agent.get("pane_id") != args.pane or agent.get("agent") != args.kind:
+                return None
+            cwd = os.path.realpath(os.path.expanduser(args.cwd)) if args.cwd else None
+            if cwd and os.path.realpath(str(agent.get("cwd") or "")) != cwd:
+                return None
+            name = agent.get("name")
+            if name and name != args.name:
+                return None
+            if not name:
+                # Metadata API only: no Enter, bootstrap, or prompt input in a live agent.
+                try:
+                    renamed = subprocess.run(_herdr_argv("agent", "rename", args.pane, args.name),
+                                             capture_output=True, text=True,
+                                             timeout=max(.01, min(5, deadline - time.monotonic())))
+                    answer = json.loads(renamed.stdout or "")
+                    if renamed.returncode or not isinstance(answer, dict) or answer.get("error"):
+                        return None
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    return None
+                # Re-read after naming; conflicting name/kind/cwd stays unclaimed.
+                continue
+            return agent
+        if not wait or deadline - time.monotonic() <= .05:
+            break
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    return None
+
+
+def _mark_started(args, sid, mode):
+    _record(to_harness=args.kind, to_name=args.name, kind="steer",
+            summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
+            to_session_id=sid)
+    from_sid, from_harness = _current_session_identity()
+    peer_message.mark_steward(
+        from_harness, from_sid,
+        {"harness": args.kind, "session_id": sid, "name": args.name, "pane": args.pane},
+        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start")
+
+
+def _grid_split(layout):
+    """Match partial 2×2 grids, including herdr's odd-cell rounding."""
+    area, panes = layout.get("area"), layout.get("panes")
+    if not isinstance(area, dict) or not isinstance(panes, list) or not 1 <= len(panes) <= 3:
+        return None
+    keys = ("x", "y", "width", "height")
+    if any(type(area.get(k)) is not int for k in keys) or min(area["width"], area["height"]) < 4:
+        return None
+    for pane in panes:
+        rect = pane.get("rect") if isinstance(pane, dict) else None
+        if not isinstance(rect, dict) or any(type(rect.get(k)) is not int for k in keys):
+            return None
+    panes = sorted(panes, key=lambda p: (p["rect"]["x"], p["rect"]["y"]))
+    # Expected rectangles in x/y order, index of the full cell, split direction.
+    full = (0, 0, 1, 1)
+    left, right = (0, 0, .5, 1), (.5, 0, .5, 1)
+    top, bottom = (0, 0, 1, .5), (0, .5, 1, .5)
+    tl, bl, tr, br = (0, 0, .5, .5), (0, .5, .5, .5), (.5, 0, .5, .5), (.5, .5, .5, .5)
+    patterns = (([full], 0, "right"), ([left, right], 1, "down"),
+                ([left, tr, br], 0, "down"), ([tl, bl, right], 2, "down"),
+                ([top, bottom], 0, "right"), ([tl, bottom, tr], 1, "right"),
+                ([top, bl, br], 0, "right"))
+    for expected, index, direction in patterns:
+        if len(expected) != len(panes):
+            continue
+        matches = True
+        for pane, (x, y, w, h) in zip(panes, expected):
+            desired = (area["x"] + x * area["width"], area["y"] + y * area["height"],
+                       w * area["width"], h * area["height"])
+            if any(abs(pane["rect"][k] - v) > .5 for k, v in zip(keys, desired)):
+                matches = False
+                break
+        if matches:
+            return panes[index]["pane_id"], direction
+    return None
+
+
+def _placement_result(*argv):
+    proc = subprocess.run(_herdr_argv(*argv), capture_output=True, text=True,
+                          timeout=_herdr_get_timeout())
+    payload = json.loads(proc.stdout or "")
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if proc.returncode or not isinstance(result, dict) or payload.get("error"):
+        return {}
+    return result
+
+
+def _start_layout(beside):
+    layout = _placement_result("pane", "layout", "--pane", beside).get("layout")
+    if not isinstance(layout, dict):
+        return None
+    panes, workspace = layout.get("panes"), layout.get("workspace_id")
+    if (not isinstance(workspace, str) or not workspace.strip()
+            or not isinstance(layout.get("tab_id"), str) or not isinstance(panes, list)
+            or not panes or any(not isinstance(p, dict) or not isinstance(p.get("pane_id"), str)
+                                or not p["pane_id"].strip() for p in panes)):
+        return None
+    ids = [p["pane_id"] for p in panes]
+    if (beside not in ids or len(ids) != len(set(ids))
+            or not layout["tab_id"].startswith(workspace + ":")
+            or any(not pane_id.startswith(workspace + ":") for pane_id in ids)):
+        return None
+    return layout
+
+
+def _empty_shell_placement(panes):
+    for pane in panes:
+        pane_id = pane["pane_id"]
+        if (_pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None
+                and _wait_for_shell_prompt(pane_id, timeout_ms=1)
+                and _pane_has_agent(pane_id) is None and _pane_foreground_shell(pane_id) is None):
+            return "reuse", pane_id, None
+    return None
+
+
+def _tab_placement(layout):
+    """One grid/shell decision for both the caller tab and its workspace peers."""
+    split = _grid_split(layout)
+    if split:
+        return "split", split[0], split[1]
+    return _empty_shell_placement(layout["panes"])
+
+
+def _project_start_workspace():
+    """A directory match locates a workspace; it never proves caller ownership."""
+    hint = os.environ.get("HERDR_PANE_ID")
+    if not hint:
+        return None
+    try:
+        pane = _placement_result("agent", "get", hint).get("agent")
+        if not isinstance(pane, dict) or pane.get("pane_id") != hint:
+            return None
+        workspace, cwd = pane.get("workspace_id"), pane.get("foreground_cwd")
+        if (not isinstance(workspace, str) or not workspace.strip()
+                or not hint.startswith(workspace + ":") or not isinstance(cwd, str)
+                or not os.path.isabs(cwd) or not os.path.isdir(cwd)):
+            return None
+        caller = INSTALL_PATHS.primary_checkout(os.getcwd()).resolve()
+        foreground = INSTALL_PATHS.primary_checkout(cwd).resolve()
+        return workspace if caller == foreground else None
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
+        return None
+
+
+def _start_workspace_placement(workspace):
+    """Project seats reuse empty shells or add a tab, without splitting a peer."""
+    try:
+        panes = _placement_result("pane", "list", "--workspace", workspace).get("panes")
+        if (not isinstance(panes, list) or not panes
+                or any(not isinstance(p, dict) or p.get("workspace_id") != workspace
+                       or not isinstance(p.get("pane_id"), str)
+                       or not p["pane_id"].startswith(workspace + ":") for p in panes)
+                or len({p["pane_id"] for p in panes}) != len(panes)):
+            return None
+        return _empty_shell_placement(reversed(panes)) or ("tab", workspace, None)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _start_placement(beside):
+    """Fill the caller tab, then the newest available tab in the same workspace."""
+    try:
+        layout = _start_layout(beside)
+        if layout is None:
+            return None
+        placement = _tab_placement(layout)
+        if placement:
+            return placement
+        workspace = layout["workspace_id"]
+        tabs = _placement_result("tab", "list", "--workspace", workspace).get("tabs")
+        if not isinstance(tabs, list):
+            return None
+        others = []
+        for tab in tabs:
+            if (not isinstance(tab, dict) or tab.get("workspace_id") != workspace
+                    or not isinstance(tab.get("tab_id"), str)
+                    or not tab["tab_id"].startswith(workspace + ":")
+                    or type(tab.get("number")) is not int):
+                return None
+            if tab["tab_id"] != layout["tab_id"]:
+                others.append(tab)
+        if others:
+            panes = _placement_result("pane", "list", "--workspace", workspace).get("panes")
+            if not isinstance(panes, list):
+                return None
+            for tab in sorted(others, key=lambda t: t["number"], reverse=True):
+                pane_id = next((p.get("pane_id") for p in panes if isinstance(p, dict)
+                                and p.get("workspace_id") == workspace and p.get("tab_id") == tab["tab_id"]
+                                and isinstance(p.get("pane_id"), str)
+                                and p["pane_id"].startswith(workspace + ":")), None)
+                if pane_id is None:
+                    return None
+                other = _start_layout(pane_id)
+                if other is None or other["workspace_id"] != workspace or other["tab_id"] != tab["tab_id"]:
+                    return None
+                placement = _tab_placement(other)
+                if placement:
+                    return placement
+        return "tab", workspace, None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def cmd_start(args):
+    if len(args.name) > 32:
+        print(f"started=false reason=agent-name-too-long agent={args.kind} name={args.name} "
+              "max_length=32 detail=이름은 최대 32자까지 사용할 수 있습니다")
+        return 1
+    if not args.pane and not args.beside:
+        args.beside = _caller_pane() or None
+        if not args.beside:
+            args.project_workspace = _project_start_workspace()
+    workspace = (args.beside.split(":")[0] if args.beside else
+                 getattr(args, "project_workspace", None))
+    if not workspace:
+        return _start_in_pane(args)
+    # Hold the workspace claim until native start settles, including shell reuse.
+    # A second start then reads the new layout instead of splitting the old cell.
+    key = hashlib.sha256(f"{_HERDR_SESSION or 'default'}:{workspace}".encode()).hexdigest()
+    root = peer_message.peer_state_root() / "peer-starts"
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / f"{key}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _start_in_pane(args)
+
+
+def _start_in_pane(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
-    if not args.pane and not args.beside:
-        # Beside the calling pane, the way a session starts its own peer.
-        args.beside = os.environ.get("HERDR_PANE_ID", "").strip() or None
-        if not args.beside:
-            print(f"started=false reason=pane-unknown agent={args.kind} name={args.name} "
-                  "pane=- detail=name --pane or --beside outside a herdr pane")
-            return 1
-    if args.beside and not args.cwd:
+    workspace = getattr(args, "project_workspace", None)
+    if not args.pane and not args.beside and not workspace:
+        print(f"started=false reason=pane-unknown agent={args.kind} name={args.name} "
+              "pane=- detail=호출자의 창 또는 같은 프로젝트 작업공간을 확인하지 못했습니다")
+        return 1
+    if (args.beside or workspace) and not args.cwd:
         try:
             args.cwd = str(INSTALL_PATHS.primary_checkout(os.getcwd()))
         except OSError:
@@ -1164,13 +1470,32 @@ def cmd_start(args):
         if flag:
             cwd_flag = [flag, pane_cwd]
 
+    if args.pane:
+        # The normal retained-pane reuse command may arrive after the runtime did.
+        # Observe first so a retry never bootstraps or starts over that live agent.
+        existing = _observed_start_agent(args, deadline=time.monotonic() + .5)
+        if existing is not None:
+            sid = peer_message.usable_session_id((existing.get("agent_session") or {}).get("value"))
+            mode = args.permission_mode or _default_permission_mode()
+            _mark_started(args, sid, mode)
+            trust_wait = _native_trust_reason(args.kind, _read_screen(args.pane))
+            print(f"started=true agent={args.kind} name={args.name} pane={args.pane} "
+                  f"permission_mode={mode} session_id={sid or '-'} managed=- "
+                  "start_verify=observed-pane" + (f" cwd={pane_cwd}" if pane_cwd else "")
+                  + (f" ready=false reason={trust_wait}" if trust_wait else ""))
+            return 0
+
     created_shell = created_screen = created_deadline = None
     created_pane = False
+    failure_deadline = None
 
     def cleanup():
         if not created_pane:
             return ""
-        result = _failed_start_cleanup(args.pane, created_shell, created_screen)
+        result = (_failed_start_cleanup(args.pane, created_shell, created_screen)
+                  if failure_deadline is None else
+                  _failed_start_cleanup(args.pane, created_shell, created_screen,
+                                        deadline=failure_deadline))
         note = f" pane_cleanup={result}"
         if result in {"retained", "close-failed"}:
             retry = ["hearting", "run", "peer-steward", "start", args.name,
@@ -1184,37 +1509,49 @@ def cmd_start(args):
             note += " reuse_command=" + shlex.quote(shlex.join(retry))
         return note
 
-    if getattr(args, "beside", None):
-        cmd = _herdr_argv("pane", "split", "--pane", args.beside,
-                          "--direction", "right", "--no-focus")
-        if pane_cwd:
-            cmd += ["--cwd", pane_cwd]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=_herdr_get_timeout())
-            payload = json.loads(proc.stdout or "")
-            result = payload.get("result") if isinstance(payload, dict) else None
-            pane = result.get("pane") if isinstance(result, dict) else None
-            new_id = pane.get("pane_id") if isinstance(pane, dict) else None
-            split_ok = (proc.returncode == 0 and isinstance(payload, dict) and not payload.get("error")
-                        and isinstance(new_id, str) and bool(new_id.strip())
-                        and new_id != args.beside and pane.get("focused") is False)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            split_ok = False
-        if not split_ok:
-            print(f"started=false reason=pane-split-failed agent={args.kind} "
+    if args.beside or workspace:
+        placement = (_start_workspace_placement(workspace) if workspace else
+                     _start_placement(args.beside))
+        if placement is None:
+            print(f"started=false reason=pane-layout-unavailable agent={args.kind} "
                   f"name={args.name} pane=- beside={args.beside}")
             return 1
-        args.pane = new_id
-        created_pane = True
-        created_shell = _start_shell_identity(new_id)
-        created_deadline = time.monotonic() + _BESIDE_READY_SECONDS
-        readiness, created_shell = _wait_for_created_shell(
-            args.pane, pane_cwd, created_shell, created_deadline)
-        if readiness:
-            print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
-                  f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
-            return 1
+        action, target, direction = placement
+        if action == "reuse":
+            args.pane = target
+        else:
+            cmd = (_herdr_argv("pane", "split", "--pane", target, "--direction", direction,
+                               "--ratio", "0.5", "--no-focus") if action == "split" else
+                   _herdr_argv("tab", "create", "--workspace", target, "--no-focus"))
+            if pane_cwd:
+                cmd += ["--cwd", pane_cwd]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      timeout=_herdr_get_timeout())
+                payload = json.loads(proc.stdout or "")
+                result = payload.get("result") if isinstance(payload, dict) else None
+                pane = result.get("pane" if action == "split" else "root_pane") if isinstance(result, dict) else None
+                new_id = pane.get("pane_id") if isinstance(pane, dict) else None
+                split_ok = (proc.returncode == 0 and isinstance(payload, dict) and not payload.get("error")
+                            and isinstance(new_id, str) and bool(new_id.strip())
+                            and new_id != args.beside and pane.get("focused") is False)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                split_ok = False
+            if not split_ok:
+                reason = "pane-split-failed" if action == "split" else "pane-tab-create-failed"
+                print(f"started=false reason={reason} agent={args.kind} "
+                      f"name={args.name} pane=- beside={args.beside}")
+                return 1
+            args.pane = new_id
+            created_pane = True
+            created_shell = _start_shell_identity(new_id)
+            created_deadline = time.monotonic() + _BESIDE_READY_SECONDS
+            readiness, created_shell = _wait_for_created_shell(
+                args.pane, pane_cwd, created_shell, created_deadline)
+            if readiness:
+                print(f"started=false reason={readiness} agent={args.kind} name={args.name} "
+                      f"pane={args.pane}" + (f" cwd={pane_cwd}" if pane_cwd else "") + cleanup())
+                return 1
 
     # Before the agent is started, not after: this is the line that decides whether the
     # session that comes up is hearting-managed at all.
@@ -1294,8 +1631,8 @@ def cmd_start(args):
             return 1
         return _unavailable("herdr-invocation-failed")
 
-    # F-100c: herdr answers `agent_started` with the agent block; a Claude/Codex id is
-    # usually present already, OpenCode's never is (measured) — record what we got.
+    # herdr answers `agent_started` with the agent block; any harness can initially
+    # omit its SID. Record it when available, otherwise keep the named pane join.
     # `started` needs exit 0 AND no error body (review round 1, #9): a herdr that exits
     # 0 with `{"error": …}` launched nobody.
     started_sid = None
@@ -1312,10 +1649,20 @@ def cmd_start(args):
                 agent_block = (payload.get("result") or {}).get("agent")
                 break
         if isinstance(agent_block, dict):
-            started_sid = (agent_block.get("agent_session") or {}).get("value") or None
+            started_sid = peer_message.usable_session_id((agent_block.get("agent_session") or {}).get("value"))
     except Exception:
         agent_block = None
     started = proc.returncode == 0 and not payload_error
+    start_verify = None
+    code = payload_error.get("code") if isinstance(payload_error, dict) else None
+    if not started and code in {"timeout", "agent_pane_busy", "pane_busy"}:
+        failure_deadline = time.monotonic() + 5
+        observed = _observed_start_agent(args, deadline=failure_deadline, wait=True)
+        if observed is not None:
+            agent_block = observed
+            started_sid = peer_message.usable_session_id((observed.get("agent_session") or {}).get("value"))
+            started = True
+            start_verify = "observed-pane"
     # herdr can report an error body with exit 0 (e.g. agent_name_taken).
     # Preserve its bounded machine-readable code instead of silently discarding
     # the only explanation of a refused start. A non-JSON native stderr becomes
@@ -1345,22 +1692,14 @@ def cmd_start(args):
             # projection needs the process start time.
             if not _write_bound_registry(tui_pid, bound_sid, tui_cwd, args.name):
                 session_bind = "bound-unregistered"
-    _record(
-        to_harness=args.kind, to_name=args.name, kind="steer",
-        summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
-        to_session_id=started_sid,
-    )
-    # Launching a session is steward-role evidence (source=start); the `[start]` steer
-    # row above is only the message and raises nothing by itself. Marked only from an
-    # error-free payload that carries the agent block — a refused start, an error body
-    # or an unparsable answer launched nothing we can point at.
+    # A successful agent block or this pane's observed matching runtime proves the
+    # start. An unresolved refusal or unparsable answer grants no role marker.
     if started and isinstance(agent_block, dict):
-        from_sid, from_harness = _current_session_identity()
-        peer_message.mark_steward(
-            from_harness, from_sid,
-            {"harness": args.kind, "session_id": started_sid, "name": args.name},
-            "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
-        )
+        _mark_started(args, started_sid, mode)
+    else:
+        _record(to_harness=args.kind, to_name=args.name, kind="steer",
+                summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
+                to_session_id=started_sid)
     # `session_id=-` is the launch-time signal that nothing proved which session this is
     # (no ledger endpoint, no board badge, nothing to steer by name); `session_bind=` says
     # why for a Codex start (timeout | ambiguous | no-process | unavailable), `bound` when
@@ -1373,7 +1712,7 @@ def cmd_start(args):
     # Interactive managed ingress is retired, so `managed=false` is no longer a defect
     # signal; the field stays for receipt compatibility and `session_id=` is what says
     # whether the session got an identity.
-    if started and getattr(args, "beside", None):
+    if started and getattr(args, "beside", None) and args.pane != args.beside:
         _mark_seat_successor(args.pane, args.beside, args.kind, started_sid)
     managed = "-"
     if started and _MANAGED_INGRESS.get(args.kind):
@@ -1390,6 +1729,8 @@ def cmd_start(args):
         + (f" cwd={pane_cwd}" if pane_cwd else "")
         + cleanup_note
         + (f" tui_scoped={tui_scoped}" if tui_scoped else "")
+        + (f" start_verify={start_verify}" if start_verify else "")
+        + (f" placement=project-workspace workspace={workspace}" if workspace else "")
     )
     return 0
 
@@ -1441,11 +1782,16 @@ def _retire_pane_info(pane, timeout=5):
         return None
 
 
-def _retire_foreground(pane, harness):
+def _retire_foreground(pane, harness, *, strict=True):
     info = _retire_pane_info(pane)
-    if info is None or len(info["foreground_processes"]) != 1:
+    if info is None or (strict and len(info["foreground_processes"]) != 1):
         return None
-    item = info["foreground_processes"][0]
+    leaders = [item for item in info["foreground_processes"]
+               if isinstance(item, dict)
+               and item.get("pid") == info["foreground_process_group_id"]]
+    if len(leaders) != 1:
+        return None
+    item = leaders[0]
     pid = item.get("pid") if isinstance(item, dict) else None
     argv = item.get("argv") if isinstance(item, dict) else None
     if (type(pid) is not int or pid <= 0 or pid == info["shell_pid"]
@@ -1494,11 +1840,217 @@ def _retire_target(target):
                 "name": target, "pane": "-"}, 4, "herdr-protocol-error")
 
 
+def _retire_request_identity(ident, foreground):
+    exact = {"server": _HERDR_SESSION or "default", "pane": ident["pane"],
+             "harness": ident["harness"], "session_id": ident["session_id"],
+             "name": ident["name"], "foreground": foreground}
+    return exact
+
+
+def _retire_booked_foreground(duty):
+    intent = duty.get("intent") or {}
+    original = (intent.get("identity") or {}).get("foreground")
+    observation = duty.get("observation") or {}
+    if not original and observation.get("phase") in {"exit-requested", "shell-returned"}:
+        # An older release recorded the exact lifetime when it sent the exit.
+        original = observation.get("foreground")
+    return original
+
+
+def _retire_subject_state(duty):
+    """The booked agent's kernel lifetime, never the pane's current occupant."""
+    original = _retire_booked_foreground(duty)
+    if not isinstance(original, dict) or not original.get("pid") or not original.get("start"):
+        return "unknown"
+    current = _retire_process_record(original["pid"])
+    start = current["start"] if current is not None else _proc_start_ticks(original["pid"])
+    if start is not None:
+        return "same" if start == original["start"] else "gone"
+    try:
+        os.stat(f"/proc/{original['pid']}")
+    except FileNotFoundError:
+        return "gone"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _complete_gone_retire(store, duty):
+    handover = _retire_handover(duty)
+    phase = (duty.get("observation") or {}).get("phase", "waiting")
+    settled = store.update(duty["id"], state="complete", result="target-already-gone",
+                           delivery="completed", cleanup="complete", expected_phases={phase},
+                           observation={"phase": "complete", "reason": "target-already-gone"})
+    if settled.get("state") == "complete":
+        ident = (duty.get("intent") or {}).get("identity") or {}
+        print(f"retired=true reason=target-already-gone agent={ident.get('harness', '-')} "
+              f"name={ident.get('name', '-')} pane={ident.get('pane', '-')}"
+              + (f" handover={handover}" if handover else ""))
+        return True
+    return False
+
+
+def _retire_request(target, exact):
+    duty_id = peer_obligations.stable_duty_id("retire", exact, target)
+    store = peer_obligations.ObligationStore()
+    duty = store.get(duty_id)
+    retry_of = None
+    # Cancellation is history, not an outstanding exit claim. Derive the next
+    # id from that history so repeated requests still converge on one duty.
+    while duty is not None and duty.get("state") == "cancelled":
+        retry_of = duty_id
+        duty_id = peer_obligations.stable_duty_id("retire", exact, retry_of)
+        duty = store.get(duty_id)
+    if duty is None:
+        own_sid, own_harness = _current_session_identity()
+        intent = {"target": target, "requester": {
+            "session_id": own_sid, "harness": own_harness,
+            "pane": _caller_pane(), "server": _HERDR_SESSION or "default"}}
+        if retry_of:
+            intent["retry_of"] = retry_of
+        duty = store.create(duty_id, "retire", exact, intent)
+    peer_obligations.ensure_runner()
+    return store, duty
+
+
+def _finish_retire_cleanup(store, duty, ident, foreground):
+    """Resume only shell-return/close work; never send an exit key from here."""
+    pane = ident.get("pane", "")
+    server = (duty.get("intent") or {}).get("identity", {}).get("server") or "default"
+    global _HERDR_SESSION
+    old_server = _HERDR_SESSION
+    _HERDR_SESSION = None if server == "default" else server
+    try:
+        info = _retire_pane_info(pane)
+        still_exact = (
+            isinstance(info, dict)
+            and info.get("pane_id") == pane
+            and info.get("shell_pid") == foreground.get("shell_pid")
+            and info.get("foreground_process_group_id") == foreground.get("shell_pid")
+            and _proc_start_ticks(foreground.get("shell_pid")) == foreground.get("shell_start")
+        )
+        if not still_exact or not _retire_shell_returned(info, foreground):
+            if _retire_subject_state(duty) == "gone":
+                return 0 if _complete_gone_retire(store, duty) else 1
+            current = store.get(duty["id"]) or duty
+            observation = {**(current.get("observation") or {}),
+                           "phase": "shell-returned", "reason": "shell-return-unverified"}
+            store.update(duty["id"], state="cleanup-pending", observation=observation,
+                         cleanup="pending")
+            return 1
+        final_info = _retire_pane_info(pane)
+        if (not final_info or final_info.get("shell_pid") != foreground.get("shell_pid")
+                or _proc_start_ticks(foreground.get("shell_pid")) != foreground.get("shell_start")
+                or not _retire_shell_returned(final_info, foreground)):
+            if _retire_subject_state(duty) == "gone":
+                return 0 if _complete_gone_retire(store, duty) else 1
+            return 1
+        handover = _retire_handover(duty)
+        if not _close_pane(pane):
+            current = store.get(duty["id"]) or duty
+            store.update(duty["id"], state="cleanup-pending",
+                         observation={**(current.get("observation") or {}),
+                                      "phase": "shell-returned", "reason": "pane-close-failed"},
+                         cleanup="pending")
+            return 1
+        store.update(duty["id"], state="complete", result="normal-exit",
+                     delivery="completed", cleanup="complete",
+                     observation={"phase": "complete", "reason": "normal-exit"})
+        _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
+                to_session_id=ident["session_id"], to_pane=pane,
+                summary_text=f"[retire] {ident['name']} normal-exit",
+                receipt="normal-exit", status="sent")
+        print(f"retired=true reason=normal-exit agent={ident['harness']} "
+              f"name={ident['name']} pane={pane}"
+              + (f" handover={handover}" if handover else ""))
+        return 0
+    finally:
+        _HERDR_SESSION = old_server
+
+
+def _resume_retire_obligation(duty, store):
+    global _HERDR_SESSION
+    intent = duty.get("intent") or {}
+    ident = dict((duty.get("intent") or {}).get("identity") or {})
+    target = intent.get("target") or ""
+    observation = duty.get("observation") or {}
+    phase = observation.get("phase", "waiting")
+    if duty.get("state") == "complete":
+        if duty.get("result") in {"normal-exit", "target-already-gone"}:
+            _retire_handover(duty)
+        return
+    if duty.get("state") == "cancelled":
+        return
+    if phase == "shell-returned":
+        foreground = observation.get("foreground") or {}
+        if foreground:
+            _finish_retire_cleanup(store, duty, ident, foreground)
+        return
+    if phase == "exit-requested":
+        foreground = observation.get("foreground") or {}
+        server = ident.get("server") or "default"
+        old_server = _HERDR_SESSION
+        _HERDR_SESSION = None if server == "default" else server
+        try:
+            info = _retire_pane_info(ident.get("pane", ""))
+            if info is not None and foreground and _retire_shell_returned(info, foreground):
+                claimed = store.claim_phase(
+                    duty["id"], {"exit-requested"}, "shell-returned",
+                    state="cleanup-pending", extra={"foreground": foreground})
+                if claimed:
+                    _finish_retire_cleanup(store, claimed, ident, foreground)
+            elif _retire_subject_state(duty) == "gone":
+                _complete_gone_retire(store, duty)
+            else:
+                store.update(duty["id"], state="pending",
+                             expected_phases={"exit-requested"},
+                             observation={**observation, "reason": "exit-result-unobserved"})
+        finally:
+            _HERDR_SESSION = old_server
+        return
+    server = ident.get("server") or "default"
+    old_server = _HERDR_SESSION
+    _HERDR_SESSION = None if server == "default" else server
+    try:
+        subject = _retire_subject_state(duty)
+        if subject == "gone":
+            _complete_gone_retire(store, duty)
+            return
+        if subject == "unknown":
+            store.update(duty["id"], state="unknown", expected_phases={"waiting"},
+                         observation={"phase": "waiting", "reason": "foreground-unverified"})
+            return
+        state, observed, _code, reason = _retire_target(target)
+        if (reason or observed.get("harness") != ident.get("harness")
+                or (ident.get("session_id") != "-"
+                    and observed.get("session_id") != ident.get("session_id"))
+                or observed.get("pane") != ident.get("pane")):
+            store.update(duty["id"], state="unknown",
+                         expected_phases={"waiting"},
+                         observation={"phase": "waiting", "reason": reason or "target-identity-changed"})
+            return
+        readiness = _pane_readiness(target, state,
+                                    expected_harness=ident["harness"],
+                                    expected_sid=observed["session_id"])
+        if readiness.state != "ready":
+            store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
+                         expected_phases={"waiting"},
+                         observation={"phase": "waiting", "reason": readiness.reason,
+                                      "state": readiness.state})
+            return
+        cmd_retire(argparse.Namespace(target=target, _resume_request_id=duty["id"]))
+    finally:
+        _HERDR_SESSION = old_server
+
+
 def cmd_retire(args):
     target = args.target
     ident = {"harness": "-", "session_id": "-", "name": target, "pane": "-"}
+    store = peer_obligations.ObligationStore()
+    duty_id = getattr(args, "_resume_request_id", None)
+    duty = store.get(duty_id) if duty_id else None
 
-    def finish(reason, retired=False, handover=None, detail=None):
+    def finish(reason, retired=False, handover=None, detail=None, pending=False):
         tail = f" handover={handover}" if handover else ""
         summary = f"[retire] {target} {reason}{tail}"
         receipt = reason
@@ -1506,46 +2058,133 @@ def cmd_retire(args):
             summary += f" {detail}"
             receipt += f" {detail}"
             print(detail, file=sys.stderr)
+        if duty:
+            current = store.get(duty["id"]) or duty
+            observation = dict(current.get("observation") or {})
+            if retired:
+                store.update(duty["id"], state="complete", result="normal-exit",
+                             delivery="completed", cleanup="complete",
+                             observation={"phase": "complete", "reason": reason})
+            elif reason == "self-target":
+                store.update(duty["id"], state="cancelled", cleanup="complete",
+                             observation={"phase": "cancelled", "reason": reason})
+            elif reason == "pane-close-failed" and observation.get("foreground"):
+                store.update(duty["id"], state="cleanup-pending",
+                             observation={**observation, "phase": "shell-returned",
+                                          "reason": reason}, cleanup="pending")
+            elif pending:
+                store.update(duty["id"], state="unknown" if reason.endswith("unknown") else "pending",
+                             expected_phases={observation.get("phase", "waiting")},
+                             observation={**observation, "reason": reason})
         _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
                 to_session_id=ident["session_id"], to_pane=ident["pane"],
                 summary_text=summary, receipt=receipt,
-                status="sent" if retired else "failed")
+                status="sent" if retired else "unknown" if pending else "failed")
         print(f"retired={str(retired).lower()} reason={reason} agent={ident['harness']} "
-              f"name={ident['name']} pane={ident['pane']}{tail}")
-        return 0 if retired else 1
+              f"name={ident['name']} pane={ident['pane']}{tail}"
+              + (f" pending=true request_id={duty_id}" if pending and duty_id else ""))
+        return 0 if retired or pending else 1
 
     if _herdr_missing():
         return finish("herdr-not-found")
     state, ident, _, reason = _retire_target(target)
-    if state not in ("idle", "done"):
-        return finish(reason if state == "herdr-unavailable" else f"agent-{state}")
+    if not isinstance(ident.get("pane"), str) or ident["pane"] in {"", "-"}:
+        # The pane may be gone while the accepted request still proves the
+        # lifetime and its successor. Never borrow another requester's duty.
+        own_sid, own_harness = _current_session_identity()
+        own_pane = _caller_pane()
+        matches = [row for row in store.list(states=peer_obligations._PENDING_STATES | {"complete"})
+                   if row.get("intent", {}).get("kind") == "retire"
+                   and row["intent"].get("target") == target
+                   and row["intent"].get("requester") == {
+                       "session_id": own_sid, "harness": own_harness,
+                       "pane": own_pane, "server": _HERDR_SESSION or "default"}]
+        if own_sid and own_pane and len(matches) == 1:
+            saved = matches[0]
+            if saved.get("state") == "complete" and saved.get("result") in {"normal-exit", "target-already-gone"}:
+                handover = _retire_handover(saved)
+                print("retired=true reason=already-complete"
+                      + (f" handover={handover}" if handover else ""))
+                return 0
+            if _retire_subject_state(saved) == "gone" and _complete_gone_retire(store, saved):
+                return 0
+        return finish(reason or "pane-unverified")
     pane, harness = ident["pane"], ident["harness"]
-    if not isinstance(pane, str) or not pane or pane == "-":
-        return finish("pane-unverified")
-    own_sid, own_harness = _current_session_identity()
-    if (pane == os.environ.get("HERDR_PANE_ID")
+    if duty is not None:
+        requester = (duty.get("intent") or {}).get("requester") or {}
+        own_sid, own_harness = requester.get("session_id"), requester.get("harness")
+        own_pane = requester.get("pane")
+        own_server = requester.get("server", (duty.get("intent") or {}).get(
+            "identity", {}).get("server", "default"))
+    else:
+        own_sid, own_harness = _current_session_identity()
+        own_pane, own_server = _caller_pane(), _HERDR_SESSION or "default"
+    if ((own_pane and pane == own_pane and own_server == (_HERDR_SESSION or "default"))
             or (own_sid and ident["session_id"] == own_sid and harness == own_harness)):
         return finish("self-target")
     if harness not in _RETIRE_ACTIONS:
         return finish("normal-exit-unverified")
+    if duty is None:
+        if getattr(args, "_resume_request_id", None):
+            return finish("retire-obligation-missing", pending=True)
+        foreground = _retire_foreground(pane, harness, strict=False)
+        exact = _retire_request_identity(ident, foreground)
+        store, duty = _retire_request(target, exact)
+        duty_id = duty["id"]
+    else:
+        duty_id = duty["id"]
+    if duty.get("state") == "complete":
+        _resume_retire_obligation(duty, store)
+        print(f"retired=true reason=already-complete agent={harness} "
+              f"name={ident['name']} pane={pane}")
+        return 0
+    if duty.get("state") == "cancelled":
+        return finish("retire-cancelled")
+    phase = (duty.get("observation") or {}).get("phase", "waiting")
+    if phase != "waiting":
+        return finish("retire-already-pending", pending=True)
+    subject = _retire_subject_state(duty)
+    if subject == "gone":
+        if _complete_gone_retire(store, duty):
+            return 0
+        return finish("retire-already-pending", pending=True)
+    if subject == "unknown":
+        return finish("foreground-unverified", pending=True)
+    booked = (duty.get("intent") or {}).get("identity") or {}
+    if (booked.get("pane") != pane or booked.get("harness") != harness
+            or (booked.get("session_id") != "-"
+                and booked.get("session_id") != ident["session_id"])):
+        return finish("target-changed", pending=True)
+    if reason or state not in {"idle", "done"}:
+        return finish(reason or f"agent-{state}", pending=True)
+    readiness = _pane_readiness(target, state, expected_harness=harness,
+                                expected_sid=ident["session_id"])
+    if readiness.state != "ready":
+        return finish(readiness.reason, pending=True)
     identity = _retire_foreground(pane, harness)
     if identity is None:
-        return finish("foreground-unverified")
-    # Resolve again after process inspection so a renamed/replaced target is
-    # never acted on using the earlier pane or SID.
+        return finish("foreground-unverified", pending=True)
+    if identity != _retire_booked_foreground(duty):
+        return finish("foreground-changed", pending=True)
     state2, ident2, _, _ = _retire_target(target)
     if state2 not in ("idle", "done") or ident2 != ident:
-        return finish("target-changed")
+        return finish("target-changed", pending=True)
     if _retire_foreground(pane, harness) != identity:
-        return finish("foreground-changed")
+        return finish("foreground-changed", pending=True)
     lines = _read_screen(target)
-    readiness = (_native_trust_reason(harness, lines) or _screen_ready(harness, lines)) if lines else "screen-unavailable"
-    if readiness:
-        return finish(readiness)
+    screen_reason = (_native_trust_reason(harness, lines) or _screen_ready(harness, lines)) if lines else "screen-unavailable"
+    if screen_reason:
+        return finish(screen_reason, pending=True)
+    claimed = store.claim_phase(
+        duty_id, {"waiting"}, "exit-requested", state="pending",
+        extra={"foreground": identity, "reason": "normal-exit-requested"})
+    if claimed is None:
+        return finish("retire-duty-already-claimed", pending=True)
+    duty = claimed
     try:
-        for index, (operation, value) in enumerate(_RETIRE_ACTIONS[harness]):
-            if index and _retire_foreground(pane, harness) != identity:
-                return finish("foreground-changed")
+        for operation, value in _RETIRE_ACTIONS[harness]:
+            if _retire_foreground(pane, harness) != identity:
+                return finish("foreground-changed", pending=True)
             sent = subprocess.run(_herdr_argv("pane", operation, pane, value),
                                   capture_output=True, text=True, timeout=5)
             send_error = False
@@ -1556,30 +2195,34 @@ def cmd_retire(args):
                 except ValueError:
                     send_error = True
             if sent.returncode or send_error:
-                return finish("exit-send-failed")
+                return finish("exit-send-unknown", pending=True)
     except (OSError, subprocess.SubprocessError):
-        return finish("exit-send-unknown")
+        return finish("exit-send-unknown", pending=True)
     wait_seconds = _OPENCODE_RETIRE_SECONDS if harness == "opencode" else _RETIRE_SECONDS
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         info = _retire_pane_info(pane, timeout=max(.1, deadline - time.monotonic()))
         if info is None:
-            return finish("shell-return-unverified")
+            return finish("shell-return-unverified", pending=True)
         if _retire_shell_returned(info, identity):
-            # A final exact shell read is required immediately before closing.
-            if not _retire_shell_returned(_retire_pane_info(pane), identity):
-                return finish("shell-changed")
-            # The predecessor has exited: a seat successor now answers for its routes.
-            handover = _seat_handover(ident, own_sid, own_harness)
-            if not _close_pane(pane):
-                return finish("pane-close-failed", handover=handover)
-            return finish("normal-exit", True, handover=handover)
+            transitioned = store.claim_phase(
+                duty_id, {"exit-requested"}, "shell-returned", state="cleanup-pending",
+                extra={"foreground": identity, "reason": "shell-returned"})
+            if transitioned is None:
+                return finish("shell-return-unverified", pending=True)
+            duty = transitioned
+            cleanup_rc = _finish_retire_cleanup(store, duty, ident, identity)
+            if cleanup_rc:
+                current = store.get(duty_id) or duty
+                cleanup_reason = (current.get("observation") or {}).get("reason", "cleanup-pending")
+                return finish(cleanup_reason, pending=True)
+            return 0
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
     if harness == "claude":
         return _retire_claude_background_confirm(
             target, pane, harness, ident, identity, finish,
-            own_sid, own_harness)
-    return finish("agent-still-running")
+            own_sid, own_harness, duty=duty)
+    return finish("agent-still-running", pending=True)
 
 
 def _retire_background_dialog_lines(lines):
@@ -1633,7 +2276,7 @@ def _retire_background_dialog_lines(lines):
 
 
 def _retire_claude_background_confirm(target, pane, harness, ident, identity, finish,
-                                      own_sid, own_harness):
+                                      own_sid, own_harness, *, duty=None):
     """Finish one normal retire path through Claude's background-work confirm.
 
     The default picks 1 (exit and stop tasks): retire closes a handed-over
@@ -1649,30 +2292,30 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
     lines = _read_screen(target)
     tasks = _retire_background_dialog_lines(lines)
     if tasks is None:
-        return finish("agent-still-running")
+        return finish("agent-still-running", pending=True)
     stopped = " stopped-background=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
     if _retire_foreground(pane, harness) != identity:
-        return finish("foreground-changed")
+        return finish("foreground-changed", pending=True)
     if _retire_background_dialog_lines(_read_screen(target)) is None:
-        return finish("agent-still-running")
+        return finish("agent-still-running", pending=True)
     try:
         subprocess.run(_herdr_argv("pane", "send-text", pane, "1"),
                        capture_output=True, text=True, timeout=5)
         subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return finish("exit-send-failed")
+        return finish("exit-send-failed", pending=True)
     deadline = time.monotonic() + _RETIRE_SECONDS
     while time.monotonic() < deadline:
         info = _retire_pane_info(pane, timeout=max(.1, deadline - time.monotonic()))
         if info is None:
-            return finish("shell-return-unverified")
+            return finish("shell-return-unverified", pending=True)
         if _retire_shell_returned(info, identity):
             if not _retire_shell_returned(_retire_pane_info(pane), identity):
-                return finish("shell-changed")
-            handover = _seat_handover(ident, own_sid, own_harness)
+                return finish("shell-changed", pending=True)
+            handover = _retire_handover(duty) if duty is not None else _seat_handover(ident, own_sid, own_harness)
             if not _close_pane(pane):
-                return finish("pane-close-failed", handover=handover)
+                return finish("pane-close-failed", handover=handover, pending=True)
             return finish("normal-exit", True, handover=handover,
                           detail=(f"background-stopped:{stopped.strip()}") if stopped else None)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
@@ -1682,8 +2325,8 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
         subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return finish("agent-still-running")
-    return finish("retire-declined-background-work" + (stopped or ""))
+        return finish("agent-still-running", pending=True)
+    return finish("retire-declined-background-work" + (stopped or ""), pending=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1693,6 +2336,8 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
 _WATCH_SCHEMA = 1
 _WATCH_STATES = _AGENT_STATES + ("timeout", "agent-not-found", "herdr-unavailable")
 _JOIN_EXIT = {"timeout": 3, "agent-not-found": 2, "herdr-unavailable": 4}
+_WATCH_OBSERVER_TIMEOUT_MS = 30_000
+_WATCH_BACKOFF_MAX_SECONDS = 15.0
 
 
 def _watch_root():
@@ -1713,6 +2358,7 @@ class _WatchPaths:
     log: Path
     receipt: Path
     ack: Path
+    observation: Path
 
 
 def _watch_paths(watch_id, root=None):
@@ -1723,6 +2369,7 @@ def _watch_paths(watch_id, root=None):
         log=root / f"{watch_id}.log",
         receipt=root / f"{watch_id}.receipt.json",
         ack=root / f"{watch_id}.ack.json",
+        observation=root / f"{watch_id}.observation.json",
     )
 
 
@@ -1731,12 +2378,12 @@ def _new_watch_id(steward_sid, target, armed_ts, nonce):
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def _dedupe_key(steward_sid, target, until):
+def _dedupe_key(steward_sid, target, until, server=None):
     # `until=[]` (herdr's default set) and `until=["idle","done","blocked"]` are
     # the same *behaviour* but stay distinct keys on purpose: (10) dedupes on the
     # "until 집합" as given, and silently normalizing them would suppress a
     # legitimate second watch.
-    raw = f"{steward_sid}|{target}|{'|'.join(sorted(until or []))}".encode("utf-8", "replace")
+    raw = f"{server or 'default'}|{steward_sid}|{target}|{'|'.join(sorted(until or []))}".encode("utf-8", "replace")
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
@@ -1922,6 +2569,38 @@ def _run_herdr_get(target):
     return None
 
 
+def _watch_identity_matches(expected, observed):
+    """Exact harness and pane, and the session -- except that a watch armed
+    before its target had one (a fresh Codex) takes the first session the pane
+    reports; `expected` keeps it, so every later check needs that session."""
+    if any(expected.get(key) in {None, "", "-"} or observed.get(key) != expected[key]
+           for key in ("harness", "pane")):
+        return False
+    if expected.get("session_id") == "-" and observed.get("session_id") not in {None, "", "-"}:
+        expected["session_id"] = observed["session_id"]
+    return observed.get("session_id") == expected.get("session_id")
+
+
+def _persist_watch_session(args, paths, server, session_id):
+    """Write the session a pane-armed watch took into its arm, under the arm
+    claim, so dedupe and a restarted observer hold that session from now on."""
+    claim = paths.arm.parent / f"{_dedupe_key(args.steward_session_id, args.target, list(args.until or []), server)}.arm"
+    try:
+        claim_fd = _open_lock(claim)
+    except OSError:
+        return False
+    try:
+        if not _acquire_bounded(claim_fd, _CLAIM_TIMEOUT_MS):
+            return False
+        arm = _read_json(paths.arm)
+        agent = arm.get("agent") if isinstance(arm, dict) else None
+        if isinstance(agent, dict) and agent.get("session_id") == "-":
+            _write_json_atomic(paths.arm, {**arm, "agent": {**agent, "session_id": session_id}})
+        return True
+    finally:
+        os.close(claim_fd)
+
+
 def cmd_watch(args):
     root = _watch_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -1953,7 +2632,8 @@ def cmd_watch(args):
     # the same *behaviour* but stay distinct keys on purpose: (10) dedupes on the
     # "until 집합" as given, and silently normalizing them would suppress a
     # legitimate second watch.
-    claim = root / f"{_dedupe_key(steward_sid, target, until)}.arm"
+    server = _HERDR_SESSION or "default"
+    claim = root / f"{_dedupe_key(steward_sid, target, until, server)}.arm"
     try:
         claim_fd = _open_lock(claim)
     except OSError as exc:
@@ -1967,14 +2647,6 @@ def cmd_watch(args):
             existing_id = claim.read_text(encoding="utf-8").strip()
         except OSError:
             pass
-        if existing_id:
-            existing_paths = _watch_paths(existing_id, root)
-            existing_arm = _read_json(existing_paths.arm)
-            if not existing_paths.receipt.exists() and _watcher_present(existing_arm):
-                print(_already_armed_line(existing_id, existing_arm, existing_paths))
-                return 0
-            # Dead with no receipt, or already finished: the key is reclaimable.
-
         # herdr pre-checks. Nothing beyond the claim exists yet, so an early
         # return leaves no watch state behind.
         if _herdr_missing():
@@ -1985,6 +2657,22 @@ def cmd_watch(args):
             return 2
         if reason is not None:
             return _unavailable(reason)
+        # The session may not exist yet (a fresh Codex before its first input):
+        # the watcher then follows the pane and takes the first session it reports.
+        if any(agent.get(key) in {None, "", "-"} for key in ("harness", "pane")):
+            return _unavailable("watch-identity-unverified")
+
+        if existing_id:
+            existing_paths = _watch_paths(existing_id, root)
+            existing_arm = _read_json(existing_paths.arm)
+            if (not existing_paths.receipt.exists() and isinstance(existing_arm, dict)
+                    and (existing_arm.get("server") or "default") == server
+                    and _watch_identity_matches(dict(existing_arm.get("agent") or {}), agent)):
+                if not _watcher_present(existing_arm):
+                    _spawn_watch_observer(existing_id, existing_arm)
+                    existing_arm = _read_json(existing_paths.arm) or existing_arm
+                print(_already_armed_line(existing_id, existing_arm, existing_paths))
+                return 0
 
         armed_ts = _utc_now()
         watch_id = _new_watch_id(steward_sid, target, armed_ts, os.urandom(8).hex())
@@ -2010,6 +2698,9 @@ def cmd_watch(args):
         argv = [
             sys.executable, str(Path(__file__).resolve()), "__watch-run",
             "--watch-id", watch_id, "--target", target,
+            "--server", server,
+            "--expected-harness", agent["harness"], "--expected-session-id", agent["session_id"],
+            "--expected-pane", agent["pane"],
             "--steward-harness", steward_harness, "--steward-session-id", steward_sid,
             "--steward-project", steward_project, "--armed-ts", armed_ts,
             "--rearm-count", str(args.rearm_count or 0),
@@ -2023,6 +2714,37 @@ def cmd_watch(args):
             argv += ["--ref", ref]
         if getattr(args, "rearmed_from", None):
             argv += ["--rearmed-from", args.rearmed_from]
+
+        arm = {
+            "schema_version": _WATCH_SCHEMA,
+            "watch_id": watch_id,
+            "target": target,
+            "until": until,
+            "timeout": args.timeout,
+            "refs": list(args.ref or []),
+            "server": server,
+            "agent": {key: agent.get(key, "-") for key in ("harness", "session_id", "name", "pane")},
+            "steward": {
+                "harness": steward_harness,
+                "session_id": steward_sid,
+                "project": steward_project,
+            },
+            "armed_ts": armed_ts,
+            "wake": wake,
+            "watcher": {},
+            "rearmed_from": getattr(args, "rearmed_from", None) or None,
+            "rearm_count": int(args.rearm_count or 0),
+            "observer_generation": 1,
+        }
+        _write_json_atomic(paths.arm, arm)
+        # Acceptance and the stable claim precede the observer side effect.
+        try:
+            os.ftruncate(claim_fd, 0)
+            os.lseek(claim_fd, 0, os.SEEK_SET)
+            os.write(claim_fd, watch_id.encode("ascii"))
+            os.fsync(claim_fd)
+        except OSError:
+            pass
 
         try:
             # Re-exec, never fork: a fork inherits the caller's process group,
@@ -2052,6 +2774,8 @@ def cmd_watch(args):
             "until": until,
             "timeout": args.timeout,
             "refs": list(args.ref or []),
+            "server": server,
+            "agent": {key: agent.get(key, "-") for key in ("harness", "session_id", "name", "pane")},
             "steward": {
                 "harness": steward_harness,
                 "session_id": steward_sid,
@@ -2062,6 +2786,7 @@ def cmd_watch(args):
             "watcher": {"pid": proc.pid, "pid_start": process_start_ticks(proc.pid) or ""},
             "rearmed_from": getattr(args, "rearmed_from", None) or None,
             "rearm_count": int(args.rearm_count or 0),
+            "observer_generation": 1,
         }
         _write_json_atomic(paths.arm, arm)
 
@@ -2135,19 +2860,59 @@ def cmd_watch_run(args):
         lock_fd = _open_lock(paths.lock)  # direct invocation fallback
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-    payload = _run_herdr_wait(args.target, args.until, args.timeout)  # exactly once
-    state, agent, _code, reason = _interpret_payload(payload, args.target)
-    if reason is not None:
-        # A herdr invocation that cannot be interpreted still terminates the
-        # watch: an un-receipted watcher waiting forever is the failure mode this
-        # whole contract exists to remove.
-        state = "herdr-unavailable"
+    global _HERDR_SESSION
+    server = getattr(args, "server", "default") or "default"
+    _HERDR_SESSION = None if server == "default" else server
+    expected = {
+        "harness": getattr(args, "expected_harness", "-"),
+        "session_id": getattr(args, "expected_session_id", "-"),
+        "pane": getattr(args, "expected_pane", "-"),
+    }
+    checkpoint_ms = args.timeout if args.timeout is not None else _WATCH_OBSERVER_TIMEOUT_MS
+    checkpoint_ms = min(600_000, max(500, int(checkpoint_ms)))
+    backoff = 1.0
+    unbound = expected["session_id"] == "-"
+    while True:
+        resolved, current, _code, reason = _interpret_payload(_run_herdr_get(args.target), args.target)
+        exact = (reason is None and resolved not in {"agent-not-found", "herdr-unavailable"}
+                 and _watch_identity_matches(expected, current))
+        if unbound and expected["session_id"] != "-":
+            unbound = not _persist_watch_session(args, paths, server, expected["session_id"])
+        if exact:
+            payload = _run_herdr_wait(args.target, args.until, checkpoint_ms)
+            state, agent, _code, reason = _interpret_payload(payload, args.target)
+            if (reason is None and state not in {"timeout", "agent-not-found", "herdr-unavailable"}
+                    and _watch_identity_matches(expected, agent)):
+                if state in {"idle", "done"}:
+                    readiness = _pane_readiness(
+                        args.target, state, expected_harness=expected["harness"],
+                        expected_sid=expected["session_id"], expected_pane=expected["pane"])
+                    if readiness.state == "ready":
+                        break
+                    reason = readiness.reason
+                else:
+                    break
+            reason = reason or state
+        elif reason is None:
+            reason = "target-identity-changed"
+        # Timeout and transport loss are checkpoints. Keep the same duty and
+        # re-resolve the exact server/pane/session before another bounded wait.
+        _write_json_atomic(paths.observation, {
+            "schema_version": _WATCH_SCHEMA, "watch_id": args.watch_id,
+            "state": "pending", "reason": str(reason or "observation-unknown"),
+            "server": server, "agent": current if exact else expected,
+            "observed_ts": _utc_now(),
+            "observer_generation": getattr(args, "rearm_count", 0) + 1,
+        })
+        time.sleep(backoff)
+        backoff = min(_WATCH_BACKOFF_MAX_SECONDS, backoff * 1.7)
 
     pid = os.getpid()
     receipt = {
         "schema_version": _WATCH_SCHEMA,
         "watch_id": args.watch_id,
         "target": args.target,
+        "server": server,
         "steward": {
             "harness": args.steward_harness,
             "session_id": args.steward_session_id,
@@ -2164,8 +2929,13 @@ def cmd_watch_run(args):
         "watcher": {"pid": pid, "pid_start": process_start_ticks(pid) or ""},
         "rearmed_from": args.rearmed_from or None,
         "refs": list(args.ref or []),
+        "observer_generation": getattr(args, "rearm_count", 0) + 1,
     }
     _write_json_atomic(paths.receipt, receipt)
+    try:
+        paths.observation.unlink()
+    except FileNotFoundError:
+        pass
 
     _record(
         to_harness=agent["harness"] if agent["harness"] != "-" else "unknown",
@@ -2281,7 +3051,8 @@ def _watch_entries(root):
 
     for arm_path in sorted(root.glob("*.json"), key=_mtime, reverse=True):
         name = arm_path.name
-        if name.endswith(".receipt.json") or name.endswith(".ack.json") or name.startswith("."):
+        if (name.endswith(".receipt.json") or name.endswith(".ack.json")
+                or name.endswith(".observation.json") or name.startswith(".")):
             continue
         watch_id = name[: -len(".json")]
         arm = _read_json(arm_path)
@@ -2294,6 +3065,95 @@ def _watch_entries(root):
         if watch_id not in seen:
             entries.append((watch_id, None))
     return entries
+
+
+def _spawn_watch_observer(watch_id, arm):
+    """Reattach the observer to accepted intent without changing its identity."""
+    if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
+        return False
+    paths = _watch_paths(watch_id)
+    if paths.receipt.exists() or _watcher_present(arm):
+        return True
+    agent = arm.get("agent") or {}
+    if (any(not isinstance(agent.get(key), str) or agent.get(key) in {"", "-"}
+            for key in ("harness", "pane"))
+            or not isinstance(agent.get("session_id"), str) or not agent["session_id"]):
+        _write_json_atomic(paths.observation, {
+            "schema_version": _WATCH_SCHEMA, "watch_id": watch_id,
+            "state": "unknown", "reason": "legacy-watch-identity-unavailable",
+            "observed_ts": _utc_now(),
+        })
+        return False
+    if _herdr_missing():
+        # Fail fast without spawning an observer that could only checkpoint
+        # forever: the duty stays unknown-pending for the next reconnect.
+        _write_json_atomic(paths.observation, {
+            "schema_version": _WATCH_SCHEMA, "watch_id": watch_id,
+            "state": "unknown", "reason": "herdr-not-found",
+            "observed_ts": _utc_now(),
+        })
+        return False
+    lock_fd = _open_lock(paths.lock)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        os.set_inheritable(lock_fd, True)
+        log_fd = os.open(str(paths.log), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        server = arm.get("server") or "default"
+        argv = [
+            sys.executable, str(Path(__file__).resolve()), "__watch-run",
+            "--watch-id", watch_id, "--target", arm["target"], "--server", server,
+            "--expected-harness", agent["harness"], "--expected-session-id", agent["session_id"],
+            "--expected-pane", agent["pane"],
+            "--steward-harness", (arm.get("steward") or {}).get("harness", "unknown"),
+            "--steward-session-id", (arm.get("steward") or {}).get("session_id", ""),
+            "--steward-project", (arm.get("steward") or {}).get("project", ""),
+            "--armed-ts", arm.get("armed_ts", ""),
+            "--rearm-count", str(int(arm.get("observer_generation", 1))),
+            "--lock-fd", str(lock_fd),
+        ]
+        for state in arm.get("until") or []:
+            argv.extend(("--until", state))
+        for ref in arm.get("refs") or []:
+            argv.extend(("--ref", ref))
+        if arm.get("timeout") is not None:
+            argv.extend(("--timeout", str(arm["timeout"])))
+        env = dict(os.environ)
+        if server == "default":
+            env.pop("AGENT_HERDR_SESSION", None)
+        else:
+            env["AGENT_HERDR_SESSION"] = server
+        try:
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
+                start_new_session=True, close_fds=True, pass_fds=(lock_fd,),
+                cwd=str(paths.arm.parent), env=env,
+            )
+        finally:
+            os.close(log_fd)
+        # Re-read: the observer may have written the session it took meanwhile.
+        current_arm = _read_json(paths.arm)
+        updated = dict(current_arm if isinstance(current_arm, dict) else arm)
+        updated["observer_generation"] = int(arm.get("observer_generation", 1)) + 1
+        updated["rearm_count"] = int(arm.get("rearm_count", 0)) + 1
+        updated["watcher"] = {"pid": proc.pid, "pid_start": process_start_ticks(proc.pid) or ""}
+        _write_json_atomic(paths.arm, updated)
+        return True
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return False
+    finally:
+        os.close(lock_fd)
+
+
+def _ensure_watch_observers():
+    root = _watch_root()
+    for watch_id, arm in _watch_entries(root):
+        if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
+            continue
+        if not _watcher_present(arm):
+            _spawn_watch_observer(watch_id, arm)
 
 
 def _status_entry(watch_id, arm, root):
@@ -2314,7 +3174,8 @@ def _status_entry(watch_id, arm, root):
     elif _alive(arm, root):
         state = "alive"
     else:
-        state = "armed"
+        state = "pending"
+    observation = _read_json(paths.observation) or {}
     watcher = arm.get("watcher") or {}
     return {
         "watch_id": watch_id,
@@ -2329,6 +3190,9 @@ def _status_entry(watch_id, arm, root):
         "ack": str(paths.ack),
         "receipt_state": (receipt or {}).get("state"),
         "agent": (receipt or {}).get("agent") or {},
+        "server": (arm or {}).get("server") or (receipt or {}).get("server") or "default",
+        "observation_state": observation.get("state", "pending" if receipt is None else "settled"),
+        "observation_reason": observation.get("reason"),
     }
 
 
@@ -2378,47 +3242,14 @@ def cmd_rearm(args):
 
     # No claim bookkeeping here: `cmd_watch` holds the dedupe lock, sees that the
     # claimed watch is dead with no receipt, and reclaims the key itself.
-    steward = arm.get("steward") or {}
-    ns = argparse.Namespace(
-        target=arm["target"], until=list(arm.get("until") or []), timeout=arm.get("timeout"),
-        ref=list(arm.get("refs") or []), wake=arm.get("wake", "none"),
-        rearmed_from=watch_id, rearm_count=int(arm.get("rearm_count", 0)) + 1,
-        steward_identity=(
-            steward.get("session_id", ""), steward.get("harness", "unknown"),
-            steward.get("project", ""),
-        ),
-    )
-    import io
-    buffer = io.StringIO()
-    stdout, sys.stdout = sys.stdout, buffer
-    try:
-        code = cmd_watch(ns)
-    finally:
-        sys.stdout = stdout
-    line = buffer.getvalue().strip()
-    if code != 0 or "state=armed" not in line:
-        print(line)
-        return code
-    # B1-a: the hook arms only from a `watch` command printing `state=armed`
-    # (`hooks/peer-steward-rewake.py` `_is_watch_command`/`parse_arm`). This
-    # line is neither, so it must not inherit the fresh arm's `end-turn` --
-    # recompute the directive for a line that carries no carrier.
-    watch_line = line.splitlines()[0].replace(
-        "state=armed", f"state=rearmed rearmed_from={watch_id}"
-    )
-    print(watch_line)
-    new_watch_id = next(
-        (token.split("=", 1)[1] for token in watch_line.split()
-         if token.startswith("watch_id=")),
-        None,
-    )
-    print(
-        steward_fields(
-            ns.wake, new_watch_id,
-            agent_home=Path(__file__).resolve().parents[1],
-            arms_hook=False, timeout_ms=ns.timeout,
-        )
-    )
+    if _spawn_watch_observer(watch_id, arm):
+        print(f"watch_id={watch_id} state=rearmed receipt={paths.receipt}")
+        print(steward_fields(
+            arm.get("wake"), watch_id, agent_home=Path(__file__).resolve().parents[1],
+            arms_hook=False, timeout_ms=arm.get("timeout"),
+        ))
+        return 0
+    print(f"watch_id={watch_id} state=pending reason=observer-restart-unavailable receipt={paths.receipt}")
     return 0
 
 
@@ -2679,8 +3510,68 @@ def _prompt_form_open(target, state_before):
     return _bottom_form_tokens(target)
 
 
-def _prompt_input_reason(target, harness, state):
+def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
+                    purpose="completion"):
+    """Use the shared projection with exact native identity and registered bindings.
+
+    Before a harness's first input herdr reports no session. The session the
+    pane's foreground process proves is then the pane's own (Codex 0.162 opens
+    its thread at start) and keeps the bound-work checks; a pane with neither
+    is exact by pane and shell birth: nothing can be bound to it, so its native
+    turn decides. A caller holding a session still needs it."""
+    try:
+        observed_state, ident, _code, _reason = _retire_target(target)
+        harness, sid, pane = ident.get("harness"), ident.get("session_id"), ident.get("pane")
+        info = _retire_pane_info(pane) if pane and pane != "-" else None
+        if sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict):
+            proven = _proven_session(info["foreground_processes"], harness)
+            if proven:
+                sid, expected_sid = proven, None
+        unbound = sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict)
+        shell_start = (_proc_start_ticks(info.get("shell_pid"))
+                       if isinstance(info, dict) else None)
+        birth = (f"{info['shell_pid']}:{shell_start}"
+                 if isinstance(info, dict) and shell_start else "")
+        exact = (
+            observed_state not in {"herdr-unavailable", "agent-not-found", "unknown"}
+            and harness in {"claude", "codex", "opencode"}
+            and (unbound or (isinstance(sid, str) and sid and sid != "-"))
+            and isinstance(pane, str) and pane and pane != "-"
+            and bool(birth)
+            and (expected_harness is None or harness == expected_harness)
+            and (expected_sid is None or sid == expected_sid)
+            and (expected_pane is None or pane == expected_pane)
+        )
+        execution_ids = peer_obligations.execution_attempts_for_processes(
+            info.get("foreground_processes", ()) if isinstance(info, dict) else ())
+        bound, binding_state = (((), "observed") if unbound and not execution_ids else
+                                peer_obligations.bound_work_for_pane(
+                                    pane or "", harness or "", sid or "",
+                                    execution_attempt_ids=execution_ids))
+        return peer_obligations.pane_readiness(
+            server=_HERDR_SESSION or "default", pane=pane or "",
+            harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
+            identity_verified=exact, native_turn=observed_state,
+            bound_work=bound, bindings_state=binding_state,
+            provenance=(("target", target), ("observed_state", observed_state)),
+            purpose=purpose,
+        )
+    except Exception:
+        return peer_obligations.pane_readiness(
+            server=_HERDR_SESSION or "default", pane="", harness="",
+            session_id="", pid_birth="", identity_verified=False,
+            native_turn="unknown", bindings_state="unknown",
+            provenance=(("target", target),))
+
+
+def _prompt_input_reason(target, harness, state, *, expected_sid=None):
     """Withhold keyboard input when a form, draft or unreadable box is present."""
+    readiness = _pane_readiness(target, state, expected_harness=harness,
+                               expected_sid=expected_sid, purpose="input")
+    if readiness.state == "unknown":
+        return readiness.reason
+    if readiness.reason.startswith("bound-registered-work") and readiness.state != "ready":
+        return readiness.reason
     if _prompt_form_open(target, state):
         return "target-form-open"
     if harness not in {"claude", "opencode"}:
@@ -2699,30 +3590,78 @@ _FLUSH_ROW_TIMEOUT_S = 12
 _FLUSH_STUCK_HOURS = 1.0
 
 
-def _flush_delay_banner(ref, created):
-    """The transport prefix included with a late redelivery in one prompt.
+def _message_obligation_id(ref):
+    return "message-" + ref
 
-    A stranded row's sealed text can never be edited in place: the transfer
-    record pins its digest, and any changed byte unattaches the receipt.
-    So an old row goes out intact, preceded by this transport prefix carrying
-    the original send time and the delay. Returns None for fresh rows.
-    """
+
+def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=None):
+    """Persist exact transport ownership without copying the sealed message body."""
+    sender = row.get("from") or {}
+    recipient = row.get("to") or {}
+    sid = recipient.get("session_id")
+    harness = recipient.get("harness")
+    identity = {"server": _HERDR_SESSION or "default", "pane": pane or "",
+                "harness": harness or "", "session_id": sid or ""}
+    intent = {"ref": row.get("ref"), "body_digest": row.get("body_sha256"),
+              "target": target, "from": sender, "to": recipient,
+              "refs": list(row.get("refs") or []),
+              "delay_notice_for": delay_notice_for or ""}
     try:
-        age_h = (time.time() - float(created or time.time())) / 3600
-    except (TypeError, ValueError):
+        duty = peer_obligations.ObligationStore().create(
+            _message_obligation_id(row["ref"]), "message", identity, intent)
+        peer_obligations.ensure_runner()
+        return duty
+    except (OSError, ValueError, peer_obligations.ObligationError):
         return None
-    if age_h < _FLUSH_STUCK_HOURS:
+
+
+def _ensure_sender_delay_notice(row):
+    """Persist and enqueue one normal peer message for an overdue original ref."""
+    original_ref = row.get("ref")
+    refs = row.get("refs") or []
+    if (not isinstance(original_ref, str) or
+            any(isinstance(value, str) and value.startswith("delay-notice:")
+                for value in refs)):
         return None
+    sender, recipient = row.get("from") or {}, row.get("to") or {}
+    notice_id = "delay-" + original_ref
+    identity = {"server": _HERDR_SESSION or "default",
+                "recipient_harness": sender.get("harness", ""),
+                "recipient_session_id": sender.get("session_id", "")}
     try:
+        existing = peer_obligations.ObligationStore().get(notice_id)
+        if existing:
+            peer_obligations.ensure_runner()
+            return existing
+        created = float(row.get("created") or time.time())
         sent_at = datetime.datetime.fromtimestamp(
-            float(created), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError, OverflowError, OSError):
+            created, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        body = (f"[notice] Your peer message ref {original_ref} is still pending "
+                f"delivery; it was sent at {sent_at}.")
+        duty = peer_obligations.ObligationStore().create(
+            notice_id, "message", identity,
+            {"delay_notice_for": original_ref, "target": sender.get("name") or sender.get("session_id"),
+             "body_digest": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+             "body": body, "from": recipient, "to": sender})
+        text, notice_ref = peer_message.prepare_peer_message(
+            body, recipient, sender, defer=True,
+            refs=["delay-notice:" + original_ref, original_ref],
+            receipt="sender-delay-notice")
+        observation = dict(duty.get("observation") or {}, transfer_ref=notice_ref)
+        peer_obligations.ObligationStore().update(notice_id, observation=observation)
+        pending = peer_message._read_pending(notice_ref)
+        if pending:
+            _schedule_message_obligation(
+                pending, sender.get("name") or sender.get("session_id"),
+                delay_notice_for=original_ref)
+        peer_obligations.ensure_runner()
+        return duty
+    except (OSError, ValueError, OverflowError, peer_obligations.ObligationError):
         return None
-    return ("[지연 전달 — 원래 보낸 시각 %s, 약 %d시간 지연] (ref %s)"
-            % (sent_at, max(1, round(age_h)), str(ref or "")[:8]))
 
 
-def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
+def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
+                              expected_pane=None):
     """Deliver this recipient's deferred rows before a new send.
 
     Returns (flushed, stuck): flushed counts observed redeliveries closed
@@ -2740,8 +3679,8 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
     row is claimed before input, never deleted, and an observed send closes
     it without waiting for a receiver hook. An ambiguous send stays inflight
     for the hook to acknowledge and is not blindly resubmitted.
-    Rows older than _FLUSH_STUCK_HOURS go out intact with a delay prefix in
-    the same prompt; receivers check the unchanged sealed inner message.
+    Rows older than _FLUSH_STUCK_HOURS keep their exact sealed body and create
+    one separate normal peer message to notify the original sender.
     Never raises; failures print to stderr and leave rows for a later prompt.
     """
     stuck = []
@@ -2763,11 +3702,13 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
             sender = ((row.get("from") or {}).get("name")
                       or (row.get("from") or {}).get("session_id") or "-")
             stuck.append((age_h, sender, row.get("ref")))
-    if stuck:
-        oldest = max(stuck, key=lambda item: item[0])
-        senders = ",".join(sorted({item[1] for item in stuck}))
-        print("pending-stuck target=%s count=%d oldest=%.1fh senders=%s -- redelivers on a receivable prompt; senders see this on their next send"
-              % (target, len(stuck), oldest[0], senders), file=sys.stderr)
+    for row in rows:
+        try:
+            age_h = (now - float(row.get("created") or now)) / 3600
+        except (TypeError, ValueError):
+            age_h = 0.0
+        if age_h >= _FLUSH_STUCK_HOURS:
+            _ensure_sender_delay_notice(row)
     flushed = 0
     if t_harness == "codex":
         return flushed, stuck
@@ -2790,17 +3731,18 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
             current_harness, current_sid, _name = _resolve_target(target)
             if (current_harness, current_sid) != (t_harness, t_sid):
                 break
+            if expected_pane:
+                _current_state, current_ident, _code, _reason = _retire_target(target)
+                if current_ident.get("pane") != expected_pane:
+                    break
             row = peer_message.claim_pending_herdr(ref, recipient)
             if row is None:
                 continue
             text = row["text"]
-            banner = _flush_delay_banner(ref, row.get("created"))
             reason = _prompt_input_reason(target, t_harness, state)
             if reason:
                 peer_message.release_unsent_herdr_claim(row, receipt=reason)
                 break
-            if banner:
-                text = banner + "\n" + text
             sent_at = time.time()
             rc, payload = _herdr_prompt(target, text, wait=state != "working",
                                         timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
@@ -2831,6 +3773,301 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None):
     return flushed, stuck
 
 
+def _resume_message_obligation(duty, store):
+    intent = duty.get("intent") or {}
+    observation = duty.get("observation") or {}
+    target = intent.get("target")
+    ref = intent.get("ref") or observation.get("transfer_ref")
+    delay_for = intent.get("delay_notice_for") or ""
+    if delay_for and not ref:
+        body = intent.get("body")
+        sender, recipient = intent.get("from") or {}, intent.get("to") or {}
+        if not isinstance(body, str) or not body:
+            store.update(duty["id"], state="unknown",
+                         observation={"reason": "delay-notice-body-unavailable"})
+            return
+        try:
+            _text, ref = peer_message.prepare_peer_message(
+                body, sender, recipient, defer=True,
+                refs=["delay-notice:" + delay_for, delay_for],
+                receipt="sender-delay-notice")
+            observation = {**observation, "transfer_ref": ref}
+            duty = store.update(duty["id"], observation=observation)
+        except (OSError, ValueError):
+            store.update(duty["id"], state="unknown",
+                         observation={"reason": "delay-notice-payload-unavailable"})
+            return
+    if not isinstance(ref, str) or not ref:
+        store.update(duty["id"], state="unknown",
+                     observation={"reason": "message-ref-unavailable"})
+        return
+    try:
+        row = peer_message._read_pending(ref)
+    except (OSError, ValueError):
+        store.update(duty["id"], state="unknown",
+                     observation={"ref": ref, "reason": "pending-row-unreadable"})
+        return
+    if row is None:
+        store.update(duty["id"], state="unknown",
+                     observation={"ref": ref, "reason": "pending-row-missing"})
+        return
+    if peer_obligations.registered_delivery_settled(row):
+        store.update(duty["id"], state="complete", delivery="not-required", cleanup="complete",
+                     observation={"ref": ref, "reason": "dispatch-notice-consumed"})
+        return
+    if row.get("state") == "received":
+        store.update(duty["id"], state="complete", result="received",
+                     delivery="acknowledged", cleanup="complete",
+                     observation={"ref": ref, "reason": "exact-peer-ref"})
+        return
+    if row.get("state") in {"queued", "unverified"}:
+        store.update(duty["id"], state="unknown",
+                     observation={"ref": ref, "transport_state": row["state"],
+                                  "reason": row.get("receipt", "delivery-unconfirmed")})
+        return
+    identity = (duty.get("intent") or {}).get("identity") or {}
+    # Identity is held outside mutable observations. The accepted target stays
+    # nameable only while its exact harness/session/pane still resolves.
+    recipient = row.get("to") or {}
+    server = identity.get("server") or "default"
+    global _HERDR_SESSION
+    old_server = _HERDR_SESSION
+    _HERDR_SESSION = None if server == "default" else server
+    try:
+        state, ident, _code, reason = _retire_target(target or recipient.get("name") or "")
+        expected_pane = identity.get("pane") or ""
+        if (reason or ident.get("harness") != recipient.get("harness")
+                or ident.get("session_id") != recipient.get("session_id")
+                or (expected_pane and ident.get("pane") != expected_pane)):
+            store.update(duty["id"], state="unknown",
+                         observation={"ref": ref, "reason": reason or "target-identity-changed",
+                                      "observed_pane": ident.get("pane", "")})
+            return
+        readiness = _pane_readiness(target, state,
+                                    expected_harness=recipient.get("harness"),
+                                    expected_sid=recipient.get("session_id"), purpose="input")
+        if readiness.state == "unknown" or readiness.reason.startswith("bound-registered-work"):
+            if readiness.state != "ready":
+                store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
+                             observation={"ref": ref, "reason": readiness.reason,
+                                          "state": readiness.state})
+                return
+        if recipient.get("harness") == "codex":
+            peer_message.deliver_pending_codex(ref, timeout=0.25)
+        elif state in {"idle", "done", "working"}:
+            _flush_pending_for_target(target, recipient["harness"], recipient["session_id"],
+                                      state, expected_pane=expected_pane or None)
+        try:
+            current = peer_message._read_pending(ref)
+        except (OSError, ValueError):
+            current = None
+        if current and current.get("state") == "received":
+            store.update(duty["id"], state="complete", result="received",
+                         delivery="acknowledged", cleanup="complete",
+                         observation={"ref": ref, "reason": "exact-peer-ref"})
+        else:
+            age = max(0.0, time.time() - float((current or row).get("created") or time.time()))
+            if age >= _FLUSH_STUCK_HOURS * 3600:
+                _ensure_sender_delay_notice(current or row)
+            store.update(duty["id"], state="pending",
+                         observation={"ref": ref, "state": (current or row).get("state"),
+                                      "reason": (current or row).get("receipt", "awaiting-receipt")})
+
+    finally:
+        _HERDR_SESSION = old_server
+
+
+def _resume_registered_obligation(duty, store):
+    """Wake an exact restored recipient through the existing durable peer courier."""
+    intent = duty.get("intent") or {}
+    from harness_capabilities import parent_completion
+    identity = intent["identity"]
+    harness = identity.get("harness")
+    if intent.get("carrier") != parent_completion(harness)["carrier"]:
+        return
+    jobs = Path(identity["jobs"])
+    from dispatch_completion_join import current_attempt_row, materialize_after_terminal_close
+    from dispatch_notice_state import keep_claim
+    import dispatch_pending_delivery as pending
+    from dispatch_seat_handover import effective_parent
+    from dispatch_session_sweep import addressed_records, delivery_context, is_human_gate_record
+    spec = importlib.util.spec_from_file_location(
+        "_retained_rewake", _UTILITIES_DIR.parent / "hooks/dispatch-owner-rewake.py")
+    rewake = sys.modules.get(spec.name)
+    if rewake is None:
+        rewake = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = rewake
+        spec.loader.exec_module(rewake)
+    arm = rewake._read_arm(rewake.arm_path(jobs, identity["attempt_id"]))
+    holder = (arm or {}).get("holder") or (duty.get("observation") or {}).get("holder")
+    row = current_attempt_row(jobs, identity["attempt_id"])
+    if row is None:
+        return
+    observation = duty.get("observation") or {}
+    transfer_ref = observation.get("transfer_ref")
+    transferred = None
+    if transfer_ref:
+        transferred = peer_message._read_pending(transfer_ref)
+        if transferred and transferred.get("state") == "received":
+            peer_obligations.acknowledge_registered_delivery(transferred, roots=[jobs.parent])
+        if transferred and peer_obligations.registered_delivery_settled(transferred, roots=[jobs.parent]):
+            transferred = None
+    parent = [row.metadata.get(key, "") for key in
+              ("parent_runtime_pid", "parent_runtime_pid_start", "parent_runtime_ns")]
+    # A native hook belongs to its original runtime. A live holder cannot wake
+    # a replacement process after that runtime died. Unknown identity stays protected.
+    # The duty follows confirmed handover; the signed queue stays under the
+    # registered parent, even when its current recipient is a successor.
+    recipient_sid = effective_parent(row.metadata, jobs)
+    storage_recipient = row.metadata.get("parent_sid", "")
+    if row.status not in {"open", "running", "done"}:
+        return
+    if row.status == "done":
+        if row.metadata.get("delivery_intent") != "1":
+            store.update(duty["id"], state="complete", delivery="not-required", cleanup="complete")
+            return
+        materialize_after_terminal_close(jobs, row.attempt_id)
+        delivery_id = row.metadata.get("delivery_id", "")
+        record = pending.read(jobs.parent, storage_recipient, delivery_id)
+        if record and record.get("state") in {"acked", "rejected", "expired"}:
+            store.update(duty["id"], state="complete", delivery=record["state"], cleanup="complete")
+            return
+    if transferred and transferred.get("state") in {"queued", "unverified"}:
+        return  # The existing message courier owns this accepted/ambiguous send.
+    if holder and rewake._holder_alive(holder) and rewake._holder_alive(parent):
+        return
+    old_server = _HERDR_SESSION
+    globals()["_HERDR_SESSION"] = None if identity["server"] == "default" else identity["server"]
+    try:
+        result = subprocess.run(_herdr_argv("agent", "list"), capture_output=True, text=True, timeout=5)
+        agents = (json.loads(result.stdout).get("result") or {}).get("agents") or []
+        matches = [a for a in agents if a.get("agent") == harness
+                   and (a.get("agent_session") or {}).get("value") == recipient_sid]
+        if len(matches) != 1:
+            store.update(duty["id"], observation={"reason": "recipient-unavailable",
+                                                  "session_id": recipient_sid})
+            return
+        pane = matches[0]["pane_id"]
+        if _resolve_target(pane)[:2] != (harness, recipient_sid):
+            return
+        if transferred and transferred.get("state") == "pending":
+            _schedule_message_obligation(transferred, pane, pane)
+            return
+        if row.status in {"open", "running"}:
+            records, _ = addressed_records(jobs.parent, intent["carrier"], recipient_sid)
+            record = next((r for r in records if row.attempt_id in (r.get("attempt_ids") or [])
+                           and (is_human_gate_record(r) or
+                                r.get("receipt", {}).get("kind") == "supervision")), None)
+            if record is None:
+                return
+            storage_recipient = record.get("_storage_key") or storage_recipient
+            delivery_id = record["delivery_id"]
+        owner = "retained-rewake:" + duty["id"]
+        if record and record.get("state") in {"claimed", "sent-ambiguous"}:
+            pending.reclaim(jobs.parent, storage_recipient, delivery_id,
+                            now_ns=time.monotonic_ns())
+        record = pending.claim(jobs.parent, storage_recipient, delivery_id,
+                               claim_owner=owner, lease_seconds=30, require_generation_proof=False)
+        if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
+            return
+        from dispatch_supervision import CONTINUED_KEY, continue_for_parent
+        continued = continue_for_parent(record, session_id=recipient_sid,
+                                        recipient_kind=intent["carrier"])
+        message = delivery_context([(jobs.parent, [{**record, **(
+            {CONTINUED_KEY: continued} if continued else {})}])])
+        # The normal prompt command seals the body, checks the recipient again,
+        # and retains it through forms, busy turns and sender/observer exit (#446).
+        prepared = []
+        def bind_transfer(ref):
+            binding = {"duty_id": duty["id"], "jobs": str(jobs), "attempt_id": row.attempt_id,
+                "carrier": intent["carrier"], "recipient_sid": recipient_sid,
+                "delivery_id": delivery_id, "storage_recipient": storage_recipient, "claim_owner": owner}
+            peer_message.bind_dispatch_notice(ref, binding)
+            store.update(duty["id"], observation={**observation, "transfer_ref": ref,
+                "delivery_id": delivery_id, "storage_recipient": storage_recipient,
+                "recipient_sid": recipient_sid, "claim_owner": owner})
+            prepared.append(ref)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
+            body.write(message)
+            body.flush()
+            args = build_parser().parse_args(["prompt", pane, "--body-file", body.name,
+                                              "--ref", duty["id"]])
+            code = cmd_prompt(args, expected_recipient=(harness, recipient_sid), on_prepared=bind_transfer)
+        current = pending.read(jobs.parent, storage_recipient, delivery_id)
+        if current and current.get("state") == "acked":
+            return
+        if prepared or code in {0, 3}:
+            pending.mark_sent_ambiguous(jobs.parent, storage_recipient, delivery_id, claim_owner=owner)
+            store.update(duty["id"], state="pending", delivery="peer-courier", cleanup="pending")
+        else:
+            pending.release_claim(jobs.parent, storage_recipient, delivery_id, claim_owner=owner)
+    finally:
+        globals()["_HERDR_SESSION"] = old_server
+
+
+def cmd_obligation_runner(args):
+    """Existing peer steward, scoped to accepted duties and stopped when they settle."""
+    store = peer_obligations.ObligationStore(args.state_root)
+    try:
+        lock_target = Path(os.path.realpath(os.readlink(f"/proc/self/fd/{args.lock_fd}")))
+        if lock_target != (store.root / peer_obligations.RUNNER_LOCK_NAME).resolve():
+            return 70
+        os.fstat(args.lock_fd)
+    except (OSError, ValueError, TypeError):
+        return 70
+    delay = 1.0
+    while True:
+        duties = store.list()
+        if not duties:
+            return 0
+        for duty in duties:
+            try:
+                if duty.get("intent", {}).get("kind") == "message" or duty.get("id", "").startswith(
+                        ("message-", "delay-")):
+                    _resume_message_obligation(duty, store)
+                elif duty.get("intent", {}).get("kind") == "retire":
+                    with peer_obligations.legacy_runner_lock(store) as acquired:
+                        if acquired:
+                            _resume_retire_obligation(duty, store)
+                elif duty.get("intent", {}).get("kind") == "registered-batch":
+                    _resume_registered_obligation(duty, store)
+            except Exception:
+                try:
+                    store.update(duty["id"], observer_error="observer-unavailable")
+                except Exception:
+                    pass
+        time.sleep(delay)
+        delay = min(15.0, delay * 1.7)
+
+
+def cmd_ensure_obligations(_args):
+    """Reconnect accepted peer duties from an existing harness lifecycle callback."""
+    try:
+        _ensure_watch_observers()
+        # Reconnect with the activated code, even if an older runner is still
+        # holding its lock. Existing transfer claims serialize submission.
+        store = peer_obligations.ObligationStore()
+        for duty in store.list():
+            if duty.get("intent", {}).get("kind") == "message":
+                try:
+                    _resume_message_obligation(duty, store)
+                except Exception:
+                    store.update(duty["id"], observer_error="observer-unavailable")
+        # Older observers could close a retire without consuming its successor
+        # mark. Lifecycle observers are detached, just like the task runner;
+        # the accepted request and original mark carry the authority.
+        for duty in store.list(states={"complete"}):
+            if duty.get("intent", {}).get("kind") == "retire":
+                pane = (duty["intent"].get("requester") or {}).get("pane")
+                if pane and _seat_successor_path(pane).is_file():
+                    _resume_retire_obligation(duty, store)
+        peer_obligations.ensure_runner()
+        dispatch_batch_obligations.ensure_observers()
+    except Exception:
+        pass
+    return 0
+
+
 def receiver_idle(recipient, pane, *, peer=True):
     """One existing receiver callback on its exact pane/session; no wait or watcher."""
     import session_tidy as st
@@ -2849,6 +4086,10 @@ def receiver_idle(recipient, pane, *, peer=True):
     current_harness, current_sid, _name = _resolve_target(pane)
     state, _pane = _agent_state(pane)
     if (current_harness, current_sid) != (harness, sid) or state not in {"idle", "done"}:
+        return
+    readiness = _pane_readiness(pane, state, expected_harness=harness, expected_sid=sid,
+                                purpose="input")
+    if readiness.state != "ready":
         return
     with contextlib.redirect_stdout(sys.stderr):
         if rows:
@@ -2874,7 +4115,7 @@ def _verify_after_send(target, first, t_harness, t_sid, sent_at):
     return "queued", "prompt-box", "prompt-box-residue"
 
 
-def cmd_prompt(args):
+def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     """F-100c — the harness-neutral steward send: `herdr agent prompt <target> <body +
     trailer>`, recorded with the target's exact session id (herdr `agent get`) and the
     sender's name. The trailer lets the receiving harness write its own `notice`.
@@ -2906,7 +4147,8 @@ def cmd_prompt(args):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
     if args.body_file:
-        body = open(args.body_file, encoding="utf-8", errors="replace").read()
+        with open(args.body_file, encoding="utf-8", errors="replace") as handle:
+            body = handle.read()
     elif args.body_stdin:
         body = sys.stdin.read()
     else:
@@ -2919,13 +4161,17 @@ def cmd_prompt(args):
     from_identity = (from_sid, from_harness, _project_of(os.getcwd()))
     from_name = _from_name(from_harness, from_sid)
     t_harness, t_sid, _t_name = _resolve_target(args.target)
+    if expected_recipient is not None and (t_harness, t_sid) != expected_recipient:
+        print("prompted=false reason=target-identity-changed")
+        return 5
     transfer_ref = None
     state_before, target_pane = _agent_state(args.target)
     if not args.no_verify and state_before in {"working", "blocked"} and args.wait_idle_ms > 0:
         _run_herdr_wait(args.target, ["idle", "done"], args.wait_idle_ms)
         state_before, target_pane = _agent_state(args.target)
     flushed = 0
-    input_reason = _prompt_input_reason(args.target, t_harness, state_before)
+    input_options = {"expected_sid": t_sid} if expected_recipient is not None else {}
+    input_reason = _prompt_input_reason(args.target, t_harness, state_before, **input_options)
     if not input_reason:
         # Deferred rows go first: a target receivable now takes what an
         # earlier form-open verdict stranded (2026-10-07). Never raises and
@@ -2941,7 +4187,10 @@ def cmd_prompt(args):
             text, transfer_ref = peer_message.prepare_peer_message(
                 body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
                 {"harness": t_harness, "session_id": t_sid, "name": _t_name},
-                defer=bool(input_reason), refs=args.ref, receipt=input_reason or "target-form-open")
+                defer=bool(input_reason) or on_prepared is not None,
+                refs=args.ref, receipt=input_reason or "target-form-open")
+            if on_prepared is not None:
+                on_prepared(transfer_ref)
         except (OSError, ValueError):
             print("prompted=unverified reason=peer-pending-or-transfer-unavailable")
             return 5
@@ -2962,6 +4211,11 @@ def cmd_prompt(args):
     except (OSError, ValueError):
         print("prompted=unverified reason=peer-pending-unavailable")
         return 5
+    if pending and not t_sid and not input_reason:
+        # Private delivery is SID-bound: a receivable target with no session
+        # yet (a fresh Codex before its first input) takes the typed send, even
+        # when a retry reused a row an earlier deferral left unaddressable.
+        pending = None
     surface = "herdr"
     claimed = None
     if pending and t_harness != "codex" and not input_reason:
@@ -2972,7 +4226,7 @@ def cmd_prompt(args):
             claimed = None
     if t_harness in {"claude", "opencode"} and not input_reason:
         # Preparation/claim may take time: the final read belongs after them.
-        input_reason = _prompt_input_reason(args.target, t_harness, state_before)
+        input_reason = _prompt_input_reason(args.target, t_harness, state_before, **input_options)
         if input_reason:
             if claimed is not None:
                 peer_message.release_unsent_herdr_claim(claimed, receipt=input_reason)
@@ -2983,10 +4237,14 @@ def cmd_prompt(args):
                         body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
                         {"harness": t_harness, "session_id": t_sid, "name": _t_name},
                         defer=True, refs=args.ref, receipt=input_reason)
+                    if on_prepared is not None:
+                        on_prepared(transfer_ref)
                     pending = peer_message._read_pending(transfer_ref)
                 except (OSError, ValueError):
                     print("prompted=unverified reason=peer-pending-unavailable")
                     return 5
+    if pending and pending.get("state") == "pending" and (input_reason or on_prepared is not None):
+        _schedule_message_obligation(pending, args.target, target_pane)
     if pending and t_harness == "codex":
         surface = "codex-queue"
         try:
@@ -3258,6 +4516,14 @@ def _process_session(pane, harness):
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
         payload = json.loads(proc.stdout or "")
         processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
+    except Exception:
+        return None
+    return _proven_session(processes, harness)
+
+
+def _proven_session(processes, harness):
+    """The session one of these foreground processes proves (`fleet.process_identity`), or None."""
+    try:
         tools_dir = Path(__file__).resolve().parent.parent / "tools"
         if tools_dir.is_dir() and str(tools_dir) not in sys.path:
             sys.path.insert(0, str(tools_dir))
@@ -3421,6 +4687,31 @@ def _clear_observe(target, req, request_path, before_threads=()):
     return None
 
 
+def _native_tidy_command(args, req, *, continuing):
+    """Keep the exact-job transport under the same peer-steward judgement ledger."""
+    from session_tidy_native import command
+    action, word = ("continue", "continued") if continuing else ("clear", "cleared")
+    started = time.monotonic()
+    verdict = command(req, args.request, args.nonce, continuing=continuing, screen_ready=_screen_ready)
+    outcome = verdict[word]
+    harness, old = req.get("harness"), req.get("sid")
+    new = verdict.get("new_session") or req.get("new_session")
+    target = f"native:{req['seat']['native']['job']}"
+    receipt = (f"action={action} {word}={outcome} harness={harness} old_session={old} "
+               f"new_session={new or '-'} verify=native ms={int((time.monotonic() - started) * 1000)}"
+               + (f" reason={verdict['reason']}" if verdict.get("reason") else ""))
+    try:
+        _record(to_harness=harness, to_name=target, kind="notice",
+                summary_text=f"[notice] action={action} {outcome}",
+                to_session_id=new if continuing else old, to_pane=None, ref=[],
+                status=_CLEAR_LEDGER_STATUS[outcome], receipt=receipt,
+                from_identity=(old, harness, _project_of(req.get("cwd"))), from_name=_from_name(harness, old))
+    except Exception:
+        pass
+    print(" ".join(f"{key}={value}" for key, value in verdict.items() if value))
+    return _CLEAR_EXIT[outcome]
+
+
 def cmd_clear(args):
     """session-tidy auto-clear: type the harness's own new-conversation command into `target`.
 
@@ -3445,6 +4736,9 @@ def cmd_clear(args):
     `action=clear` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
+    req, why = clear.validate_request(args.request, args.nonce)
+    if req and (req.get("seat") or {}).get("kind") == "native":
+        return _native_tidy_command(args, req, continuing=False)
     if _herdr_missing():
         print("cleared=failed reason=herdr-not-found")
         return _CLEAR_EXIT["failed"]
@@ -3537,7 +4831,8 @@ def _continue_look(target, req):
     else the reason.
 
     The pane and harness are the booked ones and the session there is the one the clear started,
-    with no message yet: Claude -- the pane's process (or herdr) names `new_session`; Codex -- no
+    with no message yet: a proven process selection takes precedence over delayed pane labels.
+    Claude -- the pane's process (or herdr) names `new_session`; Codex -- no
     rollout exists for `new_session` yet and the status line shows it (or herdr/the process name
     it); OpenCode -- its home screen, which also is its empty box. Then idle, the card on its way,
     no form open, an empty input box."""
@@ -3551,7 +4846,10 @@ def _continue_look(target, req):
     pane = agent.get("pane") or target
     if harness in ("claude", "codex") and new in ("", "-"):
         return "new-session-unknown"
-    if harness == "claude" and agent.get("session_id") != new and _process_session(pane, harness) != new:
+    current = _process_session(pane, harness) if harness in ("claude", "codex") else None
+    if current and current != new:
+        return "target-changed"
+    if harness == "claude" and (current or agent.get("session_id")) != new:
         return "target-changed"
     if harness == "codex" and _codex_rollout_exists(new):
         return "new-input"              # the new thread already had its first message
@@ -3574,7 +4872,7 @@ def _continue_look(target, req):
             return "draft"
         return None if _opencode_home(lines) else "target-changed"
     if harness == "codex" and new not in _codex_footer_threads(lines) \
-            and agent.get("session_id") != new and _process_session(pane, harness) != new:
+            and agent.get("session_id") != new and current != new:
         return "target-changed"
     return _screen_ready(harness, lines)
 
@@ -3616,6 +4914,9 @@ def cmd_continue(args):
     5 unverified. One ledger row (`kind=notice`, `action=continue` in the receipt) per judgement.
     """
     import session_tidy_clear as clear
+    req, why = clear.validate_continue(args.request, args.nonce)
+    if req and (req.get("seat") or {}).get("kind") == "native":
+        return _native_tidy_command(args, req, continuing=True)
     if _herdr_missing():
         print("continued=failed reason=herdr-not-found")
         return _CLEAR_EXIT["failed"]
@@ -3734,6 +5035,14 @@ def build_parser():
                              "(default: AGENT_HERDR_SESSION, else herdr's default session)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_obligation = sub.add_parser("__obligation-runner", help=argparse.SUPPRESS)
+    p_obligation.add_argument("--lock-fd", type=int, required=True)
+    p_obligation.add_argument("--state-root", required=True)
+    p_obligation.set_defaults(func=cmd_obligation_runner)
+
+    p_recover = sub.add_parser("__ensure-obligations", help=argparse.SUPPRESS)
+    p_recover.set_defaults(func=cmd_ensure_obligations)
+
     p_wait = sub.add_parser("wait")
     p_wait.add_argument("target")
     p_wait.add_argument("--until", action="append", default=[])
@@ -3768,6 +5077,10 @@ def build_parser():
     p_run = sub.add_parser("__watch-run")
     p_run.add_argument("--watch-id", required=True)
     p_run.add_argument("--target", required=True)
+    p_run.add_argument("--server", default="default")
+    p_run.add_argument("--expected-harness", default="-")
+    p_run.add_argument("--expected-session-id", default="-")
+    p_run.add_argument("--expected-pane", default="-")
     p_run.add_argument("--until", action="append", default=[])
     p_run.add_argument("--timeout", type=int, default=None)
     p_run.add_argument("--ref", action="append", default=[])

@@ -7,9 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from contextlib import contextmanager
-import ctypes
 from concurrent.futures import ThreadPoolExecutor
-import errno
 import fcntl
 import hashlib
 import json
@@ -19,6 +17,7 @@ import shutil
 import stat
 
 import artifact_admission as admission
+import atomic_publish
 import artifact_campaign as campaigns
 import artifact_locator as locator
 import artifact_producer as P
@@ -42,11 +41,11 @@ def _json(path):
     return json.loads(path.read_bytes())
 
 
-def _campaign(root, selector):
+def _campaign(root, selector, *, read_record=None):
     matches = []
     for path in sorted((root / "campaigns").glob("*/campaign.json")):
         _safe(root, path)
-        row = _json(path)
+        row = (read_record or _json)(path)
         if selector in {row.get("campaign_id"), row.get("key"), str(path), str(path.relative_to(root))}:
             matches.append((path, campaigns.fold_campaign(root, path, row)))
     active = [item for item in matches if item[1].get("state") == "active"]
@@ -361,32 +360,11 @@ def _upgrade_controls(journal):
 
 
 def _rename_locked(source, target):
-    """Publish a directory while the caller holds the root admission locks.
-
-    NFSv3 can reject RENAME_NOREPLACE although ordinary rename is supported.
-    Use producer admission's existing absence-check/rename protocol there.
-    """
-    if os.path.lexists(target):
-        _error("destination appeared before publication: " + str(target))
+    """Publish a directory while the caller holds the root admission locks."""
     try:
-        rename = ctypes.CDLL(None, use_errno=True).renameat2
-    except AttributeError:
-        code = errno.ENOSYS
-    else:
-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        if rename(-100, os.fsencode(source), -100, os.fsencode(target), 1) == 0:
-            return
-        code = ctypes.get_errno()
-    if code in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
-        # Recheck after the unsupported syscall too: never adopt a foreign path.
-        if os.path.lexists(target):
-            _error("destination appeared before publication: " + str(target))
-        os.rename(source, target)
-        return
-    if code == errno.EEXIST:
+        atomic_publish.rename_directory_locked(source, target)
+    except FileExistsError:
         _error("destination appeared before publication: " + str(target))
-    raise OSError(code, os.strerror(code), str(target))
 
 
 def _publish_tree(source, target, stage, inventory, *, binding=None, manifest_raw=None, prepare=None, roots=()):

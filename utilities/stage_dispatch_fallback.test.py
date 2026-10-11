@@ -78,6 +78,29 @@ class FallbackTest(unittest.TestCase):
   return {"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),
           "AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),
           "AGENT_DISPATCH_JOBS":str(self.jobs)}
+ def test_dirty_primary_prepares_the_cwd_that_every_stage_adapter_uses(self):
+  primary=self.repo
+  head=subprocess.run(["git","-C",str(primary),"rev-parse","HEAD"],check=True,capture_output=True,text=True).stdout.strip()
+  (primary/"x").write_text("uncommitted\n")
+  prepared=R.prepare_isolated_worktree(primary,"owner-task")
+  self.assertEqual(prepared["state"],"created")
+  self.repo=Path(prepared["cwd"])
+  self.assertNotEqual(self.repo,primary)
+  self.assertEqual(prepared["base"],head)
+  self.assertEqual((primary/"x").read_text(),"uncommitted\n")
+  self.assertEqual((self.repo/"x").read_text(),"x")
+  route_path=self.route(same_status="supported")
+  with mock.patch.dict(os.environ,self.launch_roots_env()):
+   route,node=F.load_node(route_path,"execute","dry-run")
+  self.assertEqual(route["cwd"],str(self.repo))
+  args=SimpleNamespace(action="dry-run",slug="owner-execute",parent="owner",route=route_path,
+                       jobs=self.jobs,qa=None,worker_role=None,prompt_file=None)
+  for harness in ("claude","codex","opencode"):
+   with self.subTest(harness=harness):
+    row={**self.tuple(harness,"supported"),"child_harness":harness}
+    command=F.wrapper_command(args,route,node,row,1,"att-stage-fixture")
+    self.assertEqual(command[command.index("--worktree")+1],str(self.repo))
+  self.assertEqual((primary/"x").read_text(),"uncommitted\n")
  def route(self,native="unsupported",same_status="unsupported",intensity="strong"):
   """Compile the fixture route under the SAME runtime root the launch uses.
 
@@ -178,6 +201,37 @@ class FallbackTest(unittest.TestCase):
   clean={k:v for k,v in os.environ.items() if not k.startswith("AGENT_DISPATCH_CURRENT_")}
   env={**clean,"AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(self.art),"AGENT_MODEL_GOVERNOR_ROOT":str(self.art/".runtime/model-worker-governor"),"AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_SELF_SLUG":"owner","AGENT_DISPATCH_ATTEMPT_ID":"att-fallback-parent",**envkw}
   return subprocess.run(cmd,text=True,capture_output=True,env=env)
+ @contextlib.contextmanager
+ def prior_process_observation(self,attempts,*,state="quiescent"):
+  """Model only a prior row's process dependency, without changing its payload.
+
+  Dry-run wrappers run their real main in this process so every consumer
+  receives this same observation. All other process identities use procfs.
+  """
+  import dispatch_contract as DC
+  original=DC.attempt_process_quiescence
+  def observe(meta,**kwargs):
+   if meta.get("attempt_id") in attempts:
+    return DC.ProcessQuiescence(state,"fixture-group-empty" if state=="quiescent" else "process-identity-missing")
+   return original(meta,**kwargs)
+  def wrapper(args,command):
+   self.assertIn("--dry-run",command)
+   spec=importlib.util.spec_from_file_location("observed_fallback_wrapper",command[1])
+   module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+   out=io.StringIO();err=io.StringIO()
+   with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+    code=module.main(command[1:])
+   return SimpleNamespace(returncode=code,stdout=out.getvalue(),stderr=err.getvalue())
+  with mock.patch.object(DC,"attempt_process_quiescence",side_effect=observe), \
+       mock.patch.object(F,"attempt_process_quiescence",side_effect=observe), \
+       mock.patch.object(F,"run_wrapper",side_effect=wrapper):
+   yield
+ def run_observed_chain(self,path,attempts,*,state="quiescent"):
+  with self.dispatch_env(),self.prior_process_observation(attempts,state=state):
+   out=io.StringIO();err=io.StringIO()
+   with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+    code=self.run_inline_main(path)
+   return SimpleNamespace(returncode=code,stdout=out.getvalue(),stderr=err.getvalue())
  @contextlib.contextmanager
  def dispatch_env(self,**envkw):
   """The same env `run_chain` injects into its subprocess, applied to THIS
@@ -637,6 +691,89 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"0"}]),"att-first")
   self.assertEqual(F.retry_predecessor([{**base,"_status":"open","launch_claimed":"1"}]),"")
 
+ def test_new_execute_gap_registers_after_transport_budget_was_spent(self):
+  self.assert_new_execute_request("gap-three")
+
+ def test_new_execute_request_can_reuse_its_failed_slug(self):
+  self.assert_new_execute_request("gap-two")
+
+ def assert_new_execute_request(self, slug):
+  import dispatch_contract as DC
+  import dispatch_replacement as REPLACEMENT
+  with self.dispatch_env():
+   path=self.route(same_status="supported",intensity="standard")
+   route=json.loads(path.read_text())
+   self.seed_parent()
+   self.seed_predecessor_markers(path,"execute")
+   old_id=F.attempt_identity(
+    SimpleNamespace(slug="gap-two",parent="owner",parent_attempt_id="att-fallback-parent"),
+    route,{"id":"execute"},{"child_harness":"codex"},1)
+   args=SimpleNamespace(attempt_id=old_id,jobs_path=self.jobs,
+                        worktree=self.repo,replacement_input_argv=["--slug","gap-two"])
+   old_task="Close migration fixtures and import integration."
+   meta={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+         "execution_surface":"registered-headless","registered_worker":"1",
+         "fallback_hop":"same-harness-headless","worker_type":"stage","harness":"codex",
+         "attempt_id":args.attempt_id,"route_id":route["route_id"],"route_hash":route["route_hash"],
+         "route_node":"execute","parent_attempt_id":"att-fallback-parent",
+         "parent_sid":"fixture-native-parent","automatic_retry_of":"att-execute-gap-one",
+         "note":"dead-parent-terminated","failure_class":"runtime","launch_outcome":"never-launched"}
+   meta.update(DC.parse_registry_metadata(REPLACEMENT.seal_launch_input(args,"codex",old_task)))
+   with self.jobs.open("a") as handle:
+    handle.write(f"now\tdone\t{self.repo}\t{self.repo}\tgap-two\t"+
+                 ",".join(f"{k}={v}" for k,v in meta.items())+"\n")
+   original=self.jobs.read_bytes()
+   prompt=self.art/"execute-gap-three.md"
+   prompt.write_text("Close historical/current conflict and actual DB parity.")
+   commands=[];real_run=subprocess.run
+   def wrapper(command,**kwargs):
+    if not any(str(part).endswith("/bin/dispatch-headless.py") for part in command):
+     return real_run(command,**kwargs)
+    aid=self.arg(command,"--attempt-id")
+    candidate={k:v for k,v in meta.items() if k not in
+               {"note","failure_class","launch_outcome","automatic_retry_of","replacement_input_digest"}}
+    candidate.update(attempt_id=aid,completion_gate="code-execute")
+    retry=self.arg(command,"--automatic-retry-of")
+    if retry:candidate["automatic_retry_of"]=retry
+    REPLACEMENT.admission(self.jobs,self.jobs.read_text().splitlines(),candidate)
+    if "--dry-run" in command:
+     return SimpleNamespace(returncode=0,stdout="check=ok\n",stderr="")
+    commands.append(command)
+    row=f"now\topen\t{self.repo}\t{self.repo}\t{slug}\t"+",".join(f"{k}={v}" for k,v in candidate.items())
+    started="--start" in command
+    self.assertTrue(DC.claim_attempt_row(self.jobs,aid,row,launch=started))
+    return SimpleNamespace(returncode=0,stdout=("check=ok\nregistered_worker=1\n"
+                          f"child_spawned={int(started)}\nattempt_id={aid}\n"),stderr="")
+   argv=["stage-dispatch-fallback.py","--route",str(path),"--node","execute","--slug",slug,
+         "--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),
+         "--prompt-file",str(prompt),"--start"]
+   out=io.StringIO()
+   with mock.patch.object(sys,"argv",argv),self.compiled_order(), \
+        mock.patch.object(F.subprocess,"run",side_effect=wrapper), \
+        mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})), \
+        contextlib.redirect_stdout(out):
+    code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
+   self.assertEqual(code,0,out.getvalue())
+   self.assertEqual(len(commands),1)
+   self.assertIn("registered_worker=1",out.getvalue())
+   self.assertIn("child_spawned=1",out.getvalue())
+   self.assertNotIn("--automatic-retry-of",commands[0])
+   self.assertTrue(self.jobs.read_bytes().startswith(original))
+   launched=F.registry_rows(self.jobs,route["route_id"],"execute")[-1]
+   self.assertEqual(launched["completion_gate"],"code-execute")
+   self.assertNotIn("automatic_retry_of",launched)
+   self.assertNotEqual(launched["attempt_id"],old_id)
+   if slug=="gap-two":
+    prior=F.registry_rows(self.jobs,route["route_id"],"execute")
+    self.assertEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task=prompt.read_text()),
+                     launched["attempt_id"])
+    self.assertEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task=" \n"+prompt.read_text()+"  "),
+                     launched["attempt_id"])
+    self.assertEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task=old_task),old_id)
+    self.assertNotEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task="A third distinct request."),
+                        launched["attempt_id"])
+   self.assertTrue(REPLACEMENT._budget_exhausted(self.jobs,meta))
+
  def test_a_readable_result_in_the_launch_window_is_reported_not_retried(self):
   for note,failure_class,verdict in (("dead-worker-fail","fail","FAIL"),("dead-worker-blocked","blocked","BLOCKED")):
    with self.subTest(verdict=verdict):
@@ -710,7 +847,7 @@ class FallbackTest(unittest.TestCase):
          "--parent","owner","--capability-mode","dev","--worker-mode","qa/plan-review",
          "--model-role","fast reviewer","--jobs",str(self.jobs),
          "--prompt-file",str(prompt_file),"--dry-run"]
-   with mock.patch.object(sys,"argv",argv):
+   with self.prior_process_observation({"att-plan-check-round-1"}),mock.patch.object(sys,"argv",argv):
     observation=F.LAUNCH_TUPLE.ReportOnlyObservation()
     code=F._dispatch(observation)
    node=next(n for n in route["nodes"] if n["id"]=="plan-check")
@@ -1294,7 +1431,13 @@ class FallbackTest(unittest.TestCase):
   path=self.route(same_status="supported"); route=json.loads(path.read_text())
   pipe=f"capability=autopilot-code,route_id={route['route_id']},route_node=plan,parent=owner,attempt_id=att-prior000000,parent_harness=codex,parent_transport=headless,parent_sandbox=workspace-write,child_harness=codex,launch_authority=conductor,note=dead-launch-error,failure_class=launch-tuple"
   self.jobs.write_text(f"2026-07-16T00:00:00Z\tdone\t/repo\t{self.repo}\tfallback-plan\t{pipe}\n")
-  result=self.run_chain(path); self.assertEqual(result.returncode,0,result.stdout+result.stderr); self.assertIn("selected_hop=cross-harness-headless",result.stdout); self.assertIn("skipped-prior-unchanged-failure",result.stdout)
+  result=self.run_observed_chain(path,{"att-prior000000"}); self.assertEqual(result.returncode,0,result.stdout+result.stderr); self.assertIn("selected_hop=cross-harness-headless",result.stdout); self.assertIn("skipped-prior-unchanged-failure",result.stdout)
+  before=self.jobs.read_bytes()
+  unknown=self.run_observed_chain(path,{"att-prior000000"},state="unverifiable")
+  self.assertEqual(unknown.returncode,78,unknown.stdout+unknown.stderr)
+  self.assertIn("prior-attempt-unverifiable",unknown.stdout)
+  self.assertIn("child_spawned=0",unknown.stdout)
+  self.assertEqual(self.jobs.read_bytes(),before)
  def test_registry_worker_deaths_do_not_spend_a_launch_tuple(self):
   path=self.route(same_status="supported"); route=json.loads(path.read_text())
   base=(f"capability=autopilot-code,route_id={route['route_id']},route_node=plan,"
@@ -1307,10 +1450,16 @@ class FallbackTest(unittest.TestCase):
    f"{base},attempt_id=att-worker-dead,note=dead-exact-pid\n",
    encoding="utf-8")
   self.assertEqual(F.registry_failures(self.jobs,route["route_id"],"plan"),{})
-  result=self.run_chain(path)
+  result=self.run_observed_chain(path,{"att-worker-fail","att-worker-dead"})
   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
   self.assertRegex(result.stdout,r"selected_hop=(same|cross)-harness-headless")
   self.assertNotIn("skipped-prior-unchanged-failure",result.stdout)
+  before=self.jobs.read_bytes()
+  unknown=self.run_observed_chain(path,{"att-worker-fail","att-worker-dead"},state="unverifiable")
+  self.assertEqual(unknown.returncode,78,unknown.stdout+unknown.stderr)
+  self.assertIn("prior-attempt-unverifiable",unknown.stdout)
+  self.assertIn("child_spawned=0",unknown.stdout)
+  self.assertEqual(self.jobs.read_bytes(),before)
  def test_invalid_model_role_is_structured_and_preserved(self):
   path=self.route(same_status="supported")
   cross="codex/headless/workspace-write/claude/conductor"

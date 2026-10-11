@@ -55,7 +55,7 @@ class DerivedTagTest(unittest.TestCase):
 
 class TagChipLedgerTest(unittest.TestCase):
     def _s(self, **over):
-        base = dict(harness="claude", pid=1, cwd="/x", slug="s", title="a title",
+        base = dict(harness="claude", pid=1, cwd="/x", slug="s", runtime_name="a title",
                     liveness="idle", elapsed_min=1)
         base.update(over)
         return Session(**base)
@@ -150,7 +150,7 @@ class LegendTest(unittest.TestCase):
         base.update(over)
         lines = render._build_lines([Session(**base)], [], "fleet", False, 0,
                                     layout="wide", term_width=168)
-        return _text([ln for ln in lines if ln][-1])
+        return "\n".join(_text(ln) for ln in lines if ln and any("session: " in part for part, _key in ln))
 
     def test_entries_appear_only_when_seen(self):
         plain = self._legend()

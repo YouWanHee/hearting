@@ -24,10 +24,24 @@ The headless wrapper now renders the portable minimal kernel plus one worker
 type and wraps custom prompts as assignments. It no longer asks the worker to
 read the full Codex adapter bootstrap or returns changed-file/test prose to
 main; durable detail is artifact-only and the terminal handoff is three lines.
-Official custom-agent configuration layers do not establish a switch that
-removes project `AGENTS.md` discovery, so lifecycle suppression and
-harness-controlled prompt isolation are supported while physical project
-instruction masking remains an explicit fallback.
+All new headless types, including session-tidy support, use the shared profile
+projector's role home. Hearting's global main `AGENTS.md` is replaced with the
+small attach template. This is controlled global input, distinct from native
+project instructions, which remain. User credentials/config/hooks stay linked;
+launch overrides disable apps, MCP servers, custom agents, native collaboration
+and enabled plugins, and disable discovered system skills by documented path.
+The assigned contract remains in the prompt. Native or managed input outside
+these controls must be reported from actual runtime evidence.
+
+Hook trust is path-keyed in Codex. The invocation maps existing user decisions
+to the relocated copies of the same source definitions, including disabled
+states; it reads those decisions again when a resumed command is built. Native
+current-hash validation still rejects changed or unapproved definitions. No
+user trust record is written and no hook-trust bypass is used. Validate this
+with App Server `hooks/list`, rather than assuming a linked file is active.
+
+Official surfaces: [instruction discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md),
+[configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
 ## Runtime router diagnostic boundary (2026-08-10)
 

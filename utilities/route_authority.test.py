@@ -80,6 +80,14 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertTrue(RA.lineage_parent_matches(stage, thread_id="x", parent_attempt_id="att-owner"))
         self.assertFalse(RA.lineage_parent_matches(stage, thread_id="x", parent_attempt_id="att-other"))
 
+    def test_replacement_parent_attempt_and_depth2_session_remain_exact(self):
+        stage={**self.OWNER,'dispatch_depth':'2','parent_attempt_id':'att-owner'}
+        self.assertTrue(RA.replacement_parent_matches(stage,stage,None))
+        self.assertFalse(RA.replacement_parent_matches(stage,{**stage,'parent_sid':'other'},None))
+        self.assertFalse(RA.replacement_parent_matches(stage,{**stage,'parent_attempt_id':'other'},None))
+        with mock.patch.object(RA,'owns',return_value=True):
+            self.assertFalse(RA.replacement_parent_matches(stage,{**stage,'parent_sid':'successor'},None))
+
     def test_the_runtime_parent_is_the_calling_session(self):
         env = {"CODEX_THREAD_ID": "codex-sid", "CODEX_DISPATCH_PARENT_CURRENT_FORCE": "1"}
         for honor_force, expected in ((True, "codex-sid"), (False, "synthetic")):
@@ -172,6 +180,32 @@ class OwnerPinChangeTest(unittest.TestCase):
     def test_nothing_recorded_is_the_sealed_route_itself(self):
         self.assertIs(RA.route_in_force(self.route), self.route)
         self.assertEqual(RA.sealed_pin_harness(self.route, worker_type="owner"), "codex")
+
+    def test_same_owner_pin_adds_missing_checked_evidence_once_without_rewriting_route(self):
+        self.route["selection_pins"]["owner"]["harness"] = "opencode"
+        sealed = json.loads(json.dumps(self.route))
+        values = dict(target="owner", pin={"harness": "opencode", "model": None, "effort": None},
+                      by={"harness": "claude", "session_id": "parent"}, source="existing-intent",
+                      tuples=[_tuple("opencode", "codex")], candidates=[])
+        self.assertIsNotNone(RA.record_pin_change(self.route, **values))
+        self.assertEqual(self.route, sealed)
+        view = RA.route_in_force(self.route)
+        self.assertEqual(view["route_hash"], sealed["route_hash"])
+        self.assertIn("opencode", {row["parent_harness"] for row in view["dispatch_evidence"]["tuples"]})
+        self.assertIsNone(RA.changed_pin_harness(self.route, "owner"))
+        self.assertIsNone(RA.moved_owner_harness(self.route, "codex"))
+        self.assertIsNone(RA.record_pin_change(self.route, **values))
+        self.assertEqual(len(RA.pin_changes(self.route)), 1)
+
+    def test_same_pin_replaces_only_derived_unsupported_tuple_and_hop(self):
+        values = dict(target="owner", pin=self.route["selection_pins"]["owner"],
+                      by={}, source="checked", tuples=[_tuple("codex", "opencode")], candidates=[])
+        self.assertIsNotNone(RA.record_pin_change(self.route, **values))
+        view = RA.route_in_force(self.route)
+        for rows in (view["dispatch_evidence"]["tuples"], view["nodes"][0]["fallback_hops"][1]["candidates"]):
+            self.assertEqual(next(row["status"] for row in rows if row["child_harness"] == "opencode"), "supported")
+        self.assertEqual(self.route["dispatch_evidence"]["tuples"][-1]["status"], "unsupported")
+        self.assertIsNone(RA.record_pin_change(self.route, **values))
 
     def test_the_parent_moves_the_owner_and_the_worker_pin_stays(self):
         row = self.change()
@@ -400,6 +434,50 @@ class Case4RetryLinkTest(unittest.TestCase):
         death = {**latest, "note": "dead-route-completion-rejected", "failure_class": "contract"}
         self.assertEqual(RA.retry_predecessor([death]), "att-0c43")
 
+    def test_new_settled_request_does_not_inherit_a_spent_transport_retry(self):
+        import dispatch_replacement as replacement
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            args = SimpleNamespace(attempt_id="att-gap-two", jobs_path=jobs,
+                                   worktree=td, replacement_input_argv=["--slug", "gap-two"])
+            latest = {"_status": "done", "attempt_id": args.attempt_id,
+                      "note": "dead-parent-terminated", "failure_class": "runtime",
+                      "automatic_retry_of": "att-gap-one", "launch_outcome": "never-launched"}
+            latest.update(DC.parse_registry_metadata(replacement.seal_launch_input(
+                args, "codex", "Close migration fixtures and import integration.")))
+            before = dict(latest)
+            new = "Close historical/current conflict and actual DB parity."
+            self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), "")
+            for task in (None, "", "Close migration fixtures and import integration.",
+                         "  Close migration fixtures\n and import integration.  "):
+                with self.subTest(task=task):
+                    self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=task), args.attempt_id)
+            self.assertTrue(replacement._budget_exhausted(jobs, latest))
+            self.assertEqual(latest, before)
+            candidate = {**latest, "attempt_id": "att-gap-three"}
+            candidate.pop("automatic_retry_of")
+            self.assertIsNone(replacement.admission(jobs, [], candidate))
+            # Same-task transport continuation still sees the spent allowance.
+            with self.assertRaises(DC.DispatchContractError) as spent:
+                replacement.admission(jobs, ["now\tdone\t/repo\t/wt\tgap-two\t" +
+                    ",".join(f"{k}={v}" for k, v in latest.items() if not k.startswith("_"))],
+                    {**candidate, "automatic_retry_of": args.attempt_id})
+            self.assertEqual(spent.exception.reason, "automatic-replacement-exhausted")
+            for state in ("live", "unverifiable"):
+                with mock.patch.object(DC, "attempt_process_quiescence",
+                                       return_value=SimpleNamespace(state=state)):
+                    self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), args.attempt_id)
+            conflicted = {**latest, "terminal_conflict": "pending"}
+            with mock.patch.object(DC, "terminal_conflict_pending", return_value=True):
+                self.assertEqual(RA.retry_predecessor([conflicted], jobs=jobs, task=new), args.attempt_id)
+            replacement._directory(jobs).joinpath("inputs", args.attempt_id + ".json").write_text("{}")
+            self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=new), args.attempt_id)
+
+    def test_changed_task_cannot_skip_an_open_unlaunched_transport_successor(self):
+        latest = {"_status": "open", "launch_claimed": "0", "attempt_id": "att-gap-two",
+                  "automatic_retry_of": "att-gap-one"}
+        self.assertEqual(RA.retry_predecessor([latest], jobs="unused", task="new request"), "att-gap-one")
+
     def test_the_attempt_policy_retries_only_transport_failures(self):
         from dispatch_attempt_policy import decide_attempt
         def retry(note, failure_class):
@@ -435,6 +513,27 @@ class Case5ReadRootsTest(unittest.TestCase):
                 self.assertEqual(grant.read_roots, (Path("/nas/records"),))
                 self.assertEqual(grant.unwritable_read_roots, (Path("/nas/records"),))
                 self.assertEqual((grant.read_enforcement, grant.unmet), (grade, ()))
+
+    def test_cross_harness_recovery_accepts_installed_source_reads_only(self):
+        wrapper = _load("owner_read_scope_opencode", "adapters/opencode/bin/dispatch-headless.py")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worktree, artifact, install = root / "worktree", root / "artifact", root / "install"
+            for path in (worktree, artifact, install / "core", install / "utilities"):
+                path.mkdir(parents=True)
+            history = {"harness": "codex", "worktree": str(worktree),
+                       "jobs": str(root / "state/jobs.log"), "applied_permissions": {}}
+            route = {"cwd": str(worktree), "artifact_root": str(artifact), "work_request": {"text": ""}}
+            with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "{}"}):
+                config = json.loads(wrapper.scoped_external_directory_config(
+                    str(artifact), agent_home=install, worktree=str(worktree), selected_agent="build"))
+            candidate = {"harness": "opencode", "launch_home": str(install),
+                         "applied_permissions": {"opencode_permission": config["permission"]}}
+            RA.require_recovery_grant_addresses(candidate, history, route=route)
+            config["permission"]["edit"][f"{install / 'utilities'}/**"] = "allow"
+            with self.assertRaises(DC.DispatchContractError) as refused:
+                RA.require_recovery_grant_addresses(candidate, history, route=route)
+            self.assertEqual(refused.exception.reason, "replacement-input-tuple-mismatch")
 
 
 class Case6UncappedAndEnvelopeTest(unittest.TestCase):
@@ -668,6 +767,78 @@ class WrapperAdmissionTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
                 self.assertIsNone(RA.bind_launch_access(args, runtime="opencode", default_roots=()))
+
+class SealedContractReadTest(unittest.TestCase):
+    """An activated replacement still reads the route's original contracts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.opencode = _load("sealed_contract_opencode", "adapters/opencode/bin/dispatch-headless.py")
+        cls.claude = _load("sealed_contract_claude", "adapters/claude/bin/dispatch-headless.py")
+        cls.distribution = _load("sealed_contract_distribution", "tools/install/distribution.py")
+
+    def test_owner_and_child_without_access_request_keep_the_prune_pin_readable(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {
+                "OPENCODE_CONFIG_CONTENT": ""}):
+            os.environ.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
+            root = Path(td)
+            old, new = root / "releases/v1", root / "releases/v2"
+            for home in (old, new):
+                for name in ("capabilities", "core", "utilities"):
+                    (home / name).mkdir(parents=True)
+                (home / "capabilities/autopilot-lab.md").write_text("lab contract")
+            route = {"route_id": "rt-contract", "launch_compatibility_tuple": {
+                "launch_home": {"path": str(old)}}}
+            route_file = root / "route.json"
+            route_file.write_text(json.dumps(route))
+            # This is the existing install pin, with no new retention input.
+            pin = self.distribution._route_record_launch_home(route_file, {}, {})
+            self.assertEqual(pin, str(old))
+            for depth in (1, 2):
+                args = SimpleNamespace(worktree=str(root / "work"), artifact_root=str(root / "reports"),
+                    jobs_path=root / "state/jobs.log", agent_home=new, dispatch_depth=depth,
+                    execution_access_file=None, parent_binding=None,
+                    route_file=str(route_file) if depth == 2 else None,
+                    owner_route_binding=SimpleNamespace(route_file=str(route_file)) if depth == 1 else None)
+                grant = RA.bind_launch_access(args, runtime="opencode", default_roots=())
+                self.assertIsNone(grant)  # Contract visibility requires no access request.
+                self.assertIn(Path(pin) / "capabilities", args.contract_read_roots)
+                config = json.loads(self.opencode.scoped_external_directory_config(
+                    args.artifact_root, agent_home=new, worktree=args.worktree,
+                    contract_read_roots=args.contract_read_roots, selected_agent="build"))
+                for rules in (config["permission"], config["agent"]["build"]["permission"]):
+                    for home in (old, new):
+                        for name in ("capabilities", "core", "utilities"):
+                            self.assertEqual(rules["external_directory"][str(home / name) + "/**"], "allow")
+                            self.assertEqual(rules["edit"][str(home / name) + "/**"], "deny")
+                    self.assertEqual(rules["external_directory"].get("*", config["permission"]["external_directory"]["*"]), "deny")
+                    self.assertNotIn(str(old) + "/**", rules["external_directory"])
+                args.execution_access_grant = None
+                read_dirs, denies = self.claude._read_only_projection(args)
+                for home in (old, new):
+                    for name in ("capabilities", "core", "utilities"):
+                        self.assertIn(str(home / name), read_dirs)
+                        self.assertIn(f"Edit(//{str(home / name).lstrip('/')}/**)", denies)
+
+    def test_read_projection_preserves_the_approved_development_worktree(self):
+        args = SimpleNamespace(worktree=str(ROOT), execution_access_grant=None,
+                               contract_read_roots=RA.contract_read_roots(ROOT))
+        self.assertEqual(self.claude._read_only_projection(args), ([], []))
+
+    def test_same_install_contract_permissions_compare_equal_but_another_checkout_does_not(self):
+        old, new = "/opt/hearting/releases/v1", "/opt/hearting/releases/v2"
+        worktree = "/work/project"
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": ""}):
+            def permissions(home, route=None):
+                return {"opencode_permission": json.loads(self.opencode.scoped_external_directory_config(
+                    "/reports", agent_home=Path(home),
+                    contract_read_roots=RA.contract_read_roots(home, route), worktree=worktree))["permission"]}
+            before = permissions(old)
+            after = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": old}}})
+            self.assertEqual(RA.granted_permissions(before, old, worktree), RA.granted_permissions(after, new, worktree))
+            other = permissions(new, {"launch_compatibility_tuple": {"launch_home": {"path": "/work/dev"}}})
+            self.assertNotEqual(RA.granted_permissions(before, old, worktree), RA.granted_permissions(other, new, worktree))
+
 
 class ReleaseAxisTest(unittest.TestCase):
     """Launch roots that differ only because the installed release moved, from one managed

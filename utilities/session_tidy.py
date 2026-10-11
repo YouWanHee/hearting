@@ -39,7 +39,8 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
     clear/<seat>.json       the one pending auto-clear reservation (``session_tidy_clear.py``)
     watermarks/  decisions/pending/  runs/  queue/  runner.lock   (other slices)
 
-The seat is the herdr pane when ``HERDR_PANE_ID`` is set, else harness + project.
+The seat is the herdr pane only when ``pane_ownership`` verifies its live connection,
+else harness + project. ``HERDR_PANE_ID`` is only a lookup hint.
 A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
 pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
 caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
@@ -280,15 +281,25 @@ def project_key_for(cwd) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class Seat:
-    kind: str            # "pane" | "project"
+    kind: str            # "pane" | "native" | "project"
     key: str             # hash used in file names
     pane: str = ""
     harness: str = ""
     project_key: str = ""
+    native: Optional[dict] = None
 
     def as_dict(self) -> dict:
-        return {"kind": self.kind, "key": self.key, "pane": self.pane,
-                "harness": self.harness, "project_key": self.project_key}
+        result = {"kind": self.kind, "key": self.key, "pane": self.pane,
+                  "harness": self.harness, "project_key": self.project_key}
+        if self.native is not None:
+            result["native"] = self.native
+        return result
+
+
+def seat_from_dict(data: dict) -> Seat:
+    return Seat(str(data.get("kind") or ""), str(data.get("key") or ""),
+                str(data.get("pane") or ""), str(data.get("harness") or ""),
+                str(data.get("project_key") or ""), data.get("native"))
 
 
 def seat_for_project(harness: str, project_key: str) -> Seat:
@@ -424,8 +435,15 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     pane = (env.get("HERDR_PANE_ID") or "").strip()
     if not pane and harness == "codex" and sid:
         pane = codex_pane_for_session(sid, str(cwd or ""), source)
+    from pane_ownership import verified_pane
+    pane = verified_pane(pane, harness, sid, executable=_herdr_executable())
     if pane:
         return Seat("pane", _digest("pane", pane), pane, harness or "", "")
+    from session_tidy_native import caller_target
+    native = caller_target(harness, env)
+    if native:
+        return Seat("native", _digest("native", harness, native["home"], native["job"], native["start"]),
+                    harness=harness or "", native=native)
     return seat_for_project(harness or "unknown", project_key_for(cwd))
 
 
@@ -481,6 +499,45 @@ def latest_session(seat: Seat, harness: Optional[str] = None) -> Optional[dict]:
     return max(rows, key=lambda r: r["last_seen"]) if rows else None
 
 
+def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[str]:
+    """Display IDs observed at this exact pane, bounded to one harness/repository.
+
+    Reuse the seat history; a same-cwd session elsewhere is not an alias. Readers
+    can hold the previous ID while native publication is catching up, so the
+    display join is bidirectional. Execution and notification identities stay exact.
+    """
+    if harness not in HARNESSES or not sid or not pane or not cwd:
+        return []
+    try:
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet.gitinfo import resolve_gitdir
+        repository = resolve_gitdir(cwd)[1]
+        if not repository:
+            return []
+        rows = [row for row in session_summary(_pane_seat_of(pane)).values()
+                if row["harness"] == harness and row.get("cwd")
+                and resolve_gitdir(row["cwd"])[1] == repository]
+        if not any(row["sid"] == sid for row in rows):
+            return []
+        return [row["sid"] for row in sorted(rows, key=lambda r: r["last_seen"], reverse=True)
+                if row["sid"] != sid][:8]
+    except (OSError, ValueError, TypeError, ImportError):
+        return []
+
+
+def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:
+    """The recorded native start source, not a new or inferred lifecycle event."""
+    if harness not in HARNESSES or not sid or not pane:
+        return None
+    for row in reversed(_read_ledger_lines(_pane_seat_of(pane))):
+        if row.get("harness") == harness and row.get("sid") == sid and row.get("event") == "start":
+            source = row.get("source")
+            return source if source in {"startup", "resume", "clear", "compact", "fork"} else None
+    return None
+
+
 def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str = "",
                  transcript: str = "", cwd: str = "", now: Optional[float] = None,
                  bump_epoch: bool = False) -> dict:
@@ -532,6 +589,11 @@ def _fold_ledger(seat: Seat) -> None:
         row["first_seen"] = min(row["first_seen"], item.get("first_seen", item.get("ts", 0)))
         row["ts"] = max(row["ts"], item.get("ts", 0))
         row["epoch"] = max(row["epoch"], int(item.get("epoch", 0) or 0))
+        start_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
+        start_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
+        if ("start_at" not in row and start_source in {"startup", "resume", "clear", "compact", "fork"}
+                and isinstance(start_at, (int, float)) and not isinstance(start_at, bool) and start_at > 0):
+            row.update(start_source=start_source, start_at=start_at)
         for field in ("transcript", "cwd"):
             if item.get(field):
                 row[field] = item[field]
@@ -783,7 +845,7 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
             continue
         replaced = bool(me) and me["first_seen"] > theirs["last_seen"]
         stale = now - theirs["last_seen"] > AUTHOR_STALE_SEC
-        if replaced and (seat.kind == "pane" or stale):
+        if replaced and (seat.kind in ("pane", "native") or stale):
             out.append(item)
     return out
 
@@ -858,14 +920,14 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                            cwd=cwd, now=now, bump_epoch=compacting)
         if event == "compact":
             return ""
-        if event == "start" and seat.kind == "pane":
+        if event == "start" and seat.kind in ("pane", "native"):
             with contextlib.suppress(BaseException):    # a hook never fails for the clear note
                 import session_tidy_clear
                 session_tidy_clear.note_start_locked(seat, harness, sid, now)
         # The one place a same-seat handover (A -> B) is recorded: B's confirmed start/first prompt.
         handed = None
         handover = None
-        if seat.kind == "pane" and event in ("start", "prompt"):
+        if seat.kind in ("pane", "native") and event in ("start", "prompt"):
             with contextlib.suppress(BaseException):    # a hook never fails for the handover
                 import dispatch_seat_handover as handover
                 handed = handover.record_locked(seat, harness, sid, event, source, now)
@@ -977,10 +1039,20 @@ def _guess_seat_from_ledgers(cwd: str) -> tuple[Optional[Seat], Optional[dict]]:
 def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     """(seat, harness, session id) of the calling session; ids come from the arguments,
     the harness variables, then the seat ledger, and as a last resort a fresh ``unknown-`` id."""
+    explicit_sid = bool(sid)
     if not sid:
         harness, sid = session_from_env(harness)
     detected = harness or session_from_env(None)[0]
     seat = resolve_seat(detected, cwd, sid=sid)
+    if seat.native:
+        # The inherited Claude session variable can still name the previous
+        # conversation after /clear. This exact process declares the current id.
+        from session_tidy_native import live
+        record = live(seat.native)
+        if explicit_sid and (not record or record["sessionId"] != sid):
+            return None
+        if record and not explicit_sid:
+            sid = record["sessionId"]
     if not sid or not harness:
         ledger_row = latest_session(seat, harness)
         if ledger_row is None and seat.kind == "project" and not detected:

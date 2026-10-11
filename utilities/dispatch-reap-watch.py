@@ -220,6 +220,19 @@ def watch(args: argparse.Namespace) -> int:
         if group_is_residue and descendants.state == "populated":
             basis = residue_terminal_basis(fields, metadata)
             if basis and time.monotonic() - drain_started >= args.residue_grace:
+                from route_parent_close import reap_terminal_descendants
+                reap_terminal_descendants(args.jobs, fields)
+                group = process_group_observation(args.pgid)
+                descendants = attempt_tagged_descendants(metadata)
+                if group.state == "empty" and descendants.state == "empty":
+                    break
+                if group.state == "unverifiable" or descendants.state == "unverifiable":
+                    return 69
+                tagged_pids = {pid for pid, _start, _state in descendants.members}
+                group_live = {pid for pid, _start, state in group.members if state != "Z"}
+                if descendants.state != "populated" or not group_live <= tagged_pids:
+                    time.sleep(drain_interval)
+                    continue
                 members = list(descendants.members)
                 descendant_proof = {
                     "attempt_descendant_proof": ATTEMPT_DESCENDANT_RESIDUE_PROOF,

@@ -3,12 +3,17 @@
 import argparse, contextlib, fcntl, hashlib, json, os, re, select, signal, subprocess, sys, time
 from pathlib import Path
 import resource_resume as RESOURCE_RESUME
+import resource_run_evidence as RUN_EVIDENCE
 from resource_progress import environment as progress_environment
+import gpu_leases
+from gpu_execution_sandbox import gpu_resource_nodes
 from resource_run_registry import (
     classify_identity,
     is_alive,
     proc_identity,
     register_registry,
+    resource_never_started,
+    reboot_evidence,
 )
 
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -23,6 +28,7 @@ SENTINEL_SCRIPT = (
     '"$@"; ec=$?; '
     'printf %s "$ec" > "$AGENT_RESOURCE_SENTINEL.partial" 2>/dev/null && '
     'mv "$AGENT_RESOURCE_SENTINEL.partial" "$AGENT_RESOURCE_SENTINEL" 2>/dev/null; '
+    'if [ -n "${HEARTING_GPU_LEASE_RELEASE:-}" ]; then /bin/sh -c "$HEARTING_GPU_LEASE_RELEASE"; fi; '
     'exit $ec'
 )
 
@@ -30,7 +36,9 @@ def alive(run):
     return is_alive(run)
 def fail(message):
     print("resource-runner:", message, file=sys.stderr)
-    raise SystemExit(65)
+    error = SystemExit(65)
+    error.resource_message = message
+    raise error
 def locked_update(path, fn):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
     with open(str(path)+".lock","a+") as lock:
@@ -50,7 +58,7 @@ def read_sentinel(path):
     except ValueError:
         return None
 
-def settle(registry, run_id, run):
+def settle(registry, run_id, run, *, data=None):
     """Persist the terminal row once the process is verifiably gone.
 
     Any observer may call this — `reap`, `status`, `list`, a continuation supervisor, or
@@ -58,6 +66,16 @@ def settle(registry, run_id, run):
     `running` that outlives its process is a defect, not a state, so termination is
     recorded by whoever notices it first and is idempotent afterwards.
     """
+    if resource_never_started(run):
+        def settle_unstarted(data):
+            row = data["runs"].get(run_id)
+            if row != run:
+                raise ValueError("resource-reservation-changed")
+            if row.get("ended_at") is not None:
+                return row, False
+            row.update(ended_at=time.time(), exit_code=None)
+            return row, True
+        return settle_unstarted(data) if data is not None else locked_update(registry, settle_unstarted)
     liveness,_current,reason=classify_identity(run)
     if liveness in {"working", "reaping"} or (run.get("resource_policy") in {"verified-resume", "supervised-owner"}
                               and run.get("status") == "launching"):
@@ -65,6 +83,8 @@ def settle(registry, run_id, run):
     exit_code=read_sentinel(run.get("sentinel"))
     if run.get("resource_policy") in {"verified-resume", "supervised-owner"} and run.get("cancel_requested") is True:
         status,state,failure="failed","CANCELLED","cancelled"
+    elif reason == 'host-reboot' and exit_code is None:
+        status,state,failure="failed","FAILED_RETRYABLE","host-reboot"
     elif run.get("resource_policy") in {"verified-resume", "supervised-owner"} and liveness != "exited":
         status,state,failure="failed","FAILED_RETRYABLE",reason
     elif exit_code==0:
@@ -82,11 +102,19 @@ def settle(registry, run_id, run):
         if row is None: raise ValueError("unknown run id")
         if row.get("status") in TERMINAL_STATUSES:
             return row, False
+        if row != run:
+            raise ValueError('resource-reservation-changed')
         row.update({"status":status,"exit_code":exit_code,"ended_at":time.time(),
                     "workflow_state":state,"failure_class":failure,
                     "liveness_reason":reason})
+        if failure == 'host-reboot':
+            boot = reboot_evidence(run)
+            if boot:
+                # Retain the observed old boot so compatibility evidence does
+                # not expire when this kernel's uptime grows past old ticks.
+                row.update(boot_id=boot['previous_boot_id'], boot_host=boot['boot_host'])
         return row, True
-    return locked_update(registry,apply)
+    return apply(data) if data is not None else locked_update(registry,apply)
 
 
 class LaunchDeferred(Exception):
@@ -111,7 +139,41 @@ def controller_argv(registry, row):
     for name in ("smoke_attestation", "config_manifest"):
         if request[name]:
             argv += ["--" + name.replace("_", "-"), request[name]]
+    if row.get("share"):
+        argv += ["--share"]
     return argv + ["--", *row["command"]]
+
+
+def start_watch(route_file, jobs, cwd, runtime):
+    """Start only the observer, confirming readiness before publishing its identity."""
+    ready_read, ready_write = os.pipe()
+    watch = None
+    try:
+        runtime.mkdir(parents=True, exist_ok=True)
+        with open(runtime / "watch.log", "ab", buffering=0) as output:
+            watch = subprocess.Popen([sys.executable, str(Path(__file__).with_name("workflow-supervisor.py")),
+                "watch", "--route", str(route_file), "--jobs", str(jobs), "--interval", "1",
+                "--ready-fd", str(ready_write)],
+                env={**os.environ, "AGENT_DISPATCH_JOBS": str(jobs)}, cwd=cwd,
+                pass_fds=(ready_write,), stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        os.close(ready_write)
+        ready_write = None
+        if not select.select([ready_read], [], [], 5)[0] or os.read(ready_read, 32) != b"ready\n":
+            raise ValueError("resource-supervisor-start-unconfirmed")
+        supervision = proc_identity(watch.pid)
+        if not supervision or watch.poll() is not None:
+            raise ValueError("resource-supervisor-exited-before-launch")
+        return watch, supervision
+    except Exception:
+        # Only our newly created observer handle is ours to stop.
+        if watch is not None and watch.poll() is None:
+            watch.terminate()
+            watch.wait(timeout=5)
+        raise
+    finally:
+        os.close(ready_read)
+        if ready_write is not None:
+            os.close(ready_write)
 
 
 def start_verified(registry, args, route, route_file, placeholder, *, controller=None):
@@ -129,7 +191,10 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                        route=str(route_file), jobs=str(jobs))
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
-            "resource_policy", "owner_wait", "launch_request")
+            "resource_policy", "owner_wait", "launch_request", "share")
+    import dispatch_resource_wait as OWNER_RESOURCE
+    sup = OWNER_RESOURCE.supervisor()
+    ledger = sup.ledger_for(route, jobs) if route.get("route_id") else None
     def reserve(data):
         if controller is not None:
             current = data["runs"].get(args.run_id)
@@ -141,18 +206,31 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             return True, claimed
         matches = [row for row in data["runs"].values() if row.get("route") == str(route_file)
                    and row.get("node") == args.node]
-        if matches:
-            if len(matches) != 1 or any(matches[0].get(k) != placeholder.get(k) for k in keys):
+        current = data["runs"].get(args.run_id)
+        if current is not None:
+            if any(current.get(k) != placeholder.get(k) for k in keys):
                 raise ValueError("resource-route-body-conflict")
-            return False, matches[0]
-        if args.run_id in data["runs"]:
-            raise ValueError("run id already exists")
+            return False, current
+        for previous in matches:
+            if reboot_evidence(previous):
+                settle(registry, previous['run_id'], previous, data=data)
+        from route_authority import require_resource_predecessors
+        require_resource_predecessors([*matches, *history], placeholder)
         data["runs"][args.run_id] = placeholder
         return True, placeholder
-    with controller.guard() if controller else contextlib.nullcontext():
-        created, row = locked_update(registry, reserve)
+    with ledger.lock() if ledger else contextlib.nullcontext():
+        if ledger and sup.resource_continuation_cancelled(route, ledger):
+            raise ValueError("resource-parent-close-requested")
+        history = [row for _, row in sup.resource_predecessors(ledger, args.node)] if ledger else []
+        with controller.guard() if controller else contextlib.nullcontext():
+            created, row = locked_update(registry, reserve)
     if not created:
+        armed = sup.read_armed(ledger).get(args.node)
+        if armed and armed.get("predecessor_id") == args.run_id:
+            sup.reattach_resource_watch(route, ledger, armed)
+            row = json.loads(Path(registry).read_text())["runs"][args.run_id]
         print(json.dumps({**row, "replayed": True, "payload_spawned": False,
+                          **RUN_EVIDENCE.paths(armed or {}),
                           "supervisor_alive": RESOURCE_RESUME.supervisor_alive(row.get("supervision"))}))
         return
     placeholder = row
@@ -160,9 +238,21 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     release = None
     watch = None
     payload_released = False
+    lease_path, gpu_lease = None, None
     try:
         register_registry(registry)
         artifacts = prepare_route_artifact_env(route_file, start=True, jobs=jobs)
+        node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
+        # Native Codex tools record intent; their outer controller admits the
+        # devices before arming/releasing the actual execution.
+        queued_intent = (owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller"
+                         and controller is None)
+        if not queued_intent:
+            lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
+                node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
+                share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
+        output_receipt = RUN_EVIDENCE.paths({"artifact_base": artifacts["AGENT_ARTIFACT_OUTPUT_DIR"],
+            "declared_outputs": node.get("outputs", ["run.json"])}, prepare=True)
         ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
         runtime = ledger.root / "resource"
         runtime.mkdir(parents=True, exist_ok=True)
@@ -179,31 +269,18 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             *continuation, "--successor-cwd", str(placeholder["cwd"]),
             "--successor-log", str(runtime / "verification-start.log")],
             check=True, env=environment, stdout=subprocess.DEVNULL, timeout=30)
-        if owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller" and controller is None:
+        with ledger.lock():
+            if sup.resource_continuation_cancelled(route, ledger):
+                raise ValueError("resource-parent-close-requested")
+        if queued_intent:
             queued = {**placeholder, "launch_state": "queued"}
             publish_verified_run(registry, args.run_id, placeholder, queued)
             print(json.dumps({**queued, "payload_spawned": False, "supervisor_alive": False,
+                              **output_receipt,
                               "required_action": "yield-owner-turn", "verification_admitted": False,
                               "workflow_complete": False}))
             return
-        ready_read, ready_write = os.pipe()
-        try:
-            with open(runtime / "watch.log", "ab", buffering=0) as output:
-                watch = subprocess.Popen([sys.executable, supervisor, "watch", "--route", str(route_file),
-                    "--jobs", str(jobs), "--max", "86400", "--interval", "1",
-                    "--ready-fd", str(ready_write)], env=environment, cwd=placeholder["cwd"],
-                    pass_fds=(ready_write,), stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-            os.close(ready_write)
-            ready_write = None
-            if not select.select([ready_read], [], [], 5)[0] or os.read(ready_read, 32) != b"ready\n":
-                raise ValueError("resource-supervisor-start-unconfirmed")
-            supervision = proc_identity(watch.pid)
-            if not supervision or watch.poll() is not None:
-                raise ValueError("resource-supervisor-exited-before-launch")
-        finally:
-            os.close(ready_read)
-            if ready_write is not None:
-                os.close(ready_write)
+        watch, supervision = start_watch(route_file, jobs, placeholder["cwd"], runtime)
         log = Path(placeholder["log"])
         log.parent.mkdir(parents=True, exist_ok=True)
         sentinel = Path(placeholder["sentinel"])
@@ -215,6 +292,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         launch_argv = ["/bin/sh", "-c", 'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
                        + SENTINEL_SCRIPT, "resource-runner", *(controller.command if controller else placeholder["command"])]
         environment.update(progress_environment(placeholder))
+        environment.update(HEARTING_GPU_LEASE_RELEASE="")
+        environment.update(gpu_env)
+        environment.update(HEARTING_RESOURCE_RUN_ID=args.run_id, HEARTING_RESOURCE_REGISTRY=str(registry.resolve()))
         environment.update(AGENT_RESOURCE_SENTINEL=str(sentinel), AGENT_RESOURCE_LAUNCH_FD=str(wait_read))
         try:
             with open(log, "ab", buffering=0) as output:
@@ -232,15 +312,22 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             time.sleep(.01)
         if not ident or not RESOURCE_RESUME.supervisor_alive(supervision):
             raise ValueError("resource-launch-identity-unconfirmed")
-        row = {**placeholder, **ident, "process_group": os.getpgid(proc.pid), "launch_argv": launch_argv,
+        if gpu_lease:
+            gpu_leases.bind(lease_path, gpu_lease, gpu_leases.identity(proc.pid))
+        row = {**placeholder, **ident, "pid_namespace": os.readlink("/proc/self/ns/pid"), "process_group": os.getpgid(proc.pid), "launch_argv": launch_argv,
                "status": "running", "workflow_state": "RUNNING", "supervision": supervision}
+        if gpu_lease:
+            row.update(gpu_lease=gpu_lease, gpus=",".join(gpu_lease["gpus"]))
         if controller is not None:
             row.update(launch_state="started", pid_namespace=controller.identity["pid_namespace"],
                        payload_sandbox=controller.sandbox)
-        with controller.guard() if controller else contextlib.nullcontext():
-            publish_verified_run(registry, args.run_id, placeholder, row)
-            os.write(release, b"start\n")
-            payload_released = True
+        with ledger.lock():
+            if sup.resource_continuation_cancelled(route, ledger):
+                raise ValueError("resource-parent-close-requested")
+            with controller.guard() if controller else contextlib.nullcontext():
+                publish_verified_run(registry, args.run_id, placeholder, row)
+                os.write(release, b"start\n")
+                payload_released = True
         if controller is not None:
             # The outer controller keeps the actual Popen handles so it can
             # reap its children before observing /proc, without PID guessing.
@@ -249,7 +336,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         os.close(release)
         release = None
         print(json.dumps({**row, "replayed": False, "payload_spawned": True,
-                          "supervisor_alive": True, "watch_seconds": 86400,
+                          **output_receipt,
+                          "supervisor_alive": True, "watch_seconds": None,
                           "verification_admitted": False, "workflow_complete": False}))
     except Exception as error:
         # Closing the private fence cannot run the payload. Do not signal a foreign PID.
@@ -259,6 +347,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=2)
         if not payload_released:
+            gpu_leases.release(lease_path, gpu_lease)
             if watch is not None and watch.poll() is None:
                 # This is our unreaped child, not a PID rediscovered in a registry.
                 with contextlib.suppress(ProcessLookupError):
@@ -273,8 +362,19 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     data["runs"][args.run_id] = controller.expected
                 else:
                     current.update(status="failed", workflow_state="FAILED_RETRYABLE",
-                                   failure_class="resource-launch-incomplete")
-            locked_update(registry, mark_failed)
+                                   failure_class="resource-launch-incomplete",
+                                   launch_state="not-started", ended_at=time.time(), exit_code=None,
+                                   launch_error=launch_error(error))
+                return current
+            failed = locked_update(registry, mark_failed)
+            if ledger and resource_never_started(failed):
+                # Settle only this exact armed run through the normal failure
+                # consumer, without polling or starting unrelated successors.
+                with ledger.lock():
+                    armed = sup.read_armed(ledger).get(args.node)
+                    if (armed and armed.get("predecessor_id") == args.run_id
+                            and not sup.resource_continuation_cancelled(route, ledger)):
+                        sup._evaluate(route, ledger, armed, [])
         raise
 
 
@@ -285,11 +385,76 @@ def publish_verified_run(registry, run_id, expected, published):
             raise ValueError("resource-reservation-changed")
         data["runs"][run_id] = published
     locked_update(registry, apply)
+
+
+def launch_error(error):
+    diagnostic = getattr(error, "stderr", None) or getattr(error, "resource_message", None)
+    if isinstance(diagnostic, bytes):
+        diagnostic = diagnostic.decode("utf-8", errors="replace")
+    return {"type": type(error).__name__, "message": str(diagnostic or error).strip()[:2048]}
+
+
+def verify_launch_input(command, **kwargs):
+    """Keep a verifier's actual diagnostic when returning its refusal to the owner."""
+    try:
+        result = subprocess.run(command, check=True, stderr=subprocess.PIPE, text=True, **kwargs)
+    except subprocess.CalledProcessError as error:
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+
+
+def settle_queued_validation_failure(controller, error):
+    """Only this leased launcher's unchanged pre-claim request proves no payload ran."""
+    expected = controller.expected
+    if (isinstance(error, LaunchDeferred) or expected.get("status") != "launching"
+            or expected.get("launch_state") != "queued"
+            or any(expected.get(k) is not None for k in
+                   ("pid", "starttime", "command_hash", "process_group", "launch_controller"))):
+        return
+    import dispatch_resource_wait as OWNER_RESOURCE
+    sup = OWNER_RESOURCE.supervisor()
+    route = sup.load_route(expected["route"])
+    ledger = sup.ledger_for(route, expected["jobs"])
+    with ledger.lock():
+        current = json.loads(Path(controller.registry).read_text())["runs"].get(expected["run_id"])
+        if current != expected:
+            return
+        armed = sup.read_armed(ledger).get(expected["node"])
+        if (not armed or armed.get("predecessor_id") != expected["run_id"]
+                or armed.get("resource_registry") != str(Path(controller.registry).resolve())
+                or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(expected)
+                or sup.resource_continuation_cancelled(route, ledger)):
+            return
+        failed = {**expected, "status": "failed", "workflow_state": "FAILED_RETRYABLE",
+            "failure_class": "resource-launch-incomplete", "launch_state": "not-started",
+            "launch_controller": controller.identity, "ended_at": time.time(), "exit_code": None,
+            "launch_error": launch_error(error)}
+        if not resource_never_started(failed):
+            return
+        with controller.guard():
+            # The existing reservation lock rejects a claim or foreign successor.
+            publish_verified_run(controller.registry, expected["run_id"], expected, failed)
+        sup._evaluate(route, ledger, armed, [])
+
+
 def main(argv=None, *, controller=None):
+    try:
+        return _main(argv, controller=controller)
+    except (Exception, SystemExit) as error:
+        if controller is not None and (not isinstance(error, SystemExit) or error.code == 65):
+            settle_queued_validation_failure(controller, error)
+        raise
+
+
+def _main(argv=None, *, controller=None):
     p=argparse.ArgumentParser(); p.add_argument("--registry"); s=p.add_subparsers(dest="cmd",required=True)
     a=s.add_parser("start"); a.add_argument("--run-id",required=True); a.add_argument("--cwd",required=True); a.add_argument("--log",required=True); a.add_argument("--route",required=True); a.add_argument("--node",required=True); a.add_argument("--smoke-attestation"); a.add_argument("--config-manifest")
     a.add_argument("--parent-attempt-id",help="registered headless attempt that owns this resource child")
     a.add_argument("--jobs", help="canonical dispatch registry for the existing continuation")
+    a.add_argument("--share", action="store_true", help="Allow intentional GPU sharing")
     a.add_argument("command",nargs=argparse.REMAINDER)
     for name in ("status","stop","tail","reap"):
         x=s.add_parser(name); x.add_argument("--run-id",required=True)
@@ -317,10 +482,10 @@ def main(argv=None, *, controller=None):
         artifact_root=Path(str(route.get("artifact_root", ""))).resolve()
         if not route_file.is_relative_to(artifact_root):
             fail("route-file-outside-artifact-root")
-        subprocess.run([
+        verify_launch_input([
             sys.executable, str(Path(__file__).with_name("capability-route.py")),
             "verify", "--route", str(route_file), "--cwd", str(cwd),
-        ], check=True, stdout=subprocess.DEVNULL)
+        ], stdout=subprocess.DEVNULL)
         node=next((n for n in route["nodes"] if isinstance(n,dict) and n.get("id")==args.node),None)
         if not node or node.get("kind")!="resource-runner" or node.get("resource_transport")!="detached-process":
             fail("route node is not detached resource-runner")
@@ -328,12 +493,12 @@ def main(argv=None, *, controller=None):
         if resume and not SAFE_RUN_ID.fullmatch(args.run_id): fail("invalid --run-id")
         if not args.smoke_attestation and not resume: fail("hash-bound smoke attestation required")
         if args.smoke_attestation:
-            subprocess.run([sys.executable,str(Path(__file__).parents[1]/"tools/smoke-attestation.py"),"verify","--attestation",args.smoke_attestation],check=True)
+            verify_launch_input([sys.executable,str(Path(__file__).parents[1]/"tools/smoke-attestation.py"),"verify","--attestation",args.smoke_attestation])
         provenance = {}
         if args.config_manifest:
             manifest = json.loads(Path(args.config_manifest).read_text())
             verify_tool = Path(__file__).parents[1] / "tools" / "lab-config-provenance.py"
-            subprocess.run([sys.executable, str(verify_tool), "verify", "--manifest", args.config_manifest], check=True)
+            verify_launch_input([sys.executable, str(verify_tool), "verify", "--manifest", args.config_manifest])
             if not SAFE_RUN_ID.match(args.run_id):
                 fail("invalid --run-id")
             # --attempt suffix policy: "<manifest_run_id>__a<N>" retries the same
@@ -370,6 +535,8 @@ def main(argv=None, *, controller=None):
                      "sentinel":str(sentinel),"progress_file":str(log)+".progress.json",
                      "parent_attempt_id":args.parent_attempt_id,
                      "workflow_state":"READY","started_at":time.time()}
+        if args.share:
+            placeholder["share"] = True
         owner_wait = None
         if not resume and (node.get("continuation") or {}).get("kind") == "supervised":
             import dispatch_resource_wait as OWNER_RESOURCE
@@ -400,32 +567,67 @@ def main(argv=None, *, controller=None):
             sentinel.unlink()
         with contextlib.suppress(OSError):
             Path(str(sentinel)+".partial").unlink()
-        launch_argv=["/bin/sh","-c",SENTINEL_SCRIPT,"resource-runner",*command]
-        environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel)}
-        out=open(log,"ab",buffering=0)
+        lease_path, gpu_lease, gpu_env = None, None, {}
         try:
-            proc=subprocess.Popen(launch_argv,cwd=cwd,env=environment,stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
+            lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
+                node, command, gpu_scoped=args.node in gpu_resource_nodes(route),
+                share=args.share, jobs=args.jobs, run_id=args.run_id)
         except Exception:
-            out.close()
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             raise
+        wait_read, release = os.pipe()
+        launch_argv=["/bin/sh","-c",'IFS= read -r launch <&"$AGENT_RESOURCE_LAUNCH_FD" || exit 125; '
+                     + SENTINEL_SCRIPT,"resource-runner",*command]
+        environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel),
+                     "HEARTING_RESOURCE_RUN_ID": args.run_id, "HEARTING_RESOURCE_REGISTRY": str(registry.resolve()),
+                     "HEARTING_GPU_LEASE_RELEASE": "", **gpu_env, "AGENT_RESOURCE_LAUNCH_FD": str(wait_read)}
+        out=open(log,"ab",buffering=0)
+        try:
+            proc=subprocess.Popen(launch_argv,cwd=cwd,env=environment,pass_fds=(wait_read,),stdout=out,stderr=subprocess.STDOUT,start_new_session=True)
+        except Exception:
+            out.close()
+            os.close(wait_read); os.close(release)
+            gpu_leases.release(lease_path, gpu_lease)
+            locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
+            raise
+        os.close(wait_read)
         ident=None
         for _ in range(20):
             ident=proc_identity(proc.pid)
             if ident: break
             time.sleep(.01)
         if not ident:
+            os.close(release)
             proc.kill()
+            gpu_leases.release(lease_path, gpu_lease)
             locked_update(registry,lambda data:data["runs"].pop(args.run_id,None))
             fail("could not establish process identity")
-        run={**ident,"run_id":args.run_id,"process_group":os.getpgid(proc.pid),"cwd":str(cwd),"log":str(log),"command":command,
+        run={**ident,"pid_namespace":os.readlink("/proc/self/ns/pid"),"run_id":args.run_id,"process_group":os.getpgid(proc.pid),"cwd":str(cwd),"log":str(log),"command":command,
              "launch_argv":launch_argv,"sentinel":str(sentinel),"progress_file":placeholder["progress_file"],
              "parent_attempt_id":args.parent_attempt_id,**provenance,
              "route":args.route,"node":args.node,"status":"running","workflow_state":"RUNNING",
              "started_at":placeholder["started_at"]}
         def add(data):
             data["runs"][args.run_id]=run
-        locked_update(registry,add); print(json.dumps(run)); return
+        try:
+            if gpu_lease:
+                gpu_leases.bind(lease_path, gpu_lease, gpu_leases.identity(proc.pid))
+                run.update(gpu_lease=gpu_lease, gpus=",".join(gpu_lease["gpus"]))
+            if args.share:
+                run["share"] = True
+            locked_update(registry,add)
+            os.write(release, b"start\n")
+        except Exception:
+            gpu_leases.release(lease_path, gpu_lease)
+            def discard_own(data):
+                if data["runs"].get(args.run_id) in (placeholder, run):
+                    data["runs"].pop(args.run_id)
+            locked_update(registry, discard_own)
+            raise
+        finally:
+            os.close(release)
+            out.close()
+        print(json.dumps(run)); return
     data=json.loads(registry.read_text())
     if args.cmd=="list":
         rows=[]

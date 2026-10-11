@@ -372,11 +372,9 @@ def _cycle_id_for_open_dir(root: Path, campaign: Mapping[str, Any], path: Path, 
 def _campaign_view(root: Path, campaign_path: Path) -> Optional[Dict[str, Any]]:
     """Fold ``campaign.json`` (or recover a manifest-only view) into one dict.
 
-    Returns ``None`` when the directory carries no usable campaign record --
-    not an error, just nothing to scan. Raises when the two possible sources
-    (a real ``campaign.json`` and the manifests underneath) name different
-    campaign ids for the same directory: that is always a defect, never a
-    display choice.
+    Returns ``None`` when the directory carries no usable campaign record.
+    A present campaign record owns the containing folder; a cycle moved into
+    it may still name its earlier campaign in the historical manifest.
     """
 
     campaign = _read_json(campaign_path / "campaign.json")
@@ -386,16 +384,13 @@ def _campaign_view(root: Path, campaign_path: Path) -> Optional[Dict[str, Any]]:
             campaign = fold_campaign(root, campaign_path / "campaign.json", campaign)
         except CampaignError as exc:
             raise LocatorError(exc.code, exc.detail) from exc
-    manifest_campaign = _campaign_from_manifests(campaign_path)
     if campaign is None:
-        campaign = manifest_campaign
+        campaign = _campaign_from_manifests(campaign_path)
     if campaign is None:
         return None
     campaign_id = campaign.get("campaign_id")
     if not isinstance(campaign_id, str) or _CAMPAIGN_ID.fullmatch(campaign_id) is None:
         return None
-    if manifest_campaign is not None and manifest_campaign.get("campaign_id") != campaign_id:
-        raise LocatorError("locator-campaign-id-conflict", campaign_path.as_posix())
     return campaign
 
 
@@ -403,26 +398,28 @@ def _cycle_entry_id(root: Path, campaign: Mapping[str, Any], campaign_id: str,
                      cycle_path: Path, layout: str) -> Optional[str]:
     """The verified id for one cycle directory, or ``None`` if unresolved.
 
-    Binding, manifest and record must all agree; any disagreement is a typed
-    defect (never a silent pick), matching what a full scan has always done.
+    Binding and manifest agree on the cycle ID. Campaign membership follows
+    the containing folder, including before a hand move is reconciled.
     """
 
     binding = read_cycle_binding(cycle_path) if layout == "readable" else None
-    if binding is not None and binding.get("campaign_id") != campaign_id:
-        raise LocatorError("locator-cycle-binding-campaign-mismatch", cycle_path.as_posix())
+    # An ordinary cross-campaign rename leaves the old campaign in the
+    # binding/manifest until the runtime observes it. The containing campaign
+    # is the current location; the stable cycle ID still has to agree.
     campaign_path = cycle_path.parent.parent if cycle_path.parent.name == "cycles" else cycle_path.parent
     cycle_id = _manifest_cycle_id(root, campaign_path, cycle_path)
+    if binding is not None and binding.get("campaign_id") != campaign_id:
+        record = read_cycle_record(root, binding["cycle_id"]) or {}
+        manifest = _exact_cycle_manifest(root, campaign_path, cycle_path) or {}
+        old_campaign = (manifest.get("campaign") or {}).get("campaign_id")
+        if binding["campaign_id"] not in (record.get("campaign_id"), old_campaign):
+            raise LocatorError("locator-cycle-binding-campaign-mismatch", cycle_path.as_posix())
     if cycle_id is not None and binding is not None and binding.get("cycle_id") != cycle_id:
         raise LocatorError("locator-cycle-binding-id-mismatch", cycle_path.as_posix())
     if cycle_id is None and binding is not None:
         bound_id = binding["cycle_id"]
         bound_record = read_cycle_record(root, bound_id)
-        cycle_ids = campaign.get("cycles", []) if isinstance(campaign.get("cycles"), list) else []
-        if (
-            bound_record is None
-            or bound_record.get("campaign_id") != campaign_id
-            or bound_id not in cycle_ids
-        ):
+        if bound_record is None:
             raise LocatorError("locator-cycle-binding-unverified", cycle_path.as_posix())
         cycle_id = bound_id
     if cycle_id is None:
@@ -772,6 +769,28 @@ def expected_index_bytes(root: Path) -> Tuple[bytes, bytes]:
     return render_indexes(mapping, rows)
 
 
+def index_observation_baselines(root: Path) -> Dict[str, str]:
+    """Last generated contents for history only; absence never gates a reader."""
+    value = _read_json(Path(root) / ".runtime/artifact-locator/index-observation.json")
+    if isinstance(value, dict) and set(value) == {INDEX_JSON, INDEX_MD}:
+        return value
+    import hashlib
+    data = expected_index_bytes(root)
+    return {name: "sha256:" + hashlib.sha256(raw).hexdigest()
+            for name, raw in zip((INDEX_JSON, INDEX_MD), data)}
+
+
+def _remember_generated_indexes(root: Path, json_bytes: bytes, md_bytes: bytes) -> None:
+    import hashlib
+    try:
+        path = Path(root) / ".runtime/artifact-locator/index-observation.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(path, json.dumps({name: "sha256:" + hashlib.sha256(raw).hexdigest()
+                      for name, raw in ((INDEX_JSON, json_bytes), (INDEX_MD, md_bytes))}, sort_keys=True).encode())
+    except OSError:
+        pass  # optional observation state cannot fail an ordinary cache write
+
+
 def _write_index_pair(root: Path, json_bytes: bytes, md_bytes: bytes) -> bool:
     """Atomic two-file replace with rollback. Skips the write (returns False)
     when both files already hold these exact bytes."""
@@ -783,11 +802,13 @@ def _write_index_pair(root: Path, json_bytes: bytes, md_bytes: bytes) -> bool:
     previous_json = _regular_bytes(json_path)
     previous_markdown = _regular_bytes(markdown_path)
     if previous_json == json_bytes and previous_markdown == md_bytes:
+        _remember_generated_indexes(root, json_bytes, md_bytes)
         return False
     base.mkdir(parents=True, exist_ok=True)
     try:
         _atomic_write(json_path, json_bytes)
         _atomic_write(markdown_path, md_bytes)
+        _remember_generated_indexes(root, json_bytes, md_bytes)
     except OSError:
         # Two filenames cannot share one POSIX rename. Roll the first replace
         # back if the second fails; crash residue is detected and healed by
@@ -1209,6 +1230,7 @@ def _heal_via_lock(root: Path, write: Callable[[], None]) -> None:
 def _locate_within_owner_campaign(
     root: Path, cycle_id: str, owner_campaign_id: str,
     owner_campaign_candidates: Optional[Callable[[], Iterable[Path]]],
+    *, heal: bool = True,
 ) -> Any:
     """§3.5 3a: once a cycle's owning campaign is known, look there instead of
     the whole root. A miss here is a proof, not a guess (D-88: a cycle
@@ -1235,7 +1257,7 @@ def _locate_within_owner_campaign(
     if part is not None and cycle_id in part:
         rel = part[cycle_id]["path"]
         hints = _hint_map(root)
-        if hints.get(cycle_id) != rel:
+        if heal and hints.get(cycle_id) != rel:
             _heal_via_lock(root, lambda: update_indexes(root, [owner_campaign_id]))
         return root / rel
 
@@ -1306,6 +1328,7 @@ def locate(
     candidates: Optional[Callable[[], Iterable[Path]]] = None,
     owner_campaign_id: Optional[str] = None,
     owner_campaign_candidates: Optional[Callable[[], Iterable[Path]]] = None,
+    heal: bool = True,
 ) -> Optional[Path]:
     """The one verified ID -> path lookup behind `find_path_by_id`,
     `resolve_path`, `campaign_dir`, `cycle_dir`, `read_campaign` and their
@@ -1315,6 +1338,9 @@ def locate(
 
     `owner_campaign_id` only matters when `identifier` is a cycle id: it lets
     a cache miss scan just that one campaign instead of the whole root.
+    `heal=False` skips only the index-heal write; scan, verify and duplicate
+    decisions stay identical, so pure readers (status/list/export) observe
+    without repairing.
     """
 
     root = Path(root).resolve()
@@ -1332,12 +1358,13 @@ def locate(
 
     is_cycle = _CYCLE_ID.fullmatch(str(identifier)) is not None
     if is_cycle and owner_campaign_id is not None:
-        result = _locate_within_owner_campaign(root, identifier, owner_campaign_id, owner_campaign_candidates)
+        result = _locate_within_owner_campaign(root, identifier, owner_campaign_id, owner_campaign_candidates,
+                                               heal=heal)
         if result is not _UNRESOLVED_OWNER:
             return result
 
     mapping, rows, duplicates, defect = _scan_lenient(root)
-    if not duplicates and defect is None:
+    if heal and not duplicates and defect is None:
         _heal_root(root, mapping, rows)
     if identifier in duplicates:
         raise LocatorError("locator-index-duplicate-id", identifier)
@@ -1349,8 +1376,8 @@ def locate(
     return None
 
 
-def find_path_by_id(root: Path, identifier: str) -> Optional[Path]:
-    return locate(root, identifier)
+def find_path_by_id(root: Path, identifier: str, *, heal: bool = True) -> Optional[Path]:
+    return locate(root, identifier, heal=heal)
 
 
 def resolve_path(root: Path, identifier: str) -> Optional[Path]:

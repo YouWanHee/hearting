@@ -193,8 +193,13 @@ evaluation program uses code. Small experiment-support scripts remain within
 lab's existing implementation stages and do not automatically open a code cycle.
 Existing-result analysis, evaluation, and comparison therefore select
 `autopilot-lab --capability-mode eval` under this same purpose rule. The parent
-chooses the capability: omitting `--capability` in ordinary compose uses the
-fixed `autopilot-code` default, not a classifier of the task text; framed work
+defaults to the named **Existing-result analysis** composition in
+[the lab contract](../capabilities/autopilot-lab.md#existing-result-analysis-eval-default-composition):
+`metrics → diagnose → report`, adding `independent-verify` at strong or higher
+with its declared group and automatic owner close. Include `eval-run` only when
+the request needs new raw results, using its existing inputs and write scope.
+The parent chooses the capability: omitting `--capability` in ordinary compose
+uses the fixed `autopilot-code` default, not a classifier of the task text; framed work
 leaves that choice to its frame.
 Likewise, code review within an implementation/debug cycle belongs to
 `autopilot-code --mode audit`; independent inspection of completed work belongs
@@ -281,6 +286,16 @@ These advisory points add no prerequisite or required stage:
   Reuse sufficient existing results. For a new measurement, include a node whose
   inputs and sealed `write_scope` cover it; the lab `metrics` node writes only
   `metrics.jsonl` and `summary-stats.json`, so it cannot create new raw results.
+- Keep wording, labels, and layout corrections inside the already-approved work
+  with its existing artifact owner and cycle, using only the checks the change
+  needs. Preserve lab verification for scientific changes and spec sync
+  for requirement or evaluation-policy changes; a separate document goal still
+  follows §0.2. Name the decided capability explicitly: the ordinary
+  `autopilot-code` default does not classify the request.
+- In a fresh frameless graph, campaign history can still supply ordinary partial
+  outputs, but it does not supply frame briefs. Reuse frame briefs through an
+  explicitly selected parent or `--route-plan` proposal; the owner continues to
+  judge whether that frame's scope covers the work.
 - Choose `--intensity` for the work's purpose and, when needed,
   `--explicit-profiles` for judgment or verification nodes. Check the selection
   reasons and actual node/leg profiles in the compose output.
@@ -289,6 +304,23 @@ These advisory points add no prerequisite or required stage:
   anchors, with two-way as the baseline unless the registry widens it. Check
   realized legs and omission notices, including `terminal-anchor`; the label
   alone does not retain a group. Group selection stays registry-only.
+
+At `strong` or higher, a subgraph ending in an eligible declared review or map
+group receives an automatic owner closing node. It reads every realized leg's
+result and writes only the route's closing summary. When it arbitrates auxiliary
+legs, its assignment names the realized groups and the required
+`auxiliary_findings_considered` frontmatter entries, derived from the sealed route.
+It does not publish, sync, or change the preceding artifacts. The group anchor stays non-terminal and
+the owner holds the terminal completion gate. Compose displays this addition
+alongside omission notices. If a retained group lacks its review consumer or
+auxiliary arbiter, compose restores the unique, safe downstream node declared
+by that group's recipe, including borrowed-part paths and inputs. It inserts
+the node directly after the anchor and preserves the caller's selected order;
+it adds no publication, synchronization, resource run, or source mutation.
+The assignment identifies any realized auxiliary legs and their existing
+consideration obligation. Compose names every automatic addition. Ambiguous,
+unavailable, or conflicting completions remain omissions with a warning.
+Standard and lower routes and already sealed graphs keep their existing shape.
 
 **Frame procedure at depth-0 (`framed`).** `start` launches the frame legs
 (separate launches, no owner) and returns `needs-interview` with
@@ -329,7 +361,11 @@ and no `next_leg`. A leg's optional `done_when` (sealed as `d1`, `d2`…), `veri
 and `hands_over`, and the brief whose route the person chose, reach the owner and
 every stage worker of that leg from the sealed decision; a `qa/*` stage records
 each item beside its artifact as `<artifact>.items.json` (`leg_items_v1`, read by
-`route_plan.read_leg_items`). A leg's `extra_stages` entry becomes node
+`route_plan.read_leg_items`). A leg may name its existing worktree with optional
+`cwd`; validation, first launch, later legs and the printed compose command use
+that folder and check dispatch there. Relative paths are based on the frame's
+original cwd. Omission keeps the existing worktree preparation and inheritance;
+this adds no question, flag or required input. A leg's `extra_stages` entry becomes node
 `plan-<id>` right after its `after` stage, shaped on a catalogue check or
 measurement stage of the same unit (one that writes no source; its gate, review
 budget and start approval) and writing under
@@ -719,10 +755,11 @@ closure without a model turn and sends a recovery notice while closure remains
 pending. The owner and parent have no separate close/finalize procedure.
 
 The runtime closes a route once nobody works on it; no session has to
-remember to. `compose` (within the composed route's own campaign) and `campaign-status` (across the
-artifact root) close an open route whose Claude
+remember to. `compose` (within the composed route's own campaign) closes an
+open route whose Claude
 session this host saw end and that then stayed quiet for an hour, or that saw
-no writes for a week; `campaign-close` also closes its campaign's member routes
+no writes for a week; `campaign-close` first sweeps the same way and then also
+closes its campaign's member routes
 that belong to the closing session or stayed quiet for an hour. Routes of the
 calling session, routes a dispatch attempt, a pending owner settlement or an
 unended resource run still holds, routes waiting on a human gate and routes
@@ -732,6 +769,9 @@ completion markers show, seals the cycle completed only when that proof holds
 and abandoned otherwise, and names its reason in `autoclose`. A session that
 returns to such a route is not refused: `finish` reports it closed, and
 `start` returns the compose command that begins the work again.
+`campaign-status` is a pure read: it reports folded state, pending projections,
+and close refusals without sweeping routes, reconciling the root, healing the
+index, or flushing history.
 
 A session finishes its own `direct` inline route to record real evidence.
 Supply a readable, nonempty artifact from the route's exact open cycle and the
@@ -918,6 +958,23 @@ bounded receipt. Resource receipts are separate from registered model children.
 After pending user corrections, the watch writes the resource completion marker
 from the original producer artifact before recording stage success and claiming
 next work. Exit and this marker are neither verification PASS nor workflow completion.
+
+A resource watch lasts while its recorded PID/start/command identity is alive,
+without a fixed elapsed-time ceiling. The existing start/resume can reattach a
+lost or expired watch to the same run without releasing a payload again. Explicit
+parent cancellation still suppresses the preserved resource's successors.
+
+One supervised owner stage may use resources sequentially through the existing
+runner. An exact successful resource exit with stage outputs still absent waits
+for the next resource; it does not fail or complete the stage. The same owner
+receives that execution result and may register the next run after the previous
+identity is gone and its exit sentinel proves success. Historical run records
+remain intact, including their evidence paths and unacknowledged receipts.
+Receipt recovery follows the preserved binding after the next run is registered;
+acknowledgement remains with the returning owner turn, without a lifetime run-count
+ceiling. Stage success and successor admission still require the declared
+outputs; failed, unverifiable, active, or explicitly cancelled resources cannot
+be replaced by another run.
 
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner

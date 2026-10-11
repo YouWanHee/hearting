@@ -190,9 +190,15 @@ class WorkProjection:
     scope_node_ids: Optional[tuple] = None
     ambiguity: Optional[str] = None
     _route_view: Optional[dict] = field(default=None, repr=False, compare=False)
+    report_verification: Optional[dict] = field(default=None, compare=False)
+    result: Optional[dict] = None  # recorded task result and event time; never file mtime
 
     def to_dict(self):
         payload = _public_value(self)
+        if payload.get("report_verification") is None:
+            payload.pop("report_verification", None)
+        if payload.get("result") is None:
+            payload.pop("result", None)
         # Public v16 shape is an array so future resolver diagnostics can be
         # additive without changing the JSON type.  Keep the scalar internal
         # storage compatible with existing constructors and comparisons.
@@ -266,8 +272,11 @@ class Session:
     elapsed_min: int = 0               # ps etime
     # --- enrichment (None = harness doesn't expose it → render '—') ---
     session_id: Optional[str] = None
+    process_role: str = "unknown"       # common observation: conversation | registered-worker | session-backend | service
+    session_identity_evidence: Optional[dict] = None
     slug: Optional[str] = None
     title: Optional[str] = None        # last successful Fleet subject title; native titles are not fallbacks
+    title_ts: Optional[float] = None   # exact sidecar title event time, independent of activity
     model: Optional[str] = None
     effort: Optional[str] = None
     # The runtime DID report an effort token, but it was the uninformative
@@ -344,6 +353,7 @@ class Session:
     # Symmetric send side of the same projection: the receive strip alone made the board
     # say who talked to you but never who you talked to. Same shape, `to_*` keys.
     peer_last_sent: Optional[dict] = None # {to_name, to_session_id, to_harness, kind, age_min}
+    peer_obligations: Optional[list] = None # body-free pending watch/message/delay/retire status
     # Prior session ids this same live process still answers to after a resume/fork
     # (`session_registry.session_aliases`). DISPLAY JOIN ONLY — never a ledger address,
     # a `report-agent-session` value, or a completion/wake recipient.
@@ -451,6 +461,10 @@ class DispatchJob:
     cwd: str = ""
     parent_sid: Optional[str] = None    # spawning parent session id (CLAUDE_CODE_SESSION_ID from environ)
     parent_cwd: Optional[str] = None    # fallback parent cwd when runtime session id is unavailable/mismatched
+    caller_sid: Optional[str] = None   # observation only; no dispatch/delivery authority
+    caller_harness: Optional[str] = None
+    caller_pane: Optional[str] = None
+    caller_cwd: Optional[str] = None
     parent_managed_dir: Optional[str] = None  # exact managed Codex state dir derived from
                                              # registered managed_sidecar_log (F-68)
     is_child: bool = False              # portable/adapter worker marker
@@ -536,6 +550,7 @@ class DispatchJob:
     title: Optional[str] = None         # the child session's own sidecar title, adopted in
                                         # collect_all (F-14 reach into dispatch rows) — None
                                         # keeps the slug as the row identity
+    title_ts: Optional[float] = None
     summary: Optional[str] = None       # the child session's own live sidecar summary,
                                         # adopted the same way as title (F-16/F-17 merge)
     summary_ts: Optional[float] = None  # F-63: sidecar write time of `summary`, adopted
@@ -599,11 +614,13 @@ class ResourceJob:
     pid: Optional[int] = None
     starttime: Optional[str] = None
     command_hash: Optional[str] = None
+    command: Optional[list] = None  # registry argv, display only; never ownership proof
     process_group: Optional[int] = None
     registry_status: Optional[str] = None
     registry_path: Optional[str] = None
     log_path: Optional[str] = None
     log_updated_at: Optional[float] = None
+    log_size: Optional[int] = None  # observed bytes; empty differs from unreadable
     route: Optional[str] = None
     node: Optional[str] = None
     config_ref: Optional[str] = None
@@ -619,6 +636,7 @@ class ResourceJob:
     # to non-self compute hosts by host-qualified identity, never consumed as
     # local proof. Emitted by the registry scanner, hence a pinned field.
     remote_training: Optional[list] = None
+    local_placement: Optional[dict] = None  # exact local descendants; selection is not GPU use
     # Tracked-workflow projection (OPERATIONS §5.12): a resource row exposes why it
     # ended, which registered attempt owns it, and what the workflow thinks it is.
     workflow_state: Optional[str] = None
@@ -638,6 +656,8 @@ class ResourceJob:
     route_hash: Optional[str] = None
     route_id: Optional[str] = None
     route_node: Optional[str] = None
+
+    display_title: Optional[str] = None  # exact cycle metadata, filled only by the detail pass
 
     def to_dict(self):
         return _public_value(self)
@@ -1473,6 +1493,9 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
     if ev_in.get("orphan"):
         return out("stale", 2, "proc", "orphan cwd (deleted worktree)")
 
+    if (ev_in.get("session_identity_evidence") or {}).get("verdict") == "conflict":
+        return out("unknown", 2, "session-identity", "current session claims conflict")
+
     interaction_wait = ev_in.get("interaction_wait")
     if (
         isinstance(interaction_wait, dict)
@@ -1534,7 +1557,7 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
                 return out("unused", 1, "claude-registry",
                            "idle refined to unused (no transcript, updatedAt≈startedAt)")
             return out(st, 1, st_source, st_rule)
-        return out("idle", 3, "mtime", "no mtime and no registry status")
+        return out("unknown", 3, "observation", "no mtime and no registry status")
 
     age_min = (now - m) / 60.0
     if age_min > stale_min:

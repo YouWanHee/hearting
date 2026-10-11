@@ -31,11 +31,29 @@
 
 Sections §7.1–§7.3 define the semantic/mechanical mutation boundary; §7.4 defines agent-initiated retrieval.
 
+The main session authors its own card from the conversation it already holds.
+Keep the four continuation fields first, then add a few lines for today's work
+(with PR, installed version or result path) and short user instructions with
+their finished, remaining or deferred status. Aim for at most about 90 lines;
+the existing bounded start preview and full-card path remain the read surfaces.
+The tidy worker's partial-read coverage describes its memory input, not the
+main-authored card.
+
 ### §7.1. Semantic Decisions Belong to the Agent
 
 There is no deterministic promote/skip classifier. The acting agent judges whether a memory operation is useful in context, including whether information is durable, non-obvious, recoverable elsewhere, stale, or merely ephemeral. The four storage-purpose labels are a bounded ingress contract after that semantic judgment, not a keyword classifier: code validates the declared purpose but never infers it from content. Manual user-directed memory remains governed by its owning capability.
 
 ### §7.2. Write Mechanics and Deduplication
+
+Tests that accept answers through real workflow code isolate every memory sink
+in their shared fixture, including the store, write journal, pending decisions
+and remote exchange. Direct suite execution has the same boundary as the test
+runner. Proven test records in a user's store use the normal guarded delete and
+graveyard restore path; their historical journal is preserved.
+
+The delete command retains known pre-delete content as a bounded event snippet.
+Older events whose snippet was never recorded stay unchanged; a display names
+that missing content explicitly rather than showing a blank change.
 
 - After deciding to write, inspect visible memory and prefer updating the canonical record over creating an obvious duplicate. Fuzzy similarity is candidate evidence for the agent, not an automatic semantic verdict.
 - Prefer artifact pointers over replicated artifact prose. A pointer includes the current artifact path and only enough body text to explain why and when it should be retrieved.

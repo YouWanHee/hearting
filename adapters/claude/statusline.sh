@@ -206,7 +206,7 @@ if [ -n "$S_SID" ] && [ -n "${S_TRANSCRIPT:-}" ] && [ "${FLEET_TITLE_REFRESH:-}"
     sf=$(sed -n 's/.*"summary_failures": *\([0-9][0-9]*\).*/\1/p' "$sc" 2>/dev/null | head -n 1)
     case "$sf" in ''|*[!0-9]*) sf=0 ;; esac
   fi
-  retry=120
+  retry=300
   case "$sf" in 1) retry=30 ;; 2) retry=60 ;; 3|4|5|6|7|8|9) retry=120 ;; esac
   if [ "$scts" -eq 0 ] || [ $((now - scts)) -gt "$retry" ]; then
     # 실패 상태는 cursor가 보존됐으므로 transcript mtime과 무관하게 같은 delta를 재시도한다.

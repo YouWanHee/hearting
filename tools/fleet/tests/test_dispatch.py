@@ -33,6 +33,7 @@ from fleet import projection         # noqa: E402
 from fleet import route              # noqa: E402
 from fleet import collectors as fleet_collectors  # noqa: E402
 from fleet.model import ATTEMPT_CLASSIFIER_SOURCE, DispatchJob, Session  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines, draw_observed
 
 REAL = os.path.join(os.path.dirname(__file__), "fixtures", "route", "real_claude_staged.json")
 COMPOSED = os.path.join(os.path.dirname(__file__), "fixtures", "route", "synth_composed_survey.json")
@@ -253,7 +254,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             key="code", slug="split-owner", cwd="/work/repo", harness="codex",
             depth=1, dispatch_depth=1, liveness="working", note="registry-split",
         )
-        lines = render._build_lines([], [job], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [job], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("registry-split", text)
@@ -266,7 +267,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                             parent_sid="codex-parent", is_child=True, harness="claude",
                             mode="qa/code-review", liveness="working")
 
-        lines = render._build_lines([parent], [child], section="both", narrow=False,
+        lines = build_observed_lines([parent], [child], section="both", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
@@ -315,7 +316,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         old = render._BLINK_ON
         render._BLINK_ON = blink
         try:
-            return render._build_lines([parent], [d1, d2], section="both", narrow=False,
+            return build_observed_lines([parent], [d1, d2], section="both", narrow=False,
                                        malformed=0, layout=layout, term_width=175)
         finally:
             render._BLINK_ON = old
@@ -350,7 +351,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
     def test_f64c_childless_dispatch_card_brackets_its_context_detail(self):
         parent, d1, _d2 = self._rail_fixture()
         d1.summary = None
-        lines = render._build_lines([parent], [d1], section="both", narrow=False,
+        lines = build_observed_lines([parent], [d1], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=175)
         owner = self._line_with(lines, "rail-owner (")
         owner_txt = "".join(p for p, _k in owner)
@@ -400,17 +401,16 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                     old = render._BLINK_ON
                     try:
                         render._BLINK_ON = blink
-                        lines = render._build_lines(
+                        lines = build_observed_lines(
                             [parent], [owner, child], section="both", narrow=False,
                             malformed=0, layout=layout, term_width=width)
                     finally:
                         render._BLINK_ON = old
                     top = next(i for i, line in enumerate(lines)
                                if line and "rail-owner" in "".join(p for p, _k in line))
-                    divider = next(i for i, line in enumerate(lines[top:], top)
+                    divider = next(line for line in lines[top:]
                                    if line and "├" in "".join(p for p, _k in line))
-                    owner_keys = [key for line in lines[top:divider]
-                                  for _part, key in (line or [])]
+                    owner_keys = [key for _part, key in divider]
                     self.assertIn(expected, owner_keys)
 
     def test_f66_entire_frame_uses_the_owner_rail_color(self):
@@ -440,12 +440,11 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             self.assertFalse(attr & render._A_BOLD, "frame is never bold")
         self.assertTrue(render._HUE_OF["frm_idle"][1] & render._A_DIM)
 
-    def test_card_border_keeps_equal_air_on_both_sides(self):
-        # user 2026-08-14 "테두리를 좌우 한칸씩 여백을 더 넣어서 메인세션의 하위로 보이게
-        # 강조해보자". The user has reported an asymmetric right edge twice, so the
-        # contract is measured, not assumed: the gap from the band's left edge to the
-        # left border must equal the gap from the right border to the band's right edge.
-        self.assertEqual(render._RAIL_COL, 2 + render._CARD_INSET)
+    def test_card_border_clears_connector_and_preserves_right_edge_air(self):
+        # 1008: the left inset now clears the supervisor lane; the right edge
+        # retains its previous gap while the interior alone shrinks.
+        self.assertEqual(render._RAIL_COL, 2 + render._OWNER_CARD_INSET)
+        self.assertGreater(render._RAIL_COL, render._STEWARD_LINE_COL)
         width = 175
         old = render._TINT_OK
         render._TINT_OK = True
@@ -456,7 +455,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # `_addline` shifts a tinted row by _INSET + _PAD_IN, and the band's last
         # paintable screen column is width - _INSET - 1.
         last_raw = width - 2 * render._INSET - render._PAD_IN - 1
-        self.assertEqual(last_raw - (box_width - 1), render._RAIL_COL)
+        self.assertEqual(last_raw - (box_width - 1), render._CARD_EDGE_GAP)
 
     def test_f64c_rail_hue_mirrors_the_breadcrumb_current_token(self):
         # user 2026-08-05 "컬러 안맞는데": the rail must share the exact index the lit
@@ -481,7 +480,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         for width, layout in ((60, "stack"), (80, "narrow"), (140, "wide")):
             with self.subTest(width=width, layout=layout):
                 parent, d1, d2 = self._rail_fixture()
-                lines = render._build_lines(
+                lines = build_observed_lines(
                     [parent], [d1, d2], section="both", narrow=False,
                     malformed=0, layout=layout, term_width=width)
                 text_lines = [render._plain(line) for line in lines if line]
@@ -524,7 +523,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         for width, layout in ((80, "narrow"), (140, "wide")):
             with self.subTest(width=width):
                 parent, d1, d2 = self._rail_fixture()
-                lines = render._build_lines(
+                lines = build_observed_lines(
                     [parent], [d1, d2], section="both", narrow=False,
                     malformed=0, layout=layout, term_width=width)
                 framed = [render._plain(line) for line in lines if line
@@ -617,7 +616,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
                               parent_sid=parent_sid, parent_cwd="/work/repo", is_child=True,
                               harness="codex", mode="debug", qa="standard",
                               qa_source="jobslog", liveness="working")
-            lines = render._build_lines(sessions, [job], section="both", narrow=False,
+            lines = build_observed_lines(sessions, [job], section="both", narrow=False,
                                         malformed=0, layout="wide")
             return "\n".join("".join(part for part, _key in line)
                              for line in lines if line)
@@ -630,7 +629,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # The top summary strip ("hearting …", "usage …", "fleet …") is fixed board chrome
         # unrelated to any one session/card — exclude it so a coincidental substring match
         # there (e.g. "plan quota is console-only") cannot contaminate a card-content count.
-        lines = render._build_lines([session], jobs, section="both", narrow=False,
+        lines = build_observed_lines([session], jobs, section="both", narrow=False,
                                     malformed=0, layout="wide")
         texts = ["".join(part for part, _key in line) for line in lines if line]
         return [t for t in texts
@@ -641,15 +640,12 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # D3/D4: a standard+ owner with no route binding at all still owns a card
         # (it is a direct dispatch child of the session), so the session row must show NO
         # stage of its own — only the card's owner row carries the single dim `—` fallback.
-        # The session ALSO has its own independently-resolvable (artifact-inferred) stage
-        # here — the pre-D3 exact-route-match rule would have left that stage showing on
-        # the session row once the owner's OWN route binding broke; the fix is card
-        # ownership, not route agreement, so it must stay suppressed regardless.
+        # A similarly named artifact directory cannot bind this session to work.
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "plans", "2026-07-22_unresolved-parent", "execute"))
             session = Session(harness="claude", pid=500, proc_start="root", cwd=tmp,
                               session_id="sid-unresolved", slug="unresolved-parent",
-                              title="unresolved-parent", liveness="working")
+                              runtime_name="unresolved-parent", liveness="working")
             owner = DispatchJob(
                 key="code", slug="unresolved-owner", cwd="/work/repo",
                 parent_sid="sid-unresolved", is_child=True, harness="claude",
@@ -659,7 +655,7 @@ class RenderDispatchPresentationTest(unittest.TestCase):
             projection.attach_projections([session], [owner], now=100.0)
             self.assertIsNone(owner.work_projection.route_id)
             self.assertFalse(owner.work_projection._route_view)
-            self.assertEqual(session.work_projection.source, "artifact-inferred")
+            self.assertEqual(session.work_projection.source, "none")
             texts = self._board_lines(session, [owner])
         session_line = next(t for t in texts if "unresolved-parent" in t)
         self.assertNotIn("CL/", session_line)
@@ -667,10 +663,10 @@ class RenderDispatchPresentationTest(unittest.TestCase):
         # The session's own would-be stage ("exec") never reaches its row.
         self.assertNotIn("exec", session_line)
         # The owner card carries exactly one dim `—` fallback token, not a blank slot.
+        close = next(text for text in texts if "╰" in text)
+        self.assertEqual(close.count(" — "), 1)
         segs = render._dispatch_row(owner, in_card=True, card_interior=100)
-        self.assertIn((" : ", "dim"), segs)
-        dash_idx = segs.index((" : ", "dim")) + 1
-        self.assertEqual(segs[dash_idx], ("—", "dim"))
+        self.assertNotIn((" : ", "dim"), segs)  # state moved off the model/identity line
         self.assertNotIn("execute", owner_line)
 
     def test_exact_owner_card_keeps_its_breadcrumb_with_stage_suppressed_once(self):
@@ -803,7 +799,8 @@ class RegistryHomeTest(unittest.TestCase):
                                return_value="/home/u/agent_setting/.dispatch/jobs.log"), \
              mock.patch("fleet.collectors.dispatch.os.path.expanduser",
                         side_effect=fake_expanduser), \
-             mock.patch("fleet.collectors.dispatch.os.path.exists", return_value=True):
+             mock.patch.object(dispatch, "_registry_file",
+                               side_effect=lambda path: path == "/home/u/.claude/.dispatch/jobs.log"):
             self.assertEqual(dispatch._candidate_jobs_paths(), [
                 "/home/u/agent_setting/.dispatch/jobs.log",
                 "/home/u/.claude/.dispatch/jobs.log",
@@ -1602,6 +1599,24 @@ class CwdFallbackEnrichmentTest(unittest.TestCase):
 # --- D4: _job_liveness profile-path assembly (string check, no real filesystem) ---
 class JobLivenessPathAssemblyTest(unittest.TestCase):
 
+    def test_registered_worker_home_wins_over_legacy_profile_and_main_store(self):
+        job = type('Job', (), {'_registry_metadata': {'runtime_home': '/WORKER'}})()
+        self.assertEqual(dispatch._codex_sessions_dir('legacy', 'job', job=job), '/WORKER/sessions')
+        self.assertEqual(dispatch._codex_sessions_dirs('/cwd', 'legacy', 'job', job=job), ['/WORKER/sessions'])
+        calls = []
+        def no_store(path):
+            calls.append(path)
+            raise OSError
+        with mock.patch('fleet.collectors.dispatch.os.listdir', side_effect=no_store):
+            dispatch._job_liveness('/cwd', 0, profile='legacy', slug='job', job=job)
+        self.assertEqual(calls, [os.path.join('/WORKER', 'projects', dispatch._enc('/cwd'))])
+
+    def test_opencode_registered_worker_uses_its_own_database(self):
+        job = type('Job', (), {'_registry_metadata': {'opencode_runtime_dir': '/WORKER/runtime'}})()
+        with mock.patch('fleet.collectors.dispatch.os.path.exists', return_value=False) as exists:
+            self.assertEqual(dispatch._opencode_job_liveness('/cwd', 0, job=job), 'unknown')
+        exists.assert_called_once_with('/WORKER/runtime/data/opencode/opencode.db')
+
     def test_profile_branch_composes_under_registry_home(self):
         calls = []
 
@@ -2242,7 +2257,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
             )
             self.assertEqual(Path(jobs_log).read_bytes(), before)
             render.set_show_all(False)
-            lines = render._build_lines(
+            lines = build_observed_lines(
                 [], rows, section="dispatch", narrow=False, malformed=0, layout="wide"
             )
             text = "\n".join(
@@ -2354,7 +2369,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
             for retry in range(2, 6)
         ]
         render.set_show_all(False)
-        lines = render._build_lines([], jobs, section="dispatch", narrow=False,
+        lines = build_observed_lines([], jobs, section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("test-r5", text)
@@ -2373,7 +2388,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
                              route_id="rt-a", route_node="test", liveness="working",
                              attempt_id="att-0000000000000005", registry_order=5)
         render.set_show_all(False)
-        lines = render._build_lines([], [older, newest], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [older, newest], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("test-r5", text)
@@ -2437,6 +2452,7 @@ class CodexAttemptIdentityTest(unittest.TestCase):
 
 
 # --- D5: depth-2 registry metadata ---
+@mock.patch.object(render, "_SHOW_ALL", True)
 class DepthTwoRegistryMetadataTest(unittest.TestCase):
 
 
@@ -2448,7 +2464,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                           parent_sid="parent-sid", is_child=True, harness="codex",
                           mode="loop/drill", qa="quick", qa_source="jobslog",
                           liveness="working", worker_role="g9_cross_harness_depth2_dispatch")
-        lines = render._build_lines([sess], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([sess], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
@@ -2464,7 +2480,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                           parent_sid="stale-sid", parent_cwd="/work/agent_setting", is_child=True,
                           harness="codex", mode="loop/drill", qa="quick", qa_source="jobslog",
                           liveness="working", worker_role="g9_cross_harness_depth2_dispatch")
-        lines = render._build_lines([sess], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([sess], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
@@ -2473,18 +2489,20 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
         self.assertNotIn("drill:g9", text)
         self.assertNotIn(" main", text)
 
-    def test_unparented_drill_temp_job_groups_under_fixture(self):
+    @mock.patch("fleet.model.gitinfo.resolve_gitdir", return_value=(None, None))
+    def test_unparented_drill_temp_job_groups_under_fixture(self, _gitdir):
         job = DispatchJob(key="drill", slug="drill-g9", cwd="/tmp/drill-g9-abcd/repo",
                           harness="codex", mode="loop/drill", qa="quick", qa_source="jobslog",
                           liveness="working", worker_role="g9_cross_harness_depth2_dispatch")
-        lines = render._build_lines([], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
 
         self.assertIn("drill:g9/", text)
         self.assertNotIn("loops/", text)
 
-    def test_drill_case_code_owner_is_group_root_not_orphan(self):
+    @mock.patch("fleet.model.gitinfo.resolve_gitdir", return_value=(None, None))
+    def test_drill_case_code_owner_is_group_root_not_orphan(self, _gitdir):
         # 2026-07-24 (user "orphan으로 잡히고 메인 세션은 연결도 안되고"): a non-LOOPS `code` owner
         # spawned INSIDE a drill fixture carries the harness's sentinel parent
         # (`drill-<h>-parent-session`, unresolvable by design). It must render as the drill:<case>
@@ -2499,7 +2517,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                             is_child=True, depth=2, harness="opencode", mode="qa/test",
                             qa="standard", qa_source="jobslog", liveness="working",
                             worker_role="stage")
-        lines = render._build_lines([], [owner, child], section="both", narrow=False,
+        lines = build_observed_lines([], [owner, child], section="both", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(p for p, _k in line) for line in lines if line)
         self.assertIn("drill:g10/", text)                  # grouped under the case
@@ -2514,7 +2532,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
                           parent_sid="dead-sid", is_child=True, depth=1, harness="claude",
                           mode="dev/refactor", qa="standard", qa_source="jobslog",
                           liveness="working", worker_role="owner")
-        lines = render._build_lines([], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = "\n".join("".join(p for p, _k in line) for line in lines if line)
         self.assertIn("(orphan)", text)
@@ -2535,7 +2553,7 @@ class DepthTwoRegistryMetadataTest(unittest.TestCase):
         self.assertFalse(parent.is_child)
         self.assertTrue(child_session.is_child)
 
-        lines = render._build_lines([parent, child_session], [job], section="both",
+        lines = build_observed_lines([parent, child_session], [job], section="both",
                                     narrow=False, malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("agent_setting/", text)
@@ -2742,6 +2760,7 @@ class TolerantPipeParsingTest(unittest.TestCase):
         self.assertEqual(fields["owner"], "autopilot-code")
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class StageWorkerRenderTest(unittest.TestCase):
     """SD-F1/F-15 — child name is humanized; its options cell names the assigned skill."""
 
@@ -2759,7 +2778,7 @@ class StageWorkerRenderTest(unittest.TestCase):
             # D1 raw-prefix leak since "code: " looks like a legitimate label already.
             job = DispatchJob(key=worker_role, slug="stage-job", depth=2, worker_role=worker_role,
                               intensity="strong", liveness="working")
-            lines = render._build_lines([], [job], section="both", narrow=False, malformed=0,
+            lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                         layout="wide")
             text = "\n".join("".join(part for part, _key in line) for line in lines if line)
             self.assertIn(label + " stage-job", text)
@@ -2783,7 +2802,7 @@ class QuickDispatchRenderTest(unittest.TestCase):
                           liveness="working", worker_role="capability-owner")
         texts = []
         texts.append("\n".join("".join(part for part, _key in line)
-                                 for line in render._build_lines([], [job], section="both",
+                                 for line in build_observed_lines([], [job], section="both",
                                                                  narrow=False, malformed=0,
                                                                  layout="wide") if line))
         l1, l2 = render._dispatch_row_2line(job)
@@ -2796,6 +2815,7 @@ class QuickDispatchRenderTest(unittest.TestCase):
             self.assertNotIn("test ›", text)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class ConductorBreadcrumbTest(unittest.TestCase):
     """A conductor breadcrumb is projection-backed and never selects a first child."""
 
@@ -2821,7 +2841,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
 
         def status_keys(blink_on):
             with mock.patch.object(render, "_BLINK_ON", blink_on):
-                lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+                lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                             malformed=0, layout="wide")
             return ({t: k for line in lines if line for t, k in line
                      if t in ("preparing…", "running")})
@@ -2837,7 +2857,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
                             parent_slug="fleet-ui-v2", worker_role="code-execute",
                             liveness="working")
         with mock.patch.object(render, "_BLINK_ON", True):
-            lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+            lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                         malformed=0, layout="wide")
         # F-67: the working exec child makes the UNIT active, so the owner's
         # honest preparing token now pulses with the shared blink instead of
@@ -2859,7 +2879,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
         child = DispatchJob(key="code", slug="fleet-ui-v2-exec", depth=2,
                             parent_slug="fleet-ui-v2", worker_role="code-execute",
                             liveness="done")
-        lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+        lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                     malformed=0, layout="wide")
         self.assertEqual(self._stage_keys(lines, "owner"), {})
         self.assertEqual([k for line in lines if line for t, k in line if t == "preparing…"],
@@ -2872,7 +2892,7 @@ class ConductorBreadcrumbTest(unittest.TestCase):
                             parent_slug="fleet-ui-v2", worker_role="code-report",
                             liveness="working")
         with mock.patch.object(render, "_BLINK_ON", True):
-            lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+            lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                         malformed=0, layout="wide")
         self.assertEqual(self._stage_keys(lines, "owner"), {})
         self.assertEqual([k for line in lines if line for t, k in line if t == "running"],
@@ -2888,14 +2908,14 @@ class IntegratedAlertRemovalTest(unittest.TestCase):
     def test_dead_jobs_do_not_create_alert_strip(self):
         dead_a = DispatchJob(key="drill", slug="case-a-20260709-11111", liveness="dead")
         dead_b = DispatchJob(key="drill", slug="case-b-20260709-22222", liveness="dead")
-        lines = render._build_lines([], [dead_a, dead_b], section="both", narrow=False,
+        lines = build_observed_lines([], [dead_a, dead_b], section="both", narrow=False,
                                     malformed=0, layout="wide")
         self.assertNotIn("  alert ", self._text(lines))
         self.assertNotIn("dead jobs", self._text(lines))
 
     def test_stale_job_remains_visible_without_alert_strip(self):
         stale = DispatchJob(key="drill", slug="lone-case-20260709-33333", liveness="stale")
-        lines = render._build_lines([], [stale], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [stale], section="both", narrow=False, malformed=0,
                                     layout="wide")
         text = self._text(lines)
         self.assertNotIn("  alert ", text)
@@ -2942,7 +2962,7 @@ class ResidueDisplayTest(unittest.TestCase):
         job = DispatchJob(key="code", slug="slice", cwd="/work/repo", harness="claude",
                           depth=1, dispatch_depth=1, liveness="working",
                           residue_pids=[753216])
-        lines = render._build_lines([], [job], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [job], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(part for part, _key in line) for line in lines if line)
         self.assertIn("left pid 753216", text)
@@ -2984,9 +3004,10 @@ class FastFirstPublicationTest(unittest.TestCase):
 
     ``fast_first`` keeps exact PID/start, registry tuples, and every field the
     single classifier reads (runtime session/activity association), while
-    display-only fills (sidecar titles/summaries, rollout fallback, sub-agent
-    scans) stay empty the way unscanned attempts already look. The next full
-    snapshot fills them; ``--once``/JSON always takes the full pass.
+    display-only fills (sidecar titles, rollout fallback, sub-agent scans)
+    stay empty the way unscanned attempts already look. The next full
+    snapshot fills them; cheap exact sidecar NOW remains in both passes.
+    ``--once``/JSON always takes the full pass.
     """
 
     ATTEMPT = "att-fastfirst-1"
@@ -3069,11 +3090,12 @@ class FastFirstPublicationTest(unittest.TestCase):
             self.assertEqual(full._runtime_activity["thread_id"], self.THREAD)
             self.assertEqual(fast._transcript_path, full._transcript_path)
             self.assertIsNotNone(fast._transcript_path)
-            # Display-only fills stay empty on the fast pass and arrive full.
+            # Titles defer, but exact cheap NOW is basic observed state.
             self.assertIsNone(fast.title)
             self.assertEqual(full.title, "Fixture Title")
-            self.assertIsNone(fast.summary)
+            self.assertEqual(fast.summary, "Fixture Summary")
             self.assertEqual(full.summary, "Fixture Summary")
+            self.assertEqual(fast.summary_ts, full.summary_ts)
             # Attempt-log telemetry is free math: identical in both passes.
             self.assertEqual((fast.active_context_tokens,
                               full.active_context_tokens), (4000, 4000))

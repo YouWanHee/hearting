@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge regression candidates: revision previews use writer proof, mutate nothing."""
+"""Merge regressions: revision previews use writer proof, keep durable state intact."""
 import importlib.util
 import os
 from pathlib import Path
@@ -15,8 +15,15 @@ R, N = FIX.ROUTE, FIX.DISPATCH_NODE
 
 class RevisionPreviewTest(FIX.CompletionMarkerTest):
     def snapshot(self):
-        return {str(p.relative_to(self.base)): (p.is_dir(), p.stat().st_mtime_ns,
-                None if p.is_dir() else p.read_bytes()) for p in self.base.rglob('*')}
+        caches = {self.artifact/'.runtime/routes/.route-children-index.json',
+                  self.artifact/'.runtime/artifact-producer/v1/cycles/.cycle-routes-index.json'}
+        # Cache publication may change only these parent-directory mtimes.
+        # Every durable child, lock and marker still has its own snapshot row.
+        cache_dirs = {p.parent for p in caches}
+        return {str(p.relative_to(self.base)): (p.is_dir(),
+                None if p.is_dir() and not p.is_symlink() and p in cache_dirs else p.stat().st_mtime_ns,
+                None if p.is_dir() else p.read_bytes())
+                for p in self.base.rglob('*') if p not in caches or p.is_symlink() or not p.is_file()}
 
     def input_case(self, rounds=1):
         route,node,output,owner = self.sd161_input_fixture()

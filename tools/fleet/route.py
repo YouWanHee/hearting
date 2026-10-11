@@ -50,8 +50,17 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if __package__:
+    from .work_titles import readable
+else:  # Existing file-path consumers load this module without a package.
+    tools_dir = str(Path(__file__).resolve().parents[1])
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from fleet.work_titles import readable
 
 _CACHE = {}          # {abspath: (mtime, size, record|None)}
 _OUTCOME_CACHE = {}  # {abspath: (mtime, size, outcome|None)} — F-<next> sidecar reader
@@ -551,6 +560,32 @@ def load_outcome(route_file, expect_id=None, expect_hash=None):
     del result["route_id"]
     del result["route_hash"]
     return result
+
+
+def result_projection(record, outcome):
+    """A proven route result, using its recorded close event, never disk mtime.
+
+    A false terminal gate means unproven, not failure. Missing/conflicting or
+    pending results produce no claim. Failure observations retain their own
+    explicit source (for example a resource exit code).
+    """
+    if (not isinstance(outcome, dict) or outcome.get("present") is not True
+            or outcome.get("match") is not True or outcome.get("finish_pending")
+            or outcome.get("terminal_gate_proven") is not True):
+        return None
+    try:
+        dt = datetime.fromisoformat(outcome["closed_at"].replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return None
+        timestamp = dt.timestamp()
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return None
+    name = record.get("slug")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return {"name": readable(record.get("display_title")) or readable(record.get("title")) or readable(name),
+            "result": "success", "at": timestamp, "source": "route-outcome",
+            "route_id": record.get("route_id"), "artifact_root": record.get("artifact_root")}
 
 
 def _valid_attempt_axes(marker, node):
@@ -1341,6 +1376,7 @@ def _record_view(record, route_id, route_jobs, ev_by_node, now, gate_marks_for_r
             })
     result = {"route_id": route_id, "route_hash": record.get("route_hash"), "source": "record",
             "capability": record.get("capability"), "capability_mode": record.get("capability_mode"),
+            "cwd": record.get("cwd"), "slug": record.get("slug"),
             "execution_topology": record.get("execution_topology"),
             "unit_catalog_digest": record.get("unit_catalog_digest"),
             "composed": bool(record.get("composed")),

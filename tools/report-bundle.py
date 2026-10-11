@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -15,10 +14,15 @@ from pathlib import Path
 import secrets
 import shutil
 import sys
+sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "utilities"))
+import atomic_publish  # noqa: E402
 sys.path.insert(0, str(ROOT / "tools" / "install"))
 import report_bundle_config  # noqa: E402
+sys.path.insert(0, str(ROOT / "utilities"))
+import report_verification_projection as REPORT_PROJECTION  # noqa: E402
 
 VERIFY_SPEC = importlib.util.spec_from_file_location(
     "report_manifest_verify", ROOT / "tools" / "report-manifest-verify.py"
@@ -76,19 +80,12 @@ def _safe_container(root, parts):
 
 def _rename_noreplace(source, target):
     """Atomically publish a directory only while the destination is absent."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise BundleError("atomic no-replace rename is unavailable")
-    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
-    renameat2.restype = ctypes.c_int
-    result = renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1)
-    if result == 0:
-        return
-    error = ctypes.get_errno()
-    if error == errno.EEXIST:
+    try:
+        atomic_publish.rename_directory(source, target)
+    except FileExistsError:
         raise BundleError("bundle version collision: destination appeared during publication")
-    raise BundleError("atomic no-replace rename failed: " + os.strerror(error))
+    except OSError as exc:
+        raise BundleError("atomic no-replace rename failed: " + str(exc)) from exc
 
 
 def _atomic_json(path, value):
@@ -404,6 +401,14 @@ def parser():
     sub = top.add_subparsers(dest="command", required=True)
     root = sub.add_parser("root"); root.add_argument("--optional", action="store_true")
     verify = sub.add_parser("verify"); verify.add_argument("manifest")
+    for name in ("status", "read"):
+        report_read = sub.add_parser(name)
+        report_read.add_argument("--source", required=True)
+        report_read.add_argument("--artifact-root")
+        report_read.add_argument("--jobs", default=os.environ.get("AGENT_DISPATCH_JOBS"))
+        report_read.add_argument("--json", action="store_true")
+        if name == "read":
+            report_read.add_argument("--format", choices=("text", "html"), default="text")
     integrity = sub.add_parser("integrity")
     integrity.add_argument("--root"); integrity.add_argument("--state"); integrity.add_argument("--heartbeat")
     publish_parser = sub.add_parser("publish")
@@ -426,6 +431,18 @@ def main(argv=None):
     if args.command == "root":
         root = resolve_root(optional=args.optional)
         if root is not None: print(root)
+        return 0
+    if args.command in {"status", "read"}:
+        payload = REPORT_PROJECTION.project_report(
+            args.source, artifact_root=args.artifact_root, jobs=args.jobs)
+        if args.json and args.command == "read" and args.format == "html":
+            raise BundleError("--json and --format html cannot be combined")
+        if args.json:
+            print(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+        elif args.command == "read" and args.format == "html":
+            sys.stdout.write(REPORT_PROJECTION._html(payload))
+        else:
+            print(REPORT_PROJECTION._human(payload))
         return 0
     if args.command == "verify":
         result = VERIFY.verify(args.manifest)

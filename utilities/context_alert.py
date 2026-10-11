@@ -1,0 +1,148 @@
+"""Non-blocking main-session notices from the latest request's input usage.
+
+500K/700K are absolute token thresholds, not historical usage or window ratios.
+A session jumping across both gets the urgent line; both thresholds are consumed.
+Only a new native session ID resets them. Adapters own user/model presentation.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+THRESHOLDS = (500_000, 700_000)
+
+
+def main_session(env=None) -> bool:
+    env = os.environ if env is None else env
+    from session_tidy import is_worker
+    return not is_worker(env) and env.get("AGENT_SESSION_ROLE", "").lower() not in {
+        "owner", "worker", "auxiliary", "reviewer",
+    }
+
+
+def input_tokens(usage: object, keys: tuple[str, ...]) -> int | None:
+    if not isinstance(usage, dict) or keys[0] not in usage:
+        return None
+    values = [usage.get(key, 0) for key in keys]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(value) or value < 0 for value in values):
+        return None
+    return int(sum(values))
+
+
+def claude_usage(transcript: object, session_id: str) -> int | None:
+    """Read the bounded tail, never another session or sidechain's usage."""
+    if not isinstance(transcript, str) or not transcript:
+        return None
+    try:
+        path = Path(transcript)
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        with path.open("rb") as handle:
+            start = max(0, info.st_size - 8 * 1024 * 1024)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            lines = handle.read().splitlines()
+        for raw in reversed(lines):
+            try:
+                row = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if (not isinstance(row, dict) or row.get("type") != "assistant"
+                    or row.get("isSidechain") or row.get("isMeta")
+                    or row.get("sessionId", session_id) != session_id):
+                continue
+            message = row.get("message")
+            # Missing latest usage is unknown; an older request is not current.
+            return input_tokens(message.get("usage") if isinstance(message, dict) else None, (
+                "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    except OSError:
+        pass
+    return None
+
+
+def notice(harness: str, session_id: str, tokens: int | None, *, state_dir=None, env=None) -> str:
+    """Atomically consume newly exceeded thresholds. Any unavailable state is silent."""
+    if (not main_session(env) or not session_id or not isinstance(tokens, int)
+            or isinstance(tokens, bool) or tokens <= THRESHOLDS[0]):
+        return ""
+    crossed = [threshold for threshold in THRESHOLDS if tokens > threshold]
+    base = Path(state_dir) if state_dir else Path(
+        os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state"
+    ) / "hearting/context-alert"
+    digest = hashlib.sha256(f"{harness}\0{session_id}".encode()).hexdigest()
+    target = base / (digest + ".json")
+    temporary = None
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        with target.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                seen = json.loads(target.read_text())
+            except FileNotFoundError:
+                seen = []
+            if not isinstance(seen, list) or any(item not in THRESHOLDS for item in seen):
+                return ""
+            fresh = [threshold for threshold in crossed if threshold not in seen]
+            if not fresh:
+                return ""
+            fd, temporary = tempfile.mkstemp(prefix=".context-alert-", dir=base)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(sorted(set(seen + crossed)), handle)
+            os.replace(temporary, target)
+            temporary = None
+        suffix = ("지금 /session-tidy로 정리하세요" if max(fresh) == THRESHOLDS[1]
+                  else "700K 전에 /session-tidy로 정리 권장")
+        return f"컨텍스트 약 {tokens / 1000:.0f}K — {suffix}"
+    except (OSError, ValueError, TypeError):
+        return ""
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def claude_notice(payload: dict) -> str:
+    if (payload.get("hook_event_name") != "UserPromptSubmit"
+            or payload.get("agent_id") or not main_session()):
+        return ""
+    sid = payload.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return ""
+    return notice("claude", sid, claude_usage(payload.get("transcript_path"), sid))
+
+
+def main() -> None:
+    # OpenCode supplies only the latest assistant's token fields, never bodies.
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict) or not isinstance(payload.get("session_id"), str):
+            return
+        usage = payload.get("tokens")
+        if not isinstance(usage, dict):
+            return
+        cache = usage.get("cache", {})
+        if not isinstance(cache, dict):
+            return
+        count = input_tokens({"input": usage.get("input"), "read": cache.get("read", 0),
+                              "write": cache.get("write", 0)}, ("input", "read", "write"))
+        text = notice("opencode", payload["session_id"], count)
+        if text:
+            print(text)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+if __name__ == "__main__":
+    main()

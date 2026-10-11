@@ -1214,7 +1214,7 @@ def _mutual_fallback_rollout(pid, sessions, home, paths, claimed):
         if (rival is sess or getattr(rival, "harness", None) != "codex"
                 or getattr(rival, "cwd", None) != sess.cwd or rival.pid in paths):
             continue
-        if candidates[0] in _fallback_candidates(rival, home, claimed, now):
+        if candidates[0] in _fallback_candidates(rival, home, claimed, now, rival=True):
             return None
     return candidates[0]
 
@@ -1343,6 +1343,9 @@ def process_rollouts(sessions, home):
         if getattr(sess, "harness", None) != "codex" or not getattr(sess, "cwd", None):
             continue
         path = _proc_rollout(sess.pid, sess.cwd, home)
+        # Role consumers need the native FD observation, separately from paths
+        # assigned by registry/start matching below. This does not change matching.
+        sess._fd_owner = bool(path)
         if not path:
             continue
         paths[sess.pid] = path
@@ -1539,9 +1542,23 @@ def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
             claimed.update(assigned_sids)
 
 
-def _fallback_candidates(sess, home, claimed, now):
-    """Unclaimed same-cwd root rollouts created since this process started."""
-    process_started = now - max(0, sess.elapsed_min) * 60
+def _fallback_candidates(sess, home, claimed, now, *, rival=False):
+    """Unclaimed same-cwd root rollouts created since this process started.
+
+    A rollout older than the process is not its own: a closed window's thread
+    in the same cwd is unclaimed, and a 300 s slack once handed it to the fresh
+    Codex started 61 s later (2026-10-10). The exact /proc start keeps the start
+    match's tolerance; without it, whole-minute `etime` widens by its rounding only.
+    A `rival` keeps the former slack: a resumed Codex holds no rollout fd and may
+    own an older thread, so it still makes a match ambiguous.
+    """
+    started = _process_started_at(sess)
+    if rival:
+        earliest = now - max(0, sess.elapsed_min) * 60 - 300
+    elif started is not None:
+        earliest = started - _START_MATCH_BEFORE_SEC
+    else:
+        earliest = now - (max(0, sess.elapsed_min) + 1) * 60
     candidates = []
     for path in _index(home).get(sess.cwd, []):
         sid = _sid(path)
@@ -1551,7 +1568,7 @@ def _fallback_candidates(sess, home, claimed, now):
         if _is_subagent(meta):
             continue
         created = _session_created(meta)
-        if created is not None and process_started - 300 <= created <= now + 300:
+        if created is not None and earliest <= created <= now + 300:
             candidates.append(path)
     return candidates
 
@@ -2176,8 +2193,8 @@ def enrich(sess, tick=None):
             path = _fallback_rollout(sess, home)
     if not path:
         if sess.session_id:
-            from fleet.session_handle import minted_tag
-            sess.session_tag = minted_tag(sess.session_id)
+            from fleet.session_handle import resolve_tag
+            sess.session_tag = resolve_tag("codex", sess.session_id)
         return                           # no rollout-specific telemetry for this session
     rollout_model, rollout_effort = _rollout_model_effort(path)
     if rollout_model:
@@ -2192,6 +2209,9 @@ def enrich(sess, tick=None):
     # B-3: a tier-1 session_registry sessionId (set above) outranks the rollout's —
     # preserve it instead of unconditionally overwriting with the rollout-derived id.
     sess.session_id = sess.session_id or _sid(path)
+    if sess.session_id == _sid(path):
+        from .. import session_cwd
+        session_cwd.observe(sess, session_cwd.jsonl_cwd(path, "codex", sess.session_id), sess.session_id)
     sess._transcript_path = path                 # ephemeral: live title scheduler, not --json
     sess._refresh_source = {"kind": "transcript", "harness": "codex",
                             "session_id": sess.session_id, "path": path,
@@ -2200,8 +2220,8 @@ def enrich(sess, tick=None):
         from fleet import titles
         # F-100b — Codex exposes no derived `<basename>-<xx>` name, so the tag behind the
         # `[xx]` badge is minted from the thread id. Deterministic, so nothing is stored.
-        from fleet.session_handle import minted_tag
-        sess.session_tag = minted_tag(sess.session_id)
+        from fleet.session_handle import resolve_tag
+        sess.session_tag = resolve_tag("codex", sess.session_id)
         sidecar_title = _displayable_title(
             titles.last_title(sess.session_id, harness="codex")
         )

@@ -144,6 +144,12 @@ hard eligibility.
 
 `utilities/dispatch-route.sh` is read-only and emits stable key/value trace, rejected, fallback, and unknown records. It does not register, launch, or mutate caches or worktrees. Without an adapter probe, OpenCode remains `unknown` rather than guessed.
 
+For a staged route with a fixed owner harness, readiness checks that owner as
+the conductor of its workers, even when a different harness composed the route
+or its frame supplied the first evidence. Ordinary start fills missing checked
+evidence through the existing pin journal, retaining the sealed route and intent.
+A repeated pin may supply missing evidence without changing the choice.
+
 ### §2.2. Adapter Mapping
 
 Every adapter maps portable roles and execution profiles to runtime models, tools, and prompt profiles as a quality-reproduction contract. A route-bound dispatch always carries both axes; wrappers do not infer the execution budget from role wording or silently inherit the interactive model; a model differs from the profile default only through a route-sealed pin (receipt `model_source=pin`, `model_pin_status=`) or a checked capacity retry, not through a launch-time flag. Update and read core before changing adapter maps or generated agents.
@@ -236,6 +242,10 @@ For standard+ code stage dispatch, role and profile are explicit: ordinary frame
 3. Adversarial means thorough plus a selected external adversary, failure-mode, security, or claim-verification pass. `standard + external/Codex` is not the definition.
 4. Code has no fact-checker.
 5. Do not hardcode code-test to thorough or parallel QA on every call; scale final verification from intensity-derived rigor. Registry-v6 `parallel_groups` alone declare an anchor's intensity-specific width, profile, perspective, join, and independence axes. At `strong` or higher, assembly defaults to realizing each eligible declared group on a retained anchor, including reduced `--graph` routes; two-way is the baseline unless the registry widens it. Width stays 2–4, is selective rather than universal, and never applies to `direct`; at `quick` it reaches the bootstrap layer alone — the two frame legs before owner launch — and not quick's work graph, which stays exactly one `one-shot` node.
+   Missing review consumers or auxiliary arbiters are restored from the group's
+   unique safe recipe consumer, with existing gates, scopes, and fan-in; compose
+   reports the addition. Only unsafe or ambiguous completions remain warnings
+   (`WORKFLOW §0.2.1`). Standard/lower and sealed historical graphs keep their shape.
 6. `--no-fact-check` and `--no-style-audit` must not leak to unrelated capabilities.
 7. An external review wrapper is not the reviewer; separate the independent engine from the mechanical orchestrator.
 8. New or strengthened instructions, rules, and hooks preserve why, including the motivating incident and date, inline or in the commit message. Drills are the strongest executable preservation of intent.
@@ -311,6 +321,33 @@ and inventory-bound hashes. Publisher and dry-run backfill receive explicit
 project, experiment, and version values and never infer version from paths or
 timestamps.
 
+Read-only report status is a separate projection over recorded evidence. It
+distinguishes an absent report from an existing report whose work cycle is still
+open. Fleet shows meaningful observations in the user's language inside the
+owner card; internal reason codes remain available in structured diagnostics.
+The owner's NOW and resource rows share the same observed location judgment.
+An empty registered log has no output freshness; its creation time describes
+the file, without a progress claim.
+It keeps scientific verification (`PASS`, `FAIL`, or unresolved), operational
+completion (complete, pending, blocked, unknown, or not applicable), and
+required-input observation (confirmed, failed, or unresolved) as independent
+axes. A current authoritative `FAIL` remains `FAIL` when work completed or
+resources ran successfully. Missing, stale, malformed, conflicting, or
+wrongly bound evidence cannot produce `PASS`; prior verdicts and report bytes
+remain unchanged. Bind every displayed judgment to the exact selected report
+artifact revision and input digests through existing lineage and currency
+readers. A status query reads existing completion and obligation state without
+creating a verification round, route, proof, input, publication, or durable
+display record. Execution compatibility with gates off does not attest evidence
+integrity: read observations retain tombstones, hash/history conflicts, and
+unverified lineage independently of execution permission. A terminal review
+FAIL needs its exact readable attempt and input binding, not a PASS completion
+marker. Historical verdicts require bytes bound to the historical evidence
+digest; unavailable originals remain unresolved. Required input observation
+is confirmed only when every required peer input/output was observed, even
+when another peer establishes FAIL. Existing unverified/fallback limitations
+travel with the read payload without adding execution requirements.
+
 Schema v2 stays exact: experiment logs, report documents, and media are ordinary
 members of `files[]`; adding them never adds manifest properties or creates a
 new schema version. A publishable experiment bundle keeps original logs under
@@ -334,7 +371,16 @@ most 1,048,576 bytes; `files` and `media` are each capped at 10,000 rows.
 
 Publication copies into a sibling staging directory, hashes each regular
 single-link file through one descriptor, verifies the closed staged inventory,
-and uses an atomic same-filesystem no-replace rename. Existing identical
+and uses an atomic same-filesystem no-replace rename. Shared directory
+publication uses `utilities/atomic_publish.py`: prefer `RENAME_NOREPLACE`;
+on `EINVAL`, `ENOSYS`, or `EOPNOTSUPP`, recheck destination absence and use
+ordinary atomic rename while holding the publication lock. Bundle publishers
+share a persistent parent lock; producer operations retain their existing root
+admission locks. Locks serialize cooperating writers, including empty-directory
+collisions; concurrent mutation by an unrelated writer is outside this fallback's
+exclusivity guarantee. Other syscall errors remain failures. Regular-file
+publication retains its exclusive create or no-replace hard link.
+Existing identical
 versions are unchanged; collisions fail closed. Consumers mount the bundle root
 read-only. A periodic full verifier records per-bundle state only on a health
 transition (`healthy|broken|checking` with machine reason codes); unchanged
@@ -709,9 +755,9 @@ When `spec/pipeline_state.yaml` exists, read it and activate every applicable ap
 
 **W7C cycle layout.** The output paths above are bucket-relative. While the producer cutover is inactive they resolve to the legacy top-level bucket; once active they resolve to `campaigns/<campaign-locator>/<cycle-locator>/artifacts/<bucket>/…` of the cycle issued by `utilities/artifact_producer.py begin`; the machine-managed `.cycle.json` beside `artifacts/` binds that renameable locator to its stable IDs and records its start time (see `core/CORE.md §3` and `producer_lifecycle` in `capabilities/topologies.json`). Only `spec`, `analysis`, and explicitly promoted `research` reach the immutable `shared/` tree, via `admit-shared` from a sealed cycle.
 
-**Campaign or cycle.** A cycle is the deterministic D-23 unit of one route's work; a campaign is the agent's proposal for the work stream. `compose` takes that proposal from `--campaign-key <stream>` (a folder name or close spelling joins the matching active stream), else from this session's latest route in the same artifact root, else refuses with `compose-campaign-key-required` and the root's active keys; `--parent-cycle` inherits the predecessor's campaign and `--unassigned` opts out explicitly; the same `compile` option remains optional. The sealed route carries the choice to the owner's `begin`. Explicit `begin --campaign-key`/`--campaign` remains supported and must agree with the route and parent. With no selection, `begin` uses the root's `_unassigned` campaign with `degraded=true`; this container asserts no shared goal. A new campaign's locator, slug and title come from its key (`<date>_<key-slug>`, `slug_source=campaign-key`); the route slug names only the cycle under it. `--parent-cycle` may name an open or sealed cycle of the same active campaign and records its state at admission. It carries causality only, never permission to consume mutable inputs or skip completion gates. A partial `compose --graph` keeps an input whose producer stage was left out when the parent cycle (else the campaign's latest cycle) holds a same-named output, sealing it as node `input_sources` shown on the `[경로]` card and stage brief, and route artifact env adds `AGENT_ARTIFACT_PARENT_OUTPUT_DIR`; both only name where to read, and nothing found leaves the route unchanged. A borrowed `capability:stage` part seals `part`, `part_io` (original name → path in this route) and, when its catalog row declares one, `start_approval` on the node; a route that uses no catalog part carries none of them. A linked child may produce output while its parent is open, but final manifest admission waits for the parent to seal; use the shared key without a parent edge for independent work. Name the stream, such as `tts-v6-release`, in the key and the bounded task in the date-free slug; record the predecessor and exact input revision to preserve why the next cycle exists. Session, capability and route-family identity never imply one campaign. Existing campaigns are unchanged; artifact-path-contract §27.2 owns the complete contract. A cycle's work closes in the order `complete` → `close` → `finalize`; a cycle sealed before its route closed cannot become `completed`, and campaign closure discloses it as `sealed-unproven`.
+**Campaign or cycle.** A cycle is the deterministic D-23 unit of one route's work; a campaign is the agent's proposal for the work stream. `compose` takes that proposal from `--campaign-key <stream>` (a folder name or close spelling joins the matching active stream), else from this session's latest route in the same artifact root, else refuses with `compose-campaign-key-required` and the root's active keys; `--parent-cycle` inherits the predecessor's campaign and `--unassigned` opts out explicitly; the same `compile` option remains optional. The sealed route carries the choice to the owner's `begin`. Explicit `begin --campaign-key`/`--campaign` remains supported and must agree with the route and parent. With no selection, `begin` uses the root's `_unassigned` campaign with `degraded=true`; this container asserts no shared goal. A new campaign's locator, slug and title come from its key (`<date>_<key-slug>`, `slug_source=campaign-key`); the route slug names only the cycle under it. `--parent-cycle` may name an open or sealed cycle of the same active campaign and records its state at admission. It carries causality only, never permission to consume mutable inputs or skip completion gates. A partial `compose --graph` reuses same-named omitted outputs from the selected parent (else campaign history), sealing them as node `input_sources` on the `[경로]` card and stage brief; `AGENT_ARTIFACT_PARENT_OUTPUT_DIR` names their read location. A fresh frameless graph takes frame briefs only from an explicit parent or `--route-plan` proposal; locating an input approves no direction. Nothing found leaves the route unchanged. A borrowed `capability:stage` part seals `part`, `part_io` (original name → path in this route) and, when its catalog row declares one, `start_approval` on the node; a route that uses no catalog part carries none of them. A linked child may produce output while its parent is open, but final manifest admission waits for the parent to seal; use the shared key without a parent edge for independent work. Name the stream, such as `tts-v6-release`, in the key and the bounded task in the date-free slug; record the predecessor and exact input revision to preserve why the next cycle exists. Session, capability and route-family identity never imply one campaign. Existing campaigns are unchanged; artifact-path-contract §27.2 owns the complete contract. A cycle's work closes in the order `complete` → `close` → `finalize`; a cycle sealed before its route closed cannot become `completed`, and campaign closure discloses it as `sealed-unproven`.
 
-**Campaign size.** A campaign is a stream whose closing condition can be stated in one sentence when `compose` names the key — `v4.1 revision: closed when co-author feedback is applied`, `tts-v6-release: closed when v6 ships`. A key that cannot close within weeks is too large (a project or repository name is not a key); work that ends with one cycle is too small (join the stream it serves). Follow-up cycles name their predecessor with `--parent-cycle` so a round reads as one chain. Once the condition is met, the agent closes the stream with `artifact_producer.py campaign-close --reason`; the next cycle on the same key reopens it automatically. Dozens of active keys signal unclosed or over-split streams, not an invitation to join the largest one.
+**Campaign size.** A campaign is a stream whose closing condition can be stated in one sentence when `compose` names the key — `v4.1 revision: closed when co-author feedback is applied`, `tts-v6-release: closed when v6 ships`. A key that cannot close within weeks is too large (a project or repository name is not a key); work that ends with one cycle is too small (join the stream it serves). Follow-up cycles name their predecessor with `--parent-cycle` so a round reads as one chain. Once the condition is met, the agent closes the stream with `artifact_producer.py campaign-close --reason`; the next cycle on the same key reopens it automatically. An owner's normal settlement may record that same close when its own final report already states the goal judgment explicitly — sealed cycles alone leave the goal judgment unset. Dozens of active keys signal unclosed or over-split streams, not an invitation to join the largest one.
 
 ### §6.5-anchors. Anchor Resolution
 

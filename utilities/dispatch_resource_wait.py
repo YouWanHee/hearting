@@ -28,6 +28,9 @@ def supervisor():
 
 def start_binding(route, route_file, args, environ):
     """Use the normal registered owner identity, never labels or a guessed SID."""
+    import route_parent_close
+    if route_parent_close.intent(route, args.jobs or environ.get("AGENT_DISPATCH_JOBS")):
+        raise ValueError("cancelled-by-parent")
     import owner_route_binding as OWNER
     from dispatch_contract import resolve_live_parent_attempt
     from dispatch_owner_input import inspect, PLACEHOLDER_THREAD
@@ -86,6 +89,38 @@ def resource_body_digest(row):
     return RESUME.row_digest(body)
 
 
+def resource_execution_finished(row):
+    from route_authority import resource_predecessor_finished
+    return resource_predecessor_finished(row)
+
+
+def resource_execution_succeeded(row):
+    """A past status word cannot substitute for the exact exit and sentinel."""
+    return (resource_execution_finished(row)
+            and supervisor().runner().read_sentinel(row.get("sentinel")) == 0)
+
+
+def resource_evidence_paths_conflict(left, right):
+    """Protect prior evidence across path roles, symlinks, and hard links."""
+    def paths(row):
+        values = [row.get(key) for key in ("log", "sentinel", "progress_file") if row.get(key)]
+        return [Path(path).resolve(strict=False) for value in values
+                for path in (value, value + ".partial")]
+    a, b = paths(left), paths(right)
+    if set(a) & set(b):
+        return True
+    def inodes(values):
+        result = set()
+        for path in values:
+            try:
+                stat = path.stat()
+                result.add((stat.st_dev, stat.st_ino))
+            except FileNotFoundError:
+                pass
+        return result
+    return bool(inodes(a) & inodes(b))
+
+
 def controller_intent(row):
     return ((row.get("owner_wait") or {}).get("launch_scope") == "codex-owner-controller"
             and row.get("launch_state") in {"queued", "claimed"}
@@ -101,6 +136,7 @@ def resource_key(row):
 def context(args, control):
     """Read only exact armed records under the current owner route and registry."""
     import owner_route_binding as OWNER
+    from resource_run_registry import resource_never_started
     route_file = getattr(args, "route_file", "")
     if not route_file or not Path(route_file).is_file():
         return None
@@ -140,7 +176,7 @@ def context(args, control):
                 or row.get("parent_attempt_id") != args.parent_attempt_id
                 or row.get("route") != binding.route_file or row.get("node") != node
                 or row.get("jobs") != str(jobs) or not row.get("command")
-                or not (controller_intent(row) or
+                or not (controller_intent(row) or resource_never_started(row) or
                         (type(row.get("pid")) is int and row["pid"] > 0 and row.get("starttime")))
                 or (row.get("pid_namespace") is not None and
                     row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))
@@ -183,6 +219,9 @@ def admit_controller_launch(args, control, armed, row, delivered=()):
     def guard():
         with INPUT._locked(args.jobs, args.parent_attempt_id) as (_, value):
             parent, target = INPUT._target(args.jobs, args.parent_attempt_id)
+            import route_parent_close
+            if route_parent_close.row_requested(parent.metadata, args.jobs):
+                raise runner.LaunchDeferred("cancelled-by-parent")
             live = proc_identity(owner["owner_pid"])
             if (value is None or value.get("target") != target or
                     value.get("thread_id") != control.thread_id or parent.status not in {"open", "running"}
@@ -208,11 +247,23 @@ def admit_controller_launch(args, control, armed, row, delivered=()):
         return
     command, sandbox = command_builder(row)
     controller = SimpleNamespace(expected=row, identity=identity, command=command,
-                                 sandbox=sandbox, guard=guard)
+                                 sandbox=sandbox, guard=guard, registry=armed["resource_registry"])
     # Tool receipts stay in the native tool response; the outer stream contains
     # only its existing typed controller events, not a second raw CLI receipt.
     with contextlib.redirect_stdout(io.StringIO()):
-        runner.main(runner.controller_argv(armed["resource_registry"], row), controller=controller)
+        try:
+            runner.main(runner.controller_argv(armed["resource_registry"], row), controller=controller)
+        except (Exception, SystemExit):
+            # The runner settles its own pre-release failures before raising.
+            # Let the ordinary resource outbox carry that failure to this same
+            # owner. Unsettled/foreign rows and errors after release still raise.
+            from resource_run_registry import resource_never_started
+            actual = json.loads(Path(armed["resource_registry"]).read_text())["runs"].get(row["run_id"])
+            if (not isinstance(actual, dict) or not resource_never_started(actual)
+                    or resource_body_digest(actual) != resource_body_digest(row)
+                    or actual.get("share") != row.get("share")
+                    or actual.get("launch_controller") != identity):
+                raise
     if hasattr(controller, "children"):
         owned = getattr(args, "resource_children", None)
         if owned is None:
@@ -235,6 +286,7 @@ def pending_prompt(path, parent, args=None, control=None):
     box = (state.resource or {}).get("outbox") if state else None
     if not box:
         return None
+    row = None
     if args is not None and control is not None:
         receipt = box["receipt"]
         expected = {"parent_attempt_id": parent, "session_id": control.thread_id,
@@ -242,13 +294,35 @@ def pending_prompt(path, parent, args=None, control=None):
                     "jobs": str(Path(args.jobs).resolve())}
         found = context(args, control)
         row = next((r for _, r in found[3] if resource_key(r) == box["key"]), None) if found else None
+        if row is None and found and found[3]:
+            sup, route, ledger, _ = found
+            for armed, prior in sup.resource_predecessors(ledger, receipt["node"]):
+                owner = prior.get("owner_wait") or {}
+                if (armed.get("route_id") == args.route_id and armed.get("route_hash") == args.route_hash
+                        and armed.get("route_file") == str(Path(args.route_file).resolve())
+                        and armed.get("jobs") == expected["jobs"]
+                        and armed.get("successor_external") is True
+                        and armed.get("successor_command") is None
+                        and prior.get("resource_policy") == "supervised-owner"
+                        and prior.get("parent_attempt_id") == parent
+                        and owner.get("parent_attempt_id") == parent
+                        and owner.get("session_id") == control.thread_id
+                        and resource_key(prior) == box["key"]
+                        and resource_execution_finished(prior)):
+                    row = prior
+                    break
         if (any(receipt.get(k) != v for k, v in expected.items()) or row is None
                 or RESUME.row_digest(row) != receipt.get("resource_sha256")):
             raise JOIN.JoinContractError("resource-outbox-binding-changed")
+    from resource_run_registry import resource_never_started
+    next_work = ("The payload never started. Preserve this failed run, address its launch diagnostic, "
+        "recheck current inputs through the existing smoke/config verification, "
+        "and use the normal distinct __a<N> resource retry for unfinished authorized work. "
+        "Do not rerun completed stages." if row is not None and resource_never_started(row) else
+        "Continue only the already authorized next work; do not restart the resource.")
     return ("Runtime resource receipt (not a model child or verification PASS): "
         + json.dumps(box["receipt"], sort_keys=True, separators=(",", ":"))
-        + "\nUse pending user corrections first. Continue only the already authorized next work; "
-        "do not restart the resource. Exit is not workflow completion.")
+        + "\nUse pending user corrections first. " + next_work + " Exit is not workflow completion.")
 
 
 def acknowledge(path, parent, receipt_id):
@@ -329,7 +403,12 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
         evidence = sup.resource_evidence(armed)
         stage = ledger.state().get("nodes", {}).get(armed["node"], {})
         lost_watch = not RESUME.supervisor_alive(row.get("supervision"))
-        if stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
+        if lost_watch and evidence.get("liveness") == "working":
+            recovery = sup.reattach_resource_watch(route, ledger, armed)
+            lost_watch = not (recovery and recovery.get("supervisor_alive"))
+        intermediate = (stage.get("state") == "RUNNING"
+                        and (stage.get("evidence") or {}).get("awaiting_next_resource") is True)
+        if intermediate or stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
             current_rows = context(args, control)[3]
             receipt_row = next((r for _, r in current_rows if resource_key(r) == key), None)
             if receipt_row is None:
@@ -340,15 +419,20 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
                 and sup.runner().read_sentinel(receipt_row.get("sentinel")) == 0
                 and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row)
                 and not artifact.get("missing"))
+            execution_only = (intermediate and evidence.get("succeeded")
+                and resource_execution_succeeded(receipt_row)
+                and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row))
             outcome = ("cancelled" if receipt_row.get("cancel_requested") else
-                       "succeeded" if proven else "needs-attention")
+                       "succeeded" if proven or execution_only else "needs-attention")
             receipt = {"type": "resource-completion", "parent_attempt_id": args.parent_attempt_id,
                 "session_id": control.thread_id, "route_id": args.route_id, "route_hash": args.route_hash,
                 "jobs": str(Path(args.jobs).resolve()), "node": armed["node"], "run_id": row["run_id"],
                 "resource_key": key, "resource_sha256": RESUME.row_digest(receipt_row), "state": outcome, "exit_code": evidence.get("exit_code"),
-                "reason": "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
+                "reason": "awaiting-next-resource" if execution_only else
+                    "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
+                **({"launch_error": receipt_row["launch_error"]} if receipt_row.get("launch_error") else {}),
                 "verification_pass": False, "workflow_complete": False,
-                "successors": list(armed["successors"]) if outcome == "succeeded" else []}
+                "successors": list(armed["successors"]) if proven else []}
             digest = RESUME.row_digest(receipt)
             resource["outbox"] = {"receipt_id": "resource-" + digest[:32], "digest": digest,
                                   "key": key, "receipt": receipt}

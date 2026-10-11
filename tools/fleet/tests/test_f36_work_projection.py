@@ -137,7 +137,8 @@ class WorkProjectionTest(unittest.TestCase):
                 with self.subTest(width=width):
                     self.assertIn("claim-a", text)
                     self.assertIn("claim-b", text)
-                    self.assertIn("{claim-a,claim-b}", text)
+                    if width >= 100:  # narrower rows keep each branch in its child row
+                        self.assertIn("{claim-a,claim-b}", text)
                     self.assertNotIn("stage autopilot-code", text)
         finally:
             render.set_process_view(False)
@@ -576,7 +577,9 @@ class WorkProjectionTest(unittest.TestCase):
         lines = render._build_lines([], jobs, section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = "\n".join("".join(token for token, _kind in line)
-                         for line in lines if line)
+                         for line in lines if line and any(
+                             any(mark in token for mark in ("╭", "│", "├", "╰"))
+                             for token, _kind in line))
         for stage in ("plan", "execute", "test", "report"):
             self.assertIn(stage, text)
         self.assertNotIn("preparing…", text)

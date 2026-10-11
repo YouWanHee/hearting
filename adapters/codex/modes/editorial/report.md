@@ -64,6 +64,12 @@ report, draft finalize) — it writes for the reader, it does not judge.
 - **No new QA.** Verification happened upstream. Do not re-review, re-test, or add
   findings. If an input is missing, contradictory, or unreadable, return `blocked` with
   the exact gap instead of papering over it.
+- **Status is a read projection.** Report assembly does not judge scientific success or
+  operational completion. When a consumer needs current status, display the existing
+  verification verdict, completion state, and required-input observation as separate
+  values from the shared read-only projection. Preserve the report and review bytes;
+  never rewrite a pending body, refine it, or request another verification round just
+  to make the display agree.
 - **Voice and language** follow `_voice.md` (audience-language first, rhythm rules,
   return discipline). Structure the report for the reading audience: outcome first,
   evidence next, remaining risk last.

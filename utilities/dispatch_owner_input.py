@@ -103,11 +103,19 @@ def _reachable(row, value, live):
     return live or (row.status in {"open", "running"} and _preconsumer(value))
 
 
-def _answers_blocked_owner(row, live):
+def _answers_blocked_owner(row, live, jobs=None):
     """An owner that ended BLOCKED, or with a readable FAIL, waits for a person, not gone
     (`route_authority.answerable_owner_end`): a correction sent to it is kept (`retained`) and
     the next start continues the route with it (dispatch_replacement)."""
-    return not live and bool(route_authority.answerable_owner_end(row.status, row.metadata))
+    if live:
+        return False
+    if route_authority.answerable_owner_end(row.status, row.metadata):
+        return True
+    # A correction to an exactly exited owner belongs to the same continuation.
+    # Keep successful, cancelled, live and unobservable owners out of this path.
+    from route_parent_close import owner_continuation_processes
+    return (route_authority.runtime_owner_can_resume(row.status, row.metadata)
+            and owner_continuation_processes(row.metadata, jobs)[0].state == "quiescent")
 
 
 def _owner_phase(attempt):
@@ -176,6 +184,11 @@ def submit(jobs, attempt, text, request_id=None):
     request_id = request_id or "input-" + _digest([attempt, digest])[:32]
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
         raise InputError("correction-id-invalid")
+    if row.status in {"open", "running"} and not supervisor_lease_is_held(jobs, row.metadata):
+        # Settlement takes the jobs lock before input admission takes its own
+        # lock. Storage failures leave the same open row available for retry.
+        from dispatch_completion_join import settle_finished_attempt
+        settle_finished_attempt(Path(jobs), row)
     with _locked(jobs, attempt) as (path, value):
         if value is None:
             raise InputError("owner-input-unsupported")
@@ -196,7 +209,7 @@ def submit(jobs, attempt, text, request_id=None):
         retain = False
         if (not value["accepting"] or row.status not in {"open", "running"}
                 or not _reachable(row, value, live)):
-            if not _answers_blocked_owner(row, live):
+            if not _answers_blocked_owner(row, live, jobs):
                 raise InputError("owner-input-unavailable-retain-correction")
             retain = True
         item = {"id": request_id, "digest": digest, "text": text, "events": [],
@@ -212,7 +225,7 @@ def _retained_fields(item):
     if item["state"] != "retained":
         return {}
     return {"retained": True,
-            "next_step": "The owner had ended (BLOCKED, or with a FAIL a person may answer with a fix); "
+            "next_step": "The owner had ended; "
                 "this answer is kept for it. Starting the route continues the work in a replacement "
                 "owner that receives this answer first."}
 
@@ -247,7 +260,7 @@ def blocked_owner_answers(jobs, attempt):
         row, _ = _target(jobs, attempt)
     except (InputError, JoinContractError, OSError, ValueError, KeyError):
         return []
-    if not _answers_blocked_owner(row, supervisor_lease_is_held(jobs, row.metadata)):
+    if not _answers_blocked_owner(row, supervisor_lease_is_held(jobs, row.metadata), jobs):
         return []
     return retained(jobs, attempt)
 

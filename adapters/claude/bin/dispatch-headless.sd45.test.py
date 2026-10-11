@@ -736,7 +736,7 @@ class ForegroundReviewStartPathTest(unittest.TestCase):
                 with self.subTest(key=key):
                     env = dict(environment)
                     extra = []
-                    expected_value = str(route_file) if key == "route_file" else "bound"
+                    expected_value = str(route_file) if key in ("route_file", "owner_route_file") else "bound"
                     if key == "route_file":
                         extra.extend(["--route-file", str(route_file)])
                     elif key.startswith("owner_route_"):
@@ -752,7 +752,7 @@ class ForegroundReviewStartPathTest(unittest.TestCase):
 
                     owner_binding = types.SimpleNamespace(route_file="", route_id="", route_hash="")
                     if key.startswith("owner_route_"):
-                        setattr(owner_binding, key.removeprefix("owner_"), "bound")
+                        setattr(owner_binding, key.removeprefix("owner_"), expected_value)
                     reservation = ({"batch_group": "fixture-group", key: "bound"}
                                    if key.startswith("batch_") else {})
 
@@ -761,7 +761,7 @@ class ForegroundReviewStartPathTest(unittest.TestCase):
                     def append_with_binding(jobs_path, args):
                         if key.startswith("owner_route_"):
                             args.owner_route_binding = owner_binding
-                            self.assertEqual(getattr(args.owner_route_binding, key.removeprefix("owner_")), "bound")
+                            self.assertEqual(getattr(args.owner_route_binding, key.removeprefix("owner_")), expected_value)
                         return real_append(jobs_path, args)
                     def claim_and_check(jobs_path, attempt_id, row, **kwargs):
                         metadata = WH.parse_registry_metadata(row.split("\t", 5)[5])

@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -648,6 +649,9 @@ def _projection_from_record(entity, record, route_id, jobs, node_evidence=None, 
         progress=ProgressProjection(sum(n.get("state") == "done" for n in work_nodes), len(work_nodes)),
         scope_node_ids=scope_ids,
         _route_view={"record": record, "nodes": nodes, "view": view},
+        result=route.result_projection(record, route.load_outcome(
+            _field(entity, "owner_route_file") or _field(entity, "route_file"),
+            record.get("route_id"), record.get("route_hash"))),
     )
 
 
@@ -679,6 +683,10 @@ def _artifact_reader():
 
 
 def _artifact_candidates(entity, artifact_root=None):
+    # A matching basename is never a session/work binding. Registered jobs
+    # retain their scoped compatibility lookup; anonymous processes do not.
+    if isinstance(entity, Session):
+        return []
     slug = _field(entity, "slug") or _field(entity, "key")
     if not slug:
         return []
@@ -1647,10 +1655,41 @@ def resolve_projection(*args, **kwargs):
 def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                       route_records=None, node_evidence=None, artifact_root=None, now=None,
                       spec_markers=None, spec_marker_home=None,
-                      capability_groundings=None, degradations=None, resources=None):
+                      capability_groundings=None, degradations=None, resources=None,
+                      fast_first=False):
     """Attach work to every row and exact-owned context to live cards."""
     sessions, jobs = list(sessions), list(jobs)
     _attach_resource_children(jobs, resources)
+    if fast_first:
+        # Exact observation comes first. Route authority/progress stays unknown
+        # until detail collection verifies it; resources already own exact attempts.
+        for entity in sessions + jobs:
+            entity._details_pending = True
+            owned = isinstance(entity, Session) or (entity.source == "plugin-queue"
+                    or getattr(entity, "_dispatch_context_owned", False))
+            if owned:
+                entity.context, entity._context_evidence = normalize_context(
+                    _evidence(entity), now=now, live=_is_live(entity))
+            else:
+                entity.context = None
+                entity._context_evidence = None
+            rid = _field(entity, "owner_route_id") or _field(entity, "route_id")
+            rhash = _field(entity, "owner_route_hash") or _field(entity, "route_hash")
+            entity.work_projection = WorkProjection(
+                source="registry-exact" if rid else "none", route_id=rid,
+                route_hash=rhash, route_node=_field(entity, "route_node"),
+                attempt_id=_field(entity, "attempt_id"), node_state="unknown")
+            if isinstance(entity, DispatchJob):
+                entity.stage = None
+                observed = ((_field(entity, "state_evidence") or {}).get("inputs") or {}).get(
+                    "observed_liveness") or {}
+                if entity.liveness == "idle" and observed.get("state") == "parked-supervised":
+                    children = _working_resources_for_record(
+                        {"route_id": rid, "route_hash": rhash}, [entity])
+                    if children:
+                        entity.resource_wait = {"state": "resource-parked", "nodes": list(children),
+                            "run_ids": [r.run_id for group in children.values() for r in group]}
+        return sessions, jobs
     route_records = _load_evidence_records(node_evidence, route_records, sessions + jobs)
     home = spec_marker_home or _grounding_home()
     if spec_markers is None:
@@ -1697,6 +1736,7 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     round_token = _ROUND_SCOPE.set(
         route.RoundScope(route_records, node_evidence or {}, tuple(jobs))
     )
+    report_verification_cache = {}
     try:
         for entity in all_entities:
             entity.work_projection = resolve_work_projection(
@@ -1705,6 +1745,32 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
                 spec_markers=spec_markers,
                 cap_grounding=(entity.cap_grounding if isinstance(entity, Session) else None),
                 degradations=degradations)
+            work = entity.work_projection
+            route_view = getattr(work, "_route_view", None) or {}
+            route_record = route_view.get("record") if isinstance(route_view, dict) else None
+            if (work.source == "route-exact" and not work.ambiguity
+                    and work.route_id and work.route_hash and isinstance(route_record, dict)
+                    and route_record.get("route_id") == work.route_id
+                    and route_record.get("route_hash") == work.route_hash):
+                root = (_field(entity, "artifact_root") or route_record.get("artifact_root")
+                        or artifact_root)
+                launch = route_record.get("launch_compatibility_tuple") or {}
+                jobs_binding = launch.get("jobs_path") or {}
+                jobs_path = (os.environ.get("AGENT_DISPATCH_JOBS")
+                             or (jobs_binding.get("path") if isinstance(jobs_binding, dict) else None))
+                if root:
+                    cache_key = (str(root), work.route_id, work.route_hash, str(jobs_path or ""))
+                    if cache_key not in report_verification_cache:
+                        try:
+                            from utilities.report_verification_projection import (
+                                project_route, report_detail_payload)
+                            report_verification_cache[cache_key] = report_detail_payload(project_route(
+                                root, work.route_id, work.route_hash, jobs=jobs_path))
+                        except Exception:
+                            report_verification_cache[cache_key] = None
+                    if report_verification_cache[cache_key] is not None:
+                        entity.work_projection = replace(
+                            work, report_verification=report_verification_cache[cache_key])
             entity.stage = (entity.work_projection.stage_label
                             if isinstance(entity, DispatchJob) else getattr(entity, "stage", None))
             if isinstance(entity, DispatchJob):
@@ -1712,6 +1778,24 @@ def attach_projections(sessions: Iterable[Session], jobs: Iterable[DispatchJob],
     finally:
         _ROUND_SCOPE.reset(round_token)
     return sessions, jobs
+
+
+def terminal_route_entities(node_evidence, degradations=None):
+    """Project observed routes without rows before publishing the snapshot."""
+    carriers = []
+    for rid, nodes in (node_evidence or {}).items():
+        evidence = next(iter((nodes or {}).values()), {})
+        route_file = evidence.get("route_file") if isinstance(evidence, dict) else None
+        node = next(iter((nodes or {}).keys()), None)
+        if not route_file or not node:
+            continue
+        carrier = DispatchJob(key="", slug="", route_id=rid, route_file=route_file,
+                              route_hash=evidence.get("route_hash"), route_node=node,
+                              liveness="done")
+        attach_projections([], [carrier], node_evidence=node_evidence,
+                           degradations=degradations, now=time.time())
+        carriers.append(carrier)
+    return carriers
 
 
 attach_work_projections = attach_projections

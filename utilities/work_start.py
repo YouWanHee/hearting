@@ -379,6 +379,26 @@ def validate_request(value):
     return value
 
 
+def continuation_work_request(route, jobs):
+    """Read the original request for a legacy continuation, without rewriting it.
+
+    New continuations already inherit work_request. BC's older continuation
+    lacked it, so the same normal start could not automatically attach an owner.
+    """
+    current, seen = route, set()
+    while current.get("work_request") is None:
+        source_id, source_hash = current.get("source_route_id"), current.get("source_route_hash")
+        if not source_id or not source_hash or source_id in seen:
+            return validate_request(None)
+        seen.add(source_id)
+        module = _route_module()
+        source_path = module.resolve_route_argument(source_id, jobs)
+        current = module.verify_route(json.loads(Path(source_path).read_text()))
+        if (current.get("route_id"), current.get("route_hash")) != (source_id, source_hash):
+            return validate_request(None)
+    return validate_request(current["work_request"])
+
+
 def group_context_matches_campaign(route, context):
     """Check an explicit context against selection; never infer one from a parent."""
     import artifact_producer as producer
@@ -468,7 +488,8 @@ def _start(route, path, jobs, node, harness, run):
                "--attempt-id", attempt_id(route, node)]
     if node == "owner" or not route.get("artifact_root"):
         # A route with no artifact root has no runtime home for a prompt file; every sealed route has one.
-        task = route["work_request"]["text"]
+        task = (route["work_request"] if "work_request" in route
+                else continuation_work_request(route, jobs))["text"]
         if RESOURCE_RESUME.route_selected(route):
             task += RESOURCE_RESUME.verification_prompt(route, jobs)
         command += ["--prompt-text", task]
@@ -716,6 +737,11 @@ def _capacity_pause(result, attention, resume):
 
 def _outcome(jobs, aid):
     state = current_delivery_state(jobs, aid, parent_attempt_id=aid, advance=False)
+    if state.cancellation_requested:
+        return {"attempt_id": aid, "classification": "success" if state.cancelled else "pending",
+                "required_action": "advance-completed" if state.cancelled else "",
+                "cancellation_requested": True, "state": "cancelled" if state.cancelled else "termination-pending",
+                "reason": "cancelled-by-parent"}
     action = delivery_required_action(state)
     result = {"attempt_id": aid, "classification": delivery_classification(state),
             "required_action": action, "marker": state.marker,
@@ -786,10 +812,11 @@ def _proposal_rows(route, jobs, root, record, output):
     module = _route_module()
     readiness = {}
 
-    def probe():
-        if "value" not in readiness:
-            readiness["value"] = module.proposal_readiness(route, jobs)
-        return readiness["value"]
+    def probe(cwd=None):
+        key = cwd or route["cwd"]
+        if key not in readiness:
+            readiness[key] = module.proposal_readiness({**route, "cwd": key}, jobs)
+        return readiness[key]
 
     def compile_leg(leg, index):
         return module.compile_proposal_leg(leg, index, frame_route=route, frame_cycle_id=record["cycle_id"],
@@ -1022,6 +1049,7 @@ def _decide(route, jobs, root, record, output, briefs, intent):
     record_rel = (output / RP.RECORD_RELATIVE).relative_to(root).as_posix()
     compose = {
         "leg": 0, **{key: leg[key] for key in ("capability", "mode", "shape", "graph", "intensity")},
+        **({"cwd": leg["cwd"]} if leg.get("cwd") else {}),
         "route_plan": record_rel + "#0",
         "context": {"cwd": route["cwd"], "artifact_root": str(root), "slug": route.get("slug") or "framed",
                     "campaign_key": route.get("campaign_key"), "parent_cycle": record["cycle_id"],
@@ -1084,7 +1112,7 @@ def _first_leg(route, path, jobs, result, root, record, output, record_path, dec
             if key not in readiness:
                 readiness[key] = module.proposal_readiness({**route, "cwd": key}, jobs)
             return readiness[key]
-        leg = {key: compose[key] for key in ("capability", "mode", "shape", "graph", "intensity")}
+        leg = {**binding["leg"], **{key: compose[key] for key in ("capability", "mode", "shape", "graph", "intensity")}}
         try:
             leg_route = module.compile_first_leg(
                 leg, frame_route=route, frame_cycle_id=record["cycle_id"], context=context, binding=binding,
@@ -1395,6 +1423,9 @@ def _exited_owner_response(route, result, jobs, aid, **extra):
     from dispatch_terminal_commit import inspect_owner_completion
     status, metadata = _rows(jobs)[aid]
     outcome = _outcome(jobs, aid)
+    if outcome.get("cancellation_requested"):
+        return {"route_id": route["route_id"], "state": outcome["state"],
+                "reason": "cancelled-by-parent", "launches": [], "owner_started": False, "result": outcome}
     if outcome["classification"] == "success":
         return _with_next_leg(route, {**result, "state": "completed", "result": outcome})
     return {**result, "state": "needs-attention", "reason": "owner-settlement-pending",
@@ -1404,10 +1435,109 @@ def _exited_owner_response(route, result, jobs, aid, **extra):
                 "obligation; waiting for a model turn or starting a replacement cannot finish it."}
 
 
+PIN_HANDOFF_SUMMARY = "owner-pin-handoff"
+
+
+def _pin_handoff_close_command(path, jobs):
+    # close already owns cancellation and resource preservation on every harness.
+    # It reads the registry from the environment rather than a --jobs option.
+    return shlex.join(["env", f"AGENT_DISPATCH_JOBS={Path(jobs).resolve()}", sys.executable,
+                       entrypoint(ROOT, "utilities/capability-route.py"), "close", "--route", str(path),
+                       "--summary", PIN_HANDOFF_SUMMARY])
+
+
+def _owner_pin_handoff(route, path, jobs, result, rows=None):
+    rows = _rows(jobs) if rows is None else rows
+    aid = _slot(route, "owner", rows, jobs)
+    if aid not in rows:
+        return None
+    status, metadata = rows[aid]
+    if (status not in {"open", "running"}
+            or not (metadata.get("launch_claimed") == "1" or metadata.get("launch_started") == "1")):
+        return None
+    pinned = route_authority.sealed_pin_harness(route, worker_type="owner")
+    moved = route_authority.moved_owner_harness(route, metadata.get("harness"))
+    if (not pinned or not metadata.get("harness") or metadata["harness"] == pinned
+            or not (moved or metadata.get("replacement_original_attempt_id"))):
+        return None
+    return {**result, "state": "needs-attention", "reason": PIN_HANDOFF_SUMMARY,
+            "owner_attempt_id": aid, "owner_started": metadata.get("launch_started") == "1",
+            "harness": metadata["harness"], "requested_harness": pinned,
+            "required_action": "close-owner-for-handoff",
+            "recovery_command": _pin_handoff_close_command(path, jobs),
+            "next_step": "Run recovery_command to settle this owner through the existing close. "
+                "Resource runs are preserved. The close receipt then gives the start command "
+                "for the unfinished stages on the current pin."}
+
+
+def pin_handoff_continuation(route, path, jobs, outcome):
+    """After the ordinary close settled, prepare its ordinary unfinished suffix.
+
+    No live identity changes and no owner is spawned here. Each receipt carries
+    one existing command: close while unsettled, then start the prepared suffix.
+    Replays reuse the same source evidence and immutable continuation file.
+    """
+    if outcome.get("summary") != PIN_HANDOFF_SUMMARY:
+        return outcome
+    if outcome.get("terminal_gate_proven") is True:
+        return outcome  # normal completion won the close race; no unfinished handoff
+    if outcome.get("state") != "cancelled":
+        return {**outcome, "recovery_command": _pin_handoff_close_command(path, jobs)}
+    metadata = (_rows(jobs).get(outcome.get("owner_attempt_id")) or (None, {}))[1]
+    if not _owns(metadata, _current_parent_session_id(), jobs):
+        return {**outcome, "handoff_reason": "work-parent-recovery-required"}
+    pinned = route_authority.sealed_pin_harness(route, worker_type="owner")
+    if not pinned:
+        return outcome
+    import route_parent_close
+    import workflow_state as WS
+    ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
+    with ledger.lock():
+        pins = route_authority.selection_pin_rows(route)
+        recorded = route_parent_close.settled_result(route, ledger) or outcome
+        if recorded.get("successor_route") and recorded.get("handoff_pins") == pins:
+            return recorded  # follow the published suffix, even after runtime/source changes
+        module = _route_module()
+        try:
+            for node in route.get("nodes", []):
+                try:
+                    module._continuation_reused_evidence(route, node)
+                except ValueError:
+                    boundary = node["id"]
+                    break
+            else:
+                return outcome  # all content settled before close; nothing to replay
+            evidence = route_authority.route_in_force(route).get("dispatch_evidence")
+            successor = module.build_continuation_route(
+                route, resume_from_node=boundary, requested_boundary=boundary,
+                reason=f"{PIN_HANDOFF_SUMMARY}:{metadata['attempt_id']}:{pinned}",
+                artifact_root=route["artifact_root"],
+                dispatch_evidence=evidence if evidence != route.get("dispatch_evidence") else None)
+            target = module.canonical_route_path(route["artifact_root"], successor["route_id"])
+            module.publish_continuation_route(successor, route, target)
+            module.verify_route(successor)
+            module._record_route_chain(successor, str(target), "continuation")
+            prepared = {**outcome, "successor_route": str(target),
+                    "handoff_pins": pins,
+                    "recovery_command": resume_command(target, jobs, agent_home=ROOT),
+                    "next_step": "The previous owner is settled and resource runs are preserved. "
+                        "Run recovery_command to start the unfinished stages on the current pin; "
+                        "completed stages remain reused."}
+            ledger._append({"at": WS.now_iso(), "route_id": route["route_id"],
+                            "route_hash": route["route_hash"], "actor": "parent-close",
+                            "evidence": {"parent_close_result": prepared}})
+            return prepared
+        except (OSError, ValueError) as exc:
+            return {**outcome, "handoff_reason": str(exc),
+                    "recovery_command": resume_command(path, jobs, agent_home=ROOT),
+                    "next_step": "Owner cleanup settled; continuation preparation did not. "
+                        "Inspect handoff_reason, then run recovery_command to retry preparation."}
+
+
 def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=None,
              decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
     """Advance preparation once; repeating this call creates no duplicate job."""
-    request = validate_request(route.get("work_request"))
+    request = continuation_work_request(route, jobs)
     path, jobs = Path(path).resolve(), Path(jobs).resolve()
     resume = resume_command(path, jobs, agent_home=ROOT)
     result["resume_command"] = resume
@@ -1491,6 +1621,16 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                                       "outcome": closed,
                                       **({"completion_delivery": delivery} if delivery else {}),
                                       **({"shared_publication": publication} if publication is not None else {})})
+    handoff = _owner_pin_handoff(route, path, jobs, result)
+    if handoff is not None:
+        return handoff
+    import dispatch_resource_wait as OWNER_RESOURCE
+    watches = (OWNER_RESOURCE.supervisor().recover_resource_watches(route, jobs)
+               if any(n.get("kind") == "resource-runner" for n in route.get("nodes", [])) else [])
+    if watches:
+        return {**result, "state": "resource-watching", "required_action": "end-turn",
+                "resource_watches": watches, "parent_next": "end-turn",
+                "next_step": "The exact resource retains its watch and declared continuation; end this turn."}
     if RESOURCE_RESUME.route_selected(route):
         resource = RESOURCE_RESUME.observation(route, jobs)
         if resource["state"] != "resource-succeeded":
@@ -1665,7 +1805,18 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     refusal = None
     launched_now = aid not in rows
     if aid not in rows:
-        owner_pin = ((route.get("selection_pins") or {}).get("owner") or {}).get("harness")
+        owner_pin = route_authority.sealed_pin_harness(route, worker_type="owner")
+        view = route_authority.route_in_force(route)
+        if owner_pin and view.get("registered_headless_candidates") is None and not any(
+                row.get("parent_harness") == owner_pin and row.get("status") == "supported"
+                and row.get("launch_authority") == "conductor"
+                for row in (view.get("dispatch_evidence") or {}).get("tuples", [])):
+            # Older composes probed the caller instead of the fixed owner.
+            # Keep that route and its approval; ordinary start checks the owner
+            # and records the missing evidence with the existing pin writer.
+            module = _route_module()
+            result["pin_evidence"] = module._change_pins(route, jobs, RP.pin_tokens(
+                {"owner": (view.get("selection_pins") or {})["owner"]}))
         rows, refusal = _launch_admitted(route, path, jobs, "owner", owner_pin or request["owner_harness"], run, result,
                                           wait=wait, sleep=sleep, clock=clock)
     if aid not in rows:
@@ -1695,6 +1846,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                     "it starts the owner again."}
     result.update(owner_attempt_id=aid, owner_started=metadata.get("launch_started") == "1")
     result["correction_command"] = correction_command(aid, jobs, agent_home=ROOT)
+    handoff = _owner_pin_handoff(route, path, jobs, result, rows)
+    if handoff is not None:
+        return handoff
     if status == "done":
         gate_response = _owner_gate_response(route, path, jobs, aid, metadata, result)
         if gate_response is not None:
@@ -1727,17 +1881,19 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                         interview=interview, answers=answers, decision=decision, run=run, sleep=sleep,
                         clock=clock)
     status, metadata = _rows(jobs).get(aid, (status, metadata))
-    if (status == "done" and metadata.get("note") == "dead-worker-blocked"
+    owner_stop = route_authority.answerable_owner_end(status, metadata)
+    if (owner_stop
             and not replacement.get("parked_gate")
             and (replacement.get("state") == "not-applicable"
                  or replacement.get("reason") == "automatic-replacement-exhausted")):
         # It stopped for an answer no declared gate carries. The answer, sent to it, is the way on
         # (an answered stop is a pause, so a spent replacement budget does not end it).
         report = _owner_report(route, metadata)
-        return {**result, "state": "needs-attention", "reason": "owner-blocked",
-                "required_action": "answer-blocked-owner", "result": _outcome(jobs, aid),
+        return {**result, "state": "needs-attention", "reason": "owner-" + ("blocked" if owner_stop == "BLOCKED" else "failed"),
+                "required_action": "answer-blocked-owner" if owner_stop == "BLOCKED" else "answer-failed-owner",
+                "result": _outcome(jobs, aid),
                 **({"owner_report": report} if report else {}),
-                "next_step": "The owner stopped BLOCKED and is waiting for an answer; owner_report says what it "
+                "next_step": f"The owner stopped {owner_stop} and is waiting for an answer; owner_report says what it "
                     "needs. Get the person's answer (or fix what it names), then run correction_command with "
                     "--message-file <answer file>: that continues this route at once in a replacement owner that "
                     "receives the answer. Do not close or recompose the route."}
@@ -1756,6 +1912,17 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     status, metadata = _rows(jobs).get(aid, (status, metadata))
     if status == "done":
         return _exited_owner_response(route, result, jobs, aid, observation=joined)
+    if metadata.get("pid") and metadata.get("pid_start") and metadata.get("launch_started") == "1":
+        from dispatch_contract import attempt_process_quiescence
+        process = attempt_process_quiescence(metadata, terminal_receipt=True)
+        if process.state != "live":
+            return {**result, "state": "needs-attention",
+                    "reason": "owner-settlement-pending" if process.state == "quiescent"
+                              else "owner-process-unverifiable",
+                    "owner_process_state": process.state, "owner_process_reason": process.reason,
+                    "observation": joined,
+                    "next_step": "The owner is exited or unobservable. Its open row retains settlement; "
+                        "the ordinary start or correction retries it. Preserve existing results."}
     if wait:
         return _wait_expired({**result, "observation": joined})
     directive, reason, _ = parent_next(metadata.get("parent_completion_delivery", ""), aid, agent_home=ROOT)
@@ -1893,6 +2060,22 @@ def _compose_again(route) -> str:
 
 def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
                decision="proceed", run=subprocess.run, sleep=time.sleep, clock=time.time):
+    import route_parent_close
+    closing = route_parent_close.intent(route, jobs)
+    if not closing:
+        for _, metadata in _rows(jobs).values():
+            if (route["route_id"] in {metadata.get("owner_route_id"), metadata.get("route_id")}
+                    and route_parent_close.requested(metadata)):
+                closing = route_parent_close.intent({
+                    "route_id": metadata.get("parent_close_route_id"),
+                    "route_hash": metadata.get("parent_close_route_hash")}, jobs)
+                if closing:
+                    break
+    if closing:
+        outcome = route_parent_close.continue_close(closing, jobs=jobs)
+        outcome = pin_handoff_continuation(route, path, jobs, {**outcome, "summary": closing.get("summary")})
+        return {"route_id": route["route_id"], "route_file": str(path), "launches": [],
+                "owner_started": False, "reason": route_parent_close.NOTE, **outcome}
     result = {"route_file": str(Path(path).resolve()), "route_id": route["route_id"],
               "launches": [], "owner_started": False,
               "advisories": OWNER_WRITE_ADVISORY.advisories(route),

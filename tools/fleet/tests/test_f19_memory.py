@@ -244,14 +244,14 @@ class RenderIntegrationTest(unittest.TestCase):
                                     layout="wide", memory=snap)
         self.assertNotIn("mem  +", self._text(lines))
 
-    def test_summary_row_renders_counts(self):
+    def test_summary_row_is_removed(self):
         lines = render._build_lines([], [], section="fleet", narrow=False, malformed=0,
                                     layout="wide", memory=self._snapshot())
         text = self._text(lines)
-        self.assertIn("+4 added(3w·1d)", text)
-        self.assertIn("2 expired", text)
-        self.assertIn("1 pruned", text)
-        self.assertIn("last distill 45m", text)
+        self.assertNotIn("+4 added(3w·1d)", text)
+        self.assertNotIn("2 expired", text)
+        self.assertNotIn("1 pruned", text)
+        self.assertNotIn("last distill 45m", text)
 
     def test_a_toggle_reveals_recent_events(self):
         render.set_show_all(True)
@@ -266,20 +266,20 @@ class RenderIntegrationTest(unittest.TestCase):
                                     layout="wide", memory=self._snapshot())
         self.assertNotIn("hello", self._text(lines))
 
-    def test_durable_over_stays_on_memory_summary_without_alert_strip(self):
+    def test_durable_over_is_not_rendered_in_the_header(self):
         snap = self._snapshot(alerts={"durable_over": [["proj-a", 85]], "distill_stale": False})
         lines = render._build_lines([], [], section="fleet", narrow=False, malformed=0,
                                     layout="wide", memory=snap)
         text = self._text(lines)
-        self.assertIn("durable 1 over", text)
+        self.assertNotIn("durable 1 over", text)
         self.assertNotIn("  alert ", text)
 
-    def test_distill_stale_stays_on_memory_summary_without_alert_strip(self):
+    def test_distill_stale_is_not_rendered_in_the_header(self):
         snap = self._snapshot(alerts={"durable_over": [], "distill_stale": True})
         lines = render._build_lines([], [], section="fleet", narrow=False, malformed=0,
                                     layout="wide", memory=snap)
         text = self._text(lines)
-        self.assertIn("distill stale", text)
+        self.assertNotIn("distill stale", text)
         self.assertNotIn("  alert ", text)
 
 

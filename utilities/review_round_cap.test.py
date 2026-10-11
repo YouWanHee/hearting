@@ -12,8 +12,10 @@ unregistered hop instead (`VERDICTLESS_BOUND`).
 """
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
@@ -96,6 +98,37 @@ class ClassifyRoundRowTest(unittest.TestCase):
 
 
 class RoundBudgetTest(unittest.TestCase):
+    def test_owner_closed_fail_gets_one_approved_closure_without_becoming_pass(self):
+        closed = row('done', 'completed-marker', failure_class='fail', extra={
+            'attempt_id': 'att-review-2', 'review_gate_closure': 'owner-closure',
+            'review_independence': 'owner-overridden'})
+        rows = [row('done', 'completed-review-blocking', extra={'attempt_id': 'att-review-1'}), closed]
+        revisions = [{'answers': ['att-review-2']}]
+        self.assertTrue(CAP.last_verdict_blocking(rows, 'review'))
+        self.assertTrue(CAP.gate_unmet(rows, 'review'))
+        self.assertEqual(CAP.round_budget(route(), review_node(), rows).state, 'exhausted')
+        budget = CAP.round_budget(route(), review_node(), rows, revisions=revisions)
+        self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds),
+                         ('admit', 'closure-check', 2))
+        self.assertEqual(CAP.marker_round_census(route(), review_node(), rows,
+                         site='registered', revisions=revisions)['closure_class'], 'closure-check')
+        for note in ('completed-review-blocking', 'completed-marker'):
+            later = row('done', note, failure_class='fail' if note.endswith('blocking') else 'pass',
+                        extra={'attempt_id': 'att-review-3'})
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows + [later],
+                                             revisions=revisions).state, 'exhausted')
+        for delta in ({'failure_class': 'pass'}, {'worker_type': 'stage'}, {'review_independence': 'independent'},
+                      {'review_gate_closure': ''}):
+            ordinary = (closed[0], {**closed[1], **delta})
+            self.assertFalse(CAP.last_verdict_blocking([ordinary], 'review'))
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows[:1] + [ordinary],
+                                             revisions=revisions).state, 'exhausted')
+        for status, expected in (('open', 'blocked-live'), ('done', 'blocked-unsettled')):
+            tail = row(status, '', extra={'terminal_conflict': '1',
+                                         'conflicting_terminal_note': 'x'})
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows + [tail],
+                                             revisions=revisions).state, expected)
+
     def test_sd161_parallel_review_legs_keep_capped_identity_without_broadening_other_nodes(self):
         for node_id in CAP.ROUND_CAPPED_NODE_IDS:
             self.assertTrue(CAP.is_round_capped_node({"id": node_id}))
@@ -215,6 +248,25 @@ class RoundBudgetTest(unittest.TestCase):
 
 
 class RecoveryFieldsTest(unittest.TestCase):
+    def test_owner_closed_review_does_not_repeat_its_completion_commands(self):
+        r = {**route(), 'route_id': 'rt-test', 'route_hash': 'sha256:test'}
+        node = review_node()
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+                'route_lineage.verified_route_lineage', return_value=[r]):
+            jobs = Path(directory)/'jobs.log'
+            r['artifact_root'] = directory
+            for note in ('completed-review-blocking', 'completed-marker'):
+                metadata = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': node['id'],
+                            'attempt_id': 'att-review-2', 'worker_type': 'review', 'note': note,
+                            'failure_class': 'fail', 'review_gate_closure': 'owner-closure',
+                            'review_independence': 'owner-overridden'}
+                jobs.write_text('now\tdone\twt\troot\ttask\t' + ','.join(
+                    f'{key}={value}' for key, value in metadata.items()) + '\n')
+                fields = CAP.recovery_fields('review-worker', route=r, node=node, jobs=jobs,
+                                             route_file=Path(directory)/'route.json')
+                for key in ('recovery_complete_command', 'recovery_check_command'):
+                    self.assertEqual(key in fields, note == 'completed-review-blocking')
+
     def test_exhausted_review_worker_points_at_owner_closure(self):
         fields = CAP.recovery_fields("review-worker")
         self.assertEqual(fields["recovery_surface"], "capability-route complete")

@@ -21,10 +21,16 @@ The wrapper renders `roles/worker-bootstrap.md` plus one deterministic worker
 type before the assignment. A masked profile adds only its attach layer and
 selected specialization. Changed files, commands, logs, and findings remain in
 the canonical artifact; the child returns only artifact path, verdict, and a
-one-line blocker. Official Claude Code behavior loads the `CLAUDE.md` memory
-hierarchy into ordinary custom subagents and provides no per-agent switch for
-that input, so the adapter claims masked profile projection, not universal
-physical instruction masking.
+one-line blocker. Registered print-mode workers and session-tidy support use a
+fresh `CLAUDE_CONFIG_DIR` with the attach template, linked login and copied user
+guard hooks/permissions. `--disable-slash-commands` removes skills and commands;
+`--strict-mcp-config` with an empty MCP configuration excludes connectors.
+The normal project/local and managed settings remain, as does the native system
+prompt. The resumed owner uses the same options on every turn. This headless
+surface differs from Claude's internal custom subagent instruction inheritance.
+
+Official surfaces: [CLI flags](https://code.claude.com/docs/en/cli-reference),
+[configuration home and settings](https://code.claude.com/docs/en/settings).
 
 ## Native Claude Surfaces
 
@@ -176,8 +182,10 @@ main/orchestrator chooses per job and the wrapper only reflects that choice:
   the child wrapper. An interactive Claude parent's `PostToolUse(Bash)` hook
   identifies the exact owner attempt from the start receipt or the registry row
   bound to the session (never from the command text) and arms one native
-  `asyncRewake` hook for it, one waiter per attempt (and, since SD-122 v56, a second
-  `asyncRewake` hook for an exact steward watch armed by `peer-steward.py watch`). The hook waits for terminal
+  `asyncRewake` hook for it, one waiter per attempt. `Stop` may re-take that
+  existing arm when a turn made no Bash call, but never first-arms a row.
+  Since SD-122 v56, a separate `asyncRewake` hook watches an exact steward
+  watch armed by `peer-steward.py watch`. The completion hook waits for terminal
   quiescence outside the model and wakes once with an exact receipt (a harvest
   command when one is required); an ordinary Bash call arms nothing unless a
   fresh or re-armable row of this session is waiting, and no Background Bash monitor,

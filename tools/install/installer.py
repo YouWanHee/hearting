@@ -1344,6 +1344,10 @@ def cmd_runtime(args):
         codex_launcher.discard_snapshot(launcher_snapshot)
 
     if args.runtime_command in {"activate", "refresh"}:
+        activated_roots = {report.get("active_root") for report in reports
+                           if report.get("active_root")}
+        for active_root in activated_roots:
+            runtime_activation.reconnect_peer_obligations(active_root)
         # A first install has no memory store, and mem refuses to create one at a
         # derived path: create it here, after the activation committed. Best
         # effort, so it can neither fail nor roll back the activation; importing

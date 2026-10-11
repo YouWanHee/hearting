@@ -11,6 +11,9 @@ import sys
 import stat
 import tempfile
 import time
+import uuid
+import functools
+import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -50,9 +53,155 @@ def proc_identity(pid) -> dict | None:
             "pid": pid,
             "starttime": fields[19],
             "command_hash": hashlib.sha256(command).hexdigest(),
+            **boot_identity(),
         }
     except (OSError, TypeError, ValueError, IndexError):
         return None
+
+
+def boot_identity() -> dict:
+    """Bind new local resource identities to their host and kernel lifetime."""
+    try:
+        boot = str(uuid.UUID(Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+        machine = Path('/etc/machine-id').read_text().strip()
+        host = Path('/proc/sys/kernel/hostname').read_text().strip()
+        if len(machine) != 32 or not all(c in '0123456789abcdef' for c in machine) or not host:
+            return {}
+        return {'boot_id': boot, 'boot_host': machine + ':' + host}
+    except (OSError, ValueError):
+        return {}
+
+
+@functools.lru_cache(maxsize=4)
+def local_boot_history(current_boot: str) -> frozenset[str]:
+    """Read this machine's existing boot journal, never another host's namespace."""
+    try:
+        result = subprocess.run(['journalctl', '--list-boots', '--no-pager', '--quiet'],
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode != 0:
+            return frozenset()
+        boots = set()
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) > 1 and fields[0].lstrip('-').isdigit():
+                boots.add(str(uuid.UUID(fields[1])))
+        return frozenset(boots) if current_boot in boots else frozenset()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return frozenset()
+
+
+def previous_boot_evidence(identity: dict) -> dict | None:
+    """The shared owner/resource/governor proof of this host's past kernel."""
+    if not isinstance(identity, dict):
+        return None
+    current = boot_identity()
+    try:
+        old = str(uuid.UUID(identity['boot_id']))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return None
+    if not current or old == current['boot_id']:
+        return None
+    if 'boot_host' in identity:
+        if identity['boot_host'] != current['boot_host']:
+            return None
+    elif old not in local_boot_history(current['boot_id']):
+        return None
+    return {'previous_boot_id': old, **current}
+
+
+def recorded_governor_identity(worker: dict) -> dict | None:
+    """Read the exact worker's retained claim; ambiguous identities stay unknown."""
+    if not all(worker.get(key) for key in ('artifact_root', 'pid', 'pid_start', 'pid_ns')):
+        return None
+    try:
+        path = Path(worker['artifact_root']) / '.runtime/model-worker-governor/state.json'
+        state = json.loads(path.read_text())
+        identities = {}
+        for claim in state.get('claims', {}).values():
+            identity = claim.get('claimant_identity') or {}
+            if (str(identity.get('pid')) == worker['pid']
+                    and str(identity.get('starttime')) == worker['pid_start']
+                    and f"pid:[{identity.get('pid_namespace')}]" == worker['pid_ns']):
+                for field, key in (('claimant_pid', 'pid'), ('claimant_starttime', 'starttime')):
+                    if field in claim and str(claim[field]) != str(identity.get(key)):
+                        return {'boot_id': None}
+                witness = claim.get('claimant_witness')
+                if isinstance(witness, dict) and 'identity' in witness and witness['identity'] != identity:
+                    return {'boot_id': None}
+                try:
+                    boot = str(uuid.UUID(identity['boot_id']))
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    return {'boot_id': None}
+                identities[(boot, identity.get('boot_host'))] = {**identity, 'boot_id': boot}
+        if len(identities) > 1:
+            return {'boot_id': None}
+        return next(iter(identities.values())) if identities else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def legacy_resource_identity(run: dict) -> dict | None:
+    """Use the exact recorded owner's governor identity for pre-UUID resources."""
+    try:
+        from dispatch_contract import parse_registry_metadata
+        wait = run['owner_wait']
+        aid = run['parent_attempt_id']
+        if (wait.get('parent_attempt_id') != aid or wait.get('jobs') != run['jobs']
+                or not wait.get('owner_pid') or not wait.get('owner_start')):
+            return None
+        owners = []
+        for line in Path(run['jobs']).read_text().splitlines():
+            fields = line.split('\t')
+            if len(fields) == 6:
+                meta = parse_registry_metadata(fields[5])
+                if meta.get('attempt_id') == aid:
+                    owners.append(meta)
+        if len(owners) != 1:
+            return None
+        owner = owners[0]
+        if (owner.get('worker_type') != 'owner' or owner.get('owner_route_file') != run['route']
+                or owner.get('owner_route_id') != wait.get('route_id')
+                or owner.get('owner_route_hash') != wait.get('route_hash')
+                or owner.get('pid') != str(wait['owner_pid'])
+                or owner.get('pid_start') != str(wait['owner_start'])
+                or owner.get('pid_ns') != run.get('pid_namespace')):
+            return None
+        return recorded_governor_identity(owner)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def legacy_resource_boot(run: dict) -> str | None:
+    """Compatibility projection of the exact retained identity."""
+    identity = legacy_resource_identity(run)
+    return identity.get('boot_id') if identity else None
+
+
+def reboot_evidence(run: dict) -> dict | None:
+    """Positive local boot change; missing/unobservable identities are not death.
+
+    Older local runner rows have no boot UUID. Their recorded start ticks beyond
+    this kernel's uptime, together with a launch epoch before this boot and the
+    exact owner boot in this host's journal, prove a local previous-boot run.
+    """
+    if run.get('boot_id') or run.get('boot_host'):
+        # Partial resource hints never replace its exact legacy owner binding.
+        return previous_boot_evidence(run) if run.get('boot_host') else None
+    if (run.get('resource_policy') not in {'supervised-owner', 'verified-resume'}
+            or not run.get('started_at') or not run.get('starttime') or not run.get('owner_wait')):
+        return None
+    try:
+        boot = _boot_epoch()
+        uptime = float(Path('/proc/uptime').read_text().split()[0])
+        start, launched = int(run['starttime']), float(run['started_at'])
+        if (boot and 0 < launched < boot and start > uptime * os.sysconf('SC_CLK_TCK')
+                and run.get('pid_namespace') == os.readlink('/proc/self/ns/pid')):
+            proof = previous_boot_evidence(legacy_resource_identity(run))
+            if proof:
+                return {**proof, 'reason': 'boot-clock-reset'}
+    except (OSError, KeyError, ValueError, TypeError, IndexError):
+        pass
+    return None
 
 
 def _owned_wrapper_awaiting_reap(run, pid, identity_reader):
@@ -104,6 +253,8 @@ def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, di
         pid = int(run["pid"])
     except (TypeError, ValueError):
         return "stale", None, "recorded-pid-invalid"
+    if reboot_evidence(run):
+        return "exited", None, "host-reboot"
     if run.get("pid_namespace") is not None:
         try:
             if run["pid_namespace"] != os.readlink("/proc/self/ns/pid"):
@@ -120,6 +271,34 @@ def classify_identity(run: dict, identity_reader=proc_identity) -> tuple[str, di
     if all(str(current[key]) == str(run[key]) for key in IDENTITY_KEYS):
         return "working", current, "exact-identity-match"
     return "stale", current, "process-identity-mismatch"
+
+
+def resource_never_started(run: dict) -> bool:
+    """Read the runner's pre-release failure, never infer it from disappearance.
+
+    Old direct launchers wrote this failure before publishing any identity.
+    A controller's observed crash after claim uses the same failure class but
+    retains its claim; only the launcher itself can record `not-started` there.
+    """
+    if (run.get("resource_policy") not in {"verified-resume", "supervised-owner"}
+            or run.get("status") != "failed" or run.get("workflow_state") != "FAILED_RETRYABLE"
+            or run.get("failure_class") != "resource-launch-incomplete"
+            or run.get("exit_code") is not None or not run.get("sentinel")
+            or run.get("cancel_requested") or run.get("parent_close_requested")):
+        return False
+    try:
+        Path(run["sentinel"]).lstat()
+    except FileNotFoundError:
+        pass
+    except (OSError, TypeError, ValueError):
+        return False
+    else:
+        return False
+    identity = any(run.get(key) is not None for key in IDENTITY_KEYS)
+    if run.get("launch_state") == "not-started":
+        return not identity or classify_identity(run)[0] == "exited"
+    return (run.get("launch_state") is None and not identity
+            and not run.get("launch_controller") and not run.get("launch_argv"))
 
 
 def is_alive(run: dict, identity_reader=proc_identity) -> bool:
@@ -311,22 +490,31 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
     cwd = run.get("cwd") if isinstance(run.get("cwd"), str) else ""
     log_path = run.get("log") or run.get("log_path")
     log_updated_at = None
+    log_mtime = None
+    log_size = None
     if isinstance(log_path, str) and log_path:
         try:
-            log_updated_at = Path(log_path).stat().st_mtime
+            log_stat = Path(log_path).stat()
+            log_mtime = log_stat.st_mtime
+            log_size = log_stat.st_size
+            if log_stat.st_size > 0:
+                log_updated_at = log_mtime
         except OSError:
             pass
     started_at = _start_epoch(run)
     end = now if liveness == "working" else (
-        run.get("ended_at") if isinstance(run.get("ended_at"), (int, float)) else log_updated_at
+        run.get("ended_at") if isinstance(run.get("ended_at"), (int, float)) else log_mtime
     )
     elapsed_min = max(0, int((float(end) - started_at) / 60)) if started_at and end else None
     training_progress = None
     remote_training = []
+    local_placement = None
     from resource_progress import read_progress
     progress = read_progress({**run, "run_id": str(run_id)}, now)
     if liveness == "working":
         from resource_progress import collect as collect_progress, remote_candidates
+        from resource_placement import observe as observe_placement
+        local_placement = observe_placement({**run, "run_id": str(run_id)})
         training_progress = collect_progress(run, registry, now)
         remote_training = remote_candidates(run, registry, now)
     return {
@@ -334,8 +522,10 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "cwd": cwd, "elapsed_min": elapsed_min, "liveness": liveness,
         "pid": run.get("pid"), "starttime": run.get("starttime"),
         "command_hash": run.get("command_hash"), "process_group": run.get("process_group"),
+        "command": (run["command"] if isinstance(run.get("command"), list)
+                    and all(isinstance(arg, str) for arg in run["command"]) else None),
         "registry_status": run.get("status"), "registry_path": str(registry),
-        "log_path": log_path, "log_updated_at": log_updated_at,
+        "log_path": log_path, "log_updated_at": log_updated_at, "log_size": log_size,
         "route": run.get("route"), "node": run.get("node"),
         # Root-scoped quiescence consumes these as additive attribution inputs.
         # Existing resource-runner rows carry only route/node; newer ad-hoc
@@ -350,6 +540,7 @@ def normalize_run(run_id: str, run: dict, registry: Path, identity_reader=proc_i
         "training_progress": training_progress,
         "progress_file": run.get("progress_file"), "progress": progress,
         "remote_training": remote_training,
+        "local_placement": local_placement,
         # Tracked-workflow projection (OPERATIONS §5.12): a resource row must expose why
         # it ended and who owns it, not just whether a PID is still there.
         "workflow_state": run.get("workflow_state"),

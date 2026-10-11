@@ -7,16 +7,16 @@ or an SD-106 cancellation/retry claim.
 from __future__ import annotations
 
 import importlib.util
-import hashlib
 from pathlib import Path
 import sys
 
 import dispatch_contract as DC
 import dispatch_replacement as R
 from replica_batch_contract import ReplicaBatchContractError, verify_manifest
+from recovery_history import (INPUT_SCHEMA, RecoveryHistoryError, batch_input_path,
+                              read_batch_input)
 
 SCHEMA = 'automatic-parallel-replacement-v1'
-INPUT_SCHEMA = 'automatic-parallel-input-v1'
 
 
 def _batch():
@@ -28,10 +28,10 @@ def _batch():
 
 
 def _input_path(jobs, digest):
-    from replica_batch_contract import DIGEST
-    if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
-        raise DC.DispatchContractError('replacement-batch-manifest-invalid')
-    return R._directory(jobs)/'batch-inputs'/(digest.split(':')[1]+'.json')
+    try:
+        return batch_input_path(jobs, digest)
+    except RecoveryHistoryError as exc:
+        raise DC.DispatchContractError(exc.reason, exc.detail) from exc
 
 
 def seal_launch_input(jobs, args, route, manifest, digest):
@@ -69,31 +69,10 @@ def seal_launch_input(jobs, args, route, manifest, digest):
 
 
 def _input(jobs, source):
-    payload = R._read(_input_path(jobs, source.get('batch_manifest_sha256')))
-    if (not payload or payload.get('schema') != INPUT_SCHEMA
-            or payload.get('jobs') != str(Path(jobs).resolve())):
-        raise DC.DispatchContractError('replacement-batch-input-unproven')
     try:
-        manifest, digest, leg_digests = verify_manifest(payload.get('manifest'))
-    except ReplicaBatchContractError as exc:
-        raise DC.DispatchContractError('replacement-batch-source-drift', str(exc)) from exc
-    aid = source['attempt_id']
-    member = next((m for m in manifest['members'] if m['attempt_id'] == aid), None)
-    options = payload.get('options')
-    if not isinstance(options, dict) or not isinstance(options.get('prompt_text'), str):
-        raise DC.DispatchContractError('replacement-batch-input-unproven')
-    assignment = 'sha256:'+hashlib.sha256(options['prompt_text'].encode()).hexdigest()
-    if (digest != source.get('batch_manifest_sha256')
-            or payload.get('manifest_digest') != digest or not member
-            or leg_digests[aid] != source.get('batch_leg_sha256')
-            or member['route_node'] != source.get('route_node')
-            or manifest['route_id'] != source.get('route_id')
-            or manifest['parent_attempt_id'] != source.get('parent_attempt_id')
-            or any(m['assignment_sha256'] != assignment for m in manifest['members'])
-            or options.get('parallel_group') != manifest.get('parallel_group')
-            or options.get('parent') != source.get('parent')):
-        raise DC.DispatchContractError('replacement-batch-source-drift')
-    return payload
+        return read_batch_input(jobs, [source])
+    except RecoveryHistoryError as exc:
+        raise DC.DispatchContractError(exc.reason, exc.detail) from exc
 
 
 def _evidence_path(jobs, family):

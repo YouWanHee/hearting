@@ -697,6 +697,7 @@ def dispatch_worker(item: dict, batch: str, run_dir: Path, bundle: Bundle) -> di
                       f"registered={receipt.get('registered', '-')} started={receipt.get('started', '-')}")
         if (done.returncode == 0 and receipt.get("registered") == "1" and receipt.get("started") == "1"
                 and receipt.get("child_spawned") == "1" and receipt.get("attempt_id", "-") != "-"):
+            record_caller_observation(item, receipt)
             return receipt
         reason = receipt.get("reason") or (done.stderr.strip().splitlines() or ["unknown"])[-1]
         if reason == "model-worker-governor-denied" or receipt.get("retryable") == "1":
@@ -711,6 +712,24 @@ def dispatch_worker(item: dict, batch: str, run_dir: Path, bundle: Bundle) -> di
             attempt += 1
             continue
         raise RunnerFailure(f"worker was not started: {reason}")
+
+
+def record_caller_observation(item: dict, receipt: dict) -> None:
+    """Publish the known caller without granting parent/delivery authority.
+
+    Failure to publish display metadata must not fail a successfully launched tidy.
+    The exact attempt annotation leaves all execution and completion fields alone.
+    """
+    from dispatch_contract import annotate_attempt_row
+    if not receipt.get("job_registry") or not receipt.get("attempt_id"):
+        return
+    values = {"caller_harness": item.get("harness") or "", "caller_sid": item.get("sid") or "",
+              "caller_pane": (item.get("seat") or {}).get("pane") or "",
+              "caller_cwd": item.get("cwd") or ""}
+    try:
+        annotate_attempt_row(Path(receipt["job_registry"]), receipt["attempt_id"], values)
+    except (OSError, ValueError):
+        pass
 
 
 def attempt_state(receipt: dict) -> str:

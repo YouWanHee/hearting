@@ -6,9 +6,35 @@ one follow-up run, and publishes only complete successful results.
 """
 
 from dataclasses import dataclass, field
+from concurrent.futures import Future
 import os
 import threading
 import time
+
+
+def background_read(producer):
+    """Overlap one independent read; the caller still owns result publication.
+
+    Daemon lifetime matches RefreshPump: a stalled read must not keep a closed
+    TUI alive. Each snapshot awaits its read before another tick can start.
+    Thread exhaustion is an unconfirmed read, never a synchronous wait that
+    defeats the caller's publication deadline.
+    """
+    result = Future()
+
+    def collect():
+        if not result.set_running_or_notify_cancel():
+            return
+        try:
+            result.set_result(producer())
+        except BaseException as exc:
+            result.set_exception(exc)
+
+    try:
+        threading.Thread(target=collect, daemon=True, name="fleet-read").start()
+    except (RuntimeError, OSError) as exc:
+        result.set_exception(exc)
+    return result
 
 
 @dataclass
@@ -18,9 +44,28 @@ class LiveSnapshot:
     resources: list = field(default_factory=list)
     usage_snapshots: dict = field(default_factory=dict)
     malformed: int = 0
+    resource_diagnostics: list = field(default_factory=list)
+    node_evidence: dict = field(default_factory=dict)
+    degradations: dict = field(default_factory=dict)
+    route_entities: list = field(default_factory=list)
+    observations: dict = field(default_factory=dict)
+    pending_delivery: object = None
+    tag_metadata: list = field(default_factory=list)
     memory: object = None
     governor: object = None
     hearting: dict = None
+
+    def __iter__(self):
+        # Keep the existing sessions, jobs unpacking surface for CLI readers.
+        return iter((self.sessions, self.jobs))
+
+
+def as_snapshot(value):
+    """Legacy/test collectors may still return just their two row lists."""
+    if isinstance(value, LiveSnapshot):
+        return value
+    sessions, jobs = value
+    return LiveSnapshot(sessions=list(sessions), jobs=list(jobs))
 
 
 # Measured normal tick = 10-12s (attach_projections 5.64s + dispatch.collect

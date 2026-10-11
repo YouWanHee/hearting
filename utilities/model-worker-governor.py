@@ -115,7 +115,9 @@ DEFAULT_START_BUDGET = 40
 # dispatch children could starve every new dispatch admission on their own
 # periodic title updates alone. DEFAULT_START_BUDGET stays equal to
 # CLASS_START_BUDGETS["dispatch"] -- it is the same pool under its old name.
-CLASS_START_BUDGETS = {"dispatch": DEFAULT_START_BUDGET, "title": 12, "loop": 4}
+# Text-only title calls retain a bounded rolling pool after their bootstrap
+# reduction; periodic consumers leave four starts for first/final summaries.
+CLASS_START_BUDGETS = {"dispatch": DEFAULT_START_BUDGET, "title": 24, "loop": 4}
 # Eight is the same "recent tail" size `status` already uses for
 # `identity_diagnostics` -- enough for an operator to see the last few
 # starts of a class without the receipt growing unbounded.
@@ -172,6 +174,17 @@ def start_budget(worker_class: str, override: int | None = None) -> int:
         if value >= 1:
             return value
     return CLASS_START_BUDGETS[worker_class]
+
+
+def title_start_budget(*, priority: bool = False) -> int:
+    """Leave up to four starts for first/final summaries in the existing pool.
+
+    A caller's priority never raises the configured class budget or changes
+    concurrency. Tiny user budgets retain at least one ordinary start.
+    """
+    budget = start_budget("title")
+    reserve = min(4, budget - 1)
+    return budget if priority else budget - reserve
 
 BATCH_RESERVATION_KEYS = (
     "reservation_kind",
@@ -378,6 +391,49 @@ def _limits(total: int | None, budget: int | None) -> tuple[int, int]:
     return total, budget
 
 
+def _return_previous_boot(data: dict[str, Any], now: float) -> None:
+    """Return only proven past-kernel capacity, retaining its claim evidence."""
+    from resource_run_registry import previous_boot_evidence
+    def record_proof(record, actor, pid_key, start_key):
+        identity = record.get(actor + '_identity')
+        proof = previous_boot_evidence(identity)
+        if not proof:
+            return None
+        for key, coordinate in ((pid_key, 'pid'), (start_key, 'starttime')):
+            if key in record and str(record[key]) != str(identity.get(coordinate)):
+                return None
+        witness = record.get(actor + '_witness')
+        if isinstance(witness, dict) and 'identity' in witness and witness['identity'] != identity:
+            return None
+        return proof
+
+    for token, lease in list(data['leases'].items()):
+        if not isinstance(lease, dict):
+            continue
+        proof = record_proof(lease, 'claimant', 'pid', 'starttime')
+        claim = data['claims'].get(token)
+        if not proof:
+            continue
+        if isinstance(claim, dict) and claim.get('claimant_identity'):
+            claim_proof = record_proof(claim, 'claimant', 'claimant_pid', 'claimant_starttime')
+            if not claim_proof or claim_proof['previous_boot_id'] != proof['previous_boot_id']:
+                continue
+            left, right = lease['claimant_identity'], claim['claimant_identity']
+            if any(str(left[key]) != str(right[key]) for key in left.keys() & right.keys()):
+                continue
+        del data['leases'][token]
+    for token, claim in data['claims'].items():
+        if not isinstance(claim, dict) or token in data['leases'] or claim.get('released_at') is not None:
+            continue
+        proof = record_proof(claim, 'claimant', 'claimant_pid', 'claimant_starttime')
+        if proof:
+            claim.update(released_at=now, release_proven=False, reclaimed_by='host-reboot',
+                         reclaim_reason='host-reboot', previous_boot_id=proof['previous_boot_id'])
+    for token, reservation in list(data['reservations'].items()):
+        if isinstance(reservation, dict) and record_proof(reservation, 'owner', 'owner_pid', 'owner_starttime'):
+            del data['reservations'][token]
+
+
 def _state_change(root: str | Path, fn: Callable[[dict[str, Any], float], Any]) -> Any:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -440,8 +496,9 @@ def _state_change(root: str | Path, fn: Callable[[dict[str, Any], float], Any]) 
             and isinstance(record.get("at"), (int, float))
             and now - record["at"] < START_WINDOW_SECONDS
         ]
-        # Process disappearance and namespace observations never authorize
-        # automatic capacity return.  Explicit cancel/release is required.
+        # The shared host/boot proof is independent of PID reuse or a missing
+        # witness. Ordinary same-boot/foreign/unknown records stay protected.
+        _return_previous_boot(data, now)
         # A short-lived runner may finish before its reserving wrapper observes
         # the transfer. Keep a bounded claim receipt while the claimant lease is
         # live, or until the live owner has had a full observation window.

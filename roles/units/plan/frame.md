@@ -108,6 +108,7 @@ created: {YYYY-MM-DD}
          shape: staged           # direct | solo | staged
          graph: [eval-run, metrics, report]   # staged only; stage ids or capability:stage[:unit] from the catalogue; never a frame stage
          intensity: standard     # optional
+         cwd: /path/to/existing-worktree  # optional: use this worktree for this leg; relative to the frame's cwd
          why: "one sentence"
          done_when:              # optional, 1-5: what shows this leg is finished (a sentence or {text, check})
            - "the abort tests pass"

@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Inherited daemon labels must not claim another terminal's seat or card."""
+import fcntl
+import contextlib
+import io
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pty
+import subprocess
+import sys
+import tempfile
+import termios
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "utilities"))
+sys.path.insert(0, str(ROOT / "tools"))
+import pane_ownership as po
+import session_tidy as st
+
+
+class PaneOwnershipTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pane-ownership-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.info = self.root / "process-info.json"
+        self.herdr = self.root / "herdr"
+        self.herdr.write_text("#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                              f"print(Path({str(self.info)!r}).read_text())\n")
+        self.herdr.chmod(0o755)
+
+    def runtime(self, harness="claude"):
+        master, slave = pty.openpty()
+
+        def terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        proc = subprocess.Popen([harness, "-c", "import time; time.sleep(60)"],
+                                executable=sys.executable, stdin=slave,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                preexec_fn=terminal)
+        os.close(slave)
+        self.addCleanup(os.close, master)
+        def stop():
+            proc.terminate()
+            proc.wait(timeout=5)
+        self.addCleanup(stop)
+        return proc
+
+    def foreground(self, proc, pane="wB:p3N"):
+        self.info.write_text(json.dumps({"result": {"process_info": {
+            "pane_id": pane, "foreground_process_group_id": proc.pid,
+            "foreground_processes": [{"pid": proc.pid}]}}}))
+
+    def verify(self, pid, harness="claude", sid=None):
+        return po.verified_pane("wB:p3N", harness, sid, pid=pid, executable=str(self.herdr))
+
+    def test_real_foreground_terminals_keep_their_seat_on_every_harness(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                foreground = self.runtime(harness)
+                self.foreground(foreground)
+                self.assertEqual(self.verify(foreground.pid, harness), "wB:p3N")
+
+    def test_inherited_label_different_pty_cannot_overwrite_or_consume_foreground_card(self):
+        foreground, unrelated = self.runtime(), self.runtime()
+        self.foreground(foreground)
+        self.assertNotEqual(po._process(foreground.pid)[3], po._process(unrelated.pid)[3])
+        env = {"HERDR_PANE_ID": "wB:p3N", "XDG_STATE_HOME": str(self.root / "state")}
+        with mock.patch.dict(os.environ, env), mock.patch.object(st, "project_key_for", return_value="home-os"), \
+                mock.patch.object(st, "_herdr_executable", return_value=str(self.herdr)), \
+                mock.patch.object(po.os, "getpid", return_value=unrelated.pid):
+            seat = st.resolve_seat("claude", str(self.root), sid="home-os-sid")
+            # Before the fix resolve_seat returned this pane solely from HERDR_PANE_ID.
+            self.assertEqual(seat.kind, "project")
+            pane_seat = st.Seat("pane", st._digest("pane", "wB:p3N"), "wB:p3N", "claude", "")
+            st.write_card(pane_seat, "claude", "supervisor-sid", "감독 카드", cwd=str(self.root))
+            previous = st.read_latest_card(pane_seat)
+            st.write_card(seat, "claude", "home-os-sid", "home-os 카드", cwd=str(self.root))
+            self.assertEqual(st.read_latest_card(pane_seat), previous)
+            self.assertEqual(st.read_latest_card(seat)["body"], "home-os 카드")
+            consumed = st._consumed_path(pane_seat)
+            before = consumed.read_bytes() if consumed.exists() else None
+            injected = st.run_hook("claude", "start", "home-os-successor", cwd=str(self.root))
+            self.assertIn("home-os 카드", injected)
+            self.assertNotIn("감독 카드", injected)
+            self.assertEqual(consumed.read_bytes() if consumed.exists() else None, before)
+
+    def test_parked_frontend_does_not_prove_current_attached_session(self):
+        from fleet.collectors import claude
+        foreground = self.runtime()
+        self.foreground(foreground)
+        record = po._process(foreground.pid)
+        with mock.patch.object(claude, "read_registry", return_value={
+                "procStart": record[5], "sessionId": "original-sid", "parkedJobId": "original-job"}):
+            self.assertEqual(po._native_session(foreground.pid, "claude"), "")
+
+    def test_unrelated_inheritance_is_rejected_on_codex_and_opencode_too(self):
+        for harness in ("codex", "opencode"):
+            foreground, unrelated = self.runtime(harness), self.runtime(harness)
+            self.foreground(foreground)
+            self.assertEqual(self.verify(unrelated.pid, harness, "unrelated-session"), "")
+
+    def test_daemon_or_spare_with_no_controlling_terminal_is_not_foreground(self):
+        foreground = self.runtime()
+        self.foreground(foreground)
+        proc = subprocess.Popen(["claude", "-c", "import time; time.sleep(60)"],
+                                executable=sys.executable, start_new_session=True)
+        self.addCleanup(lambda: (proc.terminate(), proc.wait(timeout=5)))
+        self.assertEqual(self.verify(proc.pid), "")
+
+    def test_stale_foreground_pid_foreign_pane_and_changed_process_start_fail_closed(self):
+        foreground = self.runtime()
+        self.foreground(foreground, "another-pane")
+        self.assertEqual(self.verify(foreground.pid), "")
+        self.foreground(foreground)
+        record = po._process(foreground.pid)
+        recycled = (*record[:5], "another-start")
+        with mock.patch.object(po, "_process", side_effect=[record, record, recycled]):
+            self.assertEqual(self.verify(foreground.pid), "")
+        with mock.patch.object(po, "_process", return_value=None):
+            self.assertEqual(self.verify(foreground.pid), "")
+
+    def test_shared_server_needs_exact_native_foreground_thread(self):
+        foreground = self.runtime("codex")
+        self.foreground(foreground)
+        caller = (123, 1, 123, 0, -1, "server-start")
+        original = po._process
+        with mock.patch.object(po, "_caller_runtime", return_value=(caller, True)), \
+                mock.patch.object(po, "_process", side_effect=lambda pid: caller if pid == 123 else original(pid)), \
+                mock.patch.object(po, "_native_session", return_value="actual-thread"):
+            self.assertEqual(self.verify(123, "codex", "inherited-thread"), "")
+            self.assertEqual(self.verify(123, "codex", "actual-thread"), "wB:p3N")
+
+    def test_pane_hook_and_peer_use_the_same_refusal(self):
+        from fleet import herdr_projection as hp
+        with mock.patch.object(hp, "runtime_identity", return_value=("claude", "home-os-sid")), \
+                mock.patch.object(po, "verified_pane", return_value=""), \
+                mock.patch.dict(os.environ, {"HERDR_PANE_ID": "wB:p3N"}):
+            self.assertFalse(hp.may_report("claude", "home-os-sid", worker=False))
+            spec = importlib.util.spec_from_file_location("pane_test_steward", ROOT / "utilities/peer-steward.py")
+            peer = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(peer)
+            with mock.patch.object(peer, "_current_session_identity", return_value=("home-os-sid", "claude")):
+                self.assertEqual(peer._caller_pane(), "")
+
+    def test_inherited_pane_cannot_receive_or_retire_another_seats_dispatch(self):
+        import dispatch_seat_handover as handover
+        foreground, unrelated = self.runtime(), self.runtime()
+        self.foreground(foreground)
+        env = {"HERDR_PANE_ID": "wB:p3N", "XDG_STATE_HOME": str(self.root / "state")}
+        with mock.patch.dict(os.environ, env), mock.patch.object(st, "project_key_for", return_value="home-os"), \
+                mock.patch.object(st, "_herdr_executable", return_value=str(self.herdr)), \
+                mock.patch.object(po.os, "getpid", return_value=unrelated.pid), \
+                mock.patch.object(handover, "handover_rows") as rows, \
+                mock.patch.object(handover, "current_bindings") as bindings:
+            self.assertIsNone(handover.pane_seat(env, "claude", "home-os-sid"))
+            self.assertEqual(handover.storage_recipients("home-os-sid", env, "claude"), [("home-os-sid", None)])
+            self.assertIsNone(handover.record_retire_handover("supervisor-sid", "claude", "home-os-sid", "claude", env=env))
+            rows.assert_not_called()
+            bindings.assert_not_called()
+
+    def test_deferred_report_cannot_promote_a_guessed_foreground_session(self):
+        from fleet import herdr_projection as hp
+        from fleet.collectors import procscan
+        foreground = self.runtime("codex")
+        self.foreground(foreground)
+        with mock.patch.object(po.shutil, "which", return_value=str(self.herdr)), \
+                mock.patch.object(hp.os, "listdir", return_value=[str(foreground.pid)]), \
+                mock.patch.object(hp, "_comm", return_value="codex"), \
+                mock.patch.object(procscan, "read_environ", return_value={"HERDR_PANE_ID": "wB:p3N"}), \
+                mock.patch.object(po, "_native_session", return_value=""):
+            self.assertIsNone(hp._codex_tui_pane("guessed-session"))
+            with mock.patch.object(po, "_native_session", return_value="actual-session"):
+                self.assertIsNone(hp._codex_tui_pane("guessed-session"))
+                self.assertEqual(hp._codex_tui_pane("actual-session"), "wB:p3N")
+
+    def test_recovery_default_does_not_use_an_inherited_pane(self):
+        foreground, unrelated = self.runtime(), self.runtime()
+        self.foreground(foreground)
+        spec = importlib.util.spec_from_file_location("pane_test_recovery", ROOT / "utilities/interactive-main-recovery.py")
+        recovery = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(recovery)
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "wB:p3N"}), \
+                mock.patch.object(st, "session_from_env", return_value=("claude", "home-os-sid")), \
+                mock.patch.object(po.shutil, "which", return_value=str(self.herdr)), \
+                mock.patch.object(po.os, "getpid", return_value=unrelated.pid), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(recovery.main(["--check"]), recovery.EXIT_INVALID)
+            self.assertEqual(json.loads(output.getvalue())["reason"], "pane-id-required")
+
+    def test_recovery_socket_override_cannot_borrow_another_servers_proof(self):
+        foreground, unrelated = self.runtime(), self.runtime()
+        self.foreground(unrelated)
+        foreign_info = self.info.read_text()
+        self.foreground(foreground)
+        self.herdr.write_text("#!/usr/bin/env python3\nimport os\nfrom pathlib import Path\n"
+                              f"print({foreign_info!r} if os.getenv('HERDR_SOCKET_PATH') == '/other.sock' "
+                              f"else Path({str(self.info)!r}).read_text())\n")
+        spec = importlib.util.spec_from_file_location("pane_test_recovery_socket", ROOT / "utilities/interactive-main-recovery.py")
+        recovery = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(recovery)
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "wB:p3N", "HERDR_SOCKET_PATH": "/own.sock"}), \
+                mock.patch.object(st, "session_from_env", return_value=("claude", "own-sid")), \
+                mock.patch.object(po.shutil, "which", return_value=str(self.herdr)), \
+                mock.patch.object(po.os, "getpid", return_value=foreground.pid), \
+                mock.patch.object(recovery, "checked_pane") as checked, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(po.verified_pane("wB:p3N", "claude"), "wB:p3N")
+            self.assertEqual(recovery.main(["--check", "--socket", "/other.sock"]), recovery.EXIT_INVALID)
+            checked.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

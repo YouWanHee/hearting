@@ -235,19 +235,24 @@ class ManagedDirParseTest(unittest.TestCase):
             "100 codex 01:00 codex app-server --listen unix:///tmp/managed-sessions/x/app-server.sock",
         ]
         with mock.patch.object(procscan, "_ps_lines", return_value=lines), \
-             mock.patch.object(procscan, "_pid_ttys", return_value={}), \
+             mock.patch.object(procscan, "_pid_ttys", return_value={137: "?", 149: "?", 243: "pts/1", 100: "?"}), \
              mock.patch.object(procscan, "_detached_ttys", return_value=set()), \
              mock.patch.object(procscan, "proc_tree", return_value={}), \
              mock.patch.object(procscan, "children_index", return_value={}), \
+             mock.patch.object(procscan, "_read_argv", side_effect=lambda pid: next(
+                 line.split(maxsplit=3)[3].split() for line in lines if line.startswith(str(pid) + " "))), \
+             mock.patch("fleet.session_registry.read", return_value=None), \
              mock.patch.object(procscan, "_read_cwd", return_value=("/project", False)), \
              mock.patch.object(procscan, "read_environ", return_value={}), \
              mock.patch.object(procscan, "read_proc_start", return_value="123"), \
              mock.patch.object(procscan, "exec_child", return_value=None) as child, \
              mock.patch.object(procscan, "_orca_dead_socks", return_value=set()):
             rows = procscan.scan(harness_filter={"codex"})
+            from fleet.process_identity import finalize_process_roles
+            finalize_process_roles(rows, [])
         self.assertEqual({s.pid for s in rows}, {243, 100})
         self.assertEqual({s.pid for s in rows if s.app_server}, {100})
-        self.assertEqual({call.args[0] for call in child.call_args_list}, {243, 100})
+        self.assertEqual({call.args[0] for call in child.call_args_list}, {137, 149, 243, 100})
 
 
 if __name__ == "__main__":

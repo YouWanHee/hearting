@@ -37,6 +37,7 @@ from dispatch_completion_join import (  # noqa: E402
     delivery_required_action,
 )
 import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import peer_obligations  # noqa: E402
 from frame_interview import PENDING_ANSWER_RULE  # noqa: E402
 import dispatch_seat_handover as seat_handover  # noqa: E402
 from parent_next_directive import entrypoint, resume_command, wait_command  # noqa: E402
@@ -423,9 +424,13 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | N
     own call or the next one. A row older than the arm window is a first-time
     refusal (the next-prompt sweep owns stale completions); a row whose claim
     lapsed -- its holder died with the session, or its gate wake was spent and
-    the gate has since closed -- is re-armed regardless of age."""
+    the gate has since closed -- is re-armed regardless of age. Stop can
+    re-take only an existing claim, so a tool-free attention turn continues
+    its completion wait without discovering new starts at that boundary."""
 
-    gate = _bash_call(payload)
+    stopping = isinstance(payload, dict) and payload.get("hook_event_name") == "Stop"
+    session = _payload_session(payload) if stopping else None
+    gate = (payload, session) if session else _bash_call(payload)
     if gate is None:
         return None
     payload, session = gate
@@ -442,6 +447,8 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | N
     # may have finished between the release and this call (top review M1).
     for attempt_id, age in _session_owner_rows(jobs, session, statuses=RECEIPT_ROW_STATUSES):
         fresh = attempt_id in open_rows and age <= window
+        if stopping and not arm_path(jobs, attempt_id).exists():
+            continue
         if attempt_id not in open_rows and not arm_path(jobs, attempt_id).exists():
             continue
         claim = claim_arm(jobs, attempt_id, session, fresh=fresh)
@@ -1299,6 +1306,8 @@ def _open_gate_pending(launch: Launch) -> bool:
 def _gate_notices(
     launch: Launch, *, attempt_only: bool = False, settle: str = "ack",
     announced: list[str] | None = None,
+    supervision_claims: list[tuple[Path, str, str, str]] | None = None,
+    announced_records: list[dict] | None = None,
 ) -> list[str]:
     """SD-123 (8)(b) carrier 1: fold every open gate record for this recipient
     into the wake this hook is about to emit.
@@ -1358,8 +1367,12 @@ def _gate_notices(
         continued = continue_for_parent(record, session_id=launch.session_id,
                                         recipient_kind="claude-parent-runtime")
         notices.append(_bounded_receipt_text({**record, CONTINUED_KEY: continued} if continued else record))
+        if announced_records is not None:
+            announced_records.append(record)
         if announced is not None:
             announced.append(delivery_id)
+        if supervision_claims is not None and record.get("receipt", {}).get("kind") == "supervision":
+            supervision_claims.append((root, recipient_key, delivery_id, claim_owner))
         try:
             if settle == "sent-ambiguous":
                 pending_delivery.mark_sent_ambiguous(
@@ -1374,12 +1387,12 @@ def _gate_notices(
     return notices
 
 
-def gate_wake_message(launch: Launch, notices: list[str]) -> str:
+def gate_wake_message(launch: Launch, notices: list[str], *, human_gate: bool) -> str:
     """The in-wait gate wake: bounded, typed, and explicit that the gate is
     answered, not harvested; the owner may still be waiting or may have paused
     at the gate."""
 
-    if any("Hearting supervision needs attention." in notice for notice in notices):
+    if not human_gate:
         return " ".join(notices)
     return (
         "Hearting human gate awaiting your decision (SD-123/129). Runtime gate receipt "
@@ -1470,6 +1483,7 @@ def _record_carrier_exit(claim: ArmClaim, observation: dict[str, Any]) -> None:
 
 
 def _observe_carrier(launch: Launch, claim: ArmClaim, payload: Any) -> int:
+    _retain_completion(launch, claim)
     observation: dict[str, Any] = {"wait_state": "starting", "reason": "carrier-return",
                                    "exit_code": 1, "exit_kind": "exception", "exit_text": ""}
     holder = {"claim": claim}
@@ -1507,6 +1521,16 @@ def _observe_carrier(launch: Launch, claim: ArmClaim, payload: Any) -> int:
                 signal.signal(signum, handler)
             except (OSError, ValueError):
                 pass
+
+
+def _retain_completion(launch: Launch, claim: ArmClaim) -> None:
+    """The existing outer task runner retains the wake if this native hook dies."""
+    try:
+        peer_obligations.retain_registered_completion(
+            launch.jobs, launch.attempt_id, launch.session_id, "claude-parent-runtime",
+            holder=claim.holder)
+    except (OSError, ValueError, JoinContractError):
+        pass  # Native delivery still owns this attempt; persistence is best effort.
 
 
 def main() -> int:
@@ -1580,6 +1604,7 @@ def _run_carrier(launch, claim, payload, observation, holder) -> int:
                 if successor is not None:
                     launch, claim = successor
                     holder["claim"] = claim
+                    _retain_completion(launch, claim)
                     continue  # Same deadline; one registry-bound successor only.
                 if _owner_status(launch) in {"open", "running"}:
                     # A transient attention (or a ready readout the current
@@ -1606,13 +1631,31 @@ def _run_carrier(launch, claim, payload, observation, holder) -> int:
             # announce) sleeps one interval and resumes waiting -- never a
             # tight loop (review round 1, B3).
             announced: list[str] = []
+            supervision_claims: list[tuple[Path, str, str, str]] = []
+            announced_records: list[dict] = []
             notices = _gate_notices(
-                launch, attempt_only=True, settle="sent-ambiguous", announced=announced
+                launch, attempt_only=True, settle="sent-ambiguous", announced=announced,
+                supervision_claims=supervision_claims,
+                announced_records=announced_records,
             )
             if notices:
                 observation.update(wait_state="gate", reason="human-gate-open")
-                code = emit_receipt("attention", gate_wake_message(launch, notices), block=False)
+                code = emit_receipt("attention", gate_wake_message(
+                    launch, notices, human_gate=any(is_human_gate_record(record)
+                                                  for record in announced_records)), block=False)
                 settle_arm(claim, "gate-wake-sent", gate_delivery_id=announced[0])
+                # The native wake immediately runs UserPromptSubmit. Keeping
+                # this exited carrier's 30s lease prevents that synchronous
+                # sweep from consuming the warning, so every Bash call in a
+                # short attention turn refuses to re-arm as `gate-open`.
+                # Return only our supervision claims; the sweep owns the ACK.
+                for state_root, recipient, delivery_id, claim_owner in supervision_claims:
+                    try:
+                        pending_delivery.release_claim(
+                            state_root, recipient, delivery_id, claim_owner=claim_owner
+                        )
+                    except (pending_delivery.PendingDeliveryError, OSError):
+                        pass
                 return code
             time.sleep(interval)
         if wait_state not in {"ready", "attention"}:

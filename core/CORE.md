@@ -106,6 +106,22 @@ unless it is intentionally describing a specific adapter runtime home.
 
 ## 3. Artifact Root
 
+**Ordinary file cleanup.** A person or agent may edit, move, or delete artifacts,
+cycles, campaigns and their generated records with ordinary filesystem tools.
+No cleanup command, approval, recovery step or intact cache is required. Normal
+runtime operations observe changes and append a history line automatically;
+readers use surviving identity records and omit absent material. A deleted
+campaign or parent does not prevent the next work from starting. Generated
+locator and producer records are bookkeeping, not locks on the files. Recorded
+completion remains a past result, distinct from new completion or execution
+authority. Cleanup leaves running work and deleted payloads alone.
+
+Route-child and cycle-route lookups may keep a disposable on-disk index bound
+to the current directory listing digest. Writers maintain it as part of their
+ordinary publication; readers re-read and validate only the selected records.
+Missing, stale, corrupt or unwritable indexes fall back to the existing scan.
+The index grants no lineage or completion authority and adds no caller step.
+
 The canonical project artifact directory is:
 
 ```text
@@ -232,7 +248,13 @@ locator check, and finalization and every later refresh share one inclusion rule
 `*.pyc`, editor temporaries (`*.swp`, `*~`, `.#*`), `*.tmp`/`*.part` and symbolic
 links are not output: a link is only `lstat`-ed and its target is not followed or read, and each
 such path is left out of the manifest and listed as excluded instead of failing
-the close. `_internal/` and other non-hidden support paths, binary and large
+the close. The browser review workspace also reserves
+`artifacts/reviews/**/browser/profile/` and `profile-*/` for Chromium runtime
+profiles. These directories and their descendants are excluded before locator
+validation and payload reads, on both first close and later refreshes; existing
+profiles remain in place. Screenshots, browser logs and review reports beside
+them remain output. New browser work uses a process-owned temporary profile
+outside the cycle payload. `_internal/` and other non-hidden support paths, binary and large
 files are output. A payload name keeps UTF-8, spaces and the ASCII punctuation
 `_ . - ~ + ( ) @ , =` up to 255 bytes; other ASCII punctuation (quotes, `$`,
 backquotes, `;`, `|`, `&`, `<`/`>` and glob characters among them) makes it
@@ -322,6 +344,20 @@ and cycle manifests and route evidence remain immutable. Membership uses member
 records: an output-less cycle removed from `campaign.cycles` remains auditable
 as detached rather than causing membership drift. Abandoned cycles remain
 abandoned; closure adds neither route repair nor a residual-zero condition.
+
+Presentation is independent of lifecycle: `campaign.presentation_kind`
+(`archive_bundle`, [ARTIFACT_META.md](ARTIFACT_META.md)) only marks how a
+campaign is shown while preserving its lifecycle state.
+`campaign-export` ([artifact-campaign-current/v1](ARTIFACT_CAMPAIGN_CURRENT.md)) is the pure read of that
+current state; `campaign-status`, `campaign-list`, and `campaign-export`
+repair nothing — reconcile, history flush, and index heals belong to writer
+commands (`campaign-close`, `compose`). A legacy close event survives a root
+rename when its snapshot rows still bind, byte-exact, to surviving manifests
+under the stable RootIdentity (the old absolute path stays as provenance, not
+proof). Only an explicit goal judgment in the owner's own final report lets
+normal settlement record a `campaign.satisfied` event; completed or sealed
+cycles alone leave the stream open, and the next begin on the same key still
+reopens it.
 
 **Campaign workflow groups.** A producer-owned versioned declaration at
 `campaigns/<campaign-locator>/workflow-groups.json` may group existing cycles by

@@ -309,6 +309,8 @@ and confidence thresholds never substitute for that judgment.
   `MEM_STORE`, then `$XDG_STATE_HOME/agent-memory/write-events.jsonl`.
 - Telemetry is fail-open; a logging failure never blocks a mutation. Graveyard
   recovery remains fail-closed because it protects destructive actions.
+- `delete` retains the known pre-delete content in its bounded snippet. Older
+  blank events remain unchanged and displays explicitly name missing content.
 - Actor precedence is explicit `MEM_ACTOR`, distiller context, operation-specific
   defaults, then `manual`. Curator application sets `MEM_ACTOR=curator`.
 - `mem log` is a timeline and complements rather than replaces `stats`.

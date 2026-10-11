@@ -59,6 +59,29 @@ class WorkStartTest(unittest.TestCase):
         self.current = mock.patch.object(W, "current_delivery_state", side_effect=self.delivery)
         self.current.start(); self.addCleanup(self.current.stop)
 
+    def test_legacy_continuation_normal_start_reads_original_request_without_rewriting(self):
+        source = json.loads(json.dumps(self.route))
+        source_path = self.path.with_name("source.json")
+        source_path.write_text(json.dumps(source))
+        self.route = {**self.route, "route_id": "rt-continuation", "route_hash": "sha256:continued",
+                      "source_route_id": source["route_id"], "source_route_hash": source["route_hash"],
+                      "nodes": [{"id": "review"}]}
+        self.route.pop("work_request")
+        self.path.write_text(json.dumps(self.route))
+        before = self.path.read_bytes()
+        self.ready = self.released = True
+        module = SimpleNamespace(resolve_route_argument=lambda *a: source_path,
+                                 verify_route=lambda value: value)
+        with mock.patch.object(W, "_route_module", return_value=module):
+            first = self.start()
+            second = self.start()
+        self.assertTrue(first["owner_started"])
+        self.assertTrue(second["owner_started"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][self.calls[0].index("--prompt-text") + 1], source["work_request"]["text"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn("work_request", self.route)
+
     def test_start_and_resume_prepare_the_same_canonical_root_request(self):
         primary = Path(self.tmp.name) / "primary"
         project = Path(self.tmp.name) / "linked"
@@ -668,6 +691,83 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn("You are the parent session", result["next_step"])
         self.assertIn("Do not kill", result["next_step"])
 
+    def test_open_but_exited_or_unobservable_owner_is_never_reported_running(self):
+        import dispatch_contract as D
+        self.start(); self.ready = self.released = True; self.start()
+        self.jobs.write_text(self.jobs.read_text().replace(
+            'worker_type=owner', 'worker_type=owner,pid=99999999,pid_start=100'))
+        for state, reason in (('quiescent', 'owner-settlement-pending'),
+                              ('unverifiable', 'owner-process-unverifiable')):
+            with self.subTest(state=state), \
+                 mock.patch.object(W, 'join_selected_attempts', return_value={'state': 'timeout', 'children': []}), \
+                 mock.patch.object(D, 'attempt_process_quiescence',
+                                   return_value=D.ProcessQuiescence(state, 'fixture')):
+                result = self.start()
+                self.assertEqual((result['state'], result['reason']), ('needs-attention', reason), result)
+                self.assertNotIn('parent_next', result)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_start_with_a_changed_pin_diagnoses_a_live_owner_on_the_old_harness(self):
+        self.start(); self.ready = self.released = True; created = self.start()
+        owner = created['owner_attempt_id']
+        self.jobs.write_text(self.jobs.read_text().replace('attempt_id='+owner,
+            'harness=codex,launch_claimed=1,replacement_original_attempt_id=att-predecessor,attempt_id='+owner))
+        self.route['selection_pins'] = {'owner': {'harness': 'opencode'}}
+        before = self.jobs.read_bytes()
+        result = self.start()
+        self.assertEqual((result['state'], result['reason'], result['requested_harness']),
+                         ('needs-attention', 'owner-pin-handoff', 'opencode'))
+        command = __import__('shlex').split(result['recovery_command'])
+        self.assertIn('close', command)
+        self.assertNotIn('--stop-resources', command)
+        self.assertEqual(result['owner_attempt_id'], owner)
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_an_ordinary_live_owner_keeps_its_selector_fallback(self):
+        self.start(); self.ready = self.released = True; created = self.start()
+        owner = created['owner_attempt_id']
+        self.jobs.write_text(self.jobs.read_text().replace('attempt_id='+owner, 'harness=codex,launch_claimed=1,attempt_id='+owner))
+        self.route['selection_pins'] = {'owner': {'harness': 'opencode'}}
+        before = self.jobs.read_bytes()
+        with mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}):
+            result = self.start()
+        self.assertEqual(result['state'], 'running', result)
+        self.assertNotEqual(result.get('reason'), 'pin-ignored-for-replacement')
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_changed_owner_pin_is_observed_before_the_resource_watch_receipt(self):
+        import dispatch_resource_wait as RESOURCE
+        self.start(); self.ready = self.released = True; created = self.start()
+        owner = created['owner_attempt_id']
+        self.jobs.write_text(self.jobs.read_text().replace('attempt_id='+owner,
+            'harness=codex,launch_claimed=1,attempt_id='+owner))
+        self.route['nodes'].append({'id': 'eval-run', 'kind': 'resource-runner'})
+        self.route['artifact_root'] = self.tmp.name
+        W.route_authority.record_pin_change(self.route, target='owner',
+            pin={'harness': 'opencode', 'model': None, 'effort': None},
+            by={'harness': 'codex', 'session_id': 'parent'},
+            source='fixture', tuples=[], candidates=[])
+        before = self.jobs.read_bytes()
+        watcher = SimpleNamespace(recover_resource_watches=mock.Mock(return_value=[{'state': 'watching'}]))
+        with mock.patch.object(RESOURCE, 'supervisor', return_value=watcher):
+            result = self.start()
+        self.assertEqual((result['state'], result['reason'], result['requested_harness']),
+                         ('needs-attention', 'owner-pin-handoff', 'opencode'))
+        self.assertEqual(result['owner_attempt_id'], owner)
+        self.assertIn(' close ', result['recovery_command'])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        watcher.recover_resource_watches.assert_not_called()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_completed_owner_winning_close_race_has_no_handoff_retry(self):
+        completed = {'state': 'completed', 'terminal_gate_proven': True,
+                     'summary': W.PIN_HANDOFF_SUMMARY}
+        result = W.pin_handoff_continuation(self.route, self.path, self.jobs, completed)
+        self.assertIs(result, completed)
+        self.assertNotIn('recovery_command', result)
+
     def test_owner_exits_during_join_before_the_public_receipt(self):
         self.start(); self.ready = self.released = True; self.start()
         def close_during_join(**kwargs):
@@ -989,6 +1089,20 @@ class WorkStartTest(unittest.TestCase):
             self.assertIn(token,result['next_step'])
         self.assertEqual(len(self.calls),3)   # nothing new launched while it waits
 
+    def test_a_readable_fail_after_spent_replacement_points_to_the_working_correction(self):
+        owner = self._parked_owner_row()
+        self.jobs.write_text(self.jobs.read_text().replace('dead-worker-blocked', 'dead-worker-fail')
+                             .replace('failure_class=blocked', 'failure_class=fail'))
+        with mock.patch('dispatch_replacement.advance', return_value={
+                'state': 'needs-attention', 'reason': 'automatic-replacement-exhausted'}):
+            result = self.start()
+        self.assertEqual((result['state'], result['reason'], result['required_action']),
+                         ('needs-attention', 'owner-failed', 'answer-failed-owner'), result)
+        self.assertIn('--attempt-id ' + owner, result['correction_command'])
+        self.assertIn('correction_command', result['next_step'])
+        self.assertIn('replacement owner', result['next_step'])
+        self.assertEqual(len(self.calls), 3)
+
     def test_released_parked_owner_continues_through_replacement(self):
         owner=self._parked_owner_row()
         row=next(line for line in self.jobs.read_text().splitlines() if 'attempt_id='+owner+',' in line)
@@ -1141,6 +1255,8 @@ class WorkStartTest(unittest.TestCase):
         pins = {"contract_version": 1,
                 "owner": {"harness": "opencode", "model": None, "effort": None}}
         self.route["selection_pins"] = pins
+        for row in self.route["dispatch_evidence"]["tuples"]:
+            row.update(parent_harness="opencode", launch_authority="conductor")
         self.start()
         # Both legs run on the one tool the caller named (SD-160 allows a shared
         # harness); with no pin they stay on automatic selection (no --adapter).
@@ -1153,11 +1269,39 @@ class WorkStartTest(unittest.TestCase):
         self.route["selection_pins"] = {"contract_version": 1,
             "owner": {"harness": "codex", "model": None, "effort": None},
             "frame": {"harness": "opencode", "model": "provider/model", "effort": "max"}}
+        for row in self.route["dispatch_evidence"]["tuples"]:
+            row.update(parent_harness="codex", launch_authority="conductor")
         self.start()
         self.assertEqual(self.adapters(), ["opencode", "opencode"])
         self.ready = True; self.released = True
         self.start()
         self.assertEqual(self.adapters()[2], "codex")
+
+    def test_start_repairs_missing_pinned_conductor_evidence_once_before_owner_launch(self):
+        import route_authority as RA
+        module = W._route_module()
+        self.route.update(cwd=self.tmp.name, artifact_root=self.tmp.name,
+                          capability="autopilot-code", capability_mode="debug", owner_model_profile="deep",
+                          nodes=[{"id": "test"}], selection_pins={"contract_version": 1,
+                              "owner": {"harness": "opencode", "model": None, "effort": None}})
+        self.route["dispatch_evidence"]["tuples"] = [{"parent_harness": "claude", "child_harness": "codex",
+                                                    "status": "supported", "launch_authority": "conductor"}]
+        self.path.write_text(json.dumps(self.route))
+        before = self.path.read_bytes()
+        checked = {"parent_harness": "opencode", "parent_transport": "headless", "parent_sandbox": "adapter-default",
+                   "child_harness": "codex", "status": "supported", "launch_authority": "conductor",
+                   "checked_worktree": self.tmp.name}
+        self.ready = self.released = True
+        with mock.patch.object(module, "_compose_readiness", return_value={"tuples": [checked]}) as probe, \
+             mock.patch.object(RA, "caller_identity", return_value=("claude", "parent")):
+            first = self.start()
+            second = self.start()
+        self.assertEqual(probe.call_count, 1)
+        self.assertTrue(first["pin_evidence"]["changed"])
+        self.assertTrue(second["owner_started"])
+        self.assertEqual(self.adapters(), ["opencode"])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(RA.route_in_force(self.route)["dispatch_evidence"]["tuples"][-1], checked)
 
     def test_a_pinned_tool_the_route_never_probed_is_not_forced(self):
         self.route["selection_pins"] = {"contract_version": 1,
@@ -1241,11 +1385,13 @@ class WorkStartTest(unittest.TestCase):
 
     def test_verified_resume_confirmed_exit_enters_existing_once_only_owner_path(self):
         self.route.update(capability="autopilot-lab", capability_mode="setup", effective_intensity="quick",
+            cwd=self.tmp.name, artifact_root=self.tmp.name,
             composed_recipe={"capability":"autopilot-lab","modes":["setup"],
                 "compose":{"graph":["resume-run","run-verify"]},
                 "standard_plus":{"nodes":[{"id":"resume-run"},{"id":"run-verify"}]}},
             nodes=[{"id":"resume-run"},{"id":"one-shot","worker_type":"owner","dispatch_depth":1}])
         with mock.patch.object(W.RESOURCE_RESUME,"observation",return_value={"state":"resource-succeeded"}), \
+             mock.patch.object(W,"prepare_task_request",return_value=None), \
              mock.patch.object(W.RESOURCE_RESUME,"verification_prompt",return_value="\nONLY independent post-run verification"):
             first=self.start()
             again=self.start()

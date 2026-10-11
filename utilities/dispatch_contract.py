@@ -3,9 +3,6 @@
 
 from __future__ import annotations
 
-from hearting_gates import gates_on, same_work_or_refuse
-from session_identity import session_label
-
 import base64
 from contextlib import contextmanager
 import contextvars
@@ -29,6 +26,14 @@ import uuid
 from typing import Callable, Iterator, Mapping, NamedTuple
 from types import MappingProxyType
 
+# Keep the actual import tree visible to the installer's existing /proc in-use
+# scan even when argv names ~/.claude/hooks or another rotating projection.
+# The descriptor closes on exec/process exit; no runtime state is written.
+_CODE_ROOT_FD = os.open(Path(__file__).resolve().parents[1],
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+
+from hearting_gates import gates_on, same_work_or_refuse
+from session_identity import session_label
 from route_identity import registered_node_identity
 from governor_identity import close_witness, create_witness
 from dispatch_attempt_policy import (decide_attempt, SUBSESSION_NOTE, SUCCESS_NOTES, committed_outcome,
@@ -277,7 +282,14 @@ FALLBACK_HOPS = {
     "inline",
 }
 ATTEMPT_MUTABLE_METADATA = {
+    # Published with the actual child environment after the admission claim.
+    # A duplicate start has not prepared that environment yet.
+    "runtime_home",
+    "parent_close_requested", "parent_close_route_id", "parent_close_route_hash",
+    "parent_close_stop_resources", "parent_close_settled",
     "resolved_model",
+    # Observational caller provenance, never parent execution/delivery authority.
+    "caller_sid", "caller_harness", "caller_pane", "caller_cwd",
     "launch_claimed",
     "pid",
     "pid_start",
@@ -909,6 +921,7 @@ class ParentAttemptBinding:
     worktree: str
     slug: str
     liveness_metadata_fingerprint: tuple[tuple[str, str], ...]
+    repository_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -2344,7 +2357,12 @@ def attempt_scan_namespace_authority(metadata: dict[str, str]) -> bool:
             metadata.get("pid_host_proof") == PID_HOST_NAMESPACE_PROOF
             and metadata.get("pid_host_ns") == current_namespace
         )
-    return metadata.get("pid_scope", "host-visible") != "namespace-local"
+    # Older rows may carry the checked procfs-root mapping without the later
+    # observer mirror. The same stored host proof already authorizes the PID
+    # reader; it also authorizes a complete descendant scan in that namespace.
+    return (metadata.get("pid_scope", "host-visible") != "namespace-local"
+            or (metadata.get("pid_host_proof") == PID_HOST_NAMESPACE_PROOF
+                and metadata.get("pid_host_ns") == current_namespace))
 
 
 def _current_observer_is_host_like() -> bool:
@@ -3002,14 +3020,14 @@ def _tag_scan_authority(metadata: dict[str, str], host_complete: bool) -> bool:
 
 def _tagged_descendants_from_scan(
     scan: ProcessTableScan, metadata: dict[str, str], attempt_id: str,
-    *, host_complete: bool = False,
+    *, host_complete: bool = False, preserved=frozenset(),
 ) -> ProcessGroupObservation:
     if scan.error:
         return ProcessGroupObservation("unverifiable", reason=scan.error)
     excluded_pids = _parent_leader_pids(metadata)
     ordered = tuple(
         member for member in scan.members_by_attempt.get(attempt_id, ())
-        if member[0] not in excluded_pids
+        if member[0] not in excluded_pids and member[:2] not in preserved
     )
     if ordered:
         return ProcessGroupObservation("populated", ordered, scan.incomplete_reason)
@@ -3079,6 +3097,10 @@ def _tag_access_observation(entry: Path, start: str = "") -> tuple[str, str]:
     try:
         raw = (entry / "stat").read_text(encoding="utf-8")
         tail = raw[raw.rfind(")") + 2:].split()
+        if tail[0] == "Z":
+            # exit_mm can revoke environ between the walk's stat read and
+            # this adjacent observation. A zombie cannot run or fork.
+            return "", ""
         current = tail[19]
         stable = start if start.isdigit() and current == start else ""
     except FileNotFoundError:
@@ -3115,7 +3137,7 @@ def _denied_process_outside_attempt(start: str, metadata: dict[str, str], *, hos
 
 
 def attempt_tagged_descendants(
-    metadata: dict[str, str], *, host_complete: bool = False
+    metadata: dict[str, str], *, host_complete: bool = False, preserved=frozenset()
 ) -> ProcessGroupObservation:
     """Find live processes still tagged with this attempt, whatever group they left.
 
@@ -3134,6 +3156,9 @@ def attempt_tagged_descendants(
     recorded namespaces are extinct (`attempt_process_quiescence`): then a
     complete walk by a host-like observer, which sees every namespace, is the
     one that may answer ``empty``.
+    ``preserved`` excludes only already classified exact PID/start positives;
+    the existing completeness and denied-environment checks still prove absence.
+    Whole-attempt callers leave it empty.
     """
 
     attempt_id = metadata.get("attempt_id", "")
@@ -3144,7 +3169,7 @@ def attempt_tagged_descendants(
         # Batch observer pass (`process_table_scan_scope`): same verdict, one
         # walk shared by every attempt of the pass instead of one per call.
         return _tagged_descendants_from_scan(
-            scan, metadata, attempt_id, host_complete=host_complete
+            scan, metadata, attempt_id, host_complete=host_complete, preserved=preserved
         )
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
     # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
@@ -3193,7 +3218,7 @@ def attempt_tagged_descendants(
             continue
         if int(entry.name) in excluded_pids:
             continue
-        if tag in environ.split(b"\0"):
+        if tag in environ.split(b"\0") and (int(entry.name), start) not in preserved:
             members.append((int(entry.name), start, state))
     ordered = tuple(sorted(members, key=lambda member: member[0]))
     if ordered:
@@ -3565,7 +3590,7 @@ def resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False)
 def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
     """Reconcile cleanup on an exact terminal row, preserving its committed result.
 
-    The runtime join and operator reconcile use this same bounded, signal-free
+    The runtime join and operator reconcile use this same bounded cleanup
     authority. A missing proof remains an obligation; no cancellation or retry
     receipt is issued. Process observations happen outside the registry lock.
     """
@@ -3581,6 +3606,10 @@ def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False
         return {**result, "reason": "cleanup-terminal-result-required"}
     validate_attempt_metadata(metadata)
     process = attempt_process_quiescence(metadata, terminal_receipt=True)
+    if apply and process.state == "live":
+        from route_parent_close import reap_terminal_descendants
+        reap_terminal_descendants(jobs, fields)
+        process = attempt_process_quiescence(metadata, terminal_receipt=True)
     # A namespace-extinct verdict is quiescent only from a host-like observer.
     # Still seal the existing cleanup receipt when its proof holds, so a later
     # sandboxed reader of this row sees the same settled state.
@@ -3682,12 +3711,24 @@ def residue_live_pids(metadata: dict[str, str]) -> tuple[int, ...]:
     return tuple(member[0] for member in probe.members) if probe.state == "populated" else ()
 
 
+def terminal_receipt_incomplete(metadata, *, terminal_receipt=True):
+    """The existing durable terminal gate for namespace-local registered workers."""
+    return bool(terminal_receipt
+                and metadata.get("registered_worker") == "1"
+                and metadata.get("pid_scope") == "namespace-local"
+                and not _post_exit_receipt_reason(metadata)
+                and not _cancellation_receipt_reason(metadata)
+                and not _cleanup_receipt_reason(metadata))
+
+
 def attempt_process_quiescence(
     metadata: dict[str, str], *, terminal_receipt: bool = False
 ) -> ProcessQuiescence:
     """Classify the exact governed process, then prove no tagged descendant survives.
 
-    The leader/process-group verdict below is left exactly as it was; it is only
+    A retained claim proving this host's past kernel settles the whole process
+    tree before consulting potentially reused PIDs. Contradictory or foreign
+    boot evidence stays unverifiable. Otherwise the leader/group verdict is
     post-processed on its way to ``quiescent``. That is the one verdict a false
     negative can turn into a duplicate launch, and it is also the rare one, so
     the ``/proc`` scan runs only at the moment quiescence is about to be
@@ -3695,6 +3736,16 @@ def attempt_process_quiescence(
     previous meaning to the letter, with one exception: a receiptless row whose
     recorded namespaces are extinct on the host (`_namespace_extinct_quiescence`).
     """
+
+    from resource_run_registry import recorded_governor_identity, previous_boot_evidence, boot_identity
+    identity = recorded_governor_identity(metadata)
+    if identity:
+        if previous_boot_evidence(identity):
+            return ProcessQuiescence("quiescent", "host-reboot")
+        current_boot = boot_identity()
+        if not current_boot or (identity.get('boot_id') != current_boot['boot_id']
+                or ('boot_host' in identity and identity['boot_host'] != current_boot['boot_host'])):
+            return ProcessQuiescence("unverifiable", "process-boot-unverifiable")
 
     # A terminal namespace-local row can become visible before its wrapper has
     # finished publishing the portable post-exit receipt.  Local PID/group and
@@ -3713,14 +3764,7 @@ def attempt_process_quiescence(
     # successor, join, wait, and cleanup gate that reads an old row, so they
     # keep the verdict they already had instead.
     if not metadata.get("attempt_id"):
-        if (
-            terminal_receipt
-            and metadata.get("registered_worker") == "1"
-            and metadata.get("pid_scope") == "namespace-local"
-            and not _post_exit_receipt_reason(metadata)
-            and not _cancellation_receipt_reason(metadata)
-            and not _cleanup_receipt_reason(metadata)
-        ):
+        if terminal_receipt_incomplete(metadata, terminal_receipt=terminal_receipt):
             return ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete")
         return result
     probe = attempt_tagged_descendants(metadata)
@@ -3734,14 +3778,7 @@ def attempt_process_quiescence(
         # Nobody is left to publish a namespace-local receipt: the wrapper
         # died with the namespace. The receipt gate below never applies here.
         return extinct
-    if (
-        terminal_receipt
-        and metadata.get("registered_worker") == "1"
-        and metadata.get("pid_scope") == "namespace-local"
-        and not _post_exit_receipt_reason(metadata)
-        and not _cancellation_receipt_reason(metadata)
-        and not _cleanup_receipt_reason(metadata)
-    ):
+    if terminal_receipt_incomplete(metadata, terminal_receipt=terminal_receipt):
         return ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete")
     if result.state != "quiescent":
         # A non-quiescent leader verdict remains authoritative unless the
@@ -4206,182 +4243,9 @@ def replica_batch_expectation(
     return expected
 
 
-def _validate_replica_reservation(
-    payload: dict[str, object], expected: dict[str, object] | None
-) -> None:
-    if expected is None:
-        if payload.get("reservation_kind") in {"replica-batch", "parallel-batch"}:
-            raise DispatchContractError(
-                "parallel-group-reservation-mismatch",
-                "parallel batch token cannot authorize a non-group start",
-            )
-        return
-    public_expected = {
-        key: value for key, value in expected.items() if not key.startswith("_")
-    }
-    mismatches = {
-        key: (value, payload.get(key))
-        for key, value in public_expected.items()
-        if payload.get(key) != value
-    }
-    for key in ("batch_manifest_sha256", "batch_leg_sha256"):
-        value = payload.get(key)
-        if not isinstance(value, str) or not DIGEST.fullmatch(value):
-            mismatches[key] = ("sha256:<64 lowercase hex>", value)
-    manifest = payload.get("batch_manifest")
-    try:
-        verified, manifest_digest, leg_digests = verify_manifest(manifest)
-    except ReplicaBatchContractError as exc:
-        mismatches["batch_manifest"] = ("valid canonical manifest", str(exc))
-        verified, manifest_digest, leg_digests = {}, "", {}
-    if manifest_digest and payload.get("batch_manifest_sha256") != manifest_digest:
-        mismatches["batch_manifest_sha256"] = (
-            manifest_digest,
-            payload.get("batch_manifest_sha256"),
-        )
-    if verified:
-        common = {
-            "route_id": public_expected.get("batch_route_id"),
-            "parent_attempt_id": public_expected.get("batch_parent_attempt_id"),
-        }
-        manifest_group = verified.get("parallel_group") or verified.get("replica_group")
-        if manifest_group != public_expected.get("batch_group"):
-            mismatches["manifest.parallel_group"] = (
-                public_expected.get("batch_group"), manifest_group
-            )
-        for key, value in common.items():
-            if verified.get(key) != value:
-                mismatches[f"manifest.{key}"] = (value, verified.get(key))
-        route_nodes = sorted(str(member.get("route_node", "")) for member in verified["members"])
-        if route_nodes != expected.get("_batch_route_nodes"):
-            mismatches["manifest.route_nodes"] = (
-                expected.get("_batch_route_nodes"), route_nodes
-            )
-        allowed = expected.get("_batch_allowed_members", {})
-        for manifest_member in verified["members"]:
-            member_node = str(manifest_member.get("route_node", ""))
-            profile_fields = expected.get("_batch_profile_selections", {}).get(member_node)
-            if profile_fields is not None:
-                for key, value in profile_fields.items():
-                    if manifest_member.get(key) != value:
-                        mismatches[f"manifest.member.{member_node}.{key}"] = (value, manifest_member.get(key))
-            allowed_for_member = (
-                allowed.get(member_node, []) if isinstance(allowed, dict) else []
-            )
-            member_tuple = {
-                "harness": manifest_member.get("harness"),
-                "fallback_hop": manifest_member.get("fallback_hop"),
-                "fallback_ordinal": manifest_member.get("fallback_ordinal"),
-            }
-            if member_tuple not in allowed_for_member:
-                mismatches[f"manifest.member.{member_node}.route_binding"] = (
-                    allowed_for_member, member_tuple
-                )
-        selected = [
-            member for member in verified["members"]
-            if member.get("attempt_id") == public_expected.get("batch_attempt_id")
-        ]
-        if len(selected) != 1:
-            mismatches["manifest.selected_member"] = (
-                public_expected.get("batch_attempt_id"), len(selected)
-            )
-        else:
-            member = selected[0]
-            member_expected = {
-                "route_node": public_expected.get("batch_route_node"),
-                "harness": public_expected.get("batch_harness"),
-                "fallback_hop": public_expected.get("batch_fallback_hop"),
-                "fallback_ordinal": public_expected.get("batch_fallback_ordinal"),
-            }
-            if int(verified.get("schema_version", 1)) >= 2:
-                member_expected.update({
-                    "model_profile": public_expected.get("batch_model_profile"),
-                    "perspective": public_expected.get("batch_perspective"),
-                    "parallel_leg_index": public_expected.get("batch_parallel_leg_index"),
-                })
-            for key, value in member_expected.items():
-                if member.get(key) != value:
-                    mismatches[f"manifest.member.{key}"] = (value, member.get(key))
-            expected_assignment = public_expected.get("batch_assignment_sha256")
-            if expected_assignment and member.get("assignment_sha256") != expected_assignment:
-                mismatches["manifest.member.assignment_sha256"] = (
-                    expected_assignment, member.get("assignment_sha256")
-                )
-            attempt = str(member.get("attempt_id", ""))
-            if payload.get("batch_leg_sha256") != leg_digests.get(attempt):
-                mismatches["batch_leg_sha256"] = (
-                    leg_digests.get(attempt), payload.get("batch_leg_sha256")
-                )
-        if payload.get("batch_independence") != verified.get("independence"):
-            mismatches["batch_independence"] = (
-                verified.get("independence"), payload.get("batch_independence")
-            )
-    declared_size = public_expected.get("batch_declared_size")
-    admission = payload.get("batch_admission_count")
-    if (isinstance(declared_size, bool) or not isinstance(declared_size, int)
-            or not 2 <= declared_size <= 4):
-        mismatches["batch_declared_size"] = ("integer 2..4", declared_size)
-        declared_size = 0
-    if isinstance(admission, bool) or admission not in {1, declared_size}:
-        mismatches["batch_admission_count"] = (f"1|{declared_size}", admission)
-    elif admission == 1:
-        selected_attempt = str(public_expected.get("batch_attempt_id", ""))
-        peer_members = (
-            [
-                member for member in verified.get("members", [])
-                if str(member.get("attempt_id", "")) != selected_attempt
-            ]
-            if verified
-            else []
-        )
-        expected_peers = sorted(str(member.get("attempt_id", "")) for member in peer_members)
-        proof_keys = {
-            "agent_home", "attempt_id", "jobs", "manifest_sha256",
-            "reason", "route", "state",
-        }
-        proofs = payload.get("batch_peer_set")
-        if payload.get("batch_peer_count") != len(expected_peers):
-            mismatches["batch_peer_count"] = (len(expected_peers), payload.get("batch_peer_count"))
-        if not isinstance(proofs, list) or len(proofs) != len(expected_peers):
-            mismatches["batch_peer_set"] = ("exact N-1 canonical proofs", proofs)
-        else:
-            actual_peers=[]
-            for index, proof in enumerate(proofs):
-                label=f"batch_peer_set[{index}]"
-                if not isinstance(proof, dict) or set(proof) != proof_keys:
-                    mismatches[label] = ("canonical peer proof", proof)
-                    continue
-                actual_peers.append(str(proof.get("attempt_id", "")))
-                if proof.get("manifest_sha256") != manifest_digest:
-                    mismatches[f"{label}.manifest_sha256"] = (manifest_digest, proof.get("manifest_sha256"))
-                if proof.get("state") not in {"active", "completed"}:
-                    mismatches[f"{label}.state"] = ("active|completed", proof.get("state"))
-                for key in ("agent_home", "jobs", "route"):
-                    value=proof.get(key)
-                    if not isinstance(value,str) or not Path(value).is_absolute():
-                        mismatches[f"{label}.{key}"] = ("absolute path", value)
-                if not isinstance(proof.get("reason"),str) or not proof.get("reason"):
-                    mismatches[f"{label}.reason"] = ("non-empty observation reason", proof.get("reason"))
-            if actual_peers != expected_peers:
-                mismatches["batch_peer_set.attempts"] = (expected_peers, actual_peers)
-            encoded=json.dumps(proofs,separators=(",",":"),sort_keys=True).encode("utf-8")
-            proof_digest="sha256:"+hashlib.sha256(encoded).hexdigest()
-            if payload.get("batch_peer_set_sha256") != proof_digest:
-                mismatches["batch_peer_set_sha256"] = (proof_digest,payload.get("batch_peer_set_sha256"))
-    elif admission == declared_size:
-        for key in (
-            "batch_peer_count", "batch_peer_set", "batch_peer_set_sha256",
-            "batch_peer_attempt_id", "batch_peer_state",
-            "batch_peer_proof", "batch_peer_proof_sha256",
-        ):
-            if key in payload:
-                mismatches[key] = ("absent for full batch", payload.get(key))
-    if mismatches:
-        detail = ";".join(
-            f"{key}:expected={wanted}:actual={actual}"
-            for key, (wanted, actual) in sorted(mismatches.items())
-        )
-        raise DispatchContractError("parallel-group-reservation-mismatch", detail)
+def _validate_replica_reservation(payload, expected) -> None:
+    from route_authority import require_batch_reservation
+    require_batch_reservation(payload, expected)
 
 
 def reserve_governor_token(
@@ -4964,8 +4828,8 @@ def parent_attempt_binding_is_live(
             if (
                 fields[4] != binding.slug
                 or fields[3] != binding.worktree
-                or canonical_repository_identity(fields[2])
-                != binding.repository_identity
+                or (fields[2] != binding.repository_path if binding.repository_path
+                    else canonical_repository_identity(fields[2]) != binding.repository_identity)
             ):
                 return False
             return _parent_binding_is_live_from_metadata(
@@ -5018,6 +4882,9 @@ def spawn_claimed_attempt(
             )
         child_index, child_fields, child_meta = matches[0]
         validate_attempt_metadata(child_meta)
+        import route_parent_close
+        if route_parent_close.row_requested(child_meta, jobs):
+            raise DispatchContractError("cancelled-by-parent")
         if child_fields[1] not in {"open", "running"}:
             raise DispatchContractError("attempt-not-open", attempt_id)
         if child_meta.get("launch_claimed") == "1":
@@ -5339,6 +5206,8 @@ def spawn_claimed_attempt(
                     )
                 fresh_index, fresh_fields, fresh_meta = fresh_matches[0]
                 validate_attempt_metadata(fresh_meta)
+                if route_parent_close.row_requested(fresh_meta, jobs):
+                    raise DispatchContractError("cancelled-by-parent")
                 if (
                     fresh_fields[1] not in {"open", "running"}
                     or fresh_fields[2:5] != child_fields[2:5]
@@ -5569,6 +5438,7 @@ def resolve_live_parent_attempt(
             transport=metadata.get("transport", ""),
             runtime_sandbox=metadata.get("runtime_sandbox", ""),
             repository_identity=requested_repository,
+            repository_path=parent_fields[2],
             worktree=parent_fields[3],
             slug=parent_fields[4],
             liveness_metadata_fingerprint=tuple(
@@ -6822,6 +6692,9 @@ def owner_operation_gates(route: dict) -> list[tuple[dict, str]]:
 
 def owner_operation_fence(route: dict, node: dict, jobs: Path | None = None) -> None:
     """Refuse the owner's own operation until a person released the current preview."""
+    import route_parent_close
+    if route_parent_close.intent(route, jobs):
+        raise DispatchContractError("cancelled-by-parent")
     _human_gate_entry_fence(route, node, jobs, release_proof=True, only=OWNER_OPERATION_GATES)
 
 
@@ -7408,7 +7281,7 @@ def _sibling_attempt_gate(
             return
     else:
         lines = registry_lines
-    sibling: tuple[str, dict[str, str]] | None = None
+    sibling: tuple[list[str], dict[str, str]] | None = None
     # Parallel slices of one chain run side by side; only another chain's
     # (or a non-slice) attempt of this node can be a leaked prior execution.
     own_chain = ""
@@ -7434,22 +7307,21 @@ def _sibling_attempt_gate(
             continue
         if own_chain and metadata.get("session_chain_id") == own_chain:
             continue
-        # A row that never recorded a governed process cannot have leaked one,
-        # and judging it `unverifiable` would wedge the node permanently.
-        if not metadata.get("pid"):
+        # Only the existing durable never-started fence can skip a predecessor.
+        # Missing PID on a claimed/started launch is an observation gap.
+        if attempt_row_never_started(fields):
             continue
         # Only the most recent sibling by registry order is authoritative; older
         # rows are its lineage, not independent claimants.
-        sibling = (fields[1], metadata)
+        sibling = (fields, metadata)
     if sibling is None:
         return
-    sibling_status, sibling_metadata = sibling
-    process = attempt_process_quiescence(
-        sibling_metadata,
-        terminal_receipt=sibling_status in {"done", "killed", "cancelled"},
-    )
-    decision = decide_attempt(sibling_status, sibling_metadata,
-                              process_state=process.state, process_reason=process.reason)
+    sibling_fields, sibling_metadata = sibling
+    sibling_status = sibling_fields[1]
+    from recovery_evidence import observe_attempt
+    evidence = observe_attempt(sibling_status, sibling_metadata, registry_rows=lines,
+                               repo=sibling_fields[2], worktree=sibling_fields[3])
+    process, decision = evidence.process, evidence.decision
     if decision.action not in {"wait", "recover"}:
         return
     reason = (
@@ -7459,7 +7331,7 @@ def _sibling_attempt_gate(
     )
     raise DispatchContractError(
         reason,
-        f"{route_node}:{sibling_metadata.get('attempt_id', '-')}:{process.reason}",
+        f"{route_node}:{sibling_metadata.get('attempt_id', '-')}:{decision.reason}",
     )
 
 
@@ -7501,7 +7373,7 @@ def owner_closure_shape(metadata: Mapping[str, object]) -> str | None:
 
 def _marker_schema_identity_ok(
     route: dict[str, object], node: dict[str, object], marker: dict[str, object],
-    marker_path: Path,
+    marker_path: Path, *, observe: bool = False,
 ) -> tuple[bool, Path | None]:
     """Schema/identity/history-byte checks shared by every marker generation
     (an ordinary marker, and -- recursively, SD-154 I-4 -- the marker a
@@ -7521,7 +7393,7 @@ def _marker_schema_identity_ok(
         "completion_gate": node.get("completion_gate"),
     }
     if any(marker.get(key) != value for key, value in expected.items()):
-        if gates_on() or any(key not in marker for key in expected):
+        if observe or gates_on() or any(key not in marker for key in expected):
             return False, None
         same_work_or_refuse("completion-marker-identity-mismatch", node_id)
     history_path = marker_path.parent / f"{node_id}.{sequence}.json"
@@ -7530,7 +7402,7 @@ def _marker_schema_identity_ok(
     except (OSError, ValueError):
         return False, None
     if history != marker:
-        if gates_on() or not isinstance(history, dict):
+        if observe or gates_on() or not isinstance(history, dict):
             return False, None
         same_work_or_refuse("completion-marker-history-changed", node_id)
     return True, history_path
@@ -7796,8 +7668,12 @@ def evidence_currency(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
+    *, observe: bool = False,
 ) -> GateCurrency:
     """The schema/identity/tombstone/evidence-digest half of `gate_currency`.
+
+    ``observe=True`` reads integrity without gates-off execution relaxation.
+    It never changes gate settings or adds execution requirements.
 
     Deliberately stops short of the attempt-link/shape proof
     (`_marker_link_current`) -- `_marker_identity_row`'s own `passed` field
@@ -7812,7 +7688,7 @@ def evidence_currency(
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
     try:
-        schema_ok, _history_path = _marker_schema_identity_ok(route, node, marker, marker_path)
+        schema_ok, _history_path = _marker_schema_identity_ok(route, node, marker, marker_path, observe=observe)
     except (KeyError, TypeError, ValueError):
         schema_ok = False
     if not schema_ok:
@@ -7827,7 +7703,7 @@ def evidence_currency(
         )
         if detail != node.get("id"):
             action += f" (upstream revision {detail})"
-        if gates_on():
+        if observe or gates_on():
             return GateCurrency("superseded", "completion-evidence-superseded", action)
         same_work_or_refuse("completion-evidence-superseded", str(detail))
     evidence_record = marker.get("evidence")
@@ -7854,7 +7730,7 @@ def evidence_currency(
         try:
             marker_stat = marker_path.lstat()
             recorded_sha = evidence_record.get("sha256")
-            if (not gates_on() and stat.S_ISREG(marker_stat.st_mode)
+            if (not observe and not gates_on() and stat.S_ISREG(marker_stat.st_mode)
                     and isinstance(recorded_sha, str)
                     and re.fullmatch(r"[0-9a-f]{64}", recorded_sha)):
                 return GateCurrency("current", "completion-evidence-recorded-missing",
@@ -7870,7 +7746,7 @@ def evidence_currency(
         return GateCurrency("completion-evidence-unreadable", "completion-evidence-unreadable")
     if digest != evidence_record.get("sha256"):
         node_id = str(node.get("id"))
-        if not gates_on():
+        if not observe and not gates_on():
             # Gates off an edit is not a refusal (nor a warning line). This read
             # stays a read: the operations that proceed on the marker keep the
             # edit as history (`note_evidence_change`).
@@ -7888,6 +7764,7 @@ def gate_currency(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
+    *, observe: bool = False,
 ) -> GateCurrency:
     """Prove one completion marker current, superseded, or needing `revise`.
 
@@ -7907,8 +7784,40 @@ def gate_currency(
         marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
-    base = evidence_currency(route, node, marker_path, marker)
-    if base.state not in {"current", "revised-unrecorded"}:
+    base = evidence_currency(route, node, marker_path, marker, observe=observe)
+    return _marker_provenance_currency(route, node, marker_path, marker, base, observe=observe)
+
+
+def _marker_provenance_currency(route, node, marker_path, marker, base, *, observe=False):
+    """Prove recorded marker lineage without rereading historical payloads."""
+    if base.state not in {"current", "revised-unrecorded", "superseded"}:
+        return base
+    try:
+        schema_ok, _ = _marker_schema_identity_ok(route, node, marker, marker_path, observe=observe)
+    except (KeyError, OSError, TypeError, ValueError):
+        schema_ok = False
+    if not schema_ok:
+        return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-identity-invalid")
+    # Legacy tombstones kept the original sequence. Run their ordinary
+    # provenance walk, including sequence and revision-edge validation,
+    # rather than treating an exact attempt link as the whole proof.
+    legacy_supersession = (marker.get("state") == "superseded-by-upstream-revision"
+                           and not marker.get("superseded_by"))
+    if marker.get("state") == "superseded-by-upstream-revision" and not legacy_supersession:
+        # Revise writes a new history row for the supersession, without
+        # changing the original worker's attempt link. Prove that exact
+        # predecessor rather than expecting its link to name the new row.
+        try:
+            prior_path, prior = _superseded_marker_predecessor(route, node, marker_path, marker)
+            prior_currency = _marker_provenance_currency(
+                route, node, prior_path, prior,
+                GateCurrency("current", "completion-marker-verified"), observe=True)
+        except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
+            return GateCurrency("integrity-broken:identity-mismatch", "supersession-provenance-invalid")
+        if prior_currency.state not in {"current", "revised-unrecorded"}:
+            return prior_currency
+        return base
+    if base.state not in {"current", "revised-unrecorded"} and not legacy_supersession:
         return base
     node_id = str(node.get("id"))
     current = marker
@@ -7931,6 +7840,12 @@ def gate_currency(
     seen: set[int] = set()
     for _depth in range(max_steps):
         sequence = current.get("sequence")
+        if (current.get("state") == "superseded-by-upstream-revision"
+                and not (legacy_supersession and current is marker)):
+            historical = _marker_provenance_currency(
+                route, node, current_path, current,
+                GateCurrency("current", "completion-marker-verified"), observe=True)
+            return base if historical.state == "current" else historical
         if current.get("stage_authority") != "revision":
             try:
                 link_ok = _marker_link_current(route, node, current, current_path)
@@ -7962,7 +7877,7 @@ def gate_currency(
             return GateCurrency("integrity-broken:history-conflict", "canonical completion marker history conflict")
         try:
             prior_marker = json.loads(prior_bytes)
-            prior_schema_ok, _ = _marker_schema_identity_ok(route, node, prior_marker, prior_path)
+            prior_schema_ok, _ = _marker_schema_identity_ok(route, node, prior_marker, prior_path, observe=observe)
         except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
             prior_schema_ok = False
             prior_marker = {}
@@ -7970,6 +7885,110 @@ def gate_currency(
             return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-identity-invalid")
         current, current_path = prior_marker, prior_path
     return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
+
+
+def _superseded_marker_predecessor(route, node, marker_path, marker):
+    """Read the predecessor copied by the existing revision writer."""
+    node_id = str(node["id"])
+    sequence = marker.get("sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 2:
+        raise ValueError("supersession-sequence-invalid")
+    predecessors = []
+    prefix = f"{node_id}."
+    for path in marker_path.parent.glob(f"{node_id}.*.json"):
+        suffix = path.name[len(prefix):-len(".json")]
+        if suffix.isdecimal() and 1 <= int(suffix) < sequence:
+            predecessors.append((int(suffix), path))
+    prior_sequence, prior_path = max(predecessors)
+    prior = json.loads(prior_path.read_text(encoding="utf-8"))
+    if (not isinstance(prior, dict) or prior.get("sequence") != prior_sequence
+            or prior.get("state") == "superseded-by-upstream-revision"):
+        raise ValueError("supersession-predecessor-invalid")
+    expected = dict(prior, sequence=sequence, state="superseded-by-upstream-revision",
+                    superseded_by=marker.get("superseded_by"))
+    if expected != marker:
+        raise ValueError("supersession-predecessor-mismatch")
+    superseding = marker.get("superseded_by") or {}
+    if not isinstance(superseding, dict):
+        raise ValueError("supersession-upstream-invalid")
+    upstream_id, upstream_sequence = superseding.get("node"), superseding.get("sequence")
+    upstream_node = next((n for n in route["nodes"] if n["id"] == upstream_id), None)
+    if (upstream_node is None
+            or not isinstance(upstream_sequence, int) or isinstance(upstream_sequence, bool)
+            or upstream_sequence < 2
+            or node_id not in _route_module()._downstream_node_ids(route, upstream_id)):
+        raise ValueError("supersession-upstream-invalid")
+    upstream_path = marker_path.parent / f"{upstream_id}.{upstream_sequence}.json"
+    upstream = json.loads(upstream_path.read_text(encoding="utf-8"))
+    if (not isinstance(upstream, dict) or upstream.get("stage_authority") != "revision"
+            or upstream.get("sequence") != upstream_sequence):
+        raise ValueError("supersession-upstream-not-revision")
+    upstream_currency = _marker_provenance_currency(
+        route, upstream_node, upstream_path, upstream,
+        GateCurrency("current", "completion-marker-verified"), observe=True)
+    if upstream_currency.state not in {"current", "revised-unrecorded"}:
+        raise ValueError("supersession-upstream-unproven")
+    return prior_path, prior
+
+
+def observe_terminal_review_failure(
+    route: dict[str, object], node: dict[str, object], attempt_id: str,
+    evidence_path: Path, evidence_sha256: str, registry_lines: list[str],
+) -> dict[str, object]:
+    """Read an exact finished FAIL without requiring a PASS stage marker.
+
+    Input digests remain the subject reader's responsibility. This observation
+    binds the governed attempt, terminal log and readable evidence bytes; it
+    grants neither execution nor stage completion authority.
+    """
+    from codex_dispatch_terminal import inspect_terminal_attempt
+
+    exact = []
+    for line in registry_lines:
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if metadata.get("attempt_id") == attempt_id:
+            exact.append((fields, metadata))
+        elif fields[1] in {"open", "running"}:
+            try:
+                identity = registered_node_identity(metadata, node)
+            except ValueError:
+                # A node-less owner belongs to its terminal owner node, not
+                # this review. Match readiness's handling of unrelated rows.
+                continue
+            if identity == (route.get("route_id"), route.get("route_hash"), node.get("id")):
+                raise ValueError("conflicting-active-retry")
+    if not attempt_id or len(exact) != 1:
+        raise ValueError("terminal-review-attempt-not-unique")
+    fields, metadata = exact[0]
+    if (registered_node_identity(metadata, node) !=
+            (route.get("route_id"), route.get("route_hash"), node.get("id"))
+            or node.get("kind") != "review-worker"
+            or committed_outcome(fields[1], metadata) != "review-blocked"
+            or metadata.get("worker_type") != "review"
+            or metadata.get("artifact_root") != route.get("artifact_root")
+            or fields[3] != route.get("cwd")
+            or verdict_pass(metadata) or terminal_conflict_pending(metadata)):
+        raise ValueError("terminal-review-binding-conflict")
+    validate_attempt_metadata(metadata)
+    if attempt_process_quiescence(metadata, terminal_receipt=True).state != "quiescent":
+        raise ValueError("terminal-review-not-quiescent")
+    terminal = inspect_terminal_attempt(
+        metadata.get("log_file"), worktree=fields[3],
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type="review")
+    if (terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL"
+            or terminal.get("artifact_state") != "readable"
+            or terminal.get("failure_note") != "completed-review-blocking"
+            or terminal.get("review_verdict_conflict")):
+        raise ValueError("terminal-review-failure-unverified")
+    encoded = str(terminal.get("artifact_path_b64", ""))
+    path = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+    if (path.resolve() != evidence_path.resolve()
+            or evidence_digest(path) != evidence_sha256):
+        raise ValueError("terminal-review-evidence-conflict")
+    return terminal
 
 
 def completion_marker_is_current(
@@ -8034,8 +8053,13 @@ def completion_attempt_readiness(
     jobs: Path,
     *,
     registry_lines: list[str] | None = None,
+    observe: bool = False,
 ) -> AttemptReadiness:
-    """Combine a current semantic marker with its exact governed process state."""
+    """Combine a current semantic marker with its exact governed process state.
+
+    ``observe=True`` retains route hash conflicts independently of execution
+    compatibility; it does not change launch or completion policy.
+    """
 
     if owner_closure_shape(marker) == "continuation":
         try:
@@ -8087,7 +8111,7 @@ def completion_attempt_readiness(
         # depth, just as registered complete does.
         if row_hash != str(route.get("route_hash") or ""):
             if metadata.get("attempt_id") == attempt_id:
-                if gates_on():
+                if observe or gates_on():
                     return AttemptReadiness("unverifiable", "attempt-route-hash-mismatch", attempt_id)
                 same_work_or_refuse("attempt-route-hash-mismatch", attempt_id)
             else:
@@ -9304,10 +9328,12 @@ def marker_bound_delivery_transaction(
         verdict = _marker_bound_row_verdict(metadata)
         quiescent = observation_current and process_observation.state == "quiescent"
         advanced = False
+        import route_parent_close
         if (
             advance
             and observation_current
             and fields[1] in {"open", "running"}
+            and not route_parent_close.row_requested(metadata, jobs)
             and marker is not None
             and quiescent
             and owned_children == 0
@@ -9569,11 +9595,17 @@ from route_authority import RELAUNCH_STABLE_KEYS as _RELAUNCH_STABLE_KEYS  # noq
 
 
 def _never_launched_same_work(fields, metadata, row_fields, row_metadata) -> bool:
+    # replacement_row already admitted this candidate against its source and
+    # current pin. Its unstarted owner row may follow the selector to another
+    # harness; every work/lineage axis still matches and started rows never move.
+    keys = _RELAUNCH_STABLE_KEYS
+    if metadata.get('worker_type') == 'owner' and metadata.get('replacement_original_attempt_id'):
+        keys = tuple(key for key in keys if key != 'harness')
     return (fields[1] == "open" and metadata.get("launch_claimed") == "0"
             and metadata.get("launch_started") != "1" and not metadata.get("pid")
             and fields[2:5] == row_fields[2:5]
             and all(metadata.get(key, "") == row_metadata.get(key, "")
-                    for key in _RELAUNCH_STABLE_KEYS))
+                    for key in keys))
 
 
 def claim_attempt_row(
@@ -9623,6 +9655,13 @@ def claim_attempt_row(
         for terminal_route_id in sorted(terminal_route_ids):
             ensure_terminal_claim_absent(jobs, terminal_route_id,
                 terminal_owner)
+            import route_parent_close
+            terminal_hash = (row_metadata.get("owner_route_hash")
+                             if terminal_route_id == row_metadata.get("owner_route_id")
+                             else row_metadata.get("route_hash"))
+            if terminal_hash and route_parent_close.intent(
+                    {"route_id": terminal_route_id, "route_hash": terminal_hash}, jobs):
+                raise DispatchContractError("cancelled-by-parent")
         from dispatch_replacement import replacement_row
         row, automatic_replacement = replacement_row(jobs, lines, row)
         row_fields = row.split("\t")
@@ -9770,7 +9809,8 @@ _SD105_CANCELLED_NOTE = "cancelled-receipt-unavailable"
 
 def _terminal_delivery_receipt(metadata: dict[str, str]) -> dict:
     """The terminal writer and every carrier use this same semantic result."""
-    is_success = committed_outcome("done", metadata) == "succeeded"
+    outcome = committed_outcome("done", metadata)
+    is_success = outcome in {"succeeded", "cancelled"}
     child = {
         "attempt_id": metadata.get("attempt_id", ""),
         "status": "done",
@@ -9781,6 +9821,8 @@ def _terminal_delivery_receipt(metadata: dict[str, str]) -> dict:
     }
     if not is_success:
         child["reason"] = "terminal-failure-or-unclosed"
+    elif outcome == "cancelled":
+        child["reason"] = "cancelled-by-parent"
     receipt = {
         "schema_version": 2,
         "state": "delivered",
@@ -9964,6 +10006,9 @@ def close_attempt_row(
             if metadata.get("attempt_id") != attempt_id:
                 continue
             validate_attempt_metadata(metadata)
+            import route_parent_close
+            if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+                return False
             if metadata.get("teardown_claim"):
                 return False
             fields[1] = "done"
@@ -10016,6 +10061,7 @@ def existing_attempt_launch_state(jobs: Path, attempt_id: str) -> tuple[str, str
         return "existing-unknown", "registry-unreadable"
     seen = False
     open_metadata: dict[str, str] | None = None
+    open_fields: list[str] | None = None
     for line in lines:
         fields = line.split("\t")
         if len(fields) != 6:
@@ -10026,16 +10072,22 @@ def existing_attempt_launch_state(jobs: Path, attempt_id: str) -> tuple[str, str
         seen = True
         if fields[1] in {"open", "running"}:
             open_metadata = metadata
+            open_fields = fields
     if open_metadata is None:
         if seen:
             return "existing-completed", "attempt-closed"
         return "existing-unknown", "attempt-row-missing"
     try:
-        process = attempt_process_quiescence(open_metadata)
+        from recovery_evidence import observe_attempt
+        evidence = observe_attempt(open_fields[1], open_metadata, registry_rows=lines,
+                                   repo=open_fields[2], worktree=open_fields[3])
+        process = evidence.process
     except Exception:  # noqa: BLE001 -- a launch receipt must not fail on observation
         return "existing-unverified", "process-observation-failed"
     if process.state == "live":
         return "existing-active", process.reason or "process-live"
+    if evidence.result_state == "unverifiable":
+        return "existing-unverified", "terminal-evidence-unverifiable"
     if process.state == "quiescent":
         return "existing-dead", process.reason or "process-gone"
     return "existing-unverified", process.reason or "process-unverifiable"
@@ -10163,6 +10215,11 @@ def _commit_attempt_terminal(
             )
         index, fields, metadata = matches[0]
         validate_attempt_metadata(metadata)
+        import route_parent_close
+        if route_parent_close.row_requested(metadata, jobs):
+            # Intent first wins; post-exit PASS/FAIL is a late observation,
+            # not a contradictory terminal result requiring another review.
+            return "already-terminal" if fields[1] not in {"open", "running"} else "cancellation-pending"
         if fields[1] in {"done", "killed", "cancelled"}:
             incoming = evidence or {}
             prior_class = metadata.get("failure_class", "")
@@ -10228,7 +10285,8 @@ def launch_orphan_watch(
 
     The watcher is deterministic infrastructure, not a model worker. It only
     waits for the recorded PID/start identity to end and then asks the shared
-    registry classifier to close a true orphan; it never resumes work.
+    registry classifier to close a true orphan. A waiting adopted continuation
+    retains its children and goes through its existing normal start after join.
     """
     if not attempt_id or pid <= 0 or not pid_start:
         raise DispatchContractError(
@@ -10393,6 +10451,9 @@ def close_attempt_row_if(
             if metadata.get("attempt_id") != attempt_id:
                 continue
             validate_attempt_metadata(metadata)
+            import route_parent_close
+            if route_parent_close.row_requested(metadata, jobs) and note != "cancelled-by-parent":
+                return False
             recorded_claim = metadata.get("teardown_claim", "")
             if recorded_claim:
                 if not teardown_claim or recorded_claim != teardown_claim:

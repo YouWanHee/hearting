@@ -5,10 +5,30 @@ liveness, and dispatch modules are imported defensively so a partial checkout / 
 enricher never drops backbone rows (PRD §1: enrichment fills fields; it does not decide existence).
 """
 import importlib
+import copy
+from dataclasses import replace
 import os
 import time as _time
 
 from . import procscan
+from ..refresh import LiveSnapshot
+
+
+_JOB_OBSERVATIONS = {}
+_OBSERVATION_SUCCESSES = {}
+
+
+def _observation_health(key, source, error=None):
+    """The same health vocabulary as RefreshPump, bound to this publication."""
+    now = _time.monotonic()
+    cache_key = (key, source)
+    if error is None:
+        _OBSERVATION_SUCCESSES[cache_key] = now
+        if len(_OBSERVATION_SUCCESSES) > 32:
+            _OBSERVATION_SUCCESSES.pop(next(iter(_OBSERVATION_SUCCESSES)))
+    success = _OBSERVATION_SUCCESSES.get(cache_key)
+    return {"state": "failed" if error else "idle", "last_error": error,
+            "last_success_at": success, "age": None if success is None else now - success}
 
 
 def _same_path(a, b):
@@ -117,6 +137,16 @@ def resolve_parent_edges(sessions, jobs):
     managed_parents = model.unique_managed_parents(sessions)
     for j in jobs:
         parent_sid = getattr(j, "parent_sid", None)
+        if not parent_sid and getattr(j, "caller_sid", None):
+            # Caller identity is observational: an exact SID or a verified session
+            # continuation may link it. A pane/cwd alone never selects another user.
+            caller_sid, harness = j.caller_sid, getattr(j, "caller_harness", None)
+            candidates = [s for s in sessions if harness == s.harness
+                          and caller_sid in [s.session_id, *(getattr(s, "session_aliases", None) or [])]
+                          and model.session_parent_visible(s) and not getattr(s, "is_child", False)]
+            j._parent_edge_sid = candidates[0].session_id if len(candidates) == 1 else None
+            j._parent_edge_promoted_orphan = False
+            continue
         if not (getattr(j, "is_child", False) and parent_sid):
             continue
         parent_sid, parent_harness = _effective_job_parent(j)
@@ -280,10 +310,9 @@ def apply_peer_rows(sessions, by_key):
         if not getattr(s, "session_id", None):
             continue
         rows = [by_key[key] for key in session_registry.session_join_keys(s) if key in by_key]
-        if not rows:
-            continue
-        s.peer_sent_1h = sum(row.get("sent_1h", 0) for row in rows)
-        s.peer_recv_1h = sum(row.get("recv_1h", 0) for row in rows)
+        if rows:
+            s.peer_sent_1h = sum(row.get("sent_1h", 0) for row in rows)
+            s.peer_recv_1h = sum(row.get("recv_1h", 0) for row in rows)
         def _age(entry):
             # A missing or non-numeric age must not win the "freshest" comparison — `or 0`
             # would rank an unparseable entry ahead of every real one.
@@ -294,6 +323,11 @@ def apply_peer_rows(sessions, by_key):
             entries = [row[field] for row in rows if row.get(field)]
             if entries:
                 setattr(s, attr, min(entries, key=_age))
+        duties = [entry for row in rows for entry in row.get("pending_obligations", [])]
+        if duties:
+            s.peer_obligations = sorted(
+                duties, key=lambda item: (item.get("kind", ""), item.get("age_min", 0))
+            )[:8]
 
 
 def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_first=False):
@@ -303,11 +337,13 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     jobs_path:      override for .dispatch/jobs.log (else env / default).
     usage:          only exact ``refresh`` may schedule a background usage fetch;
                     all other values are cache-only.
-    fast_first:     internal first-live-publication hint, threaded to dispatch
-                    only (exact classification inputs stay attached; display
-                    details fill on the next full tick). ``--once``/JSON and
-                    every other caller keep the full pass.
+    fast_first:     internal basic-live observation hint. Exact classification,
+                    NOW and resource inputs stay attached; display details fill
+                    independently. ``--once``/JSON keep the full pass.
     """
+    job_key = (str(jobs_path or os.environ.get("AGENT_DISPATCH_JOBS") or ""),
+               tuple(sorted(harness_filter or ())))
+    observations = {}
     sessions = procscan.scan(harness_filter=harness_filter)
 
     # --- per-harness passive enrichment (each enricher self-resolves its home from env) ---
@@ -338,6 +374,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
     for s in sessions:
         fn = enrichers.get(s.harness)
+        if s.harness == "claude":
+            continue  # resolve once after the existing foreground pane observation
         if fn:
             try:
                 if s.harness == "codex" and codex_tick is not None:
@@ -377,6 +415,26 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
+    # F-100b: herdr attachment — one `herdr agent list` per snapshot, exact session-id
+    # match; additive enrichment that never touches liveness or row existence.
+    try:
+        from . import herdr as _herdr
+        observed = _herdr.enrich(sessions)
+        if isinstance(observed, dict):
+            observations["herdr"] = _observation_health(
+                job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
+    except Exception as exc:
+        observations["herdr"] = _observation_health(job_key, "herdr", "%s: %s" % (type(exc).__name__, exc))
+    for s in sessions:
+        if s.harness == "claude" and enrichers.get("claude"):
+            try:
+                enrichers["claude"](s, tick={s.pid: getattr(s, "_pane_session_claim", None)})
+            except Exception:
+                pass
+    # Session directories describe work; the foreground observation above used
+    # process launch directories. Do not change those matching inputs mid-pass.
+    from .. import session_cwd
+    session_cwd.project(sessions)
     # Exact Fleet-owned decision/approval waits are additive enrichment. Run
     # after harness identity resolution and before the single liveness verdict.
     try:
@@ -390,18 +448,23 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
-    # F-100b: herdr attachment — one `herdr agent list` per snapshot, exact session-id
-    # match; additive enrichment that never touches liveness or row existence.
-    try:
-        from . import herdr as _herdr
-        _herdr.enrich(sessions)
-    except Exception:
-        pass
     # Resume/fork aliases must be resolved BEFORE the two ledger joins below, which both
     # key on `(harness, session_id)`: a resumed session's older receipts and any steward
     # marker written before the resume still name the id it used to have.
     try:
         apply_session_aliases(sessions)
+    except Exception:
+        pass
+
+    # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
+    tag_metadata = []
+    try:
+        from ..session_tags import assign
+        from ..session_handle import resolve_tag
+        tag_metadata = assign(sessions)
+        for s in sessions:
+            if s.harness in {"codex", "opencode"} and s.session_id:
+                s.session_tag = resolve_tag(s.harness, s.session_id)
     except Exception:
         pass
 
@@ -487,13 +550,32 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
 
     # --- dispatch section ---
     jobs = []
+    previous = _JOB_OBSERVATIONS.get(job_key)
+    job_error = None
+    node_evidence, degradations, pending_delivery, malformed = {}, {}, None, 0
     try:
         from . import dispatch
         jobs = dispatch.collect(jobs_path=jobs_path, harness_filter=harness_filter,
                                 session_rows=sessions,
                                 **({"fast_first": True} if fast_first else {}))
-    except Exception:
-        jobs = []
+        # Capture the collector's output at its boundary, never in render or
+        # from the independent detail worker. Older readers keep the attributes.
+        node_evidence = copy.deepcopy(getattr(dispatch.collect, "last_route_nodes", {}) or {})
+        degradations = copy.deepcopy(getattr(dispatch.collect, "last_degradations", {}) or {})
+        pending_delivery = copy.deepcopy(getattr(dispatch.collect, "last_pending_delivery", None))
+        malformed = getattr(dispatch.collect, "last_malformed", 0)
+    except Exception as exc:
+        job_error = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+        if previous is not None:
+            jobs = copy.deepcopy(previous.jobs)
+            node_evidence = copy.deepcopy(previous.node_evidence)
+            degradations = copy.deepcopy(previous.degradations)
+            pending_delivery, malformed = previous.pending_delivery, previous.malformed
+            for job in jobs:
+                job._last_observed_liveness = job.liveness
+                job.liveness = "unknown"
+                job._observation_stale = True
+    dispatch_rows = list(jobs)
 
     # F-50 (v33): the openai-codex plugin queue is a SEPARATE runtime surface (F-35e), so its
     # rows are appended, never merged or deduped against jobs.log attempts — no plugin job is
@@ -502,6 +584,12 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     try:
         from . import codex_companion
         jobs = jobs + codex_companion.collect()
+    except Exception:
+        pass
+
+    try:
+        from ..process_identity import finalize_process_roles
+        finalize_process_roles(sessions, jobs)
     except Exception:
         pass
 
@@ -530,15 +618,19 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
 
     try:
+        # This joins already observed exact child fields without further IO.
+        # NOW/context/exec must be available in the basic snapshot too.
         _adopt_child_titles(sessions, jobs)
+        from .. import titles
+        titles.annotate(sessions + jobs)
     except Exception:
         pass
 
     try:
         from .. import route_chain as _route_chain
         _route_chain.enrich(sessions, jobs=jobs,
-                             node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
-                             now=_time.time())
+                             node_evidence=node_evidence,
+                             now=_time.time(), **({"fast_first": True} if fast_first else {}))
     except Exception:
         pass
 
@@ -551,8 +643,9 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
     collect_all.last_resource_jobs = resource_jobs
-    collect_all.last_resource_malformed = getattr(
-        resource_runs.collect, "last_malformed", 0) if "resource_runs" in locals() else 0
+    resource_diagnostics = list(getattr(
+        resource_runs.collect, "last_diagnostics", [])) if "resource_runs" in locals() else []
+    collect_all.last_resource_diagnostics = resource_diagnostics
 
     # v16: all surfaces receive one projection after evidence collection and association.
     try:
@@ -563,9 +656,9 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         # for a node the registry already resolved.
         attach_projections(sessions, jobs, artifact_root=os.environ.get("AGENT_ARTIFACT_ROOT"),
                            now=_time.time(),
-                           node_evidence=getattr(dispatch.collect, "last_route_nodes", None),
-                           degradations=getattr(dispatch.collect, "last_degradations", None),
-                           resources=resource_jobs)
+                           node_evidence=node_evidence,
+                           degradations=degradations,
+                           resources=resource_jobs, **({"fast_first": True} if fast_first else {}))
     except Exception:
         # Projection failure is fail-closed at the row boundary, never a reason to drop data.
         from ..model import WorkProjection
@@ -573,13 +666,17 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
             if getattr(entity, "work_projection", None) is None:
                 entity.work_projection = WorkProjection(source="none", ambiguity="projection-error")
 
+    if not fast_first:
+        from ..work_titles import annotate
+        annotate(sessions, jobs, resource_jobs)
+
     # F-98: read-only peer-message ledger projection. Additive and fail-soft — a missing
     # or unreadable ledger must leave every Session field at its default so the rendered
     # snapshot is byte-identical to a pre-SD-122 board.
     peer = None
     try:
         from . import peer_messages
-        peer = peer_messages.collect()
+        peer = None if fast_first else peer_messages.collect()
         apply_peer_rows(sessions, (peer or {}).get("by_session") or {})
     except Exception:
         peer = None
@@ -594,11 +691,29 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
-    return sessions, jobs
+    observations["jobs"] = _observation_health(job_key, "jobs", job_error)
+    snapshot = LiveSnapshot(
+        sessions=sessions, jobs=jobs, resources=resource_jobs,
+        usage_snapshots=usage_snapshots, node_evidence=node_evidence,
+        degradations=degradations, pending_delivery=pending_delivery,
+        malformed=malformed,
+        resource_diagnostics=copy.deepcopy(resource_diagnostics),
+        observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
+    )
+    if not sessions and not jobs and node_evidence:
+        from ..projection import terminal_route_entities
+        snapshot.route_entities = terminal_route_entities(node_evidence, degradations)
+    if job_error is None:
+        # Cache projected rows, not a reference later mutated by another reader.
+        _JOB_OBSERVATIONS[job_key] = copy.deepcopy(replace(
+            snapshot, sessions=[], jobs=dispatch_rows, resources=[], usage_snapshots={}, tag_metadata=[]))
+        if len(_JOB_OBSERVATIONS) > 16:
+            _JOB_OBSERVATIONS.pop(next(iter(_JOB_OBSERVATIONS)))
+    return snapshot
 
 
 collect_all.last_resource_jobs = []
-collect_all.last_resource_malformed = 0
+collect_all.last_resource_diagnostics = []
 collect_all.last_usage = {}
 collect_all.last_usage_snapshots = {}
 collect_all.last_peer_messages = None

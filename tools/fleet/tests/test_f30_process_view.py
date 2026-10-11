@@ -2,7 +2,7 @@
 """Hermetic unit tests — F-30 process view (prd.md:304-310).
 
 Two harnesses (plan §5.6 Y2):
-  - render content (T3-1..T3-7, T3-12..T3-14): `render._build_lines(...)` directly.
+  - render content (T3-1..T3-7, T3-12..T3-14): `build_observed_lines(...)` directly.
   - mouse/maps (T3-8..T3-11): `_draw` against a FakeScreen with `curses.doupdate` patched out
     (test_f27_mouse.py:20-37 precedent) — `_build_lines` alone never populates
     `_FOLD_ROWS`/`_CLICK_ROWS`/`_TOGGLE_ROWS`.
@@ -23,6 +23,7 @@ from fleet import route                     # noqa: E402
 from fleet import demo                      # noqa: E402
 from fleet.collectors import dispatch       # noqa: E402
 from fleet.model import DispatchJob, Session, SubAgent  # noqa: E402
+from fleet.tests.snapshot_fixture import build_observed_lines, draw_observed
 
 _FIXDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "route")
 _REAL_CLAUDE = os.path.join(_FIXDIR, "real_claude_staged.json")
@@ -223,7 +224,7 @@ class RenderContentTest(ProcessViewEnv):
     def test_t3_1_process_view_off_matches_group_view(self):
         job = DispatchJob(key="code", slug="plain-job", cwd="/x", liveness="working", depth=1)
         render.set_process_view(False)
-        lines = render._build_lines([], [job], section="dispatch", narrow=False,
+        lines = build_observed_lines([], [job], section="dispatch", narrow=False,
                                     malformed=0, layout="wide")
         text = _joined(lines)
         self.assertNotIn("PROCESS VIEW", text)
@@ -242,16 +243,17 @@ class RenderContentTest(ProcessViewEnv):
                             parent_slug="v10-conductor", depth=2, liveness="working",
                             route_id=_REAL_RID, route_file=_REAL_CLAUDE, route_node="execute")
         render.set_process_view(True)
-        lines = render._build_lines([], [conductor, child], section="both", narrow=False,
+        lines = build_observed_lines([], [conductor, child], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("rt-9fa0fed8", text)
-        self.assertIn("1/4 nodes", text)
+        self.assertNotIn("rt-9fa0fed8", text)
+        self.assertIn("stages", text)
+        self.assertIn("1/4 stages", text)
 
     def test_t3_3_parallel_nodes_render_as_indented_siblings(self):
         jobs = self._lab_route_jobs()
         render.set_process_view(True)
-        lines = render._build_lines([], jobs, section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], jobs, section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
         for nid in ("eval-asr", "eval-sep", "eval-vad"):
@@ -275,24 +277,23 @@ class RenderContentTest(ProcessViewEnv):
         # Feed the process renderer a projection-attached reversed collector order.
         projection.attach_projections([], [owner, child_b, child_a], now=100.0)
         render.set_process_view(True)
-        text = _joined(render._build_lines([], [owner, child_b, child_a], section="both",
+        text = _joined(build_observed_lines([], [owner, child_b, child_a], section="both",
                                             narrow=False, malformed=0, layout="wide",
                                             term_width=168))
-        self.assertIn("survey[research/research-survey]", text)
-        self.assertIn("claim-a[research/claim-verify]", text)
-        self.assertIn("claim-b[research/claim-verify]", text)
-        self.assertIn("synth[research/research-survey]", text)
-        self.assertIn("rt-336a0adf", text)
+        for name in ("survey", "claim-a", "claim-b", "synth", "composed-owner"):
+            self.assertIn(name, text)
+        self.assertNotIn("[research/", text)  # contracts remain in explicit detail/JSON
+        self.assertNotIn("rt-336a0adf", text)
         self.assertNotIn("plan › exec › test › report", text)
 
     def test_t3_4_failed_node_auto_expands_with_red_key(self):
         jobs = self._lab_route_jobs(sep_liveness="stale")
         render.set_process_view(True)
-        lines = render._build_lines([], jobs, section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], jobs, section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
         self.assertIn("✕", text)
-        self.assertIn("⚠ failed node", text)
+        self.assertIn('⚠ stage failed', text)
         # auto-expanded — the DAG line (not just the 1-line header) must be present
         self.assertIn("setup", text)
 
@@ -312,10 +313,10 @@ class RenderContentTest(ProcessViewEnv):
             },
         }}
         render.set_process_view(True)
-        text = _joined(render._build_lines([], jobs, section="both", narrow=False,
+        text = _joined(build_observed_lines([], jobs, section="both", narrow=False,
                                             malformed=0, layout="wide", term_width=168))
-        self.assertIn("…gate", text)
-        self.assertNotIn("⚠ failed node", text)
+        self.assertIn("…exit wait", text)
+        self.assertNotIn('⚠ stage failed', text)
 
     def test_t3_5_all_done_route_defaults_to_one_line_fold(self):
         # code-test verification.md §10 — a job whose registry row is already `done` NEVER
@@ -332,10 +333,10 @@ class RenderContentTest(ProcessViewEnv):
                        for n in ("plan", "execute", "test", "report")},
         }
         render.set_process_view(True)
-        lines = render._build_lines([], [], section="both", narrow=False,
+        lines = build_observed_lines([], [], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("4/4 nodes", text)
+        self.assertIn("4/4 stages", text)
         self.assertNotIn("plan ✓", text)   # L2 line never emitted — folded to 1 line
         self.assertIn("▸", text)           # collapsed glyph, never the word "folded"/"hidden"
         self.assertNotIn("folded", text)
@@ -348,10 +349,10 @@ class RenderContentTest(ProcessViewEnv):
         job = DispatchJob(key="code", slug="no-record-job", cwd="/x", liveness="working",
                           depth=1, mode="dev")
         render.set_process_view(True)
-        lines = render._build_lines([], [job], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [job], section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("no route record", text)
+        self.assertIn("route unknown", text)
         self.assertIn("no-record-job", text)
 
     def test_conductor_not_duplicated_as_degrade_card_when_route_child_is_terminal(self):
@@ -373,12 +374,13 @@ class RenderContentTest(ProcessViewEnv):
         conductor = DispatchJob(key="code", slug="v10-conductor", cwd="/x", depth=1,
                                 liveness="idle")   # the ONLY job — its route-carrying child is gone
         render.set_process_view(True)
-        lines = render._build_lines([], [conductor], section="both", narrow=False,
+        lines = build_observed_lines([], [conductor], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("rt-9fa0fed8", text)          # the real record card IS present
+        self.assertNotIn("rt-9fa0fed8", text)
+        self.assertIn("stages", text)          # the real record card IS present
         self.assertNotIn("no route record", text)   # the conductor must NOT re-appear as degrade
-        self.assertNotIn("v10-conductor", text)     # its bare slug never rendered a 2nd card
+        self.assertEqual(text.count("v10-conductor"), 1)  # work name on one real card
 
     def test_t3_7_active_node_subagent_row_via_pid_join(self):
         conductor = DispatchJob(key="code", slug="v10-sub-conductor", cwd="/x", depth=1,
@@ -391,7 +393,7 @@ class RenderContentTest(ProcessViewEnv):
                        proc_start="77001-start", is_child=True, liveness="working",
                        subagents=[SubAgent(agent_type="explore", active=True)])
         render.set_process_view(True)
-        lines = render._build_lines([sess], [conductor, child], section="both", narrow=False,
+        lines = build_observed_lines([sess], [conductor, child], section="both", narrow=False,
                                     malformed=0, layout="wide", term_width=168)
         text = _joined(lines)
         self.assertIn(render._ICON_SUBAGENT, text)
@@ -404,20 +406,20 @@ class RenderContentTest(ProcessViewEnv):
                             parent_slug="v10-gate-conductor", depth=2, liveness="working",
                             route_id=_REAL_RID, route_file=_REAL_CLAUDE, route_node="execute")
         render.set_process_view(True)
-        base = _joined(render._build_lines([], [conductor, child], section="both", narrow=False,
+        base = _joined(build_observed_lines([], [conductor, child], section="both", narrow=False,
                                            malformed=0, layout="wide", term_width=168))
         self.assertNotIn("code-plan", base)
         render.set_show_all(True)
-        toggled = _joined(render._build_lines([], [conductor, child], section="both",
+        toggled = _joined(build_observed_lines([], [conductor, child], section="both",
                                               narrow=False, malformed=0, layout="wide",
                                               term_width=168))
-        self.assertIn("code-plan", toggled)
+        self.assertIn("gates: code-plan", toggled)
 
     def test_t3_13_no_overflow_at_60_120_168(self):
         jobs = self._lab_route_jobs()
         render.set_process_view(True)
         for w in (60, 120, 168):
-            lines = render._build_lines([], jobs, section="both", narrow=(w < 70),
+            lines = build_observed_lines([], jobs, section="both", narrow=(w < 70),
                                         malformed=0, layout=render._layout_mode(w),
                                         term_width=w)
             for ln in lines[6:]:   # skip the shared pulse/mem header block (pre-existing,
@@ -429,17 +431,17 @@ class RenderContentTest(ProcessViewEnv):
 
     def test_t3_14_no_jobs_shows_honest_empty_state(self):
         render.set_process_view(True)
-        lines = render._build_lines([], [], section="both", narrow=False, malformed=0,
+        lines = build_observed_lines([], [], section="both", narrow=False, malformed=0,
                                     layout="wide", term_width=168)
         text = _joined(lines)
-        self.assertIn("no active route", text)
+        self.assertIn('no observed work', text)
 
 
 class MouseFoldTest(ProcessViewEnv):
     def _draw_once(self, sessions, jobs, w=168, h=40):
         scr = FakeScreen(h, w)
         with mock.patch.object(render.curses, "doupdate"):
-            render._draw(scr, sessions, jobs, "both", 0)
+            draw_observed(scr, sessions, jobs, "both", 0)
         return scr
 
     def _fold_row(self, card_key):
@@ -536,7 +538,7 @@ class MutationCoverageGapTest(ProcessViewEnv):
         self.assertIn(render._ELAPSED_GLYPH + "15m", text)
         # The v10 critic's real worry survives the glyph: the value must stay visibly
         # detached from "n/m nodes" rather than reading as a number glued onto it.
-        self.assertIn("nodes  ", text)
+        self.assertIn("stages  ", text)
 
     def test_demo_seeds_lab_setup_node_as_done(self):
         # M4 — demo._seed_route_evidence() must seed _LAB_RID's `setup` node (not just

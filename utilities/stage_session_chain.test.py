@@ -364,6 +364,36 @@ class PlanSlicesTest(unittest.TestCase):
                                          node=json.loads(route_path.read_text())["nodes"][0])
             self.assertEqual(len(proven["sessions"]), 2)
 
+    def test_next_route_literals_are_disjoint_but_real_globs_are_not_fixed_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            route_path, worktree, slices_path, output = self._fixture(td)
+            names = ["apps/home/src/app/trips/[id]/page.tsx",
+                     "apps/home/src/app/[...slug]/page.tsx",
+                     "apps/home/src/app/(group)/page.tsx"]
+            for name in names:
+                path = worktree / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("export default function Page() {}\n")
+            slices = json.loads(slices_path.read_text())
+            slices[0]["fixed_files"] = names[:2]
+            slices[1]["fixed_files"] = names[2:]
+            slices_path.write_text(json.dumps(slices))
+            receipt = CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                        slices_path=slices_path, output_path=output)
+            self.assertEqual((receipt["planned"], receipt["fixed_files"]), ("ok", 3))
+            route = json.loads(route_path.read_text())
+            route["nodes"][0]["write_scope"] = names
+            from stage_session_contract import load_manifest
+            manifest = load_manifest(output, route=route, node=route["nodes"][0])
+            self.assertEqual(manifest["sessions"][0]["fixed_files"],
+                             sorted(str(worktree / name) for name in names[:2]))
+            for pattern in ("apps/home/src/app/*/page.tsx", "source/?.py", "source/[ab].py"):
+                with self.subTest(pattern=pattern):
+                    slices[0]["fixed_files"] = [pattern]
+                    slices_path.write_text(json.dumps(slices))
+                    with self.assertRaisesRegex(CHAIN.StageSessionError, "fixed-file-must-be-exact"):
+                        CHAIN.plan_slices(route_path=route_path, node_id="execute", worktree=worktree,
+                                          slices_path=slices_path, output_path=output)
     def test_plan_slices_seals_the_routes_worker_pin_over_the_requested_adapter(self):
         """`--pin worker=<h>` is the route's statement about every worker, so the manifest that
         `dispatch-node` later takes as the authority is written with the pinned adapter, whatever

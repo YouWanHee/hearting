@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from worker_runtime_home import claude_worker_arguments
 import hashlib
 import json
 import os
@@ -35,7 +36,7 @@ from dispatch_completion_join import (
     reconcile_finished_children,
     read_supervisor_phase_state,
     receipt_with_current_actions,
-    receipt_with_delivery_observability,
+    wait_for_delivery_projection,
     receipt_with_stage_advance,
     remove_supervisor_state,
     runtime_wait_requested,
@@ -470,7 +471,7 @@ def emit(value: dict[str, Any]) -> None:
 def reconcile(args: argparse.Namespace, terminal: SupervisorTerminal) -> bool:
     try:
         outcome = reconcile_supervisor_terminal(
-            args.jobs, args.parent_attempt_id, terminal
+            args.jobs, args.parent_attempt_id, terminal, emit=emit
         )
         # SD-111 P2 trigger 1: dispatch_supervisor_terminal cannot import this
         # module (circular), so its own docstring asks the caller to close
@@ -608,7 +609,7 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
     join_timing = advance_delivery_timing(
         join_timing, "join_completed_ns", at_ns=completed_ns
     )
-    receipt = receipt_with_delivery_observability(
+    receipt = wait_for_delivery_projection(
         receipt,
         jobs=Path(args.jobs),
         timing=join_timing,
@@ -695,6 +696,7 @@ def claude_command(
     else:
         command = ["claude"]
     command += ["-p"]
+    command += claude_worker_arguments()
     command += ["--resume" if resume else "--session-id", session_id]
     hook_command = " ".join(
         shlex.quote(value)
@@ -908,11 +910,19 @@ def run_turn(
     resume: bool,
     stream_session: ClaudeStreamSession | None = None,
     handoff_intent: dict | None = None,
+    owner_input: OwnerInput | None = None,
 ) -> tuple[dict[str, Any], int]:
     if getattr(args, "runtime_harness", "claude") == "opencode":
         from opencode_session_runtime import run_turn as native_turn, OpenCodeTransportError
+        def native_event(value):
+            # The transport has validated and persisted this exact session.
+            # Resource tools can run before native_turn returns, so publish it
+            # to the live owner's input state at the binding event.
+            if owner_input is not None and value.get("type") == "dispatch.supervisor.session":
+                owner_input.bind_initial_thread(value["session_id"])
+            emit(value)
         try:
-            return native_turn(args, prompt, emit=emit, idle_reset=handoff_intent is None)
+            return native_turn(args, prompt, emit=native_event, idle_reset=handoff_intent is None)
         except OpenCodeTransportError as exc:
             raise SupervisorError(str(exc)) from exc
     def submit(transport):
@@ -1234,6 +1244,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             turn_kwargs = ({"handoff_intent": pending_handoff_intent}
                            if pending_handoff_intent is not None else {})
+            if args.runtime_harness == "opencode":
+                turn_kwargs["owner_input"] = control
             if pending_handoff_intent is None:
                 next_prompt = control.prepare(next_prompt)
             result, process_rc = run_turn(
@@ -1244,8 +1256,6 @@ def main(argv: list[str] | None = None) -> int:
                 stream_session=stream_session,
                 **turn_kwargs,
             )
-            if args.runtime_harness == "opencode":
-                control.bind_initial_thread(read_binding(args))
             if process_rc == 0:
                 control.started(str(turn_ordinal))
                 control.completed(str(turn_ordinal))
@@ -1317,6 +1327,7 @@ def main(argv: list[str] | None = None) -> int:
                     return 70
                 emit(result)
                 return process_rc or 3
+            DECISIONS.refresh_owner_route(args)
             rows = current_children(Path(args.jobs), args.parent_attempt_id,
                                     route_id=args.route_id, route_hash=args.route_hash)
             current = {row.attempt_id: row for row in rows}

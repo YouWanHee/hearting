@@ -42,9 +42,9 @@ else:
 def text(key):
     value = payload.get(key)
     return value if isinstance(value, str) else ""
+contexts = []
 def emit(context):
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": name,
-          "additionalContext": context}}, ensure_ascii=False), flush=True)
+    contexts.append(context)
 try:
     import session_tidy
     session_tidy.run_hook(
@@ -52,5 +52,19 @@ try:
         transcript=text("transcript_path"), cwd=text("cwd") or os.getcwd(), emit=emit)
 except Exception:
     pass
+notice = ""
+try:
+    from context_alert import claude_notice
+    notice = claude_notice(payload)
+except Exception:
+    pass
+if notice:
+    contexts.append(notice)
+if contexts:
+    output = {"hookSpecificOutput": {"hookEventName": name,
+              "additionalContext": "\n".join(contexts)}}
+    if notice:
+        output["systemMessage"] = notice
+    print(json.dumps(output, ensure_ascii=False), flush=True)
 ' 2>/dev/null
 exit 0

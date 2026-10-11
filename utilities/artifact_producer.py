@@ -67,6 +67,7 @@ import artifact_manifest  # noqa: E402
 import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
 import route_lineage  # noqa: E402
+import directory_record_index  # noqa: E402
 import dispatch_contract  # noqa: E402
 import dispatch_lock_order  # noqa: E402
 import dispatch_terminal_commit  # noqa: E402
@@ -663,17 +664,58 @@ def _fallback_blocks(fallback: Optional[Mapping[str, Any]]) -> bool:
 def read_cycle_record(root: Path, cycle_id: str) -> Optional[Dict[str, Any]]:
     if not artifact_identity.is_well_formed(cycle_id, "cycle"):
         return None
-    return _read_json(cycle_record_path(root, cycle_id))
+    record = _read_json(cycle_record_path(root, cycle_id))
+    if record is not None:
+        return record
+    # A producer record is a cache. Read the already admitted revision if the
+    # cache was removed; this recovers a past result, never a new PASS.
+    index = _read_json(artifact_admission._index_path(root)) or {}
+    row = (index.get("manifests") or {}).get(cycle_id) or {}
+    cycle_row = (index.get("cycles") or {}).get(cycle_id) or {}
+    digest = row.get("manifest_digest")
+    document = artifact_lifecycle.find_manifest_snapshot(root, cycle_id, manifest_digest=digest) if digest else None
+    if document is None:
+        return None
+    cycle = document.get("cycle") or {}
+    routes = document.get("routes") or []
+    if not routes or cycle.get("cycle_id") != cycle_id:
+        return None
+    campaign_path = artifact_locator.locate(root, cycle.get("campaign_id"))
+    campaign = _read_json(campaign_path / "campaign.json") if campaign_path is not None else None
+    if campaign is not None and cycle_id not in (campaign.get("cycles") or []):
+        return None  # an explicit removal from membership is not a missing cache
+    source = str((document.get("producer") or {}).get("source_revision", "")).split("/")
+    if len(source) < 2:
+        return None
+    route = routes[0]
+    where = Path(str(cycle_row.get("cycle_path") or ""))
+    return {"schema_version": 1, "contract": CONTRACT, "cycle_id": cycle_id,
+            "campaign_id": cycle["campaign_id"], "producer_id": document["producer"]["producer_id"],
+            "capability": source[0], "route_capability": source[0], "intensity": source[1],
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "route_file": str(route_lineage.canonical_route_path(root, route["route_id"])),
+            "node_id": None, "state": "sealed", "cycle_state": cycle["state"],
+            "parent_cycle_id": cycle.get("parent_cycle_id"), "started_on": cycle.get("started_on"),
+            "sealed_on": cycle.get("started_on"), "manifest_digest": digest,
+            "locator": where.name, "slug": where.name, "title": where.name, "locator_suffix": ""}
+
+
+def _record_content_digest(record: Mapping[str, Any]) -> str:
+    return _digest(_canonical({key: value for key, value in record.items()
+                               if not key.startswith("control_") and key != "history_pending"}))
 
 
 def _write_cycle_record(root: Path, record: Dict[str, Any], *, exclusive: bool) -> None:
     path = cycle_record_path(root, record["cycle_id"])
     _ensure_dir(path.parent)
-    data = _json_bytes(record)
+    data = _json_bytes(dict(record, control_record_digest=_record_content_digest(record)))
     if exclusive:
         _write_exclusive(path, data, 0o600)
     else:
         _write_atomic(path, data, 0o600)
+
+    directory_record_index.published(path, record, kind="cycle-routes",
+                                     classify=directory_record_index.cycle_keys)
 
 
 def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str,
@@ -687,16 +729,53 @@ def _write_cycle_binding(directory: Path, campaign_id: str, cycle_id: str,
     _write_exclusive(marker, data)
 
 
-def list_cycle_records(root: Path) -> List[Dict[str, Any]]:
+def list_cycle_records(root: Path, *, route_ids=None) -> List[Dict[str, Any]]:
     directory = producer_dir(root) / "cycles"
     rows: List[Dict[str, Any]] = []
-    if not directory.is_dir():
-        return rows
-    for entry in sorted(directory.iterdir(), key=lambda p: p.name):
-        if entry.suffix == ".json":
-            value = _read_json(entry)
-            if value is not None:
-                rows.append(value)
+    if route_ids is not None:
+        route_ids = set(route_ids)
+        rows = directory_record_index.select(directory, route_ids, kind="cycle-routes",
+                                              classify=directory_record_index.cycle_keys, read_json=_read_json)
+    else:
+        for entry in sorted(directory.iterdir(), key=lambda p: p.name) if directory.is_dir() else []:
+            if entry.suffix == ".json" and entry.name != ".cycle-routes-index.json":
+                value = _read_json(entry)
+                if value is not None:
+                    rows.append(value)
+    index = _read_json(artifact_admission._index_path(root)) or {}
+    if route_ids is None:
+        known = {row.get("cycle_id") for row in rows}
+        candidates = set(index.get("cycles") or {}) - known
+    else:
+        # Admitted manifests recover removed producer records. Their existing
+        # route projection narrows recovery too; unindexed legacy rows retain
+        # the original read-and-filter fallback.
+        projected, matching = set(), set()
+        projection = index.get("routes") or {}
+        valid_projection = isinstance(projection, dict)
+        for bucket in projection.values() if valid_projection else ():
+            if not isinstance(bucket, dict):
+                valid_projection = False
+                break
+            for route_id, item in bucket.items():
+                if (not isinstance(route_id, str) or not isinstance(item, dict)
+                        or not isinstance(item.get("cycle_id"), str)):
+                    valid_projection = False
+                    break
+                projected.add(item["cycle_id"])
+                if route_id in route_ids:
+                    matching.add(item["cycle_id"])
+            if not valid_projection:
+                break
+        if not valid_projection:
+            # A damaged optional projection cannot suppress legacy recovery.
+            projected, matching = set(), set()
+        known = {row.get("cycle_id") for row in rows}
+        candidates = (matching | (set(index.get("cycles") or {}) - projected)) - known - {None}
+    for cycle_id in sorted(candidates):
+        record = read_cycle_record(root, cycle_id)
+        if record is not None and (route_ids is None or record.get("route_id") in route_ids):
+            rows.append(record)
     return rows
 
 
@@ -754,7 +833,7 @@ def _qualified_continuation(entry_stem: str, candidate: Any, route_id: Optional[
         return False
     if route_hash_value is not None and candidate.get("source_route_hash") != route_hash_value:
         return False
-    return route_identity.route_hash(candidate) == candidate.get("route_hash")
+    return bool(directory_record_index.route_keys(entry_stem + ".json", candidate))
 
 
 class _RouteEdges:
@@ -856,9 +935,73 @@ def _route_edges(root: Path) -> Mapping[Tuple[str, Any], List[Dict[str, Any]]]:
 def _lineage_children(root: Path, route_id: str, route_hash_value: str) -> List[Dict[str, Any]]:
     """Every continuation whose sealed edge names ``route_id``/``route_hash_value`` as its source.
 
-    The directory is read through `_route_edges` (once per process while it is unchanged); the
-    edges are copied out so a caller's edit never reaches the next one."""
-    return copy.deepcopy(_route_edges(root).get((route_id, route_hash_value), []))
+    A listing-bound disposable index survives CLI processes. Only the selected
+    sealed child files are parsed on a hit; missing/stale/corrupt indexes scan
+    the original records and repair themselves."""
+    return [copy.deepcopy(child)
+            for child in _indexed_route_children(root, route_id, route_hash_value)
+            if not _closed_unexecuted_continuation(root, child)]
+
+
+def _indexed_route_children(root: Path, route_id: str, route_hash_value: str):
+    def classify(name, candidate):
+        return ([directory_record_index.route_key(candidate["source_route_id"], candidate.get("source_route_hash"))]
+                if _qualified_continuation(Path(name).stem, candidate) else [])
+    try:
+        return directory_record_index.select(
+            _routes_dir(root), [directory_record_index.route_key(route_id, route_hash_value)],
+            kind="route-children", classify=classify, read_json=_read_json,
+            ignored=directory_record_index.ROUTE_SIDECARS)
+    except OSError:
+        return list(_route_edges(root).get((route_id, route_hash_value), []))
+
+
+def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
+    """A closed, unused candidate cannot take an executed predecessor's cycle.
+
+    Audit bindings and unconsumed registrations are history, not execution.
+    Read the exact route registry and markers afresh; missing or unreadable
+    evidence stays unknown. Started or unresolved launches stay attached.
+    """
+    outcome = _read_json(route_lineage.canonical_route_path(root, route["route_id"]).with_suffix(".outcome.json"))
+    if (not isinstance(outcome, dict)
+            or outcome.get("route_id") != route["route_id"]
+            or outcome.get("route_hash") != route["route_hash"]
+            or outcome.get("terminal_gate_proven") is not False
+            or _indexed_route_children(root, route["route_id"], route["route_hash"])):
+        return False
+    try:
+        module = artifact_lifecycle._load_capability_route()
+        sealed_jobs = ((route.get("launch_compatibility_tuple") or {}).get("jobs_path") or {}).get("path")
+        if not isinstance(sealed_jobs, str) or not Path(sealed_jobs).is_absolute():
+            return False
+        resolution = module.resolve_dangling_registry(Path(sealed_jobs))
+        if resolution.status not in ("exact", "aliased"):
+            return False
+        jobs = resolution.jobs_path
+        before = jobs.stat()
+        lines = jobs.read_text(encoding="utf-8").splitlines()
+        after = jobs.stat()
+        if any(getattr(before, key) != getattr(after, key)
+               for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
+            return False
+        for line in lines:
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            if len(fields) != 6:
+                return False
+            meta = dispatch_contract.parse_registry_metadata(fields[5])
+            if route["route_id"] in {meta.get("route_id"), meta.get("route"), meta.get("owner_route_id")}:
+                from route_authority import continuation_attempt_state
+                if continuation_attempt_state(meta) != "unstarted":
+                    return False
+        markers = module.completion_dir(route["route_id"], jobs=jobs)
+        if markers.exists() and any(markers.iterdir()):
+            return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 class LineageHandover(NamedTuple):
@@ -881,14 +1024,13 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
     begin_route = load_route(root, Path(record["route_file"]))
     if begin_route["route_hash"] != record["route_hash"]:
         raise ProducerError("route-hash-drift", record["cycle_id"])
-    children_of = _route_edges(root)
     tree = {begin_route["route_id"]}
     queue = [begin_route]
     while queue:
         node = queue.pop()
         if not route_is_closed(root, node):
             return LineageHandover(False, frozenset())
-        for child in children_of.get((node["route_id"], node["route_hash"]), []):
+        for child in _lineage_children(root, node["route_id"], node["route_hash"]):
             if (child.get("capability") != record.get("capability")
                     or child.get("effective_intensity") != record.get("intensity")):
                 continue
@@ -896,7 +1038,7 @@ def closed_lineage_handover(root: Path, record: Mapping[str, Any]) -> LineageHan
                 return LineageHandover(False, frozenset())  # a cycle in the lineage is never closed
             tree.add(child["route_id"])
             queue.append(child)
-    others = {rec.get("route_id") for rec in list_cycle_records(root)
+    others = {rec.get("route_id") for rec in list_cycle_records(root, route_ids=tree)
               if rec.get("cycle_id") != record.get("cycle_id")}
     return LineageHandover(True, frozenset(tree & others) - {begin_route["route_id"]})
 
@@ -927,7 +1069,7 @@ def route_cycle_for(root: Path, route: Mapping[str, Any]) -> Optional[Dict[str, 
     except route_lineage.RouteLineageError as exc:
         raise ProducerError(exc.code, exc.detail) from exc
     nearness = {r.get("route_id"): index for index, r in enumerate(lineage)}  # [route, parent, ..., begin route]
-    matches = [rec for rec in list_cycle_records(root) if rec.get("route_id") in nearness]
+    matches = list_cycle_records(root, route_ids=nearness)
     opened = [rec for rec in matches if rec.get("state") == "open" and not rec.get("deleted_at")]
     if len(opened) > 1:
         raise ProducerError("route-cycle-binding-ambiguous", route.get("route_id", ""))
@@ -2125,26 +2267,30 @@ def backfill_cycle_bindings(root: Path, *, apply: bool = False) -> Dict[str, Any
 
 
 def list_campaign_summaries(root: Path, *, active_only: bool = True) -> List[Dict[str, Any]]:
-    """Cheap, read-only listing of the root's campaigns for callers that
+    """Pure read-only listing of the root's campaigns for callers that
     must show the agent which work streams already exist (compose).
 
     Each row uses the same validated campaign event fold as admission.
+    This performs no reconcile, history flush, or index heal; writer
+    commands (`campaign-close`, `compose`, `campaign-recover`) own repairs.
     """
     root = Path(root)
-    # §45 D-126: a folder moved, renamed or removed by hand is found first; lines a recorder could
-    # not take earlier are handed over now.  Neither can fail this listing.
-    reconcile_root(root)
-    deliver_pending_history(root)
     rows: List[Dict[str, Any]] = []
     for entry in artifact_locator.iter_campaign_dirs(root):
-        record = _read_json(entry / "campaign.json")
-        if not record or not isinstance(record.get("campaign_id"), str):
+        try:
+            record, _ = artifact_campaign.read_json(root, entry / "campaign.json")
+        except artifact_campaign.CampaignError:
+            continue
+        if not isinstance(record.get("campaign_id"), str):
             continue
         try:
-            state = artifact_campaign.campaign_state(root, entry / "campaign.json", record).state
+            folded = artifact_campaign.campaign_state(root, entry / "campaign.json", record)
+            state = folded.state
+            projection_pending = folded.projection_pending
             state_error = None
         except artifact_campaign.CampaignError as exc:
             state, state_error = "invalid", exc.code
+            projection_pending = False
         if active_only and state != "active":
             continue
         cycles = record.get("cycles")
@@ -2162,6 +2308,7 @@ def list_campaign_summaries(root: Path, *, active_only: bool = True) -> List[Dic
             "locator": entry.name,
             "state": state,
             **({"state_error": state_error} if state_error else {}),
+            "projection_pending": projection_pending,
             "degraded": record.get("degraded") is True,
             "cycle_count": len(cycles) if isinstance(cycles, list) else 0,
             "created_on": str(record.get("created_on") or ""),
@@ -2319,9 +2466,12 @@ def _begin_cycle_record(
             parent = read_cycle_record(root, parent_cycle_id)
             if parent is None:
                 raise ProducerError("parent-cycle-not-joinable", parent_cycle_id)
+            if parent.get("deleted_at") and read_campaign(root, parent["campaign_id"]) is None:
+                parent = None
+                parent_cycle_id = None
             # §45 D-123: a parent is a reference to any cycle of this root, in any
             # state and any campaign; it selects a campaign only when none was named.
-            if campaign is None:
+            if campaign is None and parent is not None:
                 campaign = read_campaign(root, parent["campaign_id"])
                 if campaign is None:
                     raise ProducerError("campaign-unknown", parent["campaign_id"])
@@ -2651,6 +2801,19 @@ def _unmanifestable_reason(rel: str) -> Optional[str]:
 _TEMPORARY_FILE_SUFFIXES = (".pyc", ".swp", "~", ".tmp", ".part")
 
 
+def _browser_profile(parts: Sequence[str], *, directory: bool = False) -> bool:
+    """Reserved browser-review scratch, including profiles left by old reviewers."""
+    payload = tuple(parts)
+    if payload and payload[0] == "artifacts":
+        payload = payload[1:]
+    return bool(payload and payload[0] == "reviews" and any(
+        payload[index - 1] == "browser"
+        and (part == "profile" or part.startswith("profile-"))
+        for index, part in enumerate(payload)
+        if index > 1 and (directory or index < len(payload) - 1)
+    ))
+
+
 def _outside_inclusion_rule(rel: str) -> bool:
     """§45 D-123's one inclusion rule: what a cycle's manifest never lists.
 
@@ -2662,6 +2825,7 @@ def _outside_inclusion_rule(rel: str) -> bool:
     """
     parts = rel.split("/")
     return (any(part.startswith(".") or part == "__pycache__" for part in parts)
+            or _browser_profile(parts)
             or parts[-1].endswith(_TEMPORARY_FILE_SUFFIXES))
 
 
@@ -3744,6 +3908,8 @@ def checkpoint(
     then spends what is left of the same budget on the root's other closed cycles
     (`refresh_sweep`); that never changes the named cycle's result except for a `refresh` key
     naming what the sweep did."""
+    if cycle_id:
+        _observe_control_changes(Path(root).resolve(), cycle_id, now=now)
     budget = RefreshBudget.unlimited() if trigger == "explicit" else RefreshBudget()
     deliver_pending_history(root)  # §45 D-125: lines an earlier trigger could not hand over
     result = _checkpoint_cycle(root, cycle_id=cycle_id, route_file=route_file, trigger=trigger, now=now,
@@ -4509,11 +4675,6 @@ def _record_cycle_manifest_path(root: Path, record: Mapping[str, Any]) -> Path:
         if locator:
             cycle_path = artifact_locator.safe_child(root, parent, locator)
             binding = artifact_locator.read_cycle_binding(cycle_path)
-            if binding is None:
-                raise ProducerError(
-                    "sealed-cycle-state-unknown",
-                    f"{cycle_id}: cycle-binding=missing",
-                )
         else:
             cycle_path = artifact_locator.safe_child(
                 root, artifact_locator.safe_child(root, parent, "cycles"), cycle_id
@@ -4643,7 +4804,6 @@ def _finalize_route(root: Path, record: Mapping[str, Any], *, deadline: Optional
     current = begin_route
     visited = {current["route_id"]}
     handed_over: Optional[frozenset] = None  # computed once, and only when a child begins another cycle
-    begin_ids: Optional[Set[Any]] = None
     while True:
         if deadline is not None and time.monotonic() >= deadline:
             raise ProducerError("scan-in-progress")
@@ -4651,9 +4811,9 @@ def _finalize_route(root: Path, record: Mapping[str, Any], *, deadline: Optional
                       if c.get("capability") == record.get("capability")
                       and c.get("effective_intensity") == record.get("intensity")]
         if candidates and handed_over is None:
-            if begin_ids is None:
-                begin_ids = {rec.get("route_id") for rec in list_cycle_records(root)
-                             if rec.get("cycle_id") != record.get("cycle_id")}
+            begin_ids = {rec.get("route_id") for rec in list_cycle_records(
+                root, route_ids={c["route_id"] for c in candidates})
+                         if rec.get("cycle_id") != record.get("cycle_id")}
             if any(c["route_id"] in begin_ids for c in candidates):
                 handed_over = _handed_over_routes(root, record)
         if handed_over:
@@ -4708,6 +4868,8 @@ def finalize(
     if _recovery_scope != "exact":
         dispatch_terminal_commit.require_current_cleanup("producer-finalize")
     _authorize_active_cleanup(root, "finalize-forward-recovery", root, cycle_id)
+    if expected_binding is None:
+        _observe_control_changes(root, cycle_id, now=now)
     if state not in {"completed", "abandoned"}:
         raise ProducerError("finalize-state-invalid", state)
     if _admission_lock_fd is not None:
@@ -5627,12 +5789,21 @@ def _refresh_journal_resume(root: Path, record: Mapping[str, Any], journal: Mapp
         _write_atomic(manifest_path, artifact_manifest.canonical_bytes(copy))
         current, current_digest = copy, new_digest
     if current_digest != new_digest:
-        raise artifact_admission.AdmissionRecoveryRequired(
-            f"manifest digest mismatch for {cycle_id}; manual inspection required")
+        # A person changed/deleted the current file after publication. Leave
+        # those bytes alone and abandon this old write intent automatically.
+        carried = journal.get("history_pending")
+        if isinstance(carried, list):
+            _write_cycle_record(root, _with_pending(record, _merge_pending(record.get("history_pending") or [],
+                                [entry for entry in carried if isinstance(entry, dict)])),
+                                exclusive=False)
+            _flush_cycle_pending_locked(root, cycle_id)
+        _remove_journal(root, cycle_id)
+        return True
     carried = journal.get("history_pending")
     if isinstance(carried, list):
         # History lines the refresh could not hand over before it stopped belong to the record.
-        record = _with_pending(record, [entry for entry in carried if isinstance(entry, dict)])
+        record = _with_pending(record, _merge_pending(record.get("history_pending") or [],
+                               [entry for entry in carried if isinstance(entry, dict)]))
     _commit_sealed(root, record, current, new_digest, now=now, previous_digest=previous_digest)
     return True
 
@@ -5855,11 +6026,20 @@ def _refresh_cycle_locked(root: Path, record: Mapping[str, Any], *, now: Optiona
     index = artifact_admission.load_index(root)
     row = index.manifests.get(cycle_id)
     if not isinstance(row, dict) or row.get("manifest_digest") != digest:
-        raise ProducerError("already-sealed-mismatch", "index")
+        previous = artifact_lifecycle.find_manifest_snapshot(
+            root, cycle_id, manifest_digest=record.get("manifest_digest"))
+        if previous is None or not isinstance(row, dict) or row.get("manifest_digest") != record.get("manifest_digest"):
+            return {"status": "already-sealed", "cycle_id": cycle_id, "refreshed": False,
+                    "manifest_digest": record.get("manifest_digest"), "changes": {"added": [], "modified": [], "removed": []}}
+        # The current file is ordinary editable material. Continue observing
+        # payloads against the recorded revision without changing past proof.
+        document = previous
+        raw = artifact_manifest.canonical_bytes(document)
+        digest = record["manifest_digest"]
     alloc = allocator or artifact_identity.IdAllocator()
     deferred = False
     refreshed: Optional[Dict[str, Any]] = None
-    if prescan is not None and prescan.manifest_digest == digest:
+    if prescan is not None:
         excluded, excluded_symlinks = list(prescan.excluded), list(prescan.excluded_symlinks)
         facts = prescan.facts
         refreshed, changes = _refreshed_document(root, record, document, facts, allocator=alloc, now=now)
@@ -6098,7 +6278,8 @@ class _RefreshScan:
 
 def _pruned_directory(parts: Sequence[str]) -> bool:
     """A directory the inclusion rule leaves out whole (hidden component or `__pycache__`)."""
-    return any(part.startswith(".") or part == "__pycache__" for part in parts)
+    return (any(part.startswith(".") or part == "__pycache__" for part in parts)
+            or _browser_profile(parts, directory=True))
 
 
 def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, ...]]):
@@ -6452,6 +6633,7 @@ def refresh_cycle(
     nothing and the next trigger finds the same work again.  A run that changes nothing
     writes nothing.  `explicit` ignores the interval and the budget."""
     root = Path(root).resolve()
+    _observe_control_changes(root, cycle_id, now=now)
     clock = time.time() if now is None else float(now)
     base = {"cycle_id": cycle_id, "trigger": trigger}
     if budget is None:
@@ -6496,7 +6678,7 @@ def _refresh_cycle_observed(root: Path, cycle_id: str, *, trigger: str, clock: f
         return skipped("manifest-unreadable")
     digest = artifact_manifest.manifest_digest(document)
     if record.get("manifest_digest") != digest:
-        return skipped("record-digest-mismatch")
+        return {"status": "unchanged", **base, "manifest_digest": record.get("manifest_digest")}
     state = _read_refresh_state(root, cycle_id)
     observed_at = state.get("observed_at")
     if (trigger != "explicit" and observed_at is not None and state.get("cursor") is None
@@ -6894,15 +7076,30 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                     })
                     continue
                 result["rolled_forward"].append(cycle_id)
-            elif document is None:
+            else:
+                # Publication was prepared from validated bytes. A later edit
+                # or deletion is history, not authority for a different close.
+                original = artifact_lifecycle.find_manifest_snapshot(
+                    root, cycle_id, manifest_digest=journal.get("manifest_digest"))
+                if original is not None:
+                    _raise_if_recovery_fenced(root, cycle_id, now=now)
+                    try:
+                        artifact_locator.prepare_index_update(root, [record["campaign_id"]])
+                        _commit_sealed(root, record, original, journal["manifest_digest"], now=now)
+                    except (artifact_locator.LocatorError, ProducerError) as exc:
+                        if not _is_recoverable_locator_defect(exc) or record["campaign_id"] == target_campaign_id:
+                            raise
+                        result["unresolved"].append({
+                            "cycle_id": cycle_id, "campaign_id": record["campaign_id"],
+                            "code": exc.code, "detail": exc.detail, "phase": "journal",
+                        })
+                        continue
+                    result["rolled_forward"].append(cycle_id)
+                    continue
                 # Crash before the commit point: cycle stays open.
                 _drop_unpublished_snapshot(root, cycle_id, journal)
                 entry.unlink()
                 result["rolled_back"].append(cycle_id)
-            else:
-                raise artifact_admission.AdmissionRecoveryRequired(
-                    f"manifest digest mismatch for {cycle_id}; manual inspection required"
-                )
     for record in list_cycle_records(root):
         if (record.get("state") != "open" or record.get("deleted_at")
                 or (record.get("relocation") or {}).get("artifact_root")):
@@ -6920,6 +7117,30 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                 document = _read_json(directory / "manifest.json")
                 if document is not None:
                     _raise_if_recovery_fenced(root, record["cycle_id"], now=now)
+                    digest = artifact_manifest.manifest_digest(document)
+                    published = artifact_lifecycle.find_manifest_snapshot(root, record["cycle_id"], manifest_digest=digest)
+                    if published is None:
+                        # Older interrupted publications may have no copy or
+                        # journal. Use their actual terminal proof, never a
+                        # state field alone, before admitting a new result.
+                        identity = artifact_lifecycle.read_root_identity(root)
+                        cycle = document.get("cycle") or {}
+                        valid_identity = (identity is not None
+                                          and document.get("artifact_root_id") == identity.artifact_root_id
+                                          and cycle.get("cycle_id") == record["cycle_id"]
+                                          and cycle.get("campaign_id") == record["campaign_id"]
+                                          and (document.get("producer") or {}).get("producer_id") == record["producer_id"])
+                        try:
+                            route_file, _ = resolve_cycle_manifest_route(root, record, document)
+                            completion = artifact_lifecycle.evaluate_cycle_completion(
+                                document, content_root=directory, route_file=route_file,
+                                expected_root_id=identity.artifact_root_id if identity else None)
+                            valid = valid_identity and completion.ok
+                        except (ProducerError, artifact_lifecycle.LifecycleError, OSError, ValueError):
+                            valid = False
+                        if not valid:
+                            result["open"].append(record["cycle_id"])
+                            continue
                     artifact_locator.prepare_index_update(root, [record["campaign_id"]])
                     _commit_sealed(root, record, document, artifact_manifest.manifest_digest(document), now=now)
                     result["rolled_forward"].append(record["cycle_id"])
@@ -8021,7 +8242,7 @@ def admit_shared(
             shutil.rmtree(str(staging), ignore_errors=True)
             raise ProducerError("revision-exists", str(target))
         # COMMIT POINT: no-replace rename of the staged immutable revision.
-        os.rename(str(staging), str(target))
+        artifact_admission.atomic_publish.rename_directory_locked(staging, target)
         _fsync_dir(revisions_dir)
         journal["state"] = "published"
         _write_atomic(shared_journal_path(root, revision_id), _json_bytes(journal), 0o600)
@@ -8382,6 +8603,87 @@ def _read_manifest_raw(directory: Path) -> Optional[Tuple[bytes, Dict[str, Any]]
     return (raw, document) if isinstance(document, dict) else None
 
 
+def _observe_control_changes(root: Path, cycle_id: str, *, now: Optional[float] = None,
+                             directory: Optional[Path] = None, locator_cache: bool = False) -> None:
+    """Log ordinary record edits/deletions through the existing recorder.
+
+    No payload is restored. Bookkeeping can be read from its admitted revision
+    and written again by an ordinary operation. Observation is best effort and
+    never changes a completion decision or fails the caller.
+    """
+    try:
+        record = read_cycle_record(root, cycle_id)
+        if record is None or record.get("deleted_at") or not _closed_record(record):
+            return
+        directory = directory or _record_cycle_manifest_path(root, record).parent
+        if not directory.is_dir() or directory.is_symlink():
+            return
+        binding = artifact_locator.cycle_binding_bytes(record["campaign_id"], cycle_id,
+                                                       started_on=record.get("started_on"))
+        journal = _read_json(journal_path(root, cycle_id)) or {}
+        manifest_expected = (journal.get("manifest_digest") if journal.get("state") == "refreshing"
+                             else record.get("manifest_digest"))
+        paths = [(directory / "manifest.json", manifest_expected),
+                 (directory / artifact_locator.CYCLE_BINDING, _digest(binding)),
+                 (cycle_record_path(root, cycle_id), record.get("control_record_digest") or _record_content_digest(record))]
+        if locator_cache:
+            expected = artifact_locator.index_observation_baselines(root)
+            paths += [(root / "campaigns" / name, expected.get(name)) for name in ("INDEX.json", "INDEX.md")]
+        prior = dict(record.get("control_observations") or {})
+        baselines = dict(record.get("control_baselines") or {})
+        stamp = _command_stamp()
+        updates = {}
+        lines = []
+        for path, expected in paths:
+            rel = path.relative_to(root).as_posix()
+            if path.parent == root / "campaigns":
+                after = _digest(path.read_bytes()) if path.is_file() and not path.is_symlink() else None
+            elif path == cycle_record_path(root, cycle_id):
+                parsed = _read_json(path)
+                after = _record_content_digest(parsed) if parsed is not None else None
+            elif path.is_symlink() or not path.is_file():
+                after = None
+            elif path.name == "manifest.json":
+                parsed = _read_json(path)
+                after = artifact_manifest.manifest_digest(parsed) if parsed is not None else _digest(path.read_bytes())
+            else:
+                after = _digest(path.read_bytes())
+            before = prior.get(rel, expected) if baselines.get(rel, expected) == expected else expected
+            baselines[rel] = expected
+            if after == expected:
+                if before != after:
+                    updates[rel] = after
+                continue
+            if before == after:
+                continue
+            updates[rel] = _record_content_digest(record) if path == cycle_record_path(root, cycle_id) else after
+            lines.append({"kind": "artifact", "target_type": "artifact", "target_id": cycle_id,
+                          "target_path": rel, "operation": "delete" if after is None else "update",
+                          "field": "content", "before": {"value": before}, "after": {"value": after},
+                          "reason": "filesystem-change", **_history_actor("rule"),
+                          "transaction_id": _history_id("htxn", cycle_id, rel, stamp),
+                          "event_id": _history_id("hevt", cycle_id, rel, stamp),
+                          "now": time.time() if now is None else float(now)})
+        if not lines and not updates:
+            return
+        fd = artifact_admission.try_acquire_lock(root)
+        if fd is None:
+            return
+        try:
+            current = read_cycle_record(root, cycle_id)
+            if current != record:
+                return
+            prior.update(updates)
+            pending = _merge_pending(record.get("history_pending") or [], lines)
+            _write_cycle_record(root, _with_pending(dict(record, control_observations=prior,
+                                                       control_baselines=baselines), pending), exclusive=False)
+            _flush_cycle_pending_locked(root, cycle_id)
+        finally:
+            artifact_admission._release_lock(root, fd)
+    except Exception:  # noqa: BLE001 -- a history observation cannot block ordinary work
+        pass
+
+
 def _preserve_current_manifest(root: Path, record: Mapping[str, Any], directory: Path) -> None:
     """Keep the manifest as it is now (a cycle closed before copies existed has none yet)."""
     if not _closed_record(record):
@@ -8698,6 +9000,12 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
             after={"value": new_campaign_id}, reason=reason, now=now, by=by))
         changed += [old_campaign_id, new_campaign_id]
     if updated.get("locator") != new_directory.name:
+        if old_campaign_id == new_campaign_id:
+            before_path = _cycle_rel(root, new_directory.parent / str(record.get("locator") or cycle_id))
+            lines.append(_command_line(
+                command=command, stamp=stamp, target_type="cycle", target_id=cycle_id, target_path=where,
+                operation="move", field="path", before={"value": before_path}, after={"value": where},
+                reason=reason, now=now, by=by))
         base = artifact_locator.locator_base(started, record.get("slug") or "") if started else ""
         updated["locator"] = new_directory.name
         updated["locator_suffix"] = _locator_suffix(base, new_directory.name)
@@ -8727,6 +9035,14 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
         manifest = _read_manifest_raw(new_directory) if _closed_record(record) else None
     if manifest is not None:
         raw, document = manifest
+        observed_digest = manifest_digest or artifact_manifest.manifest_digest(document)
+        if observed_digest != record.get("manifest_digest"):
+            previous = artifact_lifecycle.find_manifest_snapshot(
+                root, cycle_id, manifest_digest=record.get("manifest_digest"))
+            if previous is not None:
+                document = previous
+                raw = artifact_manifest.canonical_bytes(document)
+                manifest_digest = record["manifest_digest"]
         refreshed = _next_document(document, artifact_identity.IdAllocator())
         if (record.get("relocation") or {}).get("original_root"):
             import artifact_cross_root_move
@@ -8751,6 +9067,8 @@ def _adopt_location_locked(root: Path, record: Mapping[str, Any], new_directory:
     else:
         written = pending_record
         _write_cycle_record(root, written, exclusive=False)
+        if _closed_record(record):
+            _swap_index_path_locked(root, cycle_id, where, index=index)
     return written, list(dict.fromkeys(changed))
 
 
@@ -9099,6 +9417,19 @@ class _LayoutScan:
         return found
 
 
+def _folder_cycle_id(folder: Path, manifest: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+    """The surviving identity, shared by the scan and its locked confirmation."""
+    try:
+        binding = artifact_locator.read_cycle_binding(folder)
+    except artifact_locator.LocatorError:
+        binding = None
+    if binding is not None:
+        return binding["cycle_id"]
+    document = manifest if manifest is not None else (_read_json(folder / "manifest.json") or {})
+    cycle_id = (document.get("cycle") or {}).get("cycle_id")
+    return cycle_id if artifact_identity.is_well_formed(cycle_id, "cycle") else None
+
+
 def _scan_layout(root: Path) -> _LayoutScan:
     """Where every campaign and cycle ID sits, read from the folders alone (a `lstat` and a few small files each).
 
@@ -9159,14 +9490,10 @@ def _scan_layout(root: Path) -> _LayoutScan:
             if child == "cycles":
                 scan.complete = False  # an old layout: moves are not judged from it
                 continue
-            try:
-                binding = artifact_locator.read_cycle_binding(path)
-            except artifact_locator.LocatorError:
-                binding = None
-            if binding is None:
+            cycle_id = _folder_cycle_id(path)
+            if cycle_id is None:
                 scan.complete = False
                 continue
-            cycle_id = binding["cycle_id"]
             if cycle_id in scan.cycles or cycle_id in scan.duplicates:
                 scan.duplicates.add(cycle_id)
                 scan.cycles.pop(cycle_id, None)
@@ -9232,11 +9559,11 @@ def _manifest_fingerprint(folder: Path) -> Optional[Tuple[int, int, int]]:
 
 
 def _preread_manifests(root: Path, changes: Mapping[str, Any]) -> Dict[str, _PreManifest]:
-    """Read, with no lock held, the manifest of each closed cycle a reconcile is about to adopt or revive."""
+    """Read, with no lock held, each moved cycle's surviving manifest and identity."""
     out: Dict[str, _PreManifest] = {}
     for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
         record = read_cycle_record(root, cycle_id)
-        if record is None or not _closed_record(record):
+        if record is None:
             continue
         fingerprint = _manifest_fingerprint(folder)
         found = _read_manifest_raw(folder)
@@ -9255,15 +9582,27 @@ def reconcile_root(root: Path, *, now: Optional[float] = None) -> Dict[str, Any]
     copy, a link or a folder with no ID is left alone.  Best effort: it never fails its caller."""
     try:
         root = Path(root).resolve()
-        if not is_active(root) or not (root / "campaigns").is_dir():
+        if not is_active(root):
             return {"status": "inactive"}
         # The folders are read with no lock held (§45 D-124); the lock only confirms what was found.
         # A change that no longer holds when the lock is taken is looked for once more.
         for _attempt in range(2):
             published = artifact_locator._load_index(root)
             if published is None:
-                return {"status": "unchanged"}
+                # INDEX is a disposable cache. The admission rows retain
+                # last locations even when the entire campaigns tree is gone.
+                index = artifact_admission.load_index(root)
+                published = {}
+                for cycle_id, row in index.cycles.items():
+                    where = row.get("cycle_path") if isinstance(row, dict) else None
+                    record = read_cycle_record(root, cycle_id)
+                    if isinstance(where, str) and record is not None:
+                        published[cycle_id] = where
+                        published[record["campaign_id"]] = str(Path(where).parent)
             scan = _scan_layout(root)
+            ordered = sorted(scan.cycles, key=lambda cid: ((read_cycle_record(root, cid) or {}).get("started_on") or "", cid))
+            for position, cycle_id in enumerate(ordered):
+                _observe_control_changes(root, cycle_id, now=now, directory=scan.cycles[cycle_id], locator_cache=position == 0)
             if scan.mapping(root) == published:
                 return {"status": "unchanged"}
             changes = _hand_changes(root, scan, published)
@@ -9336,7 +9675,8 @@ def _look_again_before_gone(root: Path, changes: Mapping[str, Any]) -> Tuple[Dic
                        if item not in again.campaigns and item not in again.duplicates]), seen
 
 
-def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mapping[str, str]) -> bool:
+def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mapping[str, str],
+                       manifests: Optional[Mapping[str, _PreManifest]] = None) -> bool:
     """Under the lock, with `lstat` and the small files that name an ID: is each change the scan found still there?"""
     def gone(relative: str) -> bool:
         try:
@@ -9356,11 +9696,10 @@ def _hand_changes_hold(root: Path, changes: Mapping[str, Any], published: Mappin
         if not campaign or campaign.get("campaign_id") != campaign_id or campaign.get("locator") == folder.name:
             return False
     for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
-        try:
-            binding = artifact_locator.read_cycle_binding(folder) if folder_is(folder) else None
-        except artifact_locator.LocatorError:
-            binding = None
-        if binding is None or binding.get("cycle_id") != cycle_id:
+        pre = (manifests or {}).get(cycle_id)
+        document = (pre.found[1] if pre is not None and pre.found is not None else {}) \
+            if manifests is not None else None
+        if not folder_is(folder) or _folder_cycle_id(folder, document) != cycle_id:
             return False
     for identifier in list(changes["cycle_gone"]) + list(changes["campaign_gone"]):
         if identifier not in published or not gone(published[identifier]):
@@ -9378,12 +9717,14 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
     held = artifact_admission.holds_lock(root)
     lock_fd = None if held else artifact_admission._acquire_lock(root, REFRESH_ADMISSION_WAIT_SECONDS, now=now)
     try:
-        if artifact_locator._load_index(root) != published or not _hand_changes_hold(root, changes, published):
+        current_index = artifact_locator._load_index(root)
+        if ((current_index is not None and current_index != published)
+                or not _hand_changes_hold(root, changes, published, manifests)):
             return None
         if manifests is not None:
             for cycle_id, folder in list(changes["cycle_moves"]) + list(changes["cycle_revive"]):
                 current = read_cycle_record(root, cycle_id)
-                if current is None or not _closed_record(current):
+                if current is None:
                     continue
                 pre = manifests.get(cycle_id)
                 if pre is None or pre.fingerprint != _manifest_fingerprint(folder):
@@ -9454,7 +9795,8 @@ def _reconcile_locked_run(root: Path, now: Optional[float], scan: _LayoutScan, p
             last_path = published.get(campaign_id, "") or f"campaigns/{campaign_id}"
             members = [r for r in list_cycle_records(root) if r.get("campaign_id") == campaign_id]
             for member in members:
-                if member.get("deleted_at") or not _closed_record(member) or member["cycle_id"] in seen:
+                if (member.get("deleted_at") or not _closed_record(member) or member["cycle_id"] in seen
+                        or (member.get("relocation") or {}).get("artifact_root")):
                     continue
                 _tombstone_cycle_locked(root, member, where=_last_known_path(root, member, published.get(member["cycle_id"], "")),
                                         command="reconcile", stamp=stamp, reason="reconcile", now=now, by=by,
@@ -9613,7 +9955,7 @@ def require_cycle_output(
         elif record is None:
             # Legacy records can lack a canonical route. Preserve only their
             # original exact begin-route match; continuation still needs proof.
-            candidates = [item for item in list_cycle_records(root) if item.get("route_id") == route_id]
+            candidates = list_cycle_records(root, route_ids={route_id})
             opened = [item for item in candidates if item.get("state") == "open"]
             candidates = opened or candidates
             if len(candidates) > 1:
@@ -9826,16 +10168,21 @@ def resolve_output_dir(root: Path, bucket: str, *, cycle_dir_hint: Optional[str]
 def _route_autoclose(root: Path, trigger: str, campaign: Optional[str] = None) -> None:
     """Close routes nobody works on before campaign bookkeeping reads them
     (route_autoclose.py).  Bookkeeping only: it never fails the command.
-    `campaign` is the one `campaign-close` ends; its members close sooner."""
+    `campaign` limits `campaign-close` bookkeeping to that campaign."""
     try:
         import artifact_cutover
         import route_autoclose
         campaign_id = None
+        scope = {}
         if campaign is not None:
-            record, _raw = artifact_campaign.read_json(root, artifact_campaign.campaign_path(root, campaign))
+            path = artifact_campaign.campaign_path(root, campaign)
+            record, _raw = artifact_campaign.read_json(root, path)
             campaign_id = record.get("campaign_id")
+            scope = {"scope_campaign_id": campaign_id, "scope_dir": path.parent,
+                     "scope_key": record.get("key")}
         route_autoclose.report(route_autoclose.sweep(
-            root, api=artifact_cutover._route_module(), trigger=trigger, campaign_id=campaign_id))
+            root, api=artifact_cutover._route_module(), trigger=trigger,
+            campaign_id=campaign_id, **scope))
     except Exception as exc:  # noqa: BLE001
         print(f"route_autoclose error={type(exc).__name__}", file=sys.stderr)
 
@@ -9883,6 +10230,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = sub.add_parser("campaign-list", help="summarize the root's campaigns (keys, titles, cycle counts)")
     p.add_argument("--artifact-root", required=True)
     p.add_argument("--all-states", action="store_true", help="include satisfied/superseded campaigns")
+
+    p = sub.add_parser("campaign-export", help="pure read of every campaign's current state (artifact-campaign-current/v1)")
+    p.add_argument("--artifact-root", required=True)
 
     p = sub.add_parser("cycle-binding-backfill",
                        help="add started_on to .cycle.json bindings written before the field existed")
@@ -10071,6 +10421,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "campaign-list":
             rows = list_campaign_summaries(root, active_only=not args.all_states)
             result = {"status": "ok", "artifact_root": str(Path(root).resolve()), "campaigns": rows}
+        elif args.command == "campaign-export":
+            # Pure read: captured bytes, no writes or locks; only an
+            # OS-unreadable root is exit 65, never a content verdict.
+            try:
+                result = artifact_campaign.export_current(root)
+            except OSError as exc:
+                _print({"status": "blocked", "code": "root-unreadable", "detail": str(exc)[:200]})
+                return 65
         elif args.command == "cycle-binding-backfill":
             result = backfill_cycle_bindings(root, apply=args.apply)
         elif args.command == "cycle-time-recovery":
@@ -10092,15 +10450,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "campaign-status":
             import artifact_cross_root_move as cross_move
             try:
-                historical_path, historical = cross_move._campaign(root, args.campaign)
+                historical_path, historical = cross_move._campaign(
+                    root, args.campaign,
+                    read_record=lambda path: artifact_campaign.read_json(root, path)[0])
             except ProducerError:
                 historical = {}
             if historical.get("relocation"):
                 result = {"status": historical["state"], "state": historical["state"],
                           "campaign_id": historical["campaign_id"], "canonical": historical["relocation"]}
             else:
-                _route_autoclose(root, "campaign-status")
-                reconcile_root(root)
+                # Pure read: no route sweep, no reconcile, no history flush.
+                # Writer paths (`campaign-close`, `compose`) keep the sweep.
                 result = artifact_campaign.status(root, args.campaign)
         elif args.command == "campaign-close":
             _route_autoclose(root, "campaign-close", campaign=args.campaign)

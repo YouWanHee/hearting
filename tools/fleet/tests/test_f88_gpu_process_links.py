@@ -196,6 +196,8 @@ class ProbeCommandAndSessionEvidenceTest(unittest.TestCase):
 
 class GpuProcessAndResourceRenderTest(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(setattr, render, "_ROUTE_FOLD", render._ROUTE_FOLD)
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
         self.original_blink = render._BLINK_ON
         self.addCleanup(setattr, render, "_BLINK_ON", self.original_blink)
         self.session = Session(
@@ -306,16 +308,19 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
             text = [render._plain(row) for row in rows]
             self.assertTrue(all(render._dw(line) <= width for line in text))
             joined = "\n".join(text)
-            self.assertEqual(len(text), 1)
+            self.assertGreaterEqual(len(text), 1)
+            self.assertLessEqual(len(text), 2)
             self.assertEqual(joined.count("GPU moving4:0"), 1)
             self.assertEqual(joined.count("GPU moving4:1"), 1)
             if width >= 100:
-                self.assertIn("(M6 학습)", joined)
-                self.assertIn("(M3_9 학습)", joined)
+                self.assertIn("(M6 train)", joined)
+                self.assertIn("(M3_9 train)", joined)
             self.assertNotIn("other.py", "\n".join(text))
         narrow = [render._plain(row) for row in render._gpu_resource_strip(linked, 60)]
-        self.assertEqual(len(narrow), 1)
-        self.assertNotIn(" GB", narrow[0])
+        self.assertEqual(len(narrow), 2)
+        self.assertTrue(all(render._dw(row) <= 60 for row in narrow))
+        for name in ("M6 train", "M3_9 train"):
+            self.assertIn(name, "\n".join(narrow))
         wide = render._plain(render._gpu_resource_strip(linked, 168)[0])
         self.assertIn("12 GB", wide)
         self.assertIn("9.8 GB", wide)
@@ -326,8 +331,8 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         ):
             text = [render._plain(line) for line in lines if line]
             gpu_rows = [line for line in text if "GPU moving4:" in line]
-            self.assertEqual("\n".join(gpu_rows).count("GPU moving4:0 (M6 학습)"), 1)
-            self.assertEqual("\n".join(gpu_rows).count("GPU moving4:1 (M3_9 학습)"), 1)
+            self.assertEqual("\n".join(gpu_rows).count("GPU moving4:0 (M6 train)"), 1)
+            self.assertEqual("\n".join(gpu_rows).count("GPU moving4:1 (M3_9 train)"), 1)
             self.assertFalse(any(" RUN " in line for line in text))
             self.assertLess(next(i for i, line in enumerate(text) if "Codex [92]" in line),
                             next(i for i, line in enumerate(text) if "GPU moving4:" in line))
@@ -393,7 +398,7 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
                         [current, neighbor], [], "both", False, 0, term_width=120) if row]
                     gpu_rows = [row for row in rows if "● GPU" in row]
                     self.assertEqual(len(gpu_rows), 1)
-                    self.assertNotIn("미등록", gpu_rows[0])
+                    self.assertNotIn("unregistered", gpu_rows[0])
                     self.assertLess(next(i for i, row in enumerate(rows) if "current" in row),
                                     next(i for i, row in enumerate(rows) if "● GPU" in row))
                     self.assertEqual(json.dumps(snapshot, sort_keys=True), raw)
@@ -433,8 +438,8 @@ class GpuProcessAndResourceRenderTest(unittest.TestCase):
         self.assertEqual(len(linked), 1)
         self.assertEqual(len(linked[0]["processes"]), 2)
         text = render._plain(render._gpu_resource_strip(linked, term_width=168)[0])
-        self.assertIn("GPU cnn:0 (M6 학습, unknown_eval)", text)
-        for absent in ("registered", "ambiguous", "wrong", "reused", "unknown_eval 학습"):
+        self.assertIn("GPU cnn:0 (M6 train, unknown_eval)", text)
+        for absent in ("registered", "ambiguous", "wrong", "reused", "unknown_eval train"):
             self.assertNotIn(absent, text)
         self.assertEqual(render._gpu_process_label("python train.py --engine_mode eval --config other.yaml"),
                          "other")

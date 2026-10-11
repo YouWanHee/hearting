@@ -260,7 +260,7 @@ class DispatchBatchTest(unittest.TestCase):
         ]
         return contextlib.ExitStack(), assignments
 
-    def legs(self, assignments=None):
+    def legs(self, assignments=None, prompt=None):
         assignments = assignments or self.common_patches()[1]
         legs = []
         for node, adapter, hop, ordinal in assignments:
@@ -281,7 +281,7 @@ class DispatchBatchTest(unittest.TestCase):
                     ordinal,
                 ),
                 "assignment_sha256": "sha256:" + __import__("hashlib").sha256(
-                    BATCH.DEFAULT_PROMPT.encode("utf-8")
+                    (BATCH.DEFAULT_PROMPT if prompt is None else prompt).encode("utf-8")
                 ).hexdigest(),
                 "independence": "cross-harness",
                 "model_profile": str(node["model_profile"]),
@@ -293,8 +293,9 @@ class DispatchBatchTest(unittest.TestCase):
     def write_existing(
         self, leg, *, status="open", note="", claimed="1", append=True,
         live_identity=True,
+        all_legs=None,
     ):
-        all_legs = self.legs()
+        all_legs = all_legs or self.legs()
         _manifest, manifest_digest, leg_digests = BATCH.build_manifest(
             replica_group="plan",
             route_id=self.route["route_id"],
@@ -663,13 +664,45 @@ class DispatchBatchTest(unittest.TestCase):
         popen.assert_not_called()
 
     def test_at5_partial_continuation_reuses_peers_and_claims_only_gap(self):
-        source_legs = self.legs()
+        self._partial_continuation_launch()
+
+    def test_partial_continuation_uses_sealed_assignment_with_new_gap_brief(self):
+        self._partial_continuation_launch(
+            retry_prompt="Independent research: finish only the failed alternative.\n",
+            sealed=True,
+        )
+
+    def test_partial_continuation_preserves_newline_lost_by_shell_substitution(self):
+        original = BATCH.DEFAULT_PROMPT + "\n"
+        with mock.patch.object(BATCH, "DEFAULT_PROMPT", original):
+            self._partial_continuation_launch(retry_prompt=original.rstrip("\n"), sealed=True)
+
+    def test_partial_continuation_legacy_rows_keep_assignment_with_new_brief(self):
+        self._partial_continuation_launch(retry_prompt="Recover the failed leg only.")
+
+    def test_partial_continuation_legacy_custom_assignment_keeps_matching_prompt(self):
+        self._partial_continuation_launch(
+            original_prompt="The original custom assignment.",
+            retry_prompt="The original custom assignment.",
+        )
+
+    def test_partial_continuation_new_owner_keeps_source_parent_and_replacement(self):
+        self._partial_continuation_launch(
+            retry_prompt="Continue the authorized gap.", sealed=True,
+            parent_attempt="att-corrected-owner",
+        )
+
+    def _partial_continuation_launch(self, *, retry_prompt=None, sealed=False,
+                                    parent_attempt="att-parent-fixture", original_prompt=None):
+        source_legs = self.legs(prompt=original_prompt)
         _source_manifest, continuation, partial = self.partial_continuation(source_legs)
         peer, gap = source_legs
-        self.write_existing(peer, status="done", note="completed-marker")
+        self.write_existing(peer, status="done", note="completed-marker", all_legs=source_legs)
         self.write_existing(
-            gap, status="done", note="cancelled-receipt-unavailable"
+            gap, status="done", note="cancelled-receipt-unavailable", all_legs=source_legs
         )
+        if sealed:
+            self.seal_original_input()
         self.jobs.write_text(
             self.jobs.read_text(encoding="utf-8").replace(
                 f"note=cancelled-receipt-unavailable\n",
@@ -680,6 +713,8 @@ class DispatchBatchTest(unittest.TestCase):
         )
         continuation_path = self.base / "continuation.json"
         argv = self.argv() + ["--continuation", str(continuation_path)]
+        if retry_prompt is not None:
+            argv += ["--prompt-text", retry_prompt]
         output = io.StringIO()
         created = []
 
@@ -689,6 +724,7 @@ class DispatchBatchTest(unittest.TestCase):
 
             def __init__(self, command, **kwargs):
                 self.command = command
+                self.env = kwargs.get("env", {})
                 created.append(self)
 
             def communicate(self):
@@ -743,7 +779,7 @@ class DispatchBatchTest(unittest.TestCase):
             ))
             stack.enter_context(mock.patch.dict(os.environ, {
                 "AGENT_DISPATCH_SELF_SLUG": "owner",
-                "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_ATTEMPT_ID": parent_attempt,
                 "AGENT_DISPATCH_CURRENT_HARNESS": "codex",
                 "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
                 "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write",
@@ -790,6 +826,11 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(popen.call_count, 1)
         self.assertEqual(len(created), 1)
         command = created[0].command
+        self.assertEqual(command[command.index("--prompt-text") + 1],
+                         BATCH.DEFAULT_PROMPT if original_prompt is None else original_prompt)
+        self.assertEqual(created[0].env["AGENT_DISPATCH_RETRY_BRIEF"],
+                         retry_prompt if retry_prompt is not None else BATCH.DEFAULT_PROMPT)
+        self.assertEqual(command[command.index("--parent-attempt-id") + 1], parent_attempt)
         self.assertEqual(
             command[command.index("--attempt-id") + 1],
             "att-retry-verbatim",
@@ -803,6 +844,43 @@ class DispatchBatchTest(unittest.TestCase):
             receipt["legs"][0]["reason"], "reused-successful-peer"
         )
         self.assertEqual(len(self.jobs.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_partial_source_rejects_tampered_launch_input_and_row_bindings(self):
+        from dispatch_replacement_batch import _input_path
+        legs = self.legs()
+        _manifest, _continuation, partial = self.partial_continuation(legs)
+        self.write_existing(legs[0], status="done", note="completed-marker")
+        self.write_existing(legs[1], status="done", note="dead-worker-blocked")
+        self.seal_original_input()
+        path = _input_path(self.jobs, partial["source_batch_manifest_digest"])
+        original_input = path.read_text()
+        original_rows = self.jobs.read_text()
+        for mutation in ("manifest", "prompt", "leg-digest", "profile", "parent", "duplicate"):
+            with self.subTest(mutation=mutation):
+                path.write_text(original_input)
+                self.jobs.write_text(original_rows)
+                payload = json.loads(original_input)
+                if mutation == "manifest":
+                    payload["manifest"]["members"][0]["assignment_sha256"] = "sha256:" + "f" * 64
+                    path.write_text(json.dumps(payload))
+                elif mutation == "prompt":
+                    payload["options"]["prompt_text"] += "tampered"
+                    path.write_text(json.dumps(payload))
+                else:
+                    rows = original_rows
+                    if mutation == "leg-digest":
+                        rows = rows.replace("batch_leg_sha256=sha256:", "batch_leg_sha256=sha256:f")
+                    elif mutation == "profile":
+                        rows = rows.replace(f"batch_model_profile={legs[0]['model_profile']}",
+                                            "batch_model_profile=mini")
+                    elif mutation == "parent":
+                        rows = rows.replace("batch_parent_attempt_id=att-parent-fixture",
+                                            "batch_parent_attempt_id=att-foreign")
+                    else:
+                        rows += original_rows.splitlines()[0] + "\n"
+                    self.jobs.write_text(rows)
+                with self.assertRaises(BATCH.BatchError):
+                    BATCH.partial_batch_input(self.jobs, self.route, self.route["nodes"], partial)
 
     def test_blocked_recovery_claim_can_never_reuse_retry_attempt(self):
         metadata = {
@@ -857,6 +935,121 @@ class DispatchBatchTest(unittest.TestCase):
             "att-parent-fixture", "codex", 1,
         )
         self.assertEqual(first, second)
+
+    def test_review_round_identity_keeps_replays_stable_and_rounds_distinct(self):
+        node = self.route["nodes"][0]
+        identities = [BATCH.stable_attempt_id(self.route, node, "display", "owner",
+            "att-parent-fixture", "codex", 1, review_round=round_number)
+            for round_number in (1, 2, 3)]
+        self.assertEqual(len(set(identities)), 3)
+        self.assertEqual(identities[1], BATCH.stable_attempt_id(self.route, node,
+            "changed-display", "changed-owner-label", "att-parent-fixture", "codex", 1,
+            review_round=2))
+
+    def _same_owner_next_review_round(self, prompt, parent_harness):
+        # Use the lab's actual review kinds/units and derived alternative id.
+        # Only launch/process boundaries are faked; admission, both sealed
+        # inputs, attempt matching and the round census run for real.
+        from dispatch_replacement_batch import _input_path
+        self._configure_lab_review()
+        assignments = self.common_patches()[1]
+        for index, leg in enumerate(self.legs()):
+            self.write_existing(leg, status="done", note="completed-review-blocking", append=index != 0)
+        self.seal_original_input()
+        original_rows = self.jobs.read_bytes()
+        source = BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
+                                        "plan", "att-parent-fixture", BATCH.DEFAULT_PROMPT)
+        source_path = _input_path(self.jobs, source["manifest_digest"])
+        original_input = source_path.read_bytes()
+        output = io.StringIO()
+        commands = []
+
+        def spawn(command, **kwargs):
+            commands.append(command)
+            return SimpleNamespace(pid=12000, returncode=0,
+                communicate=lambda: (success_receipt(command), ""), poll=lambda: 0)
+
+        with contextlib.ExitStack() as stack:
+            for name, value in (("load_route", self.route), ("resolve_agent_home", self.base),
+                                ("resolve_global_registry", SimpleNamespace(path=self.jobs)),
+                                ("assign_harnesses", (assignments, "cross-harness", {})),
+                                ("reserve_batch", ["a" * 32, "b" * 32])):
+                stack.enter_context(mock.patch.object(BATCH, name, return_value=value))
+            stack.enter_context(mock.patch.object(BATCH, "resolve_live_parent_attempt"))
+            stack.enter_context(mock.patch.object(BATCH, "completion_marker_gate"))
+            stack.enter_context(mock.patch.object(BATCH, "cancel_unclaimed"))
+            stack.enter_context(mock.patch.object(BATCH.subprocess, "check_output", return_value=str(self.base)))
+            process = stack.enter_context(mock.patch.object(BATCH.subprocess, "Popen", side_effect=spawn))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_SELF_SLUG": "owner", "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-fixture",
+                "AGENT_DISPATCH_CURRENT_HARNESS": parent_harness, "AGENT_DISPATCH_CURRENT_TRANSPORT": "headless",
+                "AGENT_DISPATCH_CURRENT_SANDBOX": "workspace-write"}))
+            with contextlib.redirect_stdout(output):
+                result = BATCH.main(self.argv() + ["--prompt-text", prompt])
+            self.assertEqual(result, 0, output.getvalue())
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["newly_started"], 2)
+            self.assertEqual(len(commands), 2)
+            new_ids = {leg["attempt_id"] for leg in receipt["legs"]}
+            self.assertTrue(new_ids.isdisjoint(leg["attempt_id"] for leg in self.legs()))
+            self.assertEqual(self.jobs.read_bytes(), original_rows)
+            self.assertEqual(source_path.read_bytes(), original_input)
+            manifest, digest, _ = BATCH.build_manifest(
+                parallel_group="plan", route_id=self.route["route_id"], parent_attempt_id="att-parent-fixture",
+                independence="cross-harness", members=BATCH.manifest_members(receipt["legs"]),
+                required_independence_axes=["cross-harness", "model-profile", "perspective"],
+                realized_independence_axes=["cross-harness", "model-profile", "perspective"])
+            second_path = _input_path(self.jobs, digest)
+            self.assertNotEqual(source_path, second_path)
+            self.assertEqual(json.loads(second_path.read_text())["options"]["prompt_text"], prompt)
+            # A duplicate start while r2 is live starts nothing. After its
+            # blocking verdict, the same command still respects the cap.
+            for leg in receipt["legs"]:
+                self.write_existing(leg, all_legs=receipt["legs"])
+            second_input = second_path.read_bytes()
+            process.reset_mock()
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = BATCH.main(self.argv() + ["--prompt-text", prompt])
+            self.assertEqual(result, 78, output.getvalue())
+            self.assertEqual(json.loads(output.getvalue())["reason"], "prior-attempt-still-live")
+            process.assert_not_called()
+            # Fixture settlement replaces only its own open rows.
+            self.jobs.write_text(self.jobs.read_text().replace("\topen\t", "\tdone\t")
+                .replace("launch_started=1", "launch_started=1,note=completed-review-blocking"))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = BATCH.main(self.argv() + ["--prompt-text", "round three"])
+            self.assertEqual(result, 65, output.getvalue())
+            self.assertEqual(json.loads(output.getvalue())["reason"], "review-round-budget-exhausted")
+            process.assert_not_called()
+            self.assertTrue(self.jobs.read_bytes().startswith(original_rows))
+            self.assertEqual(source_path.read_bytes(), original_input)
+            self.assertEqual(second_path.read_bytes(), second_input)
+
+    def _configure_lab_review(self):
+        import route_identity
+        self.route["effective_intensity"] = "strong"
+        for index, node in enumerate(self.route["nodes"]):
+            node.update(id=("independent-verify" if index == 0 else "independent-verify-alternative"),
+                        kind="review-worker", unit="qa/test", parallel_anchor="independent-verify")
+            self.assertTrue(BATCH.DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(node))
+        self.route["route_hash"] = route_identity.route_hash(self.route)
+
+    def test_successful_capped_review_group_replay_reuses_its_attempts(self):
+        self._configure_lab_review()
+        with mock.patch.object(BATCH, "completion_marker_is_current", return_value=True), \
+             mock.patch.object(BATCH, "completion_attempt_readiness", return_value=SimpleNamespace(state="ready")):
+            self._assert_duplicate_batch_state(completed=True)
+
+    def test_same_owner_opens_next_review_round_with_changed_prompt(self):
+        self._same_owner_next_review_round("closure check after fixes", "codex")
+
+    def test_same_owner_opens_next_review_round_with_original_prompt(self):
+        self._same_owner_next_review_round(BATCH.DEFAULT_PROMPT, "claude")
+
+    def test_same_owner_next_review_round_works_for_opencode_parent(self):
+        self._same_owner_next_review_round("closure check after fixes", "opencode")
 
     def test_group_requires_two_to_four_depth_two_nodes_with_same_dependencies(self):
         self.assertEqual(
@@ -2460,6 +2653,19 @@ class DispatchBatchTest(unittest.TestCase):
                 self.assertEqual(result[field], "unknown")
                 self.assertEqual(result["reason"], "invalid-wrapper-receipt")
 
+    def test_reservation_mismatch_detail_survives_receipt_and_ledger(self):
+        detail = "batch_assignment_sha256:expected=original:actual=retry"
+        result = BATCH.wrapper_result(
+            {"node": "research-alternative", "adapter": "codex", "attempt_id": "att-gap"},
+            SimpleNamespace(returncode=75),
+            "check=failed\nreason=parallel-group-reservation-mismatch\n"
+            f"detail={detail}\nregistered=0\nstarted=0\nchild_spawned=0\n", "",
+        )
+        self.assertEqual(result["detail"], detail)
+        with mock.patch.object(BATCH, "record_degradation") as record:
+            BATCH._record_failed_legs(self.route, [result], self.base)
+        self.assertEqual(record.call_args.kwargs["detail"], detail)
+
     def test_duplicate_batch_state_does_not_claim_concurrent_launch(self):
         self._assert_duplicate_batch_state()
 
@@ -3806,22 +4012,12 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
                 BATCH.main(argv)
 
     def test_leg_launch_prompt_carries_the_same_round_protocol_block_as_dispatch_node(self):
-        """SD-153 rule 5 correction, 🟡 item: a dispatch-batch-launched capped
-        leg was proven only by reading source (dispatch-node.py appends
-        `round_protocol_block` to whatever raw `--prompt-text` it receives,
-        and dispatch-batch passes that text through unmodified -- P3's own
-        judgment call that a dedicated test was "disproportionate"). This
-        drives dispatch-batch's real `main()` through a real round-capped
-        `impl-review` group leg with one real verdict-less prior round (so
-        the block's "판정 없음(<note>)" text is non-trivial), intercepts the
-        leg's own process spawn with a fake `Popen`, and inside that fake
-        runs `dispatch-node.py`'s real `main()` in-process -- faking only
-        ITS two subprocess calls (the route `verify` gate and the final
-        adapter-wrapper invocation, neither of which this test is about) --
-        to capture the actual final `--prompt-text` argument dispatch-node.py
-        hands the adapter. Asserts it against `DISPATCH_NODE.round_protocol_
-        block(...)`, the same production function, executed for real by
-        production code, not re-derived by this test."""
+        """Real round admission keeps guidance separate from the sealed task.
+
+        Run dispatch-batch and dispatch-node, substituting their launch calls.
+        The wrapper receives the original raw task and the exact round protocol
+        as recovery context, so its assignment digest stays reserved.
+        """
         route = self._route("standard")
         for node in route["nodes"]:
             # `kind="pipeline-stage"` (not "review-worker") deliberately: the
@@ -3865,6 +4061,7 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
             "--jobs", str(self.jobs),
         ]
         captured = {}
+        recovery_context = {}
 
         class FakeProcess:
             def __init__(self, command, **kwargs):
@@ -3877,6 +4074,7 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
                     if "--worktree" in inner_argv:
                         node_id = inner_argv[inner_argv.index("--route-node") + 1]
                         captured[node_id] = list(inner_argv)
+                        recovery_context[node_id] = kw["env"].get("AGENT_DISPATCH_RETRY_BRIEF", "")
                     return subprocess.CompletedProcess(inner_argv, 0, stdout="", stderr="")
 
                 with mock.patch.dict(os.environ, leg_env, clear=True), \
@@ -3950,7 +4148,8 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
         )
         self.assertNotEqual(expected_block, "")
         self.assertIn("판정 없음", expected_block)
-        self.assertEqual(actual_prompt, BATCH.DEFAULT_PROMPT + expected_block)
+        self.assertEqual(actual_prompt, BATCH.DEFAULT_PROMPT)
+        self.assertEqual(recovery_context["impl-review"], expected_block)
 
 
 
@@ -4122,6 +4321,30 @@ class SlicesOneCommandTest(unittest.TestCase):
         self.assertIn("capability-route.py complete --route", receipt["next_command"])
         self.assertIn(f"--subsession-manifest {manifest_path}", receipt["next_command"])
         self.assertIn("--node execute", receipt["next_command"])
+
+    def test_next_literal_paths_reach_batch_admission_and_true_globs_do_not(self):
+        names = ["app/trips/[id]/page.tsx", "app/[...slug]/page.tsx", "app/(group)/page.tsx"]
+        for name in names:
+            path = self.primary / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("page\n")
+        slices = [{"id": "a", "files": names[:2], "verify": "true"},
+                  {"id": "b", "files": names[2:], "verify": "true"}]
+        admitted = SimpleNamespace(reservation_identity="r" * 8, sessions=[{}, {}])
+        rc, out = self.run_slices(self.plan(json.dumps(slices)), action="start",
+                                 admit=lambda **kw: admitted,
+                                 start=lambda *a, **kw: [{"started": 1}, {"started": 1}])
+        self.assertEqual(rc, 0, out)
+        receipt = json.loads(out)
+        self.assertEqual(receipt["state"], "subdivision-batch-started")
+        from stage_session_contract import load_manifest
+        manifest = load_manifest(receipt["chain_manifest"], route=self.route, node=self.route["nodes"][0])
+        self.assertEqual(manifest["sessions"][0]["fixed_files"],
+                         sorted(str(self.primary / name) for name in names[:2]))
+        slices[0]["files"] = ["app/*/page.tsx"]
+        rc, out = self.run_slices(self.plan(json.dumps(slices)))
+        self.assert_single_session(rc, out, "subdivision-disjointness-unproven", ledger=True)
+        self.assertIn("fixed-file-must-be-exact", json.loads(out)["detail"])
 
 class PlainSlotReservationTest(unittest.TestCase):
     """F12: a subdivision reserves N plain slots from the real governor, all or none."""

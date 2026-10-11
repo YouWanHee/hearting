@@ -127,6 +127,130 @@ installed copy, and running session distinct. Measure needless model turns,
 restarts, manual intervention, and boundary wait time, but do not present a
 smaller document or fewer lines of code as token or cost savings.
 
+## 7. Recovery follows lineage, not replay
+
+Between an original attempt and its recovery, work changes hands in ordinary
+ways: a supervisor seat is handed over, an owner is replaced, the parent moves a
+harness or model pin, a predecessor fails or is paused by a guard, or only an
+observation step fails. A retry, replacement, continuation, or resume accepts
+these changes through one shared lineage rule. It does not rebuild the original
+record from current values and refuse at the first difference.
+
+The shared recovery judgment reads stored inputs before reconstructing missing
+legacy inputs from their original sealed route and exact original rows. Current
+selection and authority are checked afresh at registration and launch. Work,
+review subject, fixed inputs, session scope and granted addresses remain bound;
+parent, owner and runtime selection follow their recorded lineage. A claim alone
+does not adopt a continuation. Process quiescence and terminal result availability
+are separate observations consumed by resume, reconciliation and settlement alike.
+
+Exact comparison protects sealed evidence from tampering; it is not a reason to
+refuse the normal ways work moves. When a recovery path still refuses, the
+refusal names what differs and the supported next step. A state with no
+supported way forward is a defect in the path, not a task for the operator.
+
+## 8. Let real work reshape capabilities and routes
+
+Capabilities, shapes, and routes are revised from the record of real work, not
+defended as fixed contracts. Periodically read what users and agents actually
+ran, where they worked around a capability, where work stalled, and where a
+person had to step in. Widen a capability that work keeps stretching, merge or
+drop one that is rarely used or keeps blocking, and loosen a route rule that
+refuses approved work. Changing the registry or route rules must not strand
+routes that are already running.
+
+## 9. Move hard parity outside the adapters
+
+When a behavior has to be built separately inside each runtime and keeps
+diverging — waking a parent, watching a session, session identity, pane
+placement, remote compute access — build it once in a runtime-neutral layer
+outside the adapters and let all three harnesses use it, as herdr with
+`peer-steward` does for sessions, `compute-hosts` for remote GPUs, and Fleet for
+observation. Adapters then only translate. Prefer one outer mechanism that every
+harness shares over three inner realizations kept in step by hand. Shared
+meaning stays in the core (§3); a shared mechanism may live outside it.
+
+## 10. The operator sees delegated work at a glance
+
+Fleet is how a person sees the work they delegated, and for dispatched sessions
+it is often the only way. It opens quickly (first observed state in about five seconds,
+measured from launch; a loading frame does not count)
+and shows, for every live session and dispatched owner, what is happening now:
+the model turn, the running command, or the resource the owner is waiting on
+with its host, GPU, and progress. An empty NOW while work is running is a
+defect. A slower or emptier view is a regression even when every check passes.
+Publish observed session identity, execution/wait reasons and resources first;
+campaign titles, route details and installation/git metadata fill asynchronously.
+Unknown observations stay unknown, and slow details must not stop basic refresh.
+Project activity includes running resources nested under an idle owner. A file
+update is labelled as a file update, never as completion. Recent results show
+the recorded task, result and event time; an unproven gate is not a failed task.
+Work names share one display rule across recent results, resource rows and GPU
+links: prefer the existing cycle easy title or one-line summary, then its
+recorded title and campaign title. Without a usable title, show a short readable
+name with locator dates and execution suffixes removed. Read titles in the
+existing detail pass; never wait for them before publishing basic observations.
+The name does not repeat the same command or execution identity on its line.
+Keep technical terms, capability/stage identifiers and short keyboard actions
+in their original notation. Fleet's own labels and legends use short English
+or symbols; session titles, summaries and memory content remain as written.
+Relative observation times use `1m ago`, `2h ago` or `3d ago` at the end of
+the text, with their suffix reserved when clipping. Execution durations retain
+their existing format. Previous subjects use dim color without a label prefix;
+project results use a result glyph, title and age. Repeated nonblocking resource
+diagnostics share one counted row per kind/reason, while blocking observations
+remain individually visible. These display changes add no rows, flags or
+settings and preserve gauges, percentages and column anchors at narrow widths.
+Do not put a translation beside the same original term.
+Current execution or wait observations precede generated text. Session symbols
+already show state; NOW does not repeat a state word, and the context gauge and
+current subject need no labels. Mark a subject as previous only when its known
+successful generation predates a new work boundary or exceeds the existing
+24-hour title window; idle state or an unknown timestamp cannot prove this.
+Summaries remain previous text with their own age, including sentences that
+say work is running or complete. The symbol legend keeps its explanations.
+An incomplete observation cannot establish absence: publish the last observed
+work together with the failed source, its last success and the reason it is
+unconfirmed. Basic and detail refresh share this health vocabulary. Publish
+route evidence and its projection in the same snapshot; rendering consumes
+that snapshot without rereading collector globals or redoing the judgment.
+Pane display updates belong to the existing detail pass; assigning a live
+session's number must not wait for pane metadata writes before basic publication.
+Delayed display writes check the pane's current exact session identity and
+assigned number; a changed or unconfirmed target receives no old metadata.
+Diagnostics retain the reader's kind, source and blocking evidence. A missing
+historical resource reference is not a broken dispatch log or a current execution
+failure. Memory rows describe a stored change with its content and observed origin;
+storage classifications never impersonate a current user decision.
+A process name proves a runtime, not a conversation: one shared process-role
+observation distinguishes terminal sessions, registered workers and unbound services.
+Services produce no session row. Current session identity joins live PID/start,
+the pane selection and recorded conversation continuity once; title, state and
+context consume that same result. Conflicting identities and absent work bindings
+stay unknown rather than borrowing a neighboring transcript or artifact directory.
+An exact live PID/start native current-session record takes precedence over
+historical statusline taps and delayed pane session labels after an in-process
+resume or clear. A proven different current session blocks an automated continue
+even when a delayed pane label still matches the booked session.
+Historical continuity cannot override an explicit native
+selection back to an earlier conversation. Without such a current record,
+recorded directed continuity resolves claims; unrelated claims remain unknown.
+File recency and launch arguments never prove a current selection. Project grouping uses the
+identified session's own current directory (native registry, transcript/rollout,
+or session database), with process cwd only as the fallback. Pane/process
+attribution observes the process directory before applying that display value.
+Routine ledger folding preserves the recorded native transition direction.
+The normal view retains observed run/configuration names and explains session,
+device and stage symbols separately. Names, current actions and controls share
+the terminal's width budget; internal identifiers belong in detail. Support
+work carries its caller's observed session/seat independently of execution and
+delivery authority, and is labelled project support when that link is unproven.
+Legends explain statuses and roles in short English, including project
+activity and expanded GPU commands; a copied dot or arrow must retain its meaning.
+GPU owner labels add who is responsible, such as a verified Fleet session tag;
+they do not repeat the execution's run/job identifier beside its training name.
+Raw owner identifiers remain available in structured output.
+
 ## Basis and current scope
 
 These principles condense the completion standard the user repeatedly corrected
@@ -135,3 +259,10 @@ operating procedure leaking to the model, and the dispatch responsibility repair
 record keeps both the real completions and the failures. Adopting this document
 does not mean unrepaired paths are complete. Each change must prove itself
 against the standards above.
+
+
+Sections 7–10 restate a memo the user wrote in Hearting's v1 era, made standing
+direction on 2026-10-09. On that day seven defects of the §7 kind (PR #427–#432
+and related) were each fixed by a case-specific allowance, one Fleet render took
+46 seconds, and three dispatched owners waiting on resources showed an empty NOW.
+The Korean original and the memo text are kept with the internal documents.

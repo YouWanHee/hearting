@@ -487,9 +487,13 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             self.assertEqual("deny", config["permission"]["edit"][f"{relative}/**"])
         self.assertEqual("ask", config["permission"]["edit"]["*"])
         self.assertEqual("deny", config["permission"]["edit"]["/keep/**"])
-        for directory in (alias, install, install / "core", install / "roles", install / "skills"):
+        for directory in (alias, install, install / "skills"):
             self.assertNotIn(str(directory), rules)
             self.assertNotIn(f"{directory}/**", rules)
+        for name in ("core", "utilities", "roles", "hooks", "tools"):
+            for directory in (alias / name, install / name):
+                self.assertEqual("allow", rules[str(directory)])
+                self.assertEqual("deny", config["permission"]["edit"][str(directory)])
         # A string/global deny remains the default for every other edit.
         with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": '{"permission":"deny"}'}):
             denied = json.loads(self.opencode.scoped_external_directory_config(
@@ -706,6 +710,65 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
         self.assertEqual("allow", with_read["agent"]["build"]["permission"]["external_directory"][str(readonly)])
         self.assertEqual("deny", with_read["agent"]["build"]["permission"]["edit"][str(readonly)])
         self.assertEqual("deny", with_read["permission"]["external_directory"]["*"])
+
+    def test_claude_installed_source_contracts_read_in_both_launch_paths(self) -> None:
+        install = self.root / "source-install"
+        for name in ("core", "utilities"):
+            (install / name).mkdir(parents=True)
+        alias = self.root / "source-home"
+        alias.symlink_to(install, target_is_directory=True)
+        for delivery in ("one-shot", "session-resume-supervised"):
+            args = self.claude_args(delivery)
+            args.agent_home = alias
+            command = self.claude.shell_command(args, self.root / "prompt.txt", self.root / "log.jsonl")
+            for name in ("core", "utilities"):
+                for root in (alias / name, install / name):
+                    self.assertIn(str(root), command)
+                    self.assertIn(f"Edit(//{str(root).lstrip('/')}/**)", command)
+            self.assertNotIn(str(install / ".dispatch"), command)
+
+    def test_source_projection_keeps_install_alias_but_rejects_child_escapes(self) -> None:
+        install = self.root / "source-install"
+        (install / "core").mkdir(parents=True)
+        (install / ".dispatch").mkdir()
+        credentials = self.home / ".ssh"
+        credentials.mkdir()
+        (install / "utilities").symlink_to(credentials, target_is_directory=True)
+        (install / "roles").symlink_to(install / ".dispatch", target_is_directory=True)
+        alias = self.root / "source-home"
+        alias.symlink_to(install, target_is_directory=True)
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "{}"}):
+            config = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), agent_home=alias, worktree=str(self.worktree), selected_agent="build"))
+        for permission in (config["permission"], config["agent"]["build"]["permission"]):
+            external = permission["external_directory"]
+            self.assertEqual("allow", external[str(alias / "core")])
+            self.assertEqual("allow", external[str(install / "core")])
+            for root in (alias / "utilities", install / "utilities", credentials,
+                         alias / "roles", install / "roles", install / ".dispatch"):
+                self.assertNotIn(str(root), external)
+        args = self.claude_args("one-shot")
+        args.agent_home = alias
+        command = self.claude.shell_command(args, self.root / "prompt.txt", self.root / "log.jsonl")
+        self.assertIn(str(alias / "core"), command)
+        self.assertNotIn(str(alias / "utilities"), command)
+        self.assertNotIn(str(credentials), command)
+        self.assertNotIn(str(install / ".dispatch"), command)
+
+    def test_source_projection_preserves_an_existing_writable_worktree(self) -> None:
+        for name in ("core", "utilities"):
+            (self.worktree / name).mkdir()
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "{}"}):
+            config = json.loads(self.opencode.scoped_external_directory_config(
+                str(self.artifact), agent_home=self.worktree, worktree=str(self.worktree), selected_agent="build"))
+        self.assertNotIn("edit", config["permission"])
+        self.assertNotIn("edit", config["agent"]["build"]["permission"])
+        args = self.claude_args("one-shot")
+        args.agent_home = self.worktree
+        args.execution_access_grant = None
+        command = self.claude.shell_command(args, self.root / "prompt.txt", self.root / "log.jsonl")
+        for name in ("core", "utilities"):
+            self.assertNotIn(f"Edit(//{str(self.worktree / name).lstrip('/')}/**)", command)
 
     def test_receipt_matches_projection_and_is_absent_without_request(self) -> None:
         self.assertEqual("", receipt_fragment(None))

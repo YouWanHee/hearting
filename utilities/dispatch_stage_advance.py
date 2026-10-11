@@ -723,6 +723,9 @@ def coordinate_stage_advance(
         return _refused(exc.reason)
 
     route_id = route.get("route_id")
+    import route_parent_close
+    if route_parent_close.intent(route, request.jobs):
+        return _refused("cancelled-by-parent")
     completed = completed_nodes(request.jobs, route_id)
     generation = advance_generation(route)
     started = started_nodes(request.jobs, route_id, route.get("route_hash"))

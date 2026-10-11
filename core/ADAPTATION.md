@@ -170,6 +170,12 @@ native route and bound to the same TUI process lifecycle; it is never estimated
 from a callback session id, an SDK-first root, timing, pane labels, or daemon
 environment.
 
+Pane identity follows native session-start/resume events: publishers carry the
+actual start source with the current ID. Fleet joins predecessor/current IDs from
+that pane's existing same-harness, same-repository seat history for display only;
+another live session keeps its own ID. These aliases grant no report, wake or write
+authority and add no state ledger, user confirmation or caller flag.
+
 OpenCode identity and completion helpers resolve a live harness root at invocation
 time if their import-time release has been removed, using the existing core root
 order. They preserve the exact session and inherited dispatch registry across that
@@ -186,6 +192,12 @@ path permissions may expose that directory and its canonical target for reads;
 they must not expose the whole agent home or grant contract edits. Existing
 worker write guards remain in force. A spec-read marker records an observed
 read and does not deliver file contents or prove that a contract was read.
+
+Worker runtime defaults must not index the full working directory before the
+first turn. OpenCode worker homes disable native snapshots in both their private
+config and the invocation's inline config (which overrides project config).
+Git and the existing Hearting artifact/checkpoint records retain work evidence;
+the worker has no OpenCode UI undo snapshot. Interactive user config is preserved.
 
 A portable capability describes:
 
@@ -335,6 +347,17 @@ prompt carries the carrier taxonomy (dispatch-complexity diagnosis
 
 ### 7.1. Registered owner supervision (SD-14/78/92/113)
 
+Parent close uses the same shared cancellation controller for Claude, Codex
+and OpenCode, whether the owner is in a model turn or parked on children.
+Native turn/session interruption alone is not route closure: exact OS process
+identity and owned-child cleanup are the checked common fallback. Supervisors,
+completion joins and post-exit observers read the existing cancellation intent
+before delivering gates, reconciling results or starting another turn/stage.
+The caller's existing `close` performs termination and closure; resources stay
+live unless its optional `--stop-resources` selects the exactly linked runs.
+An interrupted close is continued by the existing execution observers. No
+adapter adds a cancellation command, reason requirement or approval step.
+
 Owner corrections are accepted independently of delivery. Codex active-turn
 steering is only accepted after a matching turn response; Claude and OpenCode
 next-turn transports deliver on a later owner turn. A parked owner receives a
@@ -347,7 +370,7 @@ that it does not wake or cancel the owner; acceptance is not proof of delivery
 or application.
 
 - **Runtime-owned completion delivery under SD-14/78:** a registered `standard+` headless owner is launched under an adapter supervisor, not as an unresumable one-shot model turn. The model registers every separable child in the current batch and yields `runtime_wait: registered-children`; the supervisor snapshots only current v2 rows sealed to `parent_attempt_id=$AGENT_DISPATCH_ATTEMPT_ID`, joins every parallel attempt through canonical liveness outside the model/tool loop, and sends the same session exactly one bounded typed receipt when the whole batch is semantically terminal **and execution-quiescent**, or requires typed attention. Child output, transcript text, artifact bodies, source, git state, and liveness prose never enter that receipt. Codex realizes the bridge with one ephemeral App Server thread and repeated `turn/start` after `turn/completed`; a registered Claude owner realizes its internal batch bridge with one `--session-id` followed by `--resume`. An interactive Claude parent uses a separate `PostToolUse(Bash)` `asyncRewake` bridge: only an owner attempt whose lock-written row in the session's trusted registry (inherited `AGENT_DISPATCH_JOBS`, else the installed canonical registry) carries the same session, `worker_type=owner`, dispatch depth 1, `parent_completion_delivery=claude-parent-runtime`, and claimed/started evidence may arm it — a start receipt on stdout names the candidate, the row proves it, and a receipt naming any other file binds nothing. Each Bash call may take one unclaimed row started inside a bounded recent window through the arm ledger (one waiter per attempt; a wave of starts arms one per call, oldest first) or re-take a claim of its own that lapsed, whatever the row's age, and a row nobody can prove arms nothing, because absence beats misattribution. It watches that one owner attempt to terminal quiescence outside the model, and exits once with a bounded exact-attempt receipt. It never launches a visible background `dispatch-wait`, Monitor, progress recap, or periodic re-arm; explicit `poll-fallback` remains the only model-owned wait. Intermediate turn/result events are withheld from the terminal handoff, and only the final exact three-line envelope is exposed as terminal. Before every model turn the supervisor atomically publishes an attempt-scoped schema-v2 phase state: `parked`, `deliverable`, `running-turn`, `recovery`, or `terminal`. While an undelivered child is open or terminal-but-draining, the native pre-tool policy admits only one exact same-parent `dispatch-batch --action start` for a declared parallel group (or a non-group exact `dispatch-node --action start`), so a first child cannot prevent its checked siblings from registering. Once any delivered child remains open or draining, the policy admits only exact typed harvest for that delivered batch. Both phases reject model waits, raw inspection, liveness, unrelated tools, and shell composition; missing/invalid phase state is recovery-only exact harvest. Codex enforces this through its projected hook and Claude through a command-scoped `--settings` PreToolUse bridge without mutating user-owned runtime settings. Multiple sequential route batches repeat this one-resume transaction. A bounded join timeout is an internal repark checkpoint: it emits no model receipt, does not update the delivered set or consume continuation budget, and makes the same supervisor rejoin the same sealed child set. A second, distinct internal repark checkpoint (SD-119) advances a serial sub-session chain registered under `utilities/stage-session-chain.py`: once the joined child is a chain participant and terminal, the supervisor claims and starts the chain's next index itself, folds the closed predecessor into the delivered set so it is never re-surfaced, and rejoins — again with no model turn and no continuation spend — until the chain either completes (falls through to the ordinary route-level flow) or the joined child carries no chain metadata at all. Only terminal-and-quiescent or a typed attention condition is actionable. An exception with owned open children preserves state and lease in `recovery`; only terminal-and-quiescent completion removes them. A dispatch-depth-0 interactive Codex parent has a separate native realization: a direct registered dispatch-depth-1 attempt bound to the actual `CODEX_THREAD_ID` seals `parent_completion_delivery=codex-stop-hook`; `launch_claimed=0` registration alone never parks the parent, and a start requires the **current exact Stop and PreToolUse hook definitions** to be trusted before it may claim or spawn the process. Immediately after successful spawn, the wrapper atomically binds the exact attempt into hashed-session pending state, then the parent ends its model turn. Stop follows that immutable set even if an orphan watcher has already changed a child row to `done`, joins it outside the model, publishes the delivered phase, and returns one bounded `decision=block` continuation only when exact harvest is ready. While undelivered, PreToolUse admits no model tool—including `dispatch-wait`; after delivery it admits only exact-attempt harvest with `--status all`, so an `open`→`done` watcher transition cannot invalidate the continuation. A valid harvest consumes its exact receipt, and the final receipt removes the session state. A bounded Stop timeout yields one minimal end-turn/re-enter instruction rather than a polling tool loop. Foreign, legacy, registered-only, untrusted, or unstamped rows never enter this path and retain the explicitly reported polling/recovery contract; the recent-window bound governs a *new* claim, while a claim this session already holds re-arms whatever the row's age or terminal state, until the wake it owes is delivered. Runtime support is probed before launch: forced supervised mode fails closed, interactive native Stop delivery fails before spawn when current-hash trust cannot be proved, while other unavailable same-session bridges may use the explicitly reported `poll-fallback` (`dispatch-wait --attempt-id <id> --max 300..600`). After a supervisor has started, protocol/session failure never replays the assignment through a one-shot fallback. Arbitrary detached shell output still does not auto-resume; only the checked completion-delivery surfaces above do. Parent ownership remains exact, foreign or stale rows never wake the owner, and post-exit orphan reconcile remains mandatory and independent. Execution supervision is separate from route binding: a registered quick/solo depth-1 owner also runs under its harness supervisor when the host probe reports support (OpenCode, which has no probe, always does), carries its sealed `route_*` tuple without a standard `owner_route_*` binding, and so accepts `capability-route.py correct` from registration on; an unsupported host keeps the one-shot launch with no input state.
-- **Serial-chain realization (SD-119):** Claude and Codex owner supervisors use the shared reconcile-before-advance driver, reset repark bounds per successor, and deliver one aggregate wake; the sealed proof binds the canonical pointer/original digest and exact bidirectional parent rows. OpenCode owner supervision is unsupported and fails closed; its checked registered-headless or inline fallback must not claim parity. Completed sub-sessions are delivery-success rows, while refused chains close only proven never-started successors and report the bounded refusal notice. An owner turn that ends with its final handoff closes the successors it registered and never started the same way (`dispatch_completion_join.cancel_unstarted_chain_successors`), so a chain a correction stopped ends with the owner's result rather than a demand to start them; a post-exit cascade records a never-started child as `launch_outcome=never-launched`, so its cleanup settles.
+- **Serial-chain realization (SD-119):** Claude, Codex, and OpenCode owner supervisors use the shared reconcile-before-advance driver, reset repark bounds per successor, and deliver one aggregate completion through their existing runtime path. OpenCode's headless wrapper invokes the common supervisor with `--runtime-harness opencode`; this establishes common serial-chain semantics, not measured native receipt parity. The sealed proof binds the canonical pointer/original digest and exact bidirectional parent rows. Completed sub-sessions are delivery-success rows, while refused chains close only proven never-started successors and report the bounded refusal notice. An owner turn that ends with its final handoff closes the successors it registered and never started the same way (`dispatch_completion_join.cancel_unstarted_chain_successors`), so a chain a correction stopped ends with the owner's result rather than a demand to start them; a post-exit cascade records a never-started child as `launch_outcome=never-launched`, so its cleanup settles.
 
 - **Launch-publication settle under SD-14/78:** an owner turn may end in the narrow interval after atomic child registration but before every fenced wrapper has appended `launch_started=1`. Every owner supervisor (Codex App Server, and the Claude session supervisor that also runs OpenCode owners) therefore performs one short, bounded reread of only undelivered exact-parent rows before issuing `registration-required`, whether or not the turn ended with `runtime_wait: registered-children`; the sentinel matters only when no child is registered yet. A batch that reaches the existing durable `launch_started=1` fence during that settle window parks and joins normally without consuming a continuation or replaying the dispatch; a row that remains registered-only still receives the existing bounded correction. The settle loop (`dispatch_completion_join.settle_runtime_wait_children`) holds no registry lock, accepts no artifact, transcript, PID guess, or stale delivered row as launch proof, and never starts or retries a child itself.
 
@@ -478,6 +501,18 @@ stamp path in `core/HOOKS.md`.
   owner or different live gate, records an audited `expired` state atomically,
   and never writes a release, deletes the route/registry/marker/record, or turns
   the source attempt into PASS.
+- **Supervision wake handoff.** A supervision warning does not wait for a
+  human gate release. After emitting its in-wait wake, the Claude carrier
+  returns only its own supervision-notice claims to the existing queue. The
+  synchronous prompt sweep on the awakened turn can consume or retire them
+  immediately, allowing that turn's next Bash call to re-arm the same attempt
+  for completion. At the end of a turn, the same async carrier also runs on
+  Claude `Stop` and may re-take only an existing arm bound to that session;
+  it never first-arms a fresh row there. Thus an attention turn with no Bash
+  call still resumes the exact completion wait, while a live holder or an
+  ended arm stays quiet. The async emit is not an acknowledgement; a lost wake stays
+  recoverable. Human-gate notices retain their existing speculative lease and
+  release semantics, and another carrier's successor claim is preserved.
 - The interactive Claude `asyncRewake` bridge never reads the Bash command
   text (2026-09-09; six consecutive reviews had each found a new hole in the
   shell parsing that decided which owner a command had started). It
@@ -539,24 +574,37 @@ stamp path in `core/HOOKS.md`.
 
 ### 7.3. Detached steward watch carrier (SD-122)
 
-**Detached watch realization.** `peer-steward.py watch <target>` takes a blocking exclusive lock on the dedupe
-claim, checks the target once with `herdr agent get`, takes the watch lock, spawns one
-`setsid` watcher holding that same lock, writes an immutable arm record carrying the
-watcher's `{pid, pid_start}`, records `kind=watch … receipt=<watch_id>`, and returns a
-typed `state=armed` line without waiting. Every steward line reporting an armed watch
-carries the same `parent_next` directive a launch receipt does, and claims `end-turn` only
-when the hook arms from *that* line and the watch's wake is the hook; every other line —
-`wake=none`, a dedupe hit, a session-printed `rearm` — prints `bounded-wait` with a bounded
-`join <watch_id>`. The watcher calls `herdr agent wait` exactly
-once, writes `peer_watch_receipt_v1` atomically, records `kind=notice status=received`,
-and releases the lock only by exiting — the receipt rename strictly precedes exit. `join`
-waits on that lock (a kernel wait, never a poll), so it returns on the watcher's exit
-event; it reports `watcher-dead` only when there is no receipt **and** the arm record's
-PID identity fails, because lock acquisition alone would misread spawn latency as death.
-`status` reports `armed|alive|receipt|acked`, where `alive` needs pid, `/proc` start ticks,
-and lock possession together. `rearm` replaces only a dead un-receipted watch, always under
-a new `watch_id` so receipt and ack paths never overlap. The receipt carries no screen or
-message text: per S4 the steward reads `herdr agent read` and disk itself (idle ≠ done).
+**Detached watch realization.** `peer-steward.py watch <target>` persists one logical
+obligation with exact herdr server, pane, harness, session and until-set identity before
+starting its observer. Each herdr wait has a finite budget; timeout and unavailable
+are checkpoints, not fulfillment. The existing observer continues after those checkpoints
+with capped backoff until the exact condition is met or the process stops. Existing command,
+session-start and reconnect paths claim the same duty and replace only observer identity,
+so tab moves do not require manual rearm and same-name pane/session reuse cannot inherit
+the old duty. A tab is a current location hint. The duty remains pending until its exact
+observable condition is satisfied, explicitly canceled, or safely handed through its
+recorded identity lineage. `join`, `status`, and Fleet report the duty separately from an
+observer receipt. Wake remains adapter-specific and any unmeasured native receipt remains
+unmeasured; no always-on daemon or model polling loop is introduced. Watch observations
+continue to use bounded herdr calls. Idle/done receipts require the shared
+completion-readiness policy: exact registered-parent session or confirmed handover
+bindings take precedence over native idle, without requiring a parent-pane field.
+Peer input uses the same policy with an input purpose: a parent's idle native
+turn can receive messages while its registered children continue. Only work
+executed by that pane withholds input; exact foreground attempt tags distinguish
+execution from parent or handover bindings. Completion watches and retire keep
+all bindings. After installation, the existing reconnect callback resumes accepted
+message duties with the activated code and keeps retrying after a form or draft clears,
+even while a legacy runner holds its lock. One current runner uses a stable lock;
+the sealed transfer claim and receipt still prevent duplicate submission. Retire
+processing also holds the legacy runner lock, so the two generations cannot perform
+session cleanup together. No runner is interrupted to reconnect message delivery.
+Non-completion conditions such as working retain their native watch meaning.
+Duplicate watch requests resolve the current server/pane/harness/session before
+reusing a duty; a new session gets a separate duty while the old one is preserved.
+Message observation and transport keep the accepted server selected throughout.
+Retire observations update only their current phase under the existing duty lock;
+stale observations cannot undo an exit claim or reopen a completed/cancelled duty.
 
 On Claude, `PostToolUse(Bash)` `asyncRewake` hook `peer-steward-rewake.py` arms only from a
 same-session armed line with `wake=hook` whose receipt sits under the canonical state root,
@@ -568,6 +616,15 @@ restarted session loses nothing. Wake is at-least-once and display is idempotent
 file is created `O_EXCL` by whichever carrier gets there first.
 
 ### 7.4. Carrier taxonomy and selection
+
+Startup/resume context is not a processing turn. `dispatch_session_sweep.activate`
+reads notices without a claim or acknowledgement and reconnects the existing
+peer courier, using the adapter's declared carrier and exact receiving session.
+Claude SessionStart, Codex SessionStart and OpenCode session creation use that
+same rule. A real prompt or accepted native turn acknowledges the notice.
+The courier follows confirmed session handover, retains messages behind drafts
+or forms, and never relaunches a missing parent or types into a shell pane.
+Unreceived notices stay visible in Fleet until a recipient processes them.
 
 A registered headless owner yields after registering a batch; its runtime supervisor joins the exact `parent_attempt_id` batch outside the model and resumes the same owned session once with a bounded typed receipt. A registered Claude owner keeps one realtime stream-input process for the route and submits the next receipt immediately after each non-terminal join; when a freshly verified terminal marker closes every declared terminal gate, the supervisor skips the redundant final owner turn and closes the stream before terminal row reconciliation. An explicit custom-command fallback retains per-turn `--resume`. A Claude interactive parent may instead arm one native `asyncRewake` PostToolUse hook from a successful exact owner-start receipt, or from a successful exact steward watch armed in the same session (`utilities/peer-steward.py watch`, SD-122 §13.37.2-(10)); either way the hook owns exactly one arming event, verifies it against the session that produced it, and never widens to another attempt or watch. It re-reads the exact current row and sealed completion evidence before rendering: every terminal receipt — success or attention — exits two, because Claude Code wakes an idle session for an `asyncRewake` hook only on exit code 2 and delivers exit-0 output no earlier than the next user interaction (corrected 2026-08-29; success additionally carries its structured notification on stdout). A launcher-managed interactive Codex session places one owner-only gateway between remote TUI and App Server. The harness installer may make this checked entry transparent for interactive commands, but plugin or hook loading after process entry is not equivalent. That gateway atomically serializes manual input with an exact completion receipt, uses `turn/start` only while idle and `turn/steer` only for a steerable active turn, and durably suppresses duplicate sealed-batch delivery. The sidecar is prelaunched before the child spawn claim, connects only to the private control socket, never subscribes upstream, never sees or answers approvals, and submits no raw child output. A send followed by an unclassified disconnect is `sent-ambiguous` and is not retried. Outside those checked entries, hooks must not simulate wake by blocking Stop, parking every tool, or injecting a synthetic user turn; the parent remains conversational and uses a disclosed finite fallback. Legacy receipts may be consumed only by exact terminal typed harvest. Runtime-native subagents are a separate surface.
 

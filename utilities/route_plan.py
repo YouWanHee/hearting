@@ -289,7 +289,7 @@ def _text(value, *, name, required=False):
     return value.strip()
 
 
-_LEG_FIELDS = frozenset({"capability", "mode", "shape", "graph", "intensity", "why",
+_LEG_FIELDS = frozenset({"capability", "mode", "shape", "graph", "intensity", "cwd", "why",
                          "done_when", "verify", "hands_over", "parallel", "extra_stages"})
 MAX_DONE_WHEN = 5
 MAX_PLAN_NOTES = 8
@@ -386,6 +386,7 @@ def _normal_leg(raw, index, notes=None):
                 raise ProposalError(f"leg-invalid:{index}:frame-stage-not-allowed")
     return {"capability": capability, "mode": mode, "shape": shape, "graph": list(graph) if graph else None,
             "intensity": intensity, "why": _text(raw.get("why"), name=f"legs[{index}].why"),
+            **({"cwd": _text(raw["cwd"], name=f"legs[{index}].cwd", required=True)} if "cwd" in raw else {}),
             **_plan_fields(raw, index, notes)}
 
 
@@ -508,7 +509,16 @@ def parse_proposal_with_notes(text: str) -> tuple:
 def leg_arguments(leg) -> dict:
     """The compose-shaped keyword arguments of one normalized proposal leg."""
     return {"capability": leg["capability"], "capability_mode": leg.get("mode"), "shape": leg["shape"],
-            "graph": ",".join(leg["graph"]) if leg.get("graph") else None, "intensity": leg.get("intensity")}
+            "graph": ",".join(leg["graph"]) if leg.get("graph") else None, "intensity": leg.get("intensity"),
+            **({"cwd": leg["cwd"]} if leg.get("cwd") else {})}
+
+
+def leg_cwd(leg, default_cwd, *, base_cwd=None) -> str:
+    """A leg's chosen folder, relative to the original frame; otherwise inherit the current folder."""
+    if not leg.get("cwd"):
+        return str(default_cwd)
+    path = Path(leg["cwd"]).expanduser()
+    return str((path if path.is_absolute() else Path(base_cwd or default_cwd) / path).resolve())
 
 
 def validate_proposal(proposal, *, compile_leg, start_approvals) -> dict:
@@ -542,7 +552,8 @@ def validate_proposal(proposal, *, compile_leg, start_approvals) -> dict:
         facts.append({"capability": route["capability"], "mode": route["capability_mode"],
                       "shape": (route.get("selection") or {}).get("shape"),
                       "graph": list(composed.get("graph") or []) or None,
-                      "intensity": route["effective_intensity"]})
+                      "intensity": route["effective_intensity"],
+                      **({"cwd": route["cwd"]} if leg.get("cwd") else {})})
         approvals.extend({"leg": index, **row} for row in start_approvals(route))
     kept = []
     for row in proposal.get("entry_approvals", []):
@@ -612,7 +623,7 @@ def wording_differs(rows) -> bool:
             or [leg["why"] for leg in first["legs"]] != [leg["why"] for leg in second["legs"]])
 
 
-_LEG_KEYS = ("capability", "mode", "shape", "graph", "intensity")
+_LEG_KEYS = ("capability", "mode", "shape", "graph", "intensity", "cwd")
 
 
 def same_proposal(left, right, resolved=None) -> bool:
@@ -717,7 +728,7 @@ def pin_tokens(pins) -> list:
 
 
 def frame_selection_pins(decision, artifact_root) -> dict:
-    """The pins the decision's frame route was composed with, or `{}`.
+    """The pins in force on the decision's verified frame route, or `{}`.
 
     Read from that frame's own route file and trusted only when its id and hash are the ones the
     decision recorded and its bytes still hash to them; nothing is written or rewritten.
@@ -732,8 +743,8 @@ def frame_selection_pins(decision, artifact_root) -> dict:
         if ((frame.get("route_id"), frame.get("route_hash")) != (reference["route_id"], reference["route_hash"])
                 or route_identity.route_hash(frame) != reference["route_hash"]):
             return {}
-        pins = frame.get("selection_pins")
-        return {target: dict(pins[target]) for target in _PIN_TARGETS if isinstance(pins, dict) and target in pins}
+        from route_authority import selection_pin_rows
+        return selection_pin_rows(frame)
     except (OSError, ValueError, KeyError, TypeError):
         return {}
 
@@ -748,7 +759,7 @@ def compose_argv(leg, *, context, route_plan_arg, parent_cycle, slug, pins=None)
         argv += ["--graph", ",".join(leg["graph"])]
     if leg.get("intensity"):
         argv += ["--intensity", leg["intensity"]]
-    argv += ["--cwd", context["cwd"], "--artifact-root", context["artifact_root"],
+    argv += ["--cwd", leg_cwd(leg, context["cwd"]), "--artifact-root", context["artifact_root"],
              "--prompt-file", context["prompt_file"]]
     if context.get("spec_read") and context["spec_read"] != "auto":
         argv += ["--spec-read", context["spec_read"]]
@@ -781,10 +792,12 @@ def project_next_leg(route, completed_cycle_id):
         if not Path(context["prompt_file"]).is_file():
             return None
         leg = binding["legs"][index]
-        # The leg's own sealed pins; a leg sealed before pins reached legs takes its frame's.
-        pins = route.get("selection_pins") or frame_selection_pins(binding["record"]["decision"], root)
+        # The leg's pins in force; a leg sealed before pins reached legs takes its frame's.
+        from route_authority import selection_pin_rows
+        pins = selection_pin_rows(route) or frame_selection_pins(binding["record"]["decision"], root)
         argv = compose_argv(
-            leg, context={**context, "campaign_key": route.get("campaign_key") or context.get("campaign_key")},
+            {**leg, "cwd": leg_cwd(leg, route["cwd"], base_cwd=context["cwd"])},
+            context={**context, "campaign_key": route.get("campaign_key") or context.get("campaign_key")},
             route_plan_arg=f"{root / sealed['decision']}#{index}", parent_cycle=completed_cycle_id,
             slug=f"{context['slug']}-leg{index}", pins=pins)
         return {"index": index, "leg": leg, "compose_command": shlex.join(argv)}

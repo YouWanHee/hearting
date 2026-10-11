@@ -38,9 +38,20 @@ def main() -> int:
             if str(tools) not in sys.path:
                 sys.path.insert(0, str(tools))
             from fleet.herdr_projection import project
-            # `report-agent-session` stays herdr's own integration's job — reporting it
-            # from two sources would race two `seq` claims for one pane.
-            project("claude", session_id, report_session=False)
+            # Native herdr owns liveness; the common projector owns the current
+            # session ID and header, including a recorded native resume source.
+            project("claude", session_id)
+            if (payload.get("hook_event_name") in {"SessionStart", "UserPromptSubmit", "Stop"}
+                    and os.environ.get("AGENT_SESSION_ROLE", "").lower() != "worker"
+                    and os.environ.get("AGENT_DISPATCH_CHILD") != "1"
+                    and not os.environ.get("AGENT_DISPATCH_DEPTH")):
+                import subprocess
+                subprocess.Popen(
+                    [sys.executable, str(tools.parent / "utilities" / "peer-steward.py"),
+                     "__ensure-obligations"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    close_fds=True, start_new_session=True,
+                )
             if payload.get("hook_event_name") in {"Stop", "UserPromptSubmit"}:
                 # Reuse the existing idle/receive callback and shared draft guard.
                 import importlib.util

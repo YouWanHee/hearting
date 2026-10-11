@@ -1633,6 +1633,200 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             code = rewake.main()
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def test_lost_carrier_completion_reaches_existing_runner_without_user_prompt(self):
+        self._check_lost_carrier_completion()
+
+    def test_successor_carrier_crash_preserves_original_storage_recipient(self):
+        self._check_lost_carrier_completion(crash_sid="session-2", recipient_sid="session-2")
+
+    def test_original_retained_duty_follows_confirmed_handover(self):
+        self._check_lost_carrier_completion(recipient_sid="session-2")
+
+    def test_changed_pane_does_not_receive_or_complete_retained_duty(self):
+        self._check_lost_carrier_completion(changed_pane=True)
+
+    def test_a_live_native_holder_cannot_suppress_wake_after_its_parent_died(self):
+        self._check_lost_carrier_completion(live_holder=True)
+
+    def test_restored_parent_uses_existing_courier_without_user_prompt_all_harnesses(self):
+        self._check_restored_courier(immediate=True)
+
+    def test_queued_restored_wake_waits_for_exact_receipt_without_another_send(self):
+        self._check_restored_courier(immediate=False)
+
+    def test_a_notice_consumed_by_another_carrier_suppresses_its_deferred_peer_payload(self):
+        self._check_restored_courier(immediate=False, other_carrier=True)
+
+    def _check_restored_courier(self, *, immediate, other_carrier=False):
+        spec = importlib.util.spec_from_file_location("restored_steward_test", ROOT / "utilities/peer-steward.py")
+        steward = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(steward)
+        from dispatch_session_sweep import activate, sweep_deliver
+        self.enterContext(mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(self.root)}))
+        self.enterContext(mock.patch.object(steward.peer_obligations, "ensure_runner"))
+        for harness, carrier in (("claude", "claude-parent-runtime"),
+                                 ("codex", "codex-native-queue"), ("opencode", "opencode-turn")):
+            with self.subTest(harness=harness):
+                self._open_row()
+                self.jobs.write_text(self.jobs.read_text().replace("claude-parent-runtime", carrier))
+                path = self._close_and_materialize()
+                with mock.patch.object(rewake.peer_obligations, "ensure_runner"):
+                    activate(self.root, carrier, "session-1")
+                store = rewake.peer_obligations.ObligationStore(self.root)
+                duty = next(d for d in store.list() if d["intent"]["identity"]["harness"] == harness)
+                self.assertEqual(json.loads(path.read_text())["attempts"], 0)
+                agents = {"result": {"agents": []}}
+                real_prompt = steward.cmd_prompt
+                delivered = []
+                def prompt(args, **kwargs):
+                    # Run the real preparation and dispatch binding. Only the external
+                    # transport is substituted; no timer expiry is involved.
+                    def receive(text):
+                        record = json.loads(path.read_text())
+                        self.assertGreater(record["claim_deadline_ns"], time.monotonic_ns())
+                        self.assertEqual(sweep_deliver(self.root, carrier, "session-1")[0], [])
+                        self.assertEqual(steward.peer_message.receive_peer_message(text, {
+                            "harness": harness, "session_id": "session-1"}), 0)
+                        delivered.append(text)
+                    def herdr_prompt(target, text, **options):
+                        receive(text)
+                        return 0, {}
+                    def queue(ref):
+                        if not immediate:
+                            return {"status": "queued", "reason": "native-queue-accepted"}
+                        receive(steward.peer_message._read_pending(ref)["text"])
+                        return {"status": "received", "reason": "exact-peer-ref"}
+                    with mock.patch.object(steward, "_herdr_missing", return_value=False), \
+                            mock.patch.object(steward, "_current_session_identity", return_value=("sender-1", "claude")), \
+                            mock.patch.object(steward, "_from_name", return_value="fixture"), \
+                            mock.patch.object(steward, "_agent_state", return_value=("idle", "w1:p9")), \
+                            mock.patch.object(steward, "_prompt_input_reason",
+                                return_value=None if immediate else "target-form-open"), \
+                            mock.patch.object(steward, "_flush_pending_for_target", return_value=(0, 0)), \
+                            mock.patch.object(steward, "_schedule_message_obligation") as scheduled, \
+                            mock.patch.object(steward, "_herdr_prompt", side_effect=herdr_prompt), \
+                            mock.patch.object(steward.peer_message, "deliver_pending_codex", side_effect=queue), \
+                            mock.patch.object(steward, "_record"):
+                        code = real_prompt(args, **kwargs)
+                        scheduled.assert_called_once()
+                        return code
+                with mock.patch.object(steward.subprocess, "run", side_effect=lambda *a, **kw:
+                        type("Reply", (), {"stdout": json.dumps(agents), "returncode": 0})()), \
+                        mock.patch.object(steward, "_resolve_target", return_value=(harness, "session-1", None)), \
+                        mock.patch.object(steward, "cmd_prompt", side_effect=prompt) as prompt_call:
+                    steward._resume_registered_obligation(duty, store)
+                    prompt_call.assert_not_called()
+                    self.assertEqual(json.loads(path.read_text())["state"], "pending")
+                    self.assertEqual(store.get(duty["id"])["observation"]["reason"], "recipient-unavailable")
+                    agents["result"]["agents"] = [{"agent": harness, "pane_id": "w1:p9",
+                                                    "agent_session": {"value": "session-1"}}]
+                    steward._resume_registered_obligation(store.get(duty["id"]), store)
+                    self.assertEqual(prompt_call.call_count, 1)
+                    self.assertEqual(prompt_call.call_args.kwargs["expected_recipient"], (harness, "session-1"))
+                    if not immediate:
+                        queued = store.get(duty["id"])
+                        self.assertEqual(queued["state"], "pending")
+                        self.assertEqual(json.loads(path.read_text())["state"], "sent-ambiguous")
+                        transfer = steward.peer_message._read_pending(queued["observation"]["transfer_ref"])
+                        text = transfer["text"]
+                        steward._resume_registered_obligation(queued, store)
+                        self.assertEqual(prompt_call.call_count, 1)
+                        # An unrelated session and an altered body cannot consume the notice.
+                        steward.peer_message.receive_peer_message(text, {"harness": harness, "session_id": "stranger"})
+                        steward.peer_message.receive_peer_message("altered " + text, {"harness": harness, "session_id": "session-1"})
+                        self.assertEqual(json.loads(path.read_text())["state"], "sent-ambiguous")
+                        if other_carrier:
+                            rewake.pending_delivery.ack(self.root, "session-1", queued["observation"]["delivery_id"],
+                                                         acked_by="other-native-carrier")
+                            self.assertEqual(steward.peer_message.pending_messages({
+                                "harness": harness, "session_id": "session-1"}), [])
+                            self.assertIsNone(steward.peer_message.claim_pending_herdr(transfer["ref"], transfer["to"]))
+                            self.assertEqual(steward.peer_message.deliver_pending_codex(transfer["ref"])["status"], "not-required")
+                            msg = store.get("message-" + transfer["ref"])
+                            self.assertIsNotNone(msg)
+                            with mock.patch.object(steward, "_flush_pending_for_target") as resend:
+                                steward._resume_message_obligation(msg, store)
+                                resend.assert_not_called()
+                            self.assertEqual(store.get(msg["id"])["state"], "complete")
+                            self.assertEqual(steward.peer_message._read_pending(transfer["ref"])["state"], "pending")
+                            steward._resume_registered_obligation(queued, store)
+                            self.assertEqual(prompt_call.call_count, 1)
+                            self.assertEqual(store.get(duty["id"])["state"], "complete")
+                            self.jobs.write_text("")
+                            continue
+                        self.assertEqual(steward.peer_message.receive_peer_message(text, {
+                            "harness": harness, "session_id": "session-1"}), 0)
+                    else:
+                        self.assertEqual(len(delivered), 1)
+                    self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                    self.assertEqual(store.get(duty["id"])["state"], "complete")
+                with mock.patch.object(steward, "cmd_prompt") as prompt:
+                    steward._resume_registered_obligation(store.get(duty["id"]), store)
+                    prompt.assert_not_called()
+                # The next subcase uses a distinct notice identity.
+                self.jobs.write_text("")
+
+    def _check_lost_carrier_completion(self, crash_sid="session-1", recipient_sid="session-1",
+                                       changed_pane=False, live_holder=False):
+        self._open_row()
+        spec = importlib.util.spec_from_file_location("retained_steward_test", ROOT / "utilities/peer-steward.py")
+        steward = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(steward)
+        launch = rewake.Launch("att-owner-1", self.jobs, crash_sid)
+        claim = rewake.ArmClaim(rewake.arm_path(self.jobs, launch.attempt_id), launch.attempt_id,
+                                launch.session_id, 1, tuple(DEAD_HOLDER))
+        with mock.patch.object(rewake.peer_obligations, "ensure_runner"), \
+                mock.patch.object(rewake.seat_handover, "effective_parent", return_value=crash_sid), \
+                mock.patch.object(rewake, "_run_carrier", side_effect=RuntimeError("carrier crashed")):
+            with self.assertRaisesRegex(RuntimeError, "carrier crashed"):
+                rewake._observe_carrier(launch, claim, {})
+        store = rewake.peer_obligations.ObligationStore(self.root)
+        duty, = store.list()
+        sent = []
+        real_prompt = steward.cmd_prompt
+        def prompt(args, *, expected_recipient, on_prepared=None):
+            self.assertEqual(expected_recipient, ("claude", recipient_sid))
+            if changed_pane:
+                # The real courier must refuse before sealing any payload if
+                # its own target read no longer matches the retained identity.
+                with mock.patch.object(steward, "_herdr_missing", return_value=False), \
+                        mock.patch.object(steward, "_resolve_target", return_value=("claude", "stranger", None)), \
+                        mock.patch.object(steward.peer_message, "prepare_peer_message") as sealed:
+                    code = real_prompt(args, expected_recipient=expected_recipient, on_prepared=on_prepared)
+                    sealed.assert_not_called()
+                    return code
+            sent.append(Path(args.body_file).read_text())
+            return 0
+        agents = {"result": {"agents": [{"agent": "claude", "pane_id": "w1:p9",
+                                        "agent_session": {"value": recipient_sid}}]}}
+        holder_alive = (lambda holder: holder == list(DEAD_HOLDER)) if live_holder else rewake._holder_alive
+        with mock.patch.dict(sys.modules, {"_retained_rewake": rewake}), \
+                mock.patch.object(rewake, "_holder_alive", side_effect=holder_alive), \
+                mock.patch.object(steward.subprocess, "run", return_value=type("Reply", (), {
+                    "stdout": json.dumps(agents), "returncode": 0})()), \
+                mock.patch.object(rewake.seat_handover, "effective_parent", return_value=recipient_sid), \
+                mock.patch.object(steward, "_resolve_target", return_value=("claude", recipient_sid, None)), \
+                mock.patch.object(steward, "cmd_prompt", side_effect=prompt):
+            # A dead carrier is not completed work and must wait for its owner.
+            steward._resume_registered_obligation(duty, store)
+            self.assertEqual(sent, [])
+            path = self._close_and_materialize()
+            steward._resume_registered_obligation(duty, store)
+            if changed_pane:
+                self.assertEqual(sent, [])
+                self.assertEqual(store.get(duty["id"])["state"], "pending")
+                self.assertEqual(json.loads(path.read_text())["state"], "pending")
+                return
+            self.assertEqual(len(sent), 1)
+            self.assertIn("att-owner-1", sent[0])
+            self.assertEqual(store.get(duty["id"])["state"], "pending")
+            self.assertEqual(json.loads(path.read_text())["state"], "sent-ambiguous")
+            # Acknowledged notices retain their original delivery identity.
+            rewake.pending_delivery.ack(self.root, "session-1", json.loads(path.read_text())["delivery_id"],
+                                         acked_by="session-sweep:session-1")
+            steward._resume_registered_obligation(duty, store)
+            self.assertEqual(len(sent), 1)
+
     def test_claim_win_emits_and_transitions_to_sent_ambiguous(self):
         self._open_row()
         record_path = self._close_and_materialize()
@@ -2365,6 +2559,24 @@ class GateCarrierTest(unittest.TestCase):
     before, which is exactly why the missing `now_ns` in `_gate_notices`'
     `reclaim` call shipped: nothing here ever executed that branch."""
 
+    def test_supervision_wake_type_does_not_depend_on_rendered_words(self):
+        from dispatch_session_sweep import is_human_gate_record
+        for reason in ("workflow-completion-pending", "closure-blocked", "watch-deadline",
+                       "receiver-unavailable", "terminal-evidence-conflict"):
+            record = {"receipt": {"kind": "supervision", "reason": reason,
+                                  "required_action": "inspect-recovery"}}
+            notice = "A closure diagnostic whose wording may change."
+            text = rewake.gate_wake_message(self._launch(), [notice],
+                                             human_gate=is_human_gate_record(record))
+            self.assertEqual(text, notice)
+            self.assertNotIn("human-gate", text)
+            self.assertNotIn("AskUserQuestion", text)
+        gate = {"receipt": {"children": [{"required_action": "human-gate:frame-review"}]}}
+        text = rewake.gate_wake_message(self._launch(), [notice, "actual gate"],
+                                         human_gate=is_human_gate_record(gate))
+        self.assertIn("AskUserQuestion", text)
+        self.assertIn(notice, text)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -2816,6 +3028,170 @@ class GateCarrierTest(unittest.TestCase):
         self.assertFalse(rewake.is_human_gate_record(record))
 
 
+class SupervisionWakeRearmTest(unittest.TestCase):
+    """An attention wake must hand its notice to the immediate prompt sweep,
+    so that turn can arm a second carrier for the same owner's success."""
+
+    ANCESTRY = CarrierOneClaimGateTest.ANCESTRY
+    payload = CarrierOneClaimGateTest.payload
+
+    def setUp(self):
+        CarrierOneClaimGateTest.setUp(self)
+        CarrierOneClaimGateTest._open_row(self)
+        self.jobs.write_text(self.jobs.read_text().replace(
+            "parent_attempt_id=att-owner-parent,", ""), encoding="utf-8")
+        rewake._RECIPIENT_KEY_CACHE.clear()
+        rewake._PROBE_DIRECTORY_MTIME.clear()
+        rewake._PROBE_NEXT_DEADLINE_NS.clear()
+        from dispatch_supervision import materialize
+        self.notice = materialize(self.jobs, {"att-owner-1"}, reason="join-deadline")[0]
+
+    def _run(self, wait_state, payload=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(rewake.sys, "stdin", io.StringIO(json.dumps(payload or self.payload()))), \
+             mock.patch.object(rewake.sys, "stdout", stdout), \
+             mock.patch.object(rewake.sys, "stderr", stderr), \
+             mock.patch.object(rewake, "runtime_ancestry_binding", return_value=self.ANCESTRY), \
+             mock.patch.object(rewake, "wait_for_attempt",
+                               side_effect=wait_state if callable(wait_state) else None,
+                               return_value=(wait_state, "test-readiness")):
+            code = rewake.main()
+        return code, stderr.getvalue()
+
+    def _parent_call(self):
+        payload = self.payload()
+        payload["tool_input"] = {"command": "git status"}
+        payload["tool_response"] = {"stdout": "", "stderr": ""}
+        return payload
+
+    def _dead_holder(self):
+        path = rewake.arm_path(self.jobs, "att-owner-1")
+        record = json.loads(path.read_text())
+        record["holder"] = DEAD_HOLDER
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+    def _complete_owner(self):
+        namespace = DEAD_HOLDER[2]
+        drained = (
+            f",failure_class=pass,pid=4194304,pid_start=1,pgid=4194304,"
+            f"pid_ns={namespace},pid_observer_ns={namespace},pid_scope=namespace-local,"
+            "launch_lifecycle=detached,launch_outcome=governed-process-group-drained,"
+            "group_reap_pgid=4194304,group_reap_proof=pgid-empty-v1,"
+            f"attempt_descendant_proof=attempt-tagged-empty-v1,attempt_descendant_observer_ns={namespace}"
+        )
+        self.jobs.write_text(self.jobs.read_text().rstrip() + drained + "\n", encoding="utf-8")
+        self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", "completed-supervisor"))
+        path = JOIN.materialize_pending_delivery(self.jobs, self.jobs.read_text().splitlines()[0].split("\t"))
+        self.assertIsNotNone(path)
+        return path
+
+    def test_attention_sweep_rearm_success_without_waiting_for_a_lease(self):
+        from dispatch_session_sweep import sweep_deliver, ack_delivered
+        code, text = self._run("gate")
+        self.assertEqual(code, 2)
+        self.assertIn("Hearting supervision needs attention", text)
+        self.assertNotIn("human gate", text)
+        self._dead_holder()  # the first async hook process exited
+        records, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual([r["delivery_id"] for r in records], [self.notice["delivery_id"]])
+        self.assertEqual(ack_delivered(self.root, "session-1", records, acked_by="parent-prompt"), 1)
+        # The ordinary Bash call in that awakened turn arms again while open.
+        launch, claim = rewake.registry_launch(self._parent_call())
+        self.assertEqual((launch.armed, claim.arms), ("registry-rearm", 2))
+        self.assertFalse(rewake._open_gate_pending(launch))
+        self._dead_holder()
+        completion = self._complete_owner()
+        code, text = self._run("ready", self._parent_call())
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", text)
+        self.assertIn("advance-completed", text)
+        self.assertEqual(json.loads(completion.read_text())["state"], "sent-ambiguous")
+        self.assertEqual(rewake._read_arm(claim.path)["state"], "ended")
+        self.assertEqual(rewake.registry_launch(self._parent_call()).reason, "ended")
+
+    def test_lost_wake_is_not_acked_and_successor_claim_is_preserved(self):
+        pending = rewake.pending_delivery
+        delivery_id = self.notice["delivery_id"]
+
+        def other_carrier_claims(*args, **kwargs):
+            pending.reclaim(self.root, "session-1", delivery_id, now_ns=time.monotonic_ns() + 10**12)
+            pending.claim(self.root, "session-1", delivery_id, claim_owner="successor", lease_seconds=120)
+            return 2
+
+        with mock.patch.object(rewake, "emit_receipt", side_effect=other_carrier_claims):
+            self.assertEqual(self._run("gate")[0], 2)
+        record = pending.read(self.root, "session-1", delivery_id)
+        self.assertEqual((record["state"], record["claim_owner"]), ("claimed", "successor"))
+        self.assertIsNone(record["acked_by"])
+
+    def test_emit_failure_keeps_the_notice_recoverable(self):
+        with mock.patch.object(rewake, "emit_receipt", side_effect=RuntimeError("emit failed")):
+            with self.assertRaisesRegex(RuntimeError, "emit failed"):
+                self._run("gate")
+        record = rewake.pending_delivery.read(self.root, "session-1", self.notice["delivery_id"])
+        self.assertEqual(record["state"], "sent-ambiguous")
+        self.assertIsNone(record["acked_by"])
+
+    def test_handoff_io_failure_preserves_the_native_wake_and_retryable_notice(self):
+        with mock.patch.object(rewake.pending_delivery, "release_claim", side_effect=OSError("disk error")):
+            self.assertEqual(self._run("gate")[0], 2)
+        record = rewake.pending_delivery.read(self.root, "session-1", self.notice["delivery_id"])
+        self.assertEqual(record["state"], "sent-ambiguous")
+        self.assertIsNone(record["acked_by"])
+
+    def _wake_and_sweep(self):
+        from dispatch_session_sweep import sweep_deliver, ack_delivered
+        self.assertEqual(self._run("gate")[0], 2)
+        self._dead_holder()
+        records, _ = sweep_deliver(self.root, "claude-parent-runtime", "session-1")
+        self.assertEqual(ack_delivered(self.root, "session-1", records, acked_by="parent-prompt"), 1)
+
+    def test_stop_keeps_watching_after_an_attention_turn_with_no_bash(self):
+        self._wake_and_sweep()
+        completion = []
+
+        def finish_during_wait(*args, **kwargs):
+            arm = rewake._read_arm(rewake.arm_path(self.jobs, "att-owner-1"))
+            self.assertEqual((arm["arms"], arm["state"]), (2, "waiting"))
+            completion.append(self._complete_owner())
+            return "ready", "terminal-quiescent"
+
+        stop = {"hook_event_name": "Stop", "session_id": "session-1", "stop_hook_active": True}
+        code, text = self._run(finish_during_wait, stop)
+        self.assertEqual(code, 2)
+        self.assertIn("state=success", text)
+        self.assertEqual(json.loads(completion[0].read_text())["state"], "sent-ambiguous")
+        self.assertEqual(rewake.registry_launch(stop).reason, "ended")
+
+    def test_stop_delivers_a_completion_that_preceded_the_turn_end(self):
+        self._wake_and_sweep()
+        completion = self._complete_owner()
+        stop = {"hook_event_name": "Stop", "session_id": "session-1"}
+        self.assertEqual(self._run("ready", stop)[0], 2)
+        self.assertEqual(json.loads(completion.read_text())["state"], "sent-ambiguous")
+
+    def test_stop_never_first_arms_or_takes_a_foreign_or_live_arm(self):
+        stop = {"hook_event_name": "Stop", "session_id": "session-1"}
+        self.assertIsNone(rewake.registry_launch(stop))  # no ledger yet
+        claim = rewake.claim_arm(self.jobs, "att-owner-1", "session-1", fresh=True)
+        self.assertEqual(rewake.registry_launch(stop).reason, "held-live")
+        self._dead_holder()
+        self.assertIsNone(rewake.registry_launch({**stop, "session_id": "foreign"}))
+        self.assertEqual(rewake._read_arm(claim.path)["arms"], 1)
+        self.assertIsNone(rewake.registry_launch({**stop, "hook_event_name": "SubagentStop"}))
+
+    def test_claude_stop_registers_the_same_async_completion_carrier(self):
+        settings = json.loads((ROOT / "adapters/claude/settings.json").read_text())
+        by_event = {}
+        for event in ("PostToolUse", "Stop"):
+            by_event[event] = [hook for entry in settings["hooks"][event]
+                               for hook in entry["hooks"]
+                               if "dispatch-owner-rewake.py" in hook.get("command", "")]
+        self.assertEqual(len(by_event["Stop"]), 1)
+        self.assertEqual(by_event["Stop"], by_event["PostToolUse"])
+        self.assertTrue(by_event["Stop"][0]["asyncRewake"])
+
+
 class GateCloseRearmTest(GateCarrierTest):
     """SD-129 without command parsing: the wake spent on a gate is re-armed by
     the first same-session Bash call after that gate record closes -- the
@@ -2853,6 +3229,15 @@ class GateCloseRearmTest(GateCarrierTest):
                         self.call()["tool_input"]["command"]):
             with self.subTest(command=command):
                 self.assertNotIsInstance(rewake.registry_launch(self.call(command)), tuple)
+
+    def test_stop_rearms_only_after_the_human_gate_record_closes(self):
+        delivery_id = self._gate_record(state="sent-ambiguous")
+        self.spend_wake_on(delivery_id)
+        stop = {"hook_event_name": "Stop", "session_id": "session-gate"}
+        self.assertEqual(rewake.registry_launch(stop).reason, "gate-open")
+        rewake.pending_delivery.ack(self.state, "session-gate", delivery_id, acked_by="gate-release")
+        launch, claim = rewake.registry_launch(stop)
+        self.assertEqual((launch.attempt_id, claim.arms), ("att-gate-owner", 2))
 
     def test_the_first_call_after_the_gate_closes_rearms_the_owner(self):
         delivery_id = self._gate_record(state="sent-ambiguous")
@@ -3123,4 +3508,7 @@ def replace_session(launch, session):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # Unit fixtures exercise records without observers racing their cleanup;
+    # runner startup is exercised by peer_obligations.test.py.
+    with mock.patch.object(rewake.peer_obligations, "ensure_runner", return_value=True):
+        unittest.main()

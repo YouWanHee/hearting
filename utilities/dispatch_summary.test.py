@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -435,6 +436,63 @@ class DispatchSummaryTest(unittest.TestCase):
         self.assertTrue(decided)
         self.assertIsNone(announced)
         self.assertEqual(S._summary_source(log, {}), log)
+
+    def _opencode_source(self, attempt="att-native-now"):
+        log = Path(self.tmp.name) / f"owner.{attempt}.opencode.jsonl"
+        log.write_text(json.dumps({"type":"dispatch.supervisor.continuation-budget"})+"\n"+
+            json.dumps({"type":"dispatch.supervisor.turn-started","parent_attempt_id":attempt})+"\n"+
+            json.dumps({"type":"dispatch.supervisor.session", "runtime":"opencode",
+            "session_id":"ses_exact", "cwd":"/wt", "parent_attempt_id":attempt})+"\n")
+        runtime = Path(self.tmp.name) / "runtime"
+        db = runtime / "data/opencode/opencode.db"
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE part(session_id TEXT,data TEXT)")
+        con.execute("INSERT INTO part VALUES(?,?)", ("ses_exact",json.dumps({
+            "type":"text","text":"Preparing the exact owner continuation"})))
+        con.commit()
+        con.close()
+        jobs = Path(self.tmp.name) / "native.jobs.log"
+        jobs.write_text("2026-10-09T00:00:00Z\topen\t/repo\t/wt\towner\t"+
+            f"attempt_id={attempt},harness=opencode,log_file={log},opencode_runtime_dir={runtime}\n")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(jobs)
+        return log, db, jobs
+
+    def test_opencode_announcement_selects_exact_private_db(self):
+        log, db, jobs = self._opencode_source()
+        cache = {}
+        with mock.patch.object(S,"session_transcript",side_effect=AssertionError("Claude lookup")):
+            self.assertEqual(S._summary_source(log,cache),db)
+        self.assertEqual(cache["refresh_source"], {"kind":"opencode-db", "db_path":str(db),
+                                                 "session_id":"ses_exact"})
+        jobs.write_text(jobs.read_text().replace("att-native-now","att-foreign"))
+        self.assertIsNone(S._summary_source(log,{}))
+
+    def test_opencode_summary_sid_stays_attempt_scoped(self):
+        log, db, _ = self._opencode_source()
+        cache = {}
+        S._summary_source(log,cache)
+        from fleet import refresh_title
+        with mock.patch.object(refresh_title,"maybe_spawn",return_value=True) as spawn:
+            self.assertTrue(S._refresh("opencode","dispatch-att-native-now",db,phase="initial",
+                debounce=0,priority=True,refresh_source=cache["refresh_source"]))
+        self.assertEqual(spawn.call_args.kwargs["sid"],"dispatch-att-native-now")
+        self.assertEqual(spawn.call_args.kwargs["refresh_source"]["session_id"],"ses_exact")
+
+    def test_opencode_native_db_produces_attempt_now_without_claude_transcript(self):
+        log, db, _ = self._opencode_source()
+        worker = subprocess.Popen(["sleep","0.5"],start_new_session=True)
+        try:
+            start = S.process_observation(worker.pid)[1]
+            rc = S.supervise(attempt_id="att-native-now",harness="opencode",transcript=log,
+                target_pid=worker.pid,target_start=start,poll=.05,initial_delay=0,
+                final_grace=8,log_quiet=.05)
+            self.assertEqual(rc,0)
+            sidecar = titles.read("dispatch-att-native-now",harness="opencode")
+            self.assertEqual(sidecar["summary"],"분사 작업 요약을 갱신하고 있습니다")
+            self.assertTrue(sidecar["cursor_kind"].startswith("opencode-rowid-v1:"))
+        finally:
+            worker.wait(timeout=3)
 
     def test_empty_log_is_undecided_and_never_cached_as_unsupervised(self):
         """The summary owner starts before the worker clears its launch fence."""

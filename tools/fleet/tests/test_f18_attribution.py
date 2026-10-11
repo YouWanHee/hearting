@@ -146,6 +146,51 @@ class CodexRolloutAttributionTest(unittest.TestCase):
             codex._FALLBACK_CLAIMS.update(ts=0, sids=set())
             self.assertEqual([codex._fallback_rollout(s, "/home/codex") for s in sessions], [None, None])
 
+    def test_fallback_never_takes_a_rollout_older_than_the_process(self):
+        """2026-10-10: a closed window's same-cwd thread (01a12206, unclaimed once
+        its process exited) was taken for the fresh Codex started 61 s later,
+        whose own thread was 01a12207. Only a rollout since its start fits."""
+        started = 1791572304.0                       # 2026-10-09T18:58:24Z
+        times = {"/r/old": "2026-10-09T18:57:23Z",     # 61 s before the start
+                 "/r/near": "2026-10-09T18:57:54Z",    # 30 s before
+                 "/r/edge": "2026-10-09T18:58:21Z",    # 3 s before: start-match tolerance
+                 "/r/own": "2026-10-09T18:59:00Z"}
+
+        def fallback(paths, process_started, elapsed):
+            sess = Session(harness="codex", pid=7, cwd="/work/repo",
+                           elapsed_min=int(elapsed // 60), proc_start="1")
+            with mock.patch.object(codex, "_index", return_value={"/work/repo": paths}), \
+                 mock.patch.object(codex, "_sid", side_effect=lambda p: p.rsplit("/", 1)[-1]), \
+                 mock.patch.object(codex, "_rollout_meta", side_effect=lambda p: {"timestamp": times[p]}), \
+                 mock.patch.object(codex, "_process_started_at", return_value=process_started), \
+                 mock.patch.object(codex.time, "time", return_value=started + elapsed):
+                codex._FALLBACK_CLAIMS.update(ts=0, sids=set())
+                return codex._fallback_rollout(sess, "/home/codex")
+
+        # Exact /proc start, 61 s in: whole-minute etime alone would reach 59 s back.
+        self.assertIsNone(fallback(["/r/old"], started, 61))
+        self.assertIsNone(fallback(["/r/near"], started, 61))
+        self.assertEqual(fallback(["/r/edge"], started, 61), "/r/edge")
+        self.assertEqual(fallback(["/r/own", "/r/old"], started, 61), "/r/own")
+        # No /proc start: etime's rounding (100 s -> 1 min, so 20 s back) only.
+        self.assertIsNone(fallback(["/r/old"], None, 100))
+        self.assertEqual(fallback(["/r/own", "/r/old"], None, 100), "/r/own")
+
+    def test_resumed_rival_still_makes_the_same_cwd_fallback_ambiguous(self):
+        """A `codex resume` holds no rollout fd and may own a thread older than
+        itself; the gate keeps refusing a rollout such a rival could take."""
+        now = 1791572304.0
+        thread = "/r/rollout-2026-10-09T18-56-24-11111111-1111-1111-1111-111111111111.jsonl"
+        fresh = Session(harness="codex", pid=1, cwd="/work/repo", elapsed_min=10, proc_start="1")
+        resumed = Session(harness="codex", pid=2, cwd="/work/repo", elapsed_min=1, proc_start="2")
+        starts = {1: now - 600, 2: now - 60}
+        with mock.patch.object(codex, "_index", return_value={"/work/repo": [thread]}), \
+             mock.patch.object(codex, "_rollout_meta", return_value={"timestamp": "2026-10-09T18:56:24Z"}), \
+             mock.patch.object(codex, "_process_started_at", side_effect=lambda s: starts[s.pid]), \
+             mock.patch.object(codex.time, "time", return_value=now):
+            self.assertEqual(codex._mutual_fallback_rollout(1, [fresh], "/home/codex", {}, set()), thread)
+            self.assertIsNone(codex._mutual_fallback_rollout(1, [fresh, resumed], "/home/codex", {}, set()))
+
     def test_prepare_tick_reserves_owned_rollout_before_pid_ordered_fallback(self):
         older = Session(harness="codex", pid=10, cwd="/work/repo", elapsed_min=1)
         owner = Session(harness="codex", pid=20, cwd="/work/repo", elapsed_min=1)
@@ -172,6 +217,7 @@ class CodexRolloutAttributionTest(unittest.TestCase):
         self.assertIn("11111111", path)
 
 
+@mock.patch.object(render, "_SHOW_ALL", True)
 class RenderDuplicateParentTest(unittest.TestCase):
     def test_duplicate_session_id_renders_child_tree_once(self):
         sessions = [Session(harness="codex", pid=1, cwd="/work/repo", session_id="same", slug="repo", liveness="working"),
@@ -392,7 +438,7 @@ class ClaudeTranscriptAttributionTest(unittest.TestCase):
                 f.write("{}\n")
             self.assertEqual(claude_collector._newest_transcript_path(home, "/w/repo", "sid-a"), own)
 
-    def test_unknown_sid_still_falls_back_to_newest(self):
+    def test_unknown_sid_cannot_borrow_newest_neighbor(self):
         with tempfile.TemporaryDirectory() as home:
             proj = self._proj(home)
             older, newer = os.path.join(proj, "a.jsonl"), os.path.join(proj, "b.jsonl")
@@ -400,7 +446,7 @@ class ClaudeTranscriptAttributionTest(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("{}\n")
             os.utime(older, (1, 1))
-            self.assertEqual(claude_collector._newest_transcript_path(home, "/w/repo", None), newer)
+            self.assertIsNone(claude_collector._newest_transcript_path(home, "/w/repo", None))
 
 
 if __name__ == "__main__":

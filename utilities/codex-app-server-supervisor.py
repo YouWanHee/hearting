@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from codex_permission_profile import commit_profile_config, config_arguments
+from worker_runtime_home import codex_worker_arguments
 import json
 import queue
 import threading
@@ -37,7 +38,7 @@ from dispatch_completion_join import (
     reconcile_finished_children,
     read_supervisor_phase_state,
     receipt_with_current_actions,
-    receipt_with_delivery_observability,
+    wait_for_delivery_projection,
     receipt_with_stage_advance,
     remove_supervisor_state,
     runtime_wait_requested,
@@ -176,7 +177,7 @@ def attempt_stage_advance(args, current_rows, new_attempts, delivery_timing=None
 def reconcile(args: argparse.Namespace, terminal: SupervisorTerminal) -> bool:
     try:
         outcome = reconcile_supervisor_terminal(
-            args.jobs, args.parent_attempt_id, terminal
+            args.jobs, args.parent_attempt_id, terminal, emit=emit
         )
         # SD-111 P2 trigger 1: dispatch_supervisor_terminal cannot import this
         # module (circular), so its own docstring asks the caller to close
@@ -370,7 +371,7 @@ def run_join(args: argparse.Namespace, attempts: set[str]) -> dict[str, Any]:
     join_timing = advance_delivery_timing(
         join_timing, "join_completed_ns", at_ns=completed_ns
     )
-    observed = receipt_with_delivery_observability(
+    observed = wait_for_delivery_projection(
         receipt,
         jobs=Path(args.jobs),
         timing=join_timing,
@@ -754,6 +755,7 @@ def run_one_turn(args: argparse.Namespace) -> int:
     if args.native_permission_profile is not None:
         command += config_arguments(args.native_permission_profile)
 
+    command += codex_worker_arguments()
     server: AppServer | None = None
     completed_thread: str | None = None
     result_code = 70
@@ -857,6 +859,7 @@ def main(argv: list[str] | None = None) -> int:
     args.resource_launch_command = lambda row: resource_sandbox_command(args, row)
     if args.native_permission_profile is not None:
         command += config_arguments(args.native_permission_profile)
+    command += codex_worker_arguments()
     state_path = Path(args.state_file) if args.state_file else None
     lease_path = Path(args.lease_file)
     runtime_env = dict(os.environ)
@@ -982,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
                 server, thread_id=thread_id, prompt=next_prompt, args=args
             )
             pending_notice = ""
+            DECISIONS.refresh_owner_route(args)
             rows = current_children(Path(args.jobs), args.parent_attempt_id,
                                     route_id=args.route_id, route_hash=args.route_hash)
             current = {row.attempt_id: row for row in rows}

@@ -928,6 +928,8 @@ _EXPECTED_WRITER_CENSUS = {
     ("artifact_producer.py", "set_campaign_related"): "no-row-effect",
     ("artifact_producer.py", "finalize"): "no-row-effect",  # the no-lineage cycle-record write
     ("artifact_producer.py", "_recover_locked"): "no-row-effect",  # the dropped-record write
+    ("artifact_producer.py", "_refresh_journal_resume"): "no-row-effect",  # pending history; row changes use _commit_sealed
+    ("artifact_producer.py", "_observe_control_changes"): "no-row-effect",  # observation digests and pending history only
     ("artifact_producer.py", "_bind_cycle_route_locked"): "no-row-effect",  # D-120: `route_bindings[]` is audit-only, never a judgment input
     # §45 D-126: the three commands and the finding of a hand-made change.
     ("artifact_producer.py", "cycle_mark"): "no-row-effect",  # `disposition` is a record field no locator row reads

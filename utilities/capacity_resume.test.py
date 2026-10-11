@@ -36,7 +36,7 @@ class CapacityResumeTest(unittest.TestCase):
         self.jobs.touch()
         self.route = {"route_id": "rt-cap", "route_hash": "sha256:cap", "slug": "task",
                       "artifact_root": str(self.root / "artifacts"), "cwd": str(self.root),
-                      "capability": "autopilot-code", "effective_intensity": "standard",
+                      "capability": "autopilot-code", "effective_intensity": "standard", "owner_model_profile": "deep",
                       "work_request": {"text": "the raw task", "owner_harness": "claude"}, "nodes": []}
         self.path = self.root / "route.json"
         self.path.write_text(json.dumps(self.route))
@@ -120,11 +120,11 @@ class CapacityResumeTest(unittest.TestCase):
                 "execution_surface": "registered-headless", "registered_worker": "1",
                 "fallback_hop": "same-harness-headless", "attempt_id": aid, "route_id": "rt-cap",
                 "route_hash": "sha256:cap", "route_node": "owner", "worker_type": "owner",
-                "parent_sid": "parent", "harness": harness, "note": note, "failure_class": failure_class,
+                "parent_sid": "parent", "harness": harness, "model_profile": "deep", "note": note, "failure_class": failure_class,
                 "launch_outcome": "never-launched", "log_file": str(log), "artifact_root": str(self.root / "artifacts"),
                 "launch_started": "1", "parent_completion_delivery": "codex-managed-gateway", **extra}
         args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=str(self.root),
-                               route_id="rt-cap", route_node="owner",
+                               route_id="rt-cap", route_node="owner", model_profile="deep",
                                replacement_input_argv=["--start", "--attempt-id", aid, "--prompt-text", "the raw task"])
         meta.update(D.parse_registry_metadata(R.seal_launch_input(args, harness, "the raw task")))
         self.write(meta, stamp=datetime.fromtimestamp(time.time() - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
@@ -143,7 +143,7 @@ class CapacityResumeTest(unittest.TestCase):
         (R._directory(self.jobs) / "inputs" / "att-owner.json").unlink()
         with mock.patch.object(R, "ROOT", home):
             args = SimpleNamespace(attempt_id="att-owner", jobs_path=self.jobs, worktree=str(self.root),
-                                   route_id="rt-cap", route_node="owner", model="old-model",
+                                   route_id="rt-cap", route_node="owner", model="old-model", model_profile="deep",
                                    replacement_input_argv=["--start", "--attempt-id", "att-owner", "--prompt-text", "the raw task"])
             fragment = R.seal_launch_input(args, "claude", "the raw task")
         self.set_status("att-owner", "done", **D.parse_registry_metadata(fragment))
@@ -162,7 +162,7 @@ class CapacityResumeTest(unittest.TestCase):
         task = Path(value("--prompt-file")).read_text()
         args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=value("--worktree"),
                                route_id="rt-cap", route_node="owner", replacement_input_argv=list(argv),
-                               **(self.candidate_args or {}))
+                               **{"model_profile": source["model_profile"], **(self.candidate_args or {})})
         meta = {k: v for k, v in source.items() if k not in {
             "note", "failure_class", "launch_outcome", "replacement_input_digest", "replacement_family_id",
             "replacement_attempt_id", "replacement_claim_digest", "replacement_original_attempt_id",
@@ -194,6 +194,9 @@ class CapacityResumeTest(unittest.TestCase):
 
     # -- 1: usage limit pauses; one start after it lifts resumes to completion -------
     def test_capacity_dead_owner_waits_during_limit_then_one_start_resumes_to_completion(self):
+        # A current explicit pin holds at that harness's real limit. Unpinned
+        # replacements use ordinary selection instead of waiting on the old one.
+        self.route["selection_pins"] = {"owner": {"harness": "claude"}}
         for _ in range(2):
             result = self.start()
             self.assertEqual(result["state"], "waiting-capacity", result)
@@ -217,6 +220,13 @@ class CapacityResumeTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed", result)
         self.start()
         self.assertEqual(len(self.calls), 1)
+
+    def test_an_unpinned_limited_owner_reaches_the_ordinary_owner_selector(self):
+        result = self.start()
+        self.assertEqual(result["state"], "running", result)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][1], str(R.ROOT / "utilities/dispatch-owner.py"))
+        self.assertNotIn("--adapter", self.calls[0])
 
     # -- 2: a cleanup-pending child is settled by start, not by hand ------------------
     def _owner_with_child(self, child_state=("unverifiable", "post-exit-receipt-incomplete", None)):
@@ -260,7 +270,7 @@ class CapacityResumeTest(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             result = self.start()
         self.assertEqual(result["state"], "running", result)
-        self.assertEqual(self.calls[0][1], str(R.ROOT / "adapters/claude/bin/dispatch-headless.py"))
+        self.assertEqual(self.calls[0][1], str(R.ROOT / "utilities/dispatch-owner.py"))
         # The release a launch ran from is where it ran: no diagnostic, and the evidence stays.
         self.assertNotIn("replacement-runtime-drift", stderr.getvalue())
         replay = R.launch_input(self.jobs, "att-owner", self.rows()["att-owner"][1])
@@ -268,7 +278,8 @@ class CapacityResumeTest(unittest.TestCase):
 
     def test_identity_change_is_refused_even_when_the_release_differs(self):
         self._drift_setup()
-        self.candidate_args = {"permission_mode": "config"}
+        # Adapter settings may change with its harness; the work's profile may not.
+        self.candidate_args = {"model_profile": "balanced"}
         self.ready = True
         result = self.start()
         self.assertEqual(result["state"], "needs-attention", result)
@@ -313,7 +324,8 @@ class CapacityResumeTest(unittest.TestCase):
             aid, prior = value("--attempt-id"), value("--automatic-retry-of")
             source = self.rows()[prior][1]
             args = SimpleNamespace(attempt_id=aid, jobs_path=self.jobs, worktree=value("--worktree"),
-                                   route_id="rt-cap", route_node="owner", replacement_input_argv=list(argv))
+                                   route_id="rt-cap", route_node="owner", model_profile=source["model_profile"],
+                                   replacement_input_argv=list(argv))
             meta = {k: v for k, v in source.items() if k not in {
                 "note", "failure_class", "launch_outcome", "replacement_input_digest", "replacement_family_id",
                 "replacement_attempt_id", "replacement_claim_digest", "replacement_original_attempt_id",
@@ -488,6 +500,7 @@ class CapacityResumeTest(unittest.TestCase):
         return sorted(str(p.relative_to(base)) for p in base.rglob("*") if p.is_file())
 
     def test_capacity_replacement_launches_only_from_explicit_start(self):
+        self.route["selection_pins"] = {"owner": {"harness": "claude"}}
         self.set_limit("att-owner", FREE)
         # (a) the limit has lifted, but a supervisor/rewake tick does not launch
         before = self._state_files()

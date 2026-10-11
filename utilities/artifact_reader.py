@@ -22,7 +22,9 @@ import contextvars
 import fnmatch
 import json
 import os
+import stat
 import sys
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -52,9 +54,10 @@ def _cycle_state(root: Path, campaign_dir: Path, cycle_dir: Path) -> str:
 class _ReadScope:
     """Memo for ONE read pass (see `read_scope`); never outlives its `with` block."""
 
-    __slots__ = ("scan_index", "cycle_buckets")
+    __slots__ = ("scan_index", "cycle_buckets", "cache")
 
-    def __init__(self) -> None:
+    def __init__(self, cache=None) -> None:
+        self.cache = cache
         self.scan_index: Dict[str, Tuple[Dict[str, str], Dict[str, Dict[str, str]]]] = {}
         self.cycle_buckets: Dict[Tuple[str, str], List[Tuple[Path, Dict[str, str]]]] = {}
 
@@ -62,24 +65,111 @@ class _ReadScope:
 _READ_SCOPE: contextvars.ContextVar = contextvars.ContextVar("artifact_reader_read_scope", default=None)
 
 
+def _record_stamp(root: Path):
+    """Stat only locator inputs, never payload trees or generated INDEX contents.
+
+    Directory stamps catch additions/removes/renames; file size/mtime/ctime and
+    inode catch edits and atomic replacements. Bucket children and QA contents
+    remain live reads, so their edits do not require an inventory rescan.
+    """
+    stamps = {}
+
+    def stamp(path, observed=None):
+        try:
+            s = observed if observed is not None else path.lstat()
+            stamps[str(path)] = (s.st_dev, s.st_ino, s.st_mode, s.st_size,
+                                 s.st_mtime_ns, s.st_ctime_ns)
+            return stat.S_ISDIR(s.st_mode)
+        except FileNotFoundError:
+            stamps[str(path)] = None
+            return False
+
+    def directory(path):
+        if not stamp(path):
+            return []
+        dirs = []
+        with os.scandir(path) as entries:
+            for entry in entries:
+                p = path / entry.name
+                try:
+                    s = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    stamps[str(p)] = None
+                    continue
+                if stamp(p, s) and not entry.name.startswith("."):
+                    dirs.append(p)
+        return dirs
+
+    stamp(root)
+    for campaign in directory(root / "campaigns"):
+        for child in directory(campaign):
+            if child.name == "campaign.events":
+                directory(child)
+            elif child.name == "cycles":
+                for cycle in directory(child):
+                    directory(cycle)
+            else:
+                directory(child)
+    directory(root / ".runtime" / "artifact-producer" / "v1" / "cycles")
+    return stamps
+
+
+class ReadCache:
+    """Optional bounded, process-local reuse between observer ticks.
+
+    Ordinary readers keep their existing fresh-pass semantics. A cached index
+    is derived from records, with stat invalidation; INDEX deletion, artifact
+    movement and a missing cache never become an approval or repair step.
+    """
+
+    def __init__(self):
+        self.entries = OrderedDict()
+
+    def scan(self, root):
+        key = str(Path(root).resolve())
+        root = Path(key)
+        try:
+            before = _record_stamp(root)
+        except OSError:
+            self.entries.pop(key, None)
+            return artifact_locator.scan_index(root)
+        hit = self.entries.get(key)
+        if hit is not None and hit[0] == before:
+            self.entries.move_to_end(key)
+            return hit[1]
+        self.entries.pop(key, None)
+        result = artifact_locator.scan_index(root)
+        try:
+            after = _record_stamp(root)
+        except OSError:
+            return result
+        # A concurrent edit during the scan cannot be retained for a later tick.
+        if before == after:
+            self.entries[key] = (after, result)
+            if len(self.entries) > 16:
+                self.entries.popitem(last=False)
+        return result
+
+
 @contextmanager
-def read_scope():
-    """Reuse locator scans inside one read pass, and only there.
+def read_scope(cache=None):
+    """Reuse locator scans inside one read pass.
 
     Fleet's projection asks `glob_bucket` once per entity x root: dozens of
     identical `artifact_locator.scan_index` walks of the same NFS tree in one
     collector tick (2026-09-08 audit: 80 walks, 23.6 s of a ~40 s tick against
     a 2 s refresh interval). Inside this scope the first scan of a root serves
     every later call of the same pass. The memo exists only on the context
-    stack between entry and exit, so the next pass scans the records again:
-    sealed identity still comes from campaign/manifest/open-cycle records on
-    every pass, never from a persisted cache or the rebuildable INDEX files.
+    stack between entry and exit. Normally the next pass scans records again;
+    observers may supply a ReadCache to reuse unchanged stat-checked records.
+    Sealed identity comes from campaign/manifest/open-cycle records, never
+    from a persisted cache or the rebuildable INDEX files.
     A nested scope joins the enclosing pass instead of starting a fresh memo.
     """
     if _READ_SCOPE.get() is not None:
         yield
         return
-    token = _READ_SCOPE.set(_ReadScope())
+    token = _READ_SCOPE.set(_ReadScope(cache))
     try:
         yield
     finally:
@@ -93,7 +183,8 @@ def _scan_index(root: Path) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
     key = str(Path(root).resolve())
     hit = scope.scan_index.get(key)
     if hit is None:
-        hit = scope.scan_index[key] = artifact_locator.scan_index(root)
+        hit = scope.scan_index[key] = (scope.cache.scan(root) if scope.cache is not None
+                                      else artifact_locator.scan_index(root))
     return hit
 
 
@@ -170,7 +261,11 @@ def bucket_dirs(root: Path, bucket: str, *, include_shared: bool = True,
 def iter_bucket_children(root: Path, bucket: str, **kw) -> Iterator[Tuple[Path, Dict[str, str]]]:
     """Direct child directories of every bucket candidate (a cycle/component each)."""
     for base, meta in bucket_dirs(root, bucket, **kw):
-        for child in sorted(base.iterdir()):
+        try:
+            children = sorted(base.iterdir())
+        except OSError:
+            continue  # ordinary removal/move after inventory observation
+        for child in children:
             if _is_real_dir(child) and not child.name.startswith("."):
                 yield child, meta
 

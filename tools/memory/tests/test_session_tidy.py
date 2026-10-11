@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 
 from tidy_isolation import isolated_env  # noqa: E402
 import session_tidy as st  # noqa: E402
+import pane_ownership  # noqa: E402
 import session_tidy_clear as clear  # noqa: E402
 import tidy_transcripts as tt  # noqa: E402
 from test_tidy_isolation import FIXTURES, FIXTURE_NOW, load_opencode_fixture  # noqa: E402
@@ -46,12 +47,23 @@ class TidyCase(unittest.TestCase):
         self.cwd = self.iso.root / "proj"
         self.cwd.mkdir()
         self.state = self.iso.xdg_state / "hearting" / "session-tidy"
+        # These are card/clear fixtures on an already verified pane. Actual
+        # foreground/inherited-daemon provenance is tested with real ptys in
+        # utilities/pane_ownership.test.py; never add a production test bypass.
+        proof = mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda pane, *a, **kw: pane or "")
+        proof.start()
+        self.addCleanup(proof.stop)
 
     def cli(self, *args, pane=PANE, extra=None, input=None, cwd=None):
         env = dict(extra or {})
         if pane:
             env["HERDR_PANE_ID"] = pane
-        return self.iso.run([sys.executable, TIDY, *args], input=input, extra=env, cwd=cwd or self.cwd)
+        code = (f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r}); "
+                "import pane_ownership; "
+                "pane_ownership.verified_pane=lambda pane,*a,**kw: pane or ''; "
+                "import session_tidy; sys.argv=['session_tidy.py',*sys.argv[1:]]; "
+                "raise SystemExit(session_tidy.main())")
+        return self.iso.run([sys.executable, "-c", code, *args], input=input, extra=env, cwd=cwd or self.cwd)
 
     def hook(self, harness, event, sid, *more, pane=PANE, extra=None, cwd=None):
         result = self.cli("hook", "--harness", harness, "--event", event, "--session-id", sid,
@@ -263,7 +275,7 @@ class CardConsumeTest(TidyCase):
 
 class SeatTest(TidyCase):
 
-    def test_pane_is_the_seat_when_present_else_harness_and_project(self):
+    def test_verified_pane_is_the_seat_else_harness_and_project(self):
         with self.iso.patched_environ({"HERDR_PANE_ID": "test:p9"}):
             pane_a = st.resolve_seat("claude", str(self.cwd))
             pane_b = st.resolve_seat("codex", str(self.cwd))
@@ -445,8 +457,8 @@ class DaemonCodexSeatTest(TidyCase):
         self.agents([self.agent("w:p1", "t-A")])
         with self.iso.patched_environ(self.env):
             st.run_hook("codex", "start", "t-A", cwd=str(self.cwd), env={}, emit=lambda _t: None)
-            card = self.iso.run([sys.executable, TIDY, "card", "--harness", "codex", "--session-id", "t-A",
-                                 "--text", "표식-데몬"], extra=self.env, cwd=self.cwd)
+            card = self.cli("card", "--harness", "codex", "--session-id", "t-A",
+                            "--text", "표식-데몬", pane=None, extra=self.env, cwd=self.cwd)
         self.assertEqual(card.returncode, 0, card.stderr)
         self.assertIn(f"seat={self.pane_key('w:p1')}", card.stdout)
         # /clear: herdr keeps showing t-A, the auto-clear booking waits; t-B's start hook is the first sign of it.
