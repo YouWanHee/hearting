@@ -6046,6 +6046,11 @@ def _gpu_activity_tail(groups, warnings, available):
     warning = " ".join(warnings)
     if _dw(" · " + warning) > available:
         warning = warning.replace("unreserved+", "unres+").replace("reserved+", "res+")
+    if _dw(" · " + warning) > available:
+        warning = warning.replace("unres+", "U+").replace("res+", "R+")
+    if _dw(" · " + warning) > available:
+        warning = "/".join("U" if item.startswith("unreserved+") else "R"
+                           for item in warnings)
     warning_width = _dw(" · " + warning) if warning else 0
     room = available - warning_width - 3
     entries = ["%s×%d" % group for group in groups]

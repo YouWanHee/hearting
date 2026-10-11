@@ -80,6 +80,15 @@ class GPUOneLineTest(unittest.TestCase):
         self.gpu["reservations"] = []
         self.assertIn("unreserved+1", self.rows(80)[2])
 
+    def test_two_mismatch_labels_survive_a_long_host_in_80_columns(self):
+        self.host["host"] = "gpu-worker"
+        self.gpu["reservations"][-1]["owner"] = owner("opencode", "ff")
+        line = self.rows(80)[2]
+        self.assertIn("R+1 U+1", line)
+        self.assertIn("UTIL 100%", line)
+        self.assertIn("23/48GB ▸ 4", line)
+        self.assertLessEqual(render._dw(line), 79)
+
     def test_unknown_queries_do_not_claim_a_reservation_mismatch(self):
         reservations = self.gpu.pop("reservations")
         self.assertNotIn("unreserved+", self.rows(200)[2])

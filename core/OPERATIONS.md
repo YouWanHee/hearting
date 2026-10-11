@@ -1522,7 +1522,8 @@ the GPU occupied. `compute-hosts list` shows GPU reservations before CUDA has
 allocated memory. Fleet's folded compute panel uses one row per GPU, appending
 observed process counts by session tag, largest count first. Only differences
 between reserved and observed counts per session add short `reserved+N` or
-`unreserved+N` labels; unavailable observation is not an empty process sample.
+`unreserved+N` labels (`R+N`/`U+N` when space is tight); unavailable observation
+is not an empty process or reservation sample.
 The existing `p` expansion retains reservation owners, tasks, start times and
 process commands. The session summary shortens whole entries to `+N` at narrow
 widths without shifting the utilization and memory columns or adding rows.
