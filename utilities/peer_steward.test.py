@@ -143,6 +143,31 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
                     peer_steward._resume_message_obligation(duty, store)
             self.assertEqual(peer_steward._HERDR_SESSION, "caller")
 
+    def test_delay_notice_is_minted_once_across_replaced_checkpoints(self):
+        store = peer_steward.peer_obligations.ObligationStore()
+        sender = {"harness": "codex", "session_id": "sid-sender", "name": None}
+        duty = store.create("delay-" + "o" * 32, "message", {"server": "default"},
+                            {"delay_notice_for": "o" * 32, "target": "sid-sender",
+                             "body": "[notice] still pending", "from": {"harness": "claude"},
+                             "to": sender})
+        minted = []
+
+        def prepare(*a, **kw):
+            minted.append("n%031d" % len(minted))
+            return "text", minted[-1]
+
+        row = {"state": "pending", "to": sender, "created": time.time()}
+        with mock.patch.object(peer_steward.peer_message, "prepare_peer_message", side_effect=prepare), \
+             mock.patch.object(peer_steward.peer_message, "_read_pending", side_effect=lambda ref: row), \
+             mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", {"pane": "-"}, 0, None)):
+            for _ in range(3):
+                peer_steward._resume_message_obligation(store.get(duty["id"]), store)
+        self.assertEqual(len(minted), 1)
+        observation = store.get(duty["id"])["observation"]
+        self.assertEqual((observation["ref"], observation["reason"]),
+                         (minted[0], "target-identity-changed"))
+
     def test_watch_completion_consumes_real_bound_readiness_but_working_remains_native(self):
         from dispatch_contract import ObservedAttemptLiveness, claim_attempt_row, ATTEMPT_SCHEMA_VERSION
         class WatchExited(Exception):
