@@ -155,6 +155,44 @@ it is not enforcement.
 
 Older sealed routes may still contain the historical `deploy-authorization` binding. New default compiles use the start approval mark and inline readiness continuations.
 
+### Deployment by the interactive parent
+
+For an already approved deployment that the owner's runtime cannot execute, the
+owner prepares the exact deployment command as JSON: `{"argv":["/absolute/executable",
+"/absolute/deploy-script"],"cwd":"/absolute/source","timeout_seconds":300}`.
+Arguments naming existing files are hashed automatically; additional source or
+configuration files the command reads can be listed in `inputs`. The script
+retains the project's normal scope, target checks, rollback and private preimage
+handling. Do not put secrets in argv or the request.
+
+`hearting run ship-parent-deploy prepare --attempt-id <owner> --command-file <json>`
+returns a request bound to the same route and cycle's existing deploy record.
+The owner or its actual interactive parent may prepare it. Preparation also
+records whether that parent is on the host; a parent preparation before readiness
+reviews supplies executor availability, not a deployment or review PASS. Give
+the exact request to the existing independent readiness reviews and finish them
+within their existing ceilings. While waiting for parent execution the owner
+uses its ordinary BLOCKED handoff. If upgrading an older owner runtime, name the
+installed utility's absolute path in its existing correction; do not rewrite
+the sealed owner environment.
+
+The parent runs `hearting run ship-parent-deploy run --request <request> --check`
+to inspect readiness without mutation, then the same command without `--check`
+to execute the exact request once on the host. Current reviews, arbitration,
+stop/approval fences and command inputs are checked before spawn. Only that
+route's actual parent or its confirmed same-seat successor can execute it;
+dispatch owners and workers cannot. No access request is broadened. A running,
+failed or interrupted request is never retried automatically; inspect its
+retained execution evidence and the project's rollback procedure.
+
+The utility writes the execution result in the existing `deploy-record.json`
+and prints one `correction_command`. The parent runs it to deliver the result
+through the existing owner input path, obeying its `parent_next` receipt. The
+owner completes `deploy` using that record and resumes `post-deploy-verify`.
+Completion checks the bound successful execution receipt; the receipt does not
+substitute for post-deploy verification or assert service/DB health. Claude,
+Codex and OpenCode use this common utility and the same parent authority.
+
 ## Guard Requirements
 
 Adapters must preserve the portable invariants relevant to this capability:

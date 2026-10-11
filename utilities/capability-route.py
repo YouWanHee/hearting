@@ -8378,6 +8378,9 @@ def complete_node(
         except DispatchContractError as exc:
             raise ValueError(f"{exc.reason}:{exc.detail}") from exc
     # This completion proceeds on its predecessors: keep any gates-off edit of their evidence as history.
+    if node.get("completion_gate") == "ship-deploy":
+        from ship_parent_deploy import validate_completion
+        validate_completion(route, jobs or _compose_default_jobs(), evidence)
     _note_evidence_changes(route,node.get("depends_on",[]) if isinstance(node,dict) else [],jobs=jobs)
     if node.get("completion_gate") == "compose-owner-close":
         missing = owner_terminal_prerequisites(route, node, jobs or _compose_default_jobs())
