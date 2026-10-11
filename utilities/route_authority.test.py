@@ -62,6 +62,12 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertTrue(RA.owns(self.OWNER, "codex-sid", None))
         self.assertFalse(RA.owns(self.OWNER, "", None))
 
+    def test_handover_cannot_take_an_open_foreign_owner_with_an_empty_actor(self):
+        decision = RA.decide_continuation(action="handover", status="open", metadata=self.OWNER,
+                                          facts={"eligible": True, "actor": ""})
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "work-parent-recovery-required")
+
     def test_a_recorded_successor_inherits_on_any_harness(self):
         # RA-2 (stage 2): a recorded handover row moves the parent role across harnesses.
         self.assertTrue(self._owns_after("codex-sid-after-clear", "codex"))

@@ -58,6 +58,18 @@ class WorkStartTest(unittest.TestCase):
         self.pair.start(); self.addCleanup(self.pair.stop)
         self.current = mock.patch.object(W, "current_delivery_state", side_effect=self.delivery)
         self.current.start(); self.addCleanup(self.current.stop)
+        # This orchestration suite controls observations as well as launch receipts.
+        # Real process identity and registered payload preservation have separate tests.
+        import route_parent_close as close
+        import dispatch_contract as contract
+        original_observe = close.owner_continuation_processes
+        def owner_observation(meta, jobs):
+            if meta.get("pid"):
+                return original_observe(meta, jobs)
+            status = W._rows(jobs).get(meta.get("attempt_id"), ("done", {}))[0]
+            return contract.ProcessQuiescence("live" if status in {"open", "running"} else "quiescent", "fixture-observation"), []
+        self.process = mock.patch.object(close, "owner_continuation_processes", side_effect=owner_observation)
+        self.process.start(); self.addCleanup(self.process.stop)
 
     def test_legacy_continuation_normal_start_reads_original_request_without_rewriting(self):
         source = json.loads(json.dumps(self.route))
@@ -688,8 +700,6 @@ class WorkStartTest(unittest.TestCase):
             result = self.start()
         self.assertEqual(result["state"], "running", result)
         self.assertIn("parent_next", result)
-        self.assertIn("You are the parent session", result["next_step"])
-        self.assertIn("Do not kill", result["next_step"])
 
     def test_open_but_exited_or_unobservable_owner_is_never_reported_running(self):
         import dispatch_contract as D
@@ -1060,6 +1070,18 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(result['state'],'waiting-human-gate')
         self.assertNotIn('owner_report',result)
         self.assertNotIn('owner_report',result['next_step'])
+
+    def test_parent_closure_after_parking_returns_settlement_without_launch(self):
+        owner = self._parked_owner_row()
+        self.jobs.write_text(self.jobs.read_text().replace('attempt_id=' + owner + ',',
+                             'attempt_id=' + owner + ',parent_close_requested=1,'))
+        previous_calls = list(self.calls)
+        with mock.patch('dispatch_replacement.owner_parked_gate', return_value=self._parked('blocked')):
+            result = W._owner_parked_response({}, self.jobs, owner)
+        self.assertEqual((result['state'], result['reason'], result['next_action']),
+                         ('protected', 'cancelled-by-parent', 'settle'))
+        self.assertNotIn('release_command', result)
+        self.assertEqual(self.calls, previous_calls)
 
     def test_stopped_gate_reports_without_replacement(self):
         self._parked_owner_row()

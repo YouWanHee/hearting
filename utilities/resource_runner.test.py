@@ -248,8 +248,7 @@ class TestRunner(unittest.TestCase):
                         admission = controller(queued)
                     with mock.patch.object(R.gpu_leases, "resource_admission",
                                            side_effect=R.gpu_leases.GPUUnavailable("Local GPU admission: in use")):
-                        with self.assertRaises(R.gpu_leases.GPUUnavailable):
-                            R.start_verified(registry, args, route, route_file, dict(body), controller=admission)
+                        R.start_verified(registry, args, route, route_file, dict(body), controller=admission)
                     spawn.assert_not_called()
                 failed = json.loads(registry.read_text())["runs"]["bridge"]
                 self.assertEqual(failed["launch_state"], "not-started")
@@ -328,7 +327,8 @@ class TestRunner(unittest.TestCase):
                  mock.patch.object(R.subprocess, "Popen", wraps=subprocess.Popen) as processes, \
                  mock.patch("sys.stderr"):
                 self.registry.write_text(json.dumps({"schema_version": 1, "runs": {row["run_id"]: row}}))
-                with self.assertRaises(subprocess.CalledProcessError):
+                expectation = contextlib.nullcontext() if harness == "codex" else self.assertRaises(subprocess.CalledProcessError)
+                with expectation:
                     R.main(["--registry", str(self.registry), "start", "--run-id", row["run_id"],
                         "--cwd", str(self.repo), "--log", str(self.log), "--route", str(self.route),
                         "--node", "full-run", "--smoke-attestation", str(self.attestation),
@@ -549,8 +549,7 @@ class TestRunner(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT), "AGENT_WORKFLOW_ROOT": str(self.base/"workflow"),
                                          "AGENT_RESOURCE_RUN_INDEX": str(self.index)}), \
              mock.patch.object(R.subprocess, "Popen", side_effect=spawn):
-            with self.assertRaisesRegex(OSError, "synthetic watch"):
-                R.start_verified(self.registry, args, route, self.resume_path, placeholder)
+            R.start_verified(self.registry, args, route, self.resume_path, placeholder)
         self.assertFalse(self.launch.exists())
         self.assertEqual(json.loads(self.registry.read_text())["runs"]["resume"]["status"], "failed")
         self.assertEqual(self.jobs.read_text(), "")

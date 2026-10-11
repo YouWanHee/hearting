@@ -7750,6 +7750,7 @@ class ComposeRouteTest(TestRoute):
      "parent_completion_delivery=codex-managed-gateway\n")
     return subprocess.CompletedProcess(command,0,"registered=1 started=1 child_spawned=1\n","")
    with mock.patch.object(W,"default_parent_session_id",return_value="parent"), \
+        mock.patch("route_parent_close.owner_continuation_processes",return_value=(D.ProcessQuiescence("live","mock-owner-running"),[])), \
         mock.patch.object(W,"join_selected_attempts",return_value={"state":"timeout"}):
     for _ in range(2):
      result=W.start_work(route,path,jobs,run=admit)

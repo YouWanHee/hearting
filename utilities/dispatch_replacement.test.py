@@ -1895,15 +1895,27 @@ class ReplacementTest(unittest.TestCase):
         self.assertNotIn('closure-check', text)
 
     def test_a_fix_for_a_check_that_used_its_closure_check_makes_no_round(self):
+        import review_round_cap as CAP
         import route_authority as RA
         self._failed_owner(test_fails=3)                                  # cap 2 + its one closure-check
         self.assertEqual(RA.fix_answers(self.route, self.jobs.read_text().splitlines(), self.jobs),
                          ([], ['test:exhausted']))
         self.assertTrue(self._answer(text='another fix', request_id='fix-2')['retained'])
         result, commands = self._launch()
-        self.assertEqual(commands, [])
-        self.assertEqual(result.get('reason'), 'replacement-fix-round-spent', result)
-        self.assertFalse((R._directory(self.jobs) / 'claims').exists())
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'), result)
+        record = result['record']
+        self.assertEqual(record['proof']['answers'], [])
+        self.assertEqual(record['proof']['fallback_nodes'], ['test:exhausted'])
+        self.assertEqual(self.claim(), record)
+        instructions = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source',
+            worker_type='owner', jobs_path=self.jobs, attempt_id=record['replacement_attempt_id']))
+        self.assertIn('do not register another check round', instructions)
+        rows = R._rows(self.jobs.read_text().splitlines())
+        rounds = [(f[1], m) for f, m in rows.values() if m.get('route_node') == 'test']
+        budget = CAP.round_budget(self.route, next(n for n in self.route['nodes'] if n['id'] == 'test'), rounds,
+                                  revisions=R.answered_fix_revisions(self.jobs, 'rt-test'))
+        self.assertEqual((budget.state, budget.verdict_rounds), ('exhausted', 3))
+        self.assertTrue(all(m['failure_class'] == 'fail' for _, m in rounds))
 
     def test_a_fix_does_not_answer_a_check_bound_by_blocked_rounds(self):
         # RA-5: a FAIL followed by two BLOCKED rounds without progress binds the node; the

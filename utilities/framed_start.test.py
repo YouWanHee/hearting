@@ -40,6 +40,17 @@ T, R, P, L = F.T, F.R, F.P, F.L
 import route_plan as RP  # noqa: E402
 import work_start as W  # noqa: E402
 import frame_interview as FI  # noqa: E402
+import dispatch_contract as D  # noqa: E402
+from route_parent_close import owner_continuation_processes as REAL_OWNER_OBSERVATION  # noqa: E402
+
+
+def owner_observation(meta, jobs):
+    """Observe the fake launch row; exact PID fixtures keep the real observer."""
+    if meta.get("pid"):
+        return REAL_OWNER_OBSERVATION(meta, jobs)
+    status = W._rows(jobs).get(meta.get("attempt_id"), ("done", {}))[0]
+    return D.ProcessQuiescence("live" if status in {"open", "running"} else "quiescent",
+                               "fixture-observation"), []
 
 # `StartBase` replaces `R.proposal_readiness` with a fixture; the real function stays reachable here.
 REAL_PROPOSAL_READINESS = R.proposal_readiness
@@ -92,6 +103,9 @@ class StartBase(F.EndingBase):
         patch.start()
         self.addCleanup(patch.stop)
         self.interview = self.answers = None
+        patch = mock.patch("route_parent_close.owner_continuation_processes", side_effect=owner_observation)
+        patch.start()
+        self.addCleanup(patch.stop)
         self.set_briefs(DIRECT, DIRECT)
         self.set_interview({"legs": [DIRECT]})
 
@@ -1589,6 +1603,7 @@ def driver(context_path, crash_at):
             mock.patch.object(W, "_recorded_interview", return_value=(interview, answers)), \
             mock.patch.object(W, "default_parent_session_id", return_value="parent"), \
             mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}), \
+            mock.patch("route_parent_close.owner_continuation_processes", side_effect=owner_observation), \
             mock.patch.object(W, "parent_next", return_value=("end-turn", "fixture", "")):
         result = W._framed_settle(route, path, jobs, {"route_id": route["route_id"]}, run=run)
     print("RESULT " + json.dumps(result, sort_keys=True))
