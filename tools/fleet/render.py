@@ -5428,9 +5428,7 @@ def _register_compute_folds(base):
                      for entry in _compute_host_rows.fold_rows)
 
 
-def _gpu_process_rows(gpu, indent, width):
-    """Bounded command-only process rows; evidence stays in structured output."""
-    rows = []
+def _gpu_processes_by_memory(gpu):
     processes = [row for row in (gpu.get("processes") or ()) if isinstance(row, dict)]
     processes.sort(key=lambda process: (
         process.get("used_memory_mib") is None,
@@ -5438,18 +5436,32 @@ def _gpu_process_rows(gpu, indent, width):
         if isinstance(process.get("used_memory_mib"), (int, float)) else 0,
         process.get("pid") if isinstance(process.get("pid"), int) else 2**63,
     ))
-    ambiguous = _gpu_path_collisions(
-        _gpu_safe_text(process.get("command")) for process in processes)
+    return processes
+
+
+def _gpu_command_room(prefix, width):
+    # Curses' _addline reserves the rightmost cell; do not let its final
+    # clipping remove the suffix we deliberately kept here.
+    return max(0, width - 1 - sum(_dw(text) for text, _key in prefix))
+
+
+def _gpu_command_text(process, ambiguous):
+    command = _gpu_display_command(_gpu_safe_text(process.get("command")), ambiguous)
+    return command or os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
+
+
+def _gpu_process_rows(gpu, indent, width, ambiguous=None):
+    """Bounded command-only process rows; evidence stays in structured output."""
+    rows = []
+    processes = _gpu_processes_by_memory(gpu)
+    if ambiguous is None:
+        ambiguous = _gpu_path_collisions(
+            _gpu_safe_text(process.get("command")) for process in processes)
     for process in processes:
-        command = _gpu_display_command(_gpu_safe_text(process.get("command")), ambiguous)
-        if not command:
-            command = os.path.basename(_gpu_safe_text(process.get("process_name"))) or "process"
-        prefix = [(indent + "    ", None), ("↳ ", "dim")]
-        # Curses' _addline reserves the rightmost cell; do not let its final
-        # clipping remove the suffix we deliberately kept here.
-        room = max(0, width - 1 - sum(_dw(text) for text, _key in prefix))
-        row = prefix + [(_gpu_clip_command(command, room), "dim")]
-        rows.append(_clip_segs(row, width)[0])
+        prefix = [(indent + "  ", None), ("↳ ", "dim")]
+        command = _gpu_clip_command(_gpu_command_text(process, ambiguous),
+                                    _gpu_command_room(prefix, width))
+        rows.append(_clip_segs(prefix + [(command, "dim")], width)[0])
     return rows
 
 
@@ -5991,36 +6003,102 @@ def _gpu_status_text(status):
     return text
 
 
+def _gpu_session_key(owner):
+    if (isinstance(owner, dict) and owner.get("kind") == "session"
+            and owner.get("harness") in {"claude", "codex", "opencode"}
+            and isinstance(owner.get("id"), str) and owner["id"]):
+        return owner["harness"], owner["id"]
+    return None
+
+
+def _gpu_process_session_key(process):
+    return (_gpu_session_key(process.get("session_owner"))
+            or _gpu_session_key(process.get("owner")))
+
+
+def _gpu_lease_segs(lease):
+    """Owner, start and task of one reservation; the tag is the current one."""
+    owner = lease.get("owner") or {}
+    key = _gpu_session_key(owner)
+    tag = _resolve_session_tag(*key) if key else None
+    label = ("%s [%s]" % (key[0], tag) if tag else owner.get("label")
+             or "%s:%s" % (owner.get("harness", "?"), str(owner.get("id", "unknown"))[:8]))
+    started = lease.get("started_at")
+    when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
+    task = _gpu_safe_text(_readable_name(lease.get("task") or lease.get("run_id") or "?"))
+    return [(_gpu_safe_text(label), "tag"), (" · " + when + " · " + task, "dim")]
+
+
 def _gpu_reservation_rows(leases, indent, width, unplaced=False):
-    rows = []
+    prefix = "GPU reserved · device unknown · " if unplaced else "  reserved "
+    return [_clip_segs([(indent + prefix, "lvl_y")] + _gpu_lease_segs(lease), width)[0]
+            for lease in leases]
+
+
+def _gpu_run_pairs(leases, processes):
+    """Join each reservation to the processes of its own run.
+
+    The resource runner leads the process group its reservation records, so
+    lease pid == process pgid is exact. A run that left that group joins only
+    as its session's sole unjoined lease and process on this GPU.
+    """
+    pairs, joined = [], set()
     for lease in leases:
-        owner = lease.get("owner") or {}
-        label = owner.get("label") or "%s:%s" % (owner.get("harness", "?"), str(owner.get("id", "unknown"))[:8])
-        started = lease.get("started_at")
-        when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
-        task = _gpu_safe_text(_readable_name(lease.get("task") or lease.get("run_id") or "?"))
-        prefix = "GPU reserved · device unknown · " if unplaced else "  reserved "
-        row = [(indent + prefix, "lvl_y"), (_gpu_safe_text(label), "tag"),
-               (" · " + when + " · " + task, "dim")]
-        rows.append(_clip_segs(row, width)[0])
+        pid = lease.get("pid")
+        exact = isinstance(pid, int) and not isinstance(pid, bool)
+        matched = [process for process in processes
+                   if exact and process.get("pgid") == pid and id(process) not in joined]
+        joined.update(map(id, matched))
+        pairs.append((lease, matched))
+    rest = [process for process in processes if id(process) not in joined]
+    for lease, matched in pairs:
+        key = _gpu_session_key(lease.get("owner"))
+        if matched or key is None:
+            continue
+        leases_left = [other for other, found in pairs
+                       if not found and _gpu_session_key(other.get("owner")) == key]
+        processes_left = [process for process in rest if _gpu_process_session_key(process) == key]
+        if len(leases_left) == 1 and len(processes_left) == 1:
+            matched.append(processes_left[0])
+            rest.remove(processes_left[0])
+    return pairs, rest
+
+
+_GPU_RUN_COMMAND_MIN_W = 12   # below this a clipped command says less than the task name
+
+
+def _gpu_run_rows(gpu, indent, width):
+    """Expanded GPU: one row per run, its reservation and command together.
+
+    Unjoined reservations and processes keep their own rows; whether they
+    disagree is judged once, by the folded summary.
+    """
+    leases = [lease for lease in (gpu.get("reservations") or ()) if isinstance(lease, dict)]
+    processes = _gpu_processes_by_memory(gpu)
+    ambiguous = _gpu_path_collisions(
+        _gpu_safe_text(process.get("command")) for process in processes)
+    pairs, rest = _gpu_run_pairs(leases, processes)
+    rows = []
+    for lease, matched in pairs:
+        if not matched:
+            rows.extend(_gpu_reservation_rows([lease], indent, width))
+            continue
+        row = [(indent + "  ", None), ("↳ ", "dim")] + _gpu_lease_segs(lease)
+        more = [(" +%d" % (len(matched) - 1), "dim")] if len(matched) > 1 else []
+        room = _gpu_command_room(row + more, width) - _dw(" · ")
+        if room >= _GPU_RUN_COMMAND_MIN_W:
+            row += [(" · ", "dim"),
+                    (_gpu_clip_command(_gpu_command_text(matched[0], ambiguous), room), "dim")]
+        rows.append(_clip_segs(row + more, width)[0])
+    rows.extend(_gpu_process_rows({"processes": rest}, indent, width, ambiguous))
     return rows
 
 
 def _gpu_activity_summary(gpu, host):
     """Count observed processes by full session identity, not saved badge text."""
-    def session_key(owner):
-        if (isinstance(owner, dict) and owner.get("kind") == "session"
-                and owner.get("harness") in {"claude", "codex", "opencode"}
-                and isinstance(owner.get("id"), str) and owner["id"]):
-            return owner["harness"], owner["id"]
-        return None
-
-    observed = Counter()
-    for process in gpu.get("processes") or ():
-        if isinstance(process, dict):
-            key = session_key(process.get("session_owner")) or session_key(process.get("owner"))
-            observed[key] += 1
-    reserved = Counter(session_key(lease.get("owner"))
+    observed = Counter(_gpu_process_session_key(process)
+                       for process in gpu.get("processes") or () if isinstance(process, dict))
+    reserved = Counter(_gpu_session_key(lease.get("owner"))
                        for lease in gpu.get("reservations") or () if isinstance(lease, dict))
     groups = []
     for key, count in observed.items():
@@ -6212,8 +6290,7 @@ def _compute_host_rows(term_width=None, sessions=None, resources=None):
                 row += _gpu_activity_tail(groups, warnings, room)
             rows.append(_clip_segs(row, width)[0])
             if not folded:
-                rows.extend(_gpu_reservation_rows(gpu.get("reservations") or (), indent, width))
-                rows.extend(_gpu_process_rows(gpu, indent, width))
+                rows.extend(_gpu_run_rows(gpu, indent, width))
     return rows
 
 
