@@ -22,9 +22,11 @@ class FakeScreen:
     """The minimal stdscr surface _draw touches. No real curses window is ever created —
     _draw's only curses-module call (doupdate) is patched out at every call site below."""
 
-    def __init__(self, h=24, w=168):
+    def __init__(self, h=24, w=168, fail_rows=()):
         self.h, self.w = h, w
         self.erase_count = 0
+        self.writes = []
+        self.fail_rows = set(fail_rows)
 
     def getmaxyx(self):
         return self.h, self.w
@@ -33,7 +35,9 @@ class FakeScreen:
         self.erase_count += 1
 
     def addstr(self, row, col, text, attr=0):
-        pass
+        if row in self.fail_rows:
+            raise render.curses.error("fixture paint failure")
+        self.writes.append((row, col, text, attr))
 
     def chgat(self, y, x, n, attr):
         pass
@@ -51,7 +55,14 @@ class MouseEnv(unittest.TestCase):
         os.environ["FLEET_ACTION_STATE_DIR"] = self.state
         render.reset_selection()
         render._TOGGLE_ROWS = {}
+        render._TOGGLE_SPANS = {}
         render._CLICK_ROWS = {}
+        render._CLICK_SPANS = {}
+        render._FOLD_ROWS = {}
+        render._FOLD_SPANS = {}
+        render._REPO_FOLD = {}
+        render._REPO_FOLD_ROWS = {}
+        render._REPO_FOLD_SPANS = {}
         render._PROMPT_HITS = []
         render._OFFSET = 0
 
@@ -62,7 +73,14 @@ class MouseEnv(unittest.TestCase):
             os.environ["FLEET_ACTION_STATE_DIR"] = self._prev
         render.reset_selection()
         render._TOGGLE_ROWS = {}
+        render._TOGGLE_SPANS = {}
         render._CLICK_ROWS = {}
+        render._CLICK_SPANS = {}
+        render._FOLD_ROWS = {}
+        render._FOLD_SPANS = {}
+        render._REPO_FOLD = {}
+        render._REPO_FOLD_ROWS = {}
+        render._REPO_FOLD_SPANS = {}
         render._PROMPT_HITS = []
 
     def _draw_once(self, sessions, jobs=None, w=168, h=24):
@@ -76,6 +94,14 @@ class MouseEnv(unittest.TestCase):
             if entry["pid"] == pid:
                 return row
         raise AssertionError("pid %s never entered _CLICK_ROWS: %s" % (pid, render._CLICK_ROWS))
+
+    def _x_for(self, row):
+        x0, x1 = render._CLICK_SPANS[row][0]
+        return x0 + (x1 - x0 - 1) // 2
+
+    def _click_pid(self, pid):
+        row = self._row_for(pid)
+        return render._handle_mouse(self._x_for(row), row)
 
 
 class MouseSelectionTest(MouseEnv):
@@ -101,7 +127,7 @@ class MouseSelectionTest(MouseEnv):
     def test_row_click_selects_and_highlights(self):
         self._draw_once(self._rows())
         row = self._row_for(90001)
-        self.assertTrue(render._handle_mouse(5, row))
+        self.assertTrue(render._handle_mouse(self._x_for(row), row))
         self.assertTrue(render._SELECT_MODE)
         self.assertEqual(render._CURSOR_ID, (90001, "111"))
         self.assertIsNone(render._PROMPT, "첫 클릭은 선택이지 kill 요청이 아니다")
@@ -112,17 +138,17 @@ class MouseSelectionTest(MouseEnv):
         self._draw_once(self._rows())
         self.assertFalse(render._SELECT_MODE)
         row = self._row_for(90002)
-        self.assertTrue(render._handle_mouse(0, row))
+        self.assertTrue(render._handle_mouse(self._x_for(row), row))
         self.assertTrue(render._SELECT_MODE)
         self.assertEqual(render._CURSOR_ID, (90002, "222"))
 
     def test_second_click_same_row_raises_kill_prompt(self):
         self._draw_once(self._rows())
         row = self._row_for(90001)
-        render._handle_mouse(0, row)
+        render._handle_mouse(self._x_for(row), row)
         self._draw_once(self._rows())               # §4.4.1 — redraw between clicks
         row = self._row_for(90001)
-        render._handle_mouse(0, row)
+        render._handle_mouse(self._x_for(row), row)
         self.assertIsNotNone(render._PROMPT)
         self.assertEqual(render._PROMPT["stage"], "confirm")
         self.assertEqual(render._PROMPT["entry"]["pid"], 90001)
@@ -130,27 +156,36 @@ class MouseSelectionTest(MouseEnv):
     def test_second_click_does_not_reach_kill_target(self):
         self._draw_once(self._rows())
         row = self._row_for(90001)
-        render._handle_mouse(0, row)
+        render._handle_mouse(self._x_for(row), row)
         self._draw_once(self._rows())
         row = self._row_for(90001)
         with mock.patch.object(control, "kill_target") as k:
-            render._handle_mouse(0, row)
+            render._handle_mouse(self._x_for(row), row)
             k.assert_not_called()                    # a kill REQUEST is not a kill
 
     def test_click_other_row_moves_selection(self):
         self._draw_once(self._rows())
-        render._handle_mouse(0, self._row_for(90001))
+        self._click_pid(90001)
         self.assertEqual(render._CURSOR_ID, (90001, "111"))
-        render._handle_mouse(0, self._row_for(90002))
+        self._click_pid(90002)
         self.assertEqual(render._CURSOR_ID, (90002, "222"))
         self.assertIsNone(render._PROMPT)
 
     def test_click_outside_any_row_deselects(self):
         self._draw_once(self._rows())
-        render._handle_mouse(0, self._row_for(90001))
+        self._click_pid(90001)
         self.assertTrue(render._SELECT_MODE)
         render._handle_mouse(0, 999)                  # far outside any drawn row
         self.assertFalse(render._SELECT_MODE)
+
+    def test_click_outside_painted_session_cells_does_not_select(self):
+        self._draw_once(self._rows())
+        row = self._row_for(90001)
+        spans = render._CLICK_SPANS[row]
+        self.assertFalse(any(x0 <= 167 < x1 for x0, x1 in spans))
+        self.assertTrue(render._handle_mouse(167, row))
+        self.assertFalse(render._SELECT_MODE)
+        self.assertIsNone(render._PROMPT)
 
     def test_toggle_row_click_still_toggles_show_all(self):
         """rung 2 — checked ahead of the row map (§4.3): a toggle row is never a selectable
@@ -158,6 +193,8 @@ class MouseSelectionTest(MouseEnv):
         real-board condition that populates it is out of this step's scope)."""
         before = render._SHOW_ALL
         render._TOGGLE_ROWS = {5: True}
+        render._TOGGLE_SPANS = {5: [(2, 8)]}
+        render._HIT_VALID = True
         try:
             self.assertTrue(render._handle_mouse(2, 5))
             self.assertEqual(render._SHOW_ALL, not before)
@@ -171,7 +208,7 @@ class MouseSelectionTest(MouseEnv):
                     liveness="unused", elapsed_min=1)
         self._draw_once([me])
         row = self._row_for(os.getpid())
-        self.assertTrue(render._handle_mouse(0, row))
+        self.assertTrue(render._handle_mouse(self._x_for(row), row))
         self.assertFalse(render._SELECT_MODE)
         self.assertIsNone(render._CURSOR_ID)
 

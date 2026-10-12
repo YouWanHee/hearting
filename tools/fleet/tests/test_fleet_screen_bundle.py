@@ -312,7 +312,9 @@ class BundleTest(unittest.TestCase):
             self.assertEqual(sum("↳ python" in row for row in rows), 2)
             entry = next(e for e in render._FOLDABLE if e["card_key"] == ("gpu-commands", "gpu", 0))
             render._FOLD_ROWS = {4: entry}  # viewport offset already applied by _draw
-            self.assertTrue(render._handle_mouse(0, 4))
+            render._FOLD_SPANS = {4: [(4, 12)]}
+            render._HIT_VALID = True
+            self.assertTrue(render._handle_mouse(5, 4))
             rows = text(self.build([session("aa")]))
             self.assertFalse(any("↳ python train0" in row for row in rows))
             self.assertTrue(any("↳ python train1" in row for row in rows))
@@ -320,11 +322,12 @@ class BundleTest(unittest.TestCase):
             self.assertTrue(all(render._gpu_commands_folded("gpu", i) for i in (0, 1)))
         self.assertEqual(render._COMPUTE_HOSTS, original)
         self.assertIn("c GPU cmd", render._plain(render._footer_segs(False, [], 168)))
-        fake = mock.Mock()
+        fake = mock.Mock(BUTTON1_PRESSED=1, BUTTON4_PRESSED=2, BUTTON5_PRESSED=4)
         render._configure_input(fake, {})
-        fake.mousemask.assert_not_called()
+        fake.mousemask.assert_called_once_with(7)
+        fake.mousemask.reset_mock()
         render._configure_input(fake, {"FLEET_MOUSE": "1"})
-        fake.mousemask.assert_called_once()
+        fake.mousemask.assert_called_once_with(7)
 
     def test_memory_event_mode_skips_aggregate_sources_and_keeps_project_events(self):
         now = datetime.datetime(2026, 10, 8, 16, 0)
@@ -355,13 +358,15 @@ class BundleTest(unittest.TestCase):
             self.build([session("aa")], width=100)
             entry = next(e for e in render._FOLDABLE if e["card_key"] == ("gpu-commands", "gpu", 0))
             render._OFFSET = entry["line"] - 2
-            with mock.patch.object(render, "_addline"), mock.patch.object(render.curses, "doupdate"):
-                render._draw(FakeScreen(h=12, w=100), [session("aa")], [], "both", 0)
+            with mock.patch.object(render.curses, "doupdate"):
+                render._draw(FakeScreen(h=40, w=100), [session("aa")], [], "both", 0)
             row = next(y for y, e in render._FOLD_ROWS.items() if e["card_key"] == entry["card_key"])
-            self.assertEqual(row, entry["line"] - render._OFFSET)
+            self.assertEqual(row, entry["line"], "compute/GPU fold stays pinned while list scrolls")
             self.assertNotIn(row, render._CLICK_ROWS)
             self.assertNotIn(row, render._TOGGLE_ROWS)
-            render._handle_mouse(0, row)
+            render._HIT_VALID = True
+            render._FOLD_SPANS[row] = [(4, 12)]
+            render._handle_mouse(5, row)
             self.assertFalse(render._gpu_commands_folded("gpu", 0))
             self.assertTrue(render._gpu_commands_folded("gpu", 1))
             render._ROUTE_FOLD.clear()
