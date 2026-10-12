@@ -2,6 +2,7 @@
 import copy
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ def owner(harness="codex", sid="sid-one"):
 def session(harness="codex", sid="sid-one", name="TASLP 메인", alias=None):
     return SimpleNamespace(harness=harness, session_id=sid, runtime_name=name,
                            _herdr_name=alias, title="beta0 noaux epoch99",
-                           registry_name="vacant", slug="shared", cwd="/work/epoch99")
+                           registry_name="vacant", slug="shared", cwd="/work/TASLP-wt/epoch99")
 
 
 class GPUSessionLabelsTest(unittest.TestCase):
@@ -82,7 +83,8 @@ class GPUSessionLabelsTest(unittest.TestCase):
         for sessions in ([], [session(name=None)]):
             with self.subTest(sessions=sessions):
                 line = self.rows(sessions)[2]
-                self.assertIn("codex [a1]", line)
+                self.assertIn("[a1] TASLP" if sessions else "[a1]", line)
+                self.assertNotIn("codex", line)
                 for forbidden in ("vacant", "shared", "epoch99", "beta0", "sid-one"):
                     self.assertNotIn(forbidden, line)
 
@@ -92,7 +94,32 @@ class GPUSessionLabelsTest(unittest.TestCase):
         self.assertEqual(render._gpu_session_label(owner(), [session(alias="herdr alias")])[0],
                          "TASLP 메인 [a1]")
         self.assertEqual(render._gpu_session_label(owner(), [session(sid="sid-two", name="foreign")])[0],
-                         "codex [a1]")
+                         "[a1]")
+
+    def test_repo_fallback_uses_exact_harness_identity_and_parent_worktree_repo(self):
+        for harness, tag in (("claude", "c3"), ("codex", "a1"), ("opencode", "d4")):
+            with self.subTest(harness=harness):
+                self.assertEqual(render._gpu_session_label(owner(harness), [
+                    session(harness, name=None), session("foreign", name=None)]),
+                    ("[%s] TASLP" % tag, "[%s]" % tag))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "actual-repo"
+            gitdir = repo / ".git" / "worktrees" / "branch"
+            gitdir.mkdir(parents=True)
+            (gitdir / "commondir").write_text("../..\n")
+            worktree = Path(tmp) / "arbitrary-branch-name"
+            worktree.mkdir()
+            (worktree / ".git").write_text("gitdir: %s\n" % gitdir)
+            row = session(name=None)
+            row.cwd = str(worktree)
+            self.assertEqual(render._gpu_session_label(owner(), [row])[0], "[a1] actual-repo")
+
+    def test_no_tag_uses_short_id_and_observed_repo_not_harness(self):
+        row = session(sid="abcdefgh-one", name=None)
+        self.assertEqual(render._gpu_session_label(owner(sid=row.session_id), [row]),
+                         ("abcdefgh TASLP", "abcdefgh"))
+        row.cwd = ""
+        self.assertEqual(render._gpu_session_label(owner(sid=row.session_id), [row])[0], "abcdefgh")
 
     def test_full_identity_and_harness_are_preserved_for_all_three_harnesses(self):
         for harness, tag in (("claude", "c3"), ("codex", "a1"), ("opencode", "d4")):

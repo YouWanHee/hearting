@@ -72,7 +72,7 @@ class PeerEndpointLabelTest(unittest.TestCase):
         return _text(render._peer_link_strip(None, entry, tag_by_key)[0])
 
     def test_visible_endpoint_uses_its_badge(self):
-        self.assertIn("[3a] codex", self._label({("codex", self._SID): "3a"}))
+        self.assertIn("[3a]", self._label({("codex", self._SID): "3a"}))
 
     # These two pin the fallback ladder BELOW the badge, so the resolver is stubbed out.
     # Without the stub they read this machine's live session records: `_SID` is a real id,
@@ -85,10 +85,10 @@ class PeerEndpointLabelTest(unittest.TestCase):
         self.assertIn("peer-test-codex", text)
         self.assertNotIn(self._SID, text)
 
-    def test_nameless_offscreen_endpoint_is_harness_and_short_prefix(self):
+    def test_nameless_offscreen_endpoint_keeps_short_prefix_without_repo_evidence(self):
         with mock.patch.object(render, "_resolve_session_tag", return_value=None):
             text = self._label({})
-        self.assertIn("codex:01a084f7", text)
+        self.assertIn("01a084f7", text)
         self.assertNotIn(self._SID, text)
 
     def test_an_offscreen_endpoint_still_gets_its_badge_when_one_resolves(self):
@@ -96,11 +96,11 @@ class PeerEndpointLabelTest(unittest.TestCase):
         # happens to be on screen this tick.
         with mock.patch.object(render, "_resolve_session_tag", return_value="3a"):
             text = self._label({}, name="peer-test-codex")
-        self.assertIn("[3a] codex", text)
+        self.assertIn("[3a]", text)
 
     def test_the_badge_wins_over_a_name(self):
         text = self._label({("codex", self._SID): "3a"}, name="peer-test-codex")
-        self.assertIn("[3a] codex", text)
+        self.assertIn("[3a]", text)
         self.assertNotIn("peer-test-codex", text)
 
 
@@ -247,7 +247,7 @@ class OffScreenPeerTest(unittest.TestCase):
     def test_visible_target_upgrades_the_label_to_its_badge(self):
         a, b = self._fixture()
         rows = self._rows([a, b], show_all=True)
-        self.assertTrue(any("✉ ← [b0] claude" in t for t in rows))
+        self.assertTrue(any("✉ ← [b0] group2" in t for t in rows))
 
     def test_shape_is_identical_under_group_order_reversal(self):
         a, b = self._fixture()
@@ -334,11 +334,14 @@ class RelationLineBudgetTest(unittest.TestCase):
                 "age_min": 2}
         tags = {("", "sB"): "b0", ("", "sC"): "c0"}
         with mock.patch.object(render, "_resolve_session_tag", return_value=None):
-            segs = render._peer_link_strip(sent, recv, tags, term_width=46)[0]
+            segs = render._peer_link_strip(sent, recv, tags, term_width=46,
+                repo_by_key={("", "sB"): "repoB", ("", "sC"): "repoC"})[0]
         text = _text(segs)
         self.assertLessEqual(sum(render._dw(t) for t, _k in segs), 46)
         self.assertIn("[b0]", text)
         self.assertIn("[c0]", text)
+        self.assertIn("repoB", text)
+        self.assertIn("repoC", text)
         self.assertNotIn("steer", text)
 
 class LedgerAbsentByteIdenticalTest(unittest.TestCase):

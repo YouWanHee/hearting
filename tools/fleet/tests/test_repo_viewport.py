@@ -151,7 +151,8 @@ class RepoViewportTest(unittest.TestCase):
         self.assertTrue(any(value.get("repo_key") == "beta"
                             for value in render._CLICK_ROWS.values()))
 
-    def test_flat_builder_ignores_offset_and_fixed_rows_stay_pinned(self):
+    @mock.patch.object(render.time, "time", return_value=1770000000.0)
+    def test_flat_builder_ignores_offset_and_fixed_rows_stay_pinned(self, _clock):
         rows = [session(81200 + i, "/work/alpha", "task-%02d" % i) for i in range(14)]
         render._OFFSET = 0
         with mock.patch.object(render, "_BLINK_ON", False):

@@ -557,7 +557,7 @@ class PeerEndpointLabelTest(unittest.TestCase):
             segs = render._peer_endpoint_segs(
                 "claude", "7a001534-ea46-4a67-971b-199c586889e2",
                 "uds:/run/user/1002/cc-socks/2952102.sock", {})
-        self.assertEqual("".join(t for t, _ in segs), "claude:7a001534")
+        self.assertEqual("".join(t for t, _ in segs), "7a001534")
 
     def test_an_unusable_name_with_no_id_falls_back_to_the_harness(self):
         segs = render._peer_endpoint_segs("claude", None, "/tmp/x.sock", {})
@@ -567,7 +567,45 @@ class PeerEndpointLabelTest(unittest.TestCase):
         segs = render._peer_endpoint_segs(
             "claude", "7a001534-ea46-4a67-971b-199c586889e2", "/tmp/x.sock",
             {("claude", "7a001534-ea46-4a67-971b-199c586889e2"): "46"})
-        self.assertEqual("".join(t for t, _ in segs), "[46] claude")
+        self.assertEqual("".join(t for t, _ in segs), "[46]")
+
+
+class PeerRepoLabelsTest(unittest.TestCase):
+    def test_repository_labels_keep_full_harness_and_sid_identity(self):
+        repos = {("claude", "same-id"): "Cairn", ("codex", "same-id"): "hearting",
+                 ("opencode", "same-id"): "BC"}
+        for harness, sid in repos:
+            with self.subTest(harness=harness):
+                segs = render._peer_endpoint_segs(harness, sid, None,
+                    {(harness, sid): "42"}, repos)
+                self.assertEqual(render._plain(segs), "[42] " + repos[harness, sid])
+        with mock.patch.object(render, "_resolve_session_tag", return_value=None):
+            segs = render._peer_endpoint_segs("codex", "same-id", None, {}, repos)
+        self.assertEqual(render._plain(segs), "hearting:same-id")
+
+    def test_missing_repo_and_narrow_width_preserve_tag_and_relation(self):
+        entry = {"to_harness": "codex", "to_session_id": "same-id", "age_min": 0}
+        with mock.patch.object(render, "_resolve_session_tag", return_value="42"):
+            for width in (30, 60, 168):
+                rows = render._peer_link_strip(sent=entry, term_width=width,
+                    repo_by_key={("claude", "same-id"): "foreign"})
+                text = render._plain(rows[0])
+                self.assertIn("[42]", text)
+                self.assertNotIn("foreign", text)
+                self.assertNotIn("codex", text)
+                self.assertLessEqual(render._dw(text), width)
+
+    def test_build_lines_passes_repo_for_exact_peer_and_resumed_alias(self):
+        first = Session(harness="codex", pid=1, session_id="one", cwd="/work/hearting")
+        other = Session(harness="opencode", pid=2, session_id="two", cwd="/work/BC-wt/task")
+        other.session_aliases = ["prior-two"]
+        first.peer_last_sent = {"to_harness": "opencode", "to_session_id": "prior-two"}
+        with mock.patch.object(render, "_peer_link_strip", wraps=render._peer_link_strip) as strip, \
+                mock.patch.object(render, "_resolve_session_tag", return_value="42"):
+            render._build_lines([first, other], [], "both", False, 0, term_width=168)
+        repos = strip.call_args_list[0].kwargs["repo_by_key"]
+        self.assertEqual(repos["opencode", "prior-two"], "BC")
+        self.assertEqual(repos["codex", "one"], "hearting")
 
 
 class PeerEndpointOneShapeTest(unittest.TestCase):
@@ -586,12 +624,12 @@ class PeerEndpointOneShapeTest(unittest.TestCase):
                          "Claude Code 사용량 리셋 및 감독 인수인계"):
                 with self.subTest(name=name):
                     segs = render._peer_endpoint_segs("codex", "sid-1", name, {})
-                    self.assertEqual("".join(t for t, _ in segs), "[3a] codex")
+                    self.assertEqual("".join(t for t, _ in segs), "[3a]")
 
     def test_an_on_board_badge_beats_the_resolver(self):
         with mock.patch.object(render, "_resolve_session_tag", side_effect=AssertionError):
             segs = render._peer_endpoint_segs("claude", "sid-1", "x", {("claude", "sid-1"): "67"})
-        self.assertEqual("".join(t for t, _ in segs), "[67] claude")
+        self.assertEqual("".join(t for t, _ in segs), "[67]")
 
     def test_a_resolver_failure_never_breaks_the_row(self):
         with mock.patch.object(render, "_resolve_session_tag", side_effect=OSError("boom")):

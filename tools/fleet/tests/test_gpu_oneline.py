@@ -125,7 +125,7 @@ class GPUOneLineTest(unittest.TestCase):
             for detail in ("10-04", "detailed task", "detailed-name.yaml"):
                 self.assertIn(detail, line)
             self.assertLessEqual(render._dw(line), 199)
-        self.assertEqual(sum("codex [bb]" in line for line in runs), 3)
+        self.assertEqual(sum("[bb]" in line for line in runs), 3)
         self.assertNotIn("reserved", "\n".join(runs))
         self.assertNotIn("saved", "\n".join(runs))
         self.assertEqual(original, self.gpu)
@@ -135,9 +135,9 @@ class GPUOneLineTest(unittest.TestCase):
         render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
         lines = [line.strip() for line in self.rows(200)[3:]]
         self.assertEqual(len(lines), 7)
-        self.assertEqual(sum(line.startswith("↳ claude [8e] · ") and line.endswith(".yaml")
+        self.assertEqual(sum(line.startswith("↳ [8e] · ") and line.endswith(".yaml")
                              for line in lines), 1)
-        self.assertEqual(sum(line.startswith("reserved codex [bb] · ") for line in lines), 3)
+        self.assertEqual(sum(line.startswith("reserved [bb] · ") for line in lines), 3)
         self.assertEqual(lines.count("↳ python train.py --config detailed-name.yaml"), 3)
 
     def test_narrow_row_keeps_run_identity_and_counts_extra_processes(self):

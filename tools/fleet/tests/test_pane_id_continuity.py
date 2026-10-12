@@ -76,7 +76,7 @@ class PaneContinuityTest(unittest.TestCase):
                 self.assertEqual(child.steward_parents[0]["session_id"], "old")
             rows = render._build_lines([child, parent], [], "fleet", False, 0, term_width=100, layout="narrow")
             shown = "\n".join(render._plain(row) for row in rows if row)
-            self.assertIn("← [4d] " + harness, shown)
+            self.assertIn("← [4d] " + self.repo.name, shown)
             self.assertLess(shown.index("[4d]"), shown.index("[cb]"))
 
     def test_another_live_session_keeps_its_identity_and_pid_reuse_adds_no_alias(self):
