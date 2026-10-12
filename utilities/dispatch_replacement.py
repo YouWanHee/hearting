@@ -1145,7 +1145,9 @@ def admission(jobs, lines, metadata):
         own = metadata.get('attempt_id')
         peers = [line for line in lines
                  if not (own and len(line.split('\t')) == 6 and DC.row_has_attempt(line.split('\t')[5], own))]
-        _no_competing_successor(_rows(peers), prior, own)
+        # Legacy pre-registered candidates converge at their first launch claim;
+        # the shared admission under this same jobs lock rejects a committed
+        # sibling without letting unclaimed candidates deadlock one another.
         DC._automatic_retry_admission(peers, metadata)
         if source.get('replacement_original_attempt_id'):
             # A completed content result or frame's already-applied profile
