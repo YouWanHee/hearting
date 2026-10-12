@@ -259,8 +259,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         # Fail the watch identity check after real arm and wrapper spawn,
         # before the private fence permits the payload to execute.
         with mock.patch.object(SUP.runner().RESOURCE_RESUME, 'supervisor_alive', return_value=False):
-            with self.assertRaisesRegex(ValueError, 'resource-launch-identity-unconfirmed'):
-                self.launch(route, path, jobs, registry, output, body)
+            self.launch(route, path, jobs, registry, output, body, exit_code=125)
         row = json.loads(registry.read_text())['runs'][body['run_id']]
         self.assertEqual(row['launch_state'], 'not-started')
         self.assertFalse(Path(row['sentinel']).exists())
@@ -309,8 +308,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         with mock.patch.object(SUP.runner().gpu_leases, 'resource_admission',
                                side_effect=SUP.runner().gpu_leases.GPUUnavailable('unknown GPU 99')), \
              mock.patch.object(SUP, 'main') as arm:
-            with self.assertRaisesRegex(SUP.runner().gpu_leases.GPUUnavailable, 'unknown GPU 99'):
-                self.launch(route, path, jobs, registry, output, body)
+            self.launch(route, path, jobs, registry, output, body)
         arm.assert_not_called()
         row = json.loads(registry.read_text())['runs'][body['run_id']]
         self.assertTrue(SUP.RR.resource_never_started(row))
@@ -550,8 +548,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                         controller = SimpleNamespace(expected=copy.deepcopy(body), identity={**SUP.RR.proc_identity(os.getpid()),
                             'pid_namespace': os.readlink('/proc/self/ns/pid')}, command=body['command'],
                             sandbox='fixture', guard=contextlib.nullcontext)
-                    with self.assertRaisesRegex(ValueError, 'resource-parent-close-requested'):
-                        self.launch(route, path, jobs, registry, output, body, controller=controller, close_at=close_at)
+                    self.launch(route, path, jobs, registry, output, body, controller=controller,
+                                close_at=close_at, exit_code=125)
                     self.assertFalse(effect.exists())
                     self.assertEqual(ledger.claims(), {})
                     self.assertEqual(json.loads(registry.read_text())['runs']['next']['status'], 'failed')
@@ -688,8 +686,11 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                     ledger.record('run-verify', 'FAILED_TERMINAL', evidence={'reason': 'real-failure'})
                 body = self.next_body(registry, 'next', output)
                 if other:
-                    with self.assertRaisesRegex(ValueError, 'resource-watch-binding-conflict'):
-                        self.launch(route, path, jobs, registry, output, body)
+                    self.launch(route, path, jobs, registry, output, body)
+                    failed = json.loads(registry.read_text())['runs']['next']
+                    self.assertEqual(failed['launch_error']['message'], 'resource-watch-binding-conflict')
+                    self.assertTrue(SUP.RR.resource_never_started(failed))
+                    self.assertEqual(ledger.state()['nodes']['run-verify']['state'], 'FAILED_TERMINAL')
                 else:
                     self.launch(route, path, jobs, registry, output, body)
                     self.assertEqual(ledger.state()['workflow_state'], 'RUNNING')

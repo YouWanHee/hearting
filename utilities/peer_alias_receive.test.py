@@ -513,6 +513,31 @@ class PendingCallbacks(unittest.TestCase):
     setUp = AliasReceive.setUp
     rows = AliasReceive.rows
 
+    def test_opencode_peer_guidance_reaches_model_system_context_without_acceptance(self):
+        recipient = {"harness": "opencode", "session_id": "fixture-oc"}
+        text, ref = pm.prepare_peer_message("[handoff] exact card", self.sender, recipient, defer=True)
+        js = r'''
+import { pathToFileURL } from "node:url";
+const root = process.env.AGENT_HOME;
+const { AgentHarnessGuards } = await import(pathToFileURL(root + "/adapters/opencode/plugins/hearting-guards.js"));
+const hooks = await AgentHarnessGuards({directory: root, worktree: root, client: {session: {messages: async () => ({data: []})}}});
+await hooks["chat.message"]({sessionID: "fixture-oc", messageID: "exact-peer-turn"},
+  {message: {sessionID: "fixture-oc"}, parts: [{type: "text", text: process.env.FIXTURE_PEER_TEXT}]});
+const output = {system: []};
+await hooks["experimental.chat.system.transform"]({sessionID: "fixture-oc"}, output);
+console.log(JSON.stringify(output));
+'''
+        env = dict(os.environ, FIXTURE_PEER_TEXT=text)
+        # This test reaches only the native model-context boundary. Native
+        # external delivery and user memory are isolated by AliasReceive.setUp.
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=env,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        context = "\n".join(json.loads(run.stdout)["system"])
+        self.assertIn("send acceptance before processing", context)
+        self.assertIn("ACK are not execution", context)
+        self.assertNotIn("acceptance", pm._read_pending(ref))
+
     def test_opencode_normal_registration_and_callback_observation_is_bounded_and_fail_soft(self):
         js = r'''
 import { pathToFileURL } from "node:url";

@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import WRAPPER_PARENT_HARNESSES
 from dispatch_completion_join import (  # noqa: E402
     JoinContractError,
+    CompletionDeferred,
     CODEX_QUEUE_PARENT_DELIVERY,
     canonical_receipt_digest,
     MANAGED_SESSION_PARENT_DELIVERY,
@@ -548,6 +549,8 @@ def normalize_receipt(
             jobs=jobs,
             timing=timing,
         )
+    except CompletionDeferred:
+        raise
     except JoinContractError as exc:
         raise CompletionError("delivery-classification-failed") from exc
     originals = set(attempts)
@@ -1019,11 +1022,12 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 return advanced
 
             resume = bool(getattr(args, "_resume_execution", False))
+            deadline = time.monotonic() + (max(30.0, args.timeout) if resume else max(0.0, args.timeout))
             receipt = wait_for_batch(
                 join=lambda selected: run_join(args, selected),
                 attempts=attempts, jobs=args.jobs,
                 parent_attempt_id=delivery_parent_id(args),
-                deadline=None if resume else time.monotonic() + max(0.0, args.timeout),
+                deadline=deadline,
                 stop_check=None if resume else lambda: _receiver_unavailable_reason(args, monitored),
                 replacement_checkpoint=replacement_checkpoint,
             )
@@ -1048,18 +1052,40 @@ def _execute_once(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             if watcher is not None:
                 watcher.close()
         delivery_parent = delivery_parent_id(args)
-        normalized = normalize_receipt(
-            receipt,
-            jobs=args.jobs,
-            parent_attempt_id=args.parent_attempt_id,
-            parent_session_id=args.parent_session_id,
-            delivery_parent_id=delivery_parent,
-            attempts=attempts,
-            parent_completion_delivery=(
-                CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
-                else MANAGED_SESSION_PARENT_DELIVERY
-            ),
-        )
+        normalization_error = []
+        def project(selected):
+            try:
+                projected = normalize_receipt(
+                    receipt,
+                    jobs=args.jobs,
+                    parent_attempt_id=args.parent_attempt_id,
+                    parent_session_id=args.parent_session_id,
+                    delivery_parent_id=delivery_parent,
+                    attempts=attempts,
+                    parent_completion_delivery=(
+                        CODEX_QUEUE_PARENT_DELIVERY if args.queue_socket
+                        else MANAGED_SESSION_PARENT_DELIVERY
+                    ),
+                )
+            except CompletionDeferred:
+                raise
+            except CompletionError as exc:
+                normalization_error[:] = [exc]
+                return receipt
+            return projected
+        normalized = wait_for_batch(join=project, attempts=attempts, jobs=args.jobs,
+            parent_attempt_id=delivery_parent, deadline=deadline,
+            stop_check=None if resume else lambda: _receiver_unavailable_reason(args, attempts))
+        if normalization_error:
+            raise normalization_error[0]
+        if normalized.get("state") == "watch-expired":
+            reason = normalized.get("reason") or "watch-deadline"
+            if reason == "watch-deadline":
+                reason = "termination-pending"
+            if duty_id:
+                batch_obligations.update(args.jobs, duty_id, state="unknown", reason=reason,
+                    outcome=None, delivery="pending", effective_attempts=sorted(attempts))
+            return {"schema_version": 1, "status": "retryable", "reason": reason}, 75
         if duty_id:
             current = batch_obligations.read(args.jobs, duty_id) or {}
             lineage = normalized.get("replacement_lineage") or current.get("replacement_lineage") or []

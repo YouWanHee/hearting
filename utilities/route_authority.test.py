@@ -62,6 +62,12 @@ class Case1ParentSessionTest(unittest.TestCase):
         self.assertTrue(RA.owns(self.OWNER, "codex-sid", None))
         self.assertFalse(RA.owns(self.OWNER, "", None))
 
+    def test_handover_cannot_take_an_open_foreign_owner_with_an_empty_actor(self):
+        decision = RA.decide_continuation(action="handover", status="open", metadata=self.OWNER,
+                                          facts={"eligible": True, "actor": ""})
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "work-parent-recovery-required")
+
     def test_a_recorded_successor_inherits_on_any_harness(self):
         # RA-2 (stage 2): a recorded handover row moves the parent role across harnesses.
         self.assertTrue(self._owns_after("codex-sid-after-clear", "codex"))
@@ -1051,6 +1057,74 @@ class RelocationCorrectionTest(unittest.TestCase):
             self.assertTrue(result.allowed)
             self.assertEqual(set(result.route_ids), {"rt-selected", "rt-external"})
             self.assertEqual(set(seen), set(result.route_ids))
+
+
+class CancellationProofBoundaryTest(unittest.TestCase):
+    def test_live_cancelled_related_child_never_becomes_a_terminal_proof(self):
+        for state in ("live", "unverifiable"):
+            choice = RA.decide_continuation(action="terminal-child", status="open",
+                metadata={"parent_close_requested": "1"},
+                facts={"process": SimpleNamespace(state=state, reason="cleanup-pending")})
+            self.assertEqual((choice.allowed, choice.state, choice.reason), (False, "wait", "child-not-quiescent"))
+            self.assertTrue(choice.retry_when)
+
+    def test_quiet_cancel_request_still_requires_the_terminal_writer(self):
+        choice = RA.decide_continuation(action="terminal-child", status="open",
+            metadata={"parent_close_requested": "1"},
+            facts={"process": SimpleNamespace(state="quiescent", reason="exited")})
+        self.assertEqual((choice.allowed, choice.reason, choice.next_action),
+                         (False, "child-not-terminal", "same-command"))
+
+    def test_cancelled_record_keeps_conflict_obligation_and_existing_record_action(self):
+        metadata = {"note": "cancelled-by-parent", "failure_class": "cancelled", "terminal_conflict": "1"}
+        decision = RA.decide_continuation(action="attempt", status="done", metadata=metadata,
+            facts={"process_state": "quiescent"})
+        self.assertEqual(decision.next_action, "inspect-conflict")
+        self.assertEqual(RA.decide_continuation(action="attempt-action", status="done", metadata=metadata).next_action,
+                         "advance-completed")
+
+    def test_quiet_committed_results_do_not_wait_for_their_cancellation_intent_again(self):
+        for note, failure in (("completed-marker", "pass"), ("dead-worker-fail", "fail"),
+                              ("cancelled-by-parent", "cancelled")):
+            metadata = {"note": note, "failure_class": failure, "parent_close_requested": "1"}
+            original = dict(metadata)
+            choice = RA.decide_continuation(action="terminal-child", status="done", metadata=metadata,
+                facts={"process": SimpleNamespace(state="quiescent", reason="cleanup-settled")})
+            self.assertTrue(choice.allowed, note)
+            metadata["terminal_conflict"] = "1"
+            conflict = RA.decide_continuation(action="terminal-child", status="done", metadata=metadata,
+                facts={"process": SimpleNamespace(state="quiescent", reason="cleanup-settled")})
+            self.assertEqual((conflict.allowed, conflict.reason), (False, "transaction-conflict"))
+            self.assertEqual({k: v for k, v in metadata.items() if k != "terminal_conflict"}, original)
+            execution = RA.decide_continuation(action="attempt", status="done", metadata=original,
+                facts={"process_state": "live"})
+            self.assertIn(execution.next_action, {"cancel", "settle-cancellation"})
+
+
+class InputContinuationBoundaryTest(unittest.TestCase):
+    def test_only_original_input_admissions_pass_for_each_harness(self):
+        quiet, unknown = SimpleNamespace(state="quiescent", reason="exited"), SimpleNamespace(state="unverifiable", reason="identity-missing")
+        cases = [
+            ("cancelled", {}, quiet, True, True, False, "settle"),
+            ("killed", {}, quiet, True, True, False, "settle"),
+            ("done", {"note": "completed-marker"}, quiet, True, True, False, "settle"),
+            ("open", {}, quiet, False, True, False, "wait"),
+            ("open", {}, unknown, True, False, False, "wait"),
+            ("done", {"note": "dead-worker-blocked"}, unknown, False, False, True, "retained"),
+            ("done", {"note": "dead-worker-fail", "failure_class": "fail", "worker_type": "owner"}, unknown, False, False, True, "retained"),
+            ("done", {"note": "dead-runtime-exit", "worker_type": "owner", "launch_started": "1",
+                      "supervisor_lease": "flock-v1", "supervisor_lease_file": "/unused"}, unknown, False, False, False, "wait"),
+        ]
+        for harness in ("claude", "codex", "opencode"):
+            for status, metadata, process, accepting, reachable, allowed, state in cases:
+                with self.subTest(harness=harness, status=status, note=metadata.get("note"), accepting=accepting):
+                    choice = RA.decide_continuation(action="owner-input", status=status,
+                        metadata={"harness": harness, **metadata}, facts={"process": process,
+                            "accepting": accepting, "reachable": reachable})
+                    self.assertEqual((choice.allowed, choice.state), (allowed, state))
+                    if state == "wait":
+                        self.assertEqual(choice.next_action, "same-command")
+                        self.assertTrue(choice.retry_when)
 
 
 if __name__ == "__main__":

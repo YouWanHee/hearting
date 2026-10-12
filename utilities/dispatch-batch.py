@@ -63,7 +63,7 @@ from dispatch_allocation import (  # noqa: E402
     attempt_counts,
 )
 import subdivision_batch_admission as SUBDIVISION_ADMISSION  # noqa: E402
-from route_authority import route_in_force, sealed_pin_harness  # noqa: E402
+from route_authority import decide_continuation, route_in_force, sealed_pin_harness  # noqa: E402
 
 CAPACITY_SPEC = importlib.util.spec_from_file_location(
     "harness_capacity", ROOT / "utilities" / "harness-capacity.py"
@@ -2299,34 +2299,15 @@ def main(argv: list[str] | None = None) -> int:
             round_admissions[capped_node_id] = admission
             budget = admission.budget
             planned_revision_nodes.update(admission.planned_revision_nodes)
-            if budget.state == "blocked-live":
-                raise BatchError(
-                    "prior-attempt-still-live",
-                    f"route_id={route['route_id']} route_node={capped_node_id}",
-                    route_node=capped_node_id,
-                )
-            if budget.state == "blocked-unsettled":
-                raise BatchError(
-                    "round-unsettled",
-                    f"route_id={route['route_id']} route_node={capped_node_id}",
-                    route_node=capped_node_id,
-                )
-            if budget.state == "exhausted":
-                raise BatchError(
-                    "review-round-budget-exhausted",
+            choice = decide_continuation(route, action="round", node=capped_node, facts={"budget": budget})
+            if not choice.allowed:
+                error = BatchError(choice.reason,
                     f"route_id={route['route_id']} route_node={capped_node_id} "
                     f"effective_intensity={route['effective_intensity']} "
                     f"round={budget.next_round} max_round={budget.cap}",
-                    route_node=capped_node_id,
-                )
-            if budget.state == "verdictless-bound":
-                raise BatchError(
-                    "review-verdictless-bound",
-                    f"route_id={route['route_id']} route_node={capped_node_id} "
-                    f"effective_intensity={route['effective_intensity']} "
-                    f"round={budget.next_round} max_round={budget.cap}",
-                    route_node=capped_node_id,
-                )
+                    route_node=capped_node_id)
+                error.next_action, error.retry_when = choice.next_action, choice.retry_when
+                raise error
         # Only an unmet group opens a new round. A successful group replay
         # retains its sealed attempts and spends no fresh capacity.
         historical_batch_attempts = (frozenset().union(*(
@@ -2409,7 +2390,7 @@ def main(argv: list[str] | None = None) -> int:
         # of harness families; the sole-gate rule that actually refused it lived
         # only on the exception object and died here, leaving PRD 13.30.2's "no
         # silent path" with nothing typed anywhere in the cycle.
-        extra = {}
+        extra = {"retry_when": exc.retry_when} if getattr(exc, "retry_when", "") else {}
         if reason in {"review-round-budget-exhausted", "review-verdictless-bound"}:
             capped = next((n for n in nodes if n["id"] == getattr(exc, "route_node", None)), {})
             state = "verdictless-bound" if reason == "review-verdictless-bound" else "exhausted"

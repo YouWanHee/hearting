@@ -982,7 +982,8 @@ def _parents(payload: Mapping[str, Any]) -> tuple[str, ...]:
         raise SyncInvariantError("parents must be lowercase operation IDs")
     if raw != sorted(set(raw)):
         raise SyncInvariantError("parents must be sorted and duplicate-free")
-    return tuple(raw)
+    extra = payload.get("namespace_parents", ()) if payload.get("schema_minor") == 1 else ()
+    return tuple(sorted(set(raw) | set(extra)))
 
 
 def _advance_replica_counter(
@@ -1038,6 +1039,25 @@ def _advance_replica_counter(
         )
 
 
+def project_aliases(connection: sqlite3.Connection, project: str) -> tuple[str, ...]:
+    """Read equivalent addresses from successfully applied immutable rekeys."""
+    protocol = _protocol_module()
+    links: dict[str, set[str]] = {}
+    for logical, raw in connection.execute(
+            "SELECT o.project_key,o.payload_bytes FROM sync_objects o JOIN sync_applied a "
+            "ON a.op_id=o.op_id WHERE o.kind='rekey' AND a.result IN ('local','folded')"):
+        serving = protocol.serving_project(protocol.canonical_loads(bytes(raw)))
+        links.setdefault(logical, set()).add(serving)
+        links.setdefault(serving, set()).add(logical)
+    found, stack = {project}, [project]
+    while stack:
+        for other in links.get(stack.pop(), ()):
+            if other not in found:
+                found.add(other)
+                stack.append(other)
+    return tuple(sorted(found))
+
+
 def record_local_operation(
     connection: sqlite3.Connection,
     operation: Mapping[str, Any],
@@ -1087,6 +1107,24 @@ def record_local_operation(
         raise SyncInvariantError("kind must be a non-empty string")
     parents = _parents(payload)
     frontiers = _frontiers(payload)
+    serving_project = protocol.serving_project(payload)
+    frontier_project = serving_project
+    if kind == "rekey":
+        # The prior serving address comes from the immutable parent state;
+        # logical operation namespaces never change across a rename.
+        prior_projects = set()
+        for record_id, declared_heads in frontiers:
+            for head in declared_heads:
+                row = connection.execute(
+                    "SELECT payload_bytes FROM sync_objects WHERE op_id=?", (head,)).fetchone()
+                if row is not None:
+                    parent = protocol.canonical_loads(bytes(row[0]))
+                    for mutation in parent["mutations"]:
+                        if mutation["record_id"] == record_id and "post_state" in mutation:
+                            prior_projects.add(mutation["post_state"]["cwd_origin"])
+        if len(prior_projects) != 1:
+            raise SyncInvariantError("rekey requires one exact prior serving project")
+        frontier_project = next(iter(prior_projects))
     object_path = _operation_path(protocol, op_id)
     reserved_seed: tuple[Any, ...] | None = None
     if seed_binding is not None:
@@ -1167,13 +1205,15 @@ def record_local_operation(
             f"replica dot is already bound to operation {duplicate_dot[0]}"
         )
 
+    frontier_projects = project_aliases(connection, frontier_project)
+    placeholders = ','.join('?' for _ in frontier_projects)
     for record_id, declared_heads in frontiers:
         actual_heads = tuple(
             row[0]
             for row in connection.execute(
                 "SELECT op_id FROM sync_frontier "
-                "WHERE project_key=? AND record_id=? ORDER BY op_id",
-                (project_key, record_id),
+                f"WHERE project_key IN ({placeholders}) AND record_id=? ORDER BY op_id",
+                (*frontier_projects, record_id),
             )
         )
         if actual_heads != declared_heads:
@@ -1216,13 +1256,13 @@ def record_local_operation(
         if declared_heads:
             connection.executemany(
                 "DELETE FROM sync_frontier "
-                "WHERE project_key=? AND record_id=? AND op_id=?",
-                ((project_key, record_id, head) for head in declared_heads),
+                f"WHERE project_key IN ({placeholders}) AND record_id=? AND op_id=?",
+                ((*frontier_projects, record_id, head) for head in declared_heads),
             )
         connection.execute(
             "INSERT INTO sync_frontier(project_key, record_id, op_id, source) "
             "VALUES (?, ?, ?, 'local')",
-            (project_key, record_id, op_id),
+            (serving_project, record_id, op_id),
         )
     connection.execute(
         "INSERT INTO sync_applied(op_id, result) VALUES (?, 'local')", (op_id,)

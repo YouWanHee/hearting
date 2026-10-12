@@ -468,7 +468,7 @@ def _write_exclusive(path: Path, data: bytes) -> None:
         os.unlink(temporary)
 
 
-def load_producer_binding(*, artifact_root: Path, route_id: str, owner_attempt_id: str) -> ProducerBindingResult:
+def load_producer_binding(*, artifact_root: Path, route_id: str, owner_attempt_id: str, historical: bool = False) -> ProducerBindingResult:
     path = producer_binding_path(artifact_root, route_id, owner_attempt_id)
     try:
         raw = path.read_bytes()
@@ -484,7 +484,7 @@ def load_producer_binding(*, artifact_root: Path, route_id: str, owner_attempt_i
     if not isinstance(value, dict) or value.get("contract") != CONTRACT:
         raise TerminalCommitError("producer-binding-mismatch", str(path))
     if (value.get("owner_attempt_id") != owner_attempt_id or value.get("route_id") != route_id
-            or value.get("artifact_root") != str(Path(artifact_root).resolve())):
+            or (not historical and value.get("artifact_root") != str(Path(artifact_root).resolve()))):
         raise TerminalCommitError("producer-binding-mismatch", "binding-identity")
     identity = artifact_lifecycle.read_root_identity(Path(artifact_root))
     if identity is None or value.get("root_identity") != {
@@ -964,7 +964,7 @@ def _related_route_identity(metadata, route):
 
 def _prove_route_children(request, route, gates):
     """Use the shared attempt policy for initial closure and every replay."""
-    from dispatch_attempt_policy import decide_attempt
+    from route_authority import decide_continuation
     related = []
     seen_attempts = set()
     for row_index, line in enumerate(Path(request.jobs).read_text(encoding="utf-8").splitlines()):
@@ -997,25 +997,20 @@ def _prove_route_children(request, route, gates):
         # through owner_route_* and inline markers intentionally have no row.
         # A passed exact-terminal gate is itself the shared current/readiness
         # proof.
-        if not gate.get("passed"):
-            return _proof_failure("terminal-attempt-not-pass")
+
+    choice = decide_continuation(action="completion-state", facts={"gate_only": True,
+        "gates": {key: gate for key, gate in gates.items() if gate.get("source") != "owner-terminal"}})
+    if not choice.allowed:
+        return _proof_failure("terminal-attempt-not-pass")
     for status, meta, fields in related:
-        if status == "done" and dispatch_contract.completed_marker_verdict_contradicts(meta):
-            return _proof_failure("terminal-attempt-not-pass")
-        if status == "done" and dispatch_contract.attempt_row_never_started(fields):
-            # Registered, never claimed for launch, then closed: no process ever
-            # existed to wait for. This is the same launch-fence judgment used
-            # by runtime-wait partitioning; claimed or ambiguous rows remain
-            # subject to normal process quiescence proof.
-            continue
-        process = dispatch_contract.attempt_process_quiescence(meta, terminal_receipt=True)
-        decision = decide_attempt(status, meta, process_state=process.state, process_reason=process.reason)
-        if decision.action == "inspect-conflict":
-            return _proof_failure("transaction-conflict", "child-terminal-conflict")
-        if decision.action == "reconcile":
-            return _proof_failure("child-not-terminal")
-        if decision.action in {"wait", "recover"}:
-            return _proof_failure("child-not-quiescent")
+        never_started = status == "done" and dispatch_contract.attempt_row_never_started(fields)
+        choice = decide_continuation(action="terminal-child", status=status, metadata=meta,
+            facts={"contradiction": status == "done" and dispatch_contract.completed_marker_verdict_contradicts(meta),
+                   "never_started": never_started,
+                   "process": None if never_started else
+                       dispatch_contract.attempt_process_quiescence(meta, terminal_receipt=True)})
+        if not choice.allowed:
+            return _proof_failure(choice.reason, choice.detail or None)
     # Retry timestamps record history. Real rows and the shared jobs-lock
     # terminal claim decide what remains active and fence every later start.
     return TerminalProof("proved")
@@ -1078,7 +1073,7 @@ def prove_terminal_authority(request: TerminalCommitRequest) -> TerminalProof:
 _EVIDENCE_MOVED_ON = frozenset({"completion-evidence-revised-unrecorded", "completion-evidence-unreadable"})
 
 
-def _settled_gate_rows(route_module, route, request, gates):
+def _settled_gate_rows(route_module, route, request, gates, *, historical=False):
     """Replay the terminal rows already bound by the closed route outcome.
 
     The outcome/claim/commit identity remains authoritative. Live gate reads
@@ -1118,7 +1113,7 @@ def _settled_gate_rows(route_module, route, request, gates):
                     and re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("evidence_digest") or ""))
                     and re.fullmatch(r"[0-9a-f]{64}", str(candidate.get("marker_digest") or ""))):
                 rebuilt = dict(candidate)
-        if (rebuilt is None and not getattr(route_module, "owner_executed_terminal", lambda _node: False)(node)):
+        if (rebuilt is None and (historical or not getattr(route_module, "owner_executed_terminal", lambda _node: False)(node))):
             try:
                 path = route_module.completion_dir(route["route_id"], jobs=request.jobs) / f"{node_id}.json"
                 raw = path.read_bytes()
@@ -1210,6 +1205,13 @@ def _reverify_forward_recovery(
     return TerminalProof("proved", None, "forward-recovery-replay")
 
 
+def _unsettled_result(reason, detail=None):
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="terminal-result", facts={"reason": reason, "detail": detail or ""})
+    return TerminalCommitResult(choice.state, reason, detail,
+        next_step={"action": choice.next_action, "retry_when": choice.retry_when} if choice.retry_when else None)
+
+
 def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None) -> TerminalCommitResult:
     production_services = services is None
     services = services if services is not None else TerminalCommitServices()
@@ -1236,8 +1238,7 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         proof = prove_terminal_authority(request)
     if proof.status != "proved":
         _record_attempt(request, proof.reason or "recovery-unavailable", proof.detail or "")
-        result_kind = "recoverable" if proof.reason == "transaction-conflict" else "ineligible"
-        return TerminalCommitResult(result_kind, proof.reason, proof.detail)
+        return _unsettled_result(proof.reason, proof.detail)
     try:
         route = json.loads(Path(request.route_file).read_text(encoding="utf-8"))
         route_module = _route_module()
@@ -1442,7 +1443,7 @@ def settle_terminal_commit(request: TerminalCommitRequest, services: Any = None)
         return TerminalCommitResult("recoverable", "recovery-unavailable", "partial-state", terminal_nodes)
     except TerminalCommitError as exc:
         _record_attempt(request, exc.code, exc.detail)
-        return TerminalCommitResult("recoverable" if exc.code in {"route-close-failed", "producer-finalize-failed", "recovery-unavailable"} else "ineligible", exc.code, exc.detail)
+        return _unsettled_result(exc.code, exc.detail)
     except RuntimeError as exc:
         _record_attempt(request, "recovery-unavailable", str(exc))
         return TerminalCommitResult("recoverable", "recovery-unavailable", str(exc))
@@ -1512,7 +1513,7 @@ def _read_sealed_owner_envelope(request, commit_id):
     return _sealed_owner_envelope(request, commit_id)[0]
 
 
-def _verify_settled_outputs(request, route, commit_id, binding):
+def _verify_settled_outputs(request, route, commit_id, binding, *, historical=False):
     outcome = json.loads(_route_module().outcome_path(request.route_file).read_text())
     if (outcome.get("terminal_commit_id") != commit_id
             or outcome.get("terminal_gate_proven") is not True
@@ -1522,7 +1523,8 @@ def _verify_settled_outputs(request, route, commit_id, binding):
         raise TerminalCommitError("transaction-conflict", "settled-outcome-mismatch")
     if binding is not None:
         import artifact_producer
-        _producer_operation(artifact_producer.verify_finalized_cycle, request.artifact_root,
+        _producer_operation(artifact_producer.observe_finalized_cycle if historical else
+                            artifact_producer.verify_finalized_cycle, request.artifact_root,
             cycle_id=binding["cycle_id"], expected_binding=binding)
 
 
@@ -1694,6 +1696,13 @@ def owner_workflow_gaps(jobs, metadata, route):
     return missing  # The executor's own handoff can only be proved after it exits.
 
 
+def _completion_owner_choice(jobs, status, metadata, *, executing=False):
+    import route_parent_close
+    from route_authority import decide_continuation
+    return decide_continuation(action="completion-owner", status=status, metadata=metadata,
+        facts={"closing": route_parent_close.row_requested(metadata, jobs), "executing": executing})
+
+
 def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
     """Keep the executing owner until the declared work can enter settlement.
 
@@ -1703,16 +1712,14 @@ def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
     """
     from dispatch_completion_join import exact_attempt_row
     row = exact_attempt_row(Path(jobs), owner_attempt_id)
-    import route_parent_close
-    if route_parent_close.row_requested(row.metadata, jobs):
+    if not _completion_owner_choice(jobs, row.status, row.metadata, executing=True).allowed:
         return None
-    if row.metadata.get("workflow_completion") != "runtime-v1":
-        return None
-    if row.status not in {"open", "running"}:
-        return None  # Never re-execute an already committed attempt.
     route = json.loads(Path(route_file).read_text())
     missing = owner_workflow_gaps(jobs, row.metadata, route)
-    if not missing:
+    from route_authority import decide_continuation
+    choice = decide_continuation(action="completion-state", facts={"gate_only": True,
+        "gates": {node: {"passed": False, "reason": reason} for node, reason in missing.items()}})
+    if choice.allowed:
         return None
     return (
         "[workflow-completion-pending]\n"
@@ -1726,13 +1733,75 @@ def owner_workflow_continuation(jobs, owner_attempt_id, route_file):
     )
 
 
+def _historical_request(jobs, status, metadata):
+    """Locate a past transaction without granting current launch authority."""
+    if not _completion_owner_choice(jobs, status, metadata).allowed:
+        return None
+    import owner_route_binding
+    fields, meta = owner_route_binding._owner_snapshot(Path(jobs), metadata["attempt_id"])
+    # Standard owners follow recorded route adoption. Quick owners seal route_*.
+    owner, _ = owner_route_binding.resolve_owner_route_lifecycle(
+        Path(jobs), owner_attempt_id=metadata["attempt_id"])
+    path = Path(owner.route_file if owner else meta.get("route_file", "")).resolve()
+    route = json.loads(path.read_text())
+    digest = route_identity.route_hash(route)
+    if (route.get("route_hash") != digest or route.get("route_id") != route_identity.route_id_from_hash(digest)
+            or (owner and (owner.route_id != route["route_id"] or owner.route_hash != digest))
+            or (not owner and (route.get("effective_intensity") != "quick"
+                or meta.get("route_id") != route["route_id"] or meta.get("route_hash") != digest))
+            or fields[1] not in {"open", "running", "done"} or meta.get("attempt_id") != metadata["attempt_id"]
+            or meta.get("registered_worker") != "1" or meta.get("dispatch_depth") != "1"
+            or meta.get("worker_type") != "owner" or meta.get("harness") not in dispatch_contract.WRAPPER_PARENT_HARNESSES
+            or (fields[1] == "done" and not verdict_pass(meta))):
+        raise TerminalCommitError("route-identity-unverified", "historical-owner-identity")
+    root = Path(route["artifact_root"]).resolve()
+    # Canonical route placement is an existing locator, not a filesystem search.
+    if path.parent.name == "routes" and path.parent.parent.name == ".runtime":
+        root = path.parent.parent.parent
+    return TerminalCommitRequest(path, metadata["attempt_id"], Path(jobs), root)
+
+
+def _observe_settled_transaction(request, state):
+    """Prove immutable history and current obligations without locks or repairs."""
+    route = json.loads(request.route_file.read_text())
+    module = _route_module()
+    gates = _settled_gate_rows(module, route, request,
+        {n["id"]: {} for n in route.get("nodes", []) if n.get("terminal")}, historical=True)
+    binding = (load_producer_binding(artifact_root=request.artifact_root,
+        route_id=route["route_id"], owner_attempt_id=request.owner_attempt_id,
+        historical=True) if producer_lifecycle_applies(route) else None)
+    if binding and binding.binding.get("route_hash") != route["route_hash"]:
+        raise TerminalCommitError("producer-binding-mismatch", "route-hash")
+    producer_digest = binding.digest if binding else _digest(_canonical({
+        "contract": "producer-binding-not-applicable/v1", "reason": "sealed-topology-nonproducer"}))
+    commit_id = terminal_commit_id(route_id=route["route_id"], route_hash=route["route_hash"],
+        owner_attempt_id=request.owner_attempt_id, marker_digest=terminal_marker_digest(list(gates.values())),
+        producer_digest=producer_digest)
+    claim = dispatch_contract.terminal_claim_observation(request.jobs, route["route_id"], request.owner_attempt_id)
+    if (commit_id != state.get("terminal_commit_id") or not isinstance(claim, Mapping)
+            or (claim.get("proof") or {}).get("terminal_commit_id") != commit_id):
+        raise TerminalCommitError("transaction-conflict", "historical-terminal-identity")
+    children = _prove_route_children(request, route, gates)
+    if children.status != "proved":
+        raise TerminalCommitError(children.reason or "child-not-quiescent", children.detail or "")
+    value = binding.binding if binding else None
+    _verify_settled_outputs(request, route, commit_id, value, historical=True)
+    envelope = _read_sealed_owner_envelope(request, commit_id)
+    publication = _publication_observation(request, route, value)
+    goal_path = campaign_goal_path(request)
+    goal = json.loads(goal_path.read_text()) if goal_path.exists() else None
+    if goal is not None and (not isinstance(goal, Mapping)
+            or goal.get("status") not in {"pending", "satisfied", "skipped"}
+            or goal.get("terminal_commit_id") != commit_id):
+        raise TerminalCommitError("transaction-conflict", "campaign-goal-identity")
+    goal_pending = bool(state.get("campaign_goal_duty") and goal is None
+                        or goal is not None and goal["status"] == "pending")
+    return envelope, publication, goal_pending
+
+
 def _completion_request(jobs, status, metadata):
     """The launch contract, not terminal words alone, assigns workflow closure."""
-    import route_parent_close
-    if (route_parent_close.row_requested(metadata, jobs)
-            or metadata.get("workflow_completion") != "runtime-v1"
-            or metadata.get("worker_type") != "owner" or metadata.get("dispatch_depth") != "1"
-            or status != "done" or not verdict_pass(metadata)):
+    if not _completion_owner_choice(jobs, status, metadata).allowed:
         return None
     import owner_route_binding
     binding, _ = owner_route_binding.resolve_owner_route_lifecycle(
@@ -1755,121 +1824,70 @@ def _completion_request(jobs, status, metadata):
 
 @dataclass(frozen=True)
 class CompletionState:
-    """One owner row's finishing state -- the single place that tells a proven
-    permanent block apart from ordinary in-flight or unclassified work.
-
-    `state` is one of `not-applicable | complete | pending | blocked | unknown`.
-    `blocked` is reserved for a *proven* permanent reason, read only from the
-    not-yet-claimed terminal gate: `completion-attempt-not-current` (the fence
-    saw a later recorded attempt for the same canonical node identity) or
-    `completion-evidence-hash-mismatch` (the route's own completion marker no
-    longer matches its digest). A bare `completion-marker-absent`, a route-close still in
-    flight, a claimed-but-unsealed checkpoint, a forward-recovery reverify
-    conflict (also raised for a sealed envelope whose evidence merely
-    changed after settlement -- recoverable by restoring the file, matching
-    `settle_terminal_commit`'s own `recoverable` classification for the same
-    reason), or any exception is `pending`/`unknown` -- all may still resolve
-    on their own and must never be reported as a dead end (A82-7/§13.53.5's
-    own "never a silent pass-through" applies just as much to a silent
-    permanent-failure guess).
-    """
-
+    """Compatibility projection of the common completion decision."""
     state: str
     reason: str = ""
+    next_action: str = ""
+    retry_when: str = ""
+
+    @property
+    def settled(self):
+        from route_authority import completion_satisfied
+        return completion_satisfied(self.state)
 
 
-_PROVEN_BLOCKED_GATE_REASONS = frozenset({
-    "completion-attempt-not-current", "completion-evidence-revised-unrecorded",
-})
-# SD-154 I-5: an evidence sha mismatch is `completion-evidence-revised-
-# unrecorded` now (owner can recover with `capability-route.py revise`).
-# `gate_currency`'s `integrity-broken:<reason>` family is proven-blocked in
-# spirit too, but its reason carries a variable suffix this exact-match set
-# (and its `dispatch_receipt_identity.COMPLETION_REASONS` mirror, consumed by
-# `claude-session-supervisor.py`/`codex-app-server-supervisor.py` outside this
-# package's fixed files) cannot widen to without a strict-membership consumer
-# change; left as a known gap for the next package/review rather than
-# reaching into those two files.
+from route_authority import PROVEN_BLOCKED_GATE_REASONS as _PROVEN_BLOCKED_GATE_REASONS
 
 
 def owner_completion_state(jobs, status, metadata) -> CompletionState:
-    """Read-only consumption check; success bytes remain immutable while finishing."""
-    if metadata.get("workflow_completion") != "runtime-v1" or status != "done" or not verdict_pass(metadata):
-        return CompletionState("not-applicable")
+    """Observe immutable settlement bytes; the common admission selects their state."""
+    from route_authority import decide_continuation
+    facts = {}
     try:
-        request = _completion_request(jobs, status, metadata)
+        request = _historical_request(jobs, status, metadata)
         if request is None:
             return CompletionState("not-applicable")
-        commit_state_path = _commit_state_path(request)
-        if not commit_state_path.exists():
+        path = _commit_state_path(request)
+        facts["commit_exists"] = path.exists()
+        if facts["commit_exists"]:
+            state = json.loads(path.read_text())
+            facts["checkpoint"] = state.get("state")
+            if facts["checkpoint"] == "owner-envelope-sealed":
+                _, publication, goal_pending = _observe_settled_transaction(request, state)
+                facts["settlement_verified"] = True
+                facts["publication_pending"] = publication is not None and publication["status"] == "pending"
+                facts["goal_pending"] = goal_pending
+        else:
+            request = _completion_request(jobs, status, metadata)
             route = json.loads(request.route_file.read_text())
-            gates = _route_module().terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
-            reasons = {proof.get("reason") for proof in gates.values() if not proof.get("passed")}
-            blocked = reasons & _PROVEN_BLOCKED_GATE_REASONS
-            if blocked:
-                return CompletionState("blocked", sorted(blocked)[0])
-            return CompletionState("pending", sorted(r for r in reasons if r)[0] if reasons else "")
-        state = json.loads(commit_state_path.read_text())
-        if state.get("state") != "owner-envelope-sealed":
-            return CompletionState("pending", str(state.get("state") or ""))
-        # `_reverify_forward_recovery`'s own `transaction-conflict` is deliberately
-        # NOT escalated to `blocked` here: it also fires for a sealed envelope
-        # whose evidence file changed (or was corrupted) after settlement --
-        # system-wide convention already treats that as `recoverable`
-        # (`settle_terminal_commit`'s own `result_kind` branch), since restoring
-        # the file resolves it. A proven-permanent reason is only ever read
-        # from the not-claimed gate inspection above.
-        if _reverify_forward_recovery(request, state).status != "proved":
-            return CompletionState("pending", "forward-recovery-not-proved")
-        route = json.loads(request.route_file.read_text())
-        binding = (load_producer_binding(artifact_root=request.artifact_root, route_id=route["route_id"],
-                   owner_attempt_id=request.owner_attempt_id).binding if producer_lifecycle_applies(route) else None)
-        _verify_settled_outputs(request, route, state["terminal_commit_id"], binding)
-        _read_sealed_owner_envelope(request, state["terminal_commit_id"])
-        publication = _publication_observation(request, route, binding)
-        if publication is not None and publication["status"] == "pending":
-            return CompletionState("pending", "shared-spec-publication-pending")
-        # The exact closed outcome, finalized producer and sealed handoff above
-        # are the completion proof. A progress ledger can be absent or lag after
-        # settlement; reclassifying those facts by its status strands closed work.
-        goal_path = campaign_goal_path(request)
-        if (state.get("campaign_goal_duty") and not goal_path.exists()
-                or goal_path.exists() and json.loads(goal_path.read_text()).get("status") == "pending"):
-            return CompletionState("pending", "campaign-goal-close-pending")
-        return CompletionState("complete")
+            facts["gates"] = _route_module().terminal_gate_observation(route, jobs=request.jobs, exact_terminal=True)
     except (OSError, ValueError, KeyError, TypeError, TerminalCommitError) as exc:
-        return CompletionState("unknown", str(getattr(exc, "code", type(exc).__name__)))
+        facts["error"] = str(getattr(exc, "code", type(exc).__name__))
+    choice = decide_continuation(action="completion-state", facts=facts)
+    return CompletionState(choice.state, choice.reason, choice.next_action, choice.retry_when)
 
 
 def owner_completion_pending(jobs, status, metadata) -> bool:
-    """Thin compatibility wrapper: `pending` or `unknown` liveness is still open.
-
-    `blocked` (a proven permanent reason) and `not-applicable`/`complete` are
-    not pending -- a caller that only needs the old bool keeps its meaning,
-    while `join`'s own decision logic reads `owner_completion_state` directly
-    to tell `blocked` apart instead of waiting on it forever.
-    """
+    """Compatibility bool; delivery/inspection use the full common state."""
     return owner_completion_state(jobs, status, metadata).state in {"pending", "unknown"}
 
 
 def completed_owner_handoff(jobs, status, metadata):
     """Expose the proved report after the shared consumer classified success."""
-    request = _completion_request(jobs, status, metadata)
-    if request is None:
+    request = _historical_request(jobs, status, metadata)
+    if request is None or owner_completion_state(jobs, status, metadata).state != "complete":
         return None
     state = json.loads(_commit_state_path(request).read_text())
-    return _read_sealed_owner_envelope(request, state["terminal_commit_id"])
+    return _observe_settled_transaction(request, state)[0]
 
 
 def completed_owner_publication(jobs, status, metadata):
-    """Fresh publication facts beside, never inside, the immutable handoff."""
-    request = _completion_request(jobs, status, metadata)
-    if request is None:
+    """Publication uses the same exact historical judgment as completion."""
+    request = _historical_request(jobs, status, metadata)
+    if request is None or owner_completion_state(jobs, status, metadata).state != "complete":
         return None
-    route = json.loads(request.route_file.read_text())
-    binding = (load_producer_binding(artifact_root=request.artifact_root, route_id=route["route_id"],
-               owner_attempt_id=request.owner_attempt_id).binding if producer_lifecycle_applies(route) else None)
-    return _publication_observation(request, route, binding)
+    state = json.loads(_commit_state_path(request).read_text())
+    return _observe_settled_transaction(request, state)[1]
 
 
 def inspect_owner_completion(jobs, status, metadata):
@@ -1883,7 +1901,9 @@ def inspect_owner_completion(jobs, status, metadata):
         result["terminal_gates"] = _route_module().terminal_gate_observation(
             route, jobs=Path(jobs), exact_terminal=True)
         result["process"] = dispatch_contract.attempt_process_quiescence(metadata, terminal_receipt=True).state
-        result["state"] = "closure-pending" if owner_completion_pending(jobs, status, metadata) else "completed"
+        completion = owner_completion_state(jobs, status, metadata)
+        result.update(state="completed" if completion.state == "complete" else "closure-pending",
+                      reason=completion.reason, next_action=completion.next_action, retry_when=completion.retry_when)
         path = _commit_state_path(request)
         result["checkpoint"] = json.loads(path.read_text()).get("state") if path.exists() else "not-claimed"
         if producer_lifecycle_applies(route):
@@ -1926,11 +1946,11 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
         request = _completion_request(jobs, status, metadata)
         if request is None:
             return None
-        if dispatch_contract.terminal_conflict_pending(metadata):
-            return TerminalCommitResult("recoverable", "transaction-conflict", "terminal-evidence-conflict")
-        process = dispatch_contract.attempt_process_quiescence(metadata, terminal_receipt=True)
-        if process.state != "quiescent":
-            return TerminalCommitResult("recoverable", "child-not-quiescent", process.reason)
+        from route_authority import decide_continuation
+        choice = decide_continuation(action="terminal-child", status=status, metadata=metadata,
+            facts={"process": dispatch_contract.attempt_process_quiescence(metadata, terminal_receipt=True)})
+        if not choice.allowed:
+            return _unsettled_result(choice.reason, choice.detail)
         route = json.loads(request.route_file.read_text())
         import workflow_state as workflow
         # The binding is published at owner launch by artifact_producer.bind_owner_launch,
@@ -1945,9 +1965,9 @@ def settle_owner_completion(jobs, status, metadata) -> TerminalCommitResult | No
             prior_state = None
         if isinstance(prior_state, Mapping) and prior_state.get("state") == "owner-envelope-sealed":
             gates = _settled_gate_rows(route_module, route, request, gates)
-        missing = {node: proof.get("reason", "unproven") for node, proof in gates.items() if not proof.get("passed")}
-        if missing:
-            result = TerminalCommitResult("needs-owner", "terminal-marker-not-current", json.dumps(missing, sort_keys=True))
+        gate_choice = decide_continuation(action="completion-state", facts={"gate_only": True, "gates": gates})
+        if not gate_choice.allowed:
+            result = TerminalCommitResult(gate_choice.next_action, "terminal-marker-not-current", json.dumps(gate_choice.census, sort_keys=True))
         else:
             with ledger.lock():
                 from dispatch_resource_wait import supervisor

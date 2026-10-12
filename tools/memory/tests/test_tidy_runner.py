@@ -1276,7 +1276,7 @@ class HandoffTest(RunnerCase):
                           FAKE_PEER_VERDICT="failed")
         self.assertEqual(result.returncode, 1, result.stderr)
         card = json.loads(next((self.state / "cards").glob("*.json")).read_text(encoding="utf-8"))
-        self.assertTrue(card["handed_off"])                  # whatever the verdict: the work moved
+        self.assertFalse(card.get("handed_off", False))       # failed delivery retains the card
         self.card("진행 중: 새 카드")
         card = json.loads(next((self.state / "cards").glob("*.json")).read_text(encoding="utf-8"))
         self.assertNotIn("handed_off", card)                 # a newer card starts unmarked

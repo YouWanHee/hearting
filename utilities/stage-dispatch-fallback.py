@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from model_config import ModelConfigError, resolve_config  # noqa: E402
-from route_authority import new_owner_request, retry_predecessor, route_in_force, sealed_pin_harness  # noqa: E402
+from route_authority import decide_continuation, new_owner_request, retry_predecessor, route_in_force, sealed_pin_harness  # noqa: E402
 
 
 def _unit_role(unit):
@@ -1866,42 +1866,17 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
             node_round_budget = node_round_admission.budget
         except (DispatchContractError, ValueError) as exc:
             return fail(getattr(exc, "reason", str(exc)), 65, child_spawned="0")
-        if node_round_budget.state == "blocked-live":
-            return fail(
-                "prior-attempt-still-live", 78,
-                route_id=route["route_id"], route_node=node["id"],
-                child_spawned="0",
-            )
-        if node_round_budget.state == "blocked-unsettled":
-            return fail(
-                "round-unsettled", 65,
-                route_id=route["route_id"], route_node=node["id"],
-                child_spawned="0",
-                next_action=route_state_next_action("round-unsettled", node["id"], str(args.route), node),
-            )
-        if node_round_budget.state == "exhausted":
-            return fail(
-                "review-round-budget-exhausted", 65,
+        choice = decide_continuation(route, action="round", node=node, facts={"budget": node_round_budget})
+        if not choice.allowed:
+            fields = {"next_action": choice.next_action, "retry_when": choice.retry_when}
+            if choice.state in {"exhausted", "verdictless-bound"}:
+                fields.update(DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), choice.state,
+                    route=route, node=node, jobs=args.jobs, route_file=args.route))
+            return fail(choice.reason, 78 if choice.state == "blocked-live" else 65,
                 route_id=route["route_id"], route_node=node["id"],
                 effective_intensity=route["effective_intensity"],
                 round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
-                child_spawned="0",
-                next_action=route_state_next_action("review-round-budget-exhausted", node["id"], str(args.route), node),
-                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), route=route, node=node, jobs=args.jobs, route_file=args.route),
-            )
-        if node_round_budget.state == "verdictless-bound":
-            # `review_budget_recovery_fields` already supplies its own
-            # `next_action` (native-subagent/owner-inline routing, SD-153) --
-            # that satisfies the SD-154 route-state-refusal `next_action`
-            # field too, so it is not duplicated here.
-            return fail(
-                "review-verdictless-bound", 65,
-                route_id=route["route_id"], route_node=node["id"],
-                effective_intensity=route["effective_intensity"],
-                round=str(node_round_budget.next_round), max_round=str(node_round_budget.cap),
-                child_spawned="0",
-                **DISPATCH_NODE.review_budget_recovery_fields(node.get("kind"), "verdictless-bound", route=route, node=node, jobs=args.jobs, route_file=args.route),
-            )
+                child_spawned="0", **fields)
         # B2: unlike dispatch-batch.py (which re-invokes dispatch-node.py for
         # the actual leg and gets the round protocol block for free), this
         # wrapper calls the adapter directly -- attach the same block here so

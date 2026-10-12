@@ -423,7 +423,8 @@ class RelatedOwnerDiscoveryTests(unittest.TestCase):
                 route_module.return_value.terminal_gate_observation.return_value = self.owner_gate()
                 transaction = T.settle_terminal_commit(self.request(), services)
             self.assertEqual((transaction.result, transaction.reason),
-                             ("ineligible", "child-not-quiescent"))
+                             ("recoverable", "child-not-quiescent"))
+            self.assertTrue(transaction.next_step["retry_when"])
             self.assertEqual(calls, [])
         finally:
             process.terminate()
@@ -1632,6 +1633,100 @@ class OwnerTerminalPlacementReplayTest(unittest.TestCase):
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
                     self.assertEqual(ledger.journal(), before)
                     self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+
+    def test_historical_observer_protects_corruption_missing_duty_and_unsettled_child(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+            request = terminal.TerminalCommitRequest(path, owner, jobs, fixture.root)
+            slot = terminal._commit_state_path(request).parent
+            for target, damage in [(slot / "producer-binding.json", lambda raw: raw + b" "),
+                    (slot / "owner-envelope.json", lambda raw: b"{}"),
+                    (ROUTE.outcome_path(path), lambda raw: b"{}")]:
+                raw = target.read_bytes()
+                target.write_bytes(damage(raw))
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "unknown", str(target))
+                target.write_bytes(raw)
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+            state_path = slot / "terminal-commit.json"
+            original_state = state_path.read_bytes()
+            state = json.loads(original_state)
+            state["campaign_goal_duty"] = True
+            state_path.write_text(json.dumps(state))
+            self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).reason, "campaign-goal-close-pending")
+            state_path.write_bytes(original_state)
+            index_path = artifact_admission._index_path(fixture.root)
+            index_bytes = index_path.read_bytes()
+            index_path.unlink()
+            with mock.patch.object(artifact_admission, "ensure_root_identity", side_effect=AssertionError("reader allocated identity")):
+                self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "unknown")
+            self.assertFalse(index_path.exists())
+            index_path.write_bytes(index_bytes)
+            rows = jobs.read_bytes()
+            jobs.write_text(jobs.read_text().replace("\tdone\t", "\topen\t", 1))
+            self.assertNotEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+            jobs.write_bytes(rows)
+            leases = artifact_producer._review_lease_dir(fixture.root,
+                json.loads((slot / "producer-binding.json").read_text())["cycle_id"])
+            leases.mkdir(parents=True, exist_ok=True)
+            (leases / "unverifiable.json").write_text("corrupt unknown lease")
+            self.assertNotEqual(terminal.owner_completion_state(jobs, "done", meta).state, "complete")
+
+    def test_historical_inline_owner_marker_keeps_original_digest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jobs = root / "jobs.log"
+            path = root / "route.json"
+            route = {"route_id": "rt-inline", "route_hash": "sha256:" + "a" * 64,
+                "nodes": [{"id": "sync", "terminal": True, "terminal_gate": "lab-sync"}]}
+            marker = {"route_id": route["route_id"], "route_hash": route["route_hash"],
+                "node_id": "sync", "attempt_id": "att-owner-sync-inline", "completion_gate": "lab-sync",
+                "execution_surface": "inline", "registered_worker": False,
+                "evidence": {"sha256": "b" * 64, "path": str(root / "cleaned-report")}}
+            raw = json.dumps(marker).encode()
+            (root / "sync.json").write_bytes(raw)
+            request = T.TerminalCommitRequest(path, "att-owner", jobs, root)
+            module = mock.Mock()
+            module.owner_executed_terminal.return_value = True
+            module.completion_dir.return_value = root
+            module.outcome_path.return_value = root / "missing-outcome"
+            gates = T._settled_gate_rows(module, route, request, {"sync": {}}, historical=True)
+            self.assertEqual(gates["sync"]["marker_digest"], T.hashlib.sha256(raw).hexdigest())
+            self.assertEqual(gates["sync"]["attempt_id"], "att-owner-sync-inline")
+            self.assertEqual(gates["sync"]["evidence_digest"], "b" * 64)
+            self.assertEqual((root / "sync.json").read_bytes(), raw)
+
+    def test_historical_root_alias_cleaned_cwd_and_no_transitive_writes(self):
+        fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "owner-report.md")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs), "AGENT_ARTIFACT_ROOT": str(fixture.root)}):
+            self.assertEqual(terminal.settle_owner_completion(jobs, "done", meta).result, "completed")
+            binding_path = terminal.producer_binding_path(fixture.root, route["route_id"], owner)
+            raw = binding_path.read_bytes()
+            old_root = fixture.root
+            moved = old_root.with_name("moved-root")
+            old_root.rename(moved)
+            old_root.symlink_to(moved, target_is_directory=True)
+            report.unlink()
+            before = {str(p.relative_to(moved)): p.read_bytes() for p in moved.rglob("*") if p.is_file()}
+            with mock.patch.object(artifact_admission, "_acquire_lock", side_effect=AssertionError("reader took lock")), \
+                 mock.patch.object(artifact_producer, "refresh_cycle", side_effect=AssertionError("reader refreshed")):
+                observed = terminal.owner_completion_state(jobs, "done", meta)
+                self.assertEqual(observed.state, "complete", observed)
+                self.assertIn("verdict: PASS", terminal.completed_owner_handoff(jobs, "done", meta))
+            self.assertEqual(binding_path.read_bytes(), raw)
+            self.assertEqual(before, {str(p.relative_to(moved)): p.read_bytes() for p in moved.rglob("*") if p.is_file()})
+            request = terminal.TerminalCommitRequest(path, owner, jobs, moved)
+            state = json.loads(terminal._commit_state_path(request).read_text())
+            self.assertNotEqual(terminal._reverify_forward_recovery(request, state).status, "proved")
+            slot = terminal._commit_state_path(request).parent
+            goal = slot / "campaign-goal.json"
+            goal.write_text(json.dumps({"status": "pending", "terminal_commit_id": state["terminal_commit_id"]}))
+            self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).reason, "campaign-goal-close-pending")
+            goal.unlink()
+            envelope = slot / "owner-envelope.txt"
+            envelope.write_text("corrupt")
+            self.assertEqual(terminal.owner_completion_state(jobs, "done", meta).state, "unknown")
+            self.assertIsNone(terminal.completed_owner_handoff(jobs, "done", meta))
 
     def test_a_report_already_in_its_bucket_is_unchanged(self):
         fixture, terminal, route, path, jobs, owner, report, meta = self._settled("claude", "spec/_internal/owner-report.md")

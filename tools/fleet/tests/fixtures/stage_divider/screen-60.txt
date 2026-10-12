@@ -6,7 +6,7 @@
 ─────
   compute resources  1/1
   ◇ gpu  CPU ────────  — thr  M —/—G  S —/—G
-         ⠋ 0: UTIL    —  VRAM ────      —/—GB ▸ 1
+         ⠋ 0: UTIL    —  VRAM ────      —/—GB ▸ 1 · ?×1
 ─────
 
   SESSIONS   stack · press w to cycle

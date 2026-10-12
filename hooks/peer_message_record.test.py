@@ -199,14 +199,15 @@ class PromptTest(_BaseTest):
         self._run("prompt", payload)
         self.assertEqual(len(self._all_records()), 0)
 
-    def test_prompt_path_emits_no_stdout(self):
+    def test_peer_prompt_emits_receiver_guidance_with_receipt_only(self):
         payload = {
             "session_id": "sid-receiver",
             "cwd": "/tmp/proj",
             "prompt": 'x <cross-session-message from="peer">hi</cross-session-message>',
         }
         proc = self._run("prompt", payload)
-        self.assertEqual(len(proc.stdout), 0)
+        context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("ACK are not execution", context)
 
     def test_notice_record_has_no_body_text(self):
         payload = {
@@ -405,7 +406,9 @@ class SweepTest(_BaseTest):
             capture_output=True, env=self.env, timeout=10,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, b"")
+        context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("send acceptance before processing", context)
+        self.assertNotIn("undelivered watch receipts", context)
         notices_after = [r for r in self._all_records() if r["kind"] == "notice"]
         # exactly one new notice: the cross-session-message record. The broken
         # steward must neither block it nor add or remove anything else.
@@ -430,7 +433,7 @@ class F100cTrailerAndNameTest(_BaseTest):
         self.env["CLAUDE_CONFIG_DIR"] = str(cfg)
 
     def test_herdr_trailer_prompt_writes_a_herdr_notice_with_exact_sender(self):
-        self._run("prompt", {"session_id": "sid-recv", "cwd": "/tmp/proj",
+        result = self._run("prompt", {"session_id": "sid-recv", "cwd": "/tmp/proj",
                              "prompt": "[steer] do x\n\n(peer-from: codex thread-9 f100-codex)"})
         recs = self._all_records()
         self.assertEqual(len(recs), 1)
@@ -443,6 +446,8 @@ class F100cTrailerAndNameTest(_BaseTest):
         self.assertEqual(rec["from"]["session_id"], "thread-9")
         self.assertEqual(rec["from"]["name"], "f100-codex")
         self.assertEqual(rec["summary"], "herdr steer received")
+        self.assertIn(b"send acceptance before processing", result.stdout)
+        self.assertIn(b"ACK are not execution", result.stdout)
 
     def test_plain_prompt_still_writes_nothing(self):
         self._run("prompt", {"session_id": "sid-recv", "cwd": "/tmp/proj", "prompt": "peer-from: x"})

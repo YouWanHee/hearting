@@ -790,7 +790,14 @@ class InlineReviewOwnerSettlesThroughAPollingParentTest(PollingParentBase):
         spec.loader.exec_module(sup)
 
         def continuation(route_path, jobs):
-            with self.env(), mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "fixture-parent"}):
+            from route_parent_close import owner_continuation_processes
+            def observe(meta, jobs):
+                if (meta.get("attempt_id") == getattr(self, "continuation_aid", None)
+                        and W._rows(jobs)[meta["attempt_id"]][0] in {"open", "running"}):
+                    return D.ProcessQuiescence("live", "mock-owner-running"), []
+                return owner_continuation_processes(meta, jobs)
+            with self.env(), mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": "fixture-parent"}), \
+                    mock.patch("route_parent_close.owner_continuation_processes", side_effect=observe):
                 return 0, W.start_work(self.route, self.path, self.jobs, run=self.fake_launch)
         out = io.StringIO()
         with self.env(), mock.patch.object(sup, "start_owner_continuation", continuation), contextlib.redirect_stdout(out):
