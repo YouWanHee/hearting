@@ -446,21 +446,23 @@ def schedule_acceptance_reply(handoff_ref, sender, recipient):
     with pending_lock(ref):
         path = _transfer_path(ref)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".handoff-reply-", dir=path.parent)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            existing = _read_transfer_record(ref)
-            if any(existing.get(k) != record[k] for k in ("message_id", "from", "to", "body_sha256")):
-                raise ValueError("handoff-acceptance-reply-conflict")
-        else:
             with os.fdopen(fd, "w") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 json.dump(record, handle); handle.flush(); os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                existing = _read_transfer_record(ref)
+                if any(existing.get(k) != record[k] for k in ("message_id", "from", "to", "body_sha256")):
+                    raise ValueError("handoff-acceptance-reply-conflict")
             directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+        finally:
+            os.unlink(temporary)
         row = _read_pending(ref)
         if row is None:
             _save_pending({"schema_version": 1, "ref": ref, "from": dict(sender), "to": dict(recipient),

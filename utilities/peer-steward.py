@@ -1890,6 +1890,14 @@ def _complete_gone_retire(store, duty):
     return False
 
 
+def _handoff_lifetime_valid(foreground):
+    if not isinstance(foreground, dict):
+        return False
+    pid, start = foreground.get("pid"), foreground.get("start")
+    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            and not isinstance(start, bool) and str(start).isdigit() and int(start) > 0)
+
+
 def reserve_handoff_retire(target, exact, requester):
     """Reserve in the existing store; never execute exit from acceptance."""
     store = peer_obligations.ObligationStore()
@@ -1902,6 +1910,8 @@ def reserve_handoff_retire(target, exact, requester):
             raise ValueError("handoff-retire-requester-conflict")
         duty = matches[0]
     else:
+        if not _handoff_lifetime_valid(exact.get("foreground")):
+            raise ValueError("handoff-predecessor-lifetime-unverified")
         store, duty = _retire_request(target, exact, requester=requester)
     peer_obligations.ensure_runner()
     return duty["id"]
