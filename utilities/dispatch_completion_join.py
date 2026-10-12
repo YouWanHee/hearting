@@ -784,10 +784,12 @@ def completion_followup_text(receipt: dict, *, jobs: str, surface: str) -> str:
         notes = [f"The approved route plan names a next leg (index {child['next_leg']['index']}): "
                  f"{child['next_leg']['compose_command']}" for child in receipt["children"] if child.get("next_leg")]
         return ("The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
-                "Report the result to the user. No harvest, next-stage launch, route restart, or manual finalization is required."
+                "Read the exact result and perform the already approved parent review/follow-through in this turn, "
+                "or run its existing registered continuation. Then report what you actually did and when it started. "
+                "Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual finalization is required."
                 + ("".join("\n" + note for note in notes)
-                   + ("\nThat command is information, not an instruction: nothing starts the next leg for you; "
-                      "run it only if you decide to continue." if notes else "")))
+                   + ("\nIf this next leg is already approved, execute it in this turn or its existing registered continuation. "
+                      "Nothing starts it from receipt alone; obtain approval only for work outside the existing scope." if notes else "")))
     if work_commands:
         text = "\n".join(dict.fromkeys(command for command in commands if command))
         return ("\n".join(parked_notes) + ("\n" if parked_notes else "")

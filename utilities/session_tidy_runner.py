@@ -1055,28 +1055,128 @@ def run(qid: str) -> int:
 # handoff: deliver the card to a peer session through peer-steward only
 # ---------------------------------------------------------------------------
 
+def _handoff_steward():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tidy_handoff_steward", HERE / "peer-steward.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def accept_handoff(ref, caller, *, steward=None):
+    """The agent explicitly asserts it read the card/docs and accepts this transfer."""
+    seat, harness, sid = caller
+    steward = steward or _handoff_steward()
+    peer = steward.peer_message
+    with peer.pending_lock(ref):
+        row = peer._read_pending(ref)
+        context = (row or {}).get("handoff")
+        if not isinstance(context, dict) or (row["to"].get("harness"), row["to"].get("session_id")) != (harness, sid):
+            raise ValueError("handoff-successor-mismatch")
+        successor = context["successor"]
+        if (seat.pane != successor["pane"] or (steward._HERDR_SESSION or "default") != successor["server"]):
+            raise ValueError("handoff-successor-seat-mismatch")
+        _, current, _, _ = steward._retire_target(successor["pane"])
+        observed = steward._retire_request_identity(current,
+            steward._retire_foreground(successor["pane"], harness, strict=False))
+        for identity in (successor, observed):
+            foreground = identity.get("foreground")
+            if (not steward._handoff_lifetime_valid(foreground)
+                    or not steward._pid_identity_ok(foreground["pid"], foreground["start"])):
+                raise ValueError("handoff-successor-lifetime-unverified")
+        if any(observed.get(k) != successor.get(k)
+               for k in ("server", "pane", "harness", "session_id", "foreground")):
+            raise ValueError("handoff-successor-lifetime-mismatch")
+        # Receipt callbacks never set this. Keep progress in the existing row.
+        # Register recovery before recording acceptance. Until that explicit
+        # record exists the runner waits; it can never infer agent approval.
+        if steward._schedule_message_obligation(row, successor["pane"], successor["pane"],
+                                                handoff_acceptance=True) is None:
+            raise ValueError("handoff-acceptance-continuation-unavailable")
+        acceptance = dict(row.get("acceptance") or {}, read_and_accepted=True)
+        row["acceptance"] = acceptance
+        peer._save_pending(row)
+        acceptance["reply_ref"] = peer.schedule_acceptance_reply(ref, row["to"], row["from"])
+        peer._save_pending(row)
+        reply = peer._read_pending(acceptance["reply_ref"])
+        if steward._schedule_message_obligation(reply, context["target"], context["predecessor"]["pane"]) is None:
+            raise ValueError("handoff-reply-continuation-unavailable")
+        acceptance["retire_id"] = steward.reserve_handoff_retire(context["target"],
+            context["predecessor"], context["requester"])
+        acceptance["settled"] = True
+        peer._save_pending(row)
+    # Courier/retire runner owns delivery and safe idle execution, separately.
+    return "accepted=true reply=scheduled retire=reserved request_id=" + acceptance["retire_id"], 0
+
+
 def handoff(seat: "st.Seat", target: str) -> tuple[str, int]:
     """(one report line, exit code); the verdict is peer-steward's own typed answer."""
     card = st.read_latest_card(seat)
     if not card or not st.sanitize_body(card.get("body", "")):
         return "prompted=false reason=no-card", 1
-    # The work moves to the peer whatever the verdict: this window is cleared but not continued.
-    with contextlib.suppress(BaseException):
-        st.mark_card_handed_off(seat)
     path = st.state_root() / "handoff" / f"{new_id()}.md"
     st.atomic_write(path, (card["body"].rstrip() + "\n").encode("utf-8"))
     injected = injected_executable("HEARTING_TIDY_PEER_STEWARD")
-    command = ([str(injected)] if injected else [sys.executable, str(ROOT / "utilities" / "peer-steward.py")])
+    prepared_refs = []
     try:
-        done = subprocess.run([*command, "prompt", target, "--body-file", str(path)],
-                              capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
+        if injected:
+            done = subprocess.run([str(injected), "prompt", target, "--body-file", str(path)],
+                                  capture_output=True, text=True, timeout=120)
+        else:
+            import io
+            steward = _handoff_steward()
+            _, predecessor, _, _ = steward._retire_target(seat.pane)
+            _, successor, _, _ = steward._retire_target(target)
+            sender_sid, sender_harness = steward._current_session_identity()
+            if (predecessor.get("session_id"), predecessor.get("harness")) != (sender_sid, sender_harness):
+                raise ValueError("handoff-predecessor-mismatch")
+            context = {"card_id": card.get("id"), "target": seat.pane,
+                "predecessor": steward._retire_request_identity(predecessor,
+                    steward._retire_foreground(seat.pane, sender_harness, strict=False)),
+                "successor": steward._retire_request_identity(successor,
+                    steward._retire_foreground(successor["pane"], successor["harness"], strict=False)),
+                "requester": {"harness": successor["harness"], "session_id": successor["session_id"],
+                    "pane": successor["pane"], "server": (steward._HERDR_SESSION or "default")}}
+            def prepared(ref):
+                peer = steward.peer_message
+                with peer.pending_lock(ref):
+                    row = peer._read_pending(ref)
+                    if row.get("handoff") not in (None, context):
+                        raise ValueError("handoff-transfer-conflict")
+                    row["handoff"] = context
+                    peer._save_pending(row)
+                    prepared_refs.append(ref)
+            args = argparse.Namespace(target=target, body_file=str(path), body_stdin=False,
+                text=None, no_verify=False, no_trailer=False, wait_idle_ms=0,
+                verify_timeout_ms=5000, ref=[])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = steward.cmd_prompt(args, expected_recipient=(successor["harness"], successor["session_id"]),
+                                          on_prepared=prepared)
+            done = subprocess.CompletedProcess([], code, output.getvalue(), "")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return f"prompted=failed reason=peer-steward-unavailable detail={type(exc).__name__}", 1
     finally:
         with contextlib.suppress(OSError):
             os.unlink(path)
     lines = [ln.strip() for ln in done.stdout.splitlines() if ln.strip()]
     verdict = next((ln for ln in lines if ln.startswith("prompted=")), lines[-1] if lines else "prompted=unknown")
+    outcome = verdict.split()[0]
+    retained = False
+    if not injected and outcome in ("prompted=queued", "prompted=unverified"):
+        for ref in prepared_refs:
+            try:
+                row = steward.peer_message._read_pending(ref)
+            except (OSError, ValueError):
+                row = None
+            if (row and row.get("handoff") == context
+                    and all(row["from"].get(k) == predecessor.get(k) for k in ("harness", "session_id"))
+                    and all(row["to"].get(k) == successor.get(k) for k in ("harness", "session_id"))):
+                retained = True
+                break
+    if (done.returncode == 0 and outcome == "prompted=true") or retained:
+        st.mark_card_handed_off(seat)
     return f"{verdict} exit={done.returncode}", done.returncode
 
 

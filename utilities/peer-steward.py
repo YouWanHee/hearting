@@ -1890,7 +1890,34 @@ def _complete_gone_retire(store, duty):
     return False
 
 
-def _retire_request(target, exact):
+def _handoff_lifetime_valid(foreground):
+    if not isinstance(foreground, dict):
+        return False
+    pid, start = foreground.get("pid"), foreground.get("start")
+    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            and not isinstance(start, bool) and str(start).isdigit() and int(start) > 0)
+
+
+def reserve_handoff_retire(target, exact, requester):
+    """Reserve in the existing store; never execute exit from acceptance."""
+    store = peer_obligations.ObligationStore()
+    matches = [d for d in store.list(states=peer_obligations._PENDING_STATES | {"complete"})
+        if d.get("intent", {}).get("kind") == "retire"
+        and all((d["intent"].get("identity") or {}).get(k) == exact.get(k)
+                for k in ("server", "pane", "harness", "session_id"))]
+    if matches:
+        if len(matches) != 1 or matches[0]["intent"].get("requester") != requester:
+            raise ValueError("handoff-retire-requester-conflict")
+        duty = matches[0]
+    else:
+        if not _handoff_lifetime_valid(exact.get("foreground")):
+            raise ValueError("handoff-predecessor-lifetime-unverified")
+        store, duty = _retire_request(target, exact, requester=requester)
+    peer_obligations.ensure_runner()
+    return duty["id"]
+
+
+def _retire_request(target, exact, *, requester=None):
     duty_id = peer_obligations.stable_duty_id("retire", exact, target)
     store = peer_obligations.ObligationStore()
     duty = store.get(duty_id)
@@ -1902,10 +1929,11 @@ def _retire_request(target, exact):
         duty_id = peer_obligations.stable_duty_id("retire", exact, retry_of)
         duty = store.get(duty_id)
     if duty is None:
-        own_sid, own_harness = _current_session_identity()
-        intent = {"target": target, "requester": {
-            "session_id": own_sid, "harness": own_harness,
-            "pane": _caller_pane(), "server": _HERDR_SESSION or "default"}}
+        if requester is None:
+            own_sid, own_harness = _current_session_identity()
+            requester = {"session_id": own_sid, "harness": own_harness,
+                         "pane": _caller_pane(), "server": _HERDR_SESSION or "default"}
+        intent = {"target": target, "requester": requester}
         if retry_of:
             intent["retry_of"] = retry_of
         duty = store.create(duty_id, "retire", exact, intent)
@@ -3594,7 +3622,7 @@ def _message_obligation_id(ref):
     return "message-" + ref
 
 
-def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=None):
+def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=None, handoff_acceptance=False):
     """Persist exact transport ownership without copying the sealed message body."""
     sender = row.get("from") or {}
     recipient = row.get("to") or {}
@@ -3606,9 +3634,11 @@ def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=Non
               "target": target, "from": sender, "to": recipient,
               "refs": list(row.get("refs") or []),
               "delay_notice_for": delay_notice_for or ""}
+    if handoff_acceptance:
+        intent["handoff_acceptance"] = True
     try:
         duty = peer_obligations.ObligationStore().create(
-            _message_obligation_id(row["ref"]), "message", identity, intent)
+            _message_obligation_id(row["ref"] + ("-accept" if handoff_acceptance else "")), "message", identity, intent)
         peer_obligations.ensure_runner()
         return duty
     except (OSError, ValueError, peer_obligations.ObligationError):
@@ -3813,6 +3843,30 @@ def _resume_message_obligation(duty, store):
         store.update(duty["id"], state="unknown",
                      observation={"ref": ref, "reason": "pending-row-missing"})
         return
+    if intent.get("handoff_acceptance"):
+        accepted = row.get("acceptance") or {}
+        if not accepted.get("read_and_accepted"):
+            store.update(duty["id"], state="pending", observation={"reason": "awaiting-agent-acceptance"})
+            return
+        if not accepted.get("settled"):
+            import session_tidy as tidy
+            import session_tidy_runner as runner
+            context = row.get("handoff") or {}
+            successor = context.get("successor") or {}
+            global _HERDR_SESSION
+            old_server = _HERDR_SESSION
+            _HERDR_SESSION = None if successor.get("server") == "default" else successor.get("server")
+            try:
+                runner.accept_handoff(ref, (tidy.Seat("pane", "accepted-transfer", successor["pane"]),
+                    successor["harness"], successor["session_id"]), steward=sys.modules[__name__])
+            except (OSError, ValueError, KeyError):
+                store.update(duty["id"], state="pending", observation={"reason": "handoff-acceptance-unsettled"})
+                return
+            finally:
+                _HERDR_SESSION = old_server
+        store.update(duty["id"], state="complete", result="accepted", delivery="scheduled", cleanup="complete",
+                     observation={"ref": ref, "reason": "handoff-acceptance-settled"})
+        return
     if peer_obligations.registered_delivery_settled(row):
         store.update(duty["id"], state="complete", delivery="not-required", cleanup="complete",
                      observation={"ref": ref, "reason": "dispatch-notice-consumed"})
@@ -3832,7 +3886,6 @@ def _resume_message_obligation(duty, store):
     # nameable only while its exact harness/session/pane still resolves.
     recipient = row.get("to") or {}
     server = identity.get("server") or "default"
-    global _HERDR_SESSION
     old_server = _HERDR_SESSION
     _HERDR_SESSION = None if server == "default" else server
     try:

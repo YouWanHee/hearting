@@ -274,7 +274,8 @@ GATE_DELIVERY_HEADER = (
 COMPLETION_DELIVERY_HEADER = (
     "Hearting runtime delivery (SD-111 durable pending records for this session). "
     "Follow each receipt's required_action. advance-completed confirms that attempt's "
-    "completion: consume its result without another harvest, then follow the owning "
+    "completion: read its exact result and perform already approved parent review/follow-through "
+    "this turn or its existing registered continuation. Receipt/ACK is not execution. Follow the owning "
     "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
     "runtime-owned close/finalize; a closed route needs no restart. "
     "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
