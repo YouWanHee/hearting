@@ -32,6 +32,148 @@ class CorrectionTest(unittest.TestCase):
     def snapshot(self, f):
         return {p: p.read_bytes() for p in f.directory.glob("*.json")}
 
+    def test_provenance_blocked_joint_basis_and_original_bytes(self):
+        for harness in ("codex", "claude", "opencode"):
+            for entrance in ("complete", "writer"):
+                with self.subTest(harness=harness, entrance=entrance):
+                    f = self.fixture(harness=harness, ship=True, provenance_blocked=True,
+                                     legacy=harness == "codex", append_hash=harness == "codex")
+                    marker = f.replay(entrance)
+                    self.assertEqual(marker["review_independence"], "independent")
+                    self.assertEqual(marker["reviewer_disposition"]["settled_basis"], "historical-provenance-blocked")
+                    self.assertEqual(marker["reviewer_disposition"]["authority_basis"]["terminal_verdict"], "BLOCKED")
+                    self.assertEqual(marker["round_census"], f.origin["round_census"])
+                    self.assertEqual(f.replay("complete"), marker)
+                    self.assertEqual(f.replay("writer"), marker)
+                    for path, raw in f.preserved.items():
+                        self.assertEqual(path.read_bytes(), raw)
+                    self.assertTrue(R._marker_identity_row(f.route, f.node, f.node["id"],
+                                    f.node["completion_gate"], jobs=f.jobs, exact_terminal=True)["passed"])
+                    metadata=R._find_attempt_row_metadata(f.jobs,"att-review-self")
+                    proof = D._marker_bound_prepare_marker_proof(metadata, "att-review-self")
+                    self.assertIsNotNone(proof)
+                    f.report.write_text(f.report.read_text() + "changed after receipt\n")
+                    self.assertIsNone(D._marker_bound_current_marker(metadata, "att-review-self", proof)[0])
+                    self.assert_refused(f)
+
+    def test_provenance_blocked_refusals_before_publication(self):
+        for case in ("generic", "FAIL", "substantive-blocked", "report-mutation", "no-hash", "hash-exit",
+                     "hash-spoof", "late-hash", "duplicate-hash", "no-claim", "late-claim", "wrong-report",
+                     "wrong-reviewer", "wrong-cycle", "wrong-gate", "wrong-route", "wrong-round", "wrong-request",
+                     "wrong-pins", "explicit-content-FAIL", "explicit-content-BLOCKED", "missing-embedded-receipt",
+                     "structured-content-FAIL", "structured-content-BLOCKED", "conflicting-closed-receipt"):
+            with self.subTest(case=case):
+                changes={"wrong-report":("review_artifact","reviews/release/other.md"),
+                    "wrong-reviewer":("guard_session_id","att-foreign"), "wrong-cycle":("cycle_id","cyc_foreign"),
+                    "wrong-gate":("completion_gate","foreign"), "wrong-route":("route_id","rt-foreign"),
+                    "wrong-round":("round",3),"wrong-request":("request_digest","foreign"),"wrong-pins":("bound_inputs_verified",31)}
+                f = self.fixture(ship=True, legacy=True, provenance_blocked=True,
+                                 evidence_changes=dict([changes[case]]) if case in changes else None,
+                                 report_prefix=(json.dumps({"verdict":case.removeprefix("structured-content-"),"gate_met":False})+"\n"
+                                     if case.startswith("structured-content-") else
+                                     '{"attempt_id":"att-foreign","status":"closed"}\n' if case=="conflicting-closed-receipt" else ""))
+                events = [json.loads(line) for line in f.log.read_text().splitlines()]
+                if case == "generic":
+                    events[-2]["item"]["text"] = events[-2]["item"]["text"].replace(D.REVIEW_SELF_PROVENANCE_BLOCKER, "review could not finish")
+                elif case in ("FAIL", "substantive-blocked"):
+                    if case == "FAIL": events[-2]["item"]["text"] = events[-2]["item"]["text"].replace("verdict: BLOCKED", "verdict: FAIL")
+                    else: f.evidence.write_text(f.evidence.read_text().replace('"verdict": "PASS"', '"verdict": "BLOCKED"'))
+                elif case == "report-mutation": f.report.write_text(f.report.read_text()+"changed before disposition\n")
+                elif case == "no-hash": events.pop(1)
+                elif case == "hash-exit": events[1]["item"]["exit_code"] = 64
+                elif case == "hash-spoof": events[1]["item"]["command"] = "echo sha256sum"
+                elif case == "late-hash": events.append(events.pop(1))
+                elif case == "duplicate-hash": events.insert(1, events[1])
+                elif case == "no-claim": events.pop(0)
+                elif case == "late-claim": events[0]["item"]["aggregated_output"] = events[0]["item"]["aggregated_output"].replace('"closed"', '"already-closed"')
+                elif case.startswith("explicit-content-"): f.report.write_text("# Verdict: " + case.removeprefix("explicit-content-") + "\n" + f.report.read_text())
+                elif case == "missing-embedded-receipt": f.report.write_text("## Code Review Results\nPASS in prose\n")
+                f.log.write_text("\n".join(json.dumps(e) for e in events)+"\n")
+                before = self.snapshot(f)
+                with self.assertRaises(ValueError): f.replay()
+                self.assertEqual(before, self.snapshot(f))
+
+    def test_provenance_blocked_basis_cannot_be_forged_or_downgraded_to_old_basis(self):
+        for field in ("report_path", "report_sha256", "hash_receipt", "publication_receipt", "terminal_sha256", "terminal_message_sha256", "terminal_verdict", "settled_basis"):
+            with self.subTest(field=field):
+                f=self.fixture(ship=True,legacy=True,provenance_blocked=True)
+                marker=f.replay()
+                if field=="settled_basis":
+                    marker["reviewer_disposition"]["settled_basis"]="successful-quiescent-terminal"
+                    marker["reviewer_disposition"].pop("authority_basis")
+                else: marker["reviewer_disposition"]["authority_basis"][field]="forged"
+                self.corrupt_head(f,marker)
+                self.assert_refused(f)
+
+    def test_provenance_blocked_terminal_message_bytes_remain_bound(self):
+        f=self.fixture(ship=True,legacy=True,provenance_blocked=True)
+        f.replay()
+        # The normalized handoff remains identical; its registered receipt
+        # bytes still cannot change after disposition publication.
+        f.log.write_text(f.log.read_text().replace("blocker: v3.28.6", "blocker:  v3.28.6"))
+        self.assert_refused(f)
+
+    def test_provenance_blocked_observation_leaves_locator_indexes_alone(self):
+        import artifact_locator
+        f=self.fixture(ship=True,legacy=True,provenance_blocked=True)
+        f.replay()
+        index=f.artifact/"campaigns"/artifact_locator.INDEX_JSON
+        index.unlink()
+        before={p:p.read_bytes() for p in f.base.rglob('*') if p.is_file()}
+        canonical=f.directory/(f.node["id"]+".json")
+        self.assertEqual(D.gate_currency(f.route,f.node,canonical,observe=True).state,"current")
+        self.assertEqual(before,{p:p.read_bytes() for p in f.base.rglob('*') if p.is_file()})
+
+    def duplicate_report_hash_output(self, f, identical):
+        events = [json.loads(line) for line in f.log.read_text().splitlines()]
+        item = events[1]["item"]
+        report_line, evidence_line = item["aggregated_output"].splitlines()
+        digest, path = report_line.split("  ", 1)
+        alias = f.report.parent / ".." / f.report.parent.name / f.report.name
+        self.assertEqual(alias.resolve(), f.report.resolve())
+        first_digest = digest if identical else "0" * 64
+        item["aggregated_output"] = (
+            first_digest + "  " + path + "\n" + digest + "  " + str(alias) + "\n" + evidence_line + "\n"
+        )
+        f.log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+        return events[1]
+
+    def test_duplicate_normalized_hash_output_refused_by_both_writers(self):
+        for identical in (False, True):
+            for entrance in ("complete", "writer"):
+                with self.subTest(identical=identical, entrance=entrance):
+                    f = self.fixture(ship=True, legacy=True, provenance_blocked=True)
+                    self.duplicate_report_hash_output(f, identical)
+                    before = self.snapshot(f)
+                    preserved = {path: path.read_bytes() for path in f.preserved}
+                    with self.assertRaisesRegex(ValueError, "review-self-disposition-report-bytes-unverified"):
+                        f.replay(entrance)
+                    self.assertEqual(before, self.snapshot(f))
+                    self.assertEqual(preserved, {path: path.read_bytes() for path in preserved})
+
+    def test_duplicate_normalized_hash_output_refused_by_recorded_readers(self):
+        import hashlib
+        import ship_parent_deploy
+        for identical in (False, True):
+            with self.subTest(identical=identical):
+                f = self.fixture(ship=True, legacy=True, provenance_blocked=True)
+                marker = f.replay()
+                metadata = R._find_attempt_row_metadata(f.jobs, "att-review-self")
+                prepared = D._marker_bound_prepare_marker_proof(metadata, "att-review-self")
+                self.assertIsNotNone(prepared)
+                event = self.duplicate_report_hash_output(f, identical)
+                # Even a forged basis citing the changed receipt cannot hide
+                # contradictory or identical aliases of the same output path.
+                marker["reviewer_disposition"]["authority_basis"]["hash_receipt"]["receipt_sha256"] = (
+                    hashlib.sha256(json.dumps(event).encode()).hexdigest()
+                )
+                self.corrupt_head(f, marker)
+                self.assert_refused(f)
+                self.assertIsNone(D._marker_bound_current_marker(metadata, "att-review-self", prepared)[0])
+                deploy = next(node for node in f.route["nodes"] if node["id"] == "deploy")
+                with self.assertRaisesRegex(ValueError, '"release-review": "completion-marker-not-current"'):
+                    ship_parent_deploy.reviews(f.route, deploy, f.jobs, json.loads(Path(f.prepared["request"]).read_text()))
+
     def corrupt_head(self, f, marker):
         R.atomic_write(f.directory / (f.node["id"] + ".json"), marker)
         R.atomic_write(f.directory / f"{f.node['id']}.{marker['sequence']}.json", marker)

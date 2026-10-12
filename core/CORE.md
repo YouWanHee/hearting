@@ -15,8 +15,14 @@ Owner-inline and owner-overridden review retain their reduced independence.
 The exact historical named-self publication defect may receive a provenance
 disposition through normal completion replay, preserving its original judgment,
 history, attempt link, evidence and round census. This requires the original
-bound self claim, settled successful completion and current actor authority;
+bound self claim, settled completion and current actor authority;
 an ordinary late claim cannot promote a degraded review.
+The original review judgment and its later operational handback are separate
+results. An exact provenance-only BLOCKED handback can retain the original
+independent PASS only when the registered successful publication, bound JSON,
+distinct primary report, historical report-byte receipt and settled terminal
+jointly prove that same judgment. Neither registry success nor report prose
+overrides a terminal result. Original PASS and BLOCKED bytes remain unchanged.
 Publication and observation share the exact registered subject, terminal artifact
 and historical actor-lineage judgment. Recorded authority survives ordinary owner
 replacement; a current authorized actor may finish an interrupted publication.

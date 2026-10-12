@@ -2478,11 +2478,17 @@ class CorrectAnswerContinuationTest(unittest.TestCase):
 class CoupledReviewSelfDispositionTest(unittest.TestCase):
     """Public correct/complete, real replacement authority and strict ship consumer."""
 
+    provenance_blocked = False
+    historical_home = None
+    baseline_home = None
+    record_cli = False
+
     def setUp(self):
         self.fixtures = load("coupled_review_fixtures", W.ROOT / "utilities/capability_route.test.py")
         self.f = self.fixtures.HistoricalReviewSelfDispositionTest()
         self.f.setUp(); self.addCleanup(self.f.doCleanups)
-        self.f.historical_fixture(legacy=True, ship=True)
+        self.f.historical_fixture(legacy=True, ship=True, provenance_blocked=self.provenance_blocked,
+                                  append_hash=self.provenance_blocked,historical_home=self.historical_home)
         self.cr = self.fixtures.R
         self.d = self.fixtures.D
         self.jobs = self.f.jobs
@@ -2511,6 +2517,7 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         self.request = json.loads(self.request_path.read_text()); self.request_bytes = self.request_path.read_bytes()
         self.prepare_security()
         self.native_calls = []
+        self.native_children = []
 
     def write_owner(self, metadata, status):
         lines = [line for line in self.jobs.read_text().splitlines()
@@ -2541,12 +2548,19 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         if arguments[0]=="complete":
             result=subprocess.run([sys.executable,str(W.ROOT/"utilities/capability-route.py"),*arguments],
                                   env=env,text=True,capture_output=True)
+            if self.record_cli:
+                print("fixture_cli",json.dumps({"argv":[sys.executable,str(W.ROOT/"utilities/capability-route.py"),*arguments],
+                    "exit":result.returncode,"actor":env.get("AGENT_DISPATCH_ATTEMPT_ID"),
+                    "records":[json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]}))
             self.assertEqual(result.returncode,0,result.stderr+result.stdout)
             return [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
         out=io.StringIO();err=io.StringIO()
         with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(sys,"argv",["capability-route.py",*arguments]), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code=self.cr.main()
+        if self.record_cli:
+            print("fixture_cli",json.dumps({"argv":[sys.executable,str(W.ROOT/"utilities/capability-route.py"),*arguments],
+                "exit":code or 0,"records":[json.loads(line) for line in out.getvalue().splitlines() if line.startswith('{')]}))
         self.assertIn(code,(None,0),err.getvalue()+out.getvalue())
         return [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{")]
 
@@ -2555,13 +2569,15 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         self.assertEqual(Path(command[1]).name,"dispatch-owner.py")
         self.native_calls.append(command)
         aid=command[command.index("--attempt-id")+1]
-        source=self.replacement._rows(self.jobs.read_text().splitlines())["att-owner"][1]
-        record=self.replacement._read(self.replacement._record_path(self.jobs,source["replacement_family_id"]))
-        replay=self.replacement.launch_input(self.jobs,"att-owner",source)
+        source_id=command[command.index("--automatic-retry-of")+1]
+        source=self.replacement._rows(self.jobs.read_text().splitlines())[source_id][1]
+        binding=self.replacement.source_binding(self.jobs,source)
+        record=self.replacement._read(self.replacement._record_path(self.jobs,binding[0]))
+        replay=self.replacement.launch_input(self.jobs,source_id,source)
         args=SimpleNamespace(**vars(self.args));args.attempt_id=aid
         args.replacement_input_argv=self.replacement._replacement_argv(record,source,replay)
         meta={k:v for k,v in source.items() if k not in ("note","failure_class","launch_outcome","replacement_input_digest")}
-        meta.update(attempt_id=aid,automatic_retry_of="att-owner",replacement_original_attempt_id="att-owner",
+        meta.update(attempt_id=aid,automatic_retry_of=source_id,replacement_original_attempt_id=source_id,
                     replacement_family_id=record["family_id"],replacement_claim_digest=self.replacement._digest(record),
                     replacement_ordinal="1",launch_claimed="1",launch_started="1")
         meta.update(self.d.parse_registry_metadata(self.replacement.seal_launch_input(args,"codex",replay["task"])))
@@ -2569,6 +2585,7 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
                                start_new_session=True,env={**kwargs["env"],"AGENT_DISPATCH_ATTEMPT_ID":aid})
         self.addCleanup(child.communicate,timeout=5)
+        self.native_children.append(child)
         meta.update(pid=str(child.pid),pid_start=str(self.d.process_start_ticks(child.pid)),pgid=str(child.pid),
                     pid_ns=self.d.process_namespace_identity(child.pid),
                     pid_observer_ns=self.d.process_namespace_identity(child.pid))
@@ -2598,6 +2615,14 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         env["AGENT_DISPATCH_ATTEMPT_ID"]=current
         marker=self.cli(complete,env)[0]
         self.assertEqual(marker["review_independence"],"independent")
+        if self.baseline_home:
+            before=(self.f.directory/"release-review.json").read_bytes()
+            result=subprocess.run(argv,env={**env,"AGENT_HOME":str(self.baseline_home)},text=True,capture_output=True)
+            self.assertEqual(result.returncode,64,result.stderr)
+            self.assertIn("review-self-disposition-basis-invalid",result.stderr)
+            self.assertEqual((self.f.directory/"release-review.json").read_bytes(),before)
+            print("old_reader_cli",json.dumps({"argv":argv,"exit":result.returncode,"stderr":result.stderr.strip(),
+                "published_successor_unchanged":True}))
         self.assertEqual(self.cli(complete,env)[0],marker)
         self.assertEqual(marker["round_census"]["verdict_rounds"],3)
         self.assertEqual(marker["round_census"]["verdictless_rounds"],1)
@@ -2641,8 +2666,9 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         evidence=self.f.output/"setup.md";evidence.write_text("prepared release setup\n")
         axes={"attempt_schema_version":2,"dispatch_depth":node["dispatch_depth"],"transport":"headless",
               "execution_surface":"inline","registered_worker":False,"fallback_hop":"inline"}
-        self.cr.complete_node(self.f.route,node,node["id"],evidence,
-                              attempt_id="att-setup-inline",explicit_attempt_metadata=axes)
+        if not self.provenance_blocked:
+            self.cr.complete_node(self.f.route,node,node["id"],evidence,
+                                  attempt_id="att-setup-inline",explicit_attempt_metadata=axes)
         evidence.write_text("changed release setup\n")
         current=self.cr._current_owner_attempt(self.jobs,"att-owner")
         with mock.patch.dict(os.environ,{"AGENT_DISPATCH_ATTEMPT_ID":current}):
@@ -2656,6 +2682,92 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
             self.cr.complete_node(self.f.route,self.f.node,"release-review",self.f.evidence,
                                   jobs=self.jobs,attempt_id="att-review-self",review_claim=self.f.claim)
         self.assertEqual(before,{p:p.read_bytes() for p in self.f.base.rglob('*') if p.is_file()})
+
+
+class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
+    """Historical BLOCKED/Markdown terminal with separately bound JSON, public CLIs."""
+
+    provenance_blocked = True
+
+    def test_original_owner_blocked_replacement_and_correction_complete_first(self):
+        import shlex
+        import ship_parent_deploy
+        env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
+        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off")
+        defaults=dict(W.start_work.__kwdefaults__)
+        W.start_work.__kwdefaults__["run"]=self.native_owner_launch
+        self.addCleanup(setattr,W.start_work,"__kwdefaults__",defaults)
+        correct=["correct","--jobs",str(self.jobs),"--attempt-id","att-owner","--message-file",str(self.answer)]
+        for index in range(2):
+            receipt=self.cli(correct,env)[-1]
+            self.assertEqual(receipt["state"],"running",receipt)
+            self.assertEqual(receipt["parent_next"],"bounded-wait")
+            argv=shlex.split(receipt["parent_next_command"])
+            self.assertEqual(Path(argv[1]).name,"capability-route.py")
+            # Shorten only the isolated fixture's wait window. The returned
+            # command, join, process observation and authority remain real.
+            with mock.patch.object(W,"START_WINDOW_SECONDS",0.01):
+                wait=self.cli(argv[2:],env)[-1]
+            self.assertEqual(wait["reason"],"parent-wait-deadline",wait)
+            self.assertNotIn("parent_next_command",wait)
+            current=self.cr._current_owner_attempt(self.jobs,"att-owner")
+            self.assertEqual(len(self.native_calls),index+1)
+            if index == 0:
+                self.native_children[-1].communicate(timeout=5)
+                metadata=self.cr._find_attempt_row_metadata(self.jobs,current)
+                report=self.f.output/"owner7b.md";report.write_text("provenance remains blocked\n")
+                log=self.f.base/"owner7b.jsonl"
+                log.write_text(json.dumps({"type":"item.completed","item":{"type":"agent_message",
+                    "text":f"artifact: {report}\nverdict: BLOCKED\nblocker: provenance disposition unavailable"}})+"\n"+
+                    json.dumps({"type":"turn.completed"})+"\n")
+                metadata.update(note="dead-worker-blocked",failure_class="blocked",log_file=str(log))
+                self.write_owner(metadata,"done")
+                original_replacement=current
+        self.assertNotEqual(current,original_replacement)
+        complete=["complete","--route",str(self.f.path),"--node",self.f.node["id"],"--jobs",str(self.jobs),
+                  "--attempt-id","att-review-self","--reviewer-attempt","att-review-self","--evidence",str(self.f.evidence)]
+        # The current model's first fixture action is ordinary completion;
+        # parent wait processing above is the parent's own action.
+        owner_env={**env,"AGENT_DISPATCH_ATTEMPT_ID":current}
+        marker=self.cli(complete,owner_env)[0]
+        self.assertEqual(marker["reviewer_disposition"]["actor"],current)
+        self.assertEqual(marker["review_independence"],"independent")
+        deploy=next(n for n in self.f.route["nodes"] if n["id"]=="deploy")
+        ship_parent_deploy.reviews(self.f.route,deploy,self.jobs,self.request)
+        self.assertEqual(self.request_path.read_bytes(),self.request_bytes)
+        for path,raw in self.f.preserved.items():
+            if path!=self.jobs:self.assertEqual(path.read_bytes(),raw)
+
+    def test_actual_parent_only_normal_complete_and_strict_unchanged_32pins(self):
+        import ship_parent_deploy
+        env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
+        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off")
+        complete=["complete","--route",str(self.f.path),"--node",self.f.node["id"],"--jobs",str(self.jobs),
+                  "--attempt-id","att-review-self","--reviewer-attempt","att-review-self","--evidence",str(self.f.evidence)]
+        self.assertNotIn("AGENT_DISPATCH_ATTEMPT_ID",env)
+        if self.baseline_home:
+            argv=[sys.executable,str(Path(self.baseline_home)/"utilities/capability-route.py"),*complete]
+            result=subprocess.run(argv,env={**env,"AGENT_HOME":str(self.baseline_home)},text=True,capture_output=True)
+            self.assertEqual(result.returncode,64,result.stderr)
+            self.assertIn("review-self-disposition-terminal-unverified",result.stderr)
+            print("baseline_cli",json.dumps({"argv":argv,"exit":result.returncode,"stderr":result.stderr.strip()}))
+            deploy=next(n for n in self.f.route["nodes"] if n["id"]=="deploy")
+            with self.assertRaisesRegex(ValueError,"independent-review-required"):
+                ship_parent_deploy.reviews(self.f.route,deploy,self.jobs,self.request)
+        marker=self.cli(complete,env)[0]
+        self.assertEqual(marker["review_independence"],"independent")
+        deploy=next(n for n in self.f.route["nodes"] if n["id"]=="deploy")
+        proof=ship_parent_deploy.reviews(self.f.route,deploy,self.jobs,self.request)
+        self.assertEqual(set(proof),{"release-review","security-review"})
+        self.assertEqual(len(self.request["command"]["inputs"]),32)
+        self.assertEqual(self.request_path.read_bytes(),self.request_bytes)
+        for path,raw in self.f.preserved.items():
+            if path!=self.jobs:self.assertEqual(path.read_bytes(),raw)
+        if self.record_cli:
+            import hashlib
+            print("fixture_preservation",json.dumps({"request_sha256":hashlib.sha256(self.request_bytes).hexdigest(),
+                "pins":len(self.request["command"]["inputs"]),"original_bytes_unchanged":True,
+                "round_census":marker["round_census"],"terminal":"BLOCKED","strict_reviews":list(proof)}))
 
 
 if __name__ == "__main__":
