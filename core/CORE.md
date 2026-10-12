@@ -8,6 +8,27 @@
 responsibility through execution, recovery, closure and acknowledged handoff,
 with a simpler caller surface. It distinguishes principles from verified implementation.
 
+A registered non-subsession review worker publishing its exact assigned node is
+an independent reviewer whether it names itself or leaves the reviewer claim
+implicit. Another named reviewer's authority comes from its existing terminal judgment.
+Owner-inline and owner-overridden review retain their reduced independence.
+The exact historical named-self publication defect may receive a provenance
+disposition through normal completion replay, preserving its original judgment,
+history, attempt link, evidence and round census. This requires the original
+bound self claim, settled completion and current actor authority;
+an ordinary late claim cannot promote a degraded review.
+The original review judgment and its later operational handback are separate
+results. An exact provenance-only BLOCKED handback can retain the original
+independent PASS only when the registered successful publication, bound JSON,
+distinct primary report, historical report-byte receipt and settled terminal
+jointly prove that same judgment. Neither registry success nor report prose
+overrides a terminal result. Original PASS and BLOCKED bytes remain unchanged.
+Publication and observation share the exact registered subject, terminal artifact
+and historical actor-lineage judgment. Recorded authority survives ordinary owner
+replacement; a current authorized actor may finish an interrupted publication.
+Upstream invalidation and disposition commit serialize through the existing
+completion and registry locks, so a historical replay cannot replace a tombstone.
+
 | Layer | Owns | Portable? |
 |---|---|---|
 | Core | workflow, artifact layout, memory lifecycle, QA tiers, model roles, safety invariants | yes |
@@ -248,7 +269,13 @@ locator check, and finalization and every later refresh share one inclusion rule
 `*.pyc`, editor temporaries (`*.swp`, `*~`, `.#*`), `*.tmp`/`*.part` and symbolic
 links are not output: a link is only `lstat`-ed and its target is not followed or read, and each
 such path is left out of the manifest and listed as excluded instead of failing
-the close. `_internal/` and other non-hidden support paths, binary and large
+the close. The browser review workspace also reserves
+`artifacts/reviews/**/browser/profile/` and `profile-*/` for Chromium runtime
+profiles. These directories and their descendants are excluded before locator
+validation and payload reads, on both first close and later refreshes; existing
+profiles remain in place. Screenshots, browser logs and review reports beside
+them remain output. New browser work uses a process-owned temporary profile
+outside the cycle payload. `_internal/` and other non-hidden support paths, binary and large
 files are output. Absolute/escaping paths and out-of-payload files remain
 invalid. Cycle controls and legacy relocation/exclusion retain their contracts.
 Invalid paths identify the locator and reason before payload reads or manifest
@@ -582,3 +609,7 @@ Use neutral names for new cross-tool concepts:
 | role profile | Claude-only Agent semantics |
 | model role | vendor model names as portable semantics |
 | adapter | tool-specific bootstrap |
+
+Settled terminal history is read from exact immutable transaction identities, not
+from current launch eligibility. Root movement and cleaned cwd leave it settled.
+Current publication, goal, process and cleanup obligations remain independent.

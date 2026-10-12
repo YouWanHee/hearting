@@ -49,16 +49,16 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
             handle.write(json.dumps({"type": "tool", "payload": "x" * (2 << 20)}) + "\n")
         self.assertEqual(rt.read_origin(str(path), "codex"), "Latest Fleet subject")
 
-    def test_auto_uses_now_language_and_explicit_config_changes_only_title(self):
+    def test_explicit_now_language_overrides_fleet_for_both_lines(self):
         with mock.patch.dict(os.environ, {"FLEET_NOW_LANG": "Korean"}):
             self.assertIn("in Korean.", rt._prompt("d"))
             self.assertEqual(rt.validate_title("TITLE: 세션 제목 일관성\nNOW: 시험 중", rt._title_lang()), "세션 제목 일관성")
             config.ensure()
             config.config_path().write_text('{"title_language": "en"}\n')
             prompt = rt._prompt("d")
-            self.assertIn("in English.", prompt)
+            self.assertIn("in Korean.", prompt)
             self.assertIn("NOW: one sentence, in Korean,", prompt)
-            self.assertIsNone(rt.validate_title("세션 제목 일관성", rt._title_lang()))
+            self.assertEqual(rt.validate_title("세션 제목 일관성", rt._title_lang()), "세션 제목 일관성")
 
     def test_claude_command_metadata_cannot_be_anchor_or_language(self):
         rows = [
@@ -190,11 +190,73 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
             self.assertFalse(rt.maybe_spawn("claude", "changed-language", str(path)))
             probe.assert_called_once_with("probe")
 
-    def test_auto_normalizes_now_language_codes_without_changing_now(self):
+    def test_title_and_now_normalize_the_same_language(self):
         for code, name in (("ko", "Korean"), ("en", "English"), ("ja", "Japanese")):
             with self.subTest(code=code), mock.patch.dict(os.environ, {"FLEET_NOW_LANG": code}):
                 self.assertEqual(rt._title_lang(), name)
-                self.assertIn("NOW: one sentence, in " + code + ",", rt._prompt("d"))
+                self.assertIn("NOW: one sentence, in " + name + ",", rt._prompt("d"))
+
+    def test_declarations_precede_locale_and_stale_observations_for_all_harnesses(self):
+        root = Path(os.environ["CLAUDE_CONFIG_DIR"])
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "settings.json").write_text('{"language":"korean"}')
+        config.ensure()
+        with mock.patch.dict(os.environ, {"LANG":"ja_JP.UTF-8", "LC_ALL":"",
+                                          "LC_MESSAGES":"", "FLEET_NOW_LANG":""}):
+            for harness in ("claude", "codex", "opencode"):
+                prompt = rt._prompt(harness + " English delta", anchor="English request",
+                                    observed_language="English")
+                self.assertIn("in Korean.", prompt)
+                self.assertIn("NOW: one sentence, in Korean,", prompt)
+            config.config_path().write_text('{"title_language":"fr"}')
+            self.assertEqual(rt._title_lang(), "French")
+            with mock.patch.dict(os.environ, {"FLEET_NOW_LANG":"de"}):
+                self.assertEqual(rt._title_lang(), "German")
+            config.config_path().write_text('{"title_language":"auto"}')
+            (root / "settings.json").write_text('{"language":"Spanish"}')
+            self.assertEqual(rt._title_lang(), "Spanish")
+            (root / "settings.json").write_text('invalid')
+            self.assertEqual(rt._title_lang(), "Japanese")
+
+    def test_generated_inputs_do_not_replace_the_last_real_user_language(self):
+        automated = ("[notice] Your peer message ref abc is still pending",
+                     "Hearting runtime delivery (SD-111 durable pending records)",
+                     "Hearting notice about work you started (a remote run ended)",
+                     "Hearting human gate awaiting your decision (SD-123/129)",
+                     "Hearting supervision needs attention. This is not workflow completion. reason=join-deadline owner=att-example.",
+                     "/quit", "<system-reminder>Hook output</system-reminder>",
+                     "<hook-output>English output</hook-output>",
+                     "Peer task\n(peer-from: codex [ab] peer ; ref=12345678)")
+        for harness in ("claude", "codex", "opencode"):
+            for text in automated:
+                with self.subTest(harness=harness, text=text):
+                    content = ["한국어 사용자 요청", text]
+                    rows = [{"type":"user", "message":{"role":"user", "content":t}}
+                            for t in content]
+                    if harness == "codex":
+                        rows = [{"type":"response_item", "payload":{"type":"message",
+                                 "role":"user", "content":[{"type":"input_text", "text":t}]}}
+                                for t in content]
+                    if harness == "opencode":
+                        rows = [{"role":"user", "content":t} for t in content]
+                    raw = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+                    self.assertEqual(rt._origin_text(raw, harness, latest=True), "한국어 사용자 요청")
+                    self.assertEqual(rt._human_language_text(text), "")
+
+    def test_wrong_language_now_alone_triggers_regeneration_without_new_delta(self):
+        root = Path(os.environ["CLAUDE_CONFIG_DIR"])
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "settings.json").write_text('{"language":"korean"}')
+        for harness in ("claude", "codex", "opencode"):
+            path = self._transcript(harness)
+            sid = harness + "-wrong-now"
+            titles.write(sid, "한국어 제목", harness=harness, offset=path.stat().st_size,
+                         summary="Inspecting request evidence")
+            with mock.patch.object(rt, "run_worker", return_value="TITLE: 한국어 제목\nNOW: 요청 근거 확인 중") as worker:
+                rt.main(["--harness", harness, "--sid", sid, "--transcript", str(path),
+                         "--slotdir", str(Path(self._tmp.name) / "slot")])
+            self.assertEqual(worker.call_count, 1)
+            self.assertEqual(titles.read(sid, harness=harness)["summary"], "요청 근거 확인 중")
 
     def test_config_seed_is_once_and_invalid_file_degrades_without_rewriting(self):
         self.assertEqual(config.ensure(dry_run=True)["status"], "would-create")

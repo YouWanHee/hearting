@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
 import stat
 import subprocess
 import sys
@@ -3020,14 +3021,14 @@ def _tag_scan_authority(metadata: dict[str, str], host_complete: bool) -> bool:
 
 def _tagged_descendants_from_scan(
     scan: ProcessTableScan, metadata: dict[str, str], attempt_id: str,
-    *, host_complete: bool = False,
+    *, host_complete: bool = False, preserved=frozenset(),
 ) -> ProcessGroupObservation:
     if scan.error:
         return ProcessGroupObservation("unverifiable", reason=scan.error)
     excluded_pids = _parent_leader_pids(metadata)
     ordered = tuple(
         member for member in scan.members_by_attempt.get(attempt_id, ())
-        if member[0] not in excluded_pids
+        if member[0] not in excluded_pids and member[:2] not in preserved
     )
     if ordered:
         return ProcessGroupObservation("populated", ordered, scan.incomplete_reason)
@@ -3137,7 +3138,7 @@ def _denied_process_outside_attempt(start: str, metadata: dict[str, str], *, hos
 
 
 def attempt_tagged_descendants(
-    metadata: dict[str, str], *, host_complete: bool = False
+    metadata: dict[str, str], *, host_complete: bool = False, preserved=frozenset()
 ) -> ProcessGroupObservation:
     """Find live processes still tagged with this attempt, whatever group they left.
 
@@ -3156,6 +3157,9 @@ def attempt_tagged_descendants(
     recorded namespaces are extinct (`attempt_process_quiescence`): then a
     complete walk by a host-like observer, which sees every namespace, is the
     one that may answer ``empty``.
+    ``preserved`` excludes only already classified exact PID/start positives;
+    the existing completeness and denied-environment checks still prove absence.
+    Whole-attempt callers leave it empty.
     """
 
     attempt_id = metadata.get("attempt_id", "")
@@ -3166,7 +3170,7 @@ def attempt_tagged_descendants(
         # Batch observer pass (`process_table_scan_scope`): same verdict, one
         # walk shared by every attempt of the pass instead of one per call.
         return _tagged_descendants_from_scan(
-            scan, metadata, attempt_id, host_complete=host_complete
+            scan, metadata, attempt_id, host_complete=host_complete, preserved=preserved
         )
     tag = f"{ATTEMPT_DESCENDANT_ENV}={attempt_id}".encode()
     # SD-OPEN-47 (H7-b): a child's liveness is its own process set. The
@@ -3215,7 +3219,7 @@ def attempt_tagged_descendants(
             continue
         if int(entry.name) in excluded_pids:
             continue
-        if tag in environ.split(b"\0"):
+        if tag in environ.split(b"\0") and (int(entry.name), start) not in preserved:
             members.append((int(entry.name), start, state))
     ordered = tuple(sorted(members, key=lambda member: member[0]))
     if ordered:
@@ -3708,6 +3712,16 @@ def residue_live_pids(metadata: dict[str, str]) -> tuple[int, ...]:
     return tuple(member[0] for member in probe.members) if probe.state == "populated" else ()
 
 
+def terminal_receipt_incomplete(metadata, *, terminal_receipt=True):
+    """The existing durable terminal gate for namespace-local registered workers."""
+    return bool(terminal_receipt
+                and metadata.get("registered_worker") == "1"
+                and metadata.get("pid_scope") == "namespace-local"
+                and not _post_exit_receipt_reason(metadata)
+                and not _cancellation_receipt_reason(metadata)
+                and not _cleanup_receipt_reason(metadata))
+
+
 def attempt_process_quiescence(
     metadata: dict[str, str], *, terminal_receipt: bool = False
 ) -> ProcessQuiescence:
@@ -3751,14 +3765,7 @@ def attempt_process_quiescence(
     # successor, join, wait, and cleanup gate that reads an old row, so they
     # keep the verdict they already had instead.
     if not metadata.get("attempt_id"):
-        if (
-            terminal_receipt
-            and metadata.get("registered_worker") == "1"
-            and metadata.get("pid_scope") == "namespace-local"
-            and not _post_exit_receipt_reason(metadata)
-            and not _cancellation_receipt_reason(metadata)
-            and not _cleanup_receipt_reason(metadata)
-        ):
+        if terminal_receipt_incomplete(metadata, terminal_receipt=terminal_receipt):
             return ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete")
         return result
     probe = attempt_tagged_descendants(metadata)
@@ -3772,14 +3779,7 @@ def attempt_process_quiescence(
         # Nobody is left to publish a namespace-local receipt: the wrapper
         # died with the namespace. The receipt gate below never applies here.
         return extinct
-    if (
-        terminal_receipt
-        and metadata.get("registered_worker") == "1"
-        and metadata.get("pid_scope") == "namespace-local"
-        and not _post_exit_receipt_reason(metadata)
-        and not _cancellation_receipt_reason(metadata)
-        and not _cleanup_receipt_reason(metadata)
-    ):
+    if terminal_receipt_incomplete(metadata, terminal_receipt=terminal_receipt):
         return ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete")
     if result.state != "quiescent":
         # A non-quiescent leader verdict remains authoritative unless the
@@ -7409,6 +7409,448 @@ def _marker_schema_identity_ok(
     return True, history_path
 
 
+def original_review_self_claim(route, node, origin, *, jobs, metadata, require_receipt=False):
+    """Read the claim made by the original publication, never the replay claim.
+
+    New publications retain their input in history. The legacy Codex command
+    receipt is usable only when its successful output contains this exact
+    original marker and its command binds every completion input. Do not read
+    arbitrary transcripts or infer a claim from degraded reviewer_identity.
+    """
+    claim = {"kind": "registered-worker", "attempt_id": origin.get("attempt_id")}
+    if origin.get("reviewer_claim") == claim and not require_receipt:
+        return {"source": "original-marker"}
+    if "reviewer_claim" in origin and origin.get("reviewer_claim") != claim:
+        return None
+    log = metadata.get("log_file")
+    if not log:
+        return None
+    matches = []
+    for line in Path(log).read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+            item = event.get("item") or {}
+            if (event.get("type") != "item.completed"
+                    or item.get("type") != "command_execution"
+                    or item.get("status") != "completed" or item.get("exit_code") != 0):
+                continue
+            tokens = shlex.split(item.get("command") or "")
+            # Native Codex command receipts wrap the command in a shell -lc.
+            if len(tokens) == 3 and tokens[1] in {"-lc", "-c"}:
+                tokens = shlex.split(tokens[2])
+            if len(tokens) < 3 or Path(tokens[1]).name != "capability-route.py" or tokens[2] != "complete":
+                continue
+            arguments = tokens[3:]
+            if len(arguments) % 2 or len(set(arguments[::2])) != len(arguments[::2]):
+                continue
+            args = dict(zip(arguments[::2], arguments[1::2]))
+            required = {"--route", "--node", "--jobs", "--attempt-id", "--reviewer-attempt", "--evidence"}
+            axis_flags = {"--dispatch-depth": "dispatch_depth", "--transport": "transport",
+                          "--execution-surface": "execution_surface", "--registered-worker": "registered_worker",
+                          "--fallback-hop": "fallback_hop"}
+            if not required <= set(args) or set(args) - required - set(axis_flags):
+                continue
+            if any(str(args[flag]).lower() != str(origin.get(key)).lower()
+                   and not (key == "registered_worker" and args[flag] == "1" and origin.get(key) is True)
+                   for flag, key in axis_flags.items() if flag in args):
+                continue
+            if (args["--node"] != node["id"]
+                    or args["--attempt-id"] != origin.get("attempt_id")
+                    or args["--reviewer-attempt"] != origin.get("attempt_id")
+                    or Path(args["--jobs"]).resolve() != Path(jobs).resolve()
+                    or Path(args["--evidence"]).resolve() != Path(origin["evidence"]["path"]).resolve()):
+                continue
+            sealed = json.loads(Path(args["--route"]).read_text(encoding="utf-8"))
+            sealed = _route_module().verify_route(sealed)
+            if (sealed["route_id"], sealed["route_hash"]) != (route["route_id"], route["route_hash"]):
+                continue
+            output_records = []
+            for output in item.get("aggregated_output", "").splitlines():
+                try:
+                    output_records.append(json.loads(output))
+                except ValueError:
+                    pass
+            if (origin not in output_records or
+                    {"attempt_id": origin["attempt_id"], "status": "closed"} not in output_records):
+                continue
+            matches.append({"source": "runtime-command", "log_file": str(Path(log)),
+                            "item_id": item.get("id"),
+                            "receipt_sha256": hashlib.sha256(line.encode()).hexdigest()})
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    # Started/completed are distinct; multiple successful original publications
+    # are ambiguous rather than a license to select a convenient late claim.
+    return matches[0] if len(matches) == 1 else None
+
+
+REVIEW_SELF_PROVENANCE_BLOCKER = (
+    "v3.28.6 closed the completion but downgraded reviewer independence because "
+    "the attempt had no terminal verdict at registration; an independent stage marker was not established."
+)
+
+
+def _review_report_hash_receipt(command, report, evidence):
+    """Recognize a public hash read, without executing or retaining shell text.
+
+    Support a literal sha256sum argv and the historical report-append command:
+    literal F assignment, installed write preflight, one heredoc append, then
+    sha256sum. No general shell expansion, arbitrary stdout or script execution
+    can stand in for a registered byte receipt.
+    """
+    tokens = shlex.split(command)
+    if len(tokens) == 3 and tokens[1] in {"-lc", "-c"}:
+        if Path(tokens[0]).name not in {"sh", "bash", "zsh"}:
+            return False
+        command = tokens[2]
+    lines = command.splitlines()
+    variable = None
+    if len(lines) > 1:
+        # The actual append receipt uses an unquoted EOF body; inspect only
+        # its command structure. Never evaluate the body or copy its preimage.
+        lexer = shlex.shlex(lines[0], posix=True, punctuation_chars=";<>")
+        lexer.whitespace_split = True
+        first = list(lexer)
+        if (len(first) != 12 or not first[0].startswith("F=")
+                or first[1] != ";" or not first[2].endswith("/adapters/codex/bin/preflight.sh")
+                or first[3:5] != ["write", "$F"] or first[6:] != [";", "cat", ">>", "$F", "<<", "EOF"]):
+            return False
+        variable = first[0][2:]
+        if (not variable or any(c in variable for c in "$`\n")
+                or Path(variable).resolve() != report.resolve()):
+            return False
+        # Only a single heredoc followed by one hash command is supported.
+        if lines[-2] != "EOF" or "EOF" in lines[1:-2]:
+            return False
+        command = lines[-1]
+    argv = shlex.split(command)
+    if len(argv) != 3 or argv[0] != "sha256sum":
+        return False
+    args = [variable if arg == "$F" and variable else arg for arg in argv[1:]]
+    return (all(Path(arg).is_absolute() and not any(c in arg for c in "$`\n") for arg in args)
+            and [Path(arg).resolve() for arg in args] == [report.resolve(), evidence.resolve()])
+
+
+def review_self_blocked_basis(route, node, prior, metadata, terminal, *, jobs):
+    """One historical provenance-only BLOCKED basis for writer and readers."""
+    from codex_dispatch_terminal import inspect_terminal_log
+    view = inspect_terminal_log(metadata.get("log_file"))
+    if (not view or view["blocker"] != REVIEW_SELF_PROVENANCE_BLOCKER
+            or terminal.get("review_artifact_verdict") in {"FAIL", "BLOCKED"}):
+        raise ValueError("review-self-disposition-terminal-unverified:blocked-not-provenance")
+    claim = original_review_self_claim(route, node, prior, jobs=jobs, metadata=metadata, require_receipt=True)
+    # This historical exception needs the actual successful normal command,
+    # not a newly recorded self claim or the registry's success note alone.
+    if not claim or claim.get("source") != "runtime-command" or not claim.get("item_id"):
+        raise ValueError("review-self-disposition-blocked-receipt-unverified")
+    evidence = Path(prior["evidence"]["path"])
+    content = json.loads(evidence.read_text())
+    root = Path(route["artifact_root"]).resolve()
+    output = next((p for p in evidence.parents if p.name == "artifacts" and p.is_relative_to(root)), None)
+    if output is None:
+        raise ValueError("review-self-disposition-report-binding-invalid")
+    cycle = json.loads((output.parent / ".cycle.json").read_text())
+    import artifact_producer
+    import artifact_locator
+    cycle_record = artifact_producer.read_cycle_record(root, cycle.get("cycle_id")) or {}
+    locator = content.get("review_artifact")
+    if not isinstance(locator, str) or not locator or any(c in locator for c in "\n\r\x00"):
+        raise ValueError("review-self-disposition-report-binding-invalid")
+    report = (output / locator).resolve()
+    encoded = str(terminal.get("artifact_path_b64") or "")
+    primary = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+    census = prior.get("round_census") or {}
+    if (not report.is_relative_to(output.resolve()) or report == evidence.resolve()
+            or not agent_home_equivalent(primary, report)
+            or content.get("guard_session_id") != prior["attempt_id"]
+            or content.get("cycle_id") != cycle.get("cycle_id")
+            or content.get("route_cycle_id") != cycle.get("cycle_id")
+            or content.get("stage") != node["completion_gate"]
+            or content.get("completion_gate") != node["completion_gate"]
+            or content.get("route_id") != route["route_id"]
+            or any(content.get(k, v) != v for k, v in
+                   (("route_hash", route["route_hash"]), ("node_id", node["id"])))
+            or type(content.get("round")) is not int
+            or content["round"] != census.get("verdict_rounds", 0) + census.get("verdictless_rounds", 0)
+            or content.get("verdict_sequence") != census.get("verdict_rounds")
+            or content.get("verdict_ceiling") != census.get("cap", 0) + 1
+            or census.get("closure_class") != "closure-check"
+            or content.get("blocker") != "none"):
+        raise ValueError("review-self-disposition-report-binding-invalid")
+    located = artifact_locator.locate(root, cycle["cycle_id"], candidates=lambda: [output.parent], heal=False)
+    if ((cycle_record.get("route_id"), cycle_record.get("route_hash")) != (route["route_id"], route["route_hash"])
+            or located is None or located.resolve() != output.parent.resolve()):
+        raise ValueError("review-self-disposition-cycle-binding-invalid")
+    # The unchanged prepared request is independently bound by its normal
+    # strict reader; never trust a prose or boolean claim instead of its pins.
+    from ship_parent_deploy import load_request
+    request, _ = load_request(Path(content.get("request_path", "")))
+    if (request.get("route_id") != route["route_id"]
+            or request.get("route_hash") != route["route_hash"]
+            or prior["attempt_id"] in request.get("prior_review_attempts", [])
+            or datetime.fromisoformat(request["prepared_at"]) > datetime.fromisoformat(prior["completed_at"].replace("Z", "+00:00"))
+            or content.get("request_digest") != request.get("request_digest")
+            or content.get("request_prepared_at") != request.get("prepared_at")
+            or content.get("request_digest_verified") is not True
+            or content.get("prepare_receipt_matches") is not True
+            or content.get("bound_input_mismatches") != []
+            or content.get("bound_inputs_verified") != len(request["command"]["inputs"])
+            or Path(request.get("jobs", "")).resolve() != Path(jobs).resolve()
+            or any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != sha
+                   for path, sha in request["command"]["inputs"].items())):
+        raise ValueError("review-self-disposition-request-binding-invalid")
+    records = []
+    for line in report.read_text().splitlines():
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            pass
+    closed = {"attempt_id": prior["attempt_id"], "status": "closed"}
+    if (records.count(prior) != 1 or records.count(closed) != 1
+            or any(isinstance(record, dict) and (
+                record.get("verdict") in {"FAIL", "BLOCKED"} or record.get("gate_met") is False
+                or (("completion_gate" in record or record.get("status") == "closed") and record not in (prior, closed)))
+                   for record in records)):
+        raise ValueError("review-self-disposition-report-receipt-invalid")
+    lines = Path(metadata["log_file"]).read_text().splitlines()
+    events = []
+    for line in lines:
+        try:
+            events.append((line, json.loads(line)))
+        except ValueError:
+            continue
+    publication = next((i for i, (line, _) in enumerate(events)
+                        if hashlib.sha256(line.encode()).hexdigest() == claim["receipt_sha256"]), None)
+    # Exact terminal parsing above already proves the envelope. Bind its public
+    # event/message bytes as well as chronology, without copying private text.
+    ends = [i for i, (_, e) in enumerate(events) if e.get("type") in {"turn.completed", "result", "step_finish"}]
+    end = ends[-1] if ends else -1
+    if publication is None or end <= publication:
+        raise ValueError("review-self-disposition-terminal-chronology-invalid")
+    message = end
+    if terminal["source"] == "exact-turn-completed":
+        message = next((i for i in range(end - 1, publication, -1)
+                        if events[i][1].get("type") == "item.completed"
+                        and (events[i][1].get("item") or {}).get("type") == "agent_message"), -1)
+    elif terminal["source"] == "exact-step-finish-stop":
+        message = next((i for i in range(end - 1, publication, -1)
+                        if events[i][1].get("type") == "text"), -1)
+    if message <= publication:
+        raise ValueError("review-self-disposition-terminal-chronology-invalid")
+    report_digest = hashlib.sha256(report.read_bytes()).hexdigest()
+    expected = {str(report): report_digest, str(evidence.resolve()): prior["evidence"]["sha256"]}
+    receipts = []
+    for index, (line, event) in enumerate(events):
+        item = event.get("item") or {}
+        if (not publication < index < message or event.get("type") != "item.completed"
+                or item.get("type") != "command_execution" or item.get("status") != "completed"
+                or item.get("exit_code") != 0 or not item.get("id")):
+            continue
+        try:
+            if not _review_report_hash_receipt(item.get("command") or "", report, evidence):
+                continue
+            digests = {}
+            for output_line in (item.get("aggregated_output") or "").splitlines():
+                digest, path = output_line.split("  ", 1)
+                resolved_path = str(Path(path).resolve())
+                if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest) or resolved_path in digests:
+                    raise ValueError("invalid digest output")
+                digests[resolved_path] = digest
+            receipts.append((digests, {"item_id": item.get("id"), "receipt_sha256": hashlib.sha256(line.encode()).hexdigest()}))
+        except (TypeError, ValueError):
+            continue
+    if len(receipts) != 1 or receipts[0][0] != expected:
+        raise ValueError("review-self-disposition-report-bytes-unverified")
+    claim["log_file"] = str(Path(claim["log_file"]).resolve())
+    view["log_file"] = str(Path(view["log_file"]).resolve())
+    return {"report_path": str(report), "report_sha256": report_digest,
+            "publication_receipt": claim,
+            "request_path": str(Path(content["request_path"]).resolve()),
+            "cycle_record_path": str(artifact_producer.cycle_record_path(root, cycle["cycle_id"])),
+            "cycle_binding_path": str(output.parent / ".cycle.json"),
+            "hash_receipt": receipts[0][1], "terminal_verdict": "BLOCKED",
+            "terminal_source": terminal["source"],
+            "terminal_sha256": hashlib.sha256(json.dumps(view, sort_keys=True).encode()).hexdigest(),
+            "terminal_message_sha256": hashlib.sha256(events[message][0].encode()).hexdigest(),
+            "terminal_event_sha256": hashlib.sha256(events[end][0].encode()).hexdigest()}
+
+
+def review_self_disposition_subject(route, node, prior, marker_path, *, jobs, authority_basis=None):
+    """Read the exact settled judgment; never let a disposition select its log."""
+    module = _route_module()
+    jobs = Path(jobs)
+    canonical = marker_path.parent / f"{node['id']}.json"
+    if (jobs.name != "jobs.log" or not jobs.is_file()
+            or not agent_home_equivalent(module.completion_dir(route['route_id'], jobs=jobs), marker_path.parent)):
+        raise ValueError("review-self-disposition-jobs-invalid")
+    lines = jobs.read_text(encoding="utf-8").splitlines()
+    rows = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) == 6:
+            meta = parse_registry_metadata(fields[5])
+            if meta.get("attempt_id") == prior["attempt_id"]:
+                rows.append((fields, meta))
+    if len(rows) != 1:
+        raise ValueError("review-self-disposition-row-not-exact")
+    fields, meta = rows[0]
+    axes = module._marker_attempt_axes(node, prior["attempt_id"], meta)
+    if (fields[1] != "done" or meta.get("worker_type") != "review"
+            or row_is_subsession(meta) or not verdict_pass(meta) or terminal_conflict_pending(meta)
+            or registered_node_identity(meta, node) != (route["route_id"], route["route_hash"], node["id"])
+            or any(prior.get(k) != v for k, v in axes.items())
+            or Path(fields[3]).resolve() != Path(route["cwd"]).resolve()
+            or not agent_home_equivalent(meta.get("completion_marker", ""), canonical)
+            or not agent_home_equivalent(meta.get("completion_marker_history", ""),
+                     marker_path.parent / f"{node['id']}.{prior['sequence']}.json")):
+        raise ValueError("review-self-disposition-row-binding-invalid")
+    readiness = completion_attempt_readiness(route, node, prior, jobs, registry_lines=lines, observe=True)
+    if readiness.state != "ready":
+        raise ValueError("review-self-disposition-not-settled:" + readiness.reason)
+    if module._registered_marker_fence(route, node, prior, lines) is not None:
+        raise ValueError("review-self-disposition-subject-superseded")
+    from codex_dispatch_terminal import inspect_terminal_attempt
+    terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
+                    artifact_root_metadata=meta.get("artifact_root"), worker_type="review")
+    if (terminal.get("state") != "valid" or terminal.get("verdict") not in {"PASS", "BLOCKED"}
+            or terminal.get("artifact_state") != "readable" or terminal.get("review_verdict_conflict")):
+        raise ValueError("review-self-disposition-terminal-unverified")
+    encoded = str(terminal.get("artifact_path_b64") or "")
+    artifact = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+    evidence = Path(prior["evidence"]["path"])
+    if ((terminal.get("verdict") == "PASS" and not agent_home_equivalent(artifact, evidence))
+            or evidence_currency(route, node, marker_path, prior, observe=True).state != "current"):
+        raise ValueError("review-self-disposition-terminal-artifact-mismatch")
+    content = json.loads(evidence.read_text(encoding="utf-8"))
+    if (not isinstance(content, dict) or content.get("verdict") != "PASS" or content.get("findings") != [] or content.get("gate_met") is not True
+            or content.get("route_id", route["route_id"]) != route["route_id"]
+            or content.get("completion_gate", node["completion_gate"]) != node["completion_gate"]):
+        raise ValueError("review-self-disposition-judgment-invalid")
+    if terminal.get("verdict") == "BLOCKED":
+        basis = review_self_blocked_basis(route, node, prior, meta, terminal, jobs=jobs)
+        if authority_basis is not None:
+            authority_basis.update(basis)
+    return fields, meta
+
+
+def review_self_disposition_lineage(route, jobs, metadata):
+    """Verified historical owners followed by the current owner, without liveness policy."""
+    from dispatch_replacement import effective_attempts
+    actor = metadata.get("parent_attempt_id")
+    lineage = []
+    for _ in range(32):
+        if not actor or actor in lineage:
+            raise ValueError("review-self-disposition-parent-lineage-invalid")
+        rows = []
+        for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            if len(fields) == 6:
+                meta = parse_registry_metadata(fields[5])
+                if meta.get("attempt_id") == actor:
+                    rows.append(meta)
+        if len(rows) != 1:
+            raise ValueError("review-self-disposition-actor-not-exact")
+        owner = rows[0]
+        if (owner.get("worker_type") != "owner" or owner.get("dispatch_depth") != "1"
+                or owner.get("registered_worker") != "1"
+                or (owner.get("owner_route_id"), owner.get("owner_route_hash")) !=
+                   (route["route_id"], route["route_hash"])):
+            raise ValueError("review-self-disposition-actor-route-invalid")
+        sealed = _route_module().verify_route(json.loads(Path(owner["owner_route_file"]).read_text()))
+        if (sealed["route_id"], sealed["route_hash"]) != (route["route_id"], route["route_hash"]):
+            raise ValueError("review-self-disposition-actor-route-invalid")
+        lineage.append(actor)
+        effective, mapping = effective_attempts(jobs, {actor})
+        if not mapping:
+            return lineage
+        if len(effective) != 1:
+            raise ValueError("review-self-disposition-parent-lineage-invalid")
+        actor = next(iter(effective))
+    raise ValueError("review-self-disposition-parent-lineage-invalid")
+
+
+def review_self_disposition_origin(route, node, marker, marker_path):
+    """Validate the sole origin-link exception for a named-self disposition.
+
+    Returns the original marker/path. Every other field is compared as a full
+    copy, preserving judgment, evidence, request bindings and round census.
+    Readers and both publication entrances share this decision.
+    """
+    disposition = marker.get("reviewer_disposition")
+    if not isinstance(disposition, dict) or disposition.get("kind") != "registered-named-self":
+        raise ValueError("review-self-disposition-invalid")
+    sequence = disposition.get("of_sequence")
+    if (type(sequence) is not int or sequence < 1
+            or type(marker.get("sequence")) is not int or sequence >= marker["sequence"]):
+        raise ValueError("review-self-disposition-sequence-invalid")
+    prior_path = marker_path.parent / f"{node['id']}.{sequence}.json"
+    prior_bytes = prior_path.read_bytes()
+    if hashlib.sha256(prior_bytes).hexdigest() != disposition.get("of_marker_sha256"):
+        raise ValueError("review-self-disposition-origin-changed")
+    prior = json.loads(prior_bytes)
+    ok, _ = _marker_schema_identity_ok(route, node, prior, prior_path, observe=True)
+    if (not ok or node.get("kind") != "review-worker"
+            or prior.get("reviewer_kind") != "owner-inline"
+            or prior.get("review_independence") != "degraded"
+            or prior.get("reviewer_downgrade_reason") != "reviewer-attempt-no-terminal-verdict"
+            or not prior.get("attempt_id") or prior.get("reviewer_identity") != prior["attempt_id"]
+            or prior.get("registered_worker") is not True
+            or any(k in prior for k in ("stage_authority", "state", "review_gate_closure", "reviewer_disposition"))):
+        raise ValueError("review-self-disposition-origin-invalid")
+    link_path = marker_path.parent / f"{node['id']}.{prior['attempt_id']}.attempt.json"
+    if (hashlib.sha256(link_path.read_bytes()).hexdigest() != disposition.get("origin_link_sha256")
+            or not _marker_link_current(route, node, prior, prior_path)):
+        raise ValueError("review-self-disposition-link-invalid")
+    expected = dict(prior, sequence=marker["sequence"], reviewer_kind="registered-worker",
+                    review_independence="independent", reviewer_disposition=disposition)
+    expected.pop("reviewer_downgrade_reason", None)
+    if expected != marker:
+        raise ValueError("review-self-disposition-content-changed")
+    keys = {"kind", "of_sequence", "of_marker_sha256", "origin_link_sha256",
+            "original_claim", "jobs", "actor", "settled_basis", "recorded_at"}
+    blocked = disposition.get("settled_basis") == "historical-provenance-blocked"
+    if blocked:
+        keys.add("authority_basis")
+    if (set(disposition) != keys
+            or any(not isinstance(disposition.get(k), str) or not disposition[k]
+                   for k in ("actor", "recorded_at", "jobs"))
+            or disposition.get("settled_basis") not in {"successful-quiescent-terminal", "historical-provenance-blocked"}
+            or not isinstance(disposition.get("original_claim"), dict)):
+        raise ValueError("review-self-disposition-basis-invalid")
+    recorded = datetime.fromisoformat(disposition["recorded_at"].replace("Z", "+00:00"))
+    completed = datetime.fromisoformat(prior["completed_at"].replace("Z", "+00:00"))
+    if recorded.tzinfo is None or not completed <= recorded <= datetime.now(timezone.utc):
+        raise ValueError("review-self-disposition-time-invalid")
+    authority_basis = {}
+    _, metadata = review_self_disposition_subject(route, node, prior, prior_path, jobs=disposition["jobs"],
+                                                authority_basis=authority_basis)
+    if ((blocked and (not authority_basis or disposition["authority_basis"] != authority_basis))
+            or (not blocked and authority_basis)):
+        raise ValueError("review-self-disposition-basis-invalid")
+    lineage = review_self_disposition_lineage(route, disposition["jobs"], metadata)
+    if disposition["actor"] not in lineage:
+        raise ValueError("review-self-disposition-actor-invalid")
+    actor_index = lineage.index(disposition["actor"])
+    times = {}
+    for line in Path(disposition["jobs"]).read_text().splitlines():
+        fields = line.split("\t")
+        if len(fields) == 6:
+            aid = parse_registry_metadata(fields[5]).get("attempt_id")
+            if aid in lineage:
+                times[aid] = datetime.fromisoformat(fields[0].replace("Z", "+00:00"))
+    if (times[lineage[actor_index]] > recorded
+            or (actor_index + 1 < len(lineage) and times[lineage[actor_index + 1]] <= recorded)):
+        raise ValueError("review-self-disposition-actor-time-invalid")
+    basis = disposition["original_claim"]
+    observed = original_review_self_claim(route, node, prior, jobs=disposition["jobs"], metadata=metadata)
+    # Supported path aliases do not change which registered log supplied the receipt.
+    if observed and observed.get("source") == "runtime-command" and basis.get("source") == "runtime-command":
+        if agent_home_equivalent(observed["log_file"], basis.get("log_file", "")):
+            observed["log_file"] = basis["log_file"]
+    if observed != basis:
+        raise ValueError("review-self-disposition-claim-invalid")
+    return prior, prior_path
+
+
 def _marker_link_current(
     route: dict[str, object], node: dict[str, object], marker: dict[str, object],
     marker_path: Path,
@@ -7423,6 +7865,10 @@ def _marker_link_current(
     """
     node_id = str(node["id"])
     evidence_record = marker.get("evidence") or {}
+
+    if "reviewer_disposition" in marker:
+        review_self_disposition_origin(route, node, marker, marker_path)
+        return True
 
     if marker.get("stage_authority") == "owner-closure":
         _route_module().validate_continuation_owner_closure(route, node, marker)
@@ -7786,7 +8232,39 @@ def gate_currency(
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
     base = evidence_currency(route, node, marker_path, marker, observe=observe)
-    if base.state not in {"current", "revised-unrecorded"}:
+    return _marker_provenance_currency(route, node, marker_path, marker, base, observe=observe)
+
+
+def _marker_provenance_currency(route, node, marker_path, marker, base, *, observe=False):
+    """Prove recorded marker lineage without rereading historical payloads."""
+    if base.state not in {"current", "revised-unrecorded", "superseded"}:
+        return base
+    try:
+        schema_ok, _ = _marker_schema_identity_ok(route, node, marker, marker_path, observe=observe)
+    except (KeyError, OSError, TypeError, ValueError):
+        schema_ok = False
+    if not schema_ok:
+        return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-identity-invalid")
+    # Legacy tombstones kept the original sequence. Run their ordinary
+    # provenance walk, including sequence and revision-edge validation,
+    # rather than treating an exact attempt link as the whole proof.
+    legacy_supersession = (marker.get("state") == "superseded-by-upstream-revision"
+                           and not marker.get("superseded_by"))
+    if marker.get("state") == "superseded-by-upstream-revision" and not legacy_supersession:
+        # Revise writes a new history row for the supersession, without
+        # changing the original worker's attempt link. Prove that exact
+        # predecessor rather than expecting its link to name the new row.
+        try:
+            prior_path, prior = _superseded_marker_predecessor(route, node, marker_path, marker)
+            prior_currency = _marker_provenance_currency(
+                route, node, prior_path, prior,
+                GateCurrency("current", "completion-marker-verified"), observe=True)
+        except (DispatchContractError, KeyError, OSError, TypeError, ValueError):
+            return GateCurrency("integrity-broken:identity-mismatch", "supersession-provenance-invalid")
+        if prior_currency.state not in {"current", "revised-unrecorded"}:
+            return prior_currency
+        return base
+    if base.state not in {"current", "revised-unrecorded"} and not legacy_supersession:
         return base
     node_id = str(node.get("id"))
     current = marker
@@ -7809,6 +8287,12 @@ def gate_currency(
     seen: set[int] = set()
     for _depth in range(max_steps):
         sequence = current.get("sequence")
+        if (current.get("state") == "superseded-by-upstream-revision"
+                and not (legacy_supersession and current is marker)):
+            historical = _marker_provenance_currency(
+                route, node, current_path, current,
+                GateCurrency("current", "completion-marker-verified"), observe=True)
+            return base if historical.state == "current" else historical
         if current.get("stage_authority") != "revision":
             try:
                 link_ok = _marker_link_current(route, node, current, current_path)
@@ -7848,6 +8332,60 @@ def gate_currency(
             return GateCurrency("integrity-broken:identity-mismatch", "revision-predecessor-identity-invalid")
         current, current_path = prior_marker, prior_path
     return GateCurrency("integrity-broken:identity-mismatch", "revision-provenance-invalid")
+
+
+def _superseded_marker_predecessor(route, node, marker_path, marker):
+    """Read the predecessor copied by the existing revision writer."""
+    node_id = str(node["id"])
+    sequence = marker.get("sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 2:
+        raise ValueError("supersession-sequence-invalid")
+    predecessors = []
+    prefix = f"{node_id}."
+    for path in marker_path.parent.glob(f"{node_id}.*.json"):
+        suffix = path.name[len(prefix):-len(".json")]
+        if suffix.isdecimal() and 1 <= int(suffix) < sequence:
+            predecessors.append((int(suffix), path))
+    prior_sequence, prior_path = max(predecessors)
+    prior = json.loads(prior_path.read_text(encoding="utf-8"))
+    expected = dict(prior, sequence=sequence, state="superseded-by-upstream-revision",
+                    superseded_by=marker.get("superseded_by"))
+    if expected != marker and "reviewer_disposition" in prior:
+        # History allocation can precede canonical commitment. A revision
+        # copies the actual head, leaving that valid pending disposition in
+        # history; follow its already verified origin, never delete the row.
+        origin, origin_path = review_self_disposition_origin(route, node, prior, prior_path)
+        if any(origin['sequence'] < seq < prior_sequence for seq, _ in predecessors):
+            raise ValueError("supersession-predecessor-ambiguous")
+        prior, prior_path, prior_sequence = origin, origin_path, origin['sequence']
+    if (not isinstance(prior, dict) or prior.get("sequence") != prior_sequence
+            or prior.get("state") == "superseded-by-upstream-revision"):
+        raise ValueError("supersession-predecessor-invalid")
+    expected = dict(prior, sequence=sequence, state="superseded-by-upstream-revision",
+                    superseded_by=marker.get("superseded_by"))
+    if expected != marker:
+        raise ValueError("supersession-predecessor-mismatch")
+    superseding = marker.get("superseded_by") or {}
+    if not isinstance(superseding, dict):
+        raise ValueError("supersession-upstream-invalid")
+    upstream_id, upstream_sequence = superseding.get("node"), superseding.get("sequence")
+    upstream_node = next((n for n in route["nodes"] if n["id"] == upstream_id), None)
+    if (upstream_node is None
+            or not isinstance(upstream_sequence, int) or isinstance(upstream_sequence, bool)
+            or upstream_sequence < 2
+            or node_id not in _route_module()._downstream_node_ids(route, upstream_id)):
+        raise ValueError("supersession-upstream-invalid")
+    upstream_path = marker_path.parent / f"{upstream_id}.{upstream_sequence}.json"
+    upstream = json.loads(upstream_path.read_text(encoding="utf-8"))
+    if (not isinstance(upstream, dict) or upstream.get("stage_authority") != "revision"
+            or upstream.get("sequence") != upstream_sequence):
+        raise ValueError("supersession-upstream-not-revision")
+    upstream_currency = _marker_provenance_currency(
+        route, upstream_node, upstream_path, upstream,
+        GateCurrency("current", "completion-marker-verified"), observe=True)
+    if upstream_currency.state not in {"current", "revised-unrecorded"}:
+        raise ValueError("supersession-upstream-unproven")
+    return prior_path, prior
 
 
 def observe_terminal_review_failure(
@@ -9085,6 +9623,46 @@ def _marker_bound_prepare_marker_proof(
     evidence_path = Path(str(evidence_record.get("path", "")))
     history_path = marker_path.parent / f"{metadata.get('route_node', '')}.{marker.get('sequence', 0)}.json"
     dependency_paths = [route_path, evidence_path, history_path]
+    if "reviewer_disposition" in marker:
+        try:
+            _, origin_path = review_self_disposition_origin(route, nodes[0], marker, marker_path)
+            dependency_paths.append(origin_path)
+            disposition = marker["reviewer_disposition"]
+            if disposition.get("settled_basis") == "historical-provenance-blocked":
+                authority_basis = disposition["authority_basis"]
+                dependency_paths.extend(Path(authority_basis[key]) for key in
+                                        ("report_path", "request_path", "cycle_record_path", "cycle_binding_path"))
+                request = json.loads(Path(authority_basis["request_path"]).read_text())
+                dependency_paths.extend(Path(path) for path in request["command"]["inputs"])
+            jobs = Path(disposition["jobs"])
+            dependency_paths.append(jobs)
+            from dispatch_replacement import source_binding, _record_path, _directory
+            bound_rows = []
+            for line in jobs.read_text().splitlines():
+                fields = line.split("\t")
+                if len(fields) != 6:
+                    continue
+                owner = parse_registry_metadata(fields[5])
+                bound_rows.append(owner)
+            subject = next((row for row in bound_rows if row.get("attempt_id") == attempt_id), None)
+            if subject is None:
+                raise ValueError("review-self-disposition-row-not-exact")
+            dependency_paths.append(Path(subject["log_file"]))
+            lineage = review_self_disposition_lineage(route, jobs, subject)
+            for owner in bound_rows:
+                if owner.get("attempt_id") not in lineage:
+                    continue
+                dependency_paths.append(Path(owner["owner_route_file"]))
+                binding = source_binding(jobs, owner)
+                if binding:
+                    dependency_paths.append(_record_path(jobs, binding[0]))
+                    if owner.get("replacement_original_attempt_id"):
+                        dependency_paths.append(_directory(jobs) / "by-source" / (owner["attempt_id"] + ".json"))
+            claim = marker["reviewer_disposition"]["original_claim"]
+            if claim.get("source") == "runtime-command":
+                dependency_paths.append(Path(claim["log_file"]))
+        except (IndexError, KeyError, OSError, TypeError, ValueError):
+            return None
     if marker.get("stage_authority") == "owner-chain":
         dependency_paths.append(Path(str(marker.get("subsession_manifest", ""))))
     elif nodes and nodes[0].get("kind") != "resource-runner":
@@ -9160,6 +9738,13 @@ def _marker_bound_current_marker(
         return None, ""
     if marker != proof.marker:
         return None, ""
+    if "reviewer_disposition" in marker:
+        try:
+            if any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
+                   for path, digest in proof.immutable_file_digests):
+                return None, ""
+        except OSError:
+            return None, ""
     return marker, digest
 
 

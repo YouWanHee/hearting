@@ -751,6 +751,49 @@ class NormalizeReceiptStageAdvanceNegotiationTest(unittest.TestCase):
             **extra,
         )
 
+    def test_normalize_preserves_deferred_and_rejects_ordinary_projection_errors(self):
+        with mock.patch.object(self.module, "wait_for_delivery_projection", side_effect=self.module.CompletionDeferred("termination-pending")):
+            with self.assertRaises(self.module.CompletionDeferred):
+                self._normalize()
+        with mock.patch.object(self.module, "wait_for_delivery_projection", side_effect=self.module.JoinContractError("malformed")):
+            with self.assertRaisesRegex(self.module.CompletionError, "delivery-classification-failed"):
+                self._normalize()
+
+    def test_deferred_observer_retains_duty_and_resumed_window_without_delivery(self):
+        from types import SimpleNamespace
+        import dispatch_supervision
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                args = SimpleNamespace(parent_attempt_id=PARENT, parent_session_id=None, thread_id=None,
+                    attempt_id=["att-child"], jobs=self.jobs, control_socket=Path(self.temp.name) / "control.sock",
+                    queue_socket=None, timeout=0,
+                    _resume_execution=resume, _obligation_id="existing-duty")
+                now = [100.0]
+                def pause(seconds):
+                    now[0] += seconds
+                with mock.patch.object(self.module, "wait_for_session_launch_claims"), \
+                     mock.patch.object(self.module, "run_join", return_value=self._raw_receipt()) as join, \
+                     mock.patch("dispatch_replacement.advance_batch", return_value=({"att-child"}, [], [])), \
+                     mock.patch("dispatch_replacement.adopt_receipt", return_value=({"att-child"}, set())), \
+                     mock.patch.object(self.module, "normalize_receipt", side_effect=self.module.CompletionDeferred("termination-pending")), \
+                     mock.patch.object(self.module, "_receiver_unavailable_reason", return_value=""), \
+                     mock.patch.object(self.module.batch_obligations, "read", return_value={"outcome": None}), \
+                     mock.patch.object(self.module.batch_obligations, "update") as update, \
+                     mock.patch.object(dispatch_supervision, "materialize", return_value=[]), \
+                     mock.patch.object(self.module.time, "monotonic", side_effect=lambda: now[0]), \
+                     mock.patch.object(self.module.time, "sleep", side_effect=pause) as sleep, \
+                     mock.patch.object(self.module, "deliver_to_native_queue") as deliver:
+                    result, code = self.module._execute_once(args)
+                self.assertEqual((code, result["reason"]), (75, "termination-pending"))
+                join.assert_called_once()
+                deliver.assert_not_called()
+                self.assertEqual(update.call_args.kwargs["outcome"], None)
+                self.assertEqual(update.call_args.kwargs["delivery"], "pending")
+                if resume:
+                    sleep.assert_called_once_with(30.0)
+                else:
+                    sleep.assert_not_called()
+
     @staticmethod
     def _without_live_timing(value):
         # `delivery_timing` embeds `time.monotonic_ns()` observed at call

@@ -19,6 +19,7 @@ shared-utility-deferred	artifact_locator_amendment.py
 shared-utility-deferred	artifact_metadata_amendment.py
 shared-utility-deferred	artifact_restore_sealed.py
 shared-utility-deferred	artifact_workflow_group_review.py
+shared-utility-deferred	atomic_publish.py
 shared-utility-deferred	cairn-artifact-read.sh
 shared-utility-deferred	cairn-artifact-read.ts
 shared-utility-deferred	campaign_title_repair.py
@@ -63,6 +64,8 @@ shared-utility-deferred	route_plan.py
 shared-utility-deferred	route_presence_gate.py
 shared-utility-deferred	frame_native_answer.py
 shared-utility-deferred	spec_merge.py
+shared-utility-deferred	ship-parent-deploy.py
+shared-utility-deferred	ship_parent_deploy.py
 shared-utility-deferred	transcript_turn.py
 shared-utility-deferred	verification-background-lease.py
 shared-utility-deferred	work_start.py

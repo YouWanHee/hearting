@@ -51,6 +51,7 @@ const turnContextBySession = new Map()
 //     candidate probe) and the kept text is re-emitted on every model call of
 //     that turn, so a tool-loop continuation never consumes a second card.
 const cardBySession = new Map()
+const peerGuidanceBySession = new Map()
 // One threshold notice per native session, retained for the triggering turn so
 // an auxiliary title call cannot consume the answering model's system context.
 const contextAlertBySession = new Map()
@@ -923,6 +924,14 @@ function createCompletionCarrier(ctx) {
   }
 
   return {
+    async activate(sid) {
+      if (!sid || !available()) return
+      sessions.add(sid)
+      await command("activate", sid)
+      // The existing timer and idle callback deliver the retained receipt;
+      // session creation by itself never acknowledges it.
+      this.env(sid)
+    },
     // The env a tool command of `sid` carries: only a runtime that will carry the receipt says so.
     env(sid) {
       if (!sid || !available()) return null
@@ -1094,15 +1103,22 @@ export const AgentHarnessGuards = async (ctx) => {
   // was loaded by the headless runtime (dispatch-liveness.py inspects it).
   markPluginLoaded(dispatchSlug())
   peerIdentityLog(ctx, "plugin", "plugin-registered")
-  registerPaneContext(ctx)
+  const paneBinding = registerPaneContext(ctx)
   if (!isWorkerSession()) reconnectPeerObligations()
   const completionCarrier = createCompletionCarrier(ctx)
+  // Restoring an existing -s/--session TUI does not emit session.created.
+  // Reuse the process-bound selector; a directory/SDK root cannot pick a recipient.
+  if (paneBinding.ownsOrigin && paneNativeOrigin?.sid) {
+    await completionCarrier.activate(paneNativeOrigin.sid)
+  }
 
   return ({
   dispose: () => { completionCarrier.dispose(); retirePaneContext(ctx) },
   event: async ({ event }) => {
     if (event && event.type === "session.created" && !isWorkerSession()) {
       reconnectPeerObligations()
+      const sid = event.properties?.info?.id || event.properties?.sessionID || ""
+      await completionCarrier.activate(sid)
     }
     if (event && event.type === "session.compacted") {
       collectCard("compact", (event.properties && event.properties.sessionID) || "", baseDir(ctx))
@@ -1142,6 +1158,7 @@ export const AgentHarnessGuards = async (ctx) => {
         localEvidenceBySession.delete(sid)
         turnContextBySession.delete(sid)
         cardBySession.delete(sid)
+        peerGuidanceBySession.delete(sid)
         contextAlertBySession.delete(sid)
         paneProjectionRetryAt.delete(sid)
         invalidatePaneOrigin(sid)
@@ -1158,8 +1175,13 @@ export const AgentHarnessGuards = async (ctx) => {
     const prompt = promptText(output)
     const turn = input.messageID || output?.message?.id || ""
     if (prompt) promptBySession.set(sid, prompt)
+    peerGuidanceBySession.delete(sid)
     // Actual peer receipt is observed after persistence, not callback rendering.
     if (prompt && eventSid && prompt.includes("peer-from:")) {
+      const guidance = spawnSync("python3", ["-c",
+        "import importlib.util; s=importlib.util.spec_from_file_location('peer', 'utilities/peer-message.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.receiver_guidance())"],
+        { cwd: root, encoding: "utf8", timeout: 4000 })
+      if (guidance.status === 0) peerGuidanceBySession.set(sid, (guidance.stdout || "").trim())
       // Ordinary manual sends retain their existing notice path. Pending refs
       // are acknowledged by the persisted-context observation at normal idle.
       const rows = pendingPeerCommand(eventSid)
@@ -1202,6 +1224,7 @@ export const AgentHarnessGuards = async (ctx) => {
     }
     appendContext(output, localEvidenceBySession.get(sid))
     appendContext(output, cardBySession.get(sid)?.text)
+    appendContext(output, peerGuidanceBySession.get(sid))
     appendContext(output, contextAlertBySession.get(sid)?.text)
 
     const prompt = promptBySession.get(sid) || ""

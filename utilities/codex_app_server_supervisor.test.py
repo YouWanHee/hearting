@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import hashlib
@@ -524,6 +525,136 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             failed=json.loads(registry.read_text())["runs"]["queued"]
             self.assertEqual(failed["failure_class"],"resource-launch-incomplete")
             self.assertNotIn("pid",failed)
+
+    def test_controller_launch_refusal_returns_resource_receipt_to_same_owner(self):
+        import dispatch_resource_wait as RESOURCE
+        runner = RESOURCE.supervisor().runner()
+        registry = self.base / "resource-registry.json"
+        row = {"run_id": "queued", "cwd": str(self.base), "log": str(self.base / "out.log"),
+            "route": str(self.base / "route.json"), "jobs": str(self.jobs), "node": "full-run",
+            "command": ["python3", "remote_bridge.py"], "parent_attempt_id": PARENT,
+            "sentinel": str(self.base / "out.log.exit"),
+            "resource_policy": "supervised-owner", "status": "launching", "launch_state": "queued",
+            "owner_wait": {"launch_scope": "codex-owner-controller", "owner_pid": os.getpid(),
+                "owner_start": runner.proc_identity(os.getpid())["starttime"], "session_id": "same-native"},
+            "launch_request": {"smoke_attestation": None, "config_manifest": None}}
+        args = SimpleNamespace(jobs=str(self.jobs), parent_attempt_id=PARENT, route_id="rt-test",
+            route_hash="sha256:test", resource_launch_command=lambda r: (r["command"], {}))
+        control = SimpleNamespace(thread_id="same-native", pending=lambda: False)
+        armed = {"resource_registry": str(registry), "node": "full-run", "successors": ["verify"]}
+        error = {"type": "GPUUnavailable", "message": "Local GPU admission on controller: GPU in use"}
+        stage = {"state": "FAILED_RETRYABLE"}
+        sup = SimpleNamespace(runner=lambda: runner, poll_once=mock.Mock(),
+            resource_evidence=lambda _: {"terminal": True, "succeeded": False, "liveness": "exited", "exit_code": None},
+            artifact_evidence=lambda _: {"missing": ["run.json"]})
+        def context(*_):
+            actual = json.loads(registry.read_text())["runs"]["queued"]
+            return sup, {}, SimpleNamespace(state=lambda: {"nodes": {"full-run": stage}}), [(armed, actual)]
+        def refuse(_argv, *, controller):
+            failed = {**row, "status": "failed", "workflow_state": "FAILED_RETRYABLE",
+                "launch_state": "not-started", "failure_class": "resource-launch-incomplete",
+                "launch_controller": controller.identity, "launch_error": error}
+            runner.publish_verified_run(registry, "queued", row, failed)
+            raise runner.gpu_leases.GPUUnavailable(error["message"])
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {"queued": row}}))
+        RESOURCE.JOIN.write_supervisor_state(self.state, PARENT, set(), phase="running-turn")
+        with mock.patch.object(runner, "main", side_effect=refuse), \
+             mock.patch.object(RESOURCE, "context", side_effect=context):
+            prompt = RESOURCE.wait(args, self.state, control, set(), lambda _: None)
+            self.assertIn("same-native", prompt)
+            self.assertIn(error["message"], prompt)
+            self.assertIn('"state":"needs-attention"', prompt)
+            self.assertIn('"workflow_complete":false', prompt)
+            self.assertIn("normal distinct __a<N> resource retry", prompt)
+            self.assertNotIn("do not restart the resource", prompt)
+            box = RESOURCE.JOIN.read_supervisor_phase_state(self.state, PARENT).resource["outbox"]
+            self.assertEqual(box["receipt"]["launch_error"], error)
+            self.assertEqual(box["receipt"]["successors"], [])
+            RESOURCE.acknowledge(self.state, PARENT, box["receipt_id"])
+        # A failure without this controller's settled pre-release row still raises.
+        for changes in ({"launch_state": "started"}, {"command": ["foreign"]},
+                        {"launch_controller": {"pid": -1}}, {"launch_state": "claimed"}):
+            registry.write_text(json.dumps({"schema_version": 1, "runs": {"queued": row}}))
+            def unsettled(argv, *, controller):
+                try:
+                    refuse(argv, controller=controller)
+                except runner.gpu_leases.GPUUnavailable:
+                    actual = json.loads(registry.read_text())["runs"]["queued"]
+                    runner.publish_verified_run(registry, "queued", actual, {**actual, **changes})
+                    raise
+            with self.subTest(changes=changes), mock.patch.object(runner, "main", side_effect=unsettled):
+                with self.assertRaises(runner.gpu_leases.GPUUnavailable):
+                    RESOURCE.admit_controller_launch(args, control, armed, row)
+
+    def test_preclaim_validation_refusals_return_through_same_owner_outbox(self):
+        import dispatch_resource_wait as RESOURCE
+        import dispatch_owner_input as INPUT
+        runner = RESOURCE.supervisor().runner()
+        registry = self.base / "validation-registry.json"
+        starttime = runner.proc_identity(os.getpid())["starttime"]
+        row = {"run_id": "queued", "cwd": str(self.base), "log": str(self.base / "out.log"),
+            "route": str(self.base / "route.json"), "jobs": str(self.jobs), "node": "full-run",
+            "command": ["python3", "remote_bridge.py"], "parent_attempt_id": PARENT,
+            "sentinel": str(self.base / "out.log.exit"), "workflow_state": "READY",
+            "resource_policy": "supervised-owner", "status": "launching", "launch_state": "queued",
+            "owner_wait": {"launch_scope": "codex-owner-controller", "owner_pid": os.getpid(),
+                "owner_start": starttime, "session_id": "same-native", "parent_attempt_id": PARENT,
+                "jobs": str(self.jobs)},
+            "launch_request": {"smoke_attestation": None, "config_manifest": None}}
+        args = SimpleNamespace(jobs=str(self.jobs), parent_attempt_id=PARENT, route_id="rt-test",
+            route_hash="sha256:test", resource_launch_command=lambda r: (r["command"], {}))
+        control = SimpleNamespace(thread_id="same-native", pending=lambda: False)
+        armed = {"resource_registry": str(registry), "node": "full-run", "successors": ["verify"],
+            "predecessor_id": "queued", "resource_binding": RESOURCE.resource_body_digest(row)}
+        stage = {"state": "FAILED_RETRYABLE"}
+        ledger = SimpleNamespace(lock=contextlib.nullcontext,
+            state=lambda: {"nodes": {"full-run": stage}})
+        sup = SimpleNamespace(runner=lambda: runner, poll_once=mock.Mock(),
+            load_route=lambda _: {}, ledger_for=lambda *_: ledger, read_armed=lambda _: {"full-run": armed},
+            resource_continuation_cancelled=lambda *_: False, _evaluate=mock.Mock(),
+            resource_evidence=lambda _: {"terminal": True, "succeeded": False, "liveness": "exited", "exit_code": None},
+            artifact_evidence=lambda _: {"missing": ["run.json"]})
+        parent = SimpleNamespace(status="open", metadata={"harness": "codex", "pid": str(os.getpid()),
+            "pid_start": starttime})
+        @contextlib.contextmanager
+        def locked(*_):
+            yield None, {"target": "exact", "thread_id": "same-native", "requests": []}
+        def context(*_):
+            actual = json.loads(registry.read_text())["runs"]["queued"]
+            return sup, {}, ledger, [(armed, actual)]
+        cli_error = SystemExit(65)
+        cli_error.resource_message = "config provenance does not match smoke attestation"
+        failures = [subprocess.CalledProcessError(65, ["smoke-attestation.py", "verify"],
+            stderr="stale smoke input: /current/standing-policy.json"), cli_error,
+            FileNotFoundError("missing configuration manifest")]
+        self.jobs.write_text("")
+        for error in failures:
+            with self.subTest(error=type(error).__name__):
+                registry.write_text(json.dumps({"schema_version": 1, "runs": {"queued": row}}))
+                self.state = self.base / (type(error).__name__ + "-state.json")
+                RESOURCE.JOIN.write_supervisor_state(self.state, PARENT, set(), phase="running-turn")
+                with mock.patch.object(runner, "_main", side_effect=error), \
+                     mock.patch.object(RESOURCE, "supervisor", return_value=sup), \
+                     mock.patch.object(RESOURCE, "context", side_effect=context), \
+                     mock.patch.object(RESOURCE, "model_legs_pending", return_value=False), \
+                     mock.patch.object(INPUT, "_locked", side_effect=locked), \
+                     mock.patch.object(INPUT, "_target", return_value=(parent, "exact")), \
+                     mock.patch.object(runner.subprocess, "Popen") as spawn:
+                    prompt = RESOURCE.wait(args, self.state, control, set(), lambda _: None)
+                    diagnostic = runner.launch_error(error)
+                    self.assertIn(diagnostic["message"], prompt)
+                    self.assertIn("same-native", prompt)
+                    self.assertIn('"state":"needs-attention"', prompt)
+                    failed = json.loads(registry.read_text())["runs"]["queued"]
+                    self.assertTrue(runner.resource_never_started(failed))
+                    self.assertEqual(failed["launch_request"], row["launch_request"])
+                    box = RESOURCE.JOIN.read_supervisor_phase_state(self.state, PARENT).resource["outbox"]
+                    self.assertEqual(box["receipt"]["parent_attempt_id"], PARENT)
+                    self.assertEqual(box["receipt"]["session_id"], "same-native")
+                    self.assertEqual(box["receipt"]["launch_error"], diagnostic)
+                    self.assertEqual(box["receipt"]["successors"], [])
+                    RESOURCE.acknowledge(self.state, PARENT, box["receipt_id"])
+                    spawn.assert_not_called()
 
     def test_resource_phase_restart_resumes_exact_native_thread_without_new_start(self):
         module = load_supervisor_module()

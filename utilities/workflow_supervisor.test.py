@@ -429,7 +429,7 @@ class TestSupervisorAdvance(WorkflowFixture):
         gates = {node: {"passed": passed} for node in WS.route_terminal_nodes(route)}
         with mock.patch.object(terminal, "_completion_request", return_value=request), \
                 mock.patch.object(terminal.dispatch_contract, "attempt_process_quiescence",
-                                  return_value=SimpleNamespace(state="quiescent")), \
+                                  return_value=terminal.dispatch_contract.ProcessQuiescence("quiescent", "fixture")), \
                 mock.patch.object(terminal, "_route_module", return_value=SimpleNamespace(
                     terminal_gate_observation=lambda *a, **kw: gates)), \
                 mock.patch.object(terminal, "settle_terminal_commit",
@@ -1447,6 +1447,8 @@ class TestStatusProjection(WorkflowFixture):
         route, path = self.two_stage_route()
         ledger = SUP.ledger_for(route)
         ledger.root.mkdir(parents=True)
+        ledger.claim("a" * 32, {"predecessor": "eval-run", "successor": "verify",
+                                             "claimed_by_pid": 12345})
         gates = {"verify": {"passed": True}}
         outcome = {"route_id": route["route_id"], "route_hash": route["route_hash"],
                    "terminal_gate_proven": True}
@@ -1481,6 +1483,7 @@ class TestStatusProjection(WorkflowFixture):
             self.assertEqual(projection["current_stage"], [])
             self.assertEqual(projection["next_stage"], [])
         self.assertEqual(status["journal_workflow_state"], "CREATED")
+        self.assertTrue(status["claims"])
         self.assertEqual(before_registry, (self.base / "jobs.log").read_bytes()
                          if (self.base / "jobs.log").exists() else None)
         self.assertEqual(before_journal, ledger.journal_path.read_bytes()

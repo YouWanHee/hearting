@@ -17,7 +17,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
 PROTOCOL_MAJOR = 2
-SUPPORTED_SCHEMA_MINORS = frozenset({0})
+SUPPORTED_SCHEMA_MINORS = frozenset({0, 1})
 MAX_ENVELOPE_BYTES = 1024 * 1024
 MAX_MUTATIONS = 128
 MAX_PARENTS = 256
@@ -41,7 +41,7 @@ UINT64_MAX = (1 << 64) - 1
 
 KNOWN_KINDS = frozenset({
     "put", "consume", "supersede", "tombstone", "force-tombstone",
-    "restore", "resolve", "merge",
+    "restore", "resolve", "merge", "rekey",
 })
 DESTRUCTIVE_KINDS = frozenset({"supersede", "tombstone", "force-tombstone", "merge"})
 COVERAGE_SENSITIVE_KINDS = DESTRUCTIVE_KINDS | frozenset({"restore"})
@@ -150,7 +150,9 @@ class ValidatedOperation:
 
     @property
     def parents(self) -> tuple[str, ...]:
-        return tuple(self.payload["parents"])
+        extra = (self.payload.get("namespace_parents", ())
+                 if self.supported and self.payload["schema_minor"] == 1 else ())
+        return tuple(sorted(set(self.payload["parents"]) | set(extra)))
 
     def mutation_for(self, record_id: str) -> Mapping[str, Any] | None:
         return next((m for m in self.payload["mutations"]
@@ -536,6 +538,12 @@ def _record_namespace(state: Mapping[str, Any]) -> str:
     return str(state["cwd_origin"])
 
 
+def serving_project(payload: Mapping[str, Any]) -> str:
+    """The projection address; immutable operation identity remains unchanged."""
+    return str(payload["provenance"]["source"] if payload["schema_minor"] == 1
+               else payload["project_key"])
+
+
 def _validate_tombstone_evidence(value: Mapping[str, Any], record_id: str) -> None:
     _exact_keys(value, TOMBSTONE_FIELDS, "tombstone")
     if value["record_id"] != record_id:
@@ -682,7 +690,14 @@ def _validate_payload(payload: Any) -> tuple[bool, str | None]:
     project_key = _identifier(payload["project_key"], "project_key")
     if minor not in SUPPORTED_SCHEMA_MINORS:
         return False, "unknown-schema-minor"
-    _exact_keys(payload, PAYLOAD_FIELDS, "payload")
+    _exact_keys(payload, PAYLOAD_FIELDS | ({"namespace_parents"} if minor == 1 else set()), "payload")
+    if minor == 1:
+        extra = _set_ids(payload["namespace_parents"], "namespace_parents", MAX_PARENTS)
+        if set(extra) & set(parents):
+            raise ProtocolError("parent-order", "namespace parents duplicate routing parents")
+        parents = tuple(sorted(set(parents) | set(extra)))
+        if len(parents) > MAX_PARENTS:
+            raise ProtocolError("parent-limit", "combined parents exceed protocol bound")
     kind = _identifier(payload["kind"], "kind")
     frontiers = payload["frontiers"]
     if not isinstance(frontiers, list) or len(frontiers) > MAX_MUTATIONS:
@@ -700,7 +715,8 @@ def _validate_payload(payload: Any) -> tuple[bool, str | None]:
     encoded_ids = [item.encode("utf-8") for item in frontier_ids]
     if encoded_ids != sorted(encoded_ids) or len(frontier_ids) != len(set(frontier_ids)):
         raise ProtocolError("frontier-order", "frontiers must be record_id sorted and duplicate-free")
-    if parents != tuple(sorted(union, key=lambda item: canonical_bytes(item))):
+    if (not union.issubset(parents)
+            or set(parents) - union - set(payload.get("namespace_parents", ()))):
         raise ProtocolError("parent-frontier-mismatch", "parents are not the exact frontier union")
     mutations = payload["mutations"]
     if not isinstance(mutations, list) or not 1 <= len(mutations) <= MAX_MUTATIONS:
@@ -720,7 +736,15 @@ def _validate_payload(payload: Any) -> tuple[bool, str | None]:
         _check_string(item)
     if kind not in KNOWN_KINDS:
         return False, "unknown-kind"
-    _validate_kind_mutations(kind, checked, provenance, project_key)
+    serving_project = project_key
+    if minor == 1:
+        serving_project = _identifier(provenance.get("source"), "serving project")
+        if serving_project == "global" or project_key == "global":
+            raise ProtocolError("invalid-rekey", "renamed namespaces must be projects")
+    if kind == "rekey" and (minor != 1 or not parents):
+        raise ProtocolError("invalid-rekey", "rekey needs a prior frontier and new serving project")
+    _validate_kind_mutations("put" if kind == "rekey" else kind, checked,
+                             provenance, serving_project)
     if kind == "resolve" and len(parents) < 2:
         raise ProtocolError("resolve-frontier", "resolve must descend at least two maximal heads")
     if kind == "force-tombstone":
@@ -734,6 +758,8 @@ def _normalize_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(payload)
     if isinstance(out.get("parents"), Sequence):
         out["parents"] = sorted(set(out["parents"]), key=lambda item: canonical_bytes(item))
+    if isinstance(out.get("namespace_parents"), Sequence):
+        out["namespace_parents"] = sorted(set(out["namespace_parents"]))
     if isinstance(out.get("frontiers"), Mapping):
         out["frontiers"] = [{"record_id": rid,
                               "heads": sorted(set(heads), key=lambda item: canonical_bytes(item))}
@@ -851,9 +877,30 @@ def classify_operations(operations: Iterable[Any] | Mapping[str, Any]) -> Classi
             add_hard(Diagnostic("duplicate-dot-equivocation", op.op_id, (prior_id,)))
         else:
             dots[op.dot] = op.op_id
+    # A rekey unifies serving addresses without rewriting immutable logical
+    # namespaces. Separate cross-namespace dependencies in minor 1 let older
+    # readers quarantine the operation without mistaking it for corruption.
+    aliases: dict[str, str] = {}
+
+    def logical_project(project):
+        path = []
+        while project in aliases and aliases[project] != project:
+            path.append(project)
+            project = aliases[project]
+        for name in path:
+            aliases[name] = project
+        return project
+
+    for op_id in sorted(validated):
+        op = validated[op_id]
+        if op.supported and op.payload.get("kind") == "rekey":
+            source = logical_project(str(op.payload["project_key"]))
+            target = logical_project(str(op.payload["provenance"]["source"]))
+            if source != target:
+                aliases[max(source, target)] = min(source, target)
     record_projects: dict[str, dict[str, set[str]]] = {}
     for op_id, op in validated.items():
-        project = str(op.payload["project_key"])
+        project = logical_project(str(op.payload["project_key"]))
         if op.supported:
             for mutation in op.payload["mutations"]:
                 record_projects.setdefault(mutation["record_id"], {}).setdefault(
@@ -861,7 +908,7 @@ def classify_operations(operations: Iterable[Any] | Mapping[str, Any]) -> Classi
                 ).add(op_id)
         for parent in op.parents:
             parent_op = validated.get(parent)
-            if parent_op is not None and parent_op.payload["project_key"] != project:
+            if parent_op is not None and logical_project(str(parent_op.payload["project_key"])) != project:
                 add_hard(Diagnostic("cross-project-parent", op_id, (parent,)))
     for projects in record_projects.values():
         if len(hard) >= MAX_HARD_DIAGNOSTICS:
@@ -1329,11 +1376,24 @@ def _fold_operations_unchecked(operations: Iterable[Any] | Mapping[str, Any] |
     for op_id in ancestry.order:
         op = ops[op_id]
         kind, problem = op.payload["kind"], None
+        if op.payload["schema_minor"] == 1:
+            frontier_union = {head for item in op.payload["frontiers"] for head in item["heads"]}
+            identity_heads = set(op.payload["namespace_parents"]) - frontier_union
+            matching = [head for head in op.payload["namespace_parents"]
+                        if ops[head].payload["kind"] == "rekey"
+                        and serving_project(ops[head].payload) == serving_project(op.payload)
+                        and head not in blocked]
+            if (any(head not in matching for head in identity_heads)
+                    or (kind != "rekey" and serving_project(op.payload) != op.payload["project_key"]
+                        and not matching)):
+                problem = Diagnostic("blocked-rekey-precondition", op_id, tuple(sorted(identity_heads)))
         observed_states: dict[str, Mapping[str, Any] | None] = {}
         observed_projections: dict[
             str, tuple[Mapping[str, Any] | None, str | None]
         ] = {}
         for mutation in op.payload["mutations"]:
+            if problem is not None:
+                break
             rid = mutation["record_id"]
             declared = _frontier_heads(op, rid)
             linear_parent = (
@@ -1363,6 +1423,19 @@ def _fold_operations_unchecked(operations: Iterable[Any] | Mapping[str, Any] |
             observed_projections[rid] = prior_projection
             observed_states[rid] = prior_state
             post_state = _state(op, rid)
+            if kind == "rekey":
+                expected_state = dict(prior_state or {})
+                expected_state["cwd_origin"] = op.payload["provenance"]["source"]
+                if (prior_state is None or prior_state.get("scope") != "project"
+                        or post_state != expected_state
+                        or prior_state.get("cwd_origin") == expected_state["cwd_origin"]):
+                    problem = Diagnostic("blocked-rekey-precondition", op_id, declared)
+                    break
+            elif (prior_state is not None and post_state is not None
+                  and _record_namespace(prior_state) != _record_namespace(post_state)
+                  and not (kind == "resolve" and op.payload["schema_minor"] == 1 and matching)):
+                problem = Diagnostic("blocked-project-transition", op_id, declared)
+                break
             if kind == "consume" and (
                 prior_state is None or prior_state.get("delivery_state") != "pending"
             ):
@@ -1533,8 +1606,8 @@ def _fold_operations_unchecked(operations: Iterable[Any] | Mapping[str, Any] |
             left, right = prior_state(op, source), prior_state(op, target)
             if (not _graph_endpoint_allowed(left) or
                     not _graph_endpoint_allowed(right) or
-                    record_projects.get(source) != op.payload["project_key"] or
-                    record_projects.get(target) != op.payload["project_key"] or
+                    _record_namespace(left) != edge["scope"] or
+                    _record_namespace(right) != edge["scope"] or
                     source in trial or _cycle(trial, source, target)):
                 valid = False
                 break

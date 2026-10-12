@@ -210,6 +210,184 @@ class TestRunner(unittest.TestCase):
             self.assertEqual(R.classify_identity(foreign)[0],"stale")
             self.assertEqual(R.classify_identity(foreign)[2],"process-namespace-mismatch")
 
+    def test_gpu_launch_refusal_preserves_failure_and_cpu_bridge_retry_starts_once(self):
+        import artifact_producer
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness):
+                jobs = self.base / (harness + "-jobs.log")
+                jobs.write_text("")
+                registry = self.base / (harness + "-runs.json")
+                route_file = self.base / (harness + "-route.json")
+                route = {"route_id": "rt-gpu-refusal-" + harness, "route_hash": "sha256:" + harness,
+                         "nodes": [{"id": "full-run", "resource_class": "gpu"}]}
+                args = SimpleNamespace(jobs=str(jobs), run_id="bridge", node="full-run")
+                log = self.base / (harness + "-failed.log")
+                marker = self.base / (harness + "-payload")
+                command = [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('once')"]
+                owner = {"session_id": "same-native"}
+                if harness == "codex":
+                    owner["launch_scope"] = "codex-owner-controller"
+                body = {"run_id": "bridge", "cwd": str(self.repo), "log": str(log), "command": command,
+                        "route": str(route_file), "node": "full-run", "status": "launching",
+                        "sentinel": str(log) + ".exit", "parent_attempt_id": "att-parent", "owner_wait": owner}
+                if harness == "codex":
+                    body["launch_request"] = {}
+                def controller(expected):
+                    return SimpleNamespace(expected=expected, identity={**R.proc_identity(os.getpid()),
+                        "pid_namespace": os.readlink("/proc/self/ns/pid")},
+                        command=expected["command"], sandbox={}, guard=contextlib.nullcontext)
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+                     mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                                       return_value={"AGENT_ARTIFACT_OUTPUT_DIR": str(self.base)}), \
+                     mock.patch.object(R, "register_registry"), mock.patch.object(R.subprocess, "run"), \
+                     mock.patch("sys.stdout"), mock.patch.object(R.subprocess, "Popen") as spawn:
+                    admission = None
+                    if harness == "codex":
+                        R.start_verified(registry, args, route, route_file, dict(body))
+                        queued = json.loads(registry.read_text())["runs"]["bridge"]
+                        admission = controller(queued)
+                    with mock.patch.object(R.gpu_leases, "resource_admission",
+                                           side_effect=R.gpu_leases.GPUUnavailable("Local GPU admission: in use")):
+                        R.start_verified(registry, args, route, route_file, dict(body), controller=admission)
+                    spawn.assert_not_called()
+                failed = json.loads(registry.read_text())["runs"]["bridge"]
+                self.assertEqual(failed["launch_state"], "not-started")
+                self.assertEqual(failed["launch_error"], {"type": "GPUUnavailable", "message": "Local GPU admission: in use"})
+                self.assertTrue(R.resource_never_started(failed))
+                self.assertFalse(marker.exists())
+                # The existing empty CUDA spelling describes a CPU control
+                # bridge; target-host compute admission remains its own step.
+                args.run_id = "bridge__a1"
+                retry_log = self.base / (harness + "-retry.log")
+                retry = {**body, "run_id": args.run_id, "log": str(retry_log),
+                    "sentinel": str(retry_log) + ".exit", "command": ["env", "CUDA_VISIBLE_DEVICES=", *command]}
+                real_popen = subprocess.Popen
+                watch = mock.Mock(pid=os.getpid())
+                watch.poll.return_value = None
+                payloads = []
+                def launch(argv, **kwargs):
+                    if "watch" in argv:
+                        os.write(kwargs["pass_fds"][0], b"ready\n")
+                        return watch
+                    proc = real_popen(argv, **kwargs)
+                    payloads.append(proc)
+                    return proc
+                with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+                     mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                                       return_value={"AGENT_ARTIFACT_OUTPUT_DIR": str(self.base)}), \
+                     mock.patch.object(R, "register_registry"), mock.patch.object(R.subprocess, "run"), \
+                     mock.patch("sys.stdout"), mock.patch.object(R.subprocess, "Popen", side_effect=launch), \
+                     mock.patch.object(R.gpu_leases, "local_observation") as probe:
+                    R.start_verified(registry, args, route, route_file, dict(retry))
+                    if harness == "codex":
+                        queued = json.loads(registry.read_text())["runs"][args.run_id]
+                        R.start_verified(registry, args, route, route_file, dict(retry), controller=controller(queued))
+                    payloads[0].wait(timeout=5)
+                    R.start_verified(registry, args, route, route_file, dict(retry))
+                    probe.assert_not_called()
+                runs = json.loads(registry.read_text())["runs"]
+                self.assertEqual(runs["bridge"], failed)
+                self.assertEqual(len(payloads), 1)
+                self.assertEqual(marker.read_text(), "once")
+                self.assertEqual(R.read_sentinel(runs[args.run_id]["sentinel"]), 0)
+
+    def test_stale_smoke_input_before_claim_preserves_request_and_releases_no_payload(self):
+        import dispatch_resource_wait as RESOURCE
+        from workflow_state import WorkflowLedger
+        jobs = self.base / "smoke-jobs.log"
+        jobs.write_text("")
+        route = json.loads(self.route.read_text())
+        ledger = WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
+        row = {"run_id": "stale", "cwd": str(self.repo), "log": str(self.log),
+            "command": [sys.executable, "-c", f"open({str(self.launch)!r},'w').write('wrong')"],
+            "route": str(self.route), "node": "full-run", "jobs": str(jobs),
+            "status": "launching", "workflow_state": "READY", "launch_state": "queued",
+            "resource_policy": "supervised-owner", "parent_attempt_id": "att-parent",
+            "sentinel": str(self.log) + ".exit", "owner_wait": {"session_id": "same-native"},
+            "launch_request": {"smoke_attestation": str(self.attestation),
+                "smoke_attestation_sha256": hashlib.sha256(self.attestation.read_bytes()).hexdigest(),
+                "config_manifest": None, "config_manifest_sha256": None}}
+        armed = {"predecessor_id": row["run_id"], "node": row["node"],
+            "resource_registry": str(self.registry), "resource_binding": RESOURCE.resource_body_digest(row)}
+        sup = RESOURCE.supervisor()
+        identity = {**R.proc_identity(os.getpid()), "pid_namespace": os.readlink("/proc/self/ns/pid")}
+        controller = SimpleNamespace(expected=row, registry=str(self.registry), identity=identity,
+            guard=contextlib.nullcontext)
+        # A legitimate edit after queued registration invalidates the real verifier.
+        (self.repo / "config").write_text("changed by another session\n")
+        attestation_bytes = self.attestation.read_bytes()
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness), mock.patch.dict(os.environ, CLEAN_ENV), \
+                 mock.patch.object(sup, "load_route", return_value=route), \
+                 mock.patch.object(sup, "ledger_for", return_value=ledger), \
+                 mock.patch.object(sup, "read_armed", return_value={"full-run": armed}), \
+                 mock.patch.object(sup, "resource_continuation_cancelled", return_value=False), \
+                 mock.patch.object(sup, "_evaluate") as settle_stage, \
+                 mock.patch.object(R, "start_verified") as launch, \
+                 mock.patch.object(R.subprocess, "Popen", wraps=subprocess.Popen) as processes, \
+                 mock.patch("sys.stderr"):
+                self.registry.write_text(json.dumps({"schema_version": 1, "runs": {row["run_id"]: row}}))
+                expectation = contextlib.nullcontext() if harness == "codex" else self.assertRaises(subprocess.CalledProcessError)
+                with expectation:
+                    R.main(["--registry", str(self.registry), "start", "--run-id", row["run_id"],
+                        "--cwd", str(self.repo), "--log", str(self.log), "--route", str(self.route),
+                        "--node", "full-run", "--smoke-attestation", str(self.attestation),
+                        "--", *row["command"]], controller=controller if harness == "codex" else None)
+                launch.assert_not_called()
+                # These subprocesses are route/smoke verification only; no payload/watch.
+                self.assertEqual(len(processes.call_args_list), 2)
+                actual = json.loads(self.registry.read_text())["runs"][row["run_id"]]
+                if harness == "codex":
+                    self.assertTrue(R.resource_never_started(actual))
+                    self.assertEqual(actual["launch_controller"], identity)
+                    self.assertIn("stale smoke input: " + str(self.repo / "config"), actual["launch_error"]["message"])
+                    self.assertEqual(actual["launch_request"], row["launch_request"])
+                    self.assertEqual(RESOURCE.resource_body_digest(actual), armed["resource_binding"])
+                    settle_stage.assert_called_once_with(route, ledger, armed, [])
+                else:
+                    self.assertEqual(actual, row)  # the native tool returns its refusal directly
+                    settle_stage.assert_not_called()
+                self.assertEqual(self.attestation.read_bytes(), attestation_bytes)
+                self.assertFalse(self.launch.exists())
+                self.assertFalse(Path(row["sentinel"]).exists())
+
+    def test_queued_validation_failure_preserves_foreign_claim_cancel_and_pending_correction(self):
+        import dispatch_resource_wait as RESOURCE
+        sup = RESOURCE.supervisor()
+        expected = {"run_id": "queued", "route": str(self.route), "node": "full-run",
+            "jobs": str(self.base / "jobs.log"), "status": "launching", "launch_state": "queued",
+            "resource_policy": "supervised-owner", "workflow_state": "READY",
+            "sentinel": str(self.log) + ".exit"}
+        armed = {"predecessor_id": "queued", "resource_registry": str(self.registry),
+            "resource_binding": RESOURCE.resource_body_digest(expected)}
+        ledger = SimpleNamespace(lock=contextlib.nullcontext)
+        controller = SimpleNamespace(expected=expected, registry=str(self.registry),
+            identity={"pid": os.getpid()}, guard=contextlib.nullcontext)
+        for changes in ({"command": ["foreign"]}, {"launch_state": "claimed"},
+                        {"launch_state": "started", "pid": os.getpid()},
+                        {"cancel_requested": True}, {"parent_close_requested": True}):
+            with self.subTest(changes=changes), mock.patch.object(sup, "load_route", return_value={}), \
+                 mock.patch.object(sup, "ledger_for", return_value=ledger), \
+                 mock.patch.object(sup, "read_armed", return_value={"full-run": armed}), \
+                 mock.patch.object(sup, "_evaluate") as settle_stage:
+                self.registry.write_text(json.dumps({"runs": {"queued": {**expected, **changes}}}))
+                before = self.registry.read_bytes()
+                R.settle_queued_validation_failure(controller, ValueError("invalid input"))
+                self.assertEqual(self.registry.read_bytes(), before)
+                settle_stage.assert_not_called()
+        self.registry.write_text(json.dumps({"runs": {"queued": expected}}))
+        with mock.patch.object(sup, "load_route", return_value={}), \
+             mock.patch.object(sup, "ledger_for", return_value=ledger), \
+             mock.patch.object(sup, "read_armed", return_value={"full-run": armed}), \
+             mock.patch.object(sup, "resource_continuation_cancelled", return_value=False), \
+             mock.patch.object(sup, "_evaluate") as settle_stage:
+            before = self.registry.read_bytes()
+            with mock.patch.object(controller, "guard", side_effect=R.LaunchDeferred("resource-owner-correction-pending")):
+                with self.assertRaises(R.LaunchDeferred):
+                    R.settle_queued_validation_failure(controller, ValueError("invalid input"))
+            self.assertEqual(self.registry.read_bytes(), before)
+            settle_stage.assert_not_called()
+
     def test_controller_correction_before_release_preserves_queued_body_and_payload_zero(self):
         import artifact_producer
         jobs=self.base/"correction-jobs.log"; jobs.write_text("")
@@ -371,8 +549,7 @@ class TestRunner(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT), "AGENT_WORKFLOW_ROOT": str(self.base/"workflow"),
                                          "AGENT_RESOURCE_RUN_INDEX": str(self.index)}), \
              mock.patch.object(R.subprocess, "Popen", side_effect=spawn):
-            with self.assertRaisesRegex(OSError, "synthetic watch"):
-                R.start_verified(self.registry, args, route, self.resume_path, placeholder)
+            R.start_verified(self.registry, args, route, self.resume_path, placeholder)
         self.assertFalse(self.launch.exists())
         self.assertEqual(json.loads(self.registry.read_text())["runs"]["resume"]["status"], "failed")
         self.assertEqual(self.jobs.read_text(), "")

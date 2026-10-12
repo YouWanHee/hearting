@@ -129,6 +129,22 @@ class RoundBudgetTest(unittest.TestCase):
             self.assertEqual(CAP.round_budget(route(), review_node(), rows + [tail],
                                              revisions=revisions).state, expected)
 
+    def test_superseded_pass_gets_one_recheck_within_ceiling(self):
+        rows = [row('done', 'completed-review-blocking', extra={'attempt_id': 'att-review-1'}),
+                row('done', 'completed-marker', extra={'attempt_id': 'att-review-2'})]
+        reopened = [{'supersedes': ['att-review-2']}]
+        self.assertEqual(CAP.round_budget(route(), review_node(), rows).state, 'exhausted')
+        for other in ([{'supersedes': ['att-review-1']}], [{'answers': ['att-review-2']}]):
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows, revisions=other).state, 'exhausted')
+        budget = CAP.round_budget(route(), review_node(), rows, revisions=reopened)
+        self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds),
+                         ('admit', 'closure-check', 2))
+        for note in ('completed-review-blocking', 'completed-marker'):
+            later = row('done', note, extra={'attempt_id': 'att-review-3'})
+            self.assertEqual(CAP.round_budget(route(), review_node(), rows + [later],
+                                             revisions=reopened + [{'supersedes': ['att-review-3']}]).state,
+                             'exhausted')
+
     def test_sd161_parallel_review_legs_keep_capped_identity_without_broadening_other_nodes(self):
         for node_id in CAP.ROUND_CAPPED_NODE_IDS:
             self.assertTrue(CAP.is_round_capped_node({"id": node_id}))
@@ -272,9 +288,9 @@ class RecoveryFieldsTest(unittest.TestCase):
         self.assertEqual(fields["recovery_surface"], "capability-route complete")
         self.assertEqual(fields["required_action"], "resolve-review-findings")
 
-    def test_exhausted_non_review_points_at_continuation(self):
+    def test_exhausted_non_review_names_existing_inline_completion(self):
         fields = CAP.recovery_fields("pipeline-stage")
-        self.assertEqual(fields["recovery_surface"], "capability-route continue")
+        self.assertEqual(fields["recovery_surface"], "capability-route complete --inline")
 
     def test_verdictless_bound_review_worker_names_native_subagent(self):
         fields = CAP.recovery_fields("review-worker", "verdictless-bound")

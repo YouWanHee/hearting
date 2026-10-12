@@ -78,7 +78,12 @@ class CapacityResumeTest(unittest.TestCase):
         return CurrentDeliveryState(**fields)
 
     def quiescence(self, meta, terminal_receipt=False):
-        state = self.quiet.get(meta.get("attempt_id"), ("quiescent", "process-absent", None))
+        row = self.rows().get(meta.get("attempt_id"))
+        # The mocked launcher registers a running process without spawning it.
+        default = ("live", "mock-owner-running", 12) if (
+            row and row[0][1] in {"open", "running"} and meta.get("launch_claimed") == "1"
+        ) else ("quiescent", "process-absent", None)
+        state = self.quiet.get(meta.get("attempt_id"), default)
         return SimpleNamespace(state=state[0], reason=state[1], pid=state[2])
 
     def cleanup(self, jobs, aid, apply=False):

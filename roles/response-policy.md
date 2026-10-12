@@ -182,3 +182,9 @@ an unnecessary question just to make the UI more visible.
   separate confirmation. If you must ask, ask before making the change.
   *Violation signal:* "should I also update the record / re-commit?" after the
   fact.
+
+- **Peer follow-through** — acknowledge a new actionable peer request before
+  processing it, without requiring a separate ACK request. Informational/no-reply
+  notices need no ping-pong. Read exact completion results and carry out approved
+  review/follow-through now or through the existing registered continuation.
+  State receipt and actual start times honestly; queued/consumed/ACK is not work.

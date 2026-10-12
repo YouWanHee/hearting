@@ -144,9 +144,7 @@ Reference only: recent CONVERSATION determines the current topic.
 # an OPERATOR artifact (audience-language first, roles/response-policy.md), so it must not
 # follow each transcript's dominant language: headless workers read English-heavy, and the
 # per-conversation rule flipped the board row by row. FLEET_NOW_LANG names the language
-# outright; else a NON-English locale decides (an en locale is no signal — boxes like this
-# one host non-en operators under LANG=en_US); else the old per-conversation rule stands
-# (portable default — no hardcoded audience).
+# outright; the shared Fleet/native declaration follows, before locale or observations.
 _LANG_WORDS = {"ko": "Korean", "ja": "Japanese", "zh": "Chinese", "de": "German",
                "fr": "French", "es": "Spanish", "pt": "Portuguese", "it": "Italian",
                "ru": "Russian"}
@@ -158,6 +156,20 @@ _USER_LANGUAGE_SOURCE = re.compile(r"\|user-language=([A-Za-z]+)@([0-9.]+)$")
 def _user_text(text):
     if (not isinstance(text, str) or _CLAUDE_COMMAND_META.match(text)
             or text.lstrip().startswith("AGENT_HARNESS_COMPLETION_V1\n")):
+        return ""
+    return text
+
+
+def _human_language_text(text):
+    text = _user_text(text)
+    if ("(peer-from:" in text
+            or text.lstrip().startswith(("[notice]",
+                                        "Hearting notice about work you started",
+                                        "Hearting human gate awaiting your decision",
+                                        "Hearting supervision needs attention.",
+                                        "Hearting runtime delivery", "<system-reminder>",
+                                        "<hook-output>", "<hook_response>"))
+            or re.match(r"^\s*/[A-Za-z][A-Za-z0-9_-]*(?:\s|$)", text)):
         return ""
     return text
 
@@ -191,7 +203,7 @@ def _language_source(source, observation):
 
 
 def _now_lang():
-    explicit = (os.environ.get("FLEET_NOW_LANG") or "").strip()
+    explicit = config.declared_language()
     if explicit:
         return explicit
     loc = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES")
@@ -205,17 +217,16 @@ def _user_language(anchor):
     for script, language in ((r"[\uac00-\ud7a3]", "Korean"),
                              (r"[\u3040-\u30ff]", "Japanese"),
                              (r"[\u3400-\u9fff]", "Chinese")):
-        if re.search(script, _user_text(anchor)):
+        if re.search(script, _human_language_text(anchor)):
             return language
     return ""
 
 
 def _title_lang(anchor="", observed_language=""):
-    language = config.title_language()
-    if language.lower() == "auto":
-        language = (_now_lang() or observed_language or _user_language(anchor) or _observed_main_language()
-                    or "the conversation's own language")
+    language = (_now_lang() or observed_language or _user_language(anchor) or _observed_main_language()
+                or "the conversation's own language")
     aliases = {"en": "English", "한국어": "Korean", "日本語": "Japanese", "中文": "Chinese"}
+    aliases.update({name.lower(): name for name in (*_LANG_WORDS.values(), "English")})
     return aliases.get(language.lower(), _LANG_WORDS.get(language.lower(), language))
 
 
@@ -235,11 +246,11 @@ def _prior_title_block(prior_title):
 
 
 def _prompt(delta, prior_title=None, anchor="", title_lang=None, observed_language=""):
+    language = title_lang or _title_lang(anchor, observed_language)
     return PROMPT_TEMPLATE.format(
         delta=delta, anchor=anchor,
-        now_lang=(_now_lang() or observed_language or _user_language(anchor) or _observed_main_language()
-                  or "the conversation's own language"),
-        title_lang=title_lang or _title_lang(anchor, observed_language),
+        now_lang=language,
+        title_lang=language,
         prior_title_block=_prior_title_block(prior_title))
 
 
@@ -253,6 +264,11 @@ def _title_language_matches(title, language):
     if language == "English":
         return not re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]", title)
     return True
+
+
+def _language_changed(previous, language):
+    return any(not _title_language_matches(previous.get(key), language)
+               for key in ("title", "summary"))
 
 _TITLE_LINE_RE = re.compile(r"^\s*TITLE\s*:\s*(.*)$", re.IGNORECASE)
 _NOW_LINE_RE = re.compile(r"^\s*NOW\s*:\s*(.*)$", re.IGNORECASE)
@@ -411,7 +427,7 @@ def _origin_text(raw, harness="claude", latest=False):
         if not text:
             continue
         if role == "user":
-            if latest and "(peer-from:" in text:
+            if latest and not _human_language_text(joined):
                 continue
             if harness == "codex" or latest:
                 # Codex refreshes after every submitted prompt.  The latest real user
@@ -1752,7 +1768,7 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
     anchor = anchor_text or (read_prompt_anchor(prompt_path) if prompt_path else "")
     if not anchor and transcript and source_kind != "opencode-db" and previous.get("title"):
         anchor = read_origin(transcript, harness)
-    language_changed = not _title_language_matches(previous.get("title"), _title_lang(anchor))
+    language_changed = _language_changed(previous, _title_lang(anchor))
     ts = previous.get("ts") if isinstance(previous.get("ts"), (int, float)) else 0
     failures = _summary_failures(previous)
     retry_delay = SUMMARY_RETRY_DELAYS[failures - 1] if failures else debounce
@@ -2047,10 +2063,8 @@ def main(argv=None):
         # Explicit anchor stdin is the current main prompt, not a worker's
         # assignment. Retain that observation across periodic/final refreshes.
         if not args.sid.startswith("dispatch-"):
-            human = explicit_anchor or (read_origin(args.transcript, args.harness, latest=True)
-                                        if args.transcript else "")
-            if "(peer-from:" in human:
-                human = ""
+            human = _human_language_text(explicit_anchor or (
+                read_origin(args.transcript, args.harness, latest=True) if args.transcript else ""))
             language = _user_language(human)
             if not language and human and re.search(r"[A-Za-z]", human):
                 language = "English"
@@ -2065,8 +2079,12 @@ def main(argv=None):
         observed_language = (_USER_LANGUAGE_SOURCE.search(source)[1]
                              if observation and not args.sid.startswith("dispatch-") else "")
         title_lang = _title_lang(anchor, observed_language)
-        if not _title_language_matches(previous_title, title_lang):
-            previous_title = ""
+        if _language_changed(previous, title_lang):
+            if not _title_language_matches(previous_title, title_lang):
+                previous_title = ""
+            if not _title_language_matches(previous_summary, title_lang):
+                previous_summary = ""
+                previous_summary_ts = None
             offset = 0
             if args.opencode_db:
                 delta, new_offset, _ = read_opencode_delta(

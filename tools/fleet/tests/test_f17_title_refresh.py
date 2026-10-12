@@ -1496,7 +1496,7 @@ class ValidatorHardeningTest(unittest.TestCase):
             self.assertNotIn("x" * 200, text)
 
 
-class NowLangTest(unittest.TestCase):
+class NowLangTest(_ConfigHomeMixin, unittest.TestCase):
     """user 2026-07-20: "요약이 언제는 영어고 언제는 한글" — the NOW subtitle language is
     pinned per operator (env → non-en locale), not per transcript."""
 
