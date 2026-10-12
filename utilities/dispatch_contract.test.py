@@ -4355,6 +4355,116 @@ class CancellationQuiescenceExtinctSourceTest(unittest.TestCase):
   self.assertFalse(proof.proven)
 
 
+class NormalCleanupSettlementTest(ControlledConsumerTestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+  self.jobs=Path(self.tmp.name)/"jobs.log"
+  self.metadata=cancellation_metadata("att-normal-cleanup")
+  namespace=D.process_namespace_identity()
+  self.metadata.update(pid="99999996",pgid="99999996",pid_start="123",
+                       pid_ns=namespace,pid_observer_ns=namespace,
+                       group_reap_proof=D.GROUP_REAP_PROOF,group_reap_pgid="99999996",
+                       launch_lifecycle="foreground-scoped",launch_outcome="governed-process-reaped",
+                       note="completed-marker",failure_class="pass",completion_marker="original-marker",
+                       delivery_receipt_b64="original-delivery")
+  self.jobs.write_text(attempt_row(self.metadata,"done")+"\n")
+  self.empty=D.ProcessGroupObservation("empty")
+  self.denied=D.ProcessGroupObservation("unverifiable",reason="procfs-environ:997325:same-uid-unobservable")
+
+ def observations(self,tag=None,group=None,authority=True,leader=("missing","","")):
+  stack=contextlib.ExitStack()
+  stack.enter_context(mock.patch.object(D,"_proc_observation",return_value=leader))
+  stack.enter_context(mock.patch.object(D,"process_group_observation",return_value=group or self.empty))
+  stack.enter_context(mock.patch.object(D,"attempt_tagged_descendants",return_value=tag or self.empty))
+  stack.enter_context(mock.patch.object(D,"attempt_scan_namespace_authority",return_value=authority))
+  stack.enter_context(mock.patch.object(D,"observer_namespace_extinct",return_value="present"))
+  return stack
+
+ def seal(self):
+  with self.observations():
+   result=D.resolve_attempt_cleanup(self.jobs,self.metadata["attempt_id"],apply=True)
+  self.assertTrue(result["changed"],result)
+  self.assertEqual(result["proof_source"],"exact-teardown")
+  return D.parse_registry_metadata(self.jobs.read_text().strip().split("\t",5)[5])
+
+ def test_normal_full_cleanup_is_durable_and_later_unknown_consumes_it(self):
+  original=self.jobs.read_bytes()
+  with self.observations():
+   preview=D.resolve_attempt_cleanup(self.jobs,self.metadata["attempt_id"])
+  self.assertEqual(preview["reason"],"cleanup-proof-available")
+  self.assertEqual(self.jobs.read_bytes(),original)
+  sealed=self.seal();original=self.jobs.read_bytes()
+  self.assertEqual({k:sealed[k] for k in self.metadata},self.metadata)
+  self.assertFalse(D._detached_group_drain_receipt(sealed))
+  with self.observations(tag=self.denied):
+   self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"quiescent")
+   self.assertEqual(D.attempt_process_quiescence(sealed).state,"unverifiable")
+   for _ in range(2):
+    result=D.resolve_attempt_cleanup(self.jobs,sealed["attempt_id"],apply=True)
+    self.assertTrue(result["settled"]);self.assertFalse(result["changed"])
+    self.assertEqual(self.jobs.read_bytes(),original)
+  self.assertFalse(D.cancellation_receipt_reason(sealed))
+  self.assertNotIn("retry_attempt_id",sealed)
+
+ def test_live_leader_group_and_tag_win_over_normal_receipt(self):
+  sealed=self.seal();live=D.ProcessGroupObservation("populated",((42,"901","S"),))
+  for opts in ({"leader":("visible","123","S"),"tag":self.denied},
+               {"group":live,"tag":self.denied},{"tag":live}):
+   with self.subTest(opts=opts),self.observations(**opts):
+    self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"live")
+
+ def test_missing_tampered_foreign_and_binding_changes_keep_unknown(self):
+  sealed=self.seal()
+  mutations=[{"cleanup_receipt_b64":""},{"cleanup_receipt_b64":"garbage"},
+             {"cleanup_receipt_digest":"sha256:wrong"}]
+  mutations += [{key:"foreign"} for key in ("pid","pid_start","pgid","attempt_id","route_id",
+                "route_hash","route_node","pid_observer_ns","pid_ns","parallel_group")]
+  for mutation in mutations:
+   with self.subTest(mutation=mutation),self.observations(tag=self.denied):
+    self.assertEqual(D.attempt_process_quiescence({**sealed,**mutation},terminal_receipt=True).state,"unverifiable")
+  for key,value in (("namespace_authority",False),("proof_source","group-only"),
+                    ("process_group",{"state":"empty"}),
+                    ("attempt_tagged_descendants",{"state":"empty"})):
+   record=json.loads(D.base64.b64decode(sealed["cleanup_receipt_b64"]))
+   record[key]=value
+   altered={**sealed,"cleanup_receipt_b64":D.base64.b64encode(json.dumps(record).encode()).decode(),
+            "cleanup_receipt_digest":D._canonical_sha256(record)}
+   with self.subTest(key=key),self.observations(tag=self.denied):
+    self.assertEqual(D.attempt_process_quiescence(altered,terminal_receipt=True).state,"unverifiable")
+
+ def test_namespace_and_unknown_group_refuse_normal_settlement(self):
+  sealed=self.seal()
+  for opts in ({"authority":False},{"group":D.ProcessGroupObservation("unverifiable",reason="procfs-stat-denied")}):
+   with self.subTest(opts=opts),self.observations(tag=self.denied,**opts):
+    self.assertEqual(D.attempt_process_quiescence(sealed,terminal_receipt=True).state,"unverifiable")
+
+ def test_group_only_and_genuine_unknown_never_create_full_cleanup(self):
+  original=self.jobs.read_bytes()
+  diagnostic=io.StringIO()
+  with self.observations(tag=self.denied),contextlib.redirect_stderr(diagnostic):
+   result=D.resolve_attempt_cleanup(self.jobs,self.metadata["attempt_id"],apply=True)
+  self.assertFalse(result["settled"])
+  self.assertEqual(self.jobs.read_bytes(),original)
+  payload=json.loads(diagnostic.getvalue().splitlines()[0].split("=",1)[1])
+  self.assertEqual(payload["scope"],"guard-time")
+  self.assertEqual(payload["process_group"]["state"],"empty")
+  self.assertEqual(payload["attempt_tagged_descendants"]["reason"],self.denied.reason)
+  diagnostic=io.StringIO()
+  group=D.ProcessGroupObservation("unverifiable",reason="procfs-stat-denied")
+  with self.observations(group=group,tag=self.denied),contextlib.redirect_stderr(diagnostic):
+   self.assertEqual(D.attempt_process_quiescence(self.metadata,terminal_receipt=True).state,"unverifiable")
+  self.assertIn("procfs-stat-denied",diagnostic.getvalue())
+
+ def test_settlement_compare_and_set_rejects_changed_row(self):
+  original=self.jobs.read_bytes()
+  with self.observations(),mock.patch.object(D,"annotate_attempt_row_if",return_value=False) as writer:
+   result=D.resolve_attempt_cleanup(self.jobs,self.metadata["attempt_id"],apply=True)
+  self.assertFalse(result["settled"])
+  self.assertEqual(result["reason"],"cleanup-row-changed")
+  self.assertFalse(writer.call_args.args[3](["foreign"]*6))
+  self.assertEqual(self.jobs.read_bytes(),original)
+
+
 class TerminalCleanupResponsibilityTest(ControlledConsumerTestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)

@@ -2066,6 +2066,127 @@ def load_supervisor(name: str):
     return module
 
 
+class NormalReadyCleanupJoinTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.jobs = self.root / "jobs.log"
+        namespace = D.process_namespace_identity()
+        self.meta = {
+            "harness": "codex", "worker_type": "stage",
+            "fallback_hop": "same-harness-headless",
+            "pid": "99999996", "pgid": "99999996", "pid_start": "123",
+            "pid_ns": namespace, "pid_observer_ns": namespace,
+            "launch_lifecycle": "foreground-scoped",
+            "launch_outcome": "governed-process-reaped",
+            "group_reap_proof": D.GROUP_REAP_PROOF, "group_reap_pgid": "99999996",
+            "failure_class": "fail", "completion_marker": "original-marker",
+            "delivery_receipt_b64": "original-delivery",
+        }
+        self.empty = D.ProcessGroupObservation("empty")
+        self.denied = D.ProcessGroupObservation(
+            "unverifiable", reason="procfs-environ:997325:same-uid-unobservable")
+
+    def write_row(self, **extra):
+        self.jobs.write_text(row("done", "att-ready", "att-parent", "ready",
+            "completed-review-blocking", process_metadata={**self.meta, **extra}))
+
+    def observations(self, tag=None):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(D, "_proc_observation", return_value=("missing", "", "")))
+        stack.enter_context(mock.patch.object(D, "process_group_observation", return_value=self.empty))
+        stack.enter_context(mock.patch.object(D, "attempt_tagged_descendants", return_value=tag or self.empty))
+        stack.enter_context(mock.patch.object(D, "attempt_scan_namespace_authority", return_value=True))
+        stack.enter_context(mock.patch.object(D, "observer_namespace_extinct", return_value="present"))
+        return stack
+
+    def join(self, recover=True):
+        return JOIN.join_batch(jobs=self.jobs, parent_attempt_id="att-parent",
+                               timeout=0, recover_receiptless=recover)
+
+    def test_normal_ready_join_seals_once_and_common_consumers_keep_judgment(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness), self.observations():
+                self.write_row(harness=harness)
+                original = JOIN.current_attempt_row(self.jobs, "att-ready")
+                marker = self.root / "marker.json"
+                history = self.root / "history.jsonl"
+                marker.write_bytes(b'original marker\n')
+                history.write_bytes(b'original history\n')
+                with mock.patch.object(JOIN, "inspect_terminal_attempt") as judge, \
+                     mock.patch.object(JOIN, "recover_receiptless_attempt") as recover:
+                    self.assertEqual(self.join()["state"], "ready")
+                    saved = JOIN.current_attempt_row(self.jobs, "att-ready")
+                    self.assertIn("cleanup_receipt_digest", saved.metadata)
+                    record = json.loads(base64.b64decode(saved.metadata["cleanup_receipt_b64"]))
+                    self.assertEqual(record["receipt_type"], "attempt-cleanup-v1")
+                    self.assertEqual(record["proof_source"], "exact-teardown")
+                    self.assertTrue(record["namespace_authority"])
+                    self.assertEqual(saved.status, original.status)
+                    self.assertEqual({k: saved.metadata[k] for k in original.metadata}, original.metadata)
+                    sealed = self.jobs.read_bytes()
+                    self.assertEqual(self.join()["state"], "ready")
+                    self.assertEqual(self.jobs.read_bytes(), sealed)
+                judge.assert_not_called()
+                recover.assert_not_called()
+                self.assertEqual(marker.read_bytes(), b'original marker\n')
+                self.assertEqual(history.read_bytes(), b'original history\n')
+                with self.observations(tag=self.denied):
+                    self.assertEqual(self.join()["state"], "ready")
+                    self.assertEqual(self.jobs.read_bytes(), sealed)
+                    without = {k: v for k, v in saved.metadata.items()
+                               if not k.startswith("cleanup_receipt_")}
+                    self.assertEqual(D.attempt_process_quiescence(
+                        without, terminal_receipt=True).state, "unverifiable")
+
+    def test_default_ready_join_never_calls_cleanup_producer(self):
+        self.write_row()
+        original = self.jobs.read_bytes()
+        with self.observations(), mock.patch.object(JOIN, "resolve_attempt_cleanup") as producer:
+            self.assertEqual(self.join(recover=False)["state"], "ready")
+        producer.assert_not_called()
+        self.assertEqual(self.jobs.read_bytes(), original)
+
+    def test_unproved_cleanup_adds_no_gate_or_retry_loop(self):
+        self.write_row()
+        original = self.jobs.read_bytes()
+        with self.observations(), mock.patch.object(JOIN, "resolve_attempt_cleanup", return_value={
+                "changed": False, "settled": False, "reason": "cleanup-proof-unavailable"}) as producer:
+            self.assertEqual(self.join()["state"], "ready")
+        producer.assert_called_once_with(self.jobs, "att-ready", apply=True)
+        self.assertEqual(self.jobs.read_bytes(), original)
+
+    def test_changed_binding_is_not_overwritten_and_join_refreshes(self):
+        self.write_row()
+        annotate = D.annotate_attempt_row_if
+        def race(jobs, attempt, values, predicate, **kwargs):
+            self.jobs.write_text(self.jobs.read_text().replace("pid_start=123", "pid_start=456"))
+            return annotate(jobs, attempt, values, predicate, **kwargs)
+        with self.observations(), mock.patch.object(D, "annotate_attempt_row_if", side_effect=race):
+            result = self.join()
+        self.assertEqual(result["state"], "ready")
+        saved = JOIN.current_attempt_row(self.jobs, "att-ready")
+        self.assertEqual(saved.metadata["pid_start"], "456")
+        self.assertNotIn("cleanup_receipt_digest", saved.metadata)
+
+    def test_live_observation_after_receipt_commit_keeps_join_pending(self):
+        self.write_row()
+        producer = D.resolve_attempt_cleanup
+        live = D.ProcessGroupObservation("populated", ((42, "901", "S"),))
+        with self.observations() as stack:
+            tags = stack.enter_context(mock.patch.object(D, "attempt_tagged_descendants", return_value=self.empty))
+            def commit(*args, **kwargs):
+                outcome = producer(*args, **kwargs)
+                self.assertTrue(outcome["changed"], outcome)
+                tags.return_value = live
+                return outcome
+            with mock.patch.object(JOIN, "resolve_attempt_cleanup", side_effect=commit):
+                result = self.join()
+        self.assertEqual(result["state"], "timeout", result)
+        self.assertEqual(result["children"][0]["readiness"], "pending")
+
+
 class HarvestVocabularyTest(unittest.TestCase):
     """DC-3, DC-4 (plan SS5.7 / SS3.4 D1, D1b): one harvest vocabulary."""
 

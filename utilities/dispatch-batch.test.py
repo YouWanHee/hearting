@@ -436,6 +436,55 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(error.exception.reason, "batch-prior-manifest-proof-missing")
         self.assertEqual(self.jobs.read_bytes(), before)
 
+    def test_unfinished_input_discovers_zero_rows_and_register_only_exact_members(self):
+        self.jobs.touch()
+        self.seal_original_input()
+        legs = self.legs()
+        admissions = {leg['node']: SimpleNamespace(
+            budget=SimpleNamespace(next_round=1), current_attempt_ids=frozenset())
+            for leg in legs}
+        def read():
+            with mock.patch.dict(os.environ, {'AGENT_DISPATCH_SELF_SLUG': 'owner'}):
+                return BATCH.unfinished_batch_input(self.jobs, self.route,
+                    self.route['nodes'], 'plan', 'att-parent-fixture', BATCH.DEFAULT_PROMPT,
+                    admissions, route_file=self.route_path)
+        payload = read()
+        self.assertIsNotNone(payload)
+        before = self.jobs.read_bytes()
+        for admission in admissions.values():
+            admission.budget.next_round = 2
+        self.assertIsNone(read(), 'older generation cannot bind a new admission')
+        self.assertEqual(self.jobs.read_bytes(), before)
+        for admission in admissions.values():
+            admission.budget.next_round = 1
+        for leg in legs:
+            self.write_existing(leg, claimed='0', live_identity=False)
+            admissions[leg['node']].current_attempt_ids = frozenset((leg['attempt_id'],))
+        rows = self.jobs.read_bytes()
+        self.assertEqual(read(), payload)
+        self.assertEqual(self.jobs.read_bytes(), rows)
+        from recovery_history import batch_input_path
+        path = batch_input_path(self.jobs, payload['manifest_digest'])
+        for field, value in (('route', str(self.base / 'foreign.json')), ('parent', 'foreign-owner')):
+            changed = dict(payload, options=dict(payload['options'], **{field: value}))
+            path.write_text(json.dumps(changed))
+            with self.assertRaises(BATCH.BatchError) as error:
+                read()
+            self.assertEqual(error.exception.reason, 'replacement-batch-source-drift')
+            path.write_text(json.dumps(payload))
+        for field in ('options', 'manifest'):
+            path.write_text(json.dumps(dict(payload, **{field: None})))
+            with self.assertRaises(BATCH.BatchError):
+                read()
+            path.write_text(json.dumps(payload))
+        changed = json.loads(json.dumps(payload))
+        changed['manifest']['members'][0]['route_node'] = 'foreign-node'
+        path.write_text(json.dumps(changed))
+        with self.assertRaises(BATCH.BatchError) as error:
+            read()
+        self.assertEqual(error.exception.reason, 'replacement-batch-source-drift')
+        path.write_text(json.dumps(payload))
+
     def test_sd160_capacity_ratios_choose_healthy_same_harness_personas(self):
         for strategy in ("balanced", "capacity-aware"):
             for headroom in (71, 77):
@@ -2699,6 +2748,19 @@ class DispatchBatchTest(unittest.TestCase):
         with mock.patch.object(BATCH, "record_degradation") as record:
             BATCH._record_failed_legs(self.route, [result], self.base)
         self.assertEqual(record.call_args.kwargs["detail"], detail)
+
+    def test_guard_time_cleanup_diagnostics_survive_failed_wrapper(self):
+        diagnostic = json.dumps({"attempt_id": "att-prior", "scope": "guard-time",
+            "process_group": {"state": "empty", "reason": ""},
+            "attempt_tagged_descendants": {"state": "unverifiable", "reason": "procfs-environ-denied"}})
+        result = BATCH.wrapper_result(
+            {"node": "impl-review", "adapter": "codex", "attempt_id": "att-new"},
+            SimpleNamespace(returncode=73),
+            "check=failed\nreason=prior-attempt-unverifiable\nchild_spawned=0\n",
+            "cleanup_diagnostics=" + diagnostic + "\n")
+        self.assertEqual(result["exit_code"], 73)
+        self.assertEqual(result["reason"], "prior-attempt-unverifiable")
+        self.assertEqual([json.loads(item) for item in result["cleanup_diagnostics"]], [json.loads(diagnostic)])
 
     def test_duplicate_batch_state_does_not_claim_concurrent_launch(self):
         self._assert_duplicate_batch_state()

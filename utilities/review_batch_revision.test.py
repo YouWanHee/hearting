@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Revision generation selection through the public start path; no model calls."""
 import importlib.util
+import dataclasses
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -175,12 +177,14 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
             stage_start = str(ROOT / 'utilities/stage-dispatch-fallback.py') in command
             before = self.atomic_state() if stage_start else None
             result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=45)
+            if result.returncode and stage_start:
+                self.failure_snapshot(command, result)
             receipts = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
             refusal = receipts[-1] if receipts else {}
-            transient = (expected == 0 and result.returncode == 78
+            reobserve = (expected == 0 and result.returncode == 78
                 and refusal.get('reason') == 'prior-attempt-unverifiable'
                 and str(refusal.get('detail', '')).endswith(':attempt-descendant-unverifiable'))
-            if not stage_start or not transient or retry == 2:
+            if not stage_start or not reobserve or retry == 2:
                 break
             self.assertEqual(self.atomic_state(), before)
             print('Public CLI atomic procfs refusal before re-observation: ' +
@@ -189,6 +193,146 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.assertIn(result.returncode, expected if isinstance(expected, tuple) else (expected,),
                       result.stdout + result.stderr)
         return result
+
+    def failure_snapshot(self, command, result):
+        """Keep raw refusal and immediate observations; never diagnose production."""
+        root = os.environ.get('REVIEW_BATCH_EVIDENCE_DIR')
+        if not root:
+            return
+        target = Path(root) / self.id().split('.')[-1] / str(time.time_ns())
+        guard = Path(os.environ['AGENT_HOME']) / 'adapters/codex/bin/preflight.sh'
+        subprocess.run([str(guard), 'write', str(target / 'failure.json')], check=True)
+        target.mkdir(parents=True)
+        records = {}
+        for directory in (self.jobs.parent, self.art):
+            for path in directory.rglob('*'):
+                if path.is_file() and path.suffix != '.lock':
+                    records[str(path)] = path.read_text(errors='replace')
+        observations = []
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            for fields, meta in REPLACEMENT._rows(self.jobs.read_text().splitlines()).values():
+                item = {'row': fields, 'metadata': meta}
+                try:
+                    observation = DC.attempt_process_quiescence(meta)
+                    item['quiescence'] = dataclasses.asdict(observation)
+                    item['tagged_descendants'] = dataclasses.asdict(DC.attempt_tagged_descendants(meta))
+                    if str(meta.get('pgid', '')).isdigit():
+                        item['process_group'] = dataclasses.asdict(
+                            DC.process_group_observation(int(meta['pgid'])))
+                    node = next((n for n in self.route['nodes']
+                                 if n['id'] == meta.get('route_node')), None)
+                    marker_path = self.jobs.parent / 'completion' / self.route['route_id'] / (str(meta.get('route_node')) + '.json')
+                    if node and marker_path.is_file():
+                        marker = json.loads(marker_path.read_text())
+                        item['readiness'] = dataclasses.asdict(DC.completion_attempt_readiness(
+                            self.route, node, marker, self.jobs))
+                except Exception as exc:
+                    item['observation_error'] = repr(exc)
+                pid = meta.get('pid')
+                if pid:
+                    proc = Path('/proc') / pid
+                    item['proc'] = {}
+                    for name in ('stat', 'status'):
+                        try:
+                            item['proc'][name] = (proc / name).read_text(errors='replace')
+                        except OSError as exc:
+                            item['proc'][name] = repr(exc)
+                    item['namespaces'] = {}
+                    for name in ('pid', 'mnt', 'user'):
+                        try:
+                            item['namespaces'][name] = os.readlink(proc / 'ns' / name)
+                        except OSError as exc:
+                            item['namespaces'][name] = repr(exc)
+                observations.append(item)
+        payload = {'scope': 'isolated fixture only; immediate post-receipt snapshot, '
+                   'not a refusal-time production process snapshot',
+                   'command': command, 'exit': result.returncode,
+                   'stdout': result.stdout, 'stderr': result.stderr,
+                   'records': records, 'observations': observations,
+                   'record_sha256': {path: hashlib.sha256(data.encode()).hexdigest()
+                                     for path, data in records.items()},
+                   'prompt': self.prompt.read_text()}
+        (target / 'failure.json').write_text(json.dumps(payload, indent=2, default=str))
+
+    def test_one_started_one_missing_admitted_resume(self):
+        self.admitted_resume_scenario('off', 1)
+
+    def test_both_zero_admitted_resume_with_gates_on(self):
+        self.admitted_resume_scenario('on', 2)
+
+    def test_closure_capped_peer_pending_sibling(self):
+        self.admitted_resume_scenario('on', 1, closure=True)
+
+    def test_live_peer_preserved_and_unknown_unsettled_refused(self):
+        self.admitted_resume_scenario('off', 1, peer_live=True)
+
+    def admitted_resume_scenario(self, gates, missing_count, closure=False, peer_live=False):
+        self.env['HEARTING_GATES'] = gates
+        first = self.launch()
+        self.settle(first)
+        self.revise_execute(first, 2)
+        if closure:
+            self.prompt.write_text('Second settled generation')
+            first = self.launch()
+            self.settle(first)
+            self.revise_execute(first, 4)
+        self.prompt.write_text('Exact admitted pending generation ' + gates)
+        # Inject a refusal at the outer child-command boundary, after full
+        # group admission/reservation. Shared selection/admission/readiness are
+        # real; subsequent resume launches the real dispatch-node and wrapper.
+        fault_dir = self.base / 'fault'
+        fault_dir.mkdir()
+        (fault_dir / 'sitecustomize.py').write_text('import os, subprocess, sys\nOriginal = subprocess.Popen\nclass FaultPopen(Original):\n    def __init__(self, args, *a, **kw):\n        if isinstance(args, list) and any(str(x).endswith(\'/utilities/dispatch-node.py\') for x in args):\n            node = args[args.index(\'--node\') + 1]\n            if node in os.environ.get(\'FIXTURE_REFUSE_NODES\', \'\').split(\',\'):\n                args = [sys.executable, \'-c\', "print(\'check=failed\'); print(\'reason=prior-attempt-unverifiable\'); print(\'detail=fixture-injected-after-reservation\'); print(\'child_spawned=0\'); print(\'registered=0\'); print(\'started=0\'); raise SystemExit(78)"]\n        super().__init__(args, *a, **kw)\nsubprocess.Popen = FaultPopen\n')
+        self.env['PYTHONPATH'] = str(fault_dir)
+        self.env['FIXTURE_REFUSE_NODES'] = ','.join(
+            leg['node'] for leg in first['legs'][:missing_count])
+        partial = self.launch(expected=70)
+        self.assertEqual(partial['newly_started'], 2 - missing_count, partial)
+        self.assertTrue(all(leg['exit_code'] == 78 for leg in partial['legs']
+                            if leg['child_spawned'] == '0'), partial)
+        ids = {leg['attempt_id'] for leg in partial['legs']}
+        self.env.pop('FIXTURE_REFUSE_NODES')
+        self.env.pop('PYTHONPATH')
+        started = [leg for leg in partial['legs'] if leg['child_spawned'] == '1']
+        if started:
+            self.settle({'legs': started})
+            self.assertEqual(self.admission(started[0]['node']).budget.state, 'exhausted')
+        changed = self.prompt.read_text()
+        self.prompt.write_text(changed + ' changed without revision')
+        self.assert_atomic_refusal(reason='replacement-batch-source-drift')
+        self.prompt.write_text(changed)
+        settled_rows = self.jobs.read_bytes()
+        if peer_live:
+            peer = started[0]
+            self.fixture_row(peer['attempt_id'], terminal_conflict='1',
+                             conflicting_terminal_note='terminal-observation-unknown',
+                             conflicting_failure_class='unknown')
+            self.assert_atomic_refusal(reason='round-unsettled')
+            self.jobs.write_bytes(settled_rows)
+            self.fixture_row(peer['attempt_id'], status='open', remove=('pid_start',), pid='999999999')
+            before = self.atomic_state()
+            unknown = self.launch(expected=70)
+            self.assertEqual(unknown['newly_started'], 0, unknown)
+            self.assertTrue(any('existing-active-attempt-' in leg.get('reason', '')
+                                for leg in unknown['legs']), unknown)
+            self.assertEqual(self.atomic_state(), before)
+            self.jobs.write_bytes(settled_rows)
+            identity = DC.process_launch_identity(os.getpid())
+            self.fixture_row(peer['attempt_id'], status='open', pid=str(os.getpid()),
+                             pid_start=identity['pid_start'])
+            live_row = next(line for line in self.jobs.read_text().splitlines()
+                            if 'attempt_id=' + peer['attempt_id'] + ',' in line)
+        resumed = self.launch()
+        self.assertEqual({leg['attempt_id'] for leg in resumed['legs']}, ids)
+        self.assertEqual(resumed['newly_started'], missing_count, resumed)
+        if peer_live:
+            self.assertIn(live_row, self.jobs.read_text().splitlines())
+            # Restore only the seeded synthetic live observation before join.
+            old_peer = next(line for line in settled_rows.decode().splitlines()
+                            if 'attempt_id=' + peer['attempt_id'] + ',' in line)
+            self.jobs.write_text(self.jobs.read_text().replace(live_row, old_peer))
+        self.settle(resumed)
+        self.assertEqual(self.launch()['newly_started'], 0)
 
     def route_cmd(self, action, *args):
         return self.run_cmd([sys.executable, str(ROOT / "utilities/capability-route.py"), action,
@@ -620,7 +764,7 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
     def settle(self, receipt):
         command = [sys.executable, str(ROOT / "utilities/dispatch_completion_join.py"),
                    "--jobs", str(self.jobs), "--parent-attempt-id", self.owner,
-                   "--timeout", "20", "--interval", "0.1"]
+                   "--timeout", "20", "--interval", "0.1", "--recover-receiptless"]
         for leg in receipt["legs"]:
             command += ["--attempt-id", leg["attempt_id"]]
         result = self.run_cmd(command)
