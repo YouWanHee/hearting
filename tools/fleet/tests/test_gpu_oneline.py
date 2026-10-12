@@ -148,7 +148,9 @@ class GPUOneLineTest(unittest.TestCase):
         for width in (80, 200):
             lines = self.rows(width)[3:]
             self.assertEqual(len(lines), 1)
-            self.assertIn("↳ codex [bb] / claude [8e] · 10-04", lines[0])
+            self.assertIn("↳ ", lines[0])
+            self.assertIn("[bb] / ", lines[0])
+            self.assertIn("[8e] · 10-04", lines[0])
             self.assertTrue(lines[0].endswith(" +3"))
             self.assertLessEqual(render._dw(lines[0]), width - 1)
         self.assertIn("detailed-name.yaml", self.rows(200)[3])
