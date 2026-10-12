@@ -533,6 +533,14 @@ under those same locks and uses ordinary atomic rename, as producer admission do
 
 ## 4. Workflow Invariants
 
+Transport deaths have no cumulative automatic replacement count limit. The
+existing controller may replace each settled, proven-dead attempt with one
+successor per exact predecessor. It preserves original results, completed
+stages, review ceilings, runtime pins and normal backoff. Live or unknown
+processes, unsettled cleanup, readable FAIL or BLOCKED, and human decisions
+retain their existing handling. A route paused only by the old replacement
+count resumes through its ordinary `start` surface.
+
 Artifacts move forward in one direction:
 
 ```text
