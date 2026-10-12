@@ -6,7 +6,7 @@
 ─────
   compute resources  1/1
   ◇ gpu  CPU ────────  — thr  · MEM —/—GB  · SWP —/—GB
-         ⠋ 0: working  —                   UTIL    —  VRAM ────────      —/—GB ▸ 1 · ?×1
+         ⠋ 0: working  —                   UTIL    —  VRAM ────────      —/—GB ▸ 1 · 미귀속
 ─────
 
   SESSIONS   narrow · press w to cycle
