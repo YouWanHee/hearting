@@ -371,6 +371,13 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                                if surface == "reconcile" else
                                [sys.executable, str(HERE / "dispatch-attempt-ready.py"),
                                 "--attempt-id", attempt, "--settle"])
+                    if surface == "reconcile":
+                        original = jobs.read_bytes()
+                        preview = subprocess.run([arg for arg in command if arg != "--apply"]
+                                                 + ["--jobs", str(jobs)],
+                                                 capture_output=True, text=True, timeout=15)
+                        self.assertEqual(preview.returncode, 0, preview.stdout + preview.stderr)
+                        self.assertEqual(jobs.read_bytes(), original)
                     result = subprocess.run(command + ["--jobs", str(jobs)],
                                             capture_output=True, text=True, timeout=15)
                     self.assertEqual(result.returncode, 0 if surface == "reconcile" else 3,
@@ -387,6 +394,11 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                     "quiescent")
                 if surface == "reconcile":
                     self.assertIn("cleanup_receipt_digest", saved.metadata)
+                    sealed = jobs.read_bytes()
+                    repeated = subprocess.run(command + ["--jobs", str(jobs)],
+                                              capture_output=True, text=True, timeout=15)
+                    self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+                    self.assertEqual(jobs.read_bytes(), sealed)
                 self.assertNotIn("cancellation_quiescence_receipt", saved.metadata)
                 result = subprocess.run(
                     [sys.executable, str(HERE / "dispatch-attempt-ready.py"),

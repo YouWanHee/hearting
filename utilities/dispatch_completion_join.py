@@ -4236,6 +4236,11 @@ def close_finished_child(
             from foreground_terminal import terminal_evidence
             evidence = {**terminal_evidence(terminal, note, metadata.get("log_file")),
                         **(evidence or {})}
+            # SD-124 preserves the foreground wrapper's fail axis, but the
+            # typed blocking-review join producer carries its verdict in the
+            # note and exact artifact, without a failure_class annotation.
+            if note == REVIEW_BLOCKING_NOTE:
+                evidence.pop("failure_class", None)
         if choice.state == "absent":
             missing = missing_result_terminal({**metadata, "worktree": _row_worktree(row),
                                               "started_at": row.raw.split("\t")[0]})

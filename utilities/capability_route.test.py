@@ -7002,13 +7002,19 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
      prior_child.communicate(timeout=5)
      prior_meta={**axes,"attempt_id":aid,"worker_type":"review","parent_attempt_id":"att-owner",
       "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":review_id,"route_file":str(path),
-      "note":"completed-review-blocking" if index<2 else "dead-worker-blocked",
-      "failure_class":"fail" if index<2 else "blocked","artifact_root":str(artifact),"log_file":str(prior_log),
+      "artifact_root":str(artifact),"log_file":str(prior_log),
       "pid":str(prior_child.pid),"pid_start":str(ticks),"pgid":str(prior_child.pid),
       "pid_ns":namespace,"pid_observer_ns":namespace}
      with self.jobs.open("a") as f:
-      f.write("\t".join([R.datetime.now(R.timezone.utc).isoformat(),"done",str(repo),str(repo),aid,
+      f.write("\t".join([R.datetime.now(R.timezone.utc).isoformat(),"running",str(repo),str(repo),aid,
        ",".join(f"{k}={v}" for k,v in prior_meta.items())])+"\n")
+     # The foreground writer preserves the original FAIL/BLOCKED and full
+     # exact cleanup at this finite teardown, before later fixture processes.
+     from foreground_terminal import settle_foreground_exit
+     from types import SimpleNamespace
+     result=settle_foreground_exit(self.jobs,aid,prior_log,SimpleNamespace(failure="",exit_code=0),
+      worktree=repo,artifact_root=artifact,worker_type="review",legacy_close=lambda _:None)
+     self.assertTrue(result["closed"],result)
    import ship_parent_deploy
    script=output/"prepared-script.py";script.write_text("print('fixture deployment must never run')\n")
    pins=[]
@@ -7027,6 +7033,13 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
   meta=dict(axes,attempt_id="att-review-self",worker_type="review",harness=harness,
    route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],route_file=str(path),
    parent_attempt_id="att-owner",artifact_root=str(artifact),log_file=str(log))
+  # Publish the original completion from a finite, already reaped lifecycle.
+  # Its real launch identity lets the normal terminal writer preserve the
+  # full cleanup proof before a later CLI observer becomes unobservable.
+  child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
+   start_new_session=True,env={**os.environ,"AGENT_DISPATCH_ATTEMPT_ID":meta["attempt_id"]})
+  meta.update(D.process_launch_identity(child.pid))
+  child.communicate(timeout=5)
   with self.jobs.open("a" if ship else "w") as f:
    f.write("\t".join([R.datetime.now(R.timezone.utc).isoformat(),"running",str(repo),str(repo),"review",
     ",".join(f"{k}={v}" for k,v in meta.items())])+"\n")
@@ -7043,11 +7056,6 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
    origin.pop("reviewer_claim")
    R.atomic_write(directory/f"{node['id']}.json",origin)
    R.atomic_write(directory/f"{node['id']}.{origin['sequence']}.json",origin)
-  # A real reaped process provides exact quiescence, no substituted result.
-  child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,start_new_session=True)
-  start=D.process_start_ticks(child.pid); ns=D.process_namespace_identity(child.pid)
-  child.communicate(timeout=5)
-  self.jobs.write_text(self.jobs.read_text().rstrip()+f",pid={child.pid},pid_start={start},pgid={child.pid},pid_ns={ns},pid_observer_ns={ns}\n")
   if ship:
    owner_child.communicate(timeout=5)
   else:

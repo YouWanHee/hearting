@@ -803,7 +803,12 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
                           for p in (self.jobs.parent / "logs").glob("*" ) if p.is_file()))
             meta = REPLACEMENT._rows(self.jobs.read_text().splitlines())[leg['attempt_id']][1]
             if meta.get('note') == 'completed-review-blocking':
-                self.assertEqual(meta['failure_class'], 'fail')
+                if meta.get('classifier_source') == 'completion-join-terminal-verdict-v1':
+                    self.assertNotIn('failure_class', meta)
+                    self.assertEqual(meta['reconcile_reason'], 'typed-review-blocking')
+                else:
+                    self.assertEqual(meta['failure_class'], 'fail')
+                self.assertTrue(meta.get('review_artifact_b64'))
                 continue
             self.route_cmd("complete", "--node", node["id"],
                 "--evidence", str(self.output / node["outputs"][0]),
