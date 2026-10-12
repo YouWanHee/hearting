@@ -2293,5 +2293,19 @@ class RetentionContainmentGateTest(unittest.TestCase):
         self.assertFalse(gaps[0]["recoverable"])
 
 
+class ReviewSelfDispositionAliasTest(unittest.TestCase):
+    def test_alias_replay_preserves_origin_link_spelling_and_bytes(self):
+        spec=importlib.util.spec_from_file_location("disposition_alias_fixture",Path(__file__).with_name("capability_route.test.py"))
+        fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+        f=fixture.HistoricalReviewSelfDispositionTest();f.setUp();self.addCleanup(f.doCleanups)
+        f.historical_fixture(legacy=True)
+        alias=f.base/"state-alias";alias.symlink_to(f.jobs.parent,target_is_directory=True)
+        with mock.patch.dict(os.environ,{"AGENT_DISPATCH_JOBS":str(alias/"jobs.log")}):
+            marker=f.replay()
+            self.assertEqual(f.replay("writer"),marker)
+            canonical=f.directory/f"{f.node['id']}.json"
+            self.assertTrue(fixture.D.completion_marker_is_current(f.route,f.node,canonical))
+        for path,before in f.preserved.items():self.assertEqual(path.read_bytes(),before)
+
 if __name__ == "__main__":
     unittest.main()

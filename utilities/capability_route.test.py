@@ -6536,6 +6536,41 @@ class ReviewIndependenceTest(InlineStageCompletionRecipeTest):
 
  # -- the self-declared registered reviewer -------------------------------
 
+ def test_named_live_self_equals_implicit_registered_self(self):
+  for status in ("open", "running"):
+   for harness in ("claude", "codex", "opencode"):
+    with self.subTest(status=status, harness=harness):
+     self.setUp()
+     route=self._route(self.base/"artifacts"); node=self._review_node(route)
+     self._registered_row("att-self",route,"impl-review","review",status=status)
+     meta=R._find_attempt_row_metadata(self.jobs,"att-self")
+     axes=R._marker_attempt_axes(node,"att-self",meta)
+     implicit=R.resolve_review_identity(node,axes,meta)
+     marker,_=R.complete_node(route,node,"impl-review",self._evidence(),
+      jobs=str(self.jobs),attempt_id="att-self",
+      review_claim={"kind":"registered-worker","attempt_id":"att-self"})
+     self.assertEqual({k:marker[k] for k in implicit},implicit)
+     self.assertEqual(marker["review_independence"],"independent")
+     self.assertEqual(marker["reviewer_claim"]["attempt_id"],"att-self")
+
+ def test_live_self_requires_exact_canonical_completer(self):
+  route=self._route(self.base/"artifacts"); node=self._review_node(route)
+  self._registered_row("att-self",route,"impl-review","review",status="running")
+  row=R._find_attempt_row_metadata(self.jobs,"att-self")
+  axes=R._marker_attempt_axes(node,"att-self",row)
+  for change in ({"route_hash":"sha256:foreign"},{"route_hash":""},
+                 {"worker_type":"owner"},{"route_node":"other"}):
+   with self.subTest(change=change):
+    result=R.resolve_review_identity(node,axes,dict(row,**change),jobs=self.jobs,
+     route_id=route["route_id"],node_id="impl-review",
+     claim={"kind":"registered-worker","attempt_id":"att-self"})
+    self.assertEqual(result["review_independence"],"degraded")
+  self._registered_row("att-self",route,"impl-review","review",status="running")
+  result=R.resolve_review_identity(node,axes,row,jobs=self.jobs,
+   route_id=route["route_id"],node_id="impl-review",
+   claim={"kind":"registered-worker","attempt_id":"att-self"})
+  self.assertEqual(result["reviewer_downgrade_reason"],"reviewer-attempt-row-ambiguous")
+
  def test_a_claimed_review_attempt_must_exist_and_be_a_review_worker(self):
   # Requirement (4): the claim is adjudicated by the registry, and a claim that
   # does not check out is DOWNGRADED, not refused -- a refusal here would make
@@ -6906,6 +6941,296 @@ class ReviewIndependenceTest(InlineStageCompletionRecipeTest):
   identity=R.resolve_review_identity(node,axes,{},owner_chain=True)
   self.assertEqual(identity["reviewer_downgrade_reason"],
                    "review-completed-owner-chain")
+
+class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
+ """Isolated real publication/currentness/readiness; no live runtime writes."""
+
+ def historical_fixture(self,harness="codex",legacy=False,ship=False):
+  repo=self.base/"repo"; repo.mkdir()
+  subprocess.run(["git","init","-q",str(repo)],check=True)
+  subprocess.run(["git","-C",str(repo),"-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
+   "commit","--allow-empty","-qm","init"],check=True)
+  artifact=repo/".agent_reports";artifact.mkdir()
+  template=self._route(artifact)
+  dispatch=json.loads(json.dumps(template["dispatch_evidence"]))
+  for row in dispatch["tuples"]: row["checked_worktree"]=str(repo)
+  route=R.compile_route("autopilot-ship" if ship else "autopilot-code","default" if ship else "dev","standard" if ship else "strong",repo,artifact,
+   signals=[] if ship else ["shared-contract"],transport="headless",tracking="tracked",
+   tracked_gate_evidence={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec",
+    "workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}},dispatch_evidence=dispatch)
+  if ship:
+   route=R.compose_route(capability="autopilot-ship",capability_mode="default",shape="staged",graph=None,
+    slug="self-disposition-ship",cwd=repo,artifact_root=artifact,intensity="standard",spec_read="fixture",
+    campaign_key="self-disposition-fixture",
+    dispatch_evidence=dispatch,jobs=self.jobs,parent_harness=harness,
+    work_request={"text":"Continue the same prepared deploy request","owner_harness":harness})
+  node=next(n for n in route["nodes"] if n["id"]==("release-review" if ship else "impl-review"))
+  path=R.canonical_route_path(artifact,route["route_id"])
+  path.parent.mkdir(parents=True,exist_ok=True); path.write_text(json.dumps(route))
+  output=artifact
+  axes={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
+   "execution_surface":"registered-headless","registered_worker":"1","fallback_hop":"same-harness-headless"}
+  owner={**axes,"dispatch_depth":"1","attempt_id":"att-owner","worker_type":"owner",
+   "parent_sid":"parent","parent_harness":harness,"owner_route_file":str(path),
+   "owner_route_id":route["route_id"],"owner_route_hash":route["route_hash"]}
+  if ship:
+   import artifact_producer
+   begun=artifact_producer.begin(artifact,route_file=path,capability="autopilot-ship",intensity="standard",jobs=self.jobs)
+   output=Path(begun["env"]["AGENT_ARTIFACT_OUTPUT_DIR"])
+   self.producer=begun
+   owner_child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
+    start_new_session=True,env={**os.environ,"AGENT_DISPATCH_ATTEMPT_ID":"att-owner"})
+   self.addCleanup(lambda: owner_child.communicate(timeout=5) if owner_child.poll() is None else None)
+   owner.update(pid=str(owner_child.pid),pid_start=str(D.process_start_ticks(owner_child.pid)),pgid=str(owner_child.pid),
+    pid_ns=D.process_namespace_identity(owner_child.pid),pid_observer_ns=D.process_namespace_identity(owner_child.pid))
+   self.jobs.write_text("\t".join(["2026-10-12T00:00:00Z","running",str(repo),str(repo),"owner",
+    ",".join(f"{k}={v}" for k,v in owner.items())])+"\n")
+   # Seed the consumed review history before preparation. The unchanged
+   # request excludes these subjects; each current review is the third
+   # produced judgment, alongside one verdict-less historical attempt.
+   for review_id in ("release-review","security-review"):
+    for index in range(3):
+     aid=f"att-prior-{review_id}-{index}"
+     prior_report=output/f"{aid}.md";prior_report.write_text("previous blocking review\n")
+     prior_log=self.base/f"{aid}.jsonl"
+     verdict="FAIL" if index<2 else "BLOCKED"
+     prior_log.write_text(json.dumps({"type":"result","subtype":"success","is_error":False,
+      "result":f"artifact: {prior_report}\nverdict: {verdict}\nblocker: previous finding"})+"\n")
+     prior_child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
+      start_new_session=True,env={**os.environ,"AGENT_DISPATCH_ATTEMPT_ID":aid})
+     ticks=D.process_start_ticks(prior_child.pid);namespace=D.process_namespace_identity(prior_child.pid)
+     prior_child.communicate(timeout=5)
+     prior_meta={**axes,"attempt_id":aid,"worker_type":"review","parent_attempt_id":"att-owner",
+      "route_id":route["route_id"],"route_hash":route["route_hash"],"route_node":review_id,"route_file":str(path),
+      "note":"completed-review-blocking" if index<2 else "dead-worker-blocked",
+      "failure_class":"fail" if index<2 else "blocked","artifact_root":str(artifact),"log_file":str(prior_log),
+      "pid":str(prior_child.pid),"pid_start":str(ticks),"pgid":str(prior_child.pid),
+      "pid_ns":namespace,"pid_observer_ns":namespace}
+     with self.jobs.open("a") as f:
+      f.write("\t".join([R.datetime.now(R.timezone.utc).isoformat(),"done",str(repo),str(repo),aid,
+       ",".join(f"{k}={v}" for k,v in prior_meta.items())])+"\n")
+   import ship_parent_deploy
+   script=output/"prepared-script.py";script.write_text("print('fixture deployment must never run')\n")
+   pins=[]
+   for i in range(32):
+    pin=output/f"input-{i}.txt";pin.write_text(str(i));pins.append(str(pin))
+   command=output/"prepared-command.json"
+   command.write_text(json.dumps({"argv":[sys.executable,str(script)],"cwd":str(repo),"inputs":pins}))
+   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
+    self.prepared=ship_parent_deploy.prepare(self.jobs,"att-owner",command)
+  evidence=output/"evidence"/"review.json"
+  evidence.parent.mkdir(parents=True,exist_ok=True)
+  evidence.write_text(json.dumps({"verdict":"PASS","findings":[],"gate_met":True,
+   "route_id":route["route_id"],"completion_gate":node["completion_gate"],
+   "request_digest":self.prepared["request_digest"] if ship else "fixed"}))
+  log=self.base/f"review.{harness}.jsonl"
+  meta=dict(axes,attempt_id="att-review-self",worker_type="review",harness=harness,
+   route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],route_file=str(path),
+   parent_attempt_id="att-owner",artifact_root=str(artifact),log_file=str(log))
+  with self.jobs.open("a" if ship else "w") as f:
+   f.write("\t".join([R.datetime.now(R.timezone.utc).isoformat(),"running",str(repo),str(repo),"review",
+    ",".join(f"{k}={v}" for k,v in meta.items())])+"\n")
+  claim={"kind":"registered-worker","attempt_id":meta["attempt_id"]}
+  # Construct the historical bug at its original publication boundary, then
+  # use only real common authority/validation on every replay and observation.
+  degraded={"reviewer_kind":"owner-inline","review_independence":"degraded",
+   "reviewer_identity":meta["attempt_id"],"reviewer_downgrade_reason":"reviewer-attempt-no-terminal-verdict"}
+  with mock.patch.object(R,"resolve_review_identity",return_value=degraded):
+   origin,_=R.complete_node(route,node,node["id"],evidence,jobs=self.jobs,
+    attempt_id=meta["attempt_id"],review_claim=claim)
+  directory=R.completion_dir(route["route_id"])
+  if legacy:
+   origin.pop("reviewer_claim")
+   R.atomic_write(directory/f"{node['id']}.json",origin)
+   R.atomic_write(directory/f"{node['id']}.{origin['sequence']}.json",origin)
+  # A real reaped process provides exact quiescence, no substituted result.
+  child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,start_new_session=True)
+  start=D.process_start_ticks(child.pid); ns=D.process_namespace_identity(child.pid)
+  child.communicate(timeout=5)
+  self.jobs.write_text(self.jobs.read_text().rstrip()+f",pid={child.pid},pid_start={start},pgid={child.pid},pid_ns={ns},pid_observer_ns={ns}\n")
+  if ship:
+   owner_child.communicate(timeout=5)
+  else:
+   with self.jobs.open("a") as f:
+    f.write("\t".join(["2026-10-12T00:00:00Z","running",str(repo),str(repo),"owner",
+     ",".join(f"{k}={v}" for k,v in owner.items())])+"\n")
+  text=f"artifact: {evidence}\nverdict: PASS\nblocker: none"
+  terminal={
+   "codex":[{"type":"item.completed","item":{"type":"agent_message","text":text}},{"type":"turn.completed"}],
+   "claude":[{"type":"result","subtype":"success","is_error":False,"result":text}],
+   "opencode":[{"type":"text","part":{"type":"text","text":text}},
+    {"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}]}[harness]
+  if legacy:
+   import shlex
+   command=shlex.join([sys.executable,str(R.ROOT/"utilities/capability-route.py"),"complete",
+    "--route",str(path),"--node",node["id"],"--jobs",str(self.jobs),"--attempt-id",meta["attempt_id"],
+    "--reviewer-attempt",meta["attempt_id"],"--evidence",str(evidence)])
+   terminal.insert(0,{"type":"item.completed","item":{"type":"command_execution","id":"original-complete",
+    "command":command,"status":"completed","exit_code":0,"aggregated_output":json.dumps(origin)+"\n"+
+     json.dumps({"attempt_id":meta["attempt_id"],"status":"closed"})}})
+  log.write_text("\n".join(json.dumps(e) for e in terminal)+"\n")
+  self.route,self.node,self.evidence,self.claim,self.origin=route,node,evidence,claim,origin
+  self.path,self.log,self.directory=path,log,directory
+  self.repo,self.artifact,self.output,self.meta=repo,artifact,output,meta
+  self.preserved={p:p.read_bytes() for p in (directory/f"{node['id']}.{origin['sequence']}.json",
+   directory/f"{node['id']}.att-review-self.attempt.json",evidence,self.jobs)}
+  return route,node,evidence
+
+ def replay(self,entrance="complete",actor="att-owner"):
+  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_ATTEMPT_ID":actor}):
+   if entrance=="writer":
+    return R.write_completion_marker(self.route,self.node,self.node["id"],self.evidence,
+     attempt_id="att-review-self",attempt_metadata=R._find_attempt_row_metadata(self.jobs,"att-review-self"),
+     review_claim=self.claim,jobs=self.jobs)
+   return R.complete_node(self.route,self.node,self.node["id"],self.evidence,
+    jobs=self.jobs,attempt_id="att-review-self",review_claim=self.claim)[0]
+
+ def test_both_replay_entrances_current_observer_and_harness_semantics(self):
+  for harness in ("claude","codex","opencode"):
+   for entrance in ("complete","writer"):
+    with self.subTest(harness=harness,entrance=entrance):
+     self.setUp(); self.historical_fixture(harness)
+     marker=self.replay(entrance)
+     self.assertEqual(marker["review_independence"],"independent")
+     self.assertEqual(marker["completed_at"],self.origin["completed_at"])
+     self.assertEqual(marker["round_census"],self.origin["round_census"])
+     for p,b in self.preserved.items(): self.assertEqual(p.read_bytes(),b)
+     self.assertEqual(self.replay("complete"),marker)
+     self.assertEqual(self.replay("writer"),marker)
+     canonical=self.directory/f"{self.node['id']}.json"
+     self.assertTrue(D.completion_marker_is_current(self.route,self.node,canonical))
+     self.assertEqual(D.completion_attempt_readiness(self.route,self.node,marker,self.jobs).state,"ready")
+     before={p:p.read_bytes() for p in self.base.rglob('*') if p.is_file()}
+     D.gate_currency(self.route,self.node,canonical,observe=True)
+     self.assertEqual(before,{p:p.read_bytes() for p in self.base.rglob('*') if p.is_file()})
+
+ def test_bound_legacy_command_proves_original_claim_and_missing_claim_holds(self):
+  self.historical_fixture(legacy=True)
+  self.assertEqual(self.replay()["reviewer_disposition"]["original_claim"]["source"],"runtime-command")
+  self.setUp();self.historical_fixture(legacy=True)
+  lines=self.log.read_text().splitlines(); self.log.write_text("\n".join(lines[1:])+"\n")
+  self.assertEqual(self.replay(),self.origin)
+  self.assertEqual(len(list(self.directory.glob(f"{self.node['id']}.[0-9]*.json"))),1)
+
+ def test_legacy_late_self_claim_receipt_does_not_prove_original_self_claim(self):
+  self.historical_fixture(legacy=True)
+  events=[json.loads(line) for line in self.log.read_text().splitlines()]
+  item=events[0]["item"]
+  item["aggregated_output"]=json.dumps(self.origin)+"\n"+json.dumps({"attempt_id":"att-review-self","status":"already-closed"})
+  self.log.write_text("\n".join(json.dumps(e) for e in events)+"\n")
+  self.assertEqual(self.replay(),self.origin)
+
+ def test_foreign_actor_refuses_without_publication_before_and_after_disposition(self):
+  self.historical_fixture()
+  for disposed in (False,True):
+   if disposed: self.replay()
+   before={p:p.read_bytes() for p in self.base.rglob('*') if p.is_file()}
+   for actor in ("att-foreign",""):
+    with self.subTest(disposed=disposed,actor=actor),self.assertRaisesRegex(ValueError,"actor"):
+     self.replay(actor=actor)
+    self.assertEqual(before,{p:p.read_bytes() for p in self.base.rglob('*') if p.is_file()})
+
+ def test_crash_retry_preserves_commit_boundary_and_origin(self):
+  for boundary in ("history","canonical","pointer"):
+   with self.subTest(boundary=boundary):
+    self.setUp();self.historical_fixture()
+    original_write=R.atomic_write; original_once=R.write_once
+    def interrupted_write(path,payload):
+     original_write(path,payload)
+     if ((boundary=="canonical" and Path(path).name==f"{self.node['id']}.json"
+          and "reviewer_disposition" in payload)
+         or (boundary=="pointer" and Path(path).name==f"{self.node['id']}.attempt.json")):
+      raise RuntimeError("publication-interrupted")
+    def interrupted_once(path,payload):
+     original_once(path,payload)
+     if boundary=="history" and "reviewer_disposition" in payload:
+      raise RuntimeError("publication-interrupted")
+    with mock.patch.object(R,"atomic_write",side_effect=interrupted_write), \
+         mock.patch.object(R,"write_once",side_effect=interrupted_once), \
+         self.assertRaisesRegex(RuntimeError,"publication-interrupted"):
+     self.replay()
+    canonical=json.loads((self.directory/f"{self.node['id']}.json").read_text())
+    self.assertEqual(canonical["review_independence"],"degraded" if boundary=="history" else "independent")
+    marker=self.replay()
+    self.assertEqual(marker["sequence"],self.origin["sequence"]+1)
+    self.assertEqual(len(list(self.directory.glob(f"{self.node['id']}.[0-9]*.json"))),2)
+    for p,b in self.preserved.items():self.assertEqual(p.read_bytes(),b)
+
+ def test_concurrent_replay_allocates_only_one_successor(self):
+  import concurrent.futures
+  self.historical_fixture()
+  def replay(index):
+   meta=R._find_attempt_row_metadata(self.jobs,"att-review-self")
+   if index%2:
+    return R.write_completion_marker(self.route,self.node,self.node["id"],self.evidence,
+     attempt_id="att-review-self",attempt_metadata=meta,jobs=self.jobs,review_claim=self.claim)
+   return R.complete_node(self.route,self.node,self.node["id"],self.evidence,
+    attempt_id="att-review-self",jobs=self.jobs,review_claim=self.claim)[0]
+  with mock.patch.dict(os.environ,{"AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}), \
+       concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+   markers=list(pool.map(replay,range(8)))
+  self.assertTrue(all(m==markers[0] for m in markers))
+  self.assertEqual(len(list(self.directory.glob(f"{self.node['id']}.[0-9]*.json"))),2)
+  for p,b in self.preserved.items():self.assertEqual(p.read_bytes(),b)
+
+ def test_corrupt_origin_link_and_forged_successor_are_integrity_failures(self):
+  for component in ("origin","link","content","claim"):
+   with self.subTest(component=component):
+    self.setUp();self.historical_fixture();marker=self.replay()
+    canonical=self.directory/f"{self.node['id']}.json"
+    if component in ("origin","link"):
+     path=list(self.preserved)[0 if component=="origin" else 1]
+     path.write_bytes(path.read_bytes()+b" ")
+    else:
+     if component=="content":marker["round_census"]["verdict_rounds"]+=1
+     else: marker["reviewer_disposition"]["original_claim"]={"source":"made-up"}
+     R.atomic_write(canonical,marker)
+     R.atomic_write(self.directory/f"{self.node['id']}.{marker['sequence']}.json",marker)
+    self.assertTrue(D.gate_currency(self.route,self.node,canonical,observe=True).state.startswith("integrity-broken"))
+
+ def test_partial_dead_conflicting_and_unsettled_rows_do_not_promote(self):
+  for change in ("route_hash=sha256:other","note=dead-worker-fail,failure_class=fail",
+                 "completion_marker_history=/missing/history.json","pid=invalid",
+                 "worker_type=owner","stage_authority=0"):
+   with self.subTest(change=change):
+    self.setUp();self.historical_fixture()
+    lines=self.jobs.read_text().splitlines();lines[0]+=","+change;self.jobs.write_text("\n".join(lines)+"\n")
+    before=(self.directory/f"{self.node['id']}.json").read_bytes()
+    with self.assertRaises((ValueError,D.DispatchContractError)): self.replay()
+    self.assertEqual((self.directory/f"{self.node['id']}.json").read_bytes(),before)
+
+ def test_uncommitted_conflicting_history_cannot_allocate_another_successor(self):
+  self.historical_fixture()
+  R.write_once(self.directory/f"{self.node['id']}.2.json",dict(self.origin,sequence=2,attempt_id="att-other"))
+  before=(self.directory/f"{self.node['id']}.json").read_bytes()
+  with self.assertRaises(ValueError):self.replay()
+  self.assertEqual((self.directory/f"{self.node['id']}.json").read_bytes(),before)
+  self.assertFalse((self.directory/f"{self.node['id']}.3.json").exists())
+
+ def test_duplicate_or_later_subject_cannot_disposition_or_replay(self):
+  for disposed in (False,True):
+   for duplicate in (True,False):
+    with self.subTest(disposed=disposed,duplicate=duplicate):
+     self.setUp();self.historical_fixture()
+     if disposed:self.replay()
+     row=self.jobs.read_text().splitlines()[0]
+     if not duplicate:row=row.replace("att-review-self","att-later-review")
+     with self.jobs.open("a") as f:f.write(row+"\n")
+     before=(self.directory/f"{self.node['id']}.json").read_bytes()
+     with self.assertRaises(ValueError):self.replay()
+     self.assertEqual((self.directory/f"{self.node['id']}.json").read_bytes(),before)
+
+ def test_changed_evidence_writer_collision_and_missing_canonical_never_repair_for_foreign_actor(self):
+  self.historical_fixture();self.replay()
+  before=(self.directory/f"{self.node['id']}.json").read_bytes()
+  self.evidence.write_text(self.evidence.read_text()+" ")
+  with self.assertRaisesRegex(ValueError,"evidence-conflict"):self.replay("writer")
+  self.assertEqual((self.directory/f"{self.node['id']}.json").read_bytes(),before)
+  self.setUp();self.historical_fixture()
+  canonical=self.directory/f"{self.node['id']}.json";canonical.unlink()
+  with self.assertRaisesRegex(ValueError,"not-current"):self.replay("writer",actor="att-foreign")
+  self.assertFalse(canonical.exists())
+
 
 class FixtureRegistryGuardTest(unittest.TestCase):
     """The guard that keeps fixture rows out of the operator's live registry.

@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
 import stat
 import subprocess
 import sys
@@ -7408,6 +7409,128 @@ def _marker_schema_identity_ok(
     return True, history_path
 
 
+def original_review_self_claim(route, node, origin, *, jobs, metadata):
+    """Read the claim made by the original publication, never the replay claim.
+
+    New publications retain their input in history. The legacy Codex command
+    receipt is usable only when its successful output contains this exact
+    original marker and its command binds every completion input. Do not read
+    arbitrary transcripts or infer a claim from degraded reviewer_identity.
+    """
+    claim = {"kind": "registered-worker", "attempt_id": origin.get("attempt_id")}
+    if origin.get("reviewer_claim") == claim:
+        return {"source": "original-marker"}
+    if "reviewer_claim" in origin:
+        return None
+    log = metadata.get("log_file")
+    if not log:
+        return None
+    matches = []
+    for line in Path(log).read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+            item = event.get("item") or {}
+            if (event.get("type") != "item.completed"
+                    or item.get("type") != "command_execution"
+                    or item.get("status") != "completed" or item.get("exit_code") != 0):
+                continue
+            tokens = shlex.split(item.get("command") or "")
+            # Native Codex command receipts wrap the command in a shell -lc.
+            if len(tokens) == 3 and tokens[1] in {"-lc", "-c"}:
+                tokens = shlex.split(tokens[2])
+            if len(tokens) < 3 or Path(tokens[1]).name != "capability-route.py" or tokens[2] != "complete":
+                continue
+            arguments = tokens[3:]
+            if len(arguments) % 2 or len(set(arguments[::2])) != len(arguments[::2]):
+                continue
+            args = dict(zip(arguments[::2], arguments[1::2]))
+            required = {"--route", "--node", "--jobs", "--attempt-id", "--reviewer-attempt", "--evidence"}
+            axis_flags = {"--dispatch-depth": "dispatch_depth", "--transport": "transport",
+                          "--execution-surface": "execution_surface", "--registered-worker": "registered_worker",
+                          "--fallback-hop": "fallback_hop"}
+            if not required <= set(args) or set(args) - required - set(axis_flags):
+                continue
+            if any(str(args[flag]).lower() != str(origin.get(key)).lower()
+                   and not (key == "registered_worker" and args[flag] == "1" and origin.get(key) is True)
+                   for flag, key in axis_flags.items() if flag in args):
+                continue
+            if (args["--node"] != node["id"]
+                    or args["--attempt-id"] != origin.get("attempt_id")
+                    or args["--reviewer-attempt"] != origin.get("attempt_id")
+                    or Path(args["--jobs"]).resolve() != Path(jobs).resolve()
+                    or Path(args["--evidence"]).resolve() != Path(origin["evidence"]["path"]).resolve()):
+                continue
+            sealed = json.loads(Path(args["--route"]).read_text(encoding="utf-8"))
+            sealed = _route_module().verify_route(sealed)
+            if (sealed["route_id"], sealed["route_hash"]) != (route["route_id"], route["route_hash"]):
+                continue
+            output_records = []
+            for output in item.get("aggregated_output", "").splitlines():
+                try:
+                    output_records.append(json.loads(output))
+                except ValueError:
+                    pass
+            if (origin not in output_records or
+                    {"attempt_id": origin["attempt_id"], "status": "closed"} not in output_records):
+                continue
+            matches.append({"source": "runtime-command", "log_file": str(Path(log)),
+                            "item_id": item.get("id"),
+                            "receipt_sha256": hashlib.sha256(line.encode()).hexdigest()})
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+    # Started/completed are distinct; multiple successful original publications
+    # are ambiguous rather than a license to select a convenient late claim.
+    return matches[0] if len(matches) == 1 else None
+
+
+def review_self_disposition_origin(route, node, marker, marker_path):
+    """Validate the sole origin-link exception for a named-self disposition.
+
+    Returns the original marker/path. Every other field is compared as a full
+    copy, preserving judgment, evidence, request bindings and round census.
+    Readers and both publication entrances share this decision.
+    """
+    disposition = marker.get("reviewer_disposition")
+    if not isinstance(disposition, dict) or disposition.get("kind") != "registered-named-self":
+        raise ValueError("review-self-disposition-invalid")
+    sequence = disposition.get("of_sequence")
+    if (type(sequence) is not int or sequence < 1
+            or type(marker.get("sequence")) is not int or sequence >= marker["sequence"]):
+        raise ValueError("review-self-disposition-sequence-invalid")
+    prior_path = marker_path.parent / f"{node['id']}.{sequence}.json"
+    prior_bytes = prior_path.read_bytes()
+    if hashlib.sha256(prior_bytes).hexdigest() != disposition.get("of_marker_sha256"):
+        raise ValueError("review-self-disposition-origin-changed")
+    prior = json.loads(prior_bytes)
+    ok, _ = _marker_schema_identity_ok(route, node, prior, prior_path, observe=True)
+    if (not ok or node.get("kind") != "review-worker"
+            or prior.get("reviewer_kind") != "owner-inline"
+            or prior.get("review_independence") != "degraded"
+            or prior.get("reviewer_downgrade_reason") != "reviewer-attempt-no-terminal-verdict"
+            or not prior.get("attempt_id") or prior.get("reviewer_identity") != prior["attempt_id"]
+            or prior.get("registered_worker") is not True
+            or any(k in prior for k in ("stage_authority", "state", "review_gate_closure", "reviewer_disposition"))):
+        raise ValueError("review-self-disposition-origin-invalid")
+    link_path = marker_path.parent / f"{node['id']}.{prior['attempt_id']}.attempt.json"
+    if (hashlib.sha256(link_path.read_bytes()).hexdigest() != disposition.get("origin_link_sha256")
+            or not _marker_link_current(route, node, prior, prior_path)):
+        raise ValueError("review-self-disposition-link-invalid")
+    expected = dict(prior, sequence=marker["sequence"], reviewer_kind="registered-worker",
+                    review_independence="independent", reviewer_disposition=disposition)
+    expected.pop("reviewer_downgrade_reason", None)
+    if expected != marker:
+        raise ValueError("review-self-disposition-content-changed")
+    if (not disposition.get("actor") or not disposition.get("recorded_at")
+            or disposition.get("settled_basis") != "successful-quiescent-terminal"
+            or not isinstance(disposition.get("original_claim"), dict)):
+        raise ValueError("review-self-disposition-basis-invalid")
+    basis = disposition["original_claim"]
+    if original_review_self_claim(route, node, prior, jobs=disposition.get("jobs", ""),
+                                 metadata={"log_file": basis.get("log_file")}) != basis:
+        raise ValueError("review-self-disposition-claim-invalid")
+    return prior, prior_path
+
+
 def _marker_link_current(
     route: dict[str, object], node: dict[str, object], marker: dict[str, object],
     marker_path: Path,
@@ -7422,6 +7545,10 @@ def _marker_link_current(
     """
     node_id = str(node["id"])
     evidence_record = marker.get("evidence") or {}
+
+    if "reviewer_disposition" in marker:
+        review_self_disposition_origin(route, node, marker, marker_path)
+        return True
 
     if marker.get("stage_authority") == "owner-closure":
         _route_module().validate_continuation_owner_closure(route, node, marker)
@@ -9166,6 +9293,15 @@ def _marker_bound_prepare_marker_proof(
     evidence_path = Path(str(evidence_record.get("path", "")))
     history_path = marker_path.parent / f"{metadata.get('route_node', '')}.{marker.get('sequence', 0)}.json"
     dependency_paths = [route_path, evidence_path, history_path]
+    if "reviewer_disposition" in marker:
+        try:
+            _, origin_path = review_self_disposition_origin(route, nodes[0], marker, marker_path)
+            dependency_paths.append(origin_path)
+            claim = marker["reviewer_disposition"]["original_claim"]
+            if claim.get("source") == "runtime-command":
+                dependency_paths.append(Path(claim["log_file"]))
+        except (IndexError, KeyError, OSError, TypeError, ValueError):
+            return None
     if marker.get("stage_authority") == "owner-chain":
         dependency_paths.append(Path(str(marker.get("subsession_manifest", ""))))
     elif nodes and nodes[0].get("kind") != "resource-runner":

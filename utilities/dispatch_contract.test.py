@@ -6671,4 +6671,23 @@ class TagScanPermissionScopeTest(unittest.TestCase):
    with self.subTest(changes=changes):
     self.check_scan('101','unverifiable',origin='',extra={**metadata,**changes})
 
+class ReviewSelfDispositionObserverTest(unittest.TestCase):
+ def test_marker_bound_observer_proves_current_successor_and_snapshots_origin(self):
+  path=Path(__file__).with_name("capability_route.test.py")
+  spec=importlib.util.spec_from_file_location("disposition_observer_fixture",path)
+  fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+  f=fixture.HistoricalReviewSelfDispositionTest();f.setUp();self.addCleanup(f.doCleanups)
+  f.historical_fixture(legacy=True);marker=f.replay()
+  meta=fixture.R._find_attempt_row_metadata(f.jobs,"att-review-self")
+  proof=D._marker_bound_prepare_marker_proof(meta,"att-review-self")
+  self.assertIsNotNone(proof)
+  self.assertEqual(proof.marker,marker)
+  self.assertIn(str(f.directory/f"{f.node['id']}.1.json"),dict(proof.immutable_file_digests))
+  self.assertIn(str(f.log),dict(proof.immutable_file_digests))
+  self.assertEqual(meta["review_independence"],"degraded")
+  self.assertEqual(proof.marker["review_independence"],"independent")
+  origin=f.directory/f"{f.node['id']}.1.json"
+  origin.write_bytes(origin.read_bytes()+b" ")
+  self.assertIsNone(D._marker_bound_prepare_marker_proof(meta,"att-review-self"))
+
 if __name__=="__main__": unittest.main()
