@@ -62,6 +62,10 @@ from dispatch_contract import (
     evidence_currency,
     note_evidence_change,
     gate_currency,
+    original_review_self_claim,
+    review_self_disposition_origin,
+    review_self_disposition_subject,
+    review_self_disposition_lineage,
     ROUTE_STATE_REFUSAL_REASONS,
     route_state_next_action,
     dispatch_state_roots,
@@ -6797,7 +6801,7 @@ REVIEWER_KINDS = ("registered-worker", "native-subagent", "owner-inline")
 
 def resolve_review_identity(
     node, axes, attempt_metadata, *,
-    claim=None, jobs=None, route_id=None, node_id=None,
+    claim=None, jobs=None, route_id=None, node_id=None, route_hash=None,
     owner_override=False, owner_chain=False,
 ):
     """Name who actually reviewed, for a `review-worker` node's completion marker.
@@ -6864,7 +6868,16 @@ def resolve_review_identity(
         if not jobs:
             return degraded("reviewer-claim-unverifiable-no-registry")
         try:
-            row = _find_attempt_row_metadata(Path(jobs), reviewer_attempt)
+            matches = []
+            for line in Path(jobs).read_text(encoding="utf-8").splitlines():
+                fields = line.split("\t")
+                if len(fields) == 6:
+                    metadata = parse_registry_metadata(fields[5])
+                    if metadata.get("attempt_id") == reviewer_attempt:
+                        matches.append(dict(metadata, _status=fields[1]))
+            if len(matches) > 1:
+                return degraded("reviewer-attempt-row-ambiguous")
+            row = matches[0] if matches else None
         except OSError:
             return degraded("reviewer-registry-unreadable")
         if row is None:
@@ -6885,6 +6898,7 @@ def resolve_review_identity(
         claimed_route = row.get("route_id")
         if claimed_route and (
             claimed_route != route_id or row.get("route_node") != node_id
+            or route_hash and row.get("route_hash") and row["route_hash"] != route_hash
         ):
             return degraded("reviewer-attempt-foreign-route-node")
         # A reviewer that was launched and died produced no verdict. `done` plus
@@ -6892,6 +6906,29 @@ def resolve_review_identity(
         # finished its work"; `completed-review-blocking` stays admissible
         # because a FAIL verdict is a produced verdict.
         note = str(row.get("note") or "")
+        # The registered completer publishes its verdict before its own row
+        # becomes done. Naming that same authoritative row is the implicit
+        # self branch, not a claim that a different reviewer already finished.
+        if (reviewer_attempt and reviewer_attempt == axes.get("attempt_id")
+                and axes.get("registered_worker") is True
+                and claimed_route == route_id and row.get("route_node") == node_id
+                and route_hash and row.get("route_hash") == route_hash
+                and row.get("_status") in {"open", "running"}
+                and not note.startswith("dead-")
+                and not terminal_conflict_pending(row)):
+            try:
+                canonical_axes = _marker_attempt_axes(node, reviewer_attempt, row)
+                source = attempt_metadata or {}
+                bound_keys = ("attempt_id", "worker_type", "route_id", "route_hash", "route_node")
+                exact = canonical_axes == axes and all(row.get(k) == source.get(k) for k in bound_keys)
+            except (DispatchContractError, KeyError, TypeError, ValueError):
+                exact = False
+            if exact:
+                return {
+                    "reviewer_kind": "registered-worker",
+                    "review_independence": "independent",
+                    "reviewer_identity": reviewer_attempt,
+                }
         if row.get("_status") != "done" or note.startswith("dead-"):
             return degraded("reviewer-attempt-no-terminal-verdict")
         return {
@@ -7023,7 +7060,10 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *
         or json.loads(history_path.read_text(encoding="utf-8"))!=existing
     ):
         raise ValueError("canonical completion marker history conflict")
-    if recovering and repair:
+    disposition_candidate = (node.get("kind") == "review-worker" and
+                            ("reviewer_disposition" in existing or
+                             existing.get("reviewer_downgrade_reason") == "reviewer-attempt-no-terminal-verdict"))
+    if recovering and repair and not disposition_candidate:
         atomic_write(canonical_path, existing)
     return existing
 
@@ -7032,11 +7072,125 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *
 # sides of the module boundary -- this binding keeps every existing call
 # site in this file unchanged.
 
+def _review_self_disposition_actor(route, jobs, metadata):
+    actor = review_self_disposition_lineage(route, jobs, metadata)[-1]
+    caller = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
+    if caller:
+        if caller != actor:
+            raise ValueError("review-self-disposition-actor-mismatch")
+    else:
+        owner = _find_attempt_row_metadata(Path(jobs), actor) if actor else None
+        sid = ROUTE_AUTHORITY.caller_identity()[1]
+        if not owner or not ROUTE_AUTHORITY.owns(owner, sid, jobs):
+            raise ValueError("review-self-disposition-actor-unproven")
+    ROUTE_AUTHORITY.review_owner_authority(route, jobs, actor)
+    return actor
+
+
+def _review_self_disposition_locked(route, node, marker, evidence, *, review_claim, jobs, check_only=False):
+    """One narrow normal replay transition, under the existing completion lock.
+
+    This is a provenance disposition of an existing judgment, never a review
+    launch or a second verdict. Missing original claim keeps the old judgment.
+    """
+    if node.get("kind") != "review-worker":
+        return marker
+    directory = completion_dir(route["route_id"])
+    canonical = directory / f"{node['id']}.json"
+    if "reviewer_disposition" in marker:
+        if not check_only and review_claim and jobs:
+            if review_claim != {"kind": "registered-worker", "attempt_id": marker["attempt_id"]}:
+                raise ValueError("review-self-disposition-claim-mismatch")
+            meta = _find_attempt_row_metadata(Path(jobs), marker["attempt_id"])
+            if meta is None:
+                raise ValueError("review-self-disposition-row-not-exact")
+            _review_self_disposition_actor(route, jobs, meta)
+        review_self_disposition_origin(route, node, marker, canonical)
+        return marker
+    if (marker.get("state") == "superseded-by-upstream-revision"
+            and marker.get("reviewer_downgrade_reason") == "reviewer-attempt-no-terminal-verdict"
+            and review_claim == {"kind": "registered-worker", "attempt_id": marker.get("attempt_id")}):
+        raise ValueError("review-self-disposition-not-current")
+    if (check_only or node.get("kind") != "review-worker" or not jobs
+            or marker.get("reviewer_kind") != "owner-inline"
+            or marker.get("review_independence") != "degraded"
+            or marker.get("reviewer_downgrade_reason") != "reviewer-attempt-no-terminal-verdict"
+            or not marker.get("attempt_id") or marker.get("reviewer_identity") != marker["attempt_id"]
+            or marker.get("registered_worker") is not True
+            or review_claim != {"kind": "registered-worker", "attempt_id": marker["attempt_id"]}
+            or any(k in marker for k in ("state", "stage_authority", "review_gate_closure"))):
+        return marker
+    # A surviving old link must never resurrect a superseded canonical head.
+    if not canonical.is_file() or json.loads(canonical.read_text()) != marker:
+        raise ValueError("review-self-disposition-not-current")
+    if gate_currency(route, node, canonical, marker, observe=True).state != "current":
+        raise ValueError("review-self-disposition-integrity-invalid")
+    origin_path = directory / f"{node['id']}.{marker['sequence']}.json"
+    _, meta = review_self_disposition_subject(route, node, marker, origin_path, jobs=jobs)
+    basis = original_review_self_claim(route, node, marker, jobs=jobs, metadata=meta)
+    if basis is None:
+        print("capability-route: review-self-disposition-original-claim-unverified", file=sys.stderr)
+        return marker
+    actor = _review_self_disposition_actor(route, jobs, meta)
+    origin_path = directory / f"{node['id']}.{marker['sequence']}.json"
+    link_path = _attempt_completion_path(route, node["id"], marker["attempt_id"])
+    disposition = {"kind": "registered-named-self", "of_sequence": marker["sequence"],
+                   "of_marker_sha256": hashlib.sha256(origin_path.read_bytes()).hexdigest(),
+                   "origin_link_sha256": hashlib.sha256(link_path.read_bytes()).hexdigest(),
+                   "original_claim": basis, "jobs": str(Path(jobs)), "actor": actor,
+                   "settled_basis": "successful-quiescent-terminal"}
+    # Reuse a valid uncommitted successor left by a crash before canonical
+    # replace. Conflicting history is a collision, not another allocation.
+    sequence = _next_marker_sequence(directory, node["id"])
+    if sequence > marker["sequence"] + 1:
+        pending_path = directory / f"{node['id']}.{sequence - 1}.json"
+        pending = json.loads(pending_path.read_text())
+        review_self_disposition_origin(route, node, pending, pending_path)
+        recorded = dict(pending["reviewer_disposition"])
+        recorded.pop("recorded_at", None)
+        # A replacement/current parent finishes the recorded actor's interrupted
+        # publication; it does not author a new historical judgment.
+        recorded["actor"] = actor
+        if agent_home_equivalent(recorded.get("jobs", ""), disposition["jobs"]):
+            recorded["jobs"] = disposition["jobs"]
+        recorded_claim = dict(recorded["original_claim"])
+        if (recorded_claim.get("source") == basis.get("source") == "runtime-command"
+                and agent_home_equivalent(recorded_claim.get("log_file", ""), basis.get("log_file", ""))):
+            recorded_claim["log_file"] = basis["log_file"]
+            recorded["original_claim"] = recorded_claim
+        if recorded != disposition:
+            raise ValueError("review-self-disposition-history-collision")
+        successor = pending
+    else:
+        disposition["recorded_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        successor = dict(marker, sequence=sequence, reviewer_kind="registered-worker",
+                         review_independence="independent", reviewer_disposition=disposition)
+        successor.pop("reviewer_downgrade_reason", None)
+        write_once(directory / f"{node['id']}.{sequence}.json", successor)
+    review_self_disposition_origin(route, node, successor, canonical)
+    # Recheck evidence at the commit boundary. Before it, old canonical stays;
+    # after it, append-only origin/successor history is never rolled back.
+    head = json.loads(canonical.read_text(encoding="utf-8"))
+    if head != marker or gate_currency(route, node, canonical, head, observe=True).state != "current":
+        raise ValueError("review-self-disposition-origin-drift")
+    atomic_write(canonical, successor)
+    return successor
+
+
 def write_completion_marker(
     route, node, node_id, evidence, *,
     attempt_id=None, attempt_metadata=None, review_claim=None, jobs=None,
     owner_override=False, owner_chain=False, expected_evidence_sha256=None,
+    _lock_held=False,
 ):
+    if not _lock_held:
+        with _exclusive_lock(completion_dir(route["route_id"]) / f".{node_id}.completion.lock"):
+            lock = _exclusive_lock(Path(f"{jobs}.lock")) if jobs else contextlib.nullcontext()
+            with lock:
+                return write_completion_marker(
+                    route, node, node_id, evidence, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
+                    review_claim=review_claim, jobs=jobs, owner_override=owner_override,
+                    owner_chain=owner_chain, expected_evidence_sha256=expected_evidence_sha256, _lock_held=True)
     directory=completion_dir(route["route_id"])
     canonical_path=directory/f"{node_id}.json"
     if expected_evidence_sha256 is None:
@@ -7049,6 +7203,7 @@ def write_completion_marker(
         node, axes, attempt_metadata,
         claim=review_claim, jobs=jobs,
         route_id=route["route_id"], node_id=node_id,
+        route_hash=route["route_hash"],
         owner_override=owner_override, owner_chain=owner_chain,
     )
     replayed=_completion_marker_replay(
@@ -7056,6 +7211,10 @@ def write_completion_marker(
         repair=expected_evidence_sha256 is None,
         evidence_sha256=sha if expected_evidence_sha256 is not None else None,
     )
+    if replayed is None and canonical_path.is_file():
+        prior = json.loads(canonical_path.read_text(encoding="utf-8"))
+        if "reviewer_disposition" in prior and prior.get("attempt_id") == attempt_id:
+            raise ValueError("review-self-disposition-evidence-conflict")
     if expected_evidence_sha256 is not None:
         # A correction's current-manifest digest is an input to the normal
         # writer. Recheck after its read-only census/replay work, before any
@@ -7069,6 +7228,8 @@ def write_completion_marker(
                 evidence_sha256=sha,
             )
     if replayed is not None:
+        replayed = _review_self_disposition_locked(
+            route, node, replayed, evidence, review_claim=review_claim, jobs=jobs)
         # A replay is the same completion, so provenance is deliberately not in
         # marker identity -- but a caller that named a reviewer this time and
         # gets the old marker back deserves to be told the claim was dropped,
@@ -7145,6 +7306,8 @@ def write_completion_marker(
         # match for a replay to be the same completion. Empty for every node
         # kind but `review-worker`.
         **review_identity,
+        **({"reviewer_claim": dict(review_claim)}
+           if node.get("kind") == "review-worker" and review_claim else {}),
         **({"round_census":round_census} if round_census else {}),
         "completion_gate":node["completion_gate"],
         "evidence":{"path":str(evidence),"sha256":sha},
@@ -7949,7 +8112,13 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
             recorded_by=recorded_by, jobs=jobs,
         )
     directory = completion_dir(route["route_id"], jobs=jobs)
-    with _exclusive_lock(directory / f".{node_id}.completion.lock"):
+    # Every affected completion lock precedes jobs, in one sorted order.
+    # Disposition holds its same node lock through the final head check/replace.
+    with contextlib.ExitStack() as locks:
+        for affected in sorted({node_id} | _downstream_node_ids(route, node_id)):
+            locks.enter_context(_exclusive_lock(directory / f".{affected}.completion.lock"))
+        if jobs:
+            locks.enter_context(_exclusive_lock(Path(f"{jobs}.lock")))
         marker, tombstones = _producer_revision_plan(
             route, node_id, evidence, basis=basis, answers=answers, direction=direction,
             reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,
@@ -8257,12 +8426,26 @@ def _publish_completion_locked(
         }
         if actual_static!=marker_static:
             raise ValueError("immutable attempt completion route identity differs from link")
+        current = None
+        if (node.get("kind") == "review-worker"
+                and marker.get("reviewer_downgrade_reason") == "reviewer-attempt-no-terminal-verdict"):
+            current = _completion_marker_replay(
+                route, node, node_id, evidence, axes, completion_dir(route["route_id"]), repair=not check_only)
+        if current is not None and "reviewer_disposition" in current:
+            origin, _ = review_self_disposition_origin(
+                route, node, current, completion_dir(route["route_id"]) / f"{node_id}.json")
+            if origin != marker:
+                raise ValueError("review-self-disposition-origin-conflict")
+            marker = current
+        marker = _review_self_disposition_locked(
+            route, node, marker, evidence, review_claim=review_claim, jobs=jobs, check_only=check_only)
         _notify_reviewer_claim_ignored(
             route,node_id,marker,
             resolve_review_identity(
                 node,axes,attempt_metadata,
                 claim=review_claim,jobs=jobs,
                 route_id=route["route_id"],node_id=node_id,
+                route_hash=route["route_hash"],
                 owner_override=owner_override,owner_chain=owner_chain,
             ),
             review_claim,
@@ -8287,8 +8470,17 @@ def _publish_completion_locked(
             owner_override=owner_override,
             owner_chain=owner_chain,
             expected_evidence_sha256=expected_evidence_sha256,
+            _lock_held=True,
         )
     if not attempt_id:
+        return marker
+
+    if "reviewer_disposition" in marker:
+        # The attempt and current pointers still describe the original
+        # publication. The shared reader follows the validated successor.
+        review_self_disposition_origin(route, node, marker,
+                                       completion_dir(route["route_id"]) / f"{node_id}.json")
+        atomic_write(completion_dir(route["route_id"]) / f"{node_id}.attempt.json", existing_link)
         return marker
 
     canonical_marker_path=completion_dir(route["route_id"])/f"{node_id}.json"
@@ -9825,6 +10017,7 @@ def complete_subsession_stage(route, node, node_id, evidence, manifest_path, job
             route,node,node_id,evidence,
             attempt_id=attempt_id,attempt_metadata=metadata,
             owner_chain=True,
+            _lock_held=True,
         )
     _launch_open_cycle_checkpoint(route)
     return marker,{"status":"stage-gate-aggregated","sessions":len(manifest["sessions"])}

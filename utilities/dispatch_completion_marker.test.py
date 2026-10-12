@@ -3187,5 +3187,24 @@ class CompletionMarkerTest(unittest.TestCase):
             parent.wait(timeout=5)
 
 
+class ReviewSelfDispositionPublicationTest(unittest.TestCase):
+    def test_read_only_existing_link_replay_returns_only_committed_disposition(self):
+        path=Path(__file__).with_name("capability_route.test.py")
+        spec=importlib.util.spec_from_file_location("disposition_publication_fixture",path)
+        fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+        f=fixture.HistoricalReviewSelfDispositionTest();f.setUp();self.addCleanup(f.doCleanups)
+        f.historical_fixture()
+        def observe():
+            return fixture.R._publish_completion_locked(f.route,f.node,f.node["id"],f.evidence,
+                attempt_id="att-review-self",attempt_metadata=fixture.R._find_attempt_row_metadata(f.jobs,"att-review-self"),
+                jobs=f.jobs,review_claim=f.claim,require_existing_link=True,check_only=True)
+        before={p:p.read_bytes() for p in f.base.rglob('*') if p.is_file()}
+        self.assertEqual(observe(),f.origin)
+        self.assertEqual(before,{p:p.read_bytes() for p in f.base.rglob('*') if p.is_file()})
+        marker=f.replay()
+        before={p:p.read_bytes() for p in f.base.rglob('*') if p.is_file()}
+        self.assertEqual(observe(),marker)
+        self.assertEqual(before,{p:p.read_bytes() for p in f.base.rglob('*') if p.is_file()})
+
 if __name__ == "__main__":
     unittest.main()

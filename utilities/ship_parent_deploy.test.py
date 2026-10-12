@@ -383,5 +383,26 @@ class ParentDeployTest(unittest.TestCase):
         self.assertEqual(self.jobs.read_bytes(), original)
 
 
+class ExactSelfDispositionAdmissionTest(unittest.TestCase):
+    def test_real_prepared_request_retains_strict_origin_and_terminal_admission(self):
+        spec=importlib.util.spec_from_file_location("strict_ship_coupled_fixture",Path(__file__).with_name("work_start.test.py"))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        f=module.CoupledReviewSelfDispositionTest();f.setUp();self.addCleanup(f.doCleanups)
+        f.test_public_correction_replacement_disposition_and_unchanged_strict_ship_consumption()
+        deploy=next(n for n in f.f.route["nodes"] if n["id"]=="deploy")
+        origin=f.f.directory/"release-review.1.json"
+        before=origin.read_bytes();origin.write_bytes(before+b" ")
+        with self.assertRaisesRegex(ValueError,"reviews-pending"):
+            S.reviews(f.f.route,deploy,f.jobs,f.request)
+        origin.write_bytes(before)
+        lines=f.jobs.read_text().splitlines()
+        for i,line in enumerate(lines):
+            if f.d.parse_registry_metadata(line.split("\t")[5]).get("attempt_id")=="att-review-self":
+                lines[i]+=",failure_class=fail"
+        f.jobs.write_text("\n".join(lines)+"\n")
+        with self.assertRaisesRegex(ValueError,"reviews-pending"):
+            S.reviews(f.f.route,deploy,f.jobs,f.request)
+        self.assertEqual(f.request_path.read_bytes(),f.request_bytes)
+
 if __name__ == "__main__":
     unittest.main()

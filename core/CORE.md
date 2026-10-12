@@ -8,6 +8,21 @@
 responsibility through execution, recovery, closure and acknowledged handoff,
 with a simpler caller surface. It distinguishes principles from verified implementation.
 
+A registered non-subsession review worker publishing its exact assigned node is
+an independent reviewer whether it names itself or leaves the reviewer claim
+implicit. Another named reviewer's authority comes from its existing terminal judgment.
+Owner-inline and owner-overridden review retain their reduced independence.
+The exact historical named-self publication defect may receive a provenance
+disposition through normal completion replay, preserving its original judgment,
+history, attempt link, evidence and round census. This requires the original
+bound self claim, settled successful completion and current actor authority;
+an ordinary late claim cannot promote a degraded review.
+Publication and observation share the exact registered subject, terminal artifact
+and historical actor-lineage judgment. Recorded authority survives ordinary owner
+replacement; a current authorized actor may finish an interrupted publication.
+Upstream invalidation and disposition commit serialize through the existing
+completion and registry locks, so a historical replay cannot replace a tombstone.
+
 | Layer | Owns | Portable? |
 |---|---|---|
 | Core | workflow, artifact layout, memory lifecycle, QA tiers, model roles, safety invariants | yes |
