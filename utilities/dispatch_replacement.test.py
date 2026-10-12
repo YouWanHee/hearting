@@ -273,11 +273,11 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(caught.exception.reason,'replacement-input-unproven')
         self.assertFalse((R._directory(self.jobs)/'claims').exists())
 
-    def test_replacement_failure_cannot_claim_a_second_replacement(self):
+    def test_malformed_incoming_family_cannot_claim_a_successor(self):
         record=self.claim();self.write({**self.meta,'attempt_id':record['replacement_attempt_id'],
              'automatic_retry_of':'att-source','replacement_family_id':record['family_id']},append=True)
         with self.assertRaises(D.DispatchContractError) as caught:R.claim(self.jobs,record['replacement_attempt_id'])
-        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+        self.assertEqual(caught.exception.reason,'replacement-lineage-unproven')
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
 
     def test_registration_admission_requires_exact_claim_and_fresh_death(self):
@@ -336,10 +336,11 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(registered['launch_claimed'],'0')
         self.assertEqual(R._rows(self.jobs.read_text().splitlines())['att-source'][1]['note'],'dead-exact-pid')
 
-    def test_legacy_retry_consumes_same_budget(self):
+    def test_legacy_retry_label_does_not_consume_a_node_budget(self):
         self.write({**self.meta,'automatic_retry_of':'att-earlier'})
-        with self.assertRaises(D.DispatchContractError) as caught:self.claim()
-        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+        record = self.claim()
+        self.assertEqual(record['original_attempt_id'], 'att-source')
+        self.assertEqual(self.claim(), record)
 
     def test_register_then_start_has_same_sealed_input(self):
         args=SimpleNamespace(**vars(self.args))
@@ -927,7 +928,7 @@ class ReplacementTest(unittest.TestCase):
         _, _, _, target = self._legacy_claimed_pair()
         self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(target))
 
-    def test_automatic_retry_row_consumes_budget_and_delivers_failure_attention(self):
+    def test_legacy_automatic_retry_still_protects_its_exact_predecessor(self):
         route, path = self._legacy_real_route('automatic-root')
         R._route.return_value = (path, route)
         original = self._legacy_row('att-auto-original', route, path)
@@ -935,27 +936,18 @@ class ReplacementTest(unittest.TestCase):
                      'automatic_retry_of': original['attempt_id'],
                      'note': 'dead-exit-1', 'failure_class': 'runtime'}
         self.write(original); self.write(successor, append=True)
-        rows = self.jobs.read_text().splitlines()
-        self.assertTrue(R.legacy_budget_exhausted(self.jobs, rows, original, route=route))
-        effective, lineage, attention = R.advance_batch(
-            self.jobs, {original['attempt_id']}, authority_check=lambda *_: True)
-        self.assertEqual(effective, {original['attempt_id']})
-        self.assertEqual(lineage, [])
-        self.assertEqual([item['reason'] for item in attention],
-                         ['automatic-replacement-exhausted'])
-        self.assertEqual(R.validate_attention(self.jobs, attention,
-                         allowed_attempts={original['attempt_id']}), attention)
+        self.assertFalse(R.legacy_budget_exhausted(
+            self.jobs, self.jobs.read_text().splitlines(), original, route=route))
         before = self.jobs.read_bytes()
-        self.assertEqual(R.advance_batch(self.jobs, {original['attempt_id']},
-                         authority_check=lambda *_: True), (effective, lineage, attention))
+        with self.assertRaises(D.DispatchContractError) as refused:
+            R.claim(self.jobs, original['attempt_id'])
+        self.assertEqual(refused.exception.reason, 'automatic-replacement-exhausted')
         self.assertEqual(self.jobs.read_bytes(), before)
-        self.assertFalse((R._directory(self.jobs) / 'claims').exists())
-
-        continuation, continuation_path = self._legacy_real_route('automatic-continuation', route)
-        current = self._legacy_row('att-auto-continuation', continuation, continuation_path)
+        # A separate proven-dead successor continues; only duplicating the
+        # exact original predecessor is refused, not its logical node count.
+        current = self._legacy_row('att-current', route, path)
         self.write(current, append=True)
-        self.assertTrue(R.legacy_budget_exhausted(
-            self.jobs, self.jobs.read_text().splitlines(), current, route=continuation))
+        self.assertEqual(R.claim(self.jobs, current['attempt_id'])['original_attempt_id'], current['attempt_id'])
 
     def test_automatic_retry_backlink_mismatch_fails_without_writes(self):
         route, path = self._legacy_real_route('automatic-negative')
@@ -1041,7 +1033,7 @@ class ReplacementTest(unittest.TestCase):
         self._legacy_assert_exhausted(lambda: R.claim(self.jobs, current['attempt_id']))
         self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(current))
 
-    def test_sd157_reservation_first_write_crash_consumes_continuation_budget(self):
+    def test_sd157_unresolved_reservation_protects_continuation(self):
         root, path = self._legacy_real_route('reservation-root')
         original = self._legacy_row('att-reserved-original', root, path)
         self.write(original); R._route.return_value = (path, root)
@@ -1059,7 +1051,9 @@ class ReplacementTest(unittest.TestCase):
         route, path = self._legacy_real_route('reservation-continuation', root)
         current = self._legacy_row('att-after-reservation-crash', route, path)
         self.write(current, append=True); R._route.return_value = (path, route)
-        self._legacy_assert_exhausted(lambda: R.claim(self.jobs, current['attempt_id']))
+        with self.assertRaises(D.DispatchContractError) as refused:
+            R.claim(self.jobs, current['attempt_id'])
+        self.assertEqual(refused.exception.reason, 'replacement-legacy-budget-link-unproven')
         self._legacy_assert_exhausted(lambda: self._legacy_retry_claim(current))
 
     def test_unrelated_corrupt_historical_route_does_not_block_healthy_stream(self):
@@ -1342,27 +1336,20 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(R.claim(self.jobs,one['attempt_id']),second)  # replay, not a third claim
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),2)
 
-    def test_silent_budget_is_one_even_after_capacity_generations(self):
+    def test_silent_and_capacity_generations_have_no_node_count_cutoff(self):
         self._capacity_owner()
-        first=self.claim()
-        one=self._die(self._successor(first,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
-        second=R.claim(self.jobs,one['attempt_id'])
-        two=self._die(self._successor(second,one),note='dead-exact-pid',failure_class='contract')
-        silent=R.claim(self.jobs,two['attempt_id'])     # the one silent replacement is still there
-        self.assertNotIn('after_capacity',silent['logical_node'])
-        three=self._die(self._successor(silent,two),note='dead-exact-pid',failure_class='contract')
-        with self.assertRaises(D.DispatchContractError) as caught:R.claim(self.jobs,three['attempt_id'])
-        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
-        # and the reverse order: the silent budget used first is not refilled by a later pause
-        self.jobs.write_text('');import shutil;shutil.rmtree(R._directory(self.jobs)/'claims');shutil.rmtree(R._directory(self.jobs)/'by-source')
-        self._owner(note='dead-exact-pid')
-        silent=self.claim()
-        one=self._die(self._successor(silent,self.meta|{'worker_type':'owner'}),note='dead-capacity',failure_class='capacity')
-        pause=R.claim(self.jobs,one['attempt_id'])
-        self.assertIn('after_capacity',pause['logical_node'])
-        two=self._die(self._successor(pause,one),note='dead-exact-pid',failure_class='contract')
-        with self.assertRaises(D.DispatchContractError) as caught:R.claim(self.jobs,two['attempt_id'])
-        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+        current = self.meta | {'worker_type': 'owner', 'note': 'dead-capacity', 'failure_class': 'capacity'}
+        records = []
+        for note, failure in [('dead-capacity','capacity'), ('dead-exact-pid','contract'),
+                              ('dead-exact-pid','contract'), ('dead-capacity','capacity'),
+                              ('dead-exact-pid','contract')]:
+            record = R.claim(self.jobs, current['attempt_id'])
+            records.append(record)
+            self.assertEqual(R.claim(self.jobs, current['attempt_id']), record)
+            current = self._die(self._successor(record,current), note=note, failure_class=failure)
+        last = R.claim(self.jobs, current['attempt_id'])
+        self.assertEqual(last['original_attempt_id'], current['attempt_id'])
+        self.assertEqual(len({record['family_id'] for record in records + [last]}), 6)
 
     def test_replacement_row_as_source_binds_through_index_not_row(self):
         self._capacity_owner()
@@ -2598,8 +2585,7 @@ class FrameTopCapacityTest(unittest.TestCase):
         record=result['record'];aid=record['replacement_attempt_id']
         self._die(self._successor(record,self.meta,'open'),note='dead-capacity',failure_class='capacity')
         _,_,attention=R.advance_batch(self.jobs,{'att-source'},authority_check=lambda *_:True)
-        self.assertEqual([a['reason'] for a in attention],['automatic-replacement-exhausted'])
-        self.assertEqual(attention[0]['source_attempt_id'],aid)
+        self.assertEqual(attention, [])
         self.assertEqual(len(commands),1)   # nothing was launched for the second death
 
     def test_advance_asks_for_the_hold_of_the_model_it_would_run(self):
@@ -2712,11 +2698,11 @@ class FrameCapacityFlow:
         # the replacement stops at a limit too: nothing registers, nothing spawns
         fx._die(fx.rows()[args.attempt_id][1], note='dead-capacity', failure_class='capacity', launch_claimed='1')
         _, _, attention = R.advance_batch(fx.jobs, {'att-source'}, authority_check=lambda *_: True)
-        case.assertEqual([a['reason'] for a in attention], ['automatic-replacement-exhausted'])
+        case.assertEqual(attention, [])
         third = self.args(fx, self.cli(fx, 'att-third', 'deep', '--automatic-retry-of', args.attempt_id))
         with case.assertRaises(D.DispatchContractError) as refused:
             self.register(fx, third)
-        case.assertEqual(refused.exception.reason, 'automatic-replacement-exhausted')
+        case.assertEqual(refused.exception.reason, 'replacement-not-silent-death')
         case.assertNotIn('att-third', fx.rows())
         with case.assertRaises(D.DispatchContractError) as nothing:   # no row to claim, so no spawn either
             self.spawn(fx, 'att-third')

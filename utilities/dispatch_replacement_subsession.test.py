@@ -90,7 +90,7 @@ class ReplacementSubsessionTest(unittest.TestCase):
         with self.assertRaises(R.DC.DispatchContractError):
             SERIAL.ADVANCE.resume_index(self.jobs, self.manifest)
 
-    def test_later_failed_slice_cannot_spend_a_second_stage_replacement(self):
+    def test_later_failed_slice_still_requires_its_own_launch_input(self):
         replace_row(self.jobs, self.route, self.manifest['sessions'][0]['attempt_id'])
         second = self.manifest['sessions'][1]['attempt_id']
         lines = self.jobs.read_text().splitlines()
@@ -103,10 +103,10 @@ class ReplacementSubsessionTest(unittest.TestCase):
                 lines[i]='\t'.join(fields)
         self.jobs.write_text('\n'.join(lines)+'\n')
         with mock.patch.object(R, '_route', return_value=(self.root/'route.json', self.route)), \
-             mock.patch.object(R, 'death_proof', return_value={'state':'quiescent'}):
+             mock.patch.object(R, 'death_proof', return_value={'state':'quiescent','death_kind':'silent'}):
             with self.assertRaises(R.DC.DispatchContractError) as caught:
                 R.claim(self.jobs, second)
-        self.assertEqual(caught.exception.reason, 'automatic-replacement-exhausted')
+        self.assertEqual(caught.exception.reason, 'replacement-input-unproven')
 
     def _row_outcome(self, attempt, *, failed=False):
         lines=self.jobs.read_text().splitlines()
@@ -178,12 +178,12 @@ class ReplacementSubsessionTest(unittest.TestCase):
         self.assertIn({target},joins)
         self.assertIn(target,result.traversed)
 
-    def test_replacement_second_failure_stops_before_next_slice(self):
+    def test_later_replacement_keeps_parent_authority_protection(self):
         result,launches,joins,advanced,target,third=self._later_slice_driver(replacement_fails=True)
         self.assertEqual(launches,[target])
         self.assertNotIn(target,advanced)
         self.assertNotIn({third},joins)
-        self.assertEqual(result.refusal.reason,'automatic-replacement-exhausted')
+        self.assertEqual(result.refusal.reason,'replacement-parent-identity-unproven')
         self.assertEqual(result.attempts,frozenset({target}))
         self.assertIn('replacement_attention',result.receipt)
 

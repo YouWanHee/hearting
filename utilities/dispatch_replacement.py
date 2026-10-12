@@ -1,4 +1,4 @@
-"""SD-157: one proof-bound replacement of a dead logical execution.
+"""SD-157: one proof-bound successor per proven-dead execution.
 
 The jobs lock owns the claim and lineage. Launching stays in the checked adapter;
 its existing registration/spawn fence handles a lost launcher response. Original
@@ -33,13 +33,13 @@ DEATH_NOTES = frozenset({
 })
 # An owner whose runtime died under it: the process exited (`dead-runtime-exit`) or the runtime
 # returned an error envelope such as a provider 5xx (`dead-runtime-error`). Only an explicit `start`
-# replaces it, once, from the node's one replacement budget.
+# replaces each settled failed attempt through the same checked path.
 RUNTIME_DEATH_NOTES = frozenset({'dead-runtime-exit', 'dead-runtime-error'})
 SCHEMA = 'automatic-dead-replacement-v1'
 # D2: a frame leg whose `top` the frame rule assigned is replaced once, one profile lower, when it
 # stops at a usage limit. The claim carries exactly this value; nothing else may.
 FRAME_CAPACITY = 'frame-capacity'
-# Stops that are pauses, not the one silent replacement: a usage limit, an owner its launcher
+# Stops whose existing explicit-resume behavior is retained: a usage limit, an owner its launcher
 # closed before spawning, or an owner that ended BLOCKED and has since been answered. Each pause
 # opens its own family (`after_capacity` keeps the digests of existing capacity families unchanged).
 CORRECTED = 'corrected'
@@ -677,17 +677,23 @@ def legacy_budget_exhausted(jobs, lines, source, *, route=None, include_family=F
         legacy = (meta.get('retry_ordinal') == '1'
                   or meta.get('recovery_exhausted') == '1'
                   or (meta.get('start_permitted') == '0' and meta.get('recovery_id'))
-                  or attention is not None or bool(meta.get('automatic_retry_of')
+                  or attention is not None or bool(include_family and meta.get('automatic_retry_of')
                                                     and not meta.get('replacement_family_id')))
         family_hint = (reservation or {}).get('family_id')
+        if (family_hint and not include_family and other != aid
+                and _read(_record_path(jobs, family_hint)) is None):
+            index_error = DC.DispatchContractError('replacement-claim-pending')
         if family_hint and _is_capacity_record(_read(_record_path(jobs, family_hint))):
             if include_family and other == aid:
                 return True  # SD106 must not add a second successor to a resumed source.
             family_hint = None
         # SD157's own reservation is a replay, not a second consumption.
         # Its own SD106 exhaustion, however, is always a veto.
-        family_consumes = bool(family_hint) and (other != aid or include_family)
-        if legacy or family_consumes or index_error or other in reference_ids:
+        # Automatic transport succession has no cumulative family budget.
+        # SD106 cancellation recovery cannot add a successor to a reserved source.
+        family_consumes = bool(family_hint) and include_family
+        if (legacy or family_consumes or index_error or other in reference_ids
+                or meta.get('automatic_retry_of') == aid):
             candidates.append((fields, meta, bool(legacy), family_hint,
                                family_consumes, index_error))
     if not candidates and not references:
@@ -788,8 +794,7 @@ def _budget_exhausted(jobs, source, *, lines=None, route=None, capacity=False):
         if index.get('original_attempt_id') != aid or not index.get('recovery_id'):
             raise DC.DispatchContractError('replacement-recovery-attention-invalid')
         return True
-    paused = source.get('replacement_original_attempt_id') and (capacity or _in_capacity_family(jobs, source))
-    if ((source.get('automatic_retry_of') and not paused) or source.get('retry_ordinal') == '1'
+    if (source.get('retry_ordinal') == '1'
             or source.get('recovery_exhausted') == '1' or source.get('start_permitted') == '0'):
         return True
     recovery = source.get('recovery_id')
@@ -803,7 +808,7 @@ def _budget_exhausted(jobs, source, *, lines=None, route=None, capacity=False):
     if capacity:
         return False
     if lines is None:
-        lines = Path(jobs).read_text().splitlines()
+        lines = Path(jobs).read_text().splitlines() if Path(jobs).exists() else []
     return legacy_budget_exhausted(jobs, lines, source, route=route)
 
 
@@ -830,8 +835,8 @@ def claim(jobs: Path, aid: str) -> dict:
                                    {'replacement_claim_digest': claim_digest or None})
             if not record or aid not in {record['original_attempt_id'], record['replacement_attempt_id']}:
                 raise DC.DispatchContractError('replacement-lineage-unproven')
-            route_authority.require_continuation(route_authority.decide_continuation(action='replacement-budget',
-                facts={'budget_exhausted': aid == record['replacement_attempt_id']}))
+            if aid != record['original_attempt_id']:
+                raise DC.DispatchContractError('replacement-lineage-unproven')
             _no_competing_successor(rows, aid, record['replacement_attempt_id'])
             return record
         proof = death_proof(fields, meta, jobs=jobs, lines=lines)
@@ -844,10 +849,18 @@ def claim(jobs: Path, aid: str) -> dict:
             proof['source_result'] = 'FAIL'
         logical = _logical_key(route, meta)
         if capacity:
-            # Every usage-limit stop opens its own family: a pause, not the one silent replacement.
+            # Every usage-limit stop opens its own family without changing old pause keys.
             logical = {**logical, 'after_capacity': aid}
         family = _digest(logical)
         old = _read(_record_path(jobs, family))
+        if old and old.get('original_attempt_id') != aid:
+            # Retain the old logical-node claim and give the next exact
+            # predecessor its own edge. The by-source reservation arbitrates
+            # repeated calls and crash recovery without a family count cutoff.
+            _check_record(old, family)
+            logical = {**logical, 'after_death': aid}
+            family = _digest(logical)
+            old = _read(_record_path(jobs, family))
         if old:
             _check_record(old, family)
             route_authority.require_continuation(route_authority.decide_continuation(action='replacement-budget',
@@ -1132,6 +1145,12 @@ def admission(jobs, lines, metadata):
         own = metadata.get('attempt_id')
         peers = [line for line in lines
                  if not (own and len(line.split('\t')) == 6 and DC.row_has_attempt(line.split('\t')[5], own))]
+        _no_competing_successor(_rows(peers), prior, own)
+        DC._automatic_retry_admission(peers, metadata)
+        if source.get('replacement_original_attempt_id'):
+            # A completed content result or frame's already-applied profile
+            # descent cannot become transport failure merely by retry labeling.
+            death_proof(source_fields, source, jobs=jobs, lines=lines)
         route_authority.require_continuation(route_authority.decide_continuation(action='replacement-budget',
             status=source_fields[1], metadata=source, facts={
                 'budget_exhausted': _budget_exhausted(jobs, source, lines=peers)}))
@@ -1517,6 +1536,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
                 return exhausted_attention(jobs, replacement, replacement_meta)
             if progress.state in {'reused', 'running'}:
                 return {'state': progress.state, 'attempt_id': replacement, 'record': record}
+            if progress.state == 'not-applicable':
+                return {'state': 'not-applicable', 'attempt_id': replacement, 'record': record}
             if not progress.allowed:
                 return {'state': 'needs-attention', 'reason': progress.reason, 'attempt_id': replacement,
                         'harness': replacement_meta.get('harness'), 'requested_harness': pinned, 'detail': progress.detail,

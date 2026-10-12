@@ -659,13 +659,13 @@ class FallbackTest(unittest.TestCase):
    with ThreadPoolExecutor(max_workers=2) as pool:
     claimed=list(pool.map(lambda _:DC.claim_attempt_row(self.jobs,expected,row,launch=True),range(2)))
    self.assertEqual(claimed,[False,False]);self.assertEqual(self.jobs.read_bytes(),final)
-   # The old transport budget is still spent, including a direct attempt to
-   # bypass the normal semantic-round entrance with its replacement link.
-   self.assertTrue(REPLACEMENT._budget_exhausted(self.jobs,F.registry_rows(self.jobs,route["route_id"],"test")[1]))
+   # Counts do not forbid another transport death. The original predecessor
+   # already owns its exact successor, so a second competing claim is refused.
+   self.assertFalse(REPLACEMENT._budget_exhausted(self.jobs,F.registry_rows(self.jobs,route["route_id"],"test")[1]))
    with self.assertRaises(DC.DispatchContractError) as caught:
     REPLACEMENT.admission(self.jobs,final.decode().splitlines(),{**launched,"attempt_id":"att-second-death",
                                                                 "automatic_retry_of":"att-verdict"})
-   self.assertEqual(caught.exception.reason,"automatic-replacement-exhausted")
+   self.assertEqual(caught.exception.reason,"retry-predecessor-not-retryable")
 
  def test_a_readable_result_never_links_a_retry_but_a_transport_death_does(self):
   # RA-4: a worker's own FAIL or BLOCKED is its result on any node, capped or
@@ -772,7 +772,7 @@ class FallbackTest(unittest.TestCase):
     self.assertEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task=old_task),old_id)
     self.assertNotEqual(F.request_attempt_identity(old_id,prior,jobs=self.jobs,task="A third distinct request."),
                         launched["attempt_id"])
-   self.assertTrue(REPLACEMENT._budget_exhausted(self.jobs,meta))
+   self.assertFalse(REPLACEMENT._budget_exhausted(self.jobs,meta))
 
  def test_a_readable_result_in_the_launch_window_is_reported_not_retried(self):
   for note,failure_class,verdict in (("dead-worker-fail","fail","FAIL"),("dead-worker-blocked","blocked","BLOCKED")):

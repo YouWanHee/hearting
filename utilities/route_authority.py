@@ -393,16 +393,15 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
     if action == "replacement-progress":
         from dispatch_contract import verdict_pass
-        from dispatch_replacement import (PAUSE_KINDS, _in_capacity_family, _is_capacity_record,
-                                          _replacement_in_flight)
+        from dispatch_replacement import _replacement_in_flight
         if facts.get("record") is not None:
             kind = _replacement_kind(status, metadata, jobs=jobs)
             if status not in {"open", "running"}:
                 if verdict_pass(metadata):
                     return ContinuationDecision(True, "reused", next_action="observe")
-                continuing = kind in PAUSE_KINDS or kind and _is_capacity_record(facts["record"])
-                return ContinuationDecision(bool(continuing), "advance" if continuing else "exhausted",
-                                            next_action="start" if continuing else "report")
+                continuing = bool(kind)
+                return ContinuationDecision(continuing, "advance" if continuing else "not-applicable",
+                                            next_action="start" if continuing else "settle")
             if metadata.get("launch_claimed") == "1":
                 pin = facts.get("pin")
                 if pin and metadata.get("harness") != pin:
@@ -413,9 +412,6 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         if metadata.get("replacement_original_attempt_id") and status in {"open", "running"} and metadata.get("launch_claimed") != "1":
             return ContinuationDecision(True, "advance", next_action="start")
         kind = facts.get("kind")
-        if (metadata.get("replacement_original_attempt_id") and status not in {"open", "running"}
-                and not verdict_pass(metadata) and kind not in PAUSE_KINDS and not _in_capacity_family(jobs, metadata)):
-            return ContinuationDecision(False, "exhausted", "automatic-replacement-exhausted", "report")
         if kind is None:
             return ContinuationDecision(False, "not-applicable", next_action="observe")
         if not facts.get("resume_capacity") and not _replacement_in_flight(jobs, facts["registry_rows"], metadata):
@@ -1619,7 +1615,7 @@ def retry_predecessor(prior_rows, *, jobs=None, task=None):
     Only a transport failure (a death, a runtime error) is retried in place.
     A worker's readable FAIL or BLOCKED is its result, on a capped node or
     not: the next launch is new work, so it never inherits a retry link and
-    never spends the node's one replacement. Capped nodes still count it as a
+    never becomes automatic transport replacement. Capped nodes still count it as a
     round through the shared round admission. A different explicit request on
     an uncapped stage is also new work once the old execution is quiescent.
     Callers keep capped rounds on their existing admission path. No original
