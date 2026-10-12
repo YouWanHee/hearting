@@ -8562,9 +8562,22 @@ def _node_revision_records(route, node_id, jobs=None):
             revisions.append(marker.get("revision") or {})
     return revisions
 
+def _supersession_records(route, node_id, jobs=None):
+    """The node's canonical marker when an upstream revision tombstoned it,
+    as a `supersedes` entry: its verdict no longer covers the revised input,
+    so it gets one re-check inside the cap + 1 ceiling."""
+    try:
+        marker=json.loads((completion_dir(route["route_id"],jobs=jobs)/f"{node_id}.json").read_text(encoding="utf-8"))
+    except (OSError,ValueError):
+        return []
+    if marker.get("state")!="superseded-by-upstream-revision" or not marker.get("attempt_id"):
+        return []
+    return [{"supersedes": [marker["attempt_id"]], "superseded_by": marker.get("superseded_by")}]
+
 def _dependency_revisions(route, node, jobs=None, *, reviewed_input=None):
     """13.59.3 rule 7's closure-check eligibility set: every revision
-    recorded on any node this one `depends_on`. `dispatch-node.py`'s
+    recorded on any node this one `depends_on`, plus the node's own marker
+    such a revision tombstoned. `dispatch-node.py`'s
     `admit_round` calls this same function for its `round_budget`, so a
     marker published for a closure-check round is labeled
     `closure_class="closure-check"` the same way admission already saw it."""
@@ -8585,6 +8598,10 @@ def _dependency_revisions(route, node, jobs=None, *, reviewed_input=None):
         for revision in _review_input_revision_records(generation, node["id"], jobs)
         if reviewed_input is None or revision.get("evidence") == {
             "path": reviewed_input.get("path"), "sha256": reviewed_input.get("sha256")}
+    ] + [
+        record
+        for generation in reversed(lineage)
+        for record in _supersession_records(generation, node["id"], jobs)
     ] + _answered_fix_revisions(route, jobs)
 
 

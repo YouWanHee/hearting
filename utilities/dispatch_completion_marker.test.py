@@ -539,6 +539,8 @@ class CompletionMarkerTest(unittest.TestCase):
         plan_check_evidence = self.base / "plan-check.md"
         plan_check_evidence.write_text("plan-check v1\n", encoding="utf-8")
         self.assertEqual(self.complete(route_path, "plan-check", plan_check_evidence).returncode, 0)
+        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
+        checked = json.loads((canonical_dir / "plan-check.json").read_text(encoding="utf-8"))["attempt_id"]
 
         plan_evidence.write_text("plan v2 (corrected)\n", encoding="utf-8")
         result = self.revise(
@@ -547,10 +549,15 @@ class CompletionMarkerTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-        canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
         tombstone = json.loads((canonical_dir / "plan-check.json").read_text(encoding="utf-8"))
         self.assertEqual(tombstone.get("state"), "superseded-by-upstream-revision")
         self.assertEqual(tombstone.get("superseded_by"), {"node": "plan", "sequence": 2})
+        # The tombstoned verdict is what admission may re-check once.
+        plan_check = next(n for n in route["nodes"] if n["id"] == "plan-check")
+        with self.stable_root_env():
+            reopened = [r for r in ROUTE._dependency_revisions(route, plan_check, self.stable_dispatch / "jobs.log")
+                        if r.get("supersedes")]
+        self.assertEqual(reopened, [{"supersedes": [checked], "superseded_by": {"node": "plan", "sequence": 2}}])
 
         for action in ("start", "dry-run"):
             with self.subTest(action=action):
