@@ -36,6 +36,7 @@ import re
 import shlex
 import sys
 import time
+import unicodedata
 from collections import Counter
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
@@ -6345,6 +6346,11 @@ _ROUTE_FOLD = {}             # {card_key: bool} — True = explicitly folded. Us
                              # on its own unless the user folded it by hand).
 _FOLDABLE = []                # [{"line": idx, "card_key": ...}] — line-index map, `_build_process_
                               # lines` fills it fresh every call (`_SELECTABLE` precedent, F-27).
+_REPO_FOLD = {}               # repo identity -> explicit user-folded bool; independent of route/GPU folds.
+_REPO_FOLDABLE = []           # [{"line": idx, "repo_key": ..., "folded": bool}] for drawn repo titles.
+_LAYOUT_META = {"fixed_end": 0, "body_start": 0, "body_end": 0, "legend_start": 0,
+                "fixed_priorities": {}}
+_PROCESS_LAYOUT_META = {}
 
 
 def set_process_view(v):
@@ -6857,21 +6863,32 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
     defect 1's fix threads into route resolution — the covered-conductor exclusion below has the
     identical "a route's only surviving trace may be terminal, not live" problem defect 1 fixed
     for record lookup, and needs the identical fix for the SAME reason."""
-    global _FOLDABLE
+    global _FOLDABLE, _PROCESS_LAYOUT_META
     _FOLDABLE = []
+    fixed_priorities = {0: 0}
     lines = [_pulse_segs(sessions, jobs, loading=loading, observations=observations)]
     _governor = _governor_segs(governor)
     if _governor is not None:
+        fixed_priorities[len(lines)] = 0
         lines.append(_governor)
+    diagnostic_start = len(lines)
     lines.extend(_diagnostic_rows(resource_diagnostics, malformed, term_width))
+    for i in range(diagnostic_start, len(lines)):
+        fixed_priorities[i] = 0
+    divider_start = len(lines)
     lines.append([(_HFILL, None)])
     compute_rows = _compute_host_rows(term_width, sessions, resources)
     _register_compute_folds(len(lines))
     lines.extend(compute_rows)
     if compute_rows:
         lines.append([(_HFILL, None)])
+    for i in range(divider_start, len(lines)):
+        fixed_priorities[i] = 3 if i < divider_start + 1 + len(compute_rows) else 8
     lines.append(None)
     lines.append([('  PROCESS VIEW', "head"), (_RFLUSH, None), ('p group view  ', "head")])
+    fixed_priorities[len(lines) - 2] = 8
+    fixed_priorities[len(lines) - 1] = 4
+    fixed_end = len(lines)
 
     session_by_identity = {(s.pid, getattr(s, "proc_start", None)): s
                            for s in sessions if s.pid is not None and s.proc_start is not None}
@@ -6943,7 +6960,11 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
         message = ('  sessions loading…' if loading else '  jobs.log unknown'
                    if _jobs_unconfirmed(observations) else "  no observed work")
         lines.append([(message, "dim")])
+        legend_start = len(lines)
         lines.extend(_reading_legend(term_width))
+        _PROCESS_LAYOUT_META = {"fixed_end": fixed_end, "body_end": legend_start,
+                                "legend_start": legend_start,
+                                "fixed_priorities": fixed_priorities}
         return lines
 
     seen_keys = set()
@@ -7058,7 +7079,11 @@ def _build_process_lines(sessions, jobs, route_views_by_id, malformed, memory, t
               and not (isinstance(k, tuple) and k[:1] == _GPU_FOLD_ALL)]:
         del _ROUTE_FOLD[k]
 
+    legend_start = len(lines)
     lines.extend(_reading_legend(term_width))
+    _PROCESS_LAYOUT_META = {"fixed_end": fixed_end, "body_end": legend_start,
+                            "legend_start": legend_start,
+                            "fixed_priorities": fixed_priorities}
     return lines
 
 
@@ -7573,9 +7598,12 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     `memory` = F-19 collectors.memory.collect() result (or None — memory rows simply omitted;
     tests default to None so every pre-F-19 call site keeps working unchanged).
     """
-    global _SELECTABLE, _FOLDABLE
+    global _SELECTABLE, _FOLDABLE, _REPO_FOLDABLE, _LAYOUT_META
     _SELECTABLE = []     # reset before any early return — a stale target map must never survive
     _FOLDABLE = []
+    _REPO_FOLDABLE = []
+    _LAYOUT_META = {"fixed_end": 0, "body_start": 0, "body_end": 0, "legend_start": 0,
+                    "fixed_priorities": {}}
     _node_evidence = node_evidence or {}
     _projection_entities = list(sessions) + list(jobs) + list(route_entities or [])
     # v16: route authority is attached by collectors/projection.py before this surface.
@@ -7623,6 +7651,18 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                     + _delivery_pending_rows(pending_delivery))
         for entry in _FOLDABLE + _SELECTABLE:
             entry["line"] += len(top_rows)
+        process_meta = _PROCESS_LAYOUT_META or {}
+        fixed_end = len(top_rows) + process_meta.get("fixed_end", len(process_lines))
+        legend_start = len(top_rows) + process_meta.get("legend_start", len(process_lines))
+        body_end = len(top_rows) + process_meta.get("body_end", len(process_lines))
+        priorities = {i: 4 for i in range(len(top_rows))}
+        priorities.update({i: 0 for i in range(len(_top_rows(term_width, narrow)),
+                                                min(fixed_end, len(top_rows)))})
+        for index, priority in process_meta.get("fixed_priorities", {}).items():
+            priorities[len(top_rows) + int(index)] = priority
+        _LAYOUT_META = {"fixed_end": fixed_end, "body_start": fixed_end,
+                        "body_end": body_end, "legend_start": legend_start,
+                        "fixed_priorities": priorities}
         return top_rows + process_lines
     # F-18b: mem-worker (distiller/curator/F-17 refresher) census — computed on the ORIGINAL
     # session list, before is_child/mem filtering, so folded/mem-only groups still surface a
@@ -7776,7 +7816,11 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
 
     # The product identity is a distinct, quiet title block. Keep one breathing row
     # before account usage begins instead of letting the two metadata zones touch.
-    lines = _top_rows(term_width, narrow) + _observation_lines(observations, term_width)
+    top_rows = _top_rows(term_width, narrow)
+    observation_rows = _observation_lines(observations, term_width)
+    lines = top_rows + observation_rows
+    fixed_priorities = {i: 4 for i in range(len(top_rows))}
+    fixed_priorities.update({i: 0 for i in range(len(top_rows), len(lines))})
     _seen_glyphs = set()
     # F-98b's "both endpoints on screen" rule is retired (user 2026-09-09): an off-screen
     # peer now gets the same line, labelled by name or `<harness>:<sid8>` instead of a tag.
@@ -7785,15 +7829,21 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     # build. working/idle/dispatch/`~` stay unconditional (always relevant vocabulary); the
     # rest (detached/stale/dead/child-jobs/worktrees) only show up in the legend when at least
     # one row used them.
+    usage_start = len(lines)
     lines.extend(_usage_header_rows(sessions, layout=layout, api_disabled=_API_DISABLED,
                                     usage_snapshots=usage_snapshots, term_width=term_width))
+    for i in range(usage_start, len(lines)):
+        fixed_priorities[i] = 1
     # fleet pulse — htop's "Tasks: N, M running" analogue: whole-board census + live spend Σ
     # Show the row by default; counts skip app-server companions. Extracted into _pulse_segs
     # (F-30, v10) so the process view (§5.1) shares this EXACT row instead of a second copy.
+    pulse_start = len(lines)
     lines.append(_pulse_segs(sessions, display_jobs, loading=loading, observations=observations))
     _governor = _governor_segs(governor)       # F-28c — snapshot-owned in the live loop
     if _governor is not None:                  # counts (I8); None = source absent or quiet.
         lines.append(_governor)
+    for i in range(pulse_start, len(lines)):
+        fixed_priorities[i] = 0
     if _SHOW_ALL:
         _repo_ids = set()
         for name in order:
@@ -7806,23 +7856,31 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                              and _memory_event_key(e) in _shown_keys)
         _mem_events = _mem_event_rows(memory, term_width=term_width, excluded_ids=_repo_ids)
         if _mem_events:
+            memory_start = len(lines)
             lines.extend(_mem_events)
+            for i in range(memory_start, len(lines)):
+                fixed_priorities[i] = 5
             _seen_glyphs.add("mem")
 
     # usage/intel zone = PLAIN bg + a full-width dim rule below it (user 2026-07-03: intel
     # Keep tint directory-only so the intelligence zone is not confused with active cards.
+    compute_start = len(lines)
     lines.append([(_HFILL, None)])
     compute_rows = _compute_host_rows(term_width, sessions, resources)
     _register_compute_folds(len(lines))
     lines.extend(compute_rows)
     if compute_rows:
         lines.append([(_HFILL, None)])
+    for i in range(compute_start, len(lines)):
+        fixed_priorities[i] = 3 if i < compute_start + 1 + len(compute_rows) else 8
+    fixed_end = len(lines)
 
     # header bar REPLACES the `──` zone divider — htop separates meters from the process list
     # with its bar, not a rule. Leave one blank line above it so
     # the top intel zone and the bar don't touch. Narrow mode's 2-line cards have no single
     # column mapping → the bar degrades to a zone label + current-mode hint.
     # Column header uses plain dim labels; tinted panels carry the visual grouping.
+    body_start = fixed_end
     lines.append(None)
     _sh = " " * (_INSET + _PAD_IN) if _TINT_OK else ""   # shift matches panel content columns
     if layout != "wide":
@@ -7840,6 +7898,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     folded_groups = []       # dormant dirs — aggregated into ONE line at the bottom (user: the
                              # stack of per-dir folded rules at the bottom was visual noise)
     for name in order:
+        group_selectable_start = len(_SELECTABLE)
         g = groups[name]
         emission = emission_by_group[name]
         group_sessions = emission["group_sessions"]
@@ -7855,6 +7914,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         if fold:
             folded_groups.append((name, len(group_sessions)))
             continue
+        repo_folded = (name not in ("loops", _SYSTEM_GROUP)
+                       and bool(_REPO_FOLD.get(name, False)))
 
         if not first:
             lines.append(None)
@@ -7930,6 +7991,10 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                 head_segs.append(("  " + label, "dim"))
         elif _cool_min is not None:
             head_segs += [("  " + _text_age(_last_act), "dim")]
+        if name not in ("loops", _SYSTEM_GROUP):
+            head_segs = [("▸ " if repo_folded else "▾ ", "dim")] + head_segs
+            _REPO_FOLDABLE.append({"line": len(lines), "repo_key": name,
+                                   "folded": repo_folded})
         # The group header is the card's first title row.
         # tinted row of the panel, ▍ anchor on the card's padding edge; no floating label.
         _g0 = len(lines)                # panel start (title INCLUDED in the tint range)
@@ -7945,6 +8010,13 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             _body_tint = _TINT_BODY_COOL      # Cooling: middle level between active and inactive.
         else:
             _body_tint = _TINT_BODY           # Inactive: dark grey.
+
+        if repo_folded:
+            if _TINT_OK:
+                lines[_g0] = [(_body_tint, None)] + lines[_g0]
+                lines.insert(_g0 + 1, [(_body_tint, None), ("  ", None)])
+                lines.append([(_body_tint, None), ("  ", None)])
+            continue
 
         # rows stay tight (no blank line — that spread them too far apart); the mid-line gauge
         # glyph (━/─) is what keeps the stacked context bars from merging into a solid wall.
@@ -8359,6 +8431,11 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             # Insert one sentinel after the tint loop.
             lines.insert(_g0 + 1, [(_body_tint, None), ("  ", None)])
             lines.append([(_body_tint, None), ("  ", None)])
+            for entry in _SELECTABLE[group_selectable_start:]:
+                if entry["line"] > _g0:
+                    entry["line"] += 1
+        for entry in _SELECTABLE[group_selectable_start:]:
+            entry["repo_key"] = name
 
     # dormant dirs — one aggregated line, clearly set apart from the active board (blank + dim).
     # Contains the word 'folded' so the click-toggle map and `a` both still reveal them.
@@ -8385,6 +8462,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     # legend — status dots (columns are labelled by the header row). F-12(c): working/idle/
     # dispatch/`~` are always-relevant vocabulary and stay unconditional; the rest only appear
     # when this build actually used them (_seen_glyphs, tracked above — local, not global).
+    legend_start = len(lines)
     lines.append(None)
     legend = [
         ('  session: ', None), ("⠹", "g_spin"), (' working   ', "dim"),
@@ -8431,6 +8509,10 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     # inherited effort now shows plain — the tilde read as noise).
     lines.extend(_wrap_legend(legend, term_width))
     lines.extend(_reading_legend(term_width, session=False))
+
+    _LAYOUT_META = {"fixed_end": fixed_end, "body_start": body_start,
+                    "body_end": legend_start, "legend_start": legend_start,
+                    "fixed_priorities": fixed_priorities}
 
     return lines
 
@@ -8635,7 +8717,8 @@ _WIDE = set("🧠✨⏳📁🚀🛰⚡📋⚙📊🐛📈🔬💻⏱↻")
 
 def _cw(ch):
     o = ord(ch)
-    if o == 0xFE0F or 0x200B <= o <= 0x200F or o == 0x2060:   # VS16 / zero-width → 0 cells
+    if (unicodedata.combining(ch) or o == 0xFE0F or 0x200B <= o <= 0x200F
+            or o == 0x2060):                                    # combining / VS16 / zero-width
         return 0
     if ch in _WIDE:
         return 2
@@ -8707,7 +8790,8 @@ def _is_fill(t):
 
 def _addline(stdscr, row, segs, w):
     if segs is None:
-        return
+        return []
+    painted = []
     # leading row-tint sentinel (round-5 panels) — strip it FIRST so the fill scan below never
     # mistakes it for a fill sentinel; it sets the whole row's background level.
     tint = None
@@ -8734,7 +8818,7 @@ def _addline(stdscr, row, segs, w):
             left, right = segs[:i], segs[i + 1:]
             break
 
-    def _draw(seglist, start, lim=None):
+    def _draw(seglist, start, lim=None, record_hits=False):
         edge = (w - 1) if lim is None else lim
         col = start
         for text, color in seglist:
@@ -8755,12 +8839,14 @@ def _addline(stdscr, row, segs, w):
                     attr |= curses.A_BOLD
                 try:
                     stdscr.addstr(row, col, piece, attr)
+                    if record_hits and pw and piece.strip():
+                        painted.append((col, col + pw, piece))
                 except curses.error:
                     pass
             col += pw
         return col
 
-    endcol = _draw(left, start_col)
+    endcol = _draw(left, start_col, record_hits=True)
     # band lines (muted neutral bars = full width · round-5 tint panels = inset cards) paint their
     # background across; tint rows stop at w-1 so the right margin stays on the default bg.
     bar = bool(segs) and segs[0][1] in _BAR_ROLES
@@ -8781,9 +8867,27 @@ def _addline(stdscr, row, segs, w):
             # an unpainted hole immediately before the time.
             _draw([(" " * (band_lim - endcol), fill_key)], endcol, lim=band_lim)
         if right:
-            _draw(right, rcol, lim=band_lim if band else None)
+            _draw(right, rcol, lim=band_lim if band else None, record_hits=True)
     elif band and endcol < band_lim:
         _draw([(" " * (band_lim - endcol), fill_key)], endcol, lim=band_lim)
+    return painted
+
+
+def _painted_hit_spans(painted):
+    """Return only non-space cells from successful _addline writes."""
+    spans = []
+    for x0, x1, text in painted or ():
+        leading = len(text) - len(text.lstrip())
+        trailing = len(text) - len(text.rstrip())
+        start = x0 + _dw(text[:leading])
+        end = x1 - (_dw(text[len(text) - trailing:]) if trailing else 0)
+        if start < end:
+            spans.append((start, end))
+    return spans
+
+
+def _hit_at(spans, x):
+    return any(x0 <= x < x1 for x0, x1 in (spans or ()))
 
 
 _OFFSET = 0                 # scroll offset — READ only in _draw (see module docstring)
@@ -8791,8 +8895,10 @@ _RESUME_ORDER = None         # private state inherited only by this viewer's rep
 _RELOAD_FRAME = None         # last rows remain visible until the first new observation
 _RELOAD_FRAME_AT = None      # replay never renews the underlying evidence lifetime
 _RELOAD_FRAME_COMPUTE_AT = None
+_RELOAD_LAYOUT = None        # versioned fixed/body/legend geometry for viewer handoff
 _SHELL_TTY_MODE = None       # original shell mode, rather than the old curses mode
 _TOGGLE_ROWS = {}            # screen_y -> True, reset at the top of every _draw (mouse click map)
+_TOGGLE_SPANS = {}           # screen_y -> actual painted x spans
 _CLICK_ROWS = {}             # screen_y -> _SELECTABLE entry (F-27 v9 row click map, §4.2.1 —
                               # filled from _SELECTABLE, NOT _live_targets(): base mode's first
                               # click would otherwise never see a target, and gating on
@@ -8800,6 +8906,16 @@ _CLICK_ROWS = {}             # screen_y -> _SELECTABLE entry (F-27 v9 row click 
 _FOLD_ROWS = {}               # screen_y -> card_key (F-30, v10) — filled from `_FOLDABLE` the
                               # same way `_CLICK_ROWS` is filled from `_SELECTABLE`. Reset at the
                               # top of every `_draw`, same as `_TOGGLE_ROWS`/`_CLICK_ROWS`.
+_FOLD_SPANS = {}              # actual painted cell spans for route/GPU folds
+_REPO_FOLD_ROWS = {}          # screen_y -> repo fold entry
+_REPO_FOLD_SPANS = {}         # actual painted cell spans for repo titles
+_CLICK_SPANS = {}             # actual painted cell spans for session/job actions
+_HIT_VALID = False            # only the latest complete paint may receive a mouse event
+_HIT_SIZE = None              # terminal geometry of that paint
+_HIT_SNAPSHOT_ID = None       # snapshot identity used for that paint
+_CURRENT_BODY_H = 0
+_CURRENT_BODY_TOP = 0
+_CURRENT_BODY_COUNT = 0
 _PROMPT_HITS = []             # [(screen_y, x0, x1, "kill"|"cancel")] — footer button hitboxes.
                               # Reset+rebuilt every _draw call (§4.4.1): a click 2 that lands
                               # before the next _draw must never see a stale (pre-transition)
@@ -9083,6 +9199,10 @@ def _handle_base_key(ch, body_h):
     tested without curses — the F-27 regression budget is 0 and an untestable budget is
     not a budget."""
     global _OFFSET
+    if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
+              curses.KEY_HOME, curses.KEY_END, ord("k"), ord("j"), ord("g"), ord("G")) \
+            and body_h <= 0:
+        return True
     if ch in (curses.KEY_UP, ord("k")):
         _OFFSET -= 1
     elif ch in (curses.KEY_DOWN, ord("j")):
@@ -9105,6 +9225,14 @@ def _handle_base_key(ch, body_h):
         # F-30 (prd.md:305) — process view toggle. Deliberately orthogonal to `w` (layout
         # cycle keeps working inside the process view, same as the group view).
         set_process_view(not _PROCESS_VIEW)
+    elif ch == ord(" "):
+        if _SELECT_MODE or _PROCESS_VIEW or not _HIT_VALID:
+            return True
+        for row in sorted(_REPO_FOLD_ROWS):
+            entry = _REPO_FOLD_ROWS[row]
+            if _REPO_FOLD_SPANS.get(row):
+                _set_repo_fold(entry["repo_key"], not entry["folded"])
+                break
     else:
         return False
     return True
@@ -9115,11 +9243,27 @@ def _getmouse_xy():
     (the pre-v9 shape) still calls the mouse handler with a stale/unbound `mx` from a PRIOR
     getmouse() (or unbound entirely on the first call) → NameError crashes the TUI. Returning
     a matched pair makes "couldn't read the event" and "read it" mutually exclusive states."""
-    try:
-        _, mx, my, _mz, _bstate = curses.getmouse()
-    except Exception:
-        return None, None
+    mx, my, _bstate = _getmouse_event()
     return mx, my
+
+
+def _getmouse_event():
+    """Return the current mouse coordinates and bstate, or a matched empty event."""
+    try:
+        _, mx, my, _mz, bstate = curses.getmouse()
+    except Exception:
+        return None, None, 0
+    return mx, my, bstate
+
+
+def _set_repo_fold(repo_key, folded):
+    global _CURSOR_ID
+    _REPO_FOLD[repo_key] = bool(folded)
+    if folded and _SELECT_MODE:
+        selected = next((e for e in _SELECTABLE if _entry_id(e) == _CURSOR_ID), None)
+        if selected is not None and selected.get("repo_key") == repo_key:
+            _exit_select()
+            _CURSOR_ID = None
 
 
 def _handle_mouse(mx, my):
@@ -9148,6 +9292,8 @@ def _handle_mouse(mx, my):
     the exact same one decision path (§4.1: "kill 결정 경로는 하나").
     """
     global _CURSOR_ID, _SELECT_MODE, _PROMPT
+    if not _HIT_VALID:
+        return True
     if _PROMPT is not None:
         for row, x0, x1, action in _PROMPT_HITS:
             if my == row and x0 <= mx < x1:
@@ -9157,17 +9303,21 @@ def _handle_mouse(mx, my):
                     _handle_prompt_key(_ESC)
                 break
         return True                      # rung 1: every other click while prompted is swallowed
-    if my in _TOGGLE_ROWS:
+    if my in _TOGGLE_ROWS and _hit_at(_TOGGLE_SPANS.get(my), mx):
         set_show_all(not _SHOW_ALL)
         return True
-    if my in _FOLD_ROWS:
+    if my in _REPO_FOLD_ROWS and _hit_at(_REPO_FOLD_SPANS.get(my), mx):
+        entry = _REPO_FOLD_ROWS[my]
+        _set_repo_fold(entry["repo_key"], not entry["folded"])
+        return True
+    if my in _FOLD_ROWS and _hit_at(_FOLD_SPANS.get(my), mx):
         entry = _FOLD_ROWS[my]
         # Invert whatever was ACTUALLY drawn (entry["folded"] is the resolved state — default
         # OR a prior explicit choice, §5.4), never a re-guessed default — otherwise a card whose
         # default happens to be folded would need two clicks before anything visibly moves.
         _ROUTE_FOLD[entry["card_key"]] = not entry["folded"]
         return True
-    if my in _CLICK_ROWS:
+    if my in _CLICK_ROWS and _hit_at(_CLICK_SPANS.get(my), mx):
         entry = _CLICK_ROWS[my]
         reclick = _SELECT_MODE and _entry_id(entry) == _CURSOR_ID
         if _click_target_excluded(entry):
@@ -9180,6 +9330,276 @@ def _handle_mouse(mx, my):
         return True
     _exit_select()
     return True
+
+
+def _handle_mouse_event(mx, my, bstate):
+    """Route one ncurses event; only a primary press clicks, wheel never selects."""
+    global _OFFSET, _CURSOR_ID
+    if mx is None or my is None or not _HIT_VALID:
+        return True
+    primary = getattr(curses, "BUTTON1_PRESSED", 0)
+    if not primary:
+        primary = getattr(curses, "BUTTON1_CLICKED", 0)
+    if _PROMPT is not None:
+        if primary and bstate & primary:
+            _handle_mouse(mx, my)
+        return True
+    wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
+    wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
+    if wheel_up and bstate & wheel_up:
+        if _CURRENT_BODY_H > 0 and _CURRENT_BODY_TOP <= my < _CURRENT_BODY_TOP + _CURRENT_BODY_H:
+            _exit_select()
+            _CURSOR_ID = None
+            _OFFSET = _clamp_offset(_OFFSET - 1, _CURRENT_BODY_COUNT, _CURRENT_BODY_H)
+        return True
+    if wheel_down and bstate & wheel_down:
+        if _CURRENT_BODY_H > 0 and _CURRENT_BODY_TOP <= my < _CURRENT_BODY_TOP + _CURRENT_BODY_H:
+            _exit_select()
+            _CURSOR_ID = None
+            _OFFSET = _clamp_offset(_OFFSET + 1, _CURRENT_BODY_COUNT, _CURRENT_BODY_H)
+        return True
+    if primary and bstate & primary:
+        _handle_mouse(mx, my)
+    return True
+
+
+class _CursesInput:
+    """Read keypad-off curses bytes and decode complete keys and SGR mouse packets.
+
+    ncurses' keypad mouse decoder can wait indefinitely after an SGR prefix. Reading one
+    byte per frame leaves that decision here, so an unfinished packet cannot stop refresh.
+    """
+
+    _SGR_PREFIX = b"\x1b[<"
+    _FOCUS = {b"\x1b[I", b"\x1b[O"}
+    _ESC_DELAY = 0.025
+    _SGR_TIMEOUT = 0.20
+    _MAX_SEQUENCE = 64
+
+    def __init__(self, curses_mod, mouse_enabled=True):
+        self.curses = curses_mod
+        self.mouse_enabled = mouse_enabled
+        self.pending = bytearray()
+        self.pending_since = None
+        self.discarding_sgr = False
+        self.ready = []
+        self.key_sequences = {}
+        for capability, key_name in (
+                ("kcuu1", "KEY_UP"), ("kcud1", "KEY_DOWN"),
+                ("kcub1", "KEY_LEFT"), ("kcuf1", "KEY_RIGHT"),
+                ("kpp", "KEY_PPAGE"), ("knp", "KEY_NPAGE"),
+                ("khome", "KEY_HOME"), ("kend", "KEY_END")):
+            key = getattr(curses_mod, key_name, None)
+            try:
+                sequence = curses_mod.tigetstr(capability)
+            except Exception:
+                sequence = None
+            if key is not None and sequence:
+                self.key_sequences[bytes(sequence)] = key
+        for sequence, key_name in (
+                (b"\x1b[A", "KEY_UP"), (b"\x1bOA", "KEY_UP"),
+                (b"\x1b[B", "KEY_DOWN"), (b"\x1bOB", "KEY_DOWN"),
+                (b"\x1b[C", "KEY_RIGHT"), (b"\x1bOC", "KEY_RIGHT"),
+                (b"\x1b[D", "KEY_LEFT"), (b"\x1bOD", "KEY_LEFT"),
+                (b"\x1b[5~", "KEY_PPAGE"), (b"\x1b[6~", "KEY_NPAGE"),
+                (b"\x1b[H", "KEY_HOME"), (b"\x1b[1~", "KEY_HOME"),
+                (b"\x1b[7~", "KEY_HOME"), (b"\x1bOH", "KEY_HOME"),
+                (b"\x1b[F", "KEY_END"), (b"\x1b[4~", "KEY_END"),
+                (b"\x1b[8~", "KEY_END"), (b"\x1bOF", "KEY_END")):
+            key = getattr(curses_mod, key_name, None)
+            if key is not None:
+                self.key_sequences[sequence] = key
+
+    def _clear(self):
+        self.pending.clear()
+        self.pending_since = None
+        self.discarding_sgr = False
+
+    def has_buffered_input(self):
+        """Whether a key, packet, discard tail, or ready byte remains undecided."""
+        return bool(self.pending or self.discarding_sgr or self.ready)
+
+    def _ready_event(self):
+        return self.ready.pop(0) if self.ready else (self.curses.ERR, None)
+
+    def _fallback_bytes(self, raw):
+        self._clear()
+        self.ready.extend((value, None) for value in raw[1:])
+        return (raw[0], None) if raw else (self.curses.ERR, None)
+
+    def _mouse_state(self, button, released):
+        # xterm SGR supports button 0..2, modifiers 4/8/16, motion 32,
+        # vertical wheel 64/65, and release through the `m` final. Fleet
+        # intentionally acts only on buttons 0..2 and vertical wheel presses.
+        if button < 0 or button & ~0x5f or button & 32:
+            return 0
+        if button & 64:
+            if released or (button & 3) not in (0, 1):
+                return 0
+            name = "BUTTON5_PRESSED" if button & 1 else "BUTTON4_PRESSED"
+            state = getattr(self.curses, name, 0)
+        else:
+            number = button & 3
+            if number == 3:
+                return 0
+            if released:
+                state = getattr(self.curses, "BUTTON%d_RELEASED" % (number + 1), 0)
+            else:
+                state = (getattr(self.curses, "BUTTON%d_PRESSED" % (number + 1), 0)
+                         or getattr(self.curses, "BUTTON%d_CLICKED" % (number + 1), 0))
+        if not state:
+            return 0
+        for bit, name in ((4, "BUTTON_SHIFT"), (8, "BUTTON_ALT"), (16, "BUTTON_CTRL")):
+            if button & bit:
+                modifier = getattr(self.curses, name, 0)
+                if not modifier:
+                    return 0
+                state |= modifier
+        return state
+
+    def _discard_sgr(self, now):
+        self.discarding_sgr = True
+        self.pending_since = now
+
+    def _decode_sgr(self, raw):
+        body = raw[len(self._SGR_PREFIX):]
+        if not body:
+            return None
+        if body[-1] not in (ord("M"), ord("m")):
+            if (len(raw) > self._MAX_SEQUENCE or body.count(b";") > 2
+                    or any(byte not in b"0123456789;" for byte in body)):
+                self._discard_sgr(time.monotonic())
+                return self.curses.ERR, None
+            return None
+        fields = body[:-1].split(b";")
+        try:
+            if len(fields) != 3:
+                raise ValueError("expected button;x;y")
+            button, x, y = (int(value) for value in fields)
+            if button < 0 or button > 0x7f:
+                raise ValueError("button out of range")
+            if x < 1 or y < 1 or x > 65535 or y > 65535:
+                raise ValueError("coordinate out of range")
+        except ValueError:
+            self._clear()
+            return self.curses.ERR, None
+        state = self._mouse_state(button, body[-1] == ord("m"))
+        self._clear()
+        if not state or not self.mouse_enabled:
+            return self.curses.ERR, None
+        return getattr(self.curses, "KEY_MOUSE"), (x - 1, y - 1, state)
+
+    def _decode(self, now):
+        raw = bytes(self.pending)
+        if not raw:
+            return self._ready_event()
+        if raw in self._FOCUS:
+            self._clear()
+            return self.curses.ERR, None
+        if raw.startswith(self._SGR_PREFIX):
+            return self._decode_sgr(raw)
+        key = self.key_sequences.get(raw)
+        if key is not None:
+            self._clear()
+            return key, None
+        if (self._SGR_PREFIX.startswith(raw)
+                or any(sequence.startswith(raw) for sequence in self.key_sequences)
+                or any(sequence.startswith(raw) for sequence in self._FOCUS)):
+            return None
+        if raw.startswith(b"\x1b["):
+            if raw[-1] < 0x40 or raw[-1] > 0x7e:
+                return None
+            self._clear()  # unknown complete CSI sequences, including focus reports, are inert
+            return self.curses.ERR, None
+        if raw.startswith(b"\x1bO") and len(raw) < 3:
+            return None
+        if raw.startswith(b"\x1bO"):
+            self._clear()
+            return self.curses.ERR, None
+        if len(raw) == 1 and now - self.pending_since < self._ESC_DELAY:
+            return None
+        return self._fallback_bytes(raw)
+
+    def _expire(self, now):
+        if not self.pending:
+            return self._ready_event()
+        raw = bytes(self.pending)
+        if self.discarding_sgr or raw.startswith(self._SGR_PREFIX):
+            if now - self.pending_since < self._SGR_TIMEOUT:
+                return self.curses.ERR, None
+            self._clear()
+            return self.curses.ERR, None
+        if raw.startswith((b"\x1b[", b"\x1bO")):
+            if now - self.pending_since < self._ESC_DELAY:
+                return self.curses.ERR, None
+            self._clear()
+            return self.curses.ERR, None
+        if now - self.pending_since < self._ESC_DELAY:
+            return self.curses.ERR, None
+        if raw.startswith(b"\x1b"):
+            self._clear()
+            self.ready.extend((value, None) for value in raw[1:])
+            return 27, None
+        return self._fallback_bytes(raw)
+
+    def read(self, stdscr):
+        if self.ready:
+            return self._ready_event()
+        code = stdscr.getch()
+        now = time.monotonic()
+        if code == self.curses.ERR:
+            return self._expire(now)
+        if code < 0 or code > 255:
+            if self.pending:
+                if (self.discarding_sgr
+                        or bytes(self.pending).startswith(self._SGR_PREFIX)):
+                    # A native resize is not a packet boundary. Deliver it now,
+                    # but consume the SGR tail against the original deadline.
+                    if now - self.pending_since < self._SGR_TIMEOUT:
+                        self.discarding_sgr = True
+                    else:
+                        self._clear()
+                else:
+                    self._clear()
+            return code, None
+        if self.discarding_sgr:
+            if now - self.pending_since >= self._SGR_TIMEOUT:
+                self._clear()
+            else:
+                if code == 27:
+                    self._clear()
+                    self.pending_since = now
+                    self.pending.append(code)
+                elif code in (ord("M"), ord("m")):
+                    self._clear()
+                return self.curses.ERR, None
+        if self.pending and bytes(self.pending).startswith(self._SGR_PREFIX):
+            if now - self.pending_since >= self._SGR_TIMEOUT:
+                self._clear()
+                if code != 27:
+                    return code, None
+        if not self.pending and code != 27:
+            return code, None
+        if code == 27 and self.pending:
+            raw = bytes(self.pending)
+            if (raw.startswith(self._SGR_PREFIX)
+                    or raw.startswith((b"\x1b[", b"\x1bO"))):
+                self._clear()
+                self.pending_since = now
+                self.pending.append(code)
+                return self.curses.ERR, None
+            return self._fallback_bytes(bytes(self.pending) + bytes((code,)))
+        if not self.pending:
+            self.pending_since = now
+        self.pending.append(code)
+        if len(self.pending) > self._MAX_SEQUENCE:
+            if bytes(self.pending).startswith(self._SGR_PREFIX):
+                self._discard_sgr(now)
+                return self.curses.ERR, None
+            self._clear()
+            return self.curses.ERR, None
+        decoded = self._decode(now)
+        return self._ready_event() if decoded is None else decoded
 
 
 def _handle_prompt_key(ch):
@@ -9328,10 +9748,11 @@ def _footer_segs(select_mode, parts, width=None):
 
 def reset_scroll():
     global _OFFSET, _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE
-    global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
+    global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT, _RELOAD_LAYOUT
     _OFFSET = 0
     _RESUME_ORDER = _RELOAD_FRAME = None
     _RELOAD_FRAME_AT = _RELOAD_FRAME_COMPUTE_AT = None
+    _RELOAD_LAYOUT = None
     _SHELL_TTY_MODE = None
 
 
@@ -9340,7 +9761,9 @@ def viewer_state(live_order):
             "layout": _LAYOUT,
             "terminal_modes": _SHELL_TTY_MODE,
             "folds": list(_ROUTE_FOLD.items()), "select_mode": _SELECT_MODE,
+            "repo_folds": list(_REPO_FOLD.items()),
             "cursor": _CURSOR_ID, "frame": _RELOAD_FRAME,
+            "frame_layout": _RELOAD_LAYOUT,
             "frame_at": _RELOAD_FRAME_AT, "frame_compute_at": _RELOAD_FRAME_COMPUTE_AT,
             "order": {"groups": live_order.groups, "tiers": live_order.group_tiers,
                       "sessions": live_order.sessions}}
@@ -9348,9 +9771,9 @@ def viewer_state(live_order):
 
 def restore_viewer_state(value):
     global _OFFSET, _PROCESS_VIEW, _SHOW_ALL, _ROUTE_FOLD, _SELECT_MODE, _CURSOR_ID
-    global _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE
+    global _RESUME_ORDER, _RELOAD_FRAME, _SHELL_TTY_MODE, _RELOAD_LAYOUT
     global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
-    global _LAYOUT
+    global _LAYOUT, _REPO_FOLD, _SELECTABLE, _FOLDABLE, _REPO_FOLDABLE
 
     def tuples(item):
         return tuple(tuples(part) for part in item) if isinstance(item, list) else item
@@ -9362,10 +9785,17 @@ def restore_viewer_state(value):
     layout = value.get("layout", "auto")
     _LAYOUT = layout if layout in ("auto", "wide", "narrow", "stack") else "auto"
     _ROUTE_FOLD = {tuples(key): bool(folded) for key, folded in value.get("folds", [])}
+    _REPO_FOLD = {str(key): bool(folded) for key, folded in value.get("repo_folds", [])}
     _SELECT_MODE = bool(value.get("select_mode"))
     _CURSOR_ID = tuples(value.get("cursor"))
     _RELOAD_FRAME = [[tuple(segment) for segment in row] if row else row
                      for row in value.get("frame") or []]
+    layout_meta = value.get("frame_layout")
+    _RELOAD_LAYOUT = dict(layout_meta) if isinstance(layout_meta, dict) else None
+    _SELECTABLE = []
+    _FOLDABLE = []
+    _REPO_FOLDABLE = []
+    _HIT_VALID = False
     # Older handoffs have no age: preserve their UI state but rebuild their facts.
     _RELOAD_FRAME_AT = value.get("frame_at")
     if not isinstance(_RELOAD_FRAME_AT, (int, float)) or isinstance(_RELOAD_FRAME_AT, bool):
@@ -9382,105 +9812,156 @@ def restore_viewer_state(value):
 def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=None,
           resources=None, usage_snapshots=None, governor=None, loading=False, snapshot=None,
           resource_diagnostics=None):
-    global _OFFSET, _TOGGLE_ROWS, _CLICK_ROWS, _FOLD_ROWS, _PROMPT_HITS, _CURSOR_ID
-    global _RELOAD_FRAME
-    global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT
-    # reset before any early-return so a stale map never survives a click (§4.1 pattern) —
-    # _PROMPT_HITS in particular must never carry the PRIOR stage's coordinates into this
-    # draw (§4.4.1): that staleness is exactly what would defeat the confirm→confirm2
-    # coordinate inversion.
-    _TOGGLE_ROWS = {}
-    _CLICK_ROWS = {}
-    _FOLD_ROWS = {}
+    global _OFFSET, _TOGGLE_ROWS, _TOGGLE_SPANS, _CLICK_ROWS, _CLICK_SPANS
+    global _FOLD_ROWS, _FOLD_SPANS, _REPO_FOLD_ROWS, _REPO_FOLD_SPANS
+    global _PROMPT_HITS, _CURSOR_ID, _RELOAD_FRAME, _RELOAD_LAYOUT
+    global _RELOAD_FRAME_AT, _RELOAD_FRAME_COMPUTE_AT, _HIT_VALID, _HIT_SIZE
+    global _HIT_SNAPSHOT_ID, _CURRENT_BODY_H, _CURRENT_BODY_TOP, _CURRENT_BODY_COUNT
+    global _LAYOUT_META
+
+    _TOGGLE_ROWS, _TOGGLE_SPANS = {}, {}
+    _CLICK_ROWS, _CLICK_SPANS = {}, {}
+    _FOLD_ROWS, _FOLD_SPANS = {}, {}
+    _REPO_FOLD_ROWS, _REPO_FOLD_SPANS = {}, {}
     _PROMPT_HITS = []
+    _HIT_VALID = False
     h, w = stdscr.getmaxyx()
+    if h <= 0 or w <= 1:
+        return
     stdscr.erase()
-    narrow = w < _NARROW_CUTOFF
     now = time.monotonic()
     replay_fresh = (_RELOAD_FRAME_AT is not None
                     and 0 <= now - _RELOAD_FRAME_AT <= 3 * _COMPUTE_HOST_INTERVAL)
     same_gpu_sample = (_COMPUTE_HOSTS_SET_AT is None
                        or _COMPUTE_HOSTS_SET_AT == _RELOAD_FRAME_COMPUTE_AT)
-    if loading and _RELOAD_FRAME and replay_fresh and same_gpu_sample:
+    frame_layout = _RELOAD_LAYOUT if isinstance(_RELOAD_LAYOUT, dict) else {}
+    replay_geometry_ok = (frame_layout.get("schema_version") == 1
+                          and frame_layout.get("width") == w
+                          and frame_layout.get("process_view") is bool(_PROCESS_VIEW)
+                          and frame_layout.get("layout") == _layout_mode(w))
+    cached = bool(loading and _RELOAD_FRAME and replay_fresh and same_gpu_sample
+                  and replay_geometry_ok)
+    if cached:
         lines = _RELOAD_FRAME
+        _LAYOUT_META = {
+            "fixed_end": frame_layout.get("fixed_end", 0),
+            "body_start": frame_layout.get("body_start", 0),
+            "body_end": frame_layout.get("body_end", len(lines)),
+            "legend_start": frame_layout.get("legend_start", len(lines)),
+            "fixed_priorities": {int(k): v for k, v in
+                                 (frame_layout.get("fixed_priorities") or {}).items()},
+        }
     else:
-        lines = _build_lines(sessions, jobs, section, narrow, malformed, layout=_layout_mode(w),
-                         memory=memory, term_width=w, live_order=live_order,
-                         resources=resources, usage_snapshots=usage_snapshots,
-                         governor=governor, loading=loading,
-                         node_evidence=snapshot.node_evidence if snapshot else None,
-                         route_entities=snapshot.route_entities if snapshot else None,
-                         observations=snapshot.observations if snapshot else None,
-                         resource_diagnostics=snapshot.resource_diagnostics if snapshot else resource_diagnostics,
-                         pending_delivery=snapshot.pending_delivery if snapshot else None)
+        lines = _build_lines(sessions, jobs, section, w < _NARROW_CUTOFF, malformed,
+                             layout=_layout_mode(w), memory=memory, term_width=w,
+                             live_order=live_order, resources=resources,
+                             usage_snapshots=usage_snapshots, governor=governor,
+                             loading=loading,
+                             node_evidence=snapshot.node_evidence if snapshot else None,
+                             route_entities=snapshot.route_entities if snapshot else None,
+                             observations=snapshot.observations if snapshot else None,
+                             resource_diagnostics=(snapshot.resource_diagnostics if snapshot
+                                                   else resource_diagnostics),
+                             pending_delivery=snapshot.pending_delivery if snapshot else None)
         _RELOAD_FRAME = lines
         _RELOAD_FRAME_AT = min(now, _COMPUTE_HOSTS_SET_AT) if _COMPUTE_HOSTS_SET_AT is not None else now
         _RELOAD_FRAME_COMPUTE_AT = _COMPUTE_HOSTS_SET_AT
-    body_h = max(1, h - 1)   # reserve 1 footer row
+        _RELOAD_LAYOUT = dict(_LAYOUT_META, schema_version=1, width=w,
+                              process_view=bool(_PROCESS_VIEW), layout=_layout_mode(w))
 
-    # F-27: the cursor tracks a ROW, so the viewport follows it (not the reverse). Done before
-    # the offset clamp so a cursor scrolled off-screen pulls the view back to itself.
+    meta = _LAYOUT_META
+    fixed_end = max(0, min(len(lines), int(meta.get("fixed_end", 0))))
+    body_start = max(fixed_end, min(len(lines), int(meta.get("body_start", fixed_end))))
+    body_end = max(body_start, min(len(lines), int(meta.get("body_end", len(lines)))))
+    legend_start = max(body_end, min(len(lines), int(meta.get("legend_start", len(lines)))))
+    body_count = body_end - body_start
+    priorities = meta.get("fixed_priorities") or {}
+    min_body = 1 if h >= 3 and body_count else 0
+    fixed_capacity = max(0, h - 1 - min_body)
+    if fixed_end <= fixed_capacity:
+        fixed_indices = list(range(fixed_end))
+    else:
+        chosen = sorted(range(fixed_end), key=lambda i: (priorities.get(i, 9), i))[:fixed_capacity]
+        fixed_indices = sorted(chosen)
+    remaining = max(0, h - 1 - len(fixed_indices))
+    body_h = min(body_count, remaining)
+    legend_count = len(lines) - legend_start
+    legend_h = min(legend_count, max(0, remaining - body_h))
+
     cur_line = None
     targets = _live_targets() if _SELECT_MODE else []
     if _SELECT_MODE and targets:
         i = _cursor_index(targets)
-        if i is None:                    # the selected row is gone → re-anchor, never re-aim
+        if i is None:
             i = 0
             _CURSOR_ID = _entry_id(targets[0])
         cur_line = targets[i]["line"]
-        if cur_line < _OFFSET:
-            _OFFSET = cur_line
-        elif cur_line >= _OFFSET + body_h:
-            _OFFSET = cur_line - body_h + 1
-    _OFFSET = _clamp_offset(_OFFSET, len(lines), body_h)
+        cursor_body = cur_line - body_start
+        if body_h > 0:
+            if cursor_body < _OFFSET:
+                _OFFSET = cursor_body
+            elif cursor_body >= _OFFSET + body_h:
+                _OFFSET = cursor_body - body_h + 1
+    _OFFSET = _clamp_offset(_OFFSET, body_count, body_h)
 
-    # F-27 v9 (§4.2.1): the click map is built from _SELECTABLE, NOT _live_targets() — see the
-    # module-level _CLICK_ROWS comment for why (base-mode first click / per-tick cost).
-    _sel_by_line = {e["line"]: e for e in _SELECTABLE}
-    # F-30 (v10, §5.4 Y2): same idiom, from `_FOLDABLE` (line-index map `_build_process_lines`
-    # fills) to `_FOLD_ROWS` (screen-row map, offset-applied here — `_FOLDABLE` itself is only
-    # ever line indices, exactly like `_SELECTABLE`).
-    _fold_by_line = {e["line"]: e for e in _FOLDABLE}
+    sel_by_line = {e["line"]: e for e in _SELECTABLE}
+    fold_by_line = {e["line"]: e for e in _FOLDABLE}
+    repo_by_line = {e["line"]: e for e in _REPO_FOLDABLE}
+    logical_rows = [(i, lines[i]) for i in fixed_indices]
+    body_first_y = len(logical_rows)
+    logical_rows.extend((i, lines[i]) for i in range(body_start + _OFFSET,
+                                                      body_start + _OFFSET + body_h))
+    logical_rows.extend((i, lines[i]) for i in range(legend_start, legend_start + legend_h))
+    logical_to_screen = {}
 
-    visible = lines[_OFFSET: _OFFSET + body_h]
-    row = 0
-    for segs in visible:
-        _addline(stdscr, row, segs, w)
-        fold_entry = _fold_by_line.get(_OFFSET + row)
-        if fold_entry is not None:
-            # ★ I7/§5.4 B2: a foldable row is decided FIRST and unconditionally — it never also
-            # falls into the `_TOGGLE_ROWS` substring check below, even if its text happened to
-            # contain "hidden"/"folded" (the card-label ban in _route_card/_degrade_card is the
-            # other half of this invariant; this is the structural half).
-            _FOLD_ROWS[row] = fold_entry
+    for row, (line_index, segs) in enumerate(logical_rows):
+        logical_to_screen[line_index] = row
+        painted = _addline(stdscr, row, segs, w)
+        if cached:
+            continue
+        spans = _painted_hit_spans(painted)
+        if not spans:
+            continue
+        if line_index in repo_by_line:
+            _REPO_FOLD_ROWS[row] = repo_by_line[line_index]
+            _REPO_FOLD_SPANS[row] = spans
+        elif line_index in fold_by_line:
+            _FOLD_ROWS[row] = fold_by_line[line_index]
+            _FOLD_SPANS[row] = spans
         elif segs is not None and len(segs) == 1 and (
                 "hidden" in segs[0][0] or "folded" in segs[0][0]):
             _TOGGLE_ROWS[row] = True
-        else:
-            entry = _sel_by_line.get(_OFFSET + row)
-            if entry is not None:
-                _CLICK_ROWS[row] = entry
-        row += 1
-    if cur_line is not None and _OFFSET <= cur_line < _OFFSET + body_h:
-        _highlight_row(stdscr, cur_line - _OFFSET, w)
+            _TOGGLE_SPANS[row] = spans
+        elif line_index in sel_by_line:
+            _CLICK_ROWS[row] = sel_by_line[line_index]
+            _CLICK_SPANS[row] = spans
+
+    if cur_line is not None and cur_line in logical_to_screen:
+        _highlight_row(stdscr, logical_to_screen[cur_line], w)
 
     above = _OFFSET
-    below = max(0, len(lines) - body_h - _OFFSET)
+    below = max(0, body_count - body_h - _OFFSET)
     parts = []
     if above:
         parts.append("↑%d" % above)
     if below:
         parts.append("↓%d" % below)
-    # htop F-key bar (round-4): CYAN full-width, keycaps BOLD (dim is invisible on CYAN), the
-    # scroll indicator rides the right edge. `w` cycles layout auto → narrow → wide.
-    # A pending confirmation OWNS the footer: while it is up, the only thing that matters is
-    # the decision in front of the user.
+    if _REPO_FOLD_ROWS and not _PROCESS_VIEW:
+        parts.append("Space fold")
     fsegs = _prompt_segs(_PROMPT, w) if _PROMPT else _footer_segs(_SELECT_MODE, parts, w)
-    _addline(stdscr, h - 1, fsegs, w)
-    if _PROMPT:
-        _PROMPT_HITS = _prompt_hit_boxes(fsegs, h - 1, w)
+    footer_paint = _addline(stdscr, h - 1, fsegs, w)
+    footer_spans = _painted_hit_spans(footer_paint)
+    if _PROMPT and not cached:
+        _PROMPT_HITS = [hit for hit in _prompt_hit_boxes(fsegs, h - 1, w)
+                        if any(x0 <= hit[1] and hit[2] <= x1 for x0, x1 in footer_spans)]
     stdscr.noutrefresh()
     curses.doupdate()
+    _CURRENT_BODY_H = body_h
+    _CURRENT_BODY_TOP = body_first_y
+    _CURRENT_BODY_COUNT = body_count
+    _HIT_SIZE = (h, w)
+    _HIT_SNAPSHOT_ID = id(snapshot) if snapshot is not None else None
+    _HIT_VALID = not cached
 
 
 def _highlight_row(stdscr, y, w):
@@ -9503,7 +9984,7 @@ def _configure_input(curses_mod, env):
     only partly seen: ten dropped frames for one stray ESC, and the floor under the freeze
     below.
 
-    **Mouse reporting is off unless `FLEET_MOUSE=1` asks for it.** Enabling it froze the
+    **Mouse reporting is enabled by default**; explicitly set non-`1` values keep opt-out.
     TUI in two different terminals — under herdr (2026-07-01) and in a VS Code terminal
     (2026-09-09). The second was measured while stuck: 0 CPU, zero read and write syscalls,
     one thread, sleeping on the tty, and the terminal's own output queue empty, so it was
@@ -9512,29 +9993,50 @@ def _configure_input(curses_mod, env):
     which is what a half-assembled mouse/focus escape sequence does: ncurses holds for bytes
     that never arrive and the next keystroke terminates the parse.
 
-    Keyboard was always the primary path, so the only thing lost by default is
-    click-to-toggle — a far better trade than a dashboard that stops. This was already the
-    behavior under herdr; it makes the safe case the default everywhere.
+    Earlier freeze reports came from incomplete mouse/focus sequences. The current default
+    keeps press-only mouse events. Both mouse modes bypass ncurses' blocking keypad
+    sequence decoder and assemble keys and SGR packets incrementally; opt-out consumes
+    mouse packets without dispatching them. PTY evidence records tested terminal limits.
     """
     if hasattr(curses_mod, "set_escdelay"):
         try:
             curses_mod.set_escdelay(25)
         except Exception:
             pass
-    if env.get("FLEET_MOUSE") == "1":
-        try:
-            curses_mod.mousemask(curses_mod.BUTTON1_CLICKED)
-        except Exception:
-            pass
+    if "FLEET_MOUSE" not in env or env.get("FLEET_MOUSE") == "1":
+        button1_pressed = getattr(curses_mod, "BUTTON1_PRESSED", 0)
+        button1 = button1_pressed or getattr(curses_mod, "BUTTON1_CLICKED", 0)
+        mask = button1 | getattr(curses_mod, "BUTTON4_PRESSED", 0)
+        mask |= getattr(curses_mod, "BUTTON5_PRESSED", 0)
+        # A zero interval disables ncurses click synthesis. That's appropriate
+        # when listening to press events (the normal path), but would suppress
+        # the legacy click-only fallback on older curses builds.
+        if button1_pressed and hasattr(curses_mod, "mouseinterval"):
+            try:
+                curses_mod.mouseinterval(0)
+            except Exception:
+                pass
+        if mask:
+            try:
+                curses_mod.mousemask(mask)
+            except Exception:
+                pass
 
 
 def _loop(stdscr, collect_all, hfilter, section, interval):
-    global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME
+    global _OFFSET, _BLINK_ON, _RESUME_ORDER, _RELOAD_FRAME, _HIT_VALID
     curses.curs_set(0)
     _init_colors()
     live_order = _RESUME_ORDER or _LiveOrderState()
     _RESUME_ORDER = None
+    mouse_enabled = "FLEET_MOUSE" not in os.environ or os.environ.get("FLEET_MOUSE") == "1"
     _configure_input(curses, os.environ)
+    # Keep curses' raw byte reads in both mouse modes. The incremental reader
+    # consumes malformed SGR packets safely even when mouse actions are opted out.
+    keypad = getattr(stdscr, "keypad", None)
+    if callable(keypad):
+        keypad(False)
+    input_reader = _CursesInput(curses, mouse_enabled=mouse_enabled)
 
     from . import details
     latest_basic = [None]
@@ -9618,7 +10120,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             # is independent, so a slow ps/dispatch/git call cannot pause this cadence.
             _nb = (int(time.time() * 10) + 1) / 10.0
             stdscr.timeout(max(20, min(100, int((_nb - time.time()) * 1000) + 1)))
-            ch = stdscr.getch()
+            ch, mouse_event = (input_reader.read(stdscr) if input_reader is not None
+                               else (stdscr.getch(), None))
             now = time.time()
             now_mono = time.monotonic()
             pump.request_due(now=now_mono)
@@ -9646,6 +10149,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 detail_generation, latest_detail = detail_update
             if update is not None or detail_update is not None:
                 snapshot = details.merge(basic_snapshot, latest_detail)
+                _HIT_VALID = False
                 sessions, jobs = snapshot.sessions, snapshot.jobs
                 resources = snapshot.resources
                 usage_snapshots = snapshot.usage_snapshots
@@ -9659,19 +10163,25 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 if compute_host_update is not None:
                     compute_host_generation, compute_host_snapshot = compute_host_update
                     set_compute_hosts(compute_host_snapshot)
+                    _HIT_VALID = False
             _BLINK_ON = _blink_phase(now)
 
             if ch in (ord("q"), ord("Q")):
                 return 0
             # Idle input boundary only: never discard a key or an in-flight action.
-            if (install_target is not None and ch == -1
+            if (install_target is not None and ch == curses.ERR
+                    and not input_reader.has_buffered_input()
                     and _PROMPT is None and _PENDING_KILL is None):
                 follower.restart(install_target, getattr(collect_all, "restart_argv", []),
                                  viewer_state(live_order),
                                  stderr_fd=getattr(collect_all, "restart_stderr_fd", None))
                 install_target = None  # a raced/failed exec is retried by the next observation
             h, w = stdscr.getmaxyx()
-            body_h = max(1, h - 1)
+            hit_current = (_HIT_VALID and _HIT_SIZE == (h, w)
+                           and _HIT_SNAPSHOT_ID == id(snapshot))
+            if not hit_current:
+                _HIT_VALID = False
+            body_h = _CURRENT_BODY_H if hit_current else 0
             # --- F-27: a pending confirmation swallows ALL keys. Nothing else can happen while
             # the user is being asked, and only an explicit yes proceeds. ---
             if _PROMPT is not None:
@@ -9681,9 +10191,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 # call ahead of this block would let a click 2 read a stale (pre-transition) map
                 # and silently defeat the confirm→confirm2 coordinate inversion (§4.4).
                 if ch == curses.KEY_MOUSE:
-                    mx, my = _getmouse_xy()
+                    mx, my, bstate = (mouse_event if mouse_event is not None
+                                      else _getmouse_event())
                     if mx is not None:
-                        _handle_mouse(mx, my)
+                        _handle_mouse_event(mx, my, bstate)
                 else:
                     _handle_prompt_key(ch)
                 _draw(stdscr, sessions, jobs, section, malformed, memory=mem_snapshot,
@@ -9711,9 +10222,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             if _handle_base_key(ch, body_h):
                 pass
             elif ch == curses.KEY_MOUSE:
-                mx, my = _getmouse_xy()
+                mx, my, bstate = (mouse_event if mouse_event is not None
+                                  else _getmouse_event())
                 if mx is not None:
-                    _handle_mouse(mx, my)
+                    _handle_mouse_event(mx, my, bstate)
             # KEY_RESIZE: no special handling needed — _draw's clamp re-clamps against the new
             # body_h below; do NOT reset _OFFSET here (would destroy scroll position).
 

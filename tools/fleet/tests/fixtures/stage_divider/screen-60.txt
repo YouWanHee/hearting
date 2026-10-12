@@ -10,7 +10,7 @@
 ─────
 
   SESSIONS   stack · press w to cycle
-● bundle/
+▾ ● bundle/
 ▍ ⠋ [aa] claude     aa ▾4
 ▍    ⚑  3h 00m      Opus (high)              -
 ▍    ┆              ────────────────   —    … · age unknown

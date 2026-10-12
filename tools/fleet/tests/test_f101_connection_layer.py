@@ -363,7 +363,10 @@ class LedgerAbsentByteIdenticalTest(unittest.TestCase):
     requested original technical terms and removal of context/NOW labels. These
     fixed-clock goldens retain the layout changes without absent connection rows.
     Exception on record: 2026-10-10 the user then requested compact English
-    Fleet labels; only the three legend lines change in these four goldens."""
+    Fleet labels; only the three legend lines change in these four goldens.
+    Exception on record: 2026-10-12 the approved per-repository mouse fold adds
+    the open-repository arrow to each heading. Only those three heading prefixes
+    change in these four goldens; absent connection rows remain absent."""
 
     def _render(self, width):
         with mock.patch("time.time", return_value=1700000000.0):

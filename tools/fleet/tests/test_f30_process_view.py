@@ -451,12 +451,16 @@ class MouseFoldTest(ProcessViewEnv):
         raise AssertionError("card_key %s never entered _FOLD_ROWS: %s"
                              % (card_key, render._FOLD_ROWS))
 
+    def _x_for(self, row, spans):
+        x0, x1 = spans[row][0]
+        return x0 + (x1 - x0 - 1) // 2
+
     def test_t3_8_card_click_toggles_fold_no_prompt(self):
         render.set_process_view(True)
         jobs = self._lab_route_jobs()
         self._draw_once([], jobs)
         row = self._fold_row(_LAB_RID)
-        self.assertTrue(render._handle_mouse(2, row))
+        self.assertTrue(render._handle_mouse(self._x_for(row, render._FOLD_SPANS), row))
         self.assertIsNone(render._PROMPT)
         self.assertIn(_LAB_RID, render._ROUTE_FOLD)
 
@@ -487,7 +491,7 @@ class MouseFoldTest(ProcessViewEnv):
         row = self._fold_row(_REAL_RID)
         self.assertNotIn(row, render._TOGGLE_ROWS)
         show_all_before = render._SHOW_ALL
-        self.assertTrue(render._handle_mouse(2, row))
+        self.assertTrue(render._handle_mouse(self._x_for(row, render._FOLD_SPANS), row))
         self.assertEqual(render._SHOW_ALL, show_all_before)   # `a` toggle untouched
         self.assertIn(_REAL_RID, render._ROUTE_FOLD)
 
@@ -501,11 +505,11 @@ class MouseFoldTest(ProcessViewEnv):
                             pid=88002, proc_start="123")
         self._draw_once([], [conductor, child])
         row = next(r for r, e in render._CLICK_ROWS.items() if e.get("pid") == 88002)
-        self.assertTrue(render._handle_mouse(2, row))
+        self.assertTrue(render._handle_mouse(self._x_for(row, render._CLICK_SPANS), row))
         self.assertEqual(render._CURSOR_ID, (88002, "123"))
         self._draw_once([], [conductor, child])
         row2 = next(r for r, e in render._CLICK_ROWS.items() if e.get("pid") == 88002)
-        self.assertTrue(render._handle_mouse(2, row2))
+        self.assertTrue(render._handle_mouse(self._x_for(row2, render._CLICK_SPANS), row2))
         self.assertIsNotNone(render._PROMPT)
         self.assertEqual(render._PROMPT["stage"], "confirm")
 
@@ -516,7 +520,7 @@ class MouseFoldTest(ProcessViewEnv):
         row = self._fold_row(_LAB_RID)
         render._PROMPT = {"stage": "confirm", "entry": {"pid": 1, "label": "x", "state": "working"}}
         before = dict(render._ROUTE_FOLD)
-        self.assertTrue(render._handle_mouse(2, row))
+        self.assertTrue(render._handle_mouse(self._x_for(row, render._FOLD_SPANS), row))
         self.assertEqual(render._ROUTE_FOLD, before)   # swallowed — fold state untouched
         render._PROMPT = None
 
