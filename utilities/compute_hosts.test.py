@@ -889,6 +889,41 @@ class ComputeHostsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def _delayed_gpu_probe(self, delay):
+        module = load_module()
+        fakebin = self.root / "delayed-bin"
+        fakebin.mkdir()
+        fake = fakebin / "nvidia-smi"
+        fake.write_text(
+            "#!/usr/bin/env python3\nimport sys,time\ntime.sleep(%r)\n"
+            "if any(a.startswith('--query-gpu=') for a in sys.argv):\n"
+            " print('0, GPU-A, NVIDIA A100, 42, 40960, 12288')\n" % delay)
+        fake.chmod(0o755)
+        env = {**self.env, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"]}
+        before = time.monotonic()
+        with mock.patch.dict(os.environ, env, clear=True):
+            row = module.probe_host("here", {"ssh_host": "local"},
+                                    owner_claims=[], ssh_session_bridges=[])
+        return row, time.monotonic() - before
+
+    def test_slow_successful_nvidia_queries_survive_both_inner_and_host_deadlines(self):
+        row, elapsed = self._delayed_gpu_probe(2.0)
+        self.assertTrue(row["reachable"], row)
+        self.assertNotIn("gpu_status", row)
+        self.assertEqual(row["gpus"][0]["utilization_gpu_pct"], 42)
+        self.assertEqual(row["gpus"][0]["memory_used_mib"], 12288)
+        self.assertGreater(elapsed, 3.0)  # The old entire-host deadline was 3s.
+
+    def test_hung_nvidia_query_still_returns_timeout_with_unknown_measurements(self):
+        row, elapsed = self._delayed_gpu_probe(30.0)
+        self.assertTrue(row["reachable"], row)
+        self.assertIn("timed out", row["detail"])
+        self.assertIn("gpu_status", row)
+        for gpu in row["gpus"]:
+            self.assertIsNone(gpu["utilization_gpu_pct"])
+            self.assertIsNone(gpu["memory_used_mib"])
+        self.assertLess(elapsed, 20.0)
+
     def test_gpu_probe_reports_cwd_elapsed_and_process_group(self):
         workdir = self.root / "work"
         workdir.mkdir()

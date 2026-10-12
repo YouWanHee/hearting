@@ -4139,12 +4139,20 @@ def _peer_name_is_readable(name):
     return " " not in text or _session_handle_cell_width(text) <= _PEER_NAME_MAX_CELLS
 
 
-def _peer_endpoint_segs(harness, session_id, name, tag_by_key):
+def _session_repo_label(session):
+    cwd = getattr(session, "cwd", None)
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        return ""
+    repo = project_of(cwd)
+    return _sanitize_session_title(repo) if repo not in {"(unknown)", "(root)"} else ""
+
+
+def _peer_endpoint_segs(harness, session_id, name, tag_by_key, repo_by_key=None):
     """Name the session at the other end of a relation, best evidence first.
 
-    `[46] claude` when that session is also a row on this board — the badge is the thing
+    `[46] hearting` when that session's repository is observed — the badge is the thing
     the user can actually look up. Otherwise the ledger's own display name, and only then
-    `claude:01a084f7`. Never the full session id: `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2`
+    the short session ID. Never the full session id: `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2`
     is what the board printed before this (the collector used to paste the raw id into the
     name slot), and it names nothing a person can act on.
     """
@@ -4167,13 +4175,16 @@ def _peer_endpoint_segs(harness, session_id, name, tag_by_key):
             tag = _resolve_session_tag(harness, sid)
         except Exception:
             tag = None
+    repo = (repo_by_key or {}).get((harness, sid)) if sid else None
     if tag:
-        return [("[", "dim"), (str(tag), "tag"), ("]", "dim"),
-                (" " + (harness or "peer"), "dim")]
+        segs = [("[", "dim"), (str(tag), "tag"), ("]", "dim")]
+        if repo:
+            segs.append((" " + _clip_cells(repo, _PEER_NAME_MAX_CELLS), "dim"))
+        return segs
     if _peer_name_is_readable(name):
         return [(_clip_cells(name.strip(), _PEER_NAME_MAX_CELLS), "dim")]
     if sid:
-        return [("%s:%s" % (harness or "peer", sid[:8]), "dim")]
+        return [((repo + ":" if repo else "") + sid[:8], "dim")]
     return [(harness, "dim")] if harness else []
 
 
@@ -4183,7 +4194,8 @@ def _peer_endpoint_segs(harness, session_id, name, tag_by_key):
 _RELATION_GAP = "   "
 
 
-def _peer_half_segs(entry, direction, tag_by_key, include_kind=True, include_age=True):
+def _peer_half_segs(entry, direction, tag_by_key, include_kind=True, include_age=True,
+                    repo_by_key=None):
     """One direction of peer messaging, without the leading icon."""
     if not entry:
         return []
@@ -4193,7 +4205,7 @@ def _peer_half_segs(entry, direction, tag_by_key, include_kind=True, include_age
     else:
         arrow, harness = "←", entry.get("from_harness")
         sid, name = entry.get("from_session_id"), entry.get("from_name")
-    endpoint = _peer_endpoint_segs(harness, sid, name, tag_by_key)
+    endpoint = _peer_endpoint_segs(harness, sid, name, tag_by_key, repo_by_key)
     if not endpoint:
         return []          # a record naming no endpoint at all is not a relation
     segs = [(arrow, "dim"), (" ", None)] + list(endpoint)
@@ -4206,8 +4218,8 @@ def _peer_half_segs(entry, direction, tag_by_key, include_kind=True, include_age
 
 
 def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, depth=0,
-                     in_card=False):
-    """Both directions of peer messaging on ONE line: `✉ → [32] claude   ← [b0] codex`.
+                     in_card=False, repo_by_key=None):
+    """Both directions of peer messaging on ONE line: `✉ → [32] BC   ← [b0] hearting`.
 
     Drawn whenever the ledger has the relation — NOT only when the other endpoint also
     happens to be rendered this tick. That visibility gate is what made the same received
@@ -4225,9 +4237,9 @@ def _peer_link_strip(sent=None, recv=None, tag_by_key=None, term_width=None, dep
 
     def build(include_kind=True, include_age=True):
         halves = [h for h in (_peer_half_segs(sent, "sent", tag_by_key,
-                                              include_kind, include_age),
+                                              include_kind, include_age, repo_by_key),
                               _peer_half_segs(recv, "recv", tag_by_key,
-                                              include_kind, include_age)) if h]
+                                              include_kind, include_age, repo_by_key)) if h]
         if not halves:
             return []
         segs = [(indent, None), (_ICON_PEER, "dim"), (" ", None)]
@@ -6032,8 +6044,11 @@ def _gpu_session_label(owner, sessions=None):
             if name:
                 break
     tag = _resolve_session_tag(*key)
-    short = "[%s]" % tag if tag else key[0]
-    return ((name or key[0]) + " " + short if tag else name or key[0]), short
+    short = "[%s]" % tag if tag else key[1][:8]
+    if name:
+        return name + " " + short, short
+    repo = _session_repo_label(session)
+    return (short + " " + repo if repo else short), short
 
 
 def _gpu_lease_segs(lease, sessions=None, processes=None, compact=False):
@@ -7682,6 +7697,11 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
     # below drops it from the visible rows.
     sid_titles = {s.session_id: (s.title or s.slug) for s in sessions
                   if s.session_id and (s.title or s.slug)}
+    repo_by_key = {
+        (str(s.harness or "").lower(), identity): _session_repo_label(s)
+        for s in sessions if s.session_id
+        for identity in [s.session_id] + list(getattr(s, "session_aliases", None) or [])
+    }
     # F-29 — a dispatched child session's own sub-agents survive the is_child filter below:
     # they re-attach as a strip under the dispatch row representing the child. Exact
     # attempt-owned evidence lives on the job; legacy persistent sessions fall back to
@@ -8336,7 +8356,8 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
                 lines.extend(_gpu_resource_strip(session_resources, term_width=term_width))
             # Peer communication remains a strip; steward relations use under-id lines.
             lines.extend(_peer_link_strip(getattr(s, "peer_last_sent", None), _peer_last,
-                                          tag_by_key, term_width=term_width))
+                                          tag_by_key, term_width=term_width,
+                                          repo_by_key=repo_by_key))
             lines.extend(_peer_obligation_strip(getattr(s, "peer_obligations", None),
                                                 term_width=term_width))
             for plugin_job in plugin_kids:
