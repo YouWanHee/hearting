@@ -64,6 +64,8 @@ from dispatch_contract import (
     gate_currency,
     original_review_self_claim,
     review_self_disposition_origin,
+    review_self_disposition_subject,
+    review_self_disposition_lineage,
     ROUTE_STATE_REFUSAL_REASONS,
     route_state_next_action,
     dispatch_state_roots,
@@ -7071,22 +7073,7 @@ def _completion_marker_replay(route, node, node_id, evidence, axes, directory, *
 # site in this file unchanged.
 
 def _review_self_disposition_actor(route, jobs, metadata):
-    from dispatch_replacement import effective_attempts
-    parent = metadata.get("parent_attempt_id")
-    actor = parent or ""
-    seen = set()
-    for _ in range(32):
-        if not actor or actor in seen:
-            raise ValueError("review-self-disposition-parent-lineage-invalid")
-        seen.add(actor)
-        effective, mapping = effective_attempts(jobs, {actor})
-        if not mapping:
-            break
-        if len(effective) != 1:
-            raise ValueError("review-self-disposition-parent-lineage-invalid")
-        actor = next(iter(effective))
-    else:
-        raise ValueError("review-self-disposition-parent-lineage-invalid")
+    actor = review_self_disposition_lineage(route, jobs, metadata)[-1]
     caller = os.environ.get("AGENT_DISPATCH_ATTEMPT_ID")
     if caller:
         if caller != actor:
@@ -7111,21 +7098,19 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
     directory = completion_dir(route["route_id"])
     canonical = directory / f"{node['id']}.json"
     if "reviewer_disposition" in marker:
-        review_self_disposition_origin(route, node, marker, canonical)
         if not check_only and review_claim and jobs:
             if review_claim != {"kind": "registered-worker", "attempt_id": marker["attempt_id"]}:
                 raise ValueError("review-self-disposition-claim-mismatch")
             meta = _find_attempt_row_metadata(Path(jobs), marker["attempt_id"])
             if meta is None:
                 raise ValueError("review-self-disposition-row-not-exact")
-            ready = completion_attempt_readiness(route, node, marker, Path(jobs), observe=True)
-            if ready.state != "ready":
-                raise ValueError("review-self-disposition-not-settled:" + ready.reason)
-            lines = Path(jobs).read_text(encoding="utf-8").splitlines()
-            if _registered_marker_fence(route, node, marker, lines) is not None:
-                raise ValueError("review-self-disposition-subject-superseded")
             _review_self_disposition_actor(route, jobs, meta)
+        review_self_disposition_origin(route, node, marker, canonical)
         return marker
+    if (marker.get("state") == "superseded-by-upstream-revision"
+            and marker.get("reviewer_downgrade_reason") == "reviewer-attempt-no-terminal-verdict"
+            and review_claim == {"kind": "registered-worker", "attempt_id": marker.get("attempt_id")}):
+        raise ValueError("review-self-disposition-not-current")
     if (check_only or node.get("kind") != "review-worker" or not jobs
             or marker.get("reviewer_kind") != "owner-inline"
             or marker.get("review_independence") != "degraded"
@@ -7140,49 +7125,12 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
         raise ValueError("review-self-disposition-not-current")
     if gate_currency(route, node, canonical, marker, observe=True).state != "current":
         raise ValueError("review-self-disposition-integrity-invalid")
-    rows = []
-    for line in Path(jobs).read_text(encoding="utf-8").splitlines():
-        fields = line.split("\t")
-        if len(fields) == 6:
-            meta = parse_registry_metadata(fields[5])
-            if meta.get("attempt_id") == marker["attempt_id"]:
-                rows.append((fields, meta))
-    if len(rows) != 1:
-        raise ValueError("review-self-disposition-row-not-exact")
-    fields, meta = rows[0]
-    axes = _marker_attempt_axes(node, marker["attempt_id"], meta)
-    if (fields[1] != "done" or meta.get("worker_type") != "review"
-            or row_is_subsession(meta) or not verdict_pass(meta)
-            or terminal_conflict_pending(meta)
-            or ROUTE_IDENTITY.registered_node_identity(meta, node) !=
-               (route["route_id"], route["route_hash"], node["id"])):
-        raise ValueError("review-self-disposition-terminal-invalid")
-    if (any(marker.get(k) != v for k, v in axes.items())
-            or not agent_home_equivalent(meta.get("completion_marker", ""), canonical)
-            or not agent_home_equivalent(meta.get("completion_marker_history", ""),
-                    directory / f"{node['id']}.{marker['sequence']}.json")):
-        raise ValueError("review-self-disposition-row-binding-invalid")
+    origin_path = directory / f"{node['id']}.{marker['sequence']}.json"
+    _, meta = review_self_disposition_subject(route, node, marker, origin_path, jobs=jobs)
     basis = original_review_self_claim(route, node, marker, jobs=jobs, metadata=meta)
     if basis is None:
         print("capability-route: review-self-disposition-original-claim-unverified", file=sys.stderr)
         return marker
-    content = json.loads(Path(evidence).read_text(encoding="utf-8"))
-    if (content.get("verdict") != "PASS" or content.get("findings") != []
-            or content.get("gate_met") is not True
-            or content.get("route_id", route["route_id"]) != route["route_id"]
-            or content.get("completion_gate", node["completion_gate"]) != node["completion_gate"]):
-        raise ValueError("review-self-disposition-judgment-invalid")
-    readiness = completion_attempt_readiness(route, node, marker, Path(jobs), observe=True)
-    if readiness.state != "ready":
-        raise ValueError("review-self-disposition-not-settled:" + readiness.reason)
-    if _registered_marker_fence(route, node, marker, Path(jobs).read_text(encoding="utf-8").splitlines()) is not None:
-        raise ValueError("review-self-disposition-subject-superseded")
-    terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
-                artifact_root_metadata=meta.get("artifact_root"), worker_type="review")
-    if (terminal.get("state") != "valid" or terminal.get("verdict") != "PASS"
-            or terminal.get("artifact_state") != "readable"
-            or terminal.get("review_verdict_conflict")):
-        raise ValueError("review-self-disposition-terminal-unverified")
     actor = _review_self_disposition_actor(route, jobs, meta)
     origin_path = directory / f"{node['id']}.{marker['sequence']}.json"
     link_path = _attempt_completion_path(route, node["id"], marker["attempt_id"])
@@ -7200,6 +7148,16 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
         review_self_disposition_origin(route, node, pending, pending_path)
         recorded = dict(pending["reviewer_disposition"])
         recorded.pop("recorded_at", None)
+        # A replacement/current parent finishes the recorded actor's interrupted
+        # publication; it does not author a new historical judgment.
+        recorded["actor"] = actor
+        if agent_home_equivalent(recorded.get("jobs", ""), disposition["jobs"]):
+            recorded["jobs"] = disposition["jobs"]
+        recorded_claim = dict(recorded["original_claim"])
+        if (recorded_claim.get("source") == basis.get("source") == "runtime-command"
+                and agent_home_equivalent(recorded_claim.get("log_file", ""), basis.get("log_file", ""))):
+            recorded_claim["log_file"] = basis["log_file"]
+            recorded["original_claim"] = recorded_claim
         if recorded != disposition:
             raise ValueError("review-self-disposition-history-collision")
         successor = pending
@@ -7212,7 +7170,8 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
     review_self_disposition_origin(route, node, successor, canonical)
     # Recheck evidence at the commit boundary. Before it, old canonical stays;
     # after it, append-only origin/successor history is never rolled back.
-    if gate_currency(route, node, canonical, marker, observe=True).state != "current":
+    head = json.loads(canonical.read_text(encoding="utf-8"))
+    if head != marker or gate_currency(route, node, canonical, head, observe=True).state != "current":
         raise ValueError("review-self-disposition-origin-drift")
     atomic_write(canonical, successor)
     return successor
@@ -8153,7 +8112,13 @@ def publish_revision_locked(route, node_id, evidence, *, basis, answers=(), dire
             recorded_by=recorded_by, jobs=jobs,
         )
     directory = completion_dir(route["route_id"], jobs=jobs)
-    with _exclusive_lock(directory / f".{node_id}.completion.lock"):
+    # Every affected completion lock precedes jobs, in one sorted order.
+    # Disposition holds its same node lock through the final head check/replace.
+    with contextlib.ExitStack() as locks:
+        for affected in sorted({node_id} | _downstream_node_ids(route, node_id)):
+            locks.enter_context(_exclusive_lock(directory / f".{affected}.completion.lock"))
+        if jobs:
+            locks.enter_context(_exclusive_lock(Path(f"{jobs}.lock")))
         marker, tombstones = _producer_revision_plan(
             route, node_id, evidence, basis=basis, answers=answers, direction=direction,
             reason=reason, author_attempt_id=author_attempt_id, recorded_by=recorded_by, jobs=jobs,

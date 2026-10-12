@@ -17,6 +17,11 @@ disposition through normal completion replay, preserving its original judgment,
 history, attempt link, evidence and round census. This requires the original
 bound self claim, settled successful completion and current actor authority;
 an ordinary late claim cannot promote a degraded review.
+Publication and observation share the exact registered subject, terminal artifact
+and historical actor-lineage judgment. Recorded authority survives ordinary owner
+replacement; a current authorized actor may finish an interrupted publication.
+Upstream invalidation and disposition commit serialize through the existing
+completion and registry locks, so a historical replay cannot replace a tombstone.
 
 | Layer | Owns | Portable? |
 |---|---|---|
