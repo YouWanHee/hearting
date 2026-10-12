@@ -44,6 +44,17 @@ class ReplacementTest(unittest.TestCase):
 
     def claim(self):return R.claim(self.jobs,'att-source')
 
+    def bind_fixture_route(self):
+        """Publish the fixture's final draft with the production hash/identity before its first claim."""
+        import route_lineage
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+        self.route['route_hash']=route_identity.route_hash(self.route)
+        self.route['route_id']=route_identity.route_id_from_hash(self.route['route_hash'])
+        self.path.write_text(json.dumps(self.route))
+        self.assertEqual(route_lineage.verified_route_lineage(self.route),[self.route])
+        self.meta.update(route_id=self.route['route_id'],route_hash=self.route['route_hash'],route_file=str(self.path))
+        self.args.route_id=self.route['route_id'];self.args.route_hash=self.route['route_hash'];self.args.route_file=str(self.path)
+
     def bind_source_parent(self, *, carrier=False):
         self.args.dispatch_depth=1
         self.args.execution_surface='registered-headless';self.args.registered_worker=True
@@ -298,7 +309,7 @@ class ReplacementTest(unittest.TestCase):
         import review_input
         node={'id':'frame','kind':'review-worker','unit':'qa/plan-review','depends_on':[]}
         self.route.update(nodes=[node],effective_intensity='standard')
-        self.path.write_text(json.dumps(self.route))
+        self.bind_fixture_route()
         evidence=self.root/'plan.md';evidence.write_text('sealed review input')
         self.meta.update(unit='qa/plan-review',route_file=str(self.path))
         candidate_input=review_input.resolve_input(self.route,node,self.jobs,evidence)
@@ -2368,9 +2379,10 @@ class ReplacementTest(unittest.TestCase):
 
 class FrameTopCapacityTest(unittest.TestCase):
     """D2: a frame leg at the `top` the frame rule assigned is replaced once, at `deep`, when it stops
-    at a usage limit. Nothing else lowers a profile, and a second limit is the existing exhaustion."""
+    at a usage limit. Nothing else lowers a profile, and a second limit grants no further descent."""
     write=ReplacementTest.write
     claim=ReplacementTest.claim
+    bind_fixture_route=ReplacementTest.bind_fixture_route
     _successor=ReplacementTest._successor
     _die=ReplacementTest._die
 
@@ -2392,7 +2404,7 @@ class FrameTopCapacityTest(unittest.TestCase):
 
     def set_route(self,**changes):
         self.route.update(effective_intensity='standard',nodes=[self.node],profile_selection_contract_version=1,**changes)
-        self.path.write_text(json.dumps(self.route))
+        self.bind_fixture_route()
 
     def rows(self):return R._rows(self.jobs.read_text().splitlines())
 
@@ -2610,7 +2622,7 @@ class FrameTopCapacityTest(unittest.TestCase):
         self.assertIsNone(W._frame_downgrade_summary(self.route,self.jobs))
         record=self.claim()
         self.assertIsNone(W._frame_downgrade_summary(self.route,self.jobs))   # a claim alone ran nothing
-        meta=self._successor(record,self.meta,'done',model_profile='deep',route_node='frame',route_id='rt-test')
+        meta=self._successor(record,self.meta,'done',model_profile='deep',route_node='frame',route_id=self.route['route_id'])
         self.assertEqual(W._frame_downgrade_summary(self.route,self.jobs),
                          [{'node':'frame','original_profile':'top','actual_profile':'deep','cause':'capacity',
                            'attempt_id':record['replacement_attempt_id'],'original_attempt_id':'att-source'}])
@@ -2654,14 +2666,17 @@ class FrameCapacityFlow:
         args.replacement_input_argv = list(argv)
         args.jobs_path = Path(args.jobs)
         args.worktree = str(Path(args.worktree).resolve())
-        args.resolved_model_settings = self.wrapper.resolve_model_settings(args)
+        # Read each adapter's shipped whole-file defaults unless this fixture
+        # deliberately supplies its own user config; never use the operator's.
+        with mock.patch('model_config.user_path', return_value=getattr(fx, 'model_config_path', fx.root/'missing-models.conf')):
+            args.resolved_model_settings = self.wrapper.resolve_model_settings(args)
         return args
 
     def register(self, fx, args):
         """The row the wrapper would register for these parsed args (its own sealed input included)."""
         meta = {k: v for k, v in fx.meta.items() if k not in ('note', 'failure_class', 'replacement_input_digest')}
         settings = args.resolved_model_settings
-        meta.update(attempt_id=args.attempt_id, automatic_retry_of='att-source',
+        meta.update(attempt_id=args.attempt_id, automatic_retry_of=args.automatic_retry_of or 'att-source',
                     model_profile=settings['profile'], model=settings['model'])
         meta.update(D.parse_registry_metadata(R.seal_launch_input(args, self.harness, 'the raw task')))
         row = 'now\topen\t'+str(fx.root)+'\t'+str(fx.root)+'\tframe\t'+','.join(k+'='+v for k, v in meta.items())
@@ -2699,10 +2714,13 @@ class FrameCapacityFlow:
         fx._die(fx.rows()[args.attempt_id][1], note='dead-capacity', failure_class='capacity', launch_claimed='1')
         _, _, attention = R.advance_batch(fx.jobs, {'att-source'}, authority_check=lambda *_: True)
         case.assertEqual(attention, [])
+        with case.assertRaises(D.DispatchContractError) as no_transition:
+            R.claim(fx.jobs, args.attempt_id)
+        case.assertEqual(no_transition.exception.reason, 'replacement-not-silent-death')
         third = self.args(fx, self.cli(fx, 'att-third', 'deep', '--automatic-retry-of', args.attempt_id))
         with case.assertRaises(D.DispatchContractError) as refused:
             self.register(fx, third)
-        case.assertEqual(refused.exception.reason, 'replacement-not-silent-death')
+        case.assertEqual(refused.exception.reason, 'automatic-replacement-exhausted')  # no outgoing claim authorizes it
         case.assertNotIn('att-third', fx.rows())
         with case.assertRaises(D.DispatchContractError) as nothing:   # no row to claim, so no spawn either
             self.spawn(fx, 'att-third')
@@ -2725,6 +2743,21 @@ class FrameCapacityFlow:
             self.register(fx, args)
         case.assertEqual(refused.exception.reason, 'replacement-input-tuple-mismatch')
         case.assertNotIn(record['replacement_attempt_id'], fx.rows())
+
+    def run_undeclared_profile(self):
+        """An effective user config without opt-in `top` cannot create a frame launch."""
+        case = self.case
+        fx = self.fixture({'note': 'dead-capacity', 'failure_class': 'capacity'})
+        shipped = self.wrapper.ROOT/'adapters'/self.harness/'config/models.conf'
+        fx.model_config_path = fx.root/'models-without-top.conf'
+        fx.model_config_path.write_text('\n'.join(line for line in shipped.read_text().splitlines()
+            if not line.startswith(('CFG_MODEL_PROFILE_TOP=', 'CFG_MODEL_PROFILE_GRANULARITY_TOP=')))+'\n')
+        with case.assertRaises(self.wrapper.ModelSelectionError) as refused:
+            self.args(fx, self.cli(fx, 'att-unsupported', 'top'))
+        case.assertEqual(refused.exception.reason, 'invalid-dispatch-model-profile')
+        case.assertIn('does not declare CFG_MODEL_PROFILE_TOP', str(refused.exception))
+        case.assertNotIn('att-unsupported', fx.rows())
+        case.assertFalse((R._directory(fx.jobs)/'claims').exists())
 
 
 
