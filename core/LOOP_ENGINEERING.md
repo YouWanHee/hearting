@@ -247,8 +247,10 @@ work carries its caller's observed session/seat independently of execution and
 delivery authority, and is labelled project support when that link is unproven.
 Legends explain statuses and roles in short English, including project
 activity and expanded GPU commands; a copied dot or arrow must retain its meaning.
-GPU owner labels add who is responsible, such as a verified Fleet session tag;
-they do not repeat the execution's run/job identifier beside its training name.
+GPU occupancy names the exact observed sessions once each, using their explicit
+name or verified alias and current Fleet tag. Run/job names and identifiers never
+stand in for a session; observed occupation without an exact session is `미귀속`,
+not an empty GPU. Process commands and measurement freshness retain their meaning.
 Raw owner identifiers remain available in structured output.
 
 ## Basis and current scope
