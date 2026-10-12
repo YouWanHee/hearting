@@ -290,7 +290,9 @@ class NVMLFallbackTest(unittest.TestCase):
         render.set_compute_hosts({"configured": True, "hosts": [host]})
         self.addCleanup(render.set_compute_hosts, None)
         text = "\n".join(render._plain(r) for r in render._compute_host_rows(168))
-        self.assertIn("GPU reserved · device unknown · 확인된 예약", text)
+        # A stored label without an exact session identity is not an occupant name.
+        self.assertIn("GPU reserved · device unknown · 미귀속", text)
+        self.assertNotIn("확인된 예약", text)
         self.assertEqual(host["gpu_status"]["running_count"], 2)
         self.assertEqual(state.read_bytes(), original)
         self.assertEqual(state.stat().st_mtime_ns, mtime)
