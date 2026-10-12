@@ -528,7 +528,7 @@ def pending_state(root: Path, route_id: str):
     return _read(Path(root)/".runtime"/"inline-finish"/"v1"/route_id/"finish.json")
 
 def pending_for_cycle(root: Path, cycle_id: str):
-    """Find a cycle's exact finish slot, including a continuation route slot.
+    """Find a cycle's unfinished exact finish slot, including a continuation route slot.
 
     The cycle record retains its begin route, so looking up only that route
     would miss a finish claimed by a verified continuation.
@@ -541,7 +541,8 @@ def pending_for_cycle(root: Path, cycle_id: str):
         if route_home.is_symlink() or not route_home.is_dir():
             raise InlineFinishError("finish-intent-unsafe")
         state = _read(route_home/"finish.json")
-        if state and (state.get("intent") or {}).get("cycle_id") == cycle_id:
+        if (state and (state.get("intent") or {}).get("cycle_id") == cycle_id
+                and state.get("state") != "finished"):
             matches.append(state)
     if len(matches) > 1:
         raise InlineFinishError("finish-cycle-ambiguous")
