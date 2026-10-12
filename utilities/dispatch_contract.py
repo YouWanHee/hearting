@@ -7409,7 +7409,7 @@ def _marker_schema_identity_ok(
     return True, history_path
 
 
-def original_review_self_claim(route, node, origin, *, jobs, metadata):
+def original_review_self_claim(route, node, origin, *, jobs, metadata, require_receipt=False):
     """Read the claim made by the original publication, never the replay claim.
 
     New publications retain their input in history. The legacy Codex command
@@ -7418,9 +7418,9 @@ def original_review_self_claim(route, node, origin, *, jobs, metadata):
     arbitrary transcripts or infer a claim from degraded reviewer_identity.
     """
     claim = {"kind": "registered-worker", "attempt_id": origin.get("attempt_id")}
-    if origin.get("reviewer_claim") == claim:
+    if origin.get("reviewer_claim") == claim and not require_receipt:
         return {"source": "original-marker"}
-    if "reviewer_claim" in origin:
+    if "reviewer_claim" in origin and origin.get("reviewer_claim") != claim:
         return None
     log = metadata.get("log_file")
     if not log:
@@ -7483,7 +7483,197 @@ def original_review_self_claim(route, node, origin, *, jobs, metadata):
     return matches[0] if len(matches) == 1 else None
 
 
-def review_self_disposition_subject(route, node, prior, marker_path, *, jobs):
+REVIEW_SELF_PROVENANCE_BLOCKER = (
+    "v3.28.6 closed the completion but downgraded reviewer independence because "
+    "the attempt had no terminal verdict at registration; an independent stage marker was not established."
+)
+
+
+def _review_report_hash_receipt(command, report, evidence):
+    """Recognize a public hash read, without executing or retaining shell text.
+
+    Support a literal sha256sum argv and the historical report-append command:
+    literal F assignment, installed write preflight, one heredoc append, then
+    sha256sum. No general shell expansion, arbitrary stdout or script execution
+    can stand in for a registered byte receipt.
+    """
+    tokens = shlex.split(command)
+    if len(tokens) == 3 and tokens[1] in {"-lc", "-c"}:
+        if Path(tokens[0]).name not in {"sh", "bash", "zsh"}:
+            return False
+        command = tokens[2]
+    lines = command.splitlines()
+    variable = None
+    if len(lines) > 1:
+        # The actual append receipt uses an unquoted EOF body; inspect only
+        # its command structure. Never evaluate the body or copy its preimage.
+        lexer = shlex.shlex(lines[0], posix=True, punctuation_chars=";<>")
+        lexer.whitespace_split = True
+        first = list(lexer)
+        if (len(first) != 12 or not first[0].startswith("F=")
+                or first[1] != ";" or not first[2].endswith("/adapters/codex/bin/preflight.sh")
+                or first[3:5] != ["write", "$F"] or first[6:] != [";", "cat", ">>", "$F", "<<", "EOF"]):
+            return False
+        variable = first[0][2:]
+        if (not variable or any(c in variable for c in "$`\n")
+                or Path(variable).resolve() != report.resolve()):
+            return False
+        # Only a single heredoc followed by one hash command is supported.
+        if lines[-2] != "EOF" or "EOF" in lines[1:-2]:
+            return False
+        command = lines[-1]
+    argv = shlex.split(command)
+    if len(argv) != 3 or argv[0] != "sha256sum":
+        return False
+    args = [variable if arg == "$F" and variable else arg for arg in argv[1:]]
+    return (all(Path(arg).is_absolute() and not any(c in arg for c in "$`\n") for arg in args)
+            and [Path(arg).resolve() for arg in args] == [report.resolve(), evidence.resolve()])
+
+
+def review_self_blocked_basis(route, node, prior, metadata, terminal, *, jobs):
+    """One historical provenance-only BLOCKED basis for writer and readers."""
+    from codex_dispatch_terminal import inspect_terminal_log
+    view = inspect_terminal_log(metadata.get("log_file"))
+    if (not view or view["blocker"] != REVIEW_SELF_PROVENANCE_BLOCKER
+            or terminal.get("review_artifact_verdict") in {"FAIL", "BLOCKED"}):
+        raise ValueError("review-self-disposition-terminal-unverified:blocked-not-provenance")
+    claim = original_review_self_claim(route, node, prior, jobs=jobs, metadata=metadata, require_receipt=True)
+    # This historical exception needs the actual successful normal command,
+    # not a newly recorded self claim or the registry's success note alone.
+    if not claim or claim.get("source") != "runtime-command" or not claim.get("item_id"):
+        raise ValueError("review-self-disposition-blocked-receipt-unverified")
+    evidence = Path(prior["evidence"]["path"])
+    content = json.loads(evidence.read_text())
+    root = Path(route["artifact_root"]).resolve()
+    output = next((p for p in evidence.parents if p.name == "artifacts" and p.is_relative_to(root)), None)
+    if output is None:
+        raise ValueError("review-self-disposition-report-binding-invalid")
+    cycle = json.loads((output.parent / ".cycle.json").read_text())
+    import artifact_producer
+    import artifact_locator
+    cycle_record = artifact_producer.read_cycle_record(root, cycle.get("cycle_id")) or {}
+    locator = content.get("review_artifact")
+    if not isinstance(locator, str) or not locator or any(c in locator for c in "\n\r\x00"):
+        raise ValueError("review-self-disposition-report-binding-invalid")
+    report = (output / locator).resolve()
+    encoded = str(terminal.get("artifact_path_b64") or "")
+    primary = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+    census = prior.get("round_census") or {}
+    if (not report.is_relative_to(output.resolve()) or report == evidence.resolve()
+            or not agent_home_equivalent(primary, report)
+            or content.get("guard_session_id") != prior["attempt_id"]
+            or content.get("cycle_id") != cycle.get("cycle_id")
+            or content.get("route_cycle_id") != cycle.get("cycle_id")
+            or content.get("stage") != node["completion_gate"]
+            or content.get("completion_gate") != node["completion_gate"]
+            or content.get("route_id") != route["route_id"]
+            or any(content.get(k, v) != v for k, v in
+                   (("route_hash", route["route_hash"]), ("node_id", node["id"])))
+            or type(content.get("round")) is not int
+            or content["round"] != census.get("verdict_rounds", 0) + census.get("verdictless_rounds", 0)
+            or content.get("verdict_sequence") != census.get("verdict_rounds")
+            or content.get("verdict_ceiling") != census.get("cap", 0) + 1
+            or census.get("closure_class") != "closure-check"
+            or content.get("blocker") != "none"):
+        raise ValueError("review-self-disposition-report-binding-invalid")
+    located = artifact_locator.locate(root, cycle["cycle_id"], candidates=lambda: [output.parent], heal=False)
+    if ((cycle_record.get("route_id"), cycle_record.get("route_hash")) != (route["route_id"], route["route_hash"])
+            or located is None or located.resolve() != output.parent.resolve()):
+        raise ValueError("review-self-disposition-cycle-binding-invalid")
+    # The unchanged prepared request is independently bound by its normal
+    # strict reader; never trust a prose or boolean claim instead of its pins.
+    from ship_parent_deploy import load_request
+    request, _ = load_request(Path(content.get("request_path", "")))
+    if (request.get("route_id") != route["route_id"]
+            or request.get("route_hash") != route["route_hash"]
+            or prior["attempt_id"] in request.get("prior_review_attempts", [])
+            or datetime.fromisoformat(request["prepared_at"]) > datetime.fromisoformat(prior["completed_at"].replace("Z", "+00:00"))
+            or content.get("request_digest") != request.get("request_digest")
+            or content.get("request_prepared_at") != request.get("prepared_at")
+            or content.get("request_digest_verified") is not True
+            or content.get("prepare_receipt_matches") is not True
+            or content.get("bound_input_mismatches") != []
+            or content.get("bound_inputs_verified") != len(request["command"]["inputs"])
+            or Path(request.get("jobs", "")).resolve() != Path(jobs).resolve()
+            or any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != sha
+                   for path, sha in request["command"]["inputs"].items())):
+        raise ValueError("review-self-disposition-request-binding-invalid")
+    records = []
+    for line in report.read_text().splitlines():
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            pass
+    closed = {"attempt_id": prior["attempt_id"], "status": "closed"}
+    if (records.count(prior) != 1 or records.count(closed) != 1
+            or any(isinstance(record, dict) and (
+                record.get("verdict") in {"FAIL", "BLOCKED"} or record.get("gate_met") is False
+                or (("completion_gate" in record or record.get("status") == "closed") and record not in (prior, closed)))
+                   for record in records)):
+        raise ValueError("review-self-disposition-report-receipt-invalid")
+    lines = Path(metadata["log_file"]).read_text().splitlines()
+    events = []
+    for line in lines:
+        try:
+            events.append((line, json.loads(line)))
+        except ValueError:
+            continue
+    publication = next((i for i, (line, _) in enumerate(events)
+                        if hashlib.sha256(line.encode()).hexdigest() == claim["receipt_sha256"]), None)
+    # Exact terminal parsing above already proves the envelope. Bind its public
+    # event/message bytes as well as chronology, without copying private text.
+    ends = [i for i, (_, e) in enumerate(events) if e.get("type") in {"turn.completed", "result", "step_finish"}]
+    end = ends[-1] if ends else -1
+    if publication is None or end <= publication:
+        raise ValueError("review-self-disposition-terminal-chronology-invalid")
+    message = end
+    if terminal["source"] == "exact-turn-completed":
+        message = next((i for i in range(end - 1, publication, -1)
+                        if events[i][1].get("type") == "item.completed"
+                        and (events[i][1].get("item") or {}).get("type") == "agent_message"), -1)
+    elif terminal["source"] == "exact-step-finish-stop":
+        message = next((i for i in range(end - 1, publication, -1)
+                        if events[i][1].get("type") == "text"), -1)
+    if message <= publication:
+        raise ValueError("review-self-disposition-terminal-chronology-invalid")
+    report_digest = hashlib.sha256(report.read_bytes()).hexdigest()
+    expected = {str(report): report_digest, str(evidence.resolve()): prior["evidence"]["sha256"]}
+    receipts = []
+    for index, (line, event) in enumerate(events):
+        item = event.get("item") or {}
+        if (not publication < index < message or event.get("type") != "item.completed"
+                or item.get("type") != "command_execution" or item.get("status") != "completed"
+                or item.get("exit_code") != 0 or not item.get("id")):
+            continue
+        try:
+            if not _review_report_hash_receipt(item.get("command") or "", report, evidence):
+                continue
+            digests = {}
+            for output_line in (item.get("aggregated_output") or "").splitlines():
+                digest, path = output_line.split("  ", 1)
+                if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest) or path in digests:
+                    raise ValueError("invalid digest output")
+                digests[str(Path(path).resolve())] = digest
+            receipts.append((digests, {"item_id": item.get("id"), "receipt_sha256": hashlib.sha256(line.encode()).hexdigest()}))
+        except (TypeError, ValueError):
+            continue
+    if len(receipts) != 1 or receipts[0][0] != expected:
+        raise ValueError("review-self-disposition-report-bytes-unverified")
+    claim["log_file"] = str(Path(claim["log_file"]).resolve())
+    view["log_file"] = str(Path(view["log_file"]).resolve())
+    return {"report_path": str(report), "report_sha256": report_digest,
+            "publication_receipt": claim,
+            "request_path": str(Path(content["request_path"]).resolve()),
+            "cycle_record_path": str(artifact_producer.cycle_record_path(root, cycle["cycle_id"])),
+            "cycle_binding_path": str(output.parent / ".cycle.json"),
+            "hash_receipt": receipts[0][1], "terminal_verdict": "BLOCKED",
+            "terminal_source": terminal["source"],
+            "terminal_sha256": hashlib.sha256(json.dumps(view, sort_keys=True).encode()).hexdigest(),
+            "terminal_message_sha256": hashlib.sha256(events[message][0].encode()).hexdigest(),
+            "terminal_event_sha256": hashlib.sha256(events[end][0].encode()).hexdigest()}
+
+
+def review_self_disposition_subject(route, node, prior, marker_path, *, jobs, authority_basis=None):
     """Read the exact settled judgment; never let a disposition select its log."""
     module = _route_module()
     jobs = Path(jobs)
@@ -7520,13 +7710,13 @@ def review_self_disposition_subject(route, node, prior, marker_path, *, jobs):
     from codex_dispatch_terminal import inspect_terminal_attempt
     terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
                     artifact_root_metadata=meta.get("artifact_root"), worker_type="review")
-    if (terminal.get("state") != "valid" or terminal.get("verdict") != "PASS"
+    if (terminal.get("state") != "valid" or terminal.get("verdict") not in {"PASS", "BLOCKED"}
             or terminal.get("artifact_state") != "readable" or terminal.get("review_verdict_conflict")):
         raise ValueError("review-self-disposition-terminal-unverified")
     encoded = str(terminal.get("artifact_path_b64") or "")
     artifact = Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
     evidence = Path(prior["evidence"]["path"])
-    if (not agent_home_equivalent(artifact, evidence)
+    if ((terminal.get("verdict") == "PASS" and not agent_home_equivalent(artifact, evidence))
             or evidence_currency(route, node, marker_path, prior, observe=True).state != "current"):
         raise ValueError("review-self-disposition-terminal-artifact-mismatch")
     content = json.loads(evidence.read_text(encoding="utf-8"))
@@ -7534,6 +7724,10 @@ def review_self_disposition_subject(route, node, prior, marker_path, *, jobs):
             or content.get("route_id", route["route_id"]) != route["route_id"]
             or content.get("completion_gate", node["completion_gate"]) != node["completion_gate"]):
         raise ValueError("review-self-disposition-judgment-invalid")
+    if terminal.get("verdict") == "BLOCKED":
+        basis = review_self_blocked_basis(route, node, prior, meta, terminal, jobs=jobs)
+        if authority_basis is not None:
+            authority_basis.update(basis)
     return fields, meta
 
 
@@ -7610,18 +7804,27 @@ def review_self_disposition_origin(route, node, marker, marker_path):
     expected.pop("reviewer_downgrade_reason", None)
     if expected != marker:
         raise ValueError("review-self-disposition-content-changed")
-    if (set(disposition) != {"kind", "of_sequence", "of_marker_sha256", "origin_link_sha256",
-                             "original_claim", "jobs", "actor", "settled_basis", "recorded_at"}
+    keys = {"kind", "of_sequence", "of_marker_sha256", "origin_link_sha256",
+            "original_claim", "jobs", "actor", "settled_basis", "recorded_at"}
+    blocked = disposition.get("settled_basis") == "historical-provenance-blocked"
+    if blocked:
+        keys.add("authority_basis")
+    if (set(disposition) != keys
             or any(not isinstance(disposition.get(k), str) or not disposition[k]
                    for k in ("actor", "recorded_at", "jobs"))
-            or disposition.get("settled_basis") != "successful-quiescent-terminal"
+            or disposition.get("settled_basis") not in {"successful-quiescent-terminal", "historical-provenance-blocked"}
             or not isinstance(disposition.get("original_claim"), dict)):
         raise ValueError("review-self-disposition-basis-invalid")
     recorded = datetime.fromisoformat(disposition["recorded_at"].replace("Z", "+00:00"))
     completed = datetime.fromisoformat(prior["completed_at"].replace("Z", "+00:00"))
     if recorded.tzinfo is None or not completed <= recorded <= datetime.now(timezone.utc):
         raise ValueError("review-self-disposition-time-invalid")
-    _, metadata = review_self_disposition_subject(route, node, prior, prior_path, jobs=disposition["jobs"])
+    authority_basis = {}
+    _, metadata = review_self_disposition_subject(route, node, prior, prior_path, jobs=disposition["jobs"],
+                                                authority_basis=authority_basis)
+    if ((blocked and (not authority_basis or disposition["authority_basis"] != authority_basis))
+            or (not blocked and authority_basis)):
+        raise ValueError("review-self-disposition-basis-invalid")
     lineage = review_self_disposition_lineage(route, disposition["jobs"], metadata)
     if disposition["actor"] not in lineage:
         raise ValueError("review-self-disposition-actor-invalid")
@@ -9424,6 +9627,12 @@ def _marker_bound_prepare_marker_proof(
             _, origin_path = review_self_disposition_origin(route, nodes[0], marker, marker_path)
             dependency_paths.append(origin_path)
             disposition = marker["reviewer_disposition"]
+            if disposition.get("settled_basis") == "historical-provenance-blocked":
+                authority_basis = disposition["authority_basis"]
+                dependency_paths.extend(Path(authority_basis[key]) for key in
+                                        ("report_path", "request_path", "cycle_record_path", "cycle_binding_path"))
+                request = json.loads(Path(authority_basis["request_path"]).read_text())
+                dependency_paths.extend(Path(path) for path in request["command"]["inputs"])
             jobs = Path(disposition["jobs"])
             dependency_paths.append(jobs)
             from dispatch_replacement import source_binding, _record_path, _directory
