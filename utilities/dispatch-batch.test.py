@@ -1048,6 +1048,26 @@ class DispatchBatchTest(unittest.TestCase):
              mock.patch.object(BATCH, "completion_attempt_readiness", return_value=SimpleNamespace(state="ready")):
             self._assert_duplicate_batch_state(completed=True)
 
+    def _assert_exhausted_replay_readiness(self, state, reason, code):
+        # Admission observed settled rows; exact readiness subsequently changes.
+        self._configure_lab_review()
+        self.route["continuation_budget"] = {"review_round_cap": 1}
+        import route_identity
+        self.route["route_hash"] = route_identity.route_hash(self.route)
+        with mock.patch.object(BATCH, "completion_marker_is_current", return_value=state != "unsettled"), \
+             mock.patch.object(BATCH, "completion_attempt_readiness",
+                 return_value=SimpleNamespace(state=state, reason="attempt-descendant-" + state)):
+            self._assert_duplicate_batch_state(completed=True, refusal=(code, reason))
+
+    def test_exhausted_replay_preserves_draining_refusal(self):
+        self._assert_exhausted_replay_readiness("draining", "prior-attempt-still-live", 78)
+
+    def test_exhausted_replay_preserves_unverifiable_refusal(self):
+        self._assert_exhausted_replay_readiness("unverifiable", "prior-attempt-unverifiable", 78)
+
+    def test_exhausted_replay_preserves_unsettled_refusal(self):
+        self._assert_exhausted_replay_readiness("unsettled", "round-unsettled", 65)
+
     def test_same_owner_opens_next_review_round_with_changed_prompt(self):
         self._same_owner_next_review_round("closure check after fixes", "codex")
 
@@ -2688,7 +2708,7 @@ class DispatchBatchTest(unittest.TestCase):
              mock.patch.object(BATCH, "completion_attempt_readiness", return_value=SimpleNamespace(state="ready")):
             self._assert_duplicate_batch_state(completed=True)
 
-    def _assert_duplicate_batch_state(self, *, completed=False):
+    def _assert_duplicate_batch_state(self, *, completed=False, refusal=None):
         stack, assignments = self.common_patches()
         output = io.StringIO()
         for leg in self.legs(assignments):
@@ -2699,6 +2719,7 @@ class DispatchBatchTest(unittest.TestCase):
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(json.dumps({"attempt_id": leg["attempt_id"]}))
 
+        original_rows = self.jobs.read_bytes()
         with stack:
             stack.enter_context(mock.patch("dispatch_capacity_evidence.active_limits", side_effect=AssertionError("live replay spends no quota")))
             stack.enter_context(mock.patch.object(BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect))
@@ -2721,6 +2742,15 @@ class DispatchBatchTest(unittest.TestCase):
             }))
             with contextlib.redirect_stdout(output):
                 rc = BATCH.main(self.argv())
+        self.assertEqual(self.jobs.read_bytes(), original_rows)
+        reserve.assert_not_called()
+        popen.assert_not_called()
+        if refusal:
+            self.assertEqual(rc, refusal[0], output.getvalue())
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["reason"], refusal[1])
+            self.assertEqual((receipt["admitted"], receipt["spawned"]), (0, 0))
+            return
         self.assertEqual(rc, 0)
         receipt = json.loads(output.getvalue())
         self.assertEqual(receipt["state"], "idempotent-existing")

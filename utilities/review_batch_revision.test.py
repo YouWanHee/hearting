@@ -639,7 +639,10 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
             row = next(line for line in self.jobs.read_text().splitlines()
                        if "attempt_id=" + leg["attempt_id"] + "," in line)
             self.assertEqual(row.split("\t")[1], "done", result.stdout + self.jobs.read_text())
-        return result
+        # Completion publication may start ordinary summary observers. Join
+        # the same exact attempts after publication too; a done row alone is
+        # not current process readiness for the replay that follows.
+        return self.run_cmd(command)
 
 
 class AdmissionSelection(unittest.TestCase):

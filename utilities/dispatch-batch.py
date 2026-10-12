@@ -1701,6 +1701,7 @@ def existing_leg_result(
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             marker = None
+        readiness_state = "unsettled"
         if (
             isinstance(node, dict)
             and isinstance(marker, dict)
@@ -1716,6 +1717,7 @@ def existing_leg_result(
                     "launch_state": "existing",
                     "reason": "existing-completed-attempt",
                 }
+            readiness_state = readiness.state
             terminal_reason = readiness.reason
         else:
             terminal_reason = "completion-marker-not-current"
@@ -1725,6 +1727,7 @@ def existing_leg_result(
             "check": "failed",
             "launch_state": "failed",
             "reason": "existing-completed-attempt-" + terminal_reason,
+            "readiness_state": readiness_state,
         }
     return {
         **common,
@@ -2712,6 +2715,18 @@ def main(argv: list[str] | None = None) -> int:
     except BatchError as exc:
         return fail(exc.reason, 73, detail=exc.detail, admitted=0, spawned=0)
 
+    # Exact readiness can change after the admission observation. Preserve
+    # its refusal before considering the budget for absent/fresh work.
+    if replay_budget_errors:
+        for result in results:
+            state = result.get("readiness_state")
+            if state in {"draining", "unverifiable", "unsettled"}:
+                reason = {"draining": "prior-attempt-still-live",
+                          "unverifiable": "prior-attempt-unverifiable",
+                          "unsettled": "round-unsettled"}[state]
+                return fail(reason, 65 if state == "unsettled" else 78,
+                            detail=f"{result['node']}:{result['attempt_id']}:{result['reason']}",
+                            admitted=0, spawned=0)
     if replay_budget_errors and (pending_legs or len(results) != len(legs)
             or any(result.get("reason") != "existing-completed-attempt" for result in results)):
         error = replay_budget_errors[0]
