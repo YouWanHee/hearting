@@ -311,6 +311,11 @@ def _save_pending(row):
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)  # Own temporary payload only.
@@ -429,6 +434,40 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), recei
             "state": "pending" if endpoints_verified else "unverified", "text": text,
             "receipt": receipt if endpoints_verified else "peer-endpoint-unverified"})
         return text, ref
+
+
+def schedule_acceptance_reply(handoff_ref, sender, recipient):
+    """One durable courier intent, including replay after receipt or a crash."""
+    ref = hashlib.sha256(("handoff-accept:" + handoff_ref).encode()).hexdigest()[:32]
+    body = "[handoff] Card and referenced documents read; handoff accepted. ref=" + handoff_ref
+    text = body + "\n\n(peer-from: " + sender["harness"] + " [?] ; ref=" + ref + ")"
+    record = {"schema_version": 1, "message_id": ref, "from": dict(sender), "to": dict(recipient),
+              "body_sha256": hashlib.sha256(text.encode()).hexdigest(), "created": time.time()}
+    with pending_lock(ref):
+        path = _transfer_path(ref)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            existing = _read_transfer_record(ref)
+            if any(existing.get(k) != record[k] for k in ("message_id", "from", "to", "body_sha256")):
+                raise ValueError("handoff-acceptance-reply-conflict")
+        else:
+            with os.fdopen(fd, "w") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                json.dump(record, handle); handle.flush(); os.fsync(handle.fileno())
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        row = _read_pending(ref)
+        if row is None:
+            _save_pending({"schema_version": 1, "ref": ref, "from": dict(sender), "to": dict(recipient),
+                "body_sha256": record["body_sha256"], "source_sha256": hashlib.sha256(body.encode()).hexdigest(),
+                "refs": [handoff_ref], "created": record["created"], "state": "pending", "text": text,
+                "receipt": "handoff-acceptance-scheduled"})
+    return ref
 
 
 def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
@@ -647,6 +686,14 @@ def _ack_registered_delivery(received):
         acknowledge_registered_delivery(received)
     except (OSError, ValueError, KeyError):
         pass  # The retained courier retries the same receipt, never another send.
+
+
+def receiver_guidance():
+    return ("For a new actionable peer request, send acceptance before processing; informational/no-reply notices need no reply. "
+            "Read exact completion results and perform approved review/follow-through this turn or its existing registered continuation. "
+            "Receipt, queue consumption and ACK are not execution; report actual chronology. "
+            "For a session-tidy handoff, after reading the card/docs explicitly accept with "
+            "utilities/session_tidy.py handoff accept <ref> using the exact trailer ref.")
 
 
 def receive_peer_message(text, recipient, project="", *, summary_text=""):

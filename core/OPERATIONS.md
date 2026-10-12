@@ -2012,3 +2012,12 @@ OpenCode agent and does `herdr agent wait` return for it) and P-7 (does a Codex 
 actually recover a detached-watch receipt on its next turn, with no wake carrier) — land their
 receipts at `spec/stage-dispatch/_internal/research/peer-session-probe/P-<n>.md`; no
 adapter claims a working Codex-steward or OpenCode realization until its receipt exists.
+
+Explicit peer handoff acceptance uses `session_tidy.py handoff accept <ref>`
+after the successor reads the card and its referenced documents. That one
+agent operation schedules the acceptance reply and normal predecessor retire
+reservation using the original exact identities. Delivery is receipt, not acceptance.
+For a new actionable peer request, send an acceptance reply before processing;
+an informational/no-reply notice needs no reply. Completion reception requires
+actual approved result review/follow-through this turn or its registered
+continuation; ACK and consumed are receipt facts only.

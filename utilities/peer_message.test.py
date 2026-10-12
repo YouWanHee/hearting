@@ -1142,5 +1142,148 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(row["text"], text)
 
 
+class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        import session_tidy_runner as runner
+        import session_tidy
+        from types import SimpleNamespace
+        self.runner = runner
+        self.steward = runner._handoff_steward()
+        self.steward.peer_message = peer_message
+        self.sender = {"harness": "claude", "session_id": "predecessor", "name": "old"}
+        self.recipient = {"harness": "codex", "session_id": "successor", "name": "new"}
+        self.predecessor = {**self.sender, "pane": "p1", "server": "default", "foreground": {"pid": 11, "start": "a"}}
+        self.successor = {**self.recipient, "pane": "p2", "server": "default", "foreground": {"pid": 22, "start": "b"}}
+        self.caller = (session_tidy.Seat("pane", "seat", "p2"), "codex", "successor")
+        self.text, self.ref = peer_message.prepare_peer_message("[handoff] card", self.sender, self.recipient, defer=True)
+        row = peer_message._read_pending(self.ref)
+        row["handoff"] = {"target": "p1", "predecessor": self.predecessor, "successor": self.successor,
+            "requester": {"harness": "codex", "session_id": "successor", "pane": "p2", "server": "default"}}
+        peer_message._save_pending(row)
+        self.store = self.steward.peer_obligations.ObligationStore(self.jobs_path.parent)
+        patches = [mock.patch.object(runner, "_handoff_steward", return_value=self.steward),
+            mock.patch.object(self.steward, "_retire_target", return_value=("idle", {k:v for k,v in self.successor.items() if k not in {"foreground", "server"}}, None, None)),
+            mock.patch.object(self.steward, "_retire_foreground", return_value=self.successor["foreground"]),
+            mock.patch.object(self.steward.peer_obligations, "ObligationStore", return_value=self.store),
+            mock.patch.object(self.steward.peer_obligations, "ensure_runner"),
+            mock.patch.object(self.steward, "_HERDR_SESSION", None)]
+        for p in patches:
+            p.start(); self.addCleanup(p.stop)
+
+    def test_receipt_never_accepts_and_explicit_acceptance_is_once_only(self):
+        peer_message.receive_peer_message(self.text, self.recipient)
+        self.assertNotIn("acceptance", peer_message._read_pending(self.ref))
+        self.assertEqual(self.store.list(), [])
+        self.runner.accept_handoff(self.ref, self.caller)
+        first = peer_message._read_pending(self.ref)["acceptance"]
+        reply = peer_message._read_pending(first["reply_ref"])
+        peer_message.receive_peer_message(reply["text"], self.sender)
+        self.runner.accept_handoff(self.ref, self.caller)
+        self.assertEqual(peer_message._read_pending(self.ref)["acceptance"], first)
+        self.assertEqual(len([d for d in self.store.list() if d["intent"]["kind"] == "retire"]), 1)
+        self.assertEqual(self.store.get(first["retire_id"])["intent"]["requester"]["session_id"], "successor")
+        self.assertEqual(peer_message._read_pending(first["reply_ref"])["state"], "received")
+
+    def test_crash_after_reply_and_after_reservation_reuses_both(self):
+        reserve = self.steward.reserve_handoff_retire
+        for after in (False, True):
+            def crash(*args):
+                if after:
+                    reserve(*args)
+                raise RuntimeError("crash")
+            with mock.patch.object(self.steward, "reserve_handoff_retire", side_effect=crash):
+                with self.assertRaises(RuntimeError):
+                    self.runner.accept_handoff(self.ref, self.caller)
+            reply_ref = peer_message._read_pending(self.ref)["acceptance"]["reply_ref"]
+            duty = next(d for d in self.store.list(states={"pending", "unknown", "complete"}) if d["intent"].get("handoff_acceptance"))
+            self.steward._resume_message_obligation(duty, self.store)
+            self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+            self.assertEqual(peer_message._read_pending(self.ref)["acceptance"]["reply_ref"], reply_ref)
+            self.assertEqual(len([d for d in self.store.list() if d["intent"]["kind"] == "retire"]), 1)
+
+    def test_reincarnated_successor_and_foreign_receiver_cannot_accept(self):
+        with mock.patch.object(self.steward, "_retire_foreground", return_value={"pid": 22, "start": "changed"}):
+            with self.assertRaises(ValueError):
+                self.runner.accept_handoff(self.ref, self.caller)
+        with self.assertRaises(ValueError):
+            self.runner.accept_handoff(self.ref, (self.caller[0], "codex", "supervisor"))
+        self.assertNotIn("acceptance", peer_message._read_pending(self.ref))
+        self.assertEqual(self.store.list(), [])
+
+    def test_normal_handoff_binds_card_and_lifetimes_before_delivery_without_acceptance(self):
+        import session_tidy as tidy
+        from types import SimpleNamespace
+        def target(name):
+            identity = self.predecessor if name == "p1" else self.successor
+            return "idle", {k:v for k,v in identity.items() if k not in {"foreground", "server"}}, None, None
+        refs = []
+        def send(args, *, expected_recipient, on_prepared):
+            self.assertEqual(expected_recipient, ("codex", "successor"))
+            body = Path(args.body_file).read_text()
+            text, ref = peer_message.prepare_peer_message(body, self.sender, self.recipient, defer=True)
+            on_prepared(ref)
+            refs.append(ref)
+            row = peer_message._read_pending(ref)
+            self.assertEqual(row["handoff"]["card_id"], "card-exact")
+            self.assertEqual(row["handoff"]["predecessor"], self.predecessor)
+            self.assertEqual(row["handoff"]["successor"], self.successor)
+            self.assertNotIn("acceptance", row)
+            print("prompted=queued reason=native-queue")
+            return 3
+        with mock.patch.object(tidy, "read_latest_card", return_value={"id": "card-exact", "body": "read this card"}), \
+             mock.patch.object(tidy, "state_root", return_value=self.tmp_root), \
+             mock.patch.object(tidy, "mark_card_handed_off") as marked, \
+             mock.patch.object(self.runner, "injected_executable", return_value=None), \
+             mock.patch.object(self.steward, "_retire_target", side_effect=target), \
+             mock.patch.object(self.steward, "_retire_foreground", side_effect=lambda pane, *a, **kw: (self.predecessor if pane == "p1" else self.successor)["foreground"]), \
+             mock.patch.object(self.steward, "_current_session_identity", return_value=("predecessor", "claude")), \
+             mock.patch.object(self.steward, "cmd_prompt", side_effect=send):
+            line, code = self.runner.handoff(tidy.Seat("pane", "old-seat", "p1"), "p2")
+        self.assertEqual(code, 3)
+        self.assertIn("prompted=queued", line)
+        marked.assert_called_once()
+        self.assertEqual(self.store.list(), [])
+
+    def test_acceptance_reservation_uses_existing_cancelled_retry_lineage(self):
+        request = peer_message._read_pending(self.ref)["handoff"]["requester"]
+        original_id = self.steward.peer_obligations.stable_duty_id("retire", self.predecessor, "p1")
+        self.store.create(original_id, "retire", self.predecessor, {"target": "p1", "requester": request})
+        self.store.update(original_id, state="cancelled", cleanup="complete")
+        retry = self.steward.reserve_handoff_retire("p1", self.predecessor, request)
+        self.assertNotEqual(retry, original_id)
+        self.assertEqual(self.store.get(retry)["intent"]["retry_of"], original_id)
+        self.assertEqual(self.store.get(retry)["intent"]["requester"], request)
+        self.assertEqual(self.steward.reserve_handoff_retire("p1", self.predecessor, request), retry)
+        self.assertEqual(self.store.get(original_id)["state"], "cancelled")
+
+    def test_original_retire_request_is_preserved_with_unknown_current_foreground(self):
+        request = peer_message._read_pending(self.ref)["handoff"]["requester"]
+        original = self.store.create("retire-c375ee7af4e37ec3085239d1b7bd98db", "retire", self.predecessor,
+                                     {"target": "p1", "requester": request})
+        unknown = dict(self.predecessor, foreground=None)
+        reserved = self.steward.reserve_handoff_retire("p1", unknown, request)
+        self.assertEqual(reserved, original["id"])
+        self.assertEqual(self.store.get(reserved)["intent"], original["intent"])
+        with self.assertRaises(ValueError):
+            self.steward.reserve_handoff_retire("p1", unknown, dict(request, session_id="supervisor"))
+
+    def test_concurrent_duplicate_keeps_one_reply_and_reservation(self):
+        barrier = threading.Barrier(2)
+        results = []
+        def accept():
+            barrier.wait()
+            try:
+                results.append(self.runner.accept_handoff(self.ref, self.caller)[1])
+            except BlockingIOError:
+                results.append("busy")
+        workers = [threading.Thread(target=accept) for _ in range(2)]
+        for w in workers: w.start()
+        for w in workers: w.join()
+        self.runner.accept_handoff(self.ref, self.caller)
+        self.assertIn(0, results)
+        self.assertEqual(len([d for d in self.store.list() if d["intent"]["kind"] == "retire"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

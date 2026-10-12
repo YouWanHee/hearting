@@ -1178,3 +1178,8 @@ follows §0.4 (`[경로]` for small work, the card or SD-123 pair otherwise).
 Composition changes route *shape only* — it never bypasses the §0.1
 spec/artifact-order gates, never grants dispatch depth 3, and never substitutes for a
 capability's own completion gates.
+
+A received completion is a responsibility to read the exact result and perform
+the already approved review/follow-through this turn, or run its existing
+registered continuation. Receipt, queue consumption and ACK are not execution.
+Report when work actually started, including any delay before a user reminder.

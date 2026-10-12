@@ -241,7 +241,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                         "continue" if not missing else "needs-owner", census=missing)
             elif facts.get("checkpoint") != "owner-envelope-sealed":
                 state, reason = "pending", str(facts.get("checkpoint") or "")
-            elif not facts.get("forward_verified"):
+            elif not (facts.get("settlement_verified") or facts.get("forward_verified")):
                 state, reason = "pending", "forward-recovery-not-proved"
             elif facts.get("publication_pending"):
                 state, reason = "pending", "shared-spec-publication-pending"

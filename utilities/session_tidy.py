@@ -1127,7 +1127,15 @@ def cmd_handoff(args) -> int:
         print("prompted=false reason=no-seat")
         return 1
     import session_tidy_runner as runner
-    line, code = runner.handoff(caller[0], args.target)
+    if args.target == "accept":
+        if not args.transfer_ref:
+            raise StateError("handoff-transfer-ref-required")
+        try:
+            line, code = runner.accept_handoff(args.transfer_ref, caller)
+        except ValueError as exc:
+            raise StateError(str(exc)) from exc
+    else:
+        line, code = runner.handoff(caller[0], args.target)
     print(line)
     return code
 
@@ -1212,6 +1220,7 @@ def build_parser() -> argparse.ArgumentParser:
     enqueue.set_defaults(func=cmd_enqueue)
     handoff = sub.add_parser("handoff", help="deliver this seat's card to a peer session")
     handoff.add_argument("target")
+    handoff.add_argument("transfer_ref", nargs="?")
     handoff.add_argument("--harness", choices=HARNESSES)
     handoff.add_argument("--session-id")
     handoff.add_argument("--cwd")
