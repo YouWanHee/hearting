@@ -10,7 +10,7 @@ with a simpler caller surface. It distinguishes principles from verified impleme
 
 A registered non-subsession review worker publishing its exact assigned node is
 an independent reviewer whether it names itself or leaves the reviewer claim
-implicit. Another named reviewer must already have produced a terminal judgment.
+implicit. Another named reviewer's authority comes from its existing terminal judgment.
 Owner-inline and owner-overridden review retain their reduced independence.
 The exact historical named-self publication defect may receive a provenance
 disposition through normal completion replay, preserving its original judgment,
