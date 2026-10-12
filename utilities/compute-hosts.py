@@ -43,7 +43,8 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 CONNECT_TIMEOUT = 8
 PROBE_TIMEOUT = 40
-GPU_PROBE_TIMEOUT = 3
+# Allow the SSH connection and both 5s NVIDIA queries before process attribution.
+GPU_PROBE_TIMEOUT = 20
 LOCAL = "local"
 OWNER_CLAIMS = ".process-owners.json"
 OWNER_CLAIMS_LOCK = ".process-owners.lock"
@@ -777,9 +778,11 @@ def smi(query):
     try:
         result = subprocess.run(
             ["nvidia-smi", query, "--format=csv,noheader,nounits"],
-            text=True, capture_output=True, timeout=1.3,
+            text=True, capture_output=True, timeout=5.0,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired:
+        return None, "nvidia-smi timed out after 5s"
+    except OSError as exc:
         return None, str(exc)
     if result.returncode:
         detail = (result.stderr or result.stdout or "nvidia-smi failed").strip()[:160]

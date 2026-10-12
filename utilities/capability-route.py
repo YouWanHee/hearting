@@ -7084,6 +7084,18 @@ def _review_self_disposition_actor(route, jobs, metadata):
         sid = ROUTE_AUTHORITY.caller_identity()[1]
         if not owner or not ROUTE_AUTHORITY.owns(owner, sid, jobs):
             raise ValueError("review-self-disposition-actor-unproven")
+        # The actual parent can settle this existing judgment while its current
+        # owner waits for an answer. This is ordinary parent authority, not
+        # permission to impersonate or revive that stopped owner.
+        decision = ROUTE_AUTHORITY.decide_continuation(route, action="owner", jobs=Path(jobs),
+                    owner_attempt_id=actor, facts={"actor": sid})
+        if ((decision.state == "answer" and decision.next_action == "correct")
+                or (decision.allowed and decision.next_action == "handback")):
+            from route_parent_close import owner_continuation_processes
+            quiescence, children = owner_continuation_processes(owner, Path(jobs))
+            if quiescence.state != "quiescent" or children:
+                raise ValueError("review-self-disposition-parent-owner-not-settled")
+            return actor
     ROUTE_AUTHORITY.review_owner_authority(route, jobs, actor)
     return actor
 
@@ -7127,7 +7139,9 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
     if gate_currency(route, node, canonical, marker, observe=True).state != "current":
         raise ValueError("review-self-disposition-integrity-invalid")
     origin_path = directory / f"{node['id']}.{marker['sequence']}.json"
-    _, meta = review_self_disposition_subject(route, node, marker, origin_path, jobs=jobs)
+    authority_basis = {}
+    _, meta = review_self_disposition_subject(route, node, marker, origin_path, jobs=jobs,
+                                            authority_basis=authority_basis)
     basis = original_review_self_claim(route, node, marker, jobs=jobs, metadata=meta)
     if basis is None:
         print("capability-route: review-self-disposition-original-claim-unverified", file=sys.stderr)
@@ -7140,6 +7154,8 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
                    "origin_link_sha256": hashlib.sha256(link_path.read_bytes()).hexdigest(),
                    "original_claim": basis, "jobs": str(Path(jobs)), "actor": actor,
                    "settled_basis": "successful-quiescent-terminal"}
+    if authority_basis:
+        disposition.update(settled_basis="historical-provenance-blocked", authority_basis=authority_basis)
     # Reuse a valid uncommitted successor left by a crash before canonical
     # replace. Conflicting history is a collision, not another allocation.
     sequence = _next_marker_sequence(directory, node["id"])
@@ -11200,7 +11216,15 @@ def main():
         import inline_finish
         admission = inline_finish.admit(route, allow_legacy=True)
         if admission[0].state == "modern":
-            receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__], _admission=admission)
+            try:
+                receipt=inline_finish.finish(a,route,a.route,sys.modules[__name__], _admission=admission)
+            except inline_finish.InlineFinishError as exc:
+                if str(exc) != "finish-route-cycle-missing":
+                    raise
+                import artifact_producer
+                if artifact_producer.classify_root(Path(route["artifact_root"]))["state"] != "inactive-with-legacy":
+                    raise
+                receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__], _admission=admission)
         else:
             receipt=_legacy_inline_finish(a,route,a.route,sys.modules[__name__], _admission=admission)
         print(json.dumps(receipt,sort_keys=True))
@@ -11465,3 +11489,8 @@ if __name__=="__main__":
     # OSError too: completion walks a worker-supplied tree, and a refusal there
     # must be a typed line, never a traceback (review S-a).
     except (ValueError,OSError,TOPO.TopologyError) as exc: print(f"capability-route: {exc}",file=sys.stderr); raise SystemExit(64)
+    except Exception as exc:
+        # A producer refusal (e.g. cutover-inactive) is a typed line too, never a traceback.
+        import artifact_producer
+        if not isinstance(exc, artifact_producer.ProducerError): raise
+        print(f"capability-route: {exc}",file=sys.stderr); raise SystemExit(64)

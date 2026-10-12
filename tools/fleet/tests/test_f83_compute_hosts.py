@@ -132,7 +132,8 @@ class ComputeHostRenderTest(unittest.TestCase):
         for width in (60, 100, 168):
             rows = render._compute_host_rows(width)
             text = "\n".join(render._plain(row) for row in rows)
-            self.assertIn("reserved SR_CorrNet [cd]", text)
+            self.assertIn("reserved 미귀속", text)
+            self.assertNotIn("SR_CorrNet", text)
             self.assertIn("10-04", text)
             self.assertIn("css", text)
             self.assertTrue(all(render._dw(render._plain(row)) <= width for row in rows))

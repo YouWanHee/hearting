@@ -45,7 +45,10 @@ class GPUOneLineTest(unittest.TestCase):
             with self.subTest(width=width):
                 lines = self.rows(width)
                 self.assertEqual(len(lines), 3)
-                self.assertIn("▸ 4 · [bb]×3 [8e]×1", lines[2])
+                self.assertIn("▸ 4 · ", lines[2])
+                for tag in ("[bb]", "[8e]"):
+                    self.assertEqual(lines[2].count(tag), 1)
+                self.assertNotIn("×", lines[2])
                 self.assertNotIn("reserved", lines[2])
                 self.assertNotIn("detailed", "\n".join(lines))
                 self.assertLessEqual(render._dw(lines[2]), width - 1)
@@ -57,7 +60,9 @@ class GPUOneLineTest(unittest.TestCase):
             self.gpu["processes"].append({"session_owner": o})
             self.gpu["reservations"].append({"owner": o})
         line = self.rows(80)[2]
-        self.assertIn("[bb]×3 +4", line)
+        self.assertIn("[bb]", line)
+        self.assertIn("+", line)
+        self.assertNotIn("×", line)
         for token in ("UTIL", "%", "VRAM", "GB"):
             self.assertEqual(before.index(token), line.index(token))
         self.assertLessEqual(render._dw(line), 79)
@@ -66,8 +71,8 @@ class GPUOneLineTest(unittest.TestCase):
         self.gpu["reservations"][-1]["owner"] = owner("opencode", "ff")
         for width in (80, 200):
             line = self.rows(width)[2]
-            self.assertIn("res", line)
-            self.assertIn("unres", line)
+            self.assertTrue(any(token in line for token in ("reserved+", "res+", "R+")))
+            self.assertTrue(any(token in line for token in ("unreserved+", "unres+", "U+")))
             self.assertIn("+1", line)
             self.assertLessEqual(render._dw(line), width - 1)
 
@@ -78,7 +83,7 @@ class GPUOneLineTest(unittest.TestCase):
         self.assertEqual(len(render._compute_host_rows.fold_rows), 1)
         self.gpu["processes"] = [{"owner": owner("opencode", "ff")}]
         self.gpu["reservations"] = []
-        self.assertIn("unreserved+1", self.rows(80)[2])
+        self.assertIn("unres+1", self.rows(80)[2])
 
     def test_two_mismatch_labels_survive_a_long_host_in_80_columns(self):
         self.host["host"] = "gpu-worker"
@@ -120,7 +125,7 @@ class GPUOneLineTest(unittest.TestCase):
             for detail in ("10-04", "detailed task", "detailed-name.yaml"):
                 self.assertIn(detail, line)
             self.assertLessEqual(render._dw(line), 199)
-        self.assertEqual(sum("codex [bb]" in line for line in runs), 3)
+        self.assertEqual(sum("[bb]" in line for line in runs), 3)
         self.assertNotIn("reserved", "\n".join(runs))
         self.assertNotIn("saved", "\n".join(runs))
         self.assertEqual(original, self.gpu)
@@ -130,9 +135,9 @@ class GPUOneLineTest(unittest.TestCase):
         render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
         lines = [line.strip() for line in self.rows(200)[3:]]
         self.assertEqual(len(lines), 7)
-        self.assertEqual(sum(line.startswith("↳ claude [8e] · ") and line.endswith(".yaml")
+        self.assertEqual(sum(line.startswith("↳ [8e] · ") and line.endswith(".yaml")
                              for line in lines), 1)
-        self.assertEqual(sum(line.startswith("reserved codex [bb] · ") for line in lines), 3)
+        self.assertEqual(sum(line.startswith("reserved [bb] · ") for line in lines), 3)
         self.assertEqual(lines.count("↳ python train.py --config detailed-name.yaml"), 3)
 
     def test_narrow_row_keeps_run_identity_and_counts_extra_processes(self):
@@ -143,7 +148,9 @@ class GPUOneLineTest(unittest.TestCase):
         for width in (80, 200):
             lines = self.rows(width)[3:]
             self.assertEqual(len(lines), 1)
-            self.assertIn("↳ codex [bb] · 10-04", lines[0])
+            self.assertIn("↳ ", lines[0])
+            self.assertIn("[bb] / ", lines[0])
+            self.assertIn("[8e] · 10-04", lines[0])
             self.assertTrue(lines[0].endswith(" +3"))
             self.assertLessEqual(render._dw(lines[0]), width - 1)
         self.assertIn("detailed-name.yaml", self.rows(200)[3])

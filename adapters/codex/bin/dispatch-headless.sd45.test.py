@@ -1349,5 +1349,8 @@ class CodexFrameCapacityDowngrade(unittest.TestCase):
     def test_deep_without_a_claim_is_refused_by_the_profile_binding_and_by_registration(self):
         self.flow(self).run_claimless()
 
+    def test_an_undeclared_top_profile_is_refused_without_a_claim_or_launch(self):
+        self.flow(self).run_undeclared_profile()
+
 
 if __name__=="__main__": unittest.main()

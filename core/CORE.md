@@ -15,8 +15,14 @@ Owner-inline and owner-overridden review retain their reduced independence.
 The exact historical named-self publication defect may receive a provenance
 disposition through normal completion replay, preserving its original judgment,
 history, attempt link, evidence and round census. This requires the original
-bound self claim, settled successful completion and current actor authority;
+bound self claim, settled completion and current actor authority;
 an ordinary late claim cannot promote a degraded review.
+The original review judgment and its later operational handback are separate
+results. An exact provenance-only BLOCKED handback can retain the original
+independent PASS only when the registered successful publication, bound JSON,
+distinct primary report, historical report-byte receipt and settled terminal
+jointly prove that same judgment. Neither registry success nor report prose
+overrides a terminal result. Original PASS and BLOCKED bytes remain unchanged.
 Publication and observation share the exact registered subject, terminal artifact
 and historical actor-lineage judgment. Recorded authority survives ordinary owner
 replacement; a current authorized actor may finish an interrupted publication.
@@ -270,8 +276,10 @@ validation and payload reads, on both first close and later refreshes; existing
 profiles remain in place. Screenshots, browser logs and review reports beside
 them remain output. New browser work uses a process-owned temporary profile
 outside the cycle payload. `_internal/` and other non-hidden support paths, binary and large
-files are output. Absolute/escaping paths and out-of-payload files remain
-invalid. Cycle controls and legacy relocation/exclusion retain their contracts.
+files are output. A payload name keeps UTF-8, spaces and the ASCII punctuation
+`_ . - ~ + ( ) @ , =` up to 255 bytes; other ASCII punctuation (quotes, `$`,
+backquotes, `;`, `|`, `&`, `<`/`>` and glob characters among them) makes it
+invalid. Absolute/escaping paths and out-of-payload files remain invalid. Cycle controls and legacy relocation/exclusion retain their contracts.
 Invalid paths identify the locator and reason before payload reads or manifest
 publication.
 
@@ -524,6 +532,14 @@ without no-replace rename support, it checks the destination remains absent
 under those same locks and uses ordinary atomic rename, as producer admission does.
 
 ## 4. Workflow Invariants
+
+Transport deaths have no cumulative automatic replacement count limit. The
+existing controller may replace each settled, proven-dead attempt with one
+successor per exact predecessor. It preserves original results, completed
+stages, review ceilings, runtime pins and normal backoff. Live or unknown
+processes, unsettled cleanup, readable FAIL or BLOCKED, and human decisions
+retain their existing handling. A route paused only by the old replacement
+count resumes through its ordinary `start` surface.
 
 Artifacts move forward in one direction:
 

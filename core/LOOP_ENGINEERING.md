@@ -218,6 +218,35 @@ Pane display updates belong to the existing detail pass; assigning a live
 session's number must not wait for pane metadata writes before basic publication.
 Delayed display writes check the pane's current exact session identity and
 assigned number; a changed or unconfirmed target receives no old metadata.
+
+Fleet's interactive view keeps shared status, usage, compute/GPU observations,
+and its controls outside the scrolling work-list viewport. The list body owns
+its offset, selection-follow, page movement, and wheel movement; the flat line
+builder remains independent of that offset. When a terminal is too short to
+show everything, preserve the footer and current status first, then usage,
+then the available compute/GPU rows; omit decoration and reading legends before
+those observations. A zero-height body has no list hit targets.
+
+Mouse actions address only cells successfully painted in the current frame.
+Refresh, resize, fold, scroll, and view/layout changes invalidate the previous
+hit map before another event is applied. Fold controls own only their section;
+folding a repository hides its session/work body while leaving shared status and
+compute observations visible. Session actions retain F-27 confirmation and
+identity checks. Fleet's current approved default enables ordinary curses mouse
+input when `FLEET_MOUSE` is unset or exactly `1`; any explicitly set other value
+keeps the prior opt-out behavior. This default differs from the shared Fleet
+PRD's opt-in policy pending its separately deferred revision. Each harness
+preserves the same display and safety meaning, with terminal-specific input
+support and limitations recorded by the implementation.
+Terminal input decoding never waits inside the frame loop for the rest of a key
+or mouse packet. Incomplete sequences are consumed incrementally, and only
+complete valid events are dispatched; the mouse default, explicit opt-out,
+keyboard behavior, and click safety remain intact.
+Once an SGR mouse prefix is recognized, malformed contents are consumed through
+their terminator or a short internal expiry and are never replayed as commands.
+Unsupported button, modifier, motion, and wheel combinations are inert. Pending,
+ready, or discarded decoder input is not idle for install-follow; expiry returns
+the reader to idle so refresh and follow continue without user recovery.
 Diagnostics retain the reader's kind, source and blocking evidence. A missing
 historical resource reference is not a broken dispatch log or a current execution
 failure. Memory rows describe a stored change with its content and observed origin;
@@ -247,9 +276,20 @@ work carries its caller's observed session/seat independently of execution and
 delivery authority, and is labelled project support when that link is unproven.
 Legends explain statuses and roles in short English, including project
 activity and expanded GPU commands; a copied dot or arrow must retain its meaning.
-GPU owner labels add who is responsible, such as a verified Fleet session tag;
-they do not repeat the execution's run/job identifier beside its training name.
+GPU occupancy names the exact observed sessions once each, using their explicit
+name or verified alias and current Fleet tag. Run/job names and identifiers never
+stand in for a session; observed occupation without an exact session is `미귀속`,
+not an empty GPU. Process commands and measurement freshness retain their meaning.
 Raw owner identifiers remain available in structured output.
+When a session label has only its Fleet tag or short session ID, show its
+observed repository instead of the harness name. Resolve linked worktrees to
+their parent repository through the existing grouping resolver. Missing
+repository evidence leaves the identifier alone; another session or workload
+name never supplies it. Explicit session names and verified aliases keep priority.
+GPU sampling deadlines cover SSH connection, both bounded NVIDIA queries and
+process attribution, with room in the outer collection deadline. Slow sampling
+stays in the independent GPU refresh pump and does not delay basic refresh or
+input. A genuinely expired query still reports the timeout and unknown metrics.
 
 ## Basis and current scope
 

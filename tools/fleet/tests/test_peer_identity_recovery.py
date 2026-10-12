@@ -144,11 +144,11 @@ class EndpointUpgradeTest(unittest.TestCase):
 
     def test_an_address_only_row_reaches_the_badge(self):
         self.assertEqual(self._label("uds:/run/user/1002/cc-socks/777.sock",
-                                     {("claude", "sid-peer"): "15"}), "[15] claude")
+                                     {("claude", "sid-peer"): "15"}), "[15]")
 
     def test_a_name_only_row_reaches_the_badge(self):
         self.assertEqual(self._label("bc-resnet-15", {("claude", "sid-peer"): "15"}),
-                         "[15] claude")
+                         "[15]")
 
     def test_a_peer_that_resolves_to_no_badge_keeps_its_readable_name(self):
         # Losing a usable name to reach a badge that does not exist would be a downgrade.

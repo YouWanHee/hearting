@@ -6945,7 +6945,7 @@ class ReviewIndependenceTest(InlineStageCompletionRecipeTest):
 class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
  """Isolated real publication/currentness/readiness; no live runtime writes."""
 
- def historical_fixture(self,harness="codex",legacy=False,ship=False):
+ def historical_fixture(self,harness="codex",legacy=False,ship=False,provenance_blocked=False,append_hash=False,evidence_changes=None,historical_home=None,report_prefix=""):
   repo=self.base/"repo"; repo.mkdir()
   subprocess.run(["git","init","-q",str(repo)],check=True)
   subprocess.run(["git","-C",str(repo),"-c","user.name=Fixture","-c","user.email=fixture@example.invalid",
@@ -6979,7 +6979,7 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
    output=Path(begun["env"]["AGENT_ARTIFACT_OUTPUT_DIR"])
    self.producer=begun
    owner_child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
-    start_new_session=True,env={**os.environ,"AGENT_DISPATCH_ATTEMPT_ID":"att-owner"})
+    start_new_session=True)
    self.addCleanup(lambda: owner_child.communicate(timeout=5) if owner_child.poll() is None else None)
    owner.update(pid=str(owner_child.pid),pid_start=str(D.process_start_ticks(owner_child.pid)),pgid=str(owner_child.pid),
     pid_ns=D.process_namespace_identity(owner_child.pid),pid_observer_ns=D.process_namespace_identity(owner_child.pid))
@@ -6997,7 +6997,7 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
      prior_log.write_text(json.dumps({"type":"result","subtype":"success","is_error":False,
       "result":f"artifact: {prior_report}\nverdict: {verdict}\nblocker: previous finding"})+"\n")
      prior_child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
-      start_new_session=True,env={**os.environ,"AGENT_DISPATCH_ATTEMPT_ID":aid})
+      start_new_session=True)
      ticks=D.process_start_ticks(prior_child.pid);namespace=D.process_namespace_identity(prior_child.pid)
      prior_child.communicate(timeout=5)
      prior_meta={**axes,"attempt_id":aid,"worker_type":"review","parent_attempt_id":"att-owner",
@@ -7016,19 +7016,48 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
       worktree=repo,artifact_root=artifact,worker_type="review",legacy_close=lambda _:None)
      self.assertTrue(result["closed"],result)
    import ship_parent_deploy
+   if provenance_blocked:
+    setup=next(n for n in route["nodes"] if n["id"]=="release-setup")
+    setup_evidence=output/"setup.md";setup_evidence.write_text("previous setup\n")
+    inline={"attempt_schema_version":2,"dispatch_depth":setup["dispatch_depth"],"transport":"headless",
+     "execution_surface":"inline","registered_worker":False,"fallback_hop":"inline"}
+    R.complete_node(route,setup,setup["id"],setup_evidence,attempt_id="att-setup-inline",explicit_attempt_metadata=inline)
+    setup_evidence.write_text("corrected setup\n")
+    with mock.patch.dict(os.environ,{"AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
+     R.publish_revision_locked(route,setup["id"],setup_evidence,basis="review-findings",
+      answers=["att-prior-release-review-1","att-prior-security-review-1"],author_attempt_id="att-owner",jobs=self.jobs)
    script=output/"prepared-script.py";script.write_text("print('fixture deployment must never run')\n")
    pins=[]
-   for i in range(32):
+   for i in range(30 if provenance_blocked else 32):
     pin=output/f"input-{i}.txt";pin.write_text(str(i));pins.append(str(pin))
    command=output/"prepared-command.json"
    command.write_text(json.dumps({"argv":[sys.executable,str(script)],"cwd":str(repo),"inputs":pins}))
    with mock.patch.dict(os.environ,{"AGENT_DISPATCH_ATTEMPT_ID":"att-owner"}):
     self.prepared=ship_parent_deploy.prepare(self.jobs,"att-owner",command)
+   if provenance_blocked:
+    # prepare retains this historical creator across owner replacements.
+    # Seed the public retained-request condition before the original review;
+    # its digest/pins/bytes then stay unchanged through every disposition.
+    request_path=Path(self.prepared["request"])
+    request=json.loads(request_path.read_text());request["owner_attempt_id"]="att-earlier-preparer"
+    bound={k:v for k,v in request.items() if k not in {"request_digest","parent_availability"}}
+    request["request_digest"]=ship_parent_deploy.digest(bound)
+    request_path.write_text(json.dumps(request))
+    self.prepared.update(request)
   evidence=output/"evidence"/"review.json"
   evidence.parent.mkdir(parents=True,exist_ok=True)
-  evidence.write_text(json.dumps({"verdict":"PASS","findings":[],"gate_met":True,
+  content={"verdict":"PASS","findings":[],"gate_met":True,
    "route_id":route["route_id"],"completion_gate":node["completion_gate"],
-   "request_digest":self.prepared["request_digest"] if ship else "fixed"}))
+   "request_digest":self.prepared["request_digest"] if ship else "fixed"}
+  if provenance_blocked:
+   content.update(stage=node["completion_gate"],guard_session_id="att-review-self",blocker="none",
+    cycle_id=self.producer["env"]["AGENT_ARTIFACT_CYCLE_ID"],route_cycle_id=self.producer["env"]["AGENT_ARTIFACT_CYCLE_ID"],
+    round=4,verdict_sequence=3,verdict_ceiling=3,review_artifact="reviews/release/original.md",
+    request_path=self.prepared["request"],request_prepared_at=self.prepared["prepared_at"],
+    request_digest_verified=True,prepare_receipt_matches=True,bound_input_mismatches=[],
+    bound_inputs_verified=len(json.loads(Path(self.prepared["request"]).read_text())["command"]["inputs"]))
+  content.update(evidence_changes or {})
+  evidence.write_text(json.dumps(content))
   log=self.base/f"review.{harness}.jsonl"
   meta=dict(axes,attempt_id="att-review-self",worker_type="review",harness=harness,
    route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],route_file=str(path),
@@ -7048,11 +7077,22 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
   # use only real common authority/validation on every replay and observation.
   degraded={"reviewer_kind":"owner-inline","review_independence":"degraded",
    "reviewer_identity":meta["attempt_id"],"reviewer_downgrade_reason":"reviewer-attempt-no-terminal-verdict"}
-  with mock.patch.object(R,"resolve_review_identity",return_value=degraded):
-   origin,_=R.complete_node(route,node,node["id"],evidence,jobs=self.jobs,
-    attempt_id=meta["attempt_id"],review_claim=claim)
+  if historical_home:
+   argv=[sys.executable,str(Path(historical_home)/"utilities/capability-route.py"),"complete",
+    "--route",str(path),"--node",node["id"],"--jobs",str(self.jobs),"--attempt-id",meta["attempt_id"],
+    "--reviewer-attempt",meta["attempt_id"],"--evidence",str(evidence)]
+   result=subprocess.run(argv,text=True,capture_output=True,env={**os.environ,"AGENT_HOME":str(historical_home),
+    "AGENT_DISPATCH_JOBS":str(self.jobs),"AGENT_DISPATCH_ATTEMPT_ID":meta["attempt_id"]})
+   self.assertEqual(result.returncode,0,result.stderr)
+   origin=next(json.loads(line) for line in result.stdout.splitlines() if line.startswith('{'))
+   self.assertEqual(origin["reviewer_downgrade_reason"],"reviewer-attempt-no-terminal-verdict")
+   print("historical_cli",json.dumps({"argv":argv,"exit":result.returncode,"downgrade":origin["reviewer_downgrade_reason"]}))
+  else:
+   with mock.patch.object(R,"resolve_review_identity",return_value=degraded):
+    origin,_=R.complete_node(route,node,node["id"],evidence,jobs=self.jobs,
+     attempt_id=meta["attempt_id"],review_claim=claim)
   directory=R.completion_dir(route["route_id"])
-  if legacy:
+  if legacy and not historical_home:
    origin.pop("reviewer_claim")
    R.atomic_write(directory/f"{node['id']}.json",origin)
    R.atomic_write(directory/f"{node['id']}.{origin['sequence']}.json",origin)
@@ -7062,26 +7102,50 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
    with self.jobs.open("a") as f:
     f.write("\t".join(["2026-10-12T00:00:00Z","running",str(repo),str(repo),"owner",
      ",".join(f"{k}={v}" for k,v in owner.items())])+"\n")
-  text=f"artifact: {evidence}\nverdict: PASS\nblocker: none"
+  report=evidence
+  if provenance_blocked:
+   report=output/"reviews/release/original.md";report.parent.mkdir(parents=True,exist_ok=True)
+   report.write_text(report_prefix+"## Code Review Results\nOriginal content judgment: PASS.\n\n### Registered completion receipt\n```json\n"+
+    json.dumps(origin)+"\n"+json.dumps({"attempt_id":meta["attempt_id"],"status":"closed"})+"\n```\n")
+  text=(f"artifact: {report}\nverdict: BLOCKED\nblocker: {D.REVIEW_SELF_PROVENANCE_BLOCKER}" if provenance_blocked
+        else f"artifact: {evidence}\nverdict: PASS\nblocker: none")
   terminal={
    "codex":[{"type":"item.completed","item":{"type":"agent_message","text":text}},{"type":"turn.completed"}],
    "claude":[{"type":"result","subtype":"success","is_error":False,"result":text}],
    "opencode":[{"type":"text","part":{"type":"text","text":text}},
     {"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}]}[harness]
-  if legacy:
+  if legacy or provenance_blocked:
    import shlex
-   command=shlex.join([sys.executable,str(R.ROOT/"utilities/capability-route.py"),"complete",
+   command=shlex.join([sys.executable,str(Path(historical_home or R.ROOT)/"utilities/capability-route.py"),"complete",
     "--route",str(path),"--node",node["id"],"--jobs",str(self.jobs),"--attempt-id",meta["attempt_id"],
     "--reviewer-attempt",meta["attempt_id"],"--evidence",str(evidence)])
+   stdout=(result.stdout if historical_home else json.dumps(origin)+"\n"+
+     json.dumps({"attempt_id":meta["attempt_id"],"status":"closed"}))
    terminal.insert(0,{"type":"item.completed","item":{"type":"command_execution","id":"original-complete",
-    "command":command,"status":"completed","exit_code":0,"aggregated_output":json.dumps(origin)+"\n"+
-     json.dumps({"attempt_id":meta["attempt_id"],"status":"closed"})}})
+    "command":command,"status":"completed","exit_code":0,"aggregated_output":stdout}})
+  if provenance_blocked:
+   import hashlib
+   command=shlex.join(["sha256sum",str(report),str(evidence)])
+   if append_hash and not historical_home:
+    command=(f"F={shlex.quote(str(report))}; $AGENT_HOME/adapters/codex/bin/preflight.sh write $F {meta['attempt_id']}; cat >> $F <<EOF\n"
+             "public receipt text\nEOF\n"+shlex.join(["sha256sum","$F",str(evidence)]))
+    command=shlex.join(["/bin/zsh","-lc",command])
+   hash_stdout="\n".join(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+str(p) for p in (report,evidence))+"\n"
+   if historical_home:
+    hashed=subprocess.run(["sha256sum",str(report),str(evidence)],text=True,capture_output=True,check=True)
+    hash_stdout=hashed.stdout
+   terminal.insert(1,{"type":"item.completed","item":{"type":"command_execution","id":"original-report-hash",
+    "command":command,"status":"completed","exit_code":0,"aggregated_output":
+    hash_stdout}})
   log.write_text("\n".join(json.dumps(e) for e in terminal)+"\n")
   self.route,self.node,self.evidence,self.claim,self.origin=route,node,evidence,claim,origin
   self.path,self.log,self.directory=path,log,directory
   self.repo,self.artifact,self.output,self.meta=repo,artifact,output,meta
+  self.report=report
   self.preserved={p:p.read_bytes() for p in (directory/f"{node['id']}.{origin['sequence']}.json",
    directory/f"{node['id']}.att-review-self.attempt.json",evidence,self.jobs)}
+  if provenance_blocked:
+   self.preserved.update({report:report.read_bytes(),log:log.read_bytes(),Path(self.prepared["request"]):Path(self.prepared["request"]).read_bytes()})
   return route,node,evidence
 
  def replay(self,entrance="complete",actor="att-owner"):

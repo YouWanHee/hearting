@@ -591,16 +591,29 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.assertEqual((round_two["admitted"], round_two["newly_started"]), (2, 2), round_two)
         self.assertTrue({leg["attempt_id"] for leg in first["legs"]}.isdisjoint(
             {leg["attempt_id"] for leg in round_two["legs"]}))
-        # The real launcher may have already settled a fast fake provider,
-        # especially in a foreground namespace. Seed an unfinished physical
-        # observation using a disposable process with its full actual identity;
-        # claims, generations, inputs and public admission remain production.
+        # Finish both physical launches and their normal terminal writers
+        # before taking the fixture backup. Otherwise a delayed writer can
+        # settle either real leg during the duplicate's atomic byte check, and
+        # restoring that backup would erase its legitimate final settlement.
+        self.settle(round_two)
+        for leg in round_two['legs']:
+            fields, meta = REPLACEMENT._rows(self.jobs.read_text().splitlines())[leg['attempt_id']]
+            self.assertEqual(fields[1], 'done')
+            self.assertEqual(meta['note'], 'completed-marker')
+            self.assertTrue(DC.verdict_pass(meta), repr(meta))
+            marker = self.marker(leg['node'])
+            self.assertEqual(marker['attempt_id'], leg['attempt_id'])
+            node = next(n for n in self.route['nodes'] if n['id'] == leg['node'])
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                readiness = DC.completion_attempt_readiness(self.route, node, marker, self.jobs)
+            self.assertEqual(readiness.state, 'ready', repr(readiness))
+        # A current PASS marker does not waive a genuinely live physical
+        # observation. Claims, generations, inputs and admission remain real.
         with self.live_fixture_attempt(round_two['legs'][0]['attempt_id']):
             before_duplicate = self.atomic_state()
             live = self.launch(expected=78, slug="another-display")
             self.assertEqual(live["reason"], "prior-attempt-still-live")
             self.assertEqual(self.atomic_state(), before_duplicate)
-        self.settle(round_two)
         self.assert_selection(round_two)
         settled_rows = self.jobs.read_bytes()
         before_replay = self.atomic_state()
