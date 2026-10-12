@@ -124,6 +124,56 @@ class CorrectionTest(unittest.TestCase):
         self.assertEqual(D.gate_currency(f.route,f.node,canonical,observe=True).state,"current")
         self.assertEqual(before,{p:p.read_bytes() for p in f.base.rglob('*') if p.is_file()})
 
+    def duplicate_report_hash_output(self, f, identical):
+        events = [json.loads(line) for line in f.log.read_text().splitlines()]
+        item = events[1]["item"]
+        report_line, evidence_line = item["aggregated_output"].splitlines()
+        digest, path = report_line.split("  ", 1)
+        alias = f.report.parent / ".." / f.report.parent.name / f.report.name
+        self.assertEqual(alias.resolve(), f.report.resolve())
+        first_digest = digest if identical else "0" * 64
+        item["aggregated_output"] = (
+            first_digest + "  " + path + "\n" + digest + "  " + str(alias) + "\n" + evidence_line + "\n"
+        )
+        f.log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+        return events[1]
+
+    def test_duplicate_normalized_hash_output_refused_by_both_writers(self):
+        for identical in (False, True):
+            for entrance in ("complete", "writer"):
+                with self.subTest(identical=identical, entrance=entrance):
+                    f = self.fixture(ship=True, legacy=True, provenance_blocked=True)
+                    self.duplicate_report_hash_output(f, identical)
+                    before = self.snapshot(f)
+                    preserved = {path: path.read_bytes() for path in f.preserved}
+                    with self.assertRaisesRegex(ValueError, "review-self-disposition-report-bytes-unverified"):
+                        f.replay(entrance)
+                    self.assertEqual(before, self.snapshot(f))
+                    self.assertEqual(preserved, {path: path.read_bytes() for path in preserved})
+
+    def test_duplicate_normalized_hash_output_refused_by_recorded_readers(self):
+        import hashlib
+        import ship_parent_deploy
+        for identical in (False, True):
+            with self.subTest(identical=identical):
+                f = self.fixture(ship=True, legacy=True, provenance_blocked=True)
+                marker = f.replay()
+                metadata = R._find_attempt_row_metadata(f.jobs, "att-review-self")
+                prepared = D._marker_bound_prepare_marker_proof(metadata, "att-review-self")
+                self.assertIsNotNone(prepared)
+                event = self.duplicate_report_hash_output(f, identical)
+                # Even a forged basis citing the changed receipt cannot hide
+                # contradictory or identical aliases of the same output path.
+                marker["reviewer_disposition"]["authority_basis"]["hash_receipt"]["receipt_sha256"] = (
+                    hashlib.sha256(json.dumps(event).encode()).hexdigest()
+                )
+                self.corrupt_head(f, marker)
+                self.assert_refused(f)
+                self.assertIsNone(D._marker_bound_current_marker(metadata, "att-review-self", prepared)[0])
+                deploy = next(node for node in f.route["nodes"] if node["id"] == "deploy")
+                with self.assertRaisesRegex(ValueError, '"release-review": "completion-marker-not-current"'):
+                    ship_parent_deploy.reviews(f.route, deploy, f.jobs, json.loads(Path(f.prepared["request"]).read_text()))
+
     def corrupt_head(self, f, marker):
         R.atomic_write(f.directory / (f.node["id"] + ".json"), marker)
         R.atomic_write(f.directory / f"{f.node['id']}.{marker['sequence']}.json", marker)

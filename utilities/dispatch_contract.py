@@ -7651,9 +7651,10 @@ def review_self_blocked_basis(route, node, prior, metadata, terminal, *, jobs):
             digests = {}
             for output_line in (item.get("aggregated_output") or "").splitlines():
                 digest, path = output_line.split("  ", 1)
-                if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest) or path in digests:
+                resolved_path = str(Path(path).resolve())
+                if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest) or resolved_path in digests:
                     raise ValueError("invalid digest output")
-                digests[str(Path(path).resolve())] = digest
+                digests[resolved_path] = digest
             receipts.append((digests, {"item_id": item.get("id"), "receipt_sha256": hashlib.sha256(line.encode()).hexdigest()}))
         except (TypeError, ValueError):
             continue
