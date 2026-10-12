@@ -458,17 +458,15 @@ class Case4RetryLinkTest(unittest.TestCase):
                          "  Close migration fixtures\n and import integration.  "):
                 with self.subTest(task=task):
                     self.assertEqual(RA.retry_predecessor([latest], jobs=jobs, task=task), args.attempt_id)
-            self.assertTrue(replacement._budget_exhausted(jobs, latest))
+            self.assertFalse(replacement._budget_exhausted(jobs, latest))
             self.assertEqual(latest, before)
             candidate = {**latest, "attempt_id": "att-gap-three"}
             candidate.pop("automatic_retry_of")
             self.assertIsNone(replacement.admission(jobs, [], candidate))
-            # Same-task transport continuation still sees the spent allowance.
-            with self.assertRaises(DC.DispatchContractError) as spent:
-                replacement.admission(jobs, ["now\tdone\t/repo\t/wt\tgap-two\t" +
-                    ",".join(f"{k}={v}" for k, v in latest.items() if not k.startswith("_"))],
-                    {**candidate, "automatic_retry_of": args.attempt_id})
-            self.assertEqual(spent.exception.reason, "automatic-replacement-exhausted")
+            # Same-task transport continuation retains lineage without a count cutoff.
+            self.assertIsNone(replacement.admission(jobs, ["now\tdone\t/repo\t/wt\tgap-two\t" +
+                ",".join(f"{k}={v}" for k, v in latest.items() if not k.startswith("_"))],
+                {**candidate, "automatic_retry_of": args.attempt_id}))
             for state in ("live", "unverifiable"):
                 with mock.patch.object(DC, "attempt_process_quiescence",
                                        return_value=SimpleNamespace(state=state)):
@@ -495,12 +493,12 @@ class Case4RetryLinkTest(unittest.TestCase):
         self.assertEqual(retry("dead-invalid-envelope", "invalid-envelope"), "fallback")
         self.assertEqual(retry("dead-capacity", "capacity"), "capacity")
 
-    def test_a_second_link_on_the_same_source_is_exhausted(self):
+    def test_a_next_link_still_requires_the_predecessor_binding(self):
         source = ("2026-10-06T08:00:00Z\tdone\t/repo\t/wt\ttest-r2\t"
                   "attempt_id=att-0c43,automatic_retry_of=att-4cf2,route_id=rt-f22b0e181b82b4a3,route_node=test")
         with self.assertRaises(DC.DispatchContractError) as refused:
             DC._automatic_retry_admission([source], {"attempt_id": "att-next", "automatic_retry_of": "att-0c43"})
-        self.assertEqual(refused.exception.reason, "automatic-replacement-exhausted")
+        self.assertEqual(refused.exception.reason, "retry-predecessor-binding-mismatch")
 
 
 class Case5ReadRootsTest(unittest.TestCase):

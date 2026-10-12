@@ -368,7 +368,7 @@ class CapacityResumeTest(unittest.TestCase):
         sealed = R.launch_input(self.jobs, replacement, self.rows()[replacement][1])
         self.assertEqual(sealed["launch_home"], str(self.root / "newer-release"))
 
-    def test_a_replacement_after_a_limit_that_dies_silently_is_replaced_once(self):
+    def test_transport_deaths_after_a_limit_continue_without_a_count_cutoff(self):
         # BC rt-6a54b9aabafc81bd: the limit stop is a pause, not the node's one
         # silent replacement. The resumed owner's own silent death is replaced once.
         self.set_limit("att-owner", FREE)
@@ -381,14 +381,14 @@ class CapacityResumeTest(unittest.TestCase):
         second = self.replacement_id(resumed)
         self.assertNotEqual(second, resumed)
         self.assertEqual(len(self.calls), 2)
-        # A second silent death on the same node is the end of the automatic budget.
+        # A second settled transport death keeps the same route and advances again.
         (self.root / (second + ".log")).write_text("")
         self.set_status(second, "done", note="dead-runtime-exit", failure_class="runtime")
         self.statuses[second] = dict(verdict="FAIL", completion_proven=False, marker=None, marker_digest=None)
         result = self.start()
-        self.assertEqual(len(self.calls), 2, result)
-        self.assertIn("automatic-replacement-exhausted",
-                      json.dumps(result.get("replacement_attention") or result))
+        self.assertEqual(len(self.calls), 3, result)
+        self.assertEqual(result["state"], "running", result)
+        self.assertEqual(self.rows()[self.replacement_id(second)][1]["automatic_retry_of"], second)
 
     def test_a_crashed_owner_is_replaced_once_only_by_an_explicit_start(self):
         # rt-6c92471ab05995bf: the owner's process exited 70 before any result.
@@ -422,7 +422,7 @@ class CapacityResumeTest(unittest.TestCase):
                                         artifact_root_metadata=str(self.root / "artifacts"))
         self.assertEqual((seen["state"], seen["failure_class"]), ("invalid", "runtime"))
 
-    def test_an_owner_killed_by_a_provider_error_is_replaced_once_by_an_explicit_start(self):
+    def test_provider_errors_have_no_cumulative_replacement_cutoff(self):
         self._provider_error_owner()
         # a supervisor/rewake tick never launches it
         self.assertEqual(R.advance(self.jobs, "att-owner", run=self.launcher,
@@ -437,13 +437,83 @@ class CapacityResumeTest(unittest.TestCase):
         self.assertEqual(self.rows()[first][1]["automatic_retry_of"], "att-owner")
         record = json.loads(self.claims()[0].read_text())
         self.assertEqual((record["proof"]["death_kind"], record["proof"]["note"]), ("runtime", "dead-runtime-error"))
-        self.assertNotIn("after_capacity", record["logical_node"])  # the node's one budget, not a pause
-        # the replacement dies the same way: the budget is spent, nothing more launches
-        self._provider_death(first)
-        for _ in range(2):
+        self.assertNotIn("after_capacity", record["logical_node"])
+        original_claim = self.claims()[0].read_bytes()
+        previous = first
+        for count in range(2, 5):
+            self._provider_death(previous)
             result = self.start()
-            self.assertEqual((len(self.calls), len(self.claims())), (1, 1), result)
-            self.assertIn("automatic-replacement-exhausted", json.dumps(result.get("replacement_attention") or result))
+            self.assertEqual((len(self.calls), len(self.claims())), (count, count), result)
+            self.assertEqual(result["state"], "running", result)
+            successor = self.replacement_id(previous)
+            self.assertNotEqual(successor, previous)
+            # Duplicate start observes that exact successor; it launches nobody.
+            self.start()
+            self.assertEqual(len(self.calls), count)
+            previous = successor
+        self.assertIn(original_claim, [path.read_bytes() for path in self.claims()])
+
+    def test_old_exhaustion_resumes_same_route_and_keeps_plan_for_all_harnesses(self):
+        native_errors = {
+            "codex": [{"type": "dispatch.supervisor.turn.failed", "codex_error_info": "serverOverloaded",
+                       "message": "Selected model is at capacity. Please try a different model."},
+                      {"type": "dispatch.supervisor.terminal", "terminal": {
+                       "note": "dead-runtime-error", "failure_class": "runtime", "process_exit": "70"}}],
+            "claude": [{"type": "result", "session_id": "s", "is_error": True,
+                        "subtype": "error_during_execution", "api_error_status": 503,
+                        "result": "Provider unavailable"}],
+            "opencode": [json.loads(self.PROVIDER_504)],
+        }
+        plan = self.root / "completed-plan.md"
+        plan.write_bytes(b"completed original plan\n")
+        reused = {"node": "plan", "attempt_id": "att-plan", "marker_digest": "sha256:plan"}
+        for harness, events in native_errors.items():
+            with self.subTest(harness=harness):
+                self.calls.clear(); self.statuses.clear()
+                self.reseed(note="dead-runtime-error", failure_class="runtime", harness=harness)
+                self.route["selection_pins"] = {"owner": {"harness": harness}, "worker": {"harness": harness}}
+                self.path.write_text(json.dumps(self.route))
+                route_bytes = self.path.read_bytes()
+                self.route["work_request"]["owner_harness"] = harness
+                previous = "att-owner"
+                history = []
+                with mock.patch.object(R, "_reuse_snapshot", return_value={
+                        "completed": [reused], "cycle_id": "cyc", "producer_id": "prod", "gates": []}):
+                    for count in range(1, 5):
+                        log = self.root / (previous + ".log")
+                        log.write_text("".join(json.dumps(row) + "\n" for row in events))
+                        self.set_status(previous, "done", note="dead-runtime-error", failure_class="runtime",
+                                        process_exit="70")
+                        self.statuses[previous] = dict(verdict="FAIL", completion_proven=False,
+                                                      marker=None, marker_digest=None)
+                        if count == 2:
+                            # Reproduce the durable old-version attention without
+                            # editing or deleting it during the upgraded start.
+                            R.exhausted_attention(self.jobs, previous, self.rows()[previous][1])
+                            history = [(path, path.read_bytes()) for path in
+                                R._directory(self.jobs).joinpath("attention").rglob("*.json")]
+                        with mock.patch.object(R, "ROOT", self.root / "installed-new-release"):
+                            result = self.start()
+                        self.assertEqual(result["state"], "running", result)
+                        self.assertEqual((len(self.calls), len(self.claims())), (count, count))
+                        successor = self.replacement_id(previous)
+                        row = self.rows()[successor][1]
+                        self.assertEqual((row["harness"], row["model_profile"]), (harness, "deep"))
+                        self.assertEqual(row["route_id"], "rt-cap")
+                        claim = json.loads(R._record_path(self.jobs, row["replacement_family_id"]).read_text())
+                        self.assertEqual(claim["reuse"]["completed"], [reused])
+                        self.assertTrue(all(path.read_bytes() == data for path, data in history))
+                        self.assertEqual(plan.read_bytes(), b"completed original plan\n")
+                        self.assertEqual(self.path.read_bytes(), route_bytes)
+                        previous = successor
+                # An owner's content FAIL still waits for a correction, regardless
+                # of how many infrastructure replacements preceded it.
+                self.set_status(previous, "done", note="dead-worker-fail", failure_class="fail")
+                self.statuses[previous] = dict(verdict="FAIL", completion_proven=False,
+                                              marker=None, marker_digest=None)
+                result = self.start()
+                self.assertEqual(result["reason"], "owner-failed", result)
+                self.assertEqual(len(self.calls), 4)
 
     def test_a_provider_error_owner_with_a_live_or_unknown_child_is_not_replaced(self):
         for child_state, settles in ((("live", "attempt-descendant-live", 99), True),
