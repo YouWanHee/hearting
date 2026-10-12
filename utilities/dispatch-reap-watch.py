@@ -28,6 +28,7 @@ from dispatch_contract import (
     process_start_ticks,
     foreground_review_eligible,
     _foreground_outcome_values_from_pipe,
+    _terminal_cleanup_values,
 )
 from codex_dispatch_terminal import terminal_envelope_observed
 from dispatch_completion_join import (
@@ -251,16 +252,21 @@ def watch(args: argparse.Namespace) -> int:
         time.sleep(drain_interval)
         drain_interval = min(args.drain_interval_max, drain_interval * 2)
 
-    annotated = annotate_attempt_row(
-        args.jobs,
-        args.attempt_id,
-        {
-            "launch_outcome": "governed-process-group-drained",
-            "group_reap_proof": GROUP_REAP_PROOF,
-            "group_reap_pgid": str(args.pgid),
-            **descendant_proof,
-            "attempt_descendant_observer_ns": metadata["pid_observer_ns"],
-        },
+    drain_values = {
+        "launch_outcome": "governed-process-group-drained",
+        "group_reap_proof": GROUP_REAP_PROOF,
+        "group_reap_pgid": str(args.pgid),
+        **descendant_proof,
+        "attempt_descendant_observer_ns": metadata["pid_observer_ns"],
+    }
+    # This is the first drain writer for a result closed before process exit.
+    # Bind full cleanup to the final drain fields in this same exact-row CAS.
+    drain_values.update(_terminal_cleanup_values({**metadata, **drain_values}))
+    annotated = annotate_attempt_row_if(
+        args.jobs, args.attempt_id, drain_values,
+        lambda current: exact_binding(parse_registry_metadata(current[5]), args, current[5])
+                        and launched_attempt_identity(current) == selected_identity,
+        statuses=frozenset({"open", "running", "done", "killed", "cancelled"}),
     )
     if not annotated:
         return 65

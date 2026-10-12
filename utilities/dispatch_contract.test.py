@@ -4445,15 +4445,17 @@ class NormalCleanupSettlementTest(ControlledConsumerTestCase):
    result=D.resolve_attempt_cleanup(self.jobs,self.metadata["attempt_id"],apply=True)
   self.assertFalse(result["settled"])
   self.assertEqual(self.jobs.read_bytes(),original)
-  payload=json.loads(diagnostic.getvalue().splitlines()[0].split("=",1)[1])
-  self.assertEqual(payload["scope"],"guard-time")
-  self.assertEqual(payload["process_group"]["state"],"empty")
-  self.assertEqual(payload["attempt_tagged_descendants"]["reason"],self.denied.reason)
+  self.assertEqual(diagnostic.getvalue(),"")
+  self.assertEqual(result["group_state"],"empty")
+  self.assertEqual(result["descendant_state"],"unverifiable")
   diagnostic=io.StringIO()
   group=D.ProcessGroupObservation("unverifiable",reason="procfs-stat-denied")
   with self.observations(group=group,tag=self.denied),contextlib.redirect_stderr(diagnostic):
    self.assertEqual(D.attempt_process_quiescence(self.metadata,terminal_receipt=True).state,"unverifiable")
-  self.assertIn("procfs-stat-denied",diagnostic.getvalue())
+   payload=D._cleanup_observation_diagnostic(self.metadata,group=group,descendants=self.denied)
+  self.assertEqual(diagnostic.getvalue(),"")
+  self.assertEqual(payload["process_group"]["reason"],"procfs-stat-denied")
+  self.assertEqual(payload["attempt_tagged_descendants"]["reason"],self.denied.reason)
 
  def test_settlement_compare_and_set_rejects_changed_row(self):
   original=self.jobs.read_bytes()

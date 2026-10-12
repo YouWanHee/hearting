@@ -3323,7 +3323,6 @@ def _join_snapshot(
     last_settlement: dict[str, float] = {}
     settlement_backoff: dict[str, dict[str, object]] = {}
     recovery_results: dict[str, dict[str, object]] = {}
-    cleanup_observed: set[str] = set()
     last_observation = float("-inf")
     last_signature = ""
     observation_error = ""
@@ -3374,23 +3373,6 @@ def _join_snapshot(
             completion_state = owner_completion_state(jobs, row.status, row.metadata)
             choice = decide_continuation(action="join", status=row.status, metadata=row.metadata,
                 facts={"observed": observed, "completion": completion_state, "settlement_available": settlement is not None})
-            if (row.status == "done" and choice.state == "ready"
-                    and observed.process_state == "quiescent"
-                    and row.metadata.get("registered_worker") == "1"
-                    and (settlement is not None or recovery is not None)
-                    and row.attempt_id not in cleanup_observed):
-                # The ordinary ready path also owns cleanup preservation.
-                # Keep the existing producer/CAS and committed judgment; a
-                # missing full proof adds no readiness gate or retry loop.
-                cleanup_observed.add(row.attempt_id)
-                outcome = resolve_attempt_cleanup(jobs, row.attempt_id, apply=True)
-                recovery_results[row.attempt_id] = outcome
-                current = current_attempt_row(jobs, row.attempt_id)
-                if outcome.get("changed") is True or current != row:
-                    # Receipt commit (or a concurrent row change) requires
-                    # fresh canonical row AND current process observation.
-                    recovered = True
-                    continue
             decision = choice.census["attempt"]
             workflow_pending, workflow_blocked = choice.census["workflow_pending"], choice.census["blocked"]
             if workflow_blocked:
@@ -4250,6 +4232,10 @@ def close_finished_child(
         if choice.next_action != "typed-close":
             return choice.reason
         note, evidence, reason = choice.detail, choice.census, choice.reason
+        if choice.state == "typed":
+            from foreground_terminal import terminal_evidence
+            evidence = {**terminal_evidence(terminal, note, metadata.get("log_file")),
+                        **(evidence or {})}
         if choice.state == "absent":
             missing = missing_result_terminal({**metadata, "worktree": _row_worktree(row),
                                               "started_at": row.raw.split("\t")[0]})

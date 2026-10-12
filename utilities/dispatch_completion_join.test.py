@@ -2109,7 +2109,9 @@ class NormalReadyCleanupJoinTest(unittest.TestCase):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness), self.observations():
                 self.write_row(harness=harness)
+                self.jobs.write_text(self.jobs.read_text().replace("\tdone\t", "\topen\t", 1))
                 original = JOIN.current_attempt_row(self.jobs, "att-ready")
+                self.assertTrue(D.close_attempt_row(self.jobs, "att-ready", "completed-review-blocking"))
                 marker = self.root / "marker.json"
                 history = self.root / "history.jsonl"
                 marker.write_bytes(b'original marker\n')
@@ -2123,7 +2125,7 @@ class NormalReadyCleanupJoinTest(unittest.TestCase):
                     self.assertEqual(record["receipt_type"], "attempt-cleanup-v1")
                     self.assertEqual(record["proof_source"], "exact-teardown")
                     self.assertTrue(record["namespace_authority"])
-                    self.assertEqual(saved.status, original.status)
+                    self.assertEqual(saved.status, "done")
                     self.assertEqual({k: saved.metadata[k] for k in original.metadata}, original.metadata)
                     sealed = self.jobs.read_bytes()
                     self.assertEqual(self.join()["state"], "ready")
@@ -2148,13 +2150,22 @@ class NormalReadyCleanupJoinTest(unittest.TestCase):
         producer.assert_not_called()
         self.assertEqual(self.jobs.read_bytes(), original)
 
-    def test_unproved_cleanup_adds_no_gate_or_retry_loop(self):
+    def test_unproved_cleanup_adds_no_terminal_gate(self):
+        self.write_row()
+        self.jobs.write_text(self.jobs.read_text().replace("\tdone\t", "\topen\t", 1))
+        with self.observations(tag=self.denied):
+            self.assertTrue(D.close_attempt_row(self.jobs, "att-ready", "completed-review-blocking"))
+        saved = JOIN.current_attempt_row(self.jobs, "att-ready")
+        self.assertEqual(saved.status, "done")
+        self.assertEqual(saved.metadata['failure_class'], 'fail')
+        self.assertNotIn('cleanup_receipt_digest', saved.metadata)
+
+    def test_recovery_ready_join_keeps_previously_published_bytes(self):
         self.write_row()
         original = self.jobs.read_bytes()
-        with self.observations(), mock.patch.object(JOIN, "resolve_attempt_cleanup", return_value={
-                "changed": False, "settled": False, "reason": "cleanup-proof-unavailable"}) as producer:
+        with self.observations(), mock.patch.object(JOIN, "resolve_attempt_cleanup") as producer:
             self.assertEqual(self.join()["state"], "ready")
-        producer.assert_called_once_with(self.jobs, "att-ready", apply=True)
+        producer.assert_not_called()
         self.assertEqual(self.jobs.read_bytes(), original)
 
     def test_changed_binding_is_not_overwritten_and_join_refreshes(self):
@@ -2164,6 +2175,8 @@ class NormalReadyCleanupJoinTest(unittest.TestCase):
             self.jobs.write_text(self.jobs.read_text().replace("pid_start=123", "pid_start=456"))
             return annotate(jobs, attempt, values, predicate, **kwargs)
         with self.observations(), mock.patch.object(D, "annotate_attempt_row_if", side_effect=race):
+            outcome = D.resolve_attempt_cleanup(self.jobs, "att-ready", apply=True)
+            self.assertFalse(outcome["changed"])
             result = self.join()
         self.assertEqual(result["state"], "ready")
         saved = JOIN.current_attempt_row(self.jobs, "att-ready")
@@ -2172,16 +2185,18 @@ class NormalReadyCleanupJoinTest(unittest.TestCase):
 
     def test_live_observation_after_receipt_commit_keeps_join_pending(self):
         self.write_row()
-        producer = D.resolve_attempt_cleanup
+        self.jobs.write_text(self.jobs.read_text().replace("\tdone\t", "\topen\t", 1))
+        producer = D._terminal_cleanup_values
         live = D.ProcessGroupObservation("populated", ((42, "901", "S"),))
         with self.observations() as stack:
             tags = stack.enter_context(mock.patch.object(D, "attempt_tagged_descendants", return_value=self.empty))
             def commit(*args, **kwargs):
                 outcome = producer(*args, **kwargs)
-                self.assertTrue(outcome["changed"], outcome)
+                self.assertIn("cleanup_receipt_digest", outcome)
                 tags.return_value = live
                 return outcome
-            with mock.patch.object(JOIN, "resolve_attempt_cleanup", side_effect=commit):
+            with mock.patch.object(D, "_terminal_cleanup_values", side_effect=commit):
+                self.assertTrue(D.close_attempt_row(self.jobs, "att-ready", "completed-review-blocking"))
                 result = self.join()
         self.assertEqual(result["state"], "timeout", result)
         self.assertEqual(result["children"][0]["readiness"], "pending")

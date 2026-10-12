@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Revision generation selection through the public start path; no model calls."""
+import contextlib
 import importlib.util
 import dataclasses
 import hashlib
@@ -399,6 +400,28 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
             return meta
         self.fail("missing fixture row " + attempt)
 
+    @contextlib.contextmanager
+    def live_fixture_attempt(self, attempt):
+        original = self.jobs.read_bytes()
+        process = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={**self.env, 'AGENT_DISPATCH_ATTEMPT_ID': attempt}, start_new_session=True)
+        try:
+            identity = DC.process_launch_identity(process.pid)
+            self.assertTrue(identity['pid_start'])
+            meta = REPLACEMENT._rows(self.jobs.read_text().splitlines())[attempt][1]
+            remove = tuple(key for key in meta if key.startswith(('cleanup_receipt_', 'group_reap_',
+                'attempt_descendant_')) or key in ('note', 'failure_class', 'launch_outcome'))
+            self.fixture_row(attempt, status='open', remove=remove, **identity)
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                self.assertEqual(DC.attempt_process_quiescence(
+                    REPLACEMENT._rows(self.jobs.read_text().splitlines())[attempt][1]).state, 'live')
+            yield
+        finally:
+            process.stdin.close()
+            process.wait(timeout=5)
+            self.jobs.write_bytes(original)
+
     def replace_owner(self):
         # Synthetic physical owner observation is fixture setup. The correction,
         # immutable inputs, reservation, reciprocal binding and claim are real.
@@ -568,10 +591,15 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.assertEqual((round_two["admitted"], round_two["newly_started"]), (2, 2), round_two)
         self.assertTrue({leg["attempt_id"] for leg in first["legs"]}.isdisjoint(
             {leg["attempt_id"] for leg in round_two["legs"]}))
-        before_duplicate = self.atomic_state()
-        live = self.launch(expected=78, slug="another-display")
-        self.assertEqual(live["reason"], "prior-attempt-still-live")
-        self.assertEqual(self.atomic_state(), before_duplicate)
+        # The real launcher may have already settled a fast fake provider,
+        # especially in a foreground namespace. Seed an unfinished physical
+        # observation using a disposable process with its full actual identity;
+        # claims, generations, inputs and public admission remain production.
+        with self.live_fixture_attempt(round_two['legs'][0]['attempt_id']):
+            before_duplicate = self.atomic_state()
+            live = self.launch(expected=78, slug="another-display")
+            self.assertEqual(live["reason"], "prior-attempt-still-live")
+            self.assertEqual(self.atomic_state(), before_duplicate)
         self.settle(round_two)
         self.assert_selection(round_two)
         settled_rows = self.jobs.read_bytes()

@@ -44,6 +44,7 @@ from dispatch_contract import (
     WRAPPER_TRANSPORTS,
     _atomic_registry_replace,
     _delivery_intent_values,
+    _terminal_cleanup_values,
     _updated_attempt_metadata,
     claim_terminal_route_locked,
     ensure_terminal_claim_absent,
@@ -9575,6 +9576,10 @@ def _complete_node_locked(
                 # edge, so the delivery-intent stamp belongs here, inside the
                 # same registry lock, exactly like the supervisor-closed edges.
                 stamped=parse_registry_metadata(row_fields[5])
+                cleanup=_terminal_cleanup_values(stamped)
+                if cleanup:
+                    row_fields[5] = _updated_attempt_metadata(row_fields[5], cleanup, terminal=True)
+                    stamped=parse_registry_metadata(row_fields[5])
                 intent=_delivery_intent_values(row_fields,stamped)
                 if intent:
                     row_fields[5] += "".join(f",{key}={value}" for key,value in intent.items())

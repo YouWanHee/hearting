@@ -1648,7 +1648,9 @@ def reconcile(rows, args):
         terminal_cleanup = None
         if not only_exact_dead and row["status"] not in OPEN and row.get("attempt_contract_status") == "current":
             terminal_cleanup = resolve_attempt_cleanup(
-                args.jobs, row["meta"]["attempt_id"], apply=args.apply)
+                args.jobs, row["meta"]["attempt_id"],
+                apply=args.apply and attempt_process_quiescence(
+                    row["meta"], terminal_receipt=True).state != "quiescent")
             category = "terminal-settled" if terminal_cleanup["settled"] else "terminal-cleanup-pending"
             reason = terminal_cleanup["reason"]
         closed = False
