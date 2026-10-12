@@ -1247,12 +1247,19 @@ class ReplacementTest(unittest.TestCase):
         original={**self._legacy_row('att-f-original',route,path),'note':'dead-invalid-envelope'}
         retry={**self._legacy_row('att-f-retry',route,path),'automatic_retry_of':'att-f-original'}
         self.write(original);before=self.jobs.read_text().splitlines()
-        self.write(retry,'open',append=True);spawned=self.jobs.read_text().splitlines()
         self.assertIsNone(R.admission(self.jobs,before,retry))    # registration: own row not yet present
-        self.assertIsNone(R.admission(self.jobs,spawned,retry))   # spawn: own row present
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\ttask\t'+','.join(k+'='+v for k,v in retry.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs,retry['attempt_id'],row,launch=False))
+        registered=self.jobs.read_text().splitlines()
+        self.assertIsNone(R.admission(self.jobs,registered,retry))
         second={**retry,'attempt_id':'att-f-second'}
+        self.assertIsNone(R.admission(self.jobs,registered,second))  # neither candidate has claimed a launch
+        self.assertTrue(D.claim_attempt_row(self.jobs,retry['attempt_id'],row,launch=True))
+        spawned=self.jobs.read_text().splitlines()
+        self.assertEqual(R._rows(spawned)[retry['attempt_id']][1]['launch_claimed'],'1')
+        self.assertIsNone(R.admission(self.jobs,spawned,retry))   # spawn: own claimed row is admitted
         with self.assertRaises(D.DispatchContractError) as caught:R.admission(self.jobs,spawned,second)
-        self.assertEqual(caught.exception.reason,'automatic-replacement-exhausted')
+        self.assertEqual(caught.exception.reason,'retry-already-claimed')
 
     # -- an owner stopped at a usage limit: a pause with its own family, never the silent budget ----
     def _owner(self,**changes):
