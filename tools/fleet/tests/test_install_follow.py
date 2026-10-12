@@ -125,18 +125,24 @@ class InstallFollowTest(unittest.TestCase):
         self.assertIsNone(install_follow.read_handoff({}))
 
     def test_viewer_handoff_roundtrip_includes_tuple_fold_keys_and_order(self):
-        names = ("_OFFSET", "_PROCESS_VIEW", "_SHOW_ALL", "_ROUTE_FOLD", "_SELECT_MODE",
-                 "_CURSOR_ID", "_RESUME_ORDER", "_RELOAD_FRAME", "_LAYOUT", "_SHELL_TTY_MODE")
+        names = ("_OFFSET", "_PROCESS_VIEW", "_SHOW_ALL", "_ROUTE_FOLD", "_REPO_FOLD",
+                 "_SELECT_MODE", "_CURSOR_ID", "_RESUME_ORDER", "_RELOAD_FRAME",
+                 "_RELOAD_LAYOUT", "_LAYOUT", "_SHELL_TTY_MODE")
         saved = {key: getattr(render, key) for key in names}
         self.addCleanup(lambda: [setattr(render, key, value) for key, value in saved.items()])
         render._OFFSET, render._PROCESS_VIEW, render._SHOW_ALL = 12, True, True
         render._LAYOUT = "stack"
         render._ROUTE_FOLD = {("gpu-commands", "host", 0): False, "route:one": True}
+        render._REPO_FOLD = {"alpha": True, "beta": False}
         render._SELECT_MODE, render._CURSOR_ID = True, (12, "start")
         order = render._LiveOrderState()
         order.groups, order.group_tiers = ["beta", "alpha"], {"beta": 0, "alpha": 0}
         order.sessions = {"beta": [("codex", "sid", 12)]}
         render._RELOAD_FRAME = [[("cached", "dim")]]
+        render._RELOAD_LAYOUT = {"schema_version": 1, "width": 120, "process_view": True,
+                                 "layout": "stack", "fixed_end": 2, "body_start": 2,
+                                 "body_end": 3, "legend_start": 3,
+                                 "fixed_priorities": {"0": 0, "1": 1}}
         handoff = json.loads(json.dumps(render.viewer_state(order)))
         render.reset_scroll()
         render._ROUTE_FOLD = {}
@@ -146,10 +152,12 @@ class InstallFollowTest(unittest.TestCase):
         self.assertTrue(render._SHOW_ALL)
         self.assertEqual(render._LAYOUT, "stack")
         self.assertFalse(render._ROUTE_FOLD[("gpu-commands", "host", 0)])
+        self.assertEqual(render._REPO_FOLD, {"alpha": True, "beta": False})
         self.assertEqual(render._CURSOR_ID, (12, "start"))
         self.assertEqual(render._RESUME_ORDER.groups, ["beta", "alpha"])
         self.assertEqual(render._RESUME_ORDER.sessions, order.sessions)
         self.assertEqual(render._RELOAD_FRAME, [[("cached", "dim")]])
+        self.assertEqual(render._RELOAD_LAYOUT["body_start"], 2)
 
     def test_real_exec_keeps_pid_argv_registry_and_restores_stderr(self):
         self.activate(self.new)
@@ -228,18 +236,40 @@ class InstallFollowTest(unittest.TestCase):
         self.addCleanup(setattr, render, "_RELOAD_FRAME", render._RELOAD_FRAME)
         self.addCleanup(setattr, render, "_RELOAD_FRAME_AT", render._RELOAD_FRAME_AT)
         self.addCleanup(setattr, render, "_RELOAD_FRAME_COMPUTE_AT", render._RELOAD_FRAME_COMPUTE_AT)
+        self.addCleanup(setattr, render, "_RELOAD_LAYOUT", render._RELOAD_LAYOUT)
         self.addCleanup(setattr, render, "_SELECT_MODE", render._SELECT_MODE)
         render._SELECT_MODE = False
         render._OFFSET = 12
         render._RELOAD_FRAME = [[("line %d" % n, "dim")] for n in range(60)]
         render._RELOAD_FRAME_AT = render.time.monotonic()
         render._RELOAD_FRAME_COMPUTE_AT = render._COMPUTE_HOSTS_SET_AT
+        render._RELOAD_LAYOUT = {"schema_version": 1, "width": 100, "process_view": False,
+                                 "layout": render._layout_mode(100), "fixed_end": 0,
+                                 "body_start": 0, "body_end": 60, "legend_start": 60,
+                                 "fixed_priorities": {}}
         screen = mock.Mock()
         screen.getmaxyx.return_value = 24, 100
         with mock.patch.object(render, "_build_lines", side_effect=AssertionError("fresh loading")), \
              mock.patch.object(render, "_addline"), mock.patch.object(render.curses, "doupdate"):
             render._draw(screen, [], [], "both", 0, loading=True)
         self.assertEqual(render._OFFSET, 12)
+        self.assertFalse(render._HIT_VALID)
+        self.assertFalse(render._CLICK_ROWS)
+
+    def test_legacy_cached_frame_without_layout_metadata_is_rebuilt(self):
+        self.addCleanup(setattr, render, "_RELOAD_FRAME", render._RELOAD_FRAME)
+        self.addCleanup(setattr, render, "_RELOAD_FRAME_AT", render._RELOAD_FRAME_AT)
+        self.addCleanup(setattr, render, "_RELOAD_LAYOUT", render._RELOAD_LAYOUT)
+        render._RELOAD_FRAME = [[("legacy cached", "dim")]]
+        render._RELOAD_FRAME_AT = render.time.monotonic()
+        render._RELOAD_LAYOUT = None
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = 24, 100
+        with mock.patch.object(render.curses, "doupdate"), \
+                mock.patch.object(render, "_addline"):
+            render._draw(screen, [], [], "both", 0, loading=True)
+        self.assertNotEqual(render._RELOAD_FRAME, [[("legacy cached", "dim")]])
+        self.assertTrue(render._HIT_VALID)
 
     def test_curses_loop_defers_restart_for_input_confirmation_and_pending_kill(self):
         for blocked in ('key', 'prompt', 'kill', None):
@@ -272,6 +302,137 @@ class InstallFollowTest(unittest.TestCase):
                      mock.patch.object(render.curses, 'curs_set'):
                     self.assertEqual(render._loop(screen, collector, None, 'both', 2), 0)
                 self.assertEqual(collector.install_follower.restart.call_count, 0 if blocked else 1)
+
+    def test_curses_loop_waits_for_decoder_input_and_resumes_follow_after_expiry(self):
+        for buffered, expected_restarts in ((True, 1), (False, 1)):
+            with self.subTest(buffered=buffered):
+                names = ("_PROMPT", "_PENDING_KILL", "_SELECT_MODE", "_RESUME_ORDER", "_BLINK_ON")
+                saved = {key: getattr(render, key) for key in names}
+                self.addCleanup(lambda saved=saved: [setattr(render, k, v) for k, v in saved.items()])
+                render._PROMPT = None
+                render._PENDING_KILL = None
+                render._SELECT_MODE = False
+                collector = mock.Mock()
+                collector.compute_hosts_refresh = None
+                collector.install_follower.target.return_value = self.new
+                collector.restart_argv = []
+                screen = mock.Mock()
+                screen.getmaxyx.return_value = 24, 100
+                screen.getch.side_effect = [-1, -1, ord("q")]
+                reader = mock.Mock()
+                reader.read.side_effect = lambda stdscr: (stdscr.getch(), None)
+                reader.has_buffered_input.side_effect = [buffered, False]
+
+                def pump(_producer, *_args, **kwargs):
+                    value = mock.Mock()
+                    if kwargs.get("name") == "fleet-install-refresh":
+                        value.poll.side_effect = [(1, self.new), None, None]
+                    else:
+                        value.poll.return_value = None
+                    return value
+
+                with mock.patch.dict(os.environ, {"FLEET_MOUSE": "1"}), \
+                     mock.patch.object(render, "_CursesInput", return_value=reader), \
+                     mock.patch.object(render, "RefreshPump", side_effect=pump), \
+                     mock.patch.object(render, "_draw"), mock.patch.object(render, "_init_colors"), \
+                     mock.patch.object(render, "set_refresh_health"), \
+                     mock.patch.object(render, "_poll_pending_kill"), \
+                     mock.patch.object(render.curses, "curs_set"):
+                    self.assertEqual(render._loop(screen, collector, None, "both", 2), 0)
+                self.assertEqual(collector.install_follower.restart.call_count, expected_restarts)
+
+    def test_curses_loop_drains_ready_key_before_install_follow_restart(self):
+        names = ("_PROMPT", "_PENDING_KILL", "_SELECT_MODE", "_RESUME_ORDER", "_BLINK_ON")
+        saved = {key: getattr(render, key) for key in names}
+        self.addCleanup(lambda: [setattr(render, key, value) for key, value in saved.items()])
+        render._PROMPT = None
+        render._PENDING_KILL = None
+        render._SELECT_MODE = False
+        collector = mock.Mock()
+        collector.compute_hosts_refresh = None
+        collector.install_follower.target.return_value = self.new
+        collector.restart_argv = []
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = 24, 100
+        screen.getch.side_effect = [-1, ord("q")]
+        reader = mock.Mock()
+        reader.read.side_effect = [(ord("z"), None), (-1, None), (ord("q"), None)]
+        reader.has_buffered_input.return_value = False
+
+        def pump(_producer, *_args, **kwargs):
+            value = mock.Mock()
+            value.poll.return_value = ((1, self.new)
+                                       if kwargs.get("name") == "fleet-install-refresh" else None)
+            return value
+
+        with mock.patch.dict(os.environ, {"FLEET_MOUSE": "1"}), \
+             mock.patch.object(render, "_CursesInput", return_value=reader), \
+             mock.patch.object(render, "RefreshPump", side_effect=pump), \
+             mock.patch.object(render, "_draw"), mock.patch.object(render, "_init_colors"), \
+             mock.patch.object(render, "set_refresh_health"), \
+             mock.patch.object(render, "_poll_pending_kill"), \
+             mock.patch.object(render.curses, "curs_set"):
+            self.assertEqual(render._loop(screen, collector, None, "both", 2), 0)
+        self.assertEqual(collector.install_follower.restart.call_count, 1)
+        self.assertEqual(reader.read.call_count, 3)
+
+    def test_native_resize_tail_cannot_quit_or_restart_before_consumption_or_expiry(self):
+        for finish_code, finish_time in ((ord("M"), 0.18), (-1, 0.201)):
+            with self.subTest(finish_code=finish_code):
+                names = ("_PROMPT", "_PENDING_KILL", "_SELECT_MODE", "_RESUME_ORDER",
+                         "_BLINK_ON", "_OFFSET", "_CURSOR_ID", "_HIT_VALID")
+                saved = {key: getattr(render, key) for key in names}
+                self.addCleanup(lambda saved=saved: [setattr(render, k, v)
+                                                     for k, v in saved.items()])
+                render._PROMPT = None
+                render._PENDING_KILL = None
+                render._SELECT_MODE = False
+                collector = mock.Mock()
+                collector.compute_hosts_refresh = None
+                collector.install_follower.target.return_value = self.new
+                collector.restart_argv = []
+                inputs = [(0.0, byte) for byte in b"\x1b[<"] + [
+                    (0.04, render.curses.KEY_RESIZE), (0.05, ord("q")),
+                    (0.10, -1), (0.15, render.curses.KEY_RESIZE),
+                    (finish_time, finish_code), (0.30, ord("q"))]
+                clock = [0.0]
+                read_count = [0]
+                screen = mock.Mock()
+                screen.getmaxyx.return_value = 24, 100
+
+                def getch():
+                    tick, code = inputs[read_count[0]]
+                    read_count[0] += 1
+                    clock[0] = tick
+                    return code
+
+                screen.getch.side_effect = getch
+                reader = render._CursesInput(render.curses)
+                restarts = []
+                collector.install_follower.restart.side_effect = (
+                    lambda *_args, **_kwargs: restarts.append(
+                        (read_count[0], reader.has_buffered_input())))
+
+                def pump(_producer, *_args, **kwargs):
+                    value = mock.Mock()
+                    if kwargs.get("name") == "fleet-install-refresh":
+                        value.poll.side_effect = [(1, self.new)] + [None] * len(inputs)
+                    else:
+                        value.poll.return_value = None
+                    return value
+
+                with mock.patch.dict(os.environ, {"FLEET_MOUSE": "1"}), \
+                     mock.patch.object(render.time, "monotonic", side_effect=lambda: clock[0]), \
+                     mock.patch.object(render, "_CursesInput", return_value=reader), \
+                     mock.patch.object(render, "RefreshPump", side_effect=pump), \
+                     mock.patch.object(render, "_draw"), mock.patch.object(render, "_init_colors"), \
+                     mock.patch.object(render, "set_refresh_health"), \
+                     mock.patch.object(render, "_poll_pending_kill"), \
+                     mock.patch.object(render.curses, "curs_set"):
+                    self.assertEqual(render._loop(screen, collector, None, "both", 2), 0)
+                # The embedded q was consumed; only the final real keyboard q exits.
+                self.assertEqual(read_count[0], len(inputs))
+                self.assertEqual(restarts, [(len(inputs) - 1, False)])
 
 
 if __name__ == "__main__":
