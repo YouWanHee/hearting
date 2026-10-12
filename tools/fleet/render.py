@@ -6035,15 +6035,18 @@ def _gpu_session_label(owner, sessions=None):
     return ((name or key[0]) + " " + short if tag else name or key[0]), short
 
 
-def _gpu_lease_segs(lease, sessions=None, processes=None):
+def _gpu_lease_segs(lease, sessions=None, processes=None, compact=False):
     """Owner, start and task of one reservation; the tag is the current one."""
     if processes is None:
-        label, _short = _gpu_session_label(lease.get("owner"), sessions)
+        label, short = _gpu_session_label(lease.get("owner"), sessions)
+        if compact:
+            label = short
     else:
         keys = dict.fromkeys(_gpu_process_session_key(process) for process in processes)
         owners = ({"kind": "session", "harness": key[0], "id": key[1]} if key else None
                   for key in keys)
-        label = " / ".join(_gpu_session_label(owner, sessions)[0] for owner in owners)
+        label = " / ".join(_gpu_session_label(owner, sessions)[1 if compact else 0]
+                           for owner in owners)
     started = lease.get("started_at")
     when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
     task = _gpu_safe_text(_readable_name(lease.get("task") or lease.get("run_id") or "?"))
@@ -6107,6 +6110,11 @@ def _gpu_run_rows(gpu, indent, width, sessions=None):
         row = [(indent + "  ", None), ("↳ ", "dim")] + _gpu_lease_segs(lease, sessions, matched)
         more = [(" +%d" % (len(matched) - 1), "dim")] if len(matched) > 1 else []
         room = _gpu_command_room(row + more, width) - _dw(" · ")
+        if room < _GPU_RUN_COMMAND_MIN_W:
+            # An optional long alias cannot displace the observed command.
+            row = ([(indent + "  ", None), ("↳ ", "dim")]
+                   + _gpu_lease_segs(lease, sessions, matched, compact=True))
+            room = _gpu_command_room(row + more, width) - _dw(" · ")
         if room >= _GPU_RUN_COMMAND_MIN_W:
             row += [(" · ", "dim"),
                     (_gpu_clip_command(_gpu_command_text(matched[0], ambiguous), room), "dim")]

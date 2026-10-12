@@ -147,6 +147,16 @@ class GPUSessionLabelsTest(unittest.TestCase):
         self.assertIn("미귀속", line)
         self.assertNotIn("idle", line)
 
+    def test_long_expanded_alias_keeps_exact_tag_and_observed_script(self):
+        render._ROUTE_FOLD = {render._GPU_FOLD_ALL: False}
+        self.gpu["reservations"] = [{"pid": 700, "owner": owner(),
+                                    "started_at": 1728000000, "task": "training detail"}]
+        line = self.rows([session(name="사용자가 지정한 긴 별칭 " * 40)])[3]
+        self.assertIn("[a1]", line)
+        self.assertIn("train_beta0.py", line)
+        self.assertIn("--epochs 99", line)
+        self.assertLessEqual(render._dw(line), 199)
+
     def test_stale_observation_keeps_existing_expiry_and_never_rewrites_snapshot(self):
         before = copy.deepcopy(self.snapshot)
         with mock.patch.object(render.time, "monotonic", return_value=10):
