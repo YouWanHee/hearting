@@ -603,3 +603,7 @@ Use neutral names for new cross-tool concepts:
 | role profile | Claude-only Agent semantics |
 | model role | vendor model names as portable semantics |
 | adapter | tool-specific bootstrap |
+
+Settled terminal history is read from exact immutable transaction identities, not
+from current launch eligibility. Root movement and cleaned cwd leave it settled.
+Current publication, goal, process and cleanup obligations remain independent.

@@ -117,7 +117,8 @@ terminal. A graph that breaks this is refused at `capability-route.py compile`
 and at launch.
 
 <!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Do not end a turn while a tracked workflow has a non-terminal stage with no registered continuation. Before the turn ends, either the continuation is registered (supervisor armed via `utilities/workflow-supervisor.py arm|poll|watch|status|complete`, next stage dispatched, human gate recorded, or monitor armed) or the same turn states plainly that automatic follow-up is impossible and names the checked fallback the user can run. Report state from PID identity, sentinel/exit evidence, log modification time, and declared artifacts, never from a registry status word alone.
+Keep unfinished tracked work in this turn or its existing registered continuation; when automatic follow-up is unsupported, state the checked fallback. Report PID/start, exit/log and artifact evidence.
+On completion, read the exact result and perform approved parent review/follow-through now or through that continuation. Receipt/queue/ACK is not execution; report actual chronology. Reply before processing an actionable peer request; no-reply notices need no reply. After reading a handoff card/docs, accept with `utilities/session_tidy.py handoff accept <ref>`.
 <!-- END generated from core/fragments/bootstrap-continuation.md -->
 
 `OPERATIONS §5.12` owns the mechanics.

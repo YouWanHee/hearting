@@ -3477,7 +3477,7 @@ class NextLegReceiptTest(unittest.TestCase):
         with mock.patch("dispatch_terminal_commit.owner_completion_state", return_value=settled):
             self.assertIsNone(JOIN._completed_next_leg(jobs, "owner"))      # no plan, no key
 
-    def test_the_followup_text_names_the_command_as_information_not_an_instruction(self):
+    def test_approved_next_leg_requires_actual_parent_followthrough(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         jobs = Path(tmp.name) / "jobs.log"
         jobs.write_text(row("done", "owner", "parent", "task", process_metadata={
@@ -3487,7 +3487,8 @@ class NextLegReceiptTest(unittest.TestCase):
         text = JOIN.completion_followup_text(receipt, jobs=str(jobs), surface="/fixture/preflight.sh")
         self.assertIn("requested work is complete", text)
         self.assertIn(self.NEXT_LEG["compose_command"], text)
-        self.assertIn("nothing starts the next leg for you", text)
+        self.assertIn("If this next leg is already approved, execute it in this turn", text)
+        self.assertIn("Receipt, queue consumption and ACK are not execution", text)
         plain = JOIN.completion_followup_text({"children": [{"attempt_id": "owner", "required_action": "advance-completed"}]},
                                               jobs=str(jobs), surface="/fixture/preflight.sh")
         self.assertNotIn("next leg", plain)

@@ -5338,7 +5338,8 @@ def _earlier_documents(root: Path, cycle_id: str, document: Mapping[str, Any]) -
 
 def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
                                 expected_binding: Optional[Mapping[str, Any]] = None,
-                                expected_manifest_digest: Optional[str] = None) -> Dict[str, Any]:
+                                expected_manifest_digest: Optional[str] = None, *,
+                                historical: bool = False) -> Dict[str, Any]:
     """Prove a closed cycle's record, current manifest and index agree (§45 D-127).
 
     What is checked is identity and consistency: the cycle record, the current
@@ -5374,7 +5375,15 @@ def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
     if raw != canonical or digest != record.get("manifest_digest"):
         raise ProducerError("already-sealed-mismatch", "manifest")
     identity = artifact_lifecycle.read_root_identity(root)
-    index = artifact_admission.load_index(root)
+    if historical:
+        # load_index's missing-index fallback allocates a root identity.
+        # Observation must refuse missing/corrupt index bytes without repair.
+        payload = _read_json(artifact_admission._index_path(root))
+        if payload is None:
+            raise ProducerError("already-sealed-mismatch", "index-missing")
+        index = artifact_index._parse_owned(payload)
+    else:
+        index = artifact_admission.load_index(root)
     row = index.manifests.get(record["cycle_id"]) if hasattr(index, "manifests") else None
     if not isinstance(row, dict) or row.get("manifest_digest") != digest:
         raise ProducerError("already-sealed-mismatch", "index")
@@ -5404,6 +5413,36 @@ def _verify_sealed_cycle_locked(root: Path, record: Mapping[str, Any],
         # copy proves it existed; with none (the cycle changed before it was
         # first observed), the caller's own terminal record is the proof.
         updated_since = True
+    if historical:
+        # The exact outcome/event seals the past. Do not re-enter live route
+        # admission (cwd, evidence payload or producer refresh) to observe it.
+        rows = [r for r in document.get("routes", [])
+                if r.get("route_id") == (expected_binding or {}).get("route_id")]
+        if len(rows) != 1 or rows[0].get("route_hash") != expected_binding.get("route_hash"):
+            raise ProducerError("already-sealed-mismatch", "historical-route")
+        route_path = route_lineage.canonical_route_path(root, rows[0]["route_id"])
+        route = json.loads(route_path.read_text())
+        if (route.get("route_hash") != route_identity.route_hash(route)
+                or route.get("route_id") != rows[0]["route_id"] or route.get("route_hash") != rows[0]["route_hash"]):
+            raise ProducerError("already-sealed-mismatch", "historical-route-identity")
+        outcome_path = artifact_lifecycle.canonical_outcome_path(root, rows[0]["route_id"])
+        outcome = json.loads(outcome_path.read_text())
+        marker_digest = artifact_lifecycle._marker_digest(dispatch_terminal_commit._route_module(), route,
+            recorded=True, recorded_gates=outcome.get("terminal_gates"))
+        events = [e for e in document.get("events", [])
+                  if e.get("event_id") == rows[0].get("terminal_evidence_id")]
+        payload = {"artifact_root_id": identity.artifact_root_id,
+            "route_id": rows[0]["route_id"], "route_hash": rows[0]["route_hash"],
+            "outcome_digest": artifact_lifecycle._sha256_path(outcome_path),
+            "terminal_marker_digest": marker_digest}
+        if (document.get("cycle", {}).get("state") != "completed"
+                or rows[0].get("terminal_marker") != marker_digest or len(events) != 1
+                or events[0].get("event_type") != "route.terminal.recorded"
+                or events[0].get("target_id") != record["cycle_id"] or events[0].get("payload") != payload
+                or not artifact_manifest.validate_update(document,
+                    preserved=_earlier_documents(root, record["cycle_id"], document), published=True).ok):
+            raise ProducerError("already-sealed-mismatch", "historical-completion-evidence")
+        return {"status": "already-sealed", "cycle_id": record["cycle_id"], "manifest_digest": digest}
     manifest_route_file, _manifest_route = resolve_cycle_manifest_route(
         root, record, document, route_id=(expected_binding or {}).get("route_id"))
     if document.get("cycle", {}).get("state") == "completed":
@@ -6920,6 +6959,25 @@ def _verify_deleted_cycle(record: Mapping[str, Any], expected_binding: Optional[
     if digest:
         result["manifest_digest"] = digest
     return result
+
+
+def observe_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
+                            expected_manifest_digest: Optional[str] = None):
+    """Pure historical reader: no admission lock, refresh or producer writes.
+
+    In-flight inconsistent revisions fail conservatively and can be read again.
+    Writers retain their locked verification boundary.
+    """
+    root = Path(root).resolve()
+    if _live_review_lease(root, cycle_id) is not None:
+        raise ProducerError("cycle-finalize-blocked-live-review", cycle_id)
+    record = read_cycle_record(root, cycle_id)
+    if record is None:
+        raise ProducerError("cycle-unknown", cycle_id)
+    if record.get("deleted_at"):
+        return _verify_deleted_cycle(record, expected_binding, expected_manifest_digest)
+    return _verify_sealed_cycle_locked(root, record, expected_binding,
+                                      expected_manifest_digest=expected_manifest_digest, historical=True)
 
 
 def verify_finalized_cycle(root: Path, *, cycle_id: str, expected_binding: Mapping[str, Any],
