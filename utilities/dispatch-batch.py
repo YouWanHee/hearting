@@ -2281,6 +2281,7 @@ def main(argv: list[str] | None = None) -> int:
         # `len(prior)+1 > max_round` comparison.
         planned_revision_nodes: set[str] = set()
         round_admissions = {}
+        replay_budget_errors = []
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
             if not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(capped_node):
@@ -2307,12 +2308,26 @@ def main(argv: list[str] | None = None) -> int:
                     f"round={budget.next_round} max_round={budget.cap}",
                     route_node=capped_node_id)
                 error.next_action, error.retry_when = choice.next_action, choice.retry_when
-                raise error
-        # Only an unmet group opens a new round. A successful group replay
-        # retains its sealed attempts and spends no fresh capacity.
-        historical_batch_attempts = (frozenset().union(*(
-            admission.prior_attempt_ids for admission in round_admissions.values()
-        )) if any(admission.gate_unmet for admission in round_admissions.values()) else frozenset())
+                # Exhaustion can still return an exact successful group. All
+                # identity/input/readiness checks below must prove that replay
+                # before any reservation or input publication. Other refusals
+                # (especially live/unsettled) keep their original priority.
+                if (args.action == "start" and budget.state == "exhausted"
+                        and not admission.requires_next_round):
+                    replay_budget_errors.append(error)
+                else:
+                    raise error
+        next_generation = any(admission.requires_next_round
+                              for admission in round_admissions.values())
+        if next_generation and replay_budget_errors:
+            raise replay_budget_errors[0]
+        # One admission-selected exclusion feeds both raw history readers.
+        # Replay retains current physical members (and their original manifest).
+        historical_batch_attempts = frozenset().union(*(
+            admission.physical_attempt_ids - (frozenset() if next_generation
+                                             else admission.current_attempt_ids)
+            for admission in round_admissions.values()
+        ))
         prior_input = None if partial is not None else prior_batch_input(
             jobs, route, nodes, args.parallel_group,
             os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
@@ -2696,6 +2711,12 @@ def main(argv: list[str] | None = None) -> int:
                 results.append(existing)
     except BatchError as exc:
         return fail(exc.reason, 73, detail=exc.detail, admitted=0, spawned=0)
+
+    if replay_budget_errors and (pending_legs or len(results) != len(legs)
+            or any(result.get("reason") != "existing-completed-attempt" for result in results)):
+        error = replay_budget_errors[0]
+        return fail(error.reason, 65, detail=error.detail, admitted=0, spawned=0,
+                    next_action=error.next_action, retry_when=error.retry_when)
 
     if partial is not None and (
         len(pending_legs) > 1

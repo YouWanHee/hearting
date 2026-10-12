@@ -946,7 +946,7 @@ class DispatchBatchTest(unittest.TestCase):
             "changed-display", "changed-owner-label", "att-parent-fixture", "codex", 1,
             review_round=2))
 
-    def _same_owner_next_review_round(self, prompt, parent_harness):
+    def _same_owner_next_review_round(self, prompt, parent_harness, *, notes=None, one_sided_revision=False):
         # Use the lab's actual review kinds/units and derived alternative id.
         # Only launch/process boundaries are faked; admission, both sealed
         # inputs, attempt matching and the round census run for real.
@@ -954,7 +954,8 @@ class DispatchBatchTest(unittest.TestCase):
         self._configure_lab_review()
         assignments = self.common_patches()[1]
         for index, leg in enumerate(self.legs()):
-            self.write_existing(leg, status="done", note="completed-review-blocking", append=index != 0)
+            self.write_existing(leg, status="done",
+                note=notes[index] if notes else "completed-review-blocking", append=index != 0)
         self.seal_original_input()
         original_rows = self.jobs.read_bytes()
         source = BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
@@ -970,6 +971,11 @@ class DispatchBatchTest(unittest.TestCase):
                 communicate=lambda: (success_receipt(command), ""), poll=lambda: 0)
 
         with contextlib.ExitStack() as stack:
+            if one_sided_revision:
+                # The canonical reader's proved supersession affects one leg;
+                # batch must still apply its existing full-group round policy.
+                stack.enter_context(mock.patch.object(BATCH.DISPATCH_NODE.ROUTE,
+                    "_dependency_revisions", return_value=[{"supersedes": [self.legs()[0]["attempt_id"]]}]))
             for name, value in (("load_route", self.route), ("resolve_agent_home", self.base),
                                 ("resolve_global_registry", SimpleNamespace(path=self.jobs)),
                                 ("assign_harnesses", (assignments, "cross-harness", {})),
@@ -1050,6 +1056,14 @@ class DispatchBatchTest(unittest.TestCase):
 
     def test_same_owner_next_review_round_works_for_opencode_parent(self):
         self._same_owner_next_review_round("closure check after fixes", "opencode")
+
+    def test_mixed_pass_fail_opens_the_group_without_reclassifying_pass(self):
+        self._same_owner_next_review_round("mixed verdict correction", "codex",
+            notes=("completed-marker", "completed-review-blocking"))
+
+    def test_one_sided_supersession_opens_a_full_group_generation(self):
+        self._same_owner_next_review_round("one superseded peer", "claude",
+            notes=("completed-marker", "completed-marker"), one_sided_revision=True)
 
     def test_group_requires_two_to_four_depth_two_nodes_with_same_dependencies(self):
         self.assertEqual(
@@ -4075,10 +4089,11 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
                         node_id = inner_argv[inner_argv.index("--route-node") + 1]
                         captured[node_id] = list(inner_argv)
                         recovery_context[node_id] = kw["env"].get("AGENT_DISPATCH_RETRY_BRIEF", "")
-                    return subprocess.CompletedProcess(inner_argv, 0, stdout="", stderr="")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="", received_signal=None)
 
                 with mock.patch.dict(os.environ, leg_env, clear=True), \
                      mock.patch.object(sys, "argv", ["dispatch-node.py"] + command[2:]), \
+                     mock.patch.object(BATCH.DISPATCH_NODE, "run_forwarding_termination", side_effect=fake_inner_run), \
                      mock.patch.object(BATCH.DISPATCH_NODE.subprocess, "run", side_effect=fake_inner_run):
                     try:
                         BATCH.DISPATCH_NODE.main()

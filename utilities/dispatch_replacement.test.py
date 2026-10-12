@@ -109,6 +109,9 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(mapping[0]['replacement_attempt_id'],record['replacement_attempt_id'])
         projected=ROUND.logical_round_records(list(registered.values()),jobs=self.jobs)
         self.assertEqual([meta['attempt_id'] for _,meta in projected],[candidate['attempt_id']])
+        self.assertEqual(projected[0][1]['logical_round_attempt_ids'],
+                         frozenset(('att-source', candidate['attempt_id'])))
+        self.assertNotIn('logical_round_attempt_ids', registered[candidate['attempt_id']][1])
         self.assertEqual(self.claim(),record)
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
         # B's registered edge survives B -> C; B no longer admits a fresh launch.
@@ -293,6 +296,28 @@ class ReplacementTest(unittest.TestCase):
             with self.subTest(change=change),self.assertRaises(D.DispatchContractError):R.admission(self.jobs,lines,{**candidate,**change})
         with mock.patch.object(D,'attempt_process_quiescence',return_value=SimpleNamespace(state='live',reason='live-now')):
             with self.assertRaises(D.DispatchContractError):R.admission(self.jobs,lines,candidate)
+
+    def test_round_membership_needs_reciprocal_rows_and_the_canonical_claim(self):
+        import review_round_cap as ROUND
+        self.meta.update(worker_type='owner',owner_route_id='rt-test',owner_route_hash='sha256:test')
+        self.bind_source_parent();self.handover()
+        record=self.claim();candidate=self.replacement_candidate(record)
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\treplacement\t'+','.join(k+'='+v for k,v in candidate.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs,candidate['attempt_id'],row,launch=False))
+        rows=list(R._rows(self.jobs.read_text().splitlines()).values())
+        self.assertEqual(len(ROUND.logical_round_records(rows,jobs=self.jobs)),1)
+        for key in ('automatic_retry_of','replacement_original_attempt_id','replacement_claim_digest'):
+            altered=[(fields,{k:v for k,v in meta.items() if not (
+                meta['attempt_id']==candidate['attempt_id'] and k==key)}) for fields,meta in rows]
+            projected=ROUND.logical_round_records(altered,jobs=self.jobs)
+            self.assertEqual(len(projected),2,key)
+            self.assertTrue(all('logical_round_attempt_ids' not in meta for _,meta in projected))
+        path=R._record_path(self.jobs,record['family_id']);original=path.read_bytes()
+        for data in (b'{',json.dumps({**record,'original_attempt_id':'att-arbitrary-hidden'}).encode()):
+            path.write_bytes(data)
+            self.assertEqual(len(ROUND.logical_round_records(rows,jobs=self.jobs)),2)
+        path.write_bytes(original)
+        self.assertEqual(len(ROUND.logical_round_records(rows,jobs=self.jobs)),1)
 
     def test_sd161_first_replacement_claim_keeps_semantic_round_at_bound(self):
         import review_input
