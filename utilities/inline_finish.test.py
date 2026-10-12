@@ -30,6 +30,80 @@ GATES = ["atomic-outcome", "known-scope", "no-shared-contract", "no-resource-run
          "no-artifact-handoff", "no-independent-verifier", "focused-verification"]
 
 
+class PendingForCycleTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="inline-finish-pending-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.home = self.root / ".runtime/inline-finish/v1"
+
+    def slot(self, name, state="finished", cycle="cyc-current"):
+        path = self.home / name / "finish.json"
+        row = {"schema": "inline_finish_v1", "intent": {"cycle_id": cycle}, "state": state}
+        if state is None:
+            row.pop("state")
+        inline_finish._atomic(path, row)
+        return path, row
+
+    def test_only_finished_slots_leave_no_pending_work_and_remain_readable(self):
+        stored = [self.slot("rt-old-" + str(n)) for n in range(3)]
+        before = {path: path.read_bytes() for path, _ in stored}
+        self.assertIsNone(inline_finish.pending_for_cycle(self.root, "cyc-current"))
+        for path, row in stored:
+            self.assertEqual(inline_finish.pending_state(self.root, path.parent.name), row)
+            self.assertEqual(path.read_bytes(), before[path])
+
+    def test_one_unfinished_slot_is_selected_beside_finished_history(self):
+        old, _ = self.slot("rt-old")
+        current, row = self.slot("rt-continuation", "route-closed")
+        before = {path: path.read_bytes() for path in (old, current)}
+        self.assertEqual(inline_finish.pending_for_cycle(self.root, "cyc-current"), row)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_two_unfinished_slots_still_refuse_ambiguity(self):
+        self.slot("rt-old")
+        self.slot("rt-current", "route-closed")
+        self.slot("rt-competing", "claimed")
+        with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-cycle-ambiguous"):
+            inline_finish.pending_for_cycle(self.root, "cyc-current")
+
+    def test_other_cycles_are_not_pending_for_this_cycle(self):
+        self.slot("rt-foreign", "route-closed", "cyc-other")
+        self.slot("rt-foreign-next", "claimed", "cyc-other")
+        self.assertIsNone(inline_finish.pending_for_cycle(self.root, "cyc-current"))
+
+    def test_unknown_and_missing_states_remain_pending(self):
+        self.slot("rt-old")
+        for state in ("future-state", None):
+            with self.subTest(state=state):
+                _, row = self.slot("rt-unknown", state)
+                self.assertEqual(inline_finish.pending_for_cycle(self.root, "cyc-current"), row)
+                with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-in-progress"):
+                    inline_finish.assert_not_pending(self.root, "rt-unknown")
+
+    def test_symlink_slots_and_route_directories_are_still_refused(self):
+        path, _ = self.slot("rt-old")
+        raw = path.read_bytes()
+        outside = self.root / "outside.json"
+        outside.write_bytes(raw)
+        path.unlink(); path.symlink_to(outside)
+        with self.assertRaises(inline_finish.InlineFinishError):
+            inline_finish.pending_for_cycle(self.root, "cyc-current")
+        self.assertEqual(outside.read_bytes(), raw)
+        path.unlink(); path.write_bytes(raw)
+        (self.home / "rt-link").symlink_to(path.parent, target_is_directory=True)
+        with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-intent-unsafe"):
+            inline_finish.pending_for_cycle(self.root, "cyc-current")
+
+    def test_bad_json_or_schema_is_checked_before_finished_state_is_ignored(self):
+        path, _ = self.slot("rt-old")
+        for payload in (b"not-json", b'{"schema":"other","state":"finished","intent":{"cycle_id":"cyc-current"}}'):
+            with self.subTest(payload=payload):
+                path.write_bytes(payload)
+                with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-intent-corrupt"):
+                    inline_finish.pending_for_cycle(self.root, "cyc-current")
+
+
 class PublicInlineFinishTest(unittest.TestCase):
     CAPABILITY = "autopilot-code"
     CAPABILITY_MODE = "dev"
@@ -502,6 +576,46 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertTrue(json.loads(resumed.stdout)["replay"])
         self.assertEqual(artifact_producer.read_cycle_record(self.root, self.cycle["cycle_id"])["state"], "sealed")
+
+    def test_continuation_close_recovery_preserves_finished_history_and_current_close(self):
+        first = self.finish()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        original = self.route
+        original_slot = self.root / ".runtime/inline-finish/v1" / original["route_id"] / "finish.json"
+        old_paths = [original_slot, self.route_file, CAP.outcome_path(self.route_file),
+                     CAP.completion_dir(original["route_id"], jobs=self.jobs) / "inline.json"]
+        old_bytes = {path: path.read_bytes() for path in old_paths}
+        self.assertEqual(json.loads(old_bytes[original_slot])["state"], "finished")
+        continuation = CAP.build_continuation_route(
+            original, resume_from_node="inline", requested_boundary="inline",
+            reason="inline-finish-recovery-fixture", artifact_root=self.root)
+        path = CAP.canonical_route_path(self.root, continuation["route_id"])
+        CAP.publish_continuation_route(continuation, original, path)
+        bound = CAP.bind_continuation_cycle(self.root, original, continuation)
+        self.assertTrue(bound["bound"], bound)
+        self.route, self.route_file = continuation, path
+        self.command[self.command.index("--route") + 1] = str(path)
+        self.assertEqual(artifact_producer.route_cycle_for(self.root, continuation)["cycle_id"], self.cycle["cycle_id"])
+        crashed = self.finish("after-close")
+        self.assertNotEqual(crashed.returncode, 0)
+        self.assertNotIn("finish-cycle-ambiguous", crashed.stderr)
+        current_slot = self.root / ".runtime/inline-finish/v1" / continuation["route_id"] / "finish.json"
+        current = json.loads(current_slot.read_bytes())
+        self.assertEqual(current["state"], "route-closed")
+        self.assertEqual(inline_finish.pending_for_cycle(self.root, self.cycle["cycle_id"]), current)
+        current_paths = [path, CAP.outcome_path(path),
+                         CAP.completion_dir(continuation["route_id"], jobs=self.jobs) / "inline.json"]
+        current_bytes = {item: item.read_bytes() for item in current_paths}
+        resumed = self.finish()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertTrue(json.loads(resumed.stdout)["replay"])
+        self.assertEqual(inline_finish.pending_state(self.root, continuation["route_id"])["state"], "finished")
+        self.assertIsNone(inline_finish.pending_for_cycle(self.root, self.cycle["cycle_id"]))
+        self.assertEqual({item: item.read_bytes() for item in old_bytes}, old_bytes)
+        self.assertEqual({item: item.read_bytes() for item in current_bytes}, current_bytes)
+        replay = self.finish()
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(json.loads(replay.stdout)["inline_finish_id"], json.loads(resumed.stdout)["inline_finish_id"])
 
     def test_marker_write_crash_recovers_the_same_exact_finish(self):
         crashed = self.finish("after-marker-write")

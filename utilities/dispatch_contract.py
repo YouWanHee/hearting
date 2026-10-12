@@ -10081,8 +10081,6 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str]) -> No
                 or metadata.get("replacement_family_id") != source["replacement_family_id"]):
             raise DispatchContractError("automatic-replacement-exhausted", prior)
         return
-    if source.get("automatic_retry_of") or source.get("retry_ordinal") == "1":
-        raise DispatchContractError("automatic-replacement-exhausted", prior)
     if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
         raise DispatchContractError("retry-predecessor-binding-mismatch", prior)
     proof = attempt_process_quiescence(source, terminal_receipt=status in {"done", "killed", "cancelled"})

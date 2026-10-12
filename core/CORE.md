@@ -276,8 +276,10 @@ validation and payload reads, on both first close and later refreshes; existing
 profiles remain in place. Screenshots, browser logs and review reports beside
 them remain output. New browser work uses a process-owned temporary profile
 outside the cycle payload. `_internal/` and other non-hidden support paths, binary and large
-files are output. Absolute/escaping paths and out-of-payload files remain
-invalid. Cycle controls and legacy relocation/exclusion retain their contracts.
+files are output. A payload name keeps UTF-8, spaces and the ASCII punctuation
+`_ . - ~ + ( ) @ , =` up to 255 bytes; other ASCII punctuation (quotes, `$`,
+backquotes, `;`, `|`, `&`, `<`/`>` and glob characters among them) makes it
+invalid. Absolute/escaping paths and out-of-payload files remain invalid. Cycle controls and legacy relocation/exclusion retain their contracts.
 Invalid paths identify the locator and reason before payload reads or manifest
 publication.
 
@@ -530,6 +532,14 @@ without no-replace rename support, it checks the destination remains absent
 under those same locks and uses ordinary atomic rename, as producer admission does.
 
 ## 4. Workflow Invariants
+
+Transport deaths have no cumulative automatic replacement count limit. The
+existing controller may replace each settled, proven-dead attempt with one
+successor per exact predecessor. It preserves original results, completed
+stages, review ceilings, runtime pins and normal backoff. Live or unknown
+processes, unsettled cleanup, readable FAIL or BLOCKED, and human decisions
+retain their existing handling. A route paused only by the old replacement
+count resumes through its ordinary `start` surface.
 
 Artifacts move forward in one direction:
 
