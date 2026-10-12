@@ -2198,6 +2198,10 @@ class C1MarkTest(C1ChangesBase):
         campaigns = copy / "campaigns"
         payload = self.tree_digest(campaigns)
         before = json.loads(record_path.read_text())
+        # These rehearse a mark on a copy of the live root. Once its owner has applied
+        # the mark to the root itself, the copy already holds it and nothing is left to replay.
+        if "disposition" in before:
+            self.skipTest("the TASLP manuscript already has a disposition")
         reason = ("user instruction: set this manuscript aside; the new draft lives in "
                   "campaigns/2026-09-30_tasl-sr-corrnet-revision-r1/2026-10-01_strategy-derived-cheatsheet")
         marked = P.cycle_mark(copy, TASLP_MANUSCRIPT, discard=True, reason=reason)
@@ -2309,6 +2313,8 @@ class C1MarkTest(C1ChangesBase):
         before = json.loads(manifest_path.read_text())
         by_id = {row["artifact_id"]: row for row in before["artifacts"]}
         old = next(r["locator"]["path"] for r in before["artifact_revisions"] if by_id[r["artifact_id"]]["role"] == "primary")
+        if old == wanted:
+            self.skipTest("the TASLP cheatsheet already has this primary")
         out = P.cycle_mark(copy, TASLP_CHEATSHEET, primary=wanted, reason="redesignated by the owner")
         self.assertEqual(out["status"], "marked", out)
         after = json.loads(manifest_path.read_text())
