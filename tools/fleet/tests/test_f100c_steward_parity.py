@@ -240,6 +240,113 @@ class StewardCollectorTest(unittest.TestCase):
                      mock.patch("fleet.collectors.herdr._clear_gpu_session_aliases", return_value=[]):
                     self.assertFalse(herdr_projection.is_steward(harness, "unrelated"))
 
+    def test_explicit_self_flag_uses_the_existing_writer_on_all_harnesses(self):
+        pm = steward._peer_message_module()
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": tmp}), \
+             mock.patch("fleet.collectors.herdr._clear_gpu_session_aliases", return_value=[]):
+            for harness in ("claude", "codex", "opencode"):
+                with self.subTest(harness=harness):
+                    sid = "self-" + harness
+                    self.assertTrue(pm.mark_steward(harness, sid,
+                        {"harness": "unknown", "name": "-"}, "explicit",
+                        "2026-10-13T04:00:00Z", source="explicit"))
+                    markers = pm.read_steward_markers([tmp])
+                    session = Session(harness=harness, pid=1, session_id=sid,
+                                      cwd="/x", liveness="working", session_tag="46")
+                    with mock.patch.object(steward, "read_markers", return_value=markers):
+                        steward.enrich([session])
+                        self.assertTrue(session.steward)
+                        self.assertTrue(herdr_projection.is_steward(harness, sid))
+                        self.assertEqual(steward.role_targets(harness, sid, cwd="/x"), [])
+                    self.assertIsNone(session.steward_targets)
+                    self.assertIsNone(session.steward_parents)
+                    rows = render._build_lines([session], [], "fleet", False, 0,
+                                              layout="wide", term_width=168)
+                    self.assertEqual(sum(_text(row).count("⚑") for row in rows), 1)
+                    self.assertFalse(any("┆" in _text(row) for row in rows))
+                    self.assertEqual(render._session_tag_chip(session)[1], ("46", "tag_steward"))
+                    # Release the fixture marker through the existing off writer.
+                    self.assertEqual(pm.cmd_release(pm.argparse.Namespace(
+                        harness=harness, session_id=sid)), 0)
+                    steward.enrich([session], markers=pm.read_steward_markers([tmp]))
+                    self.assertFalse(session.steward)
+
+    def test_self_flag_accepts_only_its_exact_explicit_sentinel_and_actor(self):
+        sentinel = {"harness": "unknown", "name": "-", "session_id": None,
+                    "kind": "explicit", "source": "explicit"}
+        cases = [({"source": "watch", "kind": "watch"}, "self", "codex"),
+                 ({"source": None}, "self", "codex"),
+                 ({"kind": "handoff"}, "self", "codex"),
+                 ({"session_id": "unknown-child"}, "self", "codex"),
+                 ({"harness": "opencode"}, "self", "codex"),
+                 ({"name": "unknown-target"}, "self", "codex"),
+                 ({"pane": "fixture-pane"}, "self", "codex"),
+                 ({}, "old-dead-sid", "codex"),
+                 ({}, "self", "claude")]
+        for delta, marker_sid, marker_harness in cases:
+            with self.subTest(delta=delta, marker_sid=marker_sid, marker_harness=marker_harness):
+                marker = {"session_id": marker_sid, "harness": marker_harness,
+                          "targets": {"-": dict(sentinel, **delta)}}
+                session = Session(harness="codex", pid=1, session_id="self", cwd="/x")
+                markers = {("codex", "self"): marker}
+                with mock.patch.object(steward, "read_markers", return_value=markers), \
+                     mock.patch("fleet.collectors.herdr._clear_gpu_session_aliases", return_value=[]):
+                    steward.enrich([session])
+                    self.assertFalse(session.steward)
+                    self.assertFalse(herdr_projection.is_steward("codex", "self"))
+                self.assertIsNone(session.steward_targets)
+                self.assertIsNone(session.steward_parents)
+        # A valid historical marker alone neither transfers its flag nor creates a row.
+        old = {("codex", "old-dead-sid"): {"session_id": "old-dead-sid",
+               "targets": {"-": sentinel}}}
+        session = Session(harness="codex", pid=1, session_id="self", cwd="/x")
+        rows = [session]
+        steward.enrich(rows, markers=old)
+        self.assertEqual(rows, [session])
+        self.assertFalse(session.steward)
+
+    def test_confirmed_clear_self_flag_matches_fleet_and_herdr(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                session = Session(harness=harness, pid=1, session_id="new", cwd="/x")
+                session._gpu_session_aliases = ["old"]
+                markers = {(harness, "old"): {"session_id": "old", "targets": {
+                    "-": {"harness": "unknown", "name": "-", "session_id": None,
+                          "kind": "explicit", "source": "explicit"}}}}
+                with mock.patch.object(steward, "read_markers", return_value=markers), \
+                     mock.patch("fleet.collectors.herdr._clear_gpu_session_aliases", return_value=["old"]):
+                    steward.enrich([session])
+                    self.assertTrue(session.steward)
+                    self.assertTrue(herdr_projection.is_steward(harness, "new"))
+                with mock.patch.object(steward, "read_markers", return_value=markers), \
+                     mock.patch("fleet.collectors.herdr._clear_gpu_session_aliases", return_value=[]):
+                    self.assertFalse(herdr_projection.is_steward(harness, "unrelated"))
+
+    def test_self_flag_does_not_promote_foreign_target_relations(self):
+        parent = Session(harness="codex", pid=1, session_id="self", cwd="/x")
+        local = Session(harness="claude", pid=2, session_id="local", cwd="/x")
+        foreign = Session(harness="opencode", pid=3, session_id="foreign", cwd="/foreign")
+        sentinel = {"harness": "unknown", "name": "-", "session_id": None,
+                    "kind": "explicit", "source": "explicit"}
+        foreign_claim = {"harness": "opencode", "session_id": "foreign",
+                         "kind": "explicit", "source": "explicit"}
+        marker = {"session_id": "self", "targets": {"foreign": foreign_claim}}
+        markers = {("codex", "self"): marker}
+        steward.enrich([parent, foreign], markers=markers)
+        self.assertFalse(parent.steward)  # Explicit target claim alone is no self flag.
+        marker["targets"]["-"] = sentinel
+        steward.enrich([parent, foreign], markers=markers)
+        self.assertTrue(parent.steward)
+        self.assertIsNone(parent.steward_targets)
+        self.assertIsNone(foreign.steward_parents)
+        marker["targets"]["local"] = {"harness": "claude", "session_id": "local",
+                                      "kind": "watch", "source": "watch"}
+        steward.enrich([parent, local, foreign], markers=markers)
+        self.assertEqual([target["session_id"] for target in parent.steward_targets], ["local"])
+        self.assertEqual(local.steward_parents[0]["session_id"], "self")
+        self.assertIsNone(foreign.steward_parents)
+
     def test_join_is_exact_on_harness_and_session_id(self):
         sessions = [Session(harness="claude", pid=1, session_id="sid-a", cwd="/x"),
                     Session(harness="codex", pid=2, session_id="sid-a", cwd="/x"),
