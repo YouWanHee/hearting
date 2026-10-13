@@ -35,7 +35,8 @@ class _TmpRootMixin:
         self.jobs_path.touch()
         self._old_environ = dict(os.environ)
         for key in tuple(os.environ):
-            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_")):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "AGENT_THREAD_",
+                               "AGENT_HERDR_", "HERDR_", "OPENCODE_", "CLAUDE_", "CODEX_")):
                 os.environ.pop(key, None)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root)
@@ -48,6 +49,8 @@ class _TmpRootMixin:
         # without the test's scoped files; pin it to the isolated HOME so
         # config-home lookups stay inside the fixture.
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "home" / ".config")
+        os.environ["XDG_DATA_HOME"] = str(self.tmp_root / "home" / ".local" / "share")
+        os.environ["XDG_CACHE_HOME"] = str(self.tmp_root / "home" / ".cache")
         os.environ.pop("XDG_STATE_HOME", None)
         os.environ.pop("HARNESS_STATE_ROOT", None)
         os.environ.pop("CODEX_HOME", None)
@@ -5937,18 +5940,14 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         self.registry_bytes = self.jobs_path.read_bytes()
         self.unrelated = unrelated
         peer_steward._mark_seat_successor("w1:pNew", "w1:pOld", successor, "")
-        marker = peer_steward._seat_successor_path("w1:pNew")
-        value = json.loads(marker.read_text()); value["at"] = 100
-        marker.write_text(json.dumps(value))
         requester = {"session_id": "new-sid", "harness": successor,
                      "pane": "w1:pNew", "server": "default"}
         foreground = {"pid": 4242, "start": "800", "shell_pid": 101, "shell_start": "700"}
         identity = {"session_id": "old-sid", "harness": predecessor,
                     "pane": "w1:pOld", "foreground": foreground, "server": "default", "name": "old"}
         store = peer_steward.peer_obligations.ObligationStore()
-        with mock.patch.object(peer_steward.peer_obligations.time, "time", return_value=200):
-            duty = store.create("retire-fixture", "retire", identity,
-                                {"target": "old", "requester": requester})
+        duty = store.create("retire-fixture", "retire", identity,
+                            {"target": "old", "requester": requester})
         return store, duty
 
     def assert_authority(self, successor="new-sid"):
@@ -6059,7 +6058,7 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         store, duty = self.booking()
         marker = peer_steward._seat_successor_path("w1:pNew")
         original = json.loads(marker.read_text())
-        for change in ({"at": 300}, {"server": "another-server"},
+        for change in ({"at": duty["accepted_at"] + 1}, {"server": "another-server"},
                        {"successor": {"harness": "claude", "session_id": "new-sid"}},
                        {"successor": {"harness": "opencode", "session_id": "later-sid"}}):
             with self.subTest(change=change):
@@ -6091,7 +6090,8 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         store, duty = self.booking()
         marker = peer_steward._seat_successor_path("w1:pNew")
         requested, replaced = threading.Event(), threading.Event()
-        original_read = Path.read_bytes
+        import opencode_session_runtime as runtime
+        original_read = runtime._read_native_record
         reads = 0
 
         def replace():
@@ -6102,9 +6102,9 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         writer = threading.Thread(target=replace)
         writer.start()
 
-        def read(path):
+        def read(path, *args, **kwargs):
             nonlocal reads
-            value = original_read(path)
+            value = original_read(path, *args, **kwargs)
             if path == marker:
                 reads += 1
                 if reads == 2:
@@ -6115,7 +6115,7 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
             return value
 
         try:
-            with mock.patch.object(Path, "read_bytes", read):
+            with mock.patch.object(runtime, "_read_native_record", read):
                 self.assertEqual(peer_steward._retire_handover(duty), "1")
         finally:
             requested.set()
@@ -6124,6 +6124,450 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
         self.assertTrue(replaced.is_set())
         self.assertEqual(json.loads(marker.read_text())["successor"]["session_id"], "later-sid")
         self.assert_authority()
+
+
+class ClosedParentNativeHandoverTest(_TmpRootMixin, unittest.TestCase):
+    """Real native readers, resolver, writer and consumers in private state."""
+
+    PARENT, HEADLESS, SUCCESSOR = "ses_original", "ses_headless", "codex-successor"
+    SUCCESSOR_HARNESS = "codex"
+    PID, START = 99999991, "800"
+
+    def setUp(self):
+        super().setUp()
+        import dispatch_seat_handover as handover
+        import opencode_session_runtime as native
+        import owner_route_binding as owner
+        import session_tidy
+        self.handover, self.native, self.tidy = handover, native, session_tidy
+        self.route = owner.ROUTE.compile_route(
+            "autopilot-code", "debug", "quick", self.tmp_root, self.tmp_root / "artifacts",
+            predicates=[], transport=None, tracking="tracked",
+            tracked_gate_evidence={"spec_read": {"satisfied": True, "source": "canonical-prd-sha256"},
+                "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                "artifact_guard": {"satisfied": True, "source": "conductor-prechecked"}},
+            registered_headless_evidence={"candidates": [
+                {"harness": h, "transport": "headless", "surface": "registered-headless",
+                 "status": "supported", "probe_source": "fixture", "probe_time": "2026-10-13T00:00:00Z"}
+                for h in ("claude", "codex", "opencode")]})
+        self.route_path = self.tmp_root / "original-route.json"
+        self.route_path.write_text(json.dumps(self.route))
+        self.meta = {"attempt_schema_version": "2", "dispatch_depth": "1", "worker_type": "owner",
+            "registered_worker": "1", "execution_surface": "registered-headless", "transport": "headless",
+            "attempt_id": "att-selected", "harness": "opencode", "parent_harness": "opencode",
+            "parent_sid": self.PARENT, "route_node": "owner", "note": "dead-worker-fail",
+            "failure_class": "fail", "owner_route_file": str(self.route_path),
+            "owner_route_id": self.route["route_id"], "owner_route_hash": self.route["route_hash"]}
+        self.rows = [("done", {**self.meta, "attempt_id": aid})
+                     for aid in ("att-ancestor-one", "att-ancestor-two", "att-selected")]
+        self.foreign = {**self.meta, "attempt_id": "att-foreign", "harness": "codex",
+            "parent_sid": self.HEADLESS, "owner_route_id": "rt-foreign", "owner_route_hash": "sha256:foreign"}
+        self.rows.append(("running", self.foreign))
+        self.write_jobs()
+        self.native_args = SimpleNamespace(jobs=self.jobs_path, worktree=str(self.tmp_root),
+                                           parent_attempt_id="att-selected")
+        native.bind_session(self.native_args, self.HEADLESS)
+        self.binding_path = native.binding_path(self.native_args)
+        self.native_path = Path(os.environ["HOME"]) / ".local/state/hearting/tui-identity" / f"{self.PID}-{self.START}.json"
+        self.native_path.parent.mkdir(parents=True)
+        self.native_value = {"schema": "hearting-tui-selection-v1", "pid": self.PID, "start": self.START,
+            "sessionID": self.PARENT,
+            "writtenAt": peer_steward.datetime.datetime.now(peer_steward.datetime.timezone.utc).isoformat()}
+        self.native_path.write_text(json.dumps(self.native_value))
+        self.native_path.chmod(0o664)
+        self.identity = {"session_id": self.HEADLESS, "harness": "opencode", "pane": "w1:pOld",
+            "server": "default", "name": "old", "foreground": {"pid": self.PID, "start": self.START,
+                "argv": ["opencode"], "shell_pid": 99999992, "shell_start": "700"}}
+        self.store = peer_steward.peer_obligations.ObligationStore()
+        self.book(self.SUCCESSOR_HARNESS)
+        self.seat = session_tidy._pane_seat_of("w1:pNew")
+        # Existing route/runtime payloads survive replay byte for byte.
+        for name in ("resource.json", "completed-prefix.json", "owner.log"):
+            (self.tmp_root / name).write_text('{"completed":["plan"],"round_ceiling":1,"state":"retained"}')
+
+    def write_jobs(self):
+        self.jobs_path.write_text("".join("now\t" + status + "\t" + str(self.tmp_root) + "\t" +
+            str(self.tmp_root) + "\towner.log\t" + ",".join(f"{k}={v}" for k, v in meta.items()) + "\n"
+            for status, meta in self.rows))
+
+    def book(self, harness, duty_id="retire-native-fixture"):
+        peer_steward._mark_seat_successor("w1:pNew", "w1:pOld", harness, "")
+        self.mark = peer_steward._seat_successor_path("w1:pNew")
+        self.mark.chmod(0o664)
+        self.requester = {"session_id": self.SUCCESSOR, "harness": harness,
+                          "pane": "w1:pNew", "server": "default"}
+        self.accept(duty_id)
+
+    def accept(self, duty_id="retire-native-fixture"):
+        # Native and mark creation precede real acceptance, which precedes completion.
+        self.duty = self.store.create(duty_id, "retire", self.identity,
+                                      {"target": "w1:pOld", "requester": self.requester})
+        self.duty = self.store.update(self.duty["id"], state="complete", result="target-already-gone",
+            delivery="completed", cleanup="complete", observation={"phase": "complete"})
+
+    def protected(self):
+        paths = [self.store._record_path(self.duty["id"]), self.jobs_path, self.route_path,
+                 *(self.tmp_root / name for name in ("resource.json", "completed-prefix.json", "owner.log"))]
+        return {str(p): p.read_bytes() for p in paths}
+
+    def authority_bytes(self):
+        paths = (self.mark, self.tidy._ledger_path(self.seat), self.handover._snapshot_path(self.seat.key))
+        return {str(p): p.read_bytes() if p.exists() else None for p in paths}
+
+    def replay(self, duty=None):
+        with mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("external transport")), \
+             mock.patch.object(peer_steward, "_close_pane", side_effect=AssertionError("pane close")), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value="w9:pObserver"):
+            return peer_steward._resume_retire_obligation(duty or self.duty, self.store)
+
+    def assert_refused(self, duty=None):
+        before, authority = self.protected(), self.authority_bytes()
+        self.replay(duty)
+        self.assertEqual(self.protected(), before)
+        self.assertEqual(self.authority_bytes(), authority)
+        self.assertEqual(self.handover.effective_parent(self.meta, self.jobs_path), self.PARENT)
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+
+    def test_real_recovery_preserves_history_and_hands_only_open_original_route_once(self):
+        before = self.protected()
+        self.replay()
+        self.assertEqual(self.protected(), before)
+        self.assertFalse(self.mark.exists())
+        self.assertEqual(self.handover.effective_parent(self.meta, self.jobs_path), self.SUCCESSOR)
+        self.assertEqual(self.handover.effective_parent_harness(self.meta, self.jobs_path), "codex")
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+        ledger = self.tidy._ledger_path(self.seat).read_bytes()
+        row = json.loads(ledger)
+        self.assertEqual({b["attempt"] for b in row["bindings"]}, {m["attempt_id"] for _, m in self.rows[:3]})
+        self.assertEqual(len(self.handover.read_snapshot(self.seat.key)["bindings"]), 1)
+        self.replay()
+        self.assertEqual(self.tidy._ledger_path(self.seat).read_bytes(), ledger)
+        self.assertEqual(self.protected(), before)
+
+    def test_unrelated_closed_missing_sidecar_does_not_become_a_global_requirement(self):
+        unrelated = {**self.meta, "attempt_id": "att-unrelated", "parent_sid": "ses_unrelated",
+                     "owner_route_id": "rt-closed", "owner_route_hash": "sha256:closed"}
+        self.rows.append(("done", unrelated))
+        self.write_jobs()
+        self.replay()
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.handover.effective_parent(unrelated, self.jobs_path), "ses_unrelated")
+
+    def test_failed_native_source_never_falls_back_to_open_foreign_parent_route(self):
+        for raw in (None, b"false", b"null", b"[]", b"{", b"{}", b" " * 1025):
+            with self.subTest(raw=raw):
+                if raw is None:
+                    self.native_path.unlink(missing_ok=True)
+                else:
+                    self.native_path.write_bytes(raw)
+                self.assert_refused()
+
+    def test_false_native_fields_namesake_and_latest_guesses_grant_nothing(self):
+        for change in ({"sessionID": "ses_foreign"}, {"sessionID": False}, {"pid": self.PID + 1},
+                       {"pid": True}, {"start": "801"}, {"start": True}, {"schema": "other"},
+                       {"writtenAt": None}, {"writtenAt": "2026-10-13T00:00:00"}):
+            with self.subTest(change=change):
+                self.native_path.write_text(json.dumps({**self.native_value, **change}))
+                self.assert_refused()
+        self.native_path.unlink()
+        with mock.patch.dict(os.environ, {"OPENCODE_SESSION_ID": self.PARENT, "AGENT_SESSION_ID": self.PARENT}):
+            self.assert_refused()
+
+    def test_original_birth_live_unknown_reused_and_wrong_argv(self):
+        real_stat = os.stat
+        def proc_stat(path, *args, **kw):
+            return object() if str(path) == f"/proc/{self.PID}" else real_stat(path, *args, **kw)
+        for birth in ("800", None):
+            with self.subTest(birth=birth), \
+                 mock.patch.object(peer_steward, "_retire_process_record", return_value=None), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", return_value=birth), \
+                 mock.patch.object(peer_steward.os, "stat", side_effect=proc_stat):
+                self.assert_refused()
+        for change in ({"pid": True}, {"pid": 0}, {"start": None}, {"start": "801"},
+                       {"argv": ["opencode", "run"]}, {"argv": ["namesake"]}, {"argv": []}):
+            with self.subTest(change=change):
+                duty = json.loads(json.dumps(self.duty))
+                duty["intent"]["identity"]["foreground"].update(change)
+                self.assert_refused(duty)
+        # Reuse is proof of the OLD lifetime's end, never a source for its SID.
+        with mock.patch.object(peer_steward, "_retire_process_record", return_value={"start": "801"}):
+            self.replay()
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+
+    def test_invalid_sidecar_and_unregistered_nonowner_relations_refuse(self):
+        original = self.binding_path.read_bytes()
+        for raw in (b"false", b"[]", b"{}", b"{", b" " * 4097,
+                    json.dumps({"attempt_id": "att-other", "worktree": str(self.tmp_root),
+                                "session_id": self.HEADLESS}).encode(),
+                    json.dumps({"attempt_id": "att-selected", "worktree": str(self.tmp_root / "other"),
+                                "session_id": self.HEADLESS}).encode()):
+            self.binding_path.write_bytes(raw)
+            self.assert_refused()
+        self.binding_path.unlink()
+        self.assert_refused()
+        self.binding_path.write_bytes(original)
+        for change in ({"dispatch_depth": "2"}, {"worker_type": "frame"}, {"registered_worker": "0"},
+                       {"execution_surface": "native-subagent"}, {"owner_route_hash": ""}):
+            self.rows[2] = ("done", {**self.meta, **change})
+            self.write_jobs()
+            self.assert_refused()
+
+    def test_native_parent_mismatch_and_multiple_matching_attempts_include_closed_foreign(self):
+        self.rows[2] = ("done", {**self.meta, "parent_sid": "ses_foreign"})
+        self.write_jobs()
+        self.assert_refused()
+        for parent in (self.PARENT, "ses_foreign"):
+            self.rows[2] = ("done", self.meta)
+            other = {**self.meta, "attempt_id": "att-duplicate", "parent_sid": parent,
+                     "owner_route_id": "rt-closed", "owner_route_hash": "sha256:closed"}
+            self.rows = self.rows[:4] + [("done", other)]
+            self.write_jobs()
+            self.native.bind_session(SimpleNamespace(jobs=self.jobs_path, worktree=str(self.tmp_root),
+                                                     parent_attempt_id="att-duplicate"), self.HEADLESS)
+            self.assert_refused()
+
+    def test_source_time_and_acceptance_are_real_not_backdated_payloads(self):
+        for stamp in (None, False, float("nan"), float("inf"), 0, self.native_path.stat().st_ctime - 1):
+            with self.subTest(stamp=stamp):
+                duty = {**self.duty, "accepted_at": stamp}
+                self.assert_refused(duty)
+        # An old payload in a new generation remains too late.
+        other = self.native_path.with_suffix(".new")
+        other.write_text(json.dumps(self.native_value))
+        os.replace(other, self.native_path)
+        self.assert_refused()
+
+    def test_late_sidecar_and_mark_with_old_payload_times_are_refused(self):
+        original = self.binding_path.read_bytes()
+        self.binding_path.write_bytes(original)
+        self.assert_refused()
+
+    def test_late_mark_with_old_payload_time_is_refused_independently(self):
+        self.mark.write_bytes(self.mark.read_bytes())
+        self.assert_refused()
+
+    def test_native_mark_and_sidecar_unsafe_reads_leave_all_authority_unchanged(self):
+        for number, path in enumerate((self.native_path, self.mark, self.binding_path)):
+            original = path.read_bytes()
+            path.unlink()
+            path.symlink_to(path.with_suffix(".missing"))
+            self.assert_refused()
+            path.unlink()
+            os.mkfifo(path)
+            # Authority snapshots do not read FIFO contents.
+            with mock.patch.object(self, "authority_bytes", return_value={"fixture": "unchanged"}):
+                self.assertEqual(peer_steward._retire_handover(self.duty),
+                                 "skipped:successor-unverified" if path == self.mark else None)
+            path.unlink()
+            path.write_bytes(original)
+            # A restored source is newer than that acceptance; only a later one may use it.
+            self.accept(f"retire-native-restored-{number}")
+        # UID and EACCES injections use the actual descriptor readers.
+        uid = os.getuid()
+        with mock.patch.object(os, "getuid", return_value=uid + 1):
+            self.assert_refused()
+        real_open = os.open
+        def denied(path, *args, **kwargs):
+            if Path(path) == self.native_path:
+                raise PermissionError()
+            return real_open(path, *args, **kwargs)
+        with mock.patch.object(os, "open", side_effect=denied):
+            self.assert_refused()
+
+    def test_requester_mark_and_unsupported_completed_state_refuse(self):
+        for state, result in (("cancelled", "normal-exit"), ("complete", "unknown"),
+                              ("complete", "force-killed")):
+            self.assert_refused({**self.duty, "state": state, "result": result})
+        self.assertIsNone(peer_steward._retire_handover({**self.duty, "state": "pending"}))
+        for field, value in (("session_id", ""), ("harness", "unknown"), ("pane", "w1:pOther"), ("server", "foreign")):
+            duty = json.loads(json.dumps(self.duty))
+            duty["intent"]["requester"][field] = value
+            self.assert_refused(duty)
+        original = json.loads(self.mark.read_text())
+        for change in ({"schema": False}, {"pane": "other"}, {"beside": "other"}, {"server": "other"},
+                       {"successor": []}, {"successor": {"harness": "codex", "session_id": "other"}},
+                       {"at": False}, {"at": float("nan")}, {"at": self.duty["accepted_at"] + 1}):
+            self.mark.write_text(json.dumps({**original, **change}))
+            self.assert_refused()
+
+    def test_closed_route_and_another_successor_remain_authoritative(self):
+        outcome = self.route_path.with_suffix(".outcome.json")
+        outcome.write_text('{"state":"closed"}')
+        self.assert_refused()
+        outcome.unlink()
+        self.handover.record_retire_handover(self.PARENT, "opencode", "first-successor", "claude",
+            jobs=self.jobs_path, successor_seat=self.tidy._pane_seat_of("w1:pFirst"))
+        before = self.authority_bytes()
+        self.replay()
+        self.assertEqual(self.authority_bytes(), before)
+        self.assertEqual(self.handover.effective_parent(self.meta, self.jobs_path), "first-successor")
+
+    def test_selected_generation_is_rechecked_under_mark_lock_without_global_jobs_freeze(self):
+        real = peer_steward._retire_predecessor
+        calls = 0
+        def replaced(duty):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                other = self.binding_path.with_suffix(".new")
+                other.write_bytes(self.binding_path.read_bytes())
+                os.replace(other, self.binding_path)
+            return real(duty)
+        with mock.patch.object(peer_steward, "_retire_predecessor", side_effect=replaced):
+            self.assert_refused()
+
+    def test_same_normal_command_and_detached_callback_consume_original_requester(self):
+        with mock.patch.object(peer_steward, "_retire_target", return_value=("unknown", {
+                "harness": "-", "name": "old", "pane": "-", "session_id": "-"}, 1, "pane-unverified")), \
+             mock.patch.object(peer_steward, "_current_session_identity", return_value=(self.SUCCESSOR, "codex")), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value="w1:pNew"), \
+             mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
+            self.assertEqual(peer_steward.cmd_retire(SimpleNamespace(target="w1:pOld")), 0)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+
+    def test_detached_lifecycle_needs_no_observer_native_identity(self):
+        before = self.protected()
+        with mock.patch.object(peer_steward, "_current_session_identity", return_value=("observer", "claude")), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value=""), \
+             mock.patch.object(peer_steward, "_ensure_watch_observers"), \
+             mock.patch.object(peer_steward.dispatch_batch_obligations, "ensure_observers"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
+            self.assertEqual(peer_steward.cmd_ensure_obligations(None), 0)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.protected(), before)
+
+    def test_real_start_correct_admission_and_retained_input_use_written_effective_parent(self):
+        import work_start
+        import dispatch_replacement as replacement
+        import dispatch_owner_input as owner_input
+        from dispatch_contract import DispatchContractError
+        # Normal input admission exists before the owner ends.
+        self.rows[2] = ("running", self.meta)
+        self.write_jobs()
+        owner_input.initialize_owner_input(self.jobs_path, "att-selected", "opencode-next-turn")
+        self.rows[2] = ("done", self.meta)
+        self.write_jobs()
+        before = self.protected()
+        self.replay()
+        self.assertEqual(self.protected(), before)
+        rows = replacement._rows(self.jobs_path.read_text().splitlines())
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": self.SUCCESSOR,
+                                         "AGENT_DISPATCH_CALLER_HARNESS": "codex"}):
+            # This is the existing correct/start continuation admission, not a
+            # mocked owns=True or a new path. Input writes have their own baseline.
+            replacement._authorized(self.jobs_path, rows, self.meta)
+            input_path = owner_input._path(self.jobs_path, "att-selected")
+            initial = input_path.read_bytes()
+            result = owner_input.submit(self.jobs_path, "att-selected", "Continue approved work", "exact-answer")
+            self.assertTrue(result["retained"])
+            self.assertNotEqual(input_path.read_bytes(), initial)
+            value = json.loads(input_path.read_bytes())
+            self.assertEqual(value["requests"][0]["source_session"], self.SUCCESSOR)
+            self.assertEqual(self.meta["parent_sid"], self.PARENT)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "foreign-successor",
+                                         "AGENT_DISPATCH_CALLER_HARNESS": "codex"}):
+            with self.assertRaises(DispatchContractError):
+                replacement._authorized(self.jobs_path, rows, self.meta)
+        # Independent normal live start reuse consumes the SAME logical binding.
+        self.rows[2] = ("running", self.meta)
+        self.write_jobs()
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": self.SUCCESSOR}):
+            self.assertEqual(work_start._slot(self.route, "owner", work_start._rows(self.jobs_path), self.jobs_path),
+                             "att-selected")
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "foreign-successor"}):
+            with self.assertRaises(DispatchContractError):
+                work_start._slot(self.route, "owner", work_start._rows(self.jobs_path), self.jobs_path)
+
+    def test_real_completion_storage_allowlist_lease_ack_and_no_redelivery(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_session_sweep as sweep
+        # The synchronous Claude carrier reads the same written handover; native
+        # turn-proof support is not inferred for the other harnesses.
+        self.book("claude", "retire-native-claude")
+        self.replay()
+        root, kind = self.jobs_path.parent, "claude-parent-runtime"
+        delivery = "delivery-" + "a" * 32
+        receipt = {"schema_version": 2, "state": "delivered", "parent_attempt_id": "att-selected",
+            "job_registry": str(self.jobs_path), "delivery_classification": "attention",
+            "children": [{"attempt_id": "att-selected", "status": "done", "readiness": "ready",
+                          "reason": "terminal-failure-or-unclosed", "required_action": "inspect-done-failure",
+                          "harness": "opencode", "delivery_classification": "attention"}]}
+        pending.create(root, recipient_kind=kind, recipient_key=self.PARENT, delivery_id=delivery,
+            session_generation="", session_generation_supported="0", attempt_ids=["att-selected"],
+            parent_attempt_id="att-selected", route_id=self.route["route_id"], route_node="owner",
+            receipt=receipt, receipt_digest=pending._canonical_receipt_digest(receipt),
+            row_revisions={"att-selected": "original-revision"})
+        original = pending.read(root, self.PARENT, delivery)
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pNew"}):
+            recipients = self.handover.storage_recipients(self.SUCCESSOR, harness="claude")
+            self.assertIn((self.PARENT, frozenset({"att-selected", "att-ancestor-one", "att-ancestor-two"})),
+                          recipients)
+            allowed = dict(recipients)[self.PARENT]
+            self.assertFalse(self.handover.record_for_session({"attempt_ids": ["att-foreign"]}, allowed))
+            self.assertEqual(sweep.addressed_records(root, kind, "foreign-successor"), ([], 0))
+            records, _ = sweep.sweep_deliver(root, kind, self.SUCCESSOR)
+            self.assertEqual([r["delivery_id"] for r in records], [delivery])
+            claimed = pending.read(root, self.PARENT, delivery)
+            for key in ("delivery_id", "receipt_digest", "recipient_digest", "row_revisions"):
+                self.assertEqual(claimed[key], original[key])
+            self.assertEqual(sweep.ack_delivered(root, self.SUCCESSOR, records, acked_by="fixture-consumed"), 1)
+            self.assertEqual(pending.read(root, self.PARENT, delivery)["state"], "acked")
+            self.assertEqual(sweep.sweep_deliver(root, kind, self.SUCCESSOR)[0], [])
+            self.assertIsNone(pending.read(root, self.SUCCESSOR, delivery))
+
+    def test_pending_gone_settlement_defers_the_stale_label_to_the_completed_replay(self):
+        self.duty = self.store.create("retire-native-pending", "retire", self.identity,
+                                      {"target": "w1:pOld", "requester": self.requester})
+        authority = self.authority_bytes()
+        with mock.patch.object(peer_steward.subprocess, "run", side_effect=AssertionError("transport")):
+            self.assertTrue(peer_steward._complete_gone_retire(self.store, self.duty))
+        # The pending path never forwards the stale headless label (route F stays).
+        self.assertEqual(self.authority_bytes(), authority)
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+        settled = self.store.get(self.duty["id"])
+        self.assertEqual((settled["state"], settled["result"]), ("complete", "target-already-gone"))
+        self.replay(settled)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+        self.assertEqual(self.handover.effective_parent(self.foreign, self.jobs_path), self.HEADLESS)
+
+    def test_unrelated_registry_appends_do_not_freeze_the_selected_relation(self):
+        real = peer_steward._retire_predecessor
+        calls = 0
+        def appended(duty):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with self.jobs_path.open("a") as handle:
+                    handle.write("now\trunning\t/x\t/x\tlog\tattempt_id=att-later,dispatch_depth=2\n")
+            return real(duty)
+        with mock.patch.object(peer_steward, "_retire_predecessor", side_effect=appended):
+            self.replay()
+        self.assertEqual(calls, 2)
+        self.assertTrue(self.handover.owns(self.meta, self.SUCCESSOR, self.jobs_path))
+
+    def test_ordinary_completed_opencode_booking_keeps_its_label_without_retained_source(self):
+        # A booked label that is no headless owner session is the ordinary path:
+        # a disposed TUI record does not block the missed-handover replay.
+        self.native_path.unlink()
+        self.binding_path.unlink()
+        self.rows = [("done", {**self.meta, "attempt_id": aid, "parent_sid": self.HEADLESS})
+                     for aid in ("att-ancestor-one", "att-ancestor-two", "att-selected")]
+        self.write_jobs()
+        self.replay()
+        self.assertFalse(self.mark.exists())
+        self.assertEqual(self.handover.effective_parent(self.rows[2][1], self.jobs_path), self.SUCCESSOR)
+
+    def test_retained_selection_that_contradicts_an_ordinary_label_grants_nothing(self):
+        self.binding_path.unlink()
+        self.rows = [("done", {**self.meta, "attempt_id": aid, "parent_sid": self.HEADLESS})
+                     for aid in ("att-ancestor-one", "att-ancestor-two", "att-selected")]
+        self.write_jobs()
+        authority = self.authority_bytes()
+        self.replay()
+        self.assertEqual(self.authority_bytes(), authority)
+        self.assertEqual(self.handover.effective_parent(self.rows[2][1], self.jobs_path), self.HEADLESS)
 
 
 class RetireBackgroundDialogTest(unittest.TestCase):
