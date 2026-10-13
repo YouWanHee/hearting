@@ -35,7 +35,7 @@ class CompactHookTest(unittest.TestCase):
         envpatch = mock.patch.dict("os.environ", self.env)
         envpatch.start()
         self.addCleanup(envpatch.stop)
-        self.seat = st.Seat("project", "fixture-seat", harness="claude", project_key="fixture")
+        self.seat = st.Seat("pane", "fixture-seat", pane="w1:p1", harness="claude", project_key="fixture")
         self.resolve = mock.patch.object(st, "resolve_seat", return_value=self.seat)
         self.resolve.start()
         self.addCleanup(self.resolve.stop)
@@ -82,6 +82,29 @@ class CompactHookTest(unittest.TestCase):
         self.assertEqual(self.enqueue_mock.call_count, 2)
         self.assertEqual(st.read_latest_card(self.seat), card_before)
         self.assertEqual(st.session_summary(self.seat)[("claude", "sid-main")]["epoch"], 1)
+
+    def test_card_is_saved_only_at_a_session_seat_and_project_seat_queues_only(self):
+        for kind in ("pane", "native"):
+            seat = st.Seat(kind, f"fixture-{kind}", pane="w1:p1" if kind == "pane" else "",
+                           harness="claude", project_key="fixture",
+                           native={"pid": 1} if kind == "native" else None)
+            with mock.patch.object(st, "resolve_seat", return_value=seat):
+                st.run_hook("claude", "compact", f"sid-{kind}", phase="after", compact_summary=f"{kind} card",
+                            cwd=str(self.cwd), env=self.env, now=1000)
+            card = st.read_latest_card(seat)
+            self.assertEqual((card["body"], card["origin"]), (f"{kind} card", "runtime-compact"))
+        project = st.Seat("project", "fixture-project", harness="codex", project_key="fixture")
+        with mock.patch.object(st, "resolve_seat", return_value=project):
+            st.write_card(project, "codex", "sid-other", "another session's card", cwd=str(self.cwd), now=900)
+            st.run_hook("codex", "compact", "sid-project", phase="after", compact_summary="project summary",
+                        cwd=str(self.cwd), env=self.env, now=1000)
+        kept = st.read_latest_card(project)
+        self.assertEqual((kept["body"], kept["generation"]), ("another session's card", 1))
+        self.assertNotIn("origin", kept)
+        self.assertEqual(st.session_summary(project)[("codex", "sid-project")]["epoch"], 1)
+        self.assertEqual(self.enqueue_mock.call_count, 3)
+        self.assertEqual(self.enqueue_mock.call_args.args[0], project)
+        self.assertEqual(self.enqueue_mock.call_args.args[1:3], ("codex", "sid-project"))
 
     def test_oversized_summary_is_cut_by_the_existing_card_limit(self):
         summary = "진행 중: " + "가" * (st.CARD_BODY_MAX_BYTES // 3 + 500)

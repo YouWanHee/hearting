@@ -198,4 +198,4 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Runtime compaction tidy
 
-`PreCompact` supplies shared six-field summary instructions. `PostCompact` queues main-session memory tidy and saves a nonempty `compact_summary` as the seat card. Workers are skipped, and compaction is never held for tidy.
+`PreCompact` supplies shared six-field summary instructions. `PostCompact` queues main-session memory tidy and saves a nonempty `compact_summary` as the seat card at the session's own pane/native seat (a shared project seat queues the tidy only). Workers are skipped, and compaction is never held for tidy.

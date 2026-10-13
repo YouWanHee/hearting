@@ -526,5 +526,5 @@ approval defaults. Cross-launch propagation is not implemented by this slice.
 ## Runtime compaction tidy
 
 - **Runtime support:** compacting accepts context additions; the successful compacted event identifies a session whose completed assistant summary is readable through the v1 plugin client.
-- **Adapter realization:** shared instructions go into `output.context`; bounded client lookup feeds shared card saving and memory queueing.
-- **Fallback:** missing matching summary or lookup failure queues memory only for an already identified main session; unknown worker identity skips tidy; a third-party prompt replacement may bypass the instructions. No idle-compaction policy is added.
+- **Adapter realization:** shared instructions go into `output.context`; bounded client lookup feeds shared card saving (own pane/native seat only) and memory queueing.
+- **Fallback:** missing matching summary or lookup failure queues memory only for an already identified main session; an unreadable session identity is recorded ledger-only without tidy; a third-party prompt replacement may bypass the instructions. No idle-compaction policy is added.

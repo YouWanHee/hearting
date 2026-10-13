@@ -85,6 +85,7 @@ PROMPT_LEDGER_THROTTLE_SEC = 20
 COMPACT_DEDUPE_SEC = 60
 AUTHOR_STALE_SEC = 10 * 60
 COMPACT_LOCK_WAIT_SEC = 1.0         # a compact hook waits this long for the seat lock, never longer
+COMPACT_CARD_SEAT_KINDS = ("pane", "native")   # seats of one session; never the shared project seat
 # The runtime compaction summary doubles as the seat card (capabilities/session-tidy.md):
 # the card's fields and order, in the user's language.
 COMPACT_CARD_INSTRUCTIONS = (
@@ -1056,9 +1057,12 @@ def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transc
                        env, now: Optional[float]) -> None:
     """Record one completed main compaction, save its summary as the seat card, then queue the tidy.
 
-    The card and the queue are independent: a busy seat lock or a failed card write still
-    queues the memory tidy. This path does not go through ``cmd_enqueue``, so it never
-    snapshots handover state or touches a clear booking, and it never waits for the tidy.
+    Only a session's own seat (pane or native) takes the card: a project fallback seat can be
+    shared by several sessions of one repository, and an automatic card there could replace
+    another session's card. The card and the queue are independent: a project seat, a busy
+    seat lock or a failed card write still queues the memory tidy. This path does not go
+    through ``cmd_enqueue``, so it never snapshots handover state or touches a clear booking,
+    and it never waits for the tidy.
     """
     now = now_epoch() if now is None else now
     seat = resolve_seat(harness, cwd or None, env, sid, "compact")
@@ -1073,7 +1077,7 @@ def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transc
                              transcript=transcript or (prior or {}).get("transcript", ""),
                              cwd=cwd, now=now, bump_epoch=compacting)
             body = sanitize_body(summary)
-            if body:
+            if body and seat.kind in COMPACT_CARD_SEAT_KINDS:
                 with contextlib.suppress(BaseException):
                     write_card(seat, harness, sid, body, cwd=cwd, now=now,
                                prompt_seq=read_prompt_seq(seat), origin="runtime-compact")

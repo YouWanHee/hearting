@@ -377,4 +377,4 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Runtime compaction tidy
 
-`experimental.session.compacting` appends shared six-field instructions to `output.context`; `session.compacted` fetches the matching completed assistant summary through the v1 client, then saves it as the seat card and queues tidy. Missing summary/client data queues memory only for a known main session; unknown worker identity skips.
+`experimental.session.compacting` appends shared six-field instructions to `output.context`; `session.compacted` fetches the matching completed assistant summary through the v1 client, then saves it as the seat card at the session's own pane/native seat and queues tidy (a shared project seat queues the tidy only). Missing summary/client data queues memory only for a known main session; a session whose identity cannot be read is recorded ledger-only, as before.

@@ -504,5 +504,5 @@ unimplemented follow-up work.
 ## Runtime compaction tidy
 
 - **Runtime support:** PreCompact accepts successful stdout as summary instructions; PostCompact provides `compact_summary`, including auto/idle paths.
-- **Adapter realization:** the shared compact hook requests six fields, records the epoch, saves nonempty summaries and queues memory tidying.
+- **Adapter realization:** the shared compact hook requests six fields, records the epoch, saves nonempty summaries at the session's own pane/native seat and queues memory tidying.
 - **Fallback:** missing/empty summaries or hook failures leave compaction running; cards are preserved and available summaries are bounded by the existing card limit.

@@ -20,7 +20,8 @@ when it is safe; the new session then picks the work up from the card by itself.
 here is required input and nothing waits for a confirmation.
 
 Runtime compaction already queues memory tidying for the main session and saves its
-completed summary as the seat card when that runtime provides it. Do not enqueue a
+completed summary as the seat card when that runtime provides it and the session has
+its own seat (pane or native; a shared project seat only queues the tidy). Do not enqueue a
 duplicate tidy for the same compaction; invoke this Skill when you need a separate
 handoff or tidy.
 
