@@ -81,6 +81,34 @@ class WorkerHomes(unittest.TestCase):
         self.assertIn('--strict-mcp-config', claude_worker_arguments(env))
         self.assertNotIn('--bare', claude_worker_arguments(env))
 
+    def test_claude_default_layout_seals_the_main_session_quota_scope(self):
+        # Without CLAUDE_CONFIG_DIR the signed-in account lives in ~/.claude.json,
+        # beside ~/.claude/, never inside it; the worker must carry that account so
+        # its launch scope matches the scope the main session reads.
+        from dispatch_capacity_evidence import launch_scope
+        user_home = self.base / 'home'
+        (user_home / '.claude').mkdir(parents=True)
+        (user_home / '.claude/.credentials.json').write_text('{}')
+        account = {'accountUuid': 'user-account', 'organizationUuid': 'user-org'}
+        (user_home / '.claude.json').write_text(json.dumps({'oauthAccount': account, 'mcpServers': {'main': {}}}))
+        self.env['HOME'] = str(user_home)
+        with patch.dict(os.environ, {'HOME': str(user_home)}):
+            env = prepare_worker_home(ROOT, 'claude', 'owner', 'default-layout', env=self.env)
+        home = Path(env['CLAUDE_CONFIG_DIR'])
+        self.assertEqual(json.loads((home / '.claude.json').read_text()), {'oauthAccount': account})
+        main_scope = launch_scope('claude', {'HOME': str(user_home)})
+        self.assertTrue(main_scope)
+        self.assertEqual(launch_scope('claude', {**self.env, **env}), main_scope)
+
+    def test_claude_unreadable_account_config_leaves_the_launch_unscoped(self):
+        user_home = self.base / 'home'
+        (user_home / '.claude').mkdir(parents=True)
+        (user_home / '.claude.json').write_text('{"oauthAccount": ')
+        self.env['HOME'] = str(user_home)
+        with patch.dict(os.environ, {'HOME': str(user_home)}):
+            env = prepare_worker_home(ROOT, 'claude', 'owner', 'torn-config', env=self.env)
+        self.assertFalse((Path(env['CLAUDE_CONFIG_DIR']) / '.claude.json').exists())
+
     def test_codex_hook_alias_preserves_user_decisions_and_rereads_them_on_resume(self):
         hooks = self.source / 'hooks.json'
         hooks.write_text('{"hooks":{}}')

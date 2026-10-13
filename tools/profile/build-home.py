@@ -541,7 +541,15 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         source = Path(env.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').expanduser()
         # Capacity identity lives separately from credentials/settings. Keep
         # its account metadata without inheriting global MCP/onboarding state.
-        account = read_json(source / '.claude.json').get('oauthAccount')
+        # Claude Code keeps that global config inside the config dir only when
+        # CLAUDE_CONFIG_DIR is set; otherwise it is ~/.claude.json, beside ~/.claude/
+        # (the same file dispatch_capacity_evidence reads to seal the quota scope).
+        account_config = (source if env.get('CLAUDE_CONFIG_DIR') else Path(home_env)) / '.claude.json'
+        try:
+            config = read_json(account_config)
+        except (OSError, ValueError):
+            config = {}  # unreadable mid-rewrite: the launch stays unscoped, as before
+        account = config.get('oauthAccount') if isinstance(config, dict) else None
         if account:
             write_json(home / '.claude.json', {'oauthAccount': account})
         symlink(source / 'hooks', home / 'hooks')
