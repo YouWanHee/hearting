@@ -1876,8 +1876,14 @@ agent start|prompt|read|wait`), because `ListAgents` never surfaces a Codex sess
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for
 OpenCode) and `from.name` (the sender's registry name, Claude
-only today). Fleet joins sent/recv counts and the `← <name> · kind · age` subtitle on the
-exact session id, so a child row shows its steward on every harness; the pane pid probe
+only today). Fleet keeps sent/recv counts and exact directional peer identity in
+the existing session L1/L2: a short on-board tag (or harness-qualified short SID)
+is shown with `→`/`←`, and opposite directions for the same complete
+`(harness, full session_id)` combine as `↔`. No peer row is added; names, repository, kind,
+age and full identity remain available in the existing JSON/ledger detail. Narrow
+layouts preserve both directions. Missing endpoint identity keeps separate
+direction arrows. This communication display does not change the
+role decision below. The pane pid probe
 (`herdr pane process-info`) is what places an OpenCode session in its herdr pane. The
 steward marker under `<dispatch-state-root>/peer-steward/` is a **role** flag, not a
 side effect of talking: it is raised only by `peer-steward.py
