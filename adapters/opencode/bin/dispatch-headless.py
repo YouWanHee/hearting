@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "utilities"))
 from review_input import preview_request_nodes
+import opencode_context_window as opencode_context
 from worker_runtime_home import prepare_worker_home
 from dispatch_contract import (
     _atomic_registry_replace,
@@ -362,7 +363,7 @@ def _model_config_state() -> tuple[str, str]:
     return WRAPPER_COMMON.model_config_state("opencode")
 
 
-def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
+def _select_model_settings(args: argparse.Namespace) -> dict[str, str]:
     try:
         validate_registered_profile(
             args.model_profile,
@@ -513,6 +514,11 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         "source": "explicit", "role": "-", "profile": "unsealed",
         "tier": "explicit", "granularity": "legacy", "model": args.model, "variant": args.variant,
     }
+
+
+def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
+    selected = _select_model_settings(args)
+    return WRAPPER_COMMON.attach_context_window(selected, "opencode", error=ModelSelectionError)
 
 
 def prepare_nested_runtime(worktree: Path, attempt_id: str, environ=None,
@@ -1473,6 +1479,41 @@ def main(argv: list[str]) -> int:
         except (DispatchContractError, OSError) as exc:
             return fail(getattr(exc, "reason", "nested-opencode-runtime-unavailable"), 73,
                         detail=str(exc), child_spawned="0")
+    if action == "start":
+        native_env = {**os.environ, **args.nested_runtime_env,
+                      "OPENCODE_CONFIG_CONTENT": args.opencode_config_content}
+        try:
+            context_capture = opencode_context.prepare_launch_context(
+                model=args.resolved_model_settings["model"],
+                context_window=args.resolved_model_settings["context_window"],
+                config_content=args.opencode_config_content,
+                cwd=args.worktree,
+                environ=native_env,
+            )
+        except opencode_context.OpenCodeContextError as exc:
+            return fail("opencode-context-limit-unavailable", 69,
+                        detail=str(exc), child_spawned="0")
+        args.opencode_config_content = str(context_capture["config_content"])
+        catalog_limits = context_capture["catalog_limits"]
+        configured_limits = context_capture["configured_limits"]
+        native_limits = context_capture["native_limits"]
+        applied_limits = context_capture["applied_limits"]
+        final_limits = context_capture["final_limits"]
+        args.resolved_model_settings.update({
+            "context_window_native_model": str(context_capture["model"]),
+            "context_window_catalog_limit_context": str(catalog_limits["context"]),
+            "context_window_configured_limit_context": "absent" if configured_limits["context"] is None else str(configured_limits["context"]),
+            "context_window_configured_limit_input": "absent" if configured_limits["input"] is None else str(configured_limits["input"]),
+            "context_window_configured_limit_output": "absent" if configured_limits["output"] is None else str(configured_limits["output"]),
+            "context_window_native_limit_context": str(native_limits["context"]),
+            "context_window_native_limit_input": "absent" if native_limits["input"] is None else str(native_limits["input"]),
+            "context_window_native_limit_output": "absent" if native_limits["output"] is None else str(native_limits["output"]),
+            "context_window_applied_limit_context": str(applied_limits["context"]),
+            "context_window_applied_limit_input": "absent" if applied_limits["input"] is None else str(applied_limits["input"]),
+            "context_window_final_limit_context": "absent" if final_limits["context"] is None else str(final_limits["context"]),
+            "context_window_final_limit_input": "absent" if final_limits["input"] is None else str(final_limits["input"]),
+            "context_window_final_limit_output": "absent" if final_limits["output"] is None else str(final_limits["output"]),
+        })
     log_dir = (
         Path(args.log_dir)
         if args.log_dir
@@ -2113,6 +2154,17 @@ def main(argv: list[str]) -> int:
         print(f"{key}={value}")
     print(f"model={settings['model']}")
     print(f"variant={settings['variant']}")
+    print(f"context_window_requested={settings['context_window']}")
+    print(f"context_window_source={settings['context_window_source']}")
+    print(f"context_window_native_application=OPENCODE_CONFIG_CONTENT:provider-model-limit")
+    for key in ("context_window_native_model", "context_window_catalog_limit_context",
+                "context_window_configured_limit_context", "context_window_configured_limit_input",
+                "context_window_configured_limit_output", "context_window_native_limit_context",
+                "context_window_native_limit_input", "context_window_native_limit_output",
+                "context_window_applied_limit_context", "context_window_applied_limit_input",
+                "context_window_final_limit_context", "context_window_final_limit_input",
+                "context_window_final_limit_output"):
+        print(f"{key}={settings.get(key, 'not-launched')}")
     leg_class, auxiliary_check = _route_node_leg_fields(args)
     print(f"leg_class={leg_class}")
     print(f"auxiliary_check={auxiliary_check}")

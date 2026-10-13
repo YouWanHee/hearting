@@ -50,6 +50,73 @@ class ModelSettingsCliTest(unittest.TestCase):
                                 text=True, capture_output=True, timeout=10)
         return result.returncode, result.stdout + result.stderr
 
+    def run_get_cli(self, *args):
+        launcher = self.root / "bin" / "hearting"
+        launcher.parent.mkdir(exist_ok=True)
+        if not launcher.exists():
+            launcher.symlink_to(ROOT / "tools/install/harness.sh")
+        result = subprocess.run([str(launcher), "model", "get", *args, "--json"],
+                                env=dict(os.environ), text=True, capture_output=True, timeout=10)
+        return result.returncode, result.stdout + result.stderr
+
+    def test_context_window_set_get_and_legacy_file_bytes(self):
+        import json
+        for adapter in model_config.ADAPTERS:
+            with self.subTest(adapter=adapter):
+                path = self.user_path(adapter)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shipped = model_config.shipped_path(adapter).read_bytes()
+                legacy = b"".join(line for line in shipped.splitlines(keepends=True)
+                                   if not line.startswith(b"CFG_MODEL_CONTEXT_WINDOW="))
+                path.write_bytes(legacy)
+                before = model_config.parse_config(path)
+
+                code, output = self.run_cli(adapter, "context-window", "800000", "--json")
+                self.assertEqual(code, 0, output)
+                result = json.loads(output)
+                self.assertEqual(result["status"], "changed")
+                self.assertEqual(result["changed_keys"], ["CFG_MODEL_CONTEXT_WINDOW"])
+                self.assertEqual(Path(result["backup"]).read_bytes(), legacy)
+                after = model_config.parse_config(path)
+                self.assertEqual(after["CFG_MODEL_CONTEXT_WINDOW"], "800000")
+                for key, value in before.items():
+                    self.assertEqual(after[key], value, key)
+
+                code, output = self.run_get_cli(adapter, "context-window")
+                self.assertEqual(code, 0, output)
+                query = json.loads(output)
+                self.assertEqual(query["operation"], "model-context-window-get")
+                self.assertEqual(query["context_window"], "800000")
+                self.assertEqual(query["provenance"], "configured")
+                self.assertEqual(query["source"], "user")
+                self.assertFalse(query["measured_effective_capacity"])
+
+                code, output = self.run_cli(adapter, "context-window", "0800000", "--json")
+                self.assertEqual(code, 0, output)
+                self.assertEqual(json.loads(output)["status"], "unchanged")
+
+    def test_context_window_invalid_values_and_old_file_query_do_not_mutate(self):
+        import json
+        path = self.user_path("codex")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = b"".join(line for line in model_config.shipped_path("codex").read_bytes().splitlines(keepends=True)
+                           if not line.startswith(b"CFG_MODEL_CONTEXT_WINDOW="))
+        path.write_bytes(legacy)
+        for invalid in ("800k", "+800000", "99999", "1000001", "800000.0"):
+            before = path.read_bytes()
+            code, output = self.run_cli("codex", "context-window", invalid, "--json")
+            self.assertEqual(code, 64, output)
+            self.assertEqual(json.loads(output)["status"], "invalid-arguments")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(path.parent.glob("models.conf.bak*")), [])
+
+        code, output = self.run_get_cli("codex", "context-window")
+        self.assertEqual(code, 0, output)
+        query = json.loads(output)
+        self.assertEqual(query["source"], "user")
+        self.assertEqual(query["provenance"], "default")
+        self.assertEqual(query["context_window"], "800000")
+
     def test_all_harness_tier_edits_preserve_budget_and_exact_backup(self):
         for adapter in model_config.ADAPTERS:
             with self.subTest(adapter=adapter):

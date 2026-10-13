@@ -61,7 +61,8 @@ def _codex_args(**overrides):
         sandbox="workspace-write", approval="never",
         nested_headless_network=False,
         resolved_model_settings={
-            "source": "inherit", "role": "-", "model": None, "reasoning": None
+            "source": "inherit", "role": "-", "model": None, "reasoning": None,
+            "context_window": "800000",
         },
         resolved_completion_delivery="one-shot",
         report_bundle_root=None, owner_route_binding=None, max_continuations=None,
@@ -165,6 +166,22 @@ class CodexDryRunStartParity(unittest.TestCase):
         self.assertIn(state_root, _granted_dirs(dry_cmd, "--writable-root"))
         self.assertIn(state_root, _granted_dirs(start_cmd, "--writable-root"))
         self.assertEqual(_normalize(dry_cmd, ATTEMPT), _normalize(start_cmd, ATTEMPT))
+
+    def test_native_context_budget_reaches_raw_and_supervised_codex_commands(self):
+        settings = {"source": "profile", "model": "gpt-test", "reasoning": "low",
+                    "context_window": "600000"}
+        for delivery in ("one-shot", "app-server-supervised"):
+            args = _codex_args(resolved_model_settings=settings,
+                               resolved_completion_delivery=delivery)
+            command = shlex.split(CODEX.shell_command(
+                args, Path("/tmp/p.txt"), Path("/tmp/l.log")))
+            with self.subTest(delivery=delivery):
+                if delivery == "one-shot":
+                    self.assertIn("model_context_window=600000", command)
+                    self.assertEqual(command[command.index("model_context_window=600000") - 1], "-c")
+                else:
+                    self.assertIn("--model-context-window", command)
+                    self.assertEqual(command[command.index("--model-context-window") + 1], "600000")
 
     def test_writer_attempt_token_matches_command_attempt_id_on_both_sides(self):
         dry = _codex_args(attempt_id=None, command_attempt_id=ATTEMPT)

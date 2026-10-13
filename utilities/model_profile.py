@@ -264,6 +264,14 @@ def resolve_profile_values(
         raise ModelProfileError(f"profile tier {tier!r} lacks model/{budget_suffix.lower()}")
     if not budget:
         raise ModelProfileError(f"profile {profile!r} has an empty execution budget")
+    try:
+        from model_config import resolve_context_window
+    except ImportError:  # package import in focused unit tests
+        from utilities.model_config import resolve_context_window
+    try:
+        context_window, context_window_source = resolve_context_window(config)
+    except ValueError as exc:
+        raise ModelProfileError(f"invalid common context window: {exc}") from exc
     return {
         "profile": profile,
         "tier": tier,
@@ -271,6 +279,8 @@ def resolve_profile_values(
         "budget": budget,
         "budget_kind": budget_suffix.lower(),
         "granularity": granularity,
+        "context_window": context_window,
+        "context_window_source": context_window_source,
     }
 
 

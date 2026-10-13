@@ -481,7 +481,7 @@ def _model_config_state() -> tuple[str, str]:
     return WRAPPER_COMMON.model_config_state("codex")
 
 
-def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
+def _select_model_settings(args: argparse.Namespace) -> dict[str, str]:
     try:
         validate_registered_profile(
             args.model_profile,
@@ -650,6 +650,11 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         "source": "explicit", "role": "-", "profile": "unsealed",
         "tier": "explicit", "granularity": "legacy", "model": args.model, "reasoning": args.reasoning,
     }
+
+
+def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
+    selected = _select_model_settings(args)
+    return WRAPPER_COMMON.attach_context_window(selected, "codex", error=ModelSelectionError)
 
 
 # Who may commit, decided once for every harness (commit_policy).
@@ -1085,6 +1090,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
                 "--model", args.resolved_model_settings["model"],
                 "--reasoning", args.resolved_model_settings["reasoning"],
             ]
+        command += ["--model-context-window", args.resolved_model_settings["context_window"]]
         return (
             " ".join(shlex.quote(x) for x in [*writer, *command])
             + f" < {shlex.quote(str(prompt_path))}"
@@ -1162,6 +1168,7 @@ def shell_command(args: argparse.Namespace, prompt_path: Path, log_path: Path) -
             "-c",
             f"approval_policy={toml_string(args.approval)}",
         ]
+    cmd += ["-c", f"model_context_window={args.resolved_model_settings['context_window']}"]
     cmd += [
         "--json",
         "-",
@@ -2513,6 +2520,9 @@ def main(argv: list[str]) -> int:
         print(f"{key}={value}")
     print(f"model={settings['model']}")
     print(f"reasoning={settings['reasoning']}")
+    print(f"context_window_requested={settings['context_window']}")
+    print(f"context_window_source={settings['context_window_source']}")
+    print("context_window_native_application=codex-config:model_context_window")
     print(f"approval={args.approval}")
     leg_class, auxiliary_check = _route_node_leg_fields(args)
     print(f"leg_class={leg_class}")

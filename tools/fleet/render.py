@@ -4150,7 +4150,7 @@ def _session_repo_label(session):
 def _peer_endpoint_segs(harness, session_id, name, tag_by_key, repo_by_key=None):
     """Name the session at the other end of a relation, best evidence first.
 
-    `[46] hearting` when that session's repository is observed — the badge is the thing
+    `hearting [46]` when that session's repository is observed — the badge is the thing
     the user can actually look up. Otherwise the ledger's own display name, and only then
     the short session ID. Never the full session id: `← 01a084f7-63f2-7961-ae60-6fc2d8e60fc2`
     is what the board printed before this (the collector used to paste the raw id into the
@@ -4179,7 +4179,7 @@ def _peer_endpoint_segs(harness, session_id, name, tag_by_key, repo_by_key=None)
     if tag:
         segs = [("[", "dim"), (str(tag), "tag"), ("]", "dim")]
         if repo:
-            segs.append((" " + _clip_cells(repo, _PEER_NAME_MAX_CELLS), "dim"))
+            segs.insert(0, (_clip_cells(repo, _PEER_NAME_MAX_CELLS) + " ", "dim"))
         return segs
     if _peer_name_is_readable(name):
         return [(_clip_cells(name.strip(), _PEER_NAME_MAX_CELLS), "dim")]
@@ -6048,11 +6048,11 @@ def _gpu_session_label(owner, sessions=None):
     if name:
         return name + " " + short, short
     repo = _session_repo_label(session)
-    return (short + " " + repo if repo else short), short
+    return (repo + " " + short if repo else short), short
 
 
 def _gpu_lease_segs(lease, sessions=None, processes=None, compact=False):
-    """Owner, start and task of one reservation; the tag is the current one."""
+    """Session and start of one reservation, without task/run descriptions."""
     if processes is None:
         label, short = _gpu_session_label(lease.get("owner"), sessions)
         if compact:
@@ -6065,8 +6065,7 @@ def _gpu_lease_segs(lease, sessions=None, processes=None, compact=False):
                            for owner in owners)
     started = lease.get("started_at")
     when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) else "?"
-    task = _gpu_safe_text(_readable_name(lease.get("task") or lease.get("run_id") or "?"))
-    return [(_gpu_safe_text(label), "tag"), (" · " + when + " · " + task, "dim")]
+    return [(_gpu_safe_text(label), "tag"), (" · " + when, "dim")]
 
 
 def _gpu_reservation_rows(leases, indent, width, unplaced=False, sessions=None):
@@ -6104,7 +6103,7 @@ def _gpu_run_pairs(leases, processes):
     return pairs, rest
 
 
-_GPU_RUN_COMMAND_MIN_W = 12   # below this a clipped command says less than the task name
+_GPU_RUN_COMMAND_MIN_W = 12   # minimum room for a useful observed command
 
 
 def _gpu_run_rows(gpu, indent, width, sessions=None):

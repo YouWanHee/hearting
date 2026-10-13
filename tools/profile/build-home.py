@@ -422,6 +422,19 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     home.chmod(0o700)
     values = {'HEARTING_WORKER_HOME': str(home)}
+    home_env = env.get('HOME') or str(Path.home())
+    if harness == 'codex':
+        model_config_home = env.get('CODEX_HOME') or Path(home_env) / '.codex'
+    elif harness == 'claude':
+        model_config_home = env.get('CLAUDE_CONFIG_DIR') or Path(home_env) / '.claude'
+    else:
+        config_home = env.get('XDG_CONFIG_HOME') or Path(home_env) / '.config'
+        model_config_home = env.get('OPENCODE_CONFIG_DIR') or Path(config_home) / 'opencode'
+    values['HEARTING_MODEL_CONFIG_HOME'] = str(Path(model_config_home).expanduser().absolute())
+    if harness == 'opencode':
+        cache_home = env.get('XDG_CACHE_HOME') or Path(home_env) / '.cache'
+        values['HEARTING_OPENCODE_MODELS_CACHE'] = str(
+            (Path(cache_home).expanduser() / 'opencode').absolute())
 
     def symlink(source, target):
         if source is None:

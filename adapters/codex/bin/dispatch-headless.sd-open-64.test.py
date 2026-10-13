@@ -29,7 +29,7 @@ def _args(**overrides):
         intensity="quick", completion_delivery="auto", agent_home=Path("/tmp/sd64-fixture/home"),
         report_bundle_root=None, owner_route_binding=None, max_continuations=None,
         execution_access_grant=None, approval="never", sandbox="workspace-write",
-        resolved_model_settings={"source": "inherit"},
+        resolved_model_settings={"source": "inherit", "context_window": "800000"},
     )
     base.update(overrides)
     ns = argparse.Namespace(**base)
@@ -133,7 +133,7 @@ class SD64GrantMatrix(unittest.TestCase):
 
     # (g2) a quick owner keeps the same grants, sandbox, network and model under the supervisor
     def test_g2_quick_owner_command_is_the_same_under_the_supervisor(self):
-        settings = {"source": "profile", "model": "gpt-6-luna", "reasoning": "low"}
+        settings = {"source": "profile", "model": "gpt-6-luna", "reasoning": "low", "context_window": "800000"}
         for extra in (dict(route_id="rt-fixtureG2"), dict(route_id=None, command_attempt_id=None),
                       dict(nested_headless_network=True)):
             with self.subTest(**extra):

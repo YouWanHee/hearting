@@ -241,6 +241,10 @@ class ParentDeliveryContract(unittest.TestCase):
                 if hasattr(wrapper, "check_runtime_projection"):
                     stack.enter_context(mock.patch.object(wrapper, "check_runtime_projection", return_value=0))
                 stack.enter_context(mock.patch.object(wrapper.shutil, "which", return_value="/bin/runtime"))
+                if child == "opencode":
+                    from fixtures.opencode_native_context import launch_context
+                    stack.enter_context(mock.patch.object(wrapper.opencode_context,
+                        "prepare_launch_context", side_effect=launch_context))
                 stack.enter_context(mock.patch.object(wrapper, "shell_command", return_value="true"))
                 stack.enter_context(mock.patch.object(wrapper, "reserve_governor_token", return_value=("reserved", {})))
                 cancel = stack.enter_context(mock.patch.object(wrapper, "cancel_governor_reservation"))

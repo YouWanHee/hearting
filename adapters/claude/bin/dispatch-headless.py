@@ -378,7 +378,7 @@ def _model_config_state() -> tuple[str, str]:
     return WRAPPER_COMMON.model_config_state("claude")
 
 
-def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
+def _select_model_settings(args: argparse.Namespace) -> dict[str, str]:
     try:
         validate_registered_profile(
             args.model_profile,
@@ -528,6 +528,11 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
         "source": "explicit", "role": "-", "profile": "unsealed",
         "tier": "explicit", "granularity": "legacy", "model": args.model, "effort": args.effort,
     }
+
+
+def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
+    selected = _select_model_settings(args)
+    return WRAPPER_COMMON.attach_context_window(selected, "claude", error=ModelSelectionError)
 
 
 def task_prompt(args: argparse.Namespace) -> tuple[str, str]:
@@ -1080,6 +1085,12 @@ def completion_lease_path(args: argparse.Namespace) -> Path:
     if not args.attempt_id:
         return dispatch_state_root(args.jobs_path) / "supervisor-state" / "preview-only.lease"
     return supervisor_lease_path(args.jobs_path, args.attempt_id)
+
+
+def apply_context_window_environment(env: dict[str, str], settings: dict[str, str]) -> dict[str, str]:
+    """Set Claude's launch-scoped compaction budget after home projection."""
+    env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = settings["context_window"]
+    return env
 
 
 def _route_declares_terminal_commit_support(route_file: str) -> bool:
@@ -1818,6 +1829,10 @@ def main(argv: list[str]) -> int:
         args.worker_runtime_env = prepare_worker_home(args.agent_home, 'claude', args.worker_type,
                                                        args.attempt_id, env=env, profile=args.profile)
         env.update(args.worker_runtime_env)
+        # Apply after the masked worker home and all inherited environment
+        # updates so every direct/supervised/resumed native child sees this
+        # launch's captured operating budget.
+        apply_context_window_environment(env, args.resolved_model_settings)
         instance_dir = Path(env["CLAUDE_CONFIG_DIR"])
         command = shell_command(args, prompt_path, log_path)
         if args.resolved_completion_delivery == "session-resume-supervised":
@@ -2279,6 +2294,9 @@ def main(argv: list[str]) -> int:
         print(f"{key}={value}")
     print(f"model={settings['model']}")
     print(f"effort={settings['effort']}")
+    print(f"context_window_requested={settings['context_window']}")
+    print(f"context_window_source={settings['context_window_source']}")
+    print("context_window_native_application=env:CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     posture = _permission_posture(args)
     print(f"permission_mode={posture['mode']}")
     print(f"permission_mode_reason={posture['reason']}")

@@ -2608,6 +2608,34 @@ class PermissionPosturePassthrough(unittest.TestCase):
                 self.assertIn("--permission-mode", command)
 
 
+class ClaudeContextBudgetPropagation(unittest.TestCase):
+    def test_first_and_resumed_supervisor_processes_inherit_budget_and_runtime_home(self):
+        args = SimpleNamespace(
+            worktree="/tmp/worktree", state_file=None, claude_command=None,
+            add_dir=[], model=None, effort=None, disallowed_tool=[],
+            permission_mode=None, allowed_tool=[],
+        )
+        for resume in (False, True):
+            captured = {}
+
+            def fail_after_capture(command, **kwargs):
+                captured["command"] = command
+                captured["env"] = kwargs["env"]
+                raise OSError("fixture stops before process creation")
+
+            with self.subTest(resume=resume), \
+                 mock.patch.dict(os.environ, {
+                     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "600000",
+                     "CLAUDE_CONFIG_DIR": "/canonical/claude",
+                 }), \
+                 mock.patch.object(supervisor.subprocess, "Popen", side_effect=fail_after_capture), \
+                 self.assertRaises(supervisor.SupervisorError):
+                supervisor.ClaudeStreamSession(args, "session-1", resume=resume)
+            self.assertIn("--resume" if resume else "--session-id", captured["command"])
+            self.assertEqual(captured["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "600000")
+            self.assertEqual(captured["env"]["CLAUDE_CONFIG_DIR"], "/canonical/claude")
+
+
 class TerminalReconcileRefusalRecordTest(unittest.TestCase):
     """SD-115 axis 4 (짝), C47-14 (호출부): `reconcile()`'s `except Exception`
     already reported failure to its caller via `return False` -- it never

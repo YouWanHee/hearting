@@ -345,7 +345,7 @@ class CodexRouteBoundWorkerGrant(unittest.TestCase):
             sandbox="workspace-write",
             approval="never",
             resolved_completion_delivery="one-shot",
-            resolved_model_settings={"source": "inherit"},
+            resolved_model_settings={"source": "inherit", "context_window": "800000"},
             owner_route_binding=None,
             max_continuations=None,
         )
@@ -509,7 +509,8 @@ def _prompt_args(**overrides):
         sandbox="workspace-write", approval="never",
         nested_headless_network=False,
         resolved_model_settings={
-            "source": "inherit", "role": "-", "model": None, "reasoning": None
+            "source": "inherit", "role": "-", "model": None, "reasoning": None,
+            "context_window": "800000"
         },
         resolved_completion_delivery="app-server-supervised",
     )

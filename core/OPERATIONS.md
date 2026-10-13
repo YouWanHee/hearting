@@ -1885,9 +1885,13 @@ steward on` (`source=explicit`), by `peer-steward.py wait`/`watch` once herdr an
 about a real target (`source=watch`; a mistyped target leaves no flag), or by a
 `peer-steward.py start` that launched a session (`source=start`). No `record` path and
 no send raises it — not a steer/handoff/gate-relay and not a `SendMessage` with `notify_when_idle`, which the
-Claude hook records as `kind=watch`. Fleet renders an evidenced marker
-as the pink tag and model flag only for targets confirmed in the same repository.
-Fleet and herdr use `steward.role_targets` for that display decision, comparing
+Claude hook records as `kind=watch`. The explicit `steward on` entry
+(`source=explicit`, `kind=explicit`, target `unknown` / `-`) displays the calling
+session's role flag even without a target; it is not a supervision relation or
+workflow-health or execution-authority evidence. Fleet and herdr share
+`steward.role_flag` for this flag decision. Target-specific role evidence still
+requires targets confirmed in the same repository. The shared
+`steward.role_targets` lookup compares
 Git common directories (so linked worktrees count as the same repository) from
 existing session metadata. Unknown or foreign repository targets grant no role,
 connector or pink tag; cross-repository messages remain communication (`✉`).

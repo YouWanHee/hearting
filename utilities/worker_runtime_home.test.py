@@ -40,6 +40,8 @@ class WorkerHomes(unittest.TestCase):
         before = {p.name: p.read_bytes() for p in self.source.iterdir() if p.is_file()}
         for typ in ('owner', 'stage', 'review', 'support', 'frame'):
             env = prepare_worker_home(ROOT, 'codex', typ, typ, env=self.env)
+            self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
+            self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
             home = Path(env['CODEX_HOME'])
             self.assertNotIn('AGENTS.md — Codex Adapter Bootstrap', (home / 'AGENTS.md').read_text())
             for name in before:
@@ -65,6 +67,8 @@ class WorkerHomes(unittest.TestCase):
         (self.source / '.claude.json').write_text(json.dumps({'oauthAccount': account, 'mcpServers': {'main': {}}}))
         self.env['CLAUDE_CONFIG_DIR'] = str(self.source)
         env = prepare_worker_home(ROOT, 'claude', 'support', 'tidy', env=self.env)
+        self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
+        self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
         home = Path(env['CLAUDE_CONFIG_DIR'])
         actual = json.loads((home / 'settings.json').read_text())
         for key in ('hooks', 'permissions', 'env'):
@@ -106,7 +110,11 @@ class WorkerHomes(unittest.TestCase):
         (self.source / 'plugins').mkdir()
         (self.source / 'plugins/guard.js').write_text('guard')
         self.env['OPENCODE_CONFIG_DIR'] = str(self.source)
+        self.env['XDG_CACHE_HOME'] = str(self.source / 'cache')
         env = prepare_worker_home(ROOT, 'opencode', 'review', 'review', env=self.env)
+        self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
+        self.assertEqual(env['HEARTING_OPENCODE_MODELS_CACHE'], str(self.source / 'cache' / 'opencode'))
+        self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
         home = Path(env['OPENCODE_CONFIG_DIR'])
         actual = json.loads((home / 'opencode.json').read_text())
         self.assertEqual(actual['permission']['bash'], config['permission']['bash'])
