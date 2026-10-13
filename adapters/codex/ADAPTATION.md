@@ -736,3 +736,9 @@ filesystem sandbox, so they commit on a primary checkout unless launched inside 
 Codex owner sandbox, whose grant they inherit.
 
 Session and prompt bridges retain `hookSpecificOutput.additionalContext` for optional memory and lifecycle context.
+
+## Runtime compaction tidy
+
+- **Runtime support:** PreCompact/PostCompact run, but OpenAI remote V2 exposes no plaintext summary or compact-prompt override through them.
+- **Adapter realization:** main PostCompact queues memory tidying through the shared hook, with no stdout.
+- **Fallback:** six-field compaction summaries and automatic summary-card saving are unavailable; ordinary explicit session-tidy cards remain available, without switching providers or forcing local compaction.

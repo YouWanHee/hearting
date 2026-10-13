@@ -195,3 +195,7 @@ down, each at ratio 0.5. `--beside` selects the reference tab; `--pane` keeps
 explicit pane reuse. A full or irregular tab reuses an agent-free, idle shell
 with an empty prompt, or opens a tab in the same workspace. No pane move or
 extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.14`.
+
+## Runtime compaction tidy
+
+`PreCompact` supplies shared six-field summary instructions. `PostCompact` queues main-session memory tidy and saves a nonempty `compact_summary` as the seat card. Workers are skipped, and compaction is never held for tidy.

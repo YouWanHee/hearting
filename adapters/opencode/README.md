@@ -374,3 +374,7 @@ down, each at ratio 0.5. `--beside` selects the reference tab; `--pane` keeps
 explicit pane reuse. A full or irregular tab reuses an agent-free, idle shell
 with an empty prompt, or opens a tab in the same workspace. No pane move or
 extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.14`.
+
+## Runtime compaction tidy
+
+`experimental.session.compacting` appends shared six-field instructions to `output.context`; `session.compacted` fetches the matching completed assistant summary through the v1 client, then saves it as the seat card and queues tidy. Missing summary/client data queues memory only for a known main session; unknown worker identity skips.

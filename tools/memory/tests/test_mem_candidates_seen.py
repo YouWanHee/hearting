@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,15 @@ class SeenTestCase(unittest.TestCase):
     def setUpClass(cls):
         cls.tempdir = tempfile.TemporaryDirectory(prefix="seen-", dir="/var/tmp")
         cls.root = Path(cls.tempdir.name)
+        cls.fake_bin = cls.root / "bin"
+        cls.fake_bin.mkdir()
+        cls.real_python = sys.executable
+        compact_bridge = cls.fake_bin / "python3"
+        compact_bridge.write_text(
+            "#!/bin/sh\n"
+            "case \"$*\" in *worker-state-hook.py*compact-after*--harness*opencode*) exit 0 ;; esac\n"
+            f"exec {shlex.quote(cls.real_python)} \"$@\"\n", encoding="utf-8")
+        compact_bridge.chmod(0o700)
         cls.project = cls.root / "project"
         cls.project.mkdir()
         git(cls.project, "init")
@@ -81,6 +91,7 @@ class SeenTestCase(unittest.TestCase):
             "MEM_RECALL_EVENTS": str(cls.root / "events.jsonl"),
             "MEM_RECALL_RECEIPTS": str(cls.state / "agent-memory" / "recall-opportunities"),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PATH": str(cls.fake_bin) + os.pathsep + os.environ.get("PATH", ""),
         })
         env.update(extra)
         return env
@@ -381,7 +392,12 @@ class ResetSignalTest(SeenTestCase):
         script = f"""
 process.env.AGENT_HOME = {json.dumps(str(ROOT))}
 const mod = await import({json.dumps(str(OPENCODE_PLUGIN))})
-const plugin = await mod.AgentHarnessGuards({{ directory: {json.dumps(str(self.project))}, worktree: {json.dumps(str(self.project))} }})
+const plugin = await mod.AgentHarnessGuards({{ directory: {json.dumps(str(self.project))}, worktree: {json.dumps(str(self.project))}, client: {{
+  session: {{
+    get: async (request) => ({{ data: {{ id: request.path.id, parentID: null }} }}),
+    messages: async () => ({{ data: [] }}),
+  }},
+}} }})
 await plugin.event({{ event: {{ type: "session.compacted", properties: {{ sessionID: {json.dumps(session)} }} }} }})
 """
         result = subprocess.run(

@@ -25,6 +25,8 @@ const routeGateTools = new Set(["write", "edit", "multiedit", "patch", "apply_pa
 const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides?\.html$|03_components|scaffolds\/)/
 const promptBySession = new Map()
 const turnBySession = new Map()
+const sessionInfoById = new Map()
+const compactSnapshotBySession = new Map()
 // Prompt-lifecycle context that must stay visible for every model call of a
 // session, not just its first one. OpenCode has no Claude-style
 // `additionalContext` that merges into the user turn and persists in history:
@@ -268,6 +270,109 @@ function spawnCheckpoint(sid) {
 function sdkResponseData(result) {
   if (!result || typeof result !== "object" || result.error != null || result.response?.ok === false) return null
   return Object.hasOwn(result, "data") ? result.data : result
+}
+
+function runCompactHook(action, payload = {}) {
+  try {
+    const result = spawnSync("python3", [path.join(root, "utilities", "worker-state-hook.py"),
+      action, "--harness", "opencode"], {
+      cwd: root, env: { ...process.env, AGENT_HOME: root }, input: JSON.stringify(payload),
+      encoding: "utf8", timeout: 4000, killSignal: "SIGKILL",
+    })
+    return result.status === 0 ? (result.stdout || "").trim() : ""
+  } catch { return "" }
+}
+
+function compactInfoTime(info) {
+  const value = Number(info?.time?.created || info?.time?.updated || 0)
+  return value > 0 && value < 1e12 ? value * 1000 : value
+}
+
+function completedSummary(rows, sid) {
+  if (!Array.isArray(rows)) return null
+  return rows.map((row) => row?.info)
+    .filter((info) => info?.sessionID === sid && info.role === "assistant" && info.summary === true
+      && info.finish && !info.error)
+    .sort((a, b) => compactInfoTime(b) - compactInfoTime(a)
+      || String(b.id || "").localeCompare(String(a.id || "")))[0] || null
+}
+
+async function compactSessionInfo(ctx, sid) {
+  const known = sessionInfoById.get(sid)
+  if (known?.id === sid && Object.hasOwn(known, "parentID")) return known
+  if (typeof ctx.client?.session?.get !== "function") return null
+  const controller = new AbortController()
+  let timer
+  try {
+    const result = await Promise.race([
+      ctx.client.session.get({ path: { id: sid }, query: { directory: baseDir(ctx) }, signal: controller.signal }),
+      new Promise((resolve) => { timer = setTimeout(() => { controller.abort(); resolve(null) }, 750) }),
+    ])
+    const info = sdkResponseData(result)
+    if (!info || info.id !== sid || !Object.hasOwn(info, "parentID")) return null
+    sessionInfoById.set(sid, info)
+    return info
+  } catch { return null } finally { clearTimeout(timer) }
+}
+
+async function compactMessages(ctx, sid) {
+  if (typeof ctx.client?.session?.messages !== "function") return null
+  const controller = new AbortController()
+  let timer
+  try {
+    return await Promise.race([
+      ctx.client.session.messages({ path: { id: sid },
+        query: { directory: baseDir(ctx), limit: 64 }, signal: controller.signal }),
+      new Promise((resolve) => { timer = setTimeout(() => { controller.abort(); resolve(null) }, 1000) }),
+    ]).then(sdkResponseData)
+  } catch { return null } finally { clearTimeout(timer) }
+}
+
+async function beforeCompact(ctx, input, output) {
+  const sid = input?.sessionID || input?.sessionId || ""
+  if (process.env.AGENT_DISPATCH_STAGE_AUTHORITY === "0" || process.env.AGENT_DISPATCH_SUBSESSION_ID) {
+    runCompactHook("compact-before", input || {})
+    return
+  }
+  if (!sid || isWorkerSession()) return
+  const info = await compactSessionInfo(ctx, sid)
+  if (!info || info.parentID) return
+  const messages = await compactMessages(ctx, sid)
+  const prior = completedSummary(messages, sid)
+  compactSnapshotBySession.set(sid, { started: Date.now(), summaryID: prior?.id || "" })
+  const instructions = runCompactHook("compact-before", { ...input, worker: false })
+  if (instructions && output && typeof output === "object") {
+    if (!Array.isArray(output.context)) output.context = output.context ? [String(output.context)] : []
+    output.context.push(instructions)
+  }
+}
+
+async function afterCompact(ctx, event) {
+  const sid = event?.properties?.sessionID || ""
+  if (process.env.AGENT_DISPATCH_STAGE_AUTHORITY === "0" || process.env.AGENT_DISPATCH_SUBSESSION_ID) {
+    runCompactHook("compact-after", event || {})
+    return false
+  }
+  if (!sid || isWorkerSession()) return false
+  const info = await compactSessionInfo(ctx, sid)
+  if (!info) return false
+  const payload = { sessionID: sid, cwd: baseDir(ctx), worker: Boolean(info.parentID) }
+  if (info.parentID) { runCompactHook("compact-after", payload); return false }
+  const snapshot = compactSnapshotBySession.get(sid)
+  let summary = ""
+  if (snapshot) {
+    const rows = await compactMessages(ctx, sid)
+    const latest = completedSummary(rows, sid)
+    const created = compactInfoTime(latest)
+    if (latest && latest.id !== snapshot.summaryID && created >= snapshot.started) {
+      summary = (latest.parts || rows.find((row) => row?.info?.id === latest.id)?.parts || [])
+        .filter((part) => part?.type === "text" && typeof part.text === "string")
+        .map((part) => part.text).join("\n")
+    }
+  }
+  compactSnapshotBySession.delete(sid)
+  runCompactHook("compact-after", { ...payload, summary })
+  return true
 }
 
 // One native launch event and one publisher belong to this module/process, not
@@ -1115,15 +1220,23 @@ export const AgentHarnessGuards = async (ctx) => {
   return ({
   dispose: () => { completionCarrier.dispose(); retirePaneContext(ctx) },
   event: async ({ event }) => {
+    if (event && event.type === "session.created") {
+      const info = event.properties?.info
+      const createdID = info?.id || event.properties?.sessionID || ""
+      if (createdID && info && typeof info === "object") sessionInfoById.set(createdID, info)
+    }
     if (event && event.type === "session.created" && !isWorkerSession()) {
       reconnectPeerObligations()
       const sid = event.properties?.info?.id || event.properties?.sessionID || ""
       await completionCarrier.activate(sid)
     }
     if (event && event.type === "session.compacted") {
-      collectCard("compact", (event.properties && event.properties.sessionID) || "", baseDir(ctx))
-      runWorkerState("compact-after", event)
-      forgetShownCandidates(event.properties && event.properties.sessionID)
+      const sid = event.properties?.sessionID || ""
+      if (await afterCompact(ctx, event)) {
+        turnContextBySession.delete(sid)
+        cardBySession.delete(sid)
+        forgetShownCandidates(sid)
+      }
     }
     // session.idle fires after each turn (the session is waiting for the user).
     // It refreshes the summary and pane, starts the cycle checkpoint observation and
@@ -1247,7 +1360,7 @@ export const AgentHarnessGuards = async (ctx) => {
     }
   },
   "experimental.session.compacting": async (input, output) => {
-    runWorkerState("compact-before", input || {})
+    await beforeCompact(ctx, input || {}, output)
   },
   "shell.env": async (input, output) => {
     // A harness clears the inherited caller name and every other harness's session id from

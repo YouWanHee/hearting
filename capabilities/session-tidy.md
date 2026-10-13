@@ -15,6 +15,8 @@ This is the portable capability contract for `session-tidy`. It defines runtime-
 
 ## Invocation Semantics
 
+Runtime compaction counts as a session tidy invocation by the main session. Each completed compaction queues memory tidying without clearing the window; when the runtime accepts summary instructions, use the six card fields (work in progress, waiting decisions, next actions, related references, today's work, and user instructions), and when the completed summary is available, save it as the seat card. Never block or delay compaction to complete tidying. Worker sessions are excluded.
+
 The main-authored card keeps work in progress, waiting decisions, the next step
 and related references first. Below those four fields, add "오늘 한 일"
 (today's work, with PR/version/result pointers) and "사용자 지시" (brief user
