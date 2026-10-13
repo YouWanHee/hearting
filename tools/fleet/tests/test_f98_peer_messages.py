@@ -578,7 +578,7 @@ class PeerRepoLabelsTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 segs = render._peer_endpoint_segs(harness, sid, None,
                     {(harness, sid): "42"}, repos)
-                self.assertEqual(render._plain(segs), "[42] " + repos[harness, sid])
+                self.assertEqual(render._plain(segs), repos[harness, sid] + " [42]")
         with mock.patch.object(render, "_resolve_session_tag", return_value=None):
             segs = render._peer_endpoint_segs("codex", "same-id", None, {}, repos)
         self.assertEqual(render._plain(segs), "hearting:same-id")

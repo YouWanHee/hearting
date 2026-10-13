@@ -83,7 +83,7 @@ class GPUSessionLabelsTest(unittest.TestCase):
         for sessions in ([], [session(name=None)]):
             with self.subTest(sessions=sessions):
                 line = self.rows(sessions)[2]
-                self.assertIn("[a1] TASLP" if sessions else "[a1]", line)
+                self.assertIn("TASLP [a1]" if sessions else "[a1]", line)
                 self.assertNotIn("codex", line)
                 for forbidden in ("vacant", "shared", "epoch99", "beta0", "sid-one"):
                     self.assertNotIn(forbidden, line)
@@ -101,7 +101,7 @@ class GPUSessionLabelsTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 self.assertEqual(render._gpu_session_label(owner(harness), [
                     session(harness, name=None), session("foreign", name=None)]),
-                    ("[%s] TASLP" % tag, "[%s]" % tag))
+                    ("TASLP [%s]" % tag, "[%s]" % tag))
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "actual-repo"
             gitdir = repo / ".git" / "worktrees" / "branch"
@@ -112,12 +112,12 @@ class GPUSessionLabelsTest(unittest.TestCase):
             (worktree / ".git").write_text("gitdir: %s\n" % gitdir)
             row = session(name=None)
             row.cwd = str(worktree)
-            self.assertEqual(render._gpu_session_label(owner(), [row])[0], "[a1] actual-repo")
+            self.assertEqual(render._gpu_session_label(owner(), [row])[0], "actual-repo [a1]")
 
     def test_no_tag_uses_short_id_and_observed_repo_not_harness(self):
         row = session(sid="abcdefgh-one", name=None)
         self.assertEqual(render._gpu_session_label(owner(sid=row.session_id), [row]),
-                         ("abcdefgh TASLP", "abcdefgh"))
+                         ("TASLP abcdefgh", "abcdefgh"))
         row.cwd = ""
         self.assertEqual(render._gpu_session_label(owner(sid=row.session_id), [row])[0], "abcdefgh")
 
@@ -153,12 +153,15 @@ class GPUSessionLabelsTest(unittest.TestCase):
         self.gpu["reservations"] = [{"pid": 700, "owner": self.process["owner"],
                                     "run_id": "beta0-vacant-shared-epoch99",
                                     "started_at": 1728000000, "task": "training detail"}]
+        before = copy.deepcopy(self.snapshot)
         line = self.rows([session()])[3]
         self.assertIn("TASLP 메인 [a1]", line)
         self.assertIn("train_beta0.py", line)
         self.assertIn("--epochs 99", line)
         self.assertNotIn("run:", line)
         self.assertNotIn("vacant", line)
+        self.assertNotIn("training detail", line)
+        self.assertEqual(self.snapshot, before)
 
     def test_idle_and_unknown_metrics_do_not_acquire_false_session_owners(self):
         self.gpu["processes"] = []

@@ -281,8 +281,12 @@ name or verified alias and current Fleet tag. Run/job names and identifiers neve
 stand in for a session; observed occupation without an exact session is `미귀속`,
 not an empty GPU. Process commands and measurement freshness retain their meaning.
 Raw owner identifiers remain available in structured output.
+Expanded GPU process and reservation rows omit task descriptions and run IDs;
+the session identity and observed command identify the occupation. Reservation
+times remain facts, while task/run metadata stays in structured output.
 When a session label has only its Fleet tag or short session ID, show its
-observed repository instead of the harness name. Resolve linked worktrees to
+observed repository before that identifier instead of the harness name. The
+same repository-first order applies to peer relation labels. Resolve linked worktrees to
 their parent repository through the existing grouping resolver. Missing
 repository evidence leaves the identifier alone; another session or workload
 name never supplies it. Explicit session names and verified aliases keep priority.

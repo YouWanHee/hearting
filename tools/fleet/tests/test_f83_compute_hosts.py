@@ -123,7 +123,7 @@ class ComputeHostCollectorTest(unittest.TestCase):
 
 
 class ComputeHostRenderTest(unittest.TestCase):
-    def test_reservation_owner_task_and_start_are_visible_only_when_expanded(self):
+    def test_expanded_reservation_keeps_start_without_task_description(self):
         gpu = self.snapshot["hosts"][0]["gpus"][0]
         gpu["reservations"] = [{"owner": {"label": "SR_CorrNet [cd]"},
                                 "task": "css 1ch training", "started_at": 1728000000}]
@@ -135,7 +135,7 @@ class ComputeHostRenderTest(unittest.TestCase):
             self.assertIn("reserved 미귀속", text)
             self.assertNotIn("SR_CorrNet", text)
             self.assertIn("10-04", text)
-            self.assertIn("css", text)
+            self.assertNotIn("css", text)
             self.assertTrue(all(render._dw(render._plain(row)) <= width for row in rows))
 
     def setUp(self):

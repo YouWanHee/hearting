@@ -114,6 +114,7 @@ class GPUOneLineTest(unittest.TestCase):
         for n, (process, lease) in enumerate(zip(self.gpu["processes"], self.gpu["reservations"])):
             process["pgid"] = lease["pid"] = 900 + n
         original = copy.deepcopy(self.gpu)
+        self.rows(200)  # Build this test's fold targets, not a previous sample's.
         render._FOLDABLE = list(render._compute_host_rows.fold_rows)
         render._toggle_gpu_commands()
         lines = self.rows(200)
@@ -122,8 +123,9 @@ class GPUOneLineTest(unittest.TestCase):
         runs = lines[3:]
         for line in runs:
             self.assertIn("↳ ", line)
-            for detail in ("10-04", "detailed task", "detailed-name.yaml"):
+            for detail in ("10-04", "detailed-name.yaml"):
                 self.assertIn(detail, line)
+            self.assertNotIn("detailed task", line)
             self.assertLessEqual(render._dw(line), 199)
         self.assertEqual(sum("[bb]" in line for line in runs), 3)
         self.assertNotIn("reserved", "\n".join(runs))
