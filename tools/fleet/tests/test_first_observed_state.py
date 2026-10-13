@@ -473,7 +473,7 @@ class DelayedJoinTest(unittest.TestCase):
         self.assertEqual(row.work_projection.stage_label, 'test')
         self.assertEqual(row.summary, 'fresh basic NOW')
 
-    def test_failed_native_now_read_keeps_active_work_explicitly_checking(self):
+    def test_successful_empty_native_now_read_is_unavailable(self):
         source = self.source()
         source.jobs[0].summary, source.jobs[0].summary_ts = None, None
         detail = self.filled(source)
@@ -481,7 +481,8 @@ class DelayedJoinTest(unittest.TestCase):
         detail.snapshot.jobs[0].exec_tool = None
         row = details.merge(source, detail).jobs[0]
         text = render._plain(render._context_detail_row(row, term_width=168)[0])
-        self.assertIn('loading', text)
+        self.assertIn('unavailable', text)
+        self.assertNotIn('loading', text)
         self.assertEqual(row.liveness, 'working')
 
 
