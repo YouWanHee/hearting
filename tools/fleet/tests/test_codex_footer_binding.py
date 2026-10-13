@@ -29,7 +29,7 @@ def screen(thread_ids, *, prompt=True, clipped=False):
     lines = ["Codex", "›" if prompt else "composer unavailable"]
     for thread_id in thread_ids:
         shown = thread_id[:-4] + "…" if clipped else thread_id
-        lines.append("\x1b[2mThread ID: " + shown + "\x1b[0m")
+        lines.append("\x1b[2m" + shown + "\x1b[0m")
     return "\x1b[?25l" + "\r\n".join(lines) + "\r\n\x1b[?25h"
 
 
@@ -44,6 +44,7 @@ class CodexFooterBindingTest(unittest.TestCase):
         self.screens = {}
         self.screen_reads = []
         self.info_reads = []
+        self.report_calls = []
         self.native = {}
         self.services = set()
         self.workers = set()
@@ -74,6 +75,7 @@ class CodexFooterBindingTest(unittest.TestCase):
         env = {"HERDR_PANE_ID": pane}
         if socket_path:
             env["HERDR_SOCKET_PATH"] = socket_path
+            self.process_info[(socket_path, pane)] = self.process_info[pane]
         self.frontend_env[pid] = env
         self.screens[pane] = [screen(thread_id), screen(thread_id)]
         return self.records[pid]
@@ -101,8 +103,10 @@ class CodexFooterBindingTest(unittest.TestCase):
     def herdr(self, command, **kwargs):
         if "process-info" in command:
             pane = command[command.index("--pane") + 1]
-            self.info_reads.append((pane, kwargs.get("env")))
-            result = {"result": {"process_info": self.process_info.get(pane, {})}}
+            self.info_reads.append((pane, dict(kwargs.get("env") or os.environ)))
+            socket_path = (kwargs.get("env") or os.environ).get("HERDR_SOCKET_PATH")
+            info = self.process_info.get((socket_path, pane), self.process_info.get(pane, {}))
+            result = {"result": {"process_info": info}}
             return subprocess.CompletedProcess(command, 0, json.dumps(result), "")
         if len(command) > 3 and command[1:3] == ["agent", "read"]:
             pane = command[3]
@@ -110,6 +114,9 @@ class CodexFooterBindingTest(unittest.TestCase):
             queue = self.screens.get(pane, [""])
             output = queue.pop(0) if len(queue) > 1 else queue[0]
             return subprocess.CompletedProcess(command, 0, output, "")
+        if command[1:3] in (["pane", "report-agent-session"], ["pane", "report-metadata"]):
+            self.report_calls.append((command, dict(kwargs.get("env") or os.environ)))
+            return subprocess.CompletedProcess(command, 0, "", "")
         raise AssertionError(f"unexpected Herdr call: {command!r}")
 
     def scan_panes(self, pids):
@@ -132,24 +139,27 @@ class CodexFooterBindingTest(unittest.TestCase):
                 pid = 41000 + index
                 pane = f"wB:p{index}"
                 self.add_frontend(pid, pane, thread_id, socket_path=f"/isolated/{index}.sock")
-                reports = []
+                self.report_calls.clear()
                 scan = self.scan_panes([pid])
                 with scan[0], scan[1], scan[2], \
                         mock.patch.object(projection.shutil, "which", return_value="/fake/herdr"), \
                         mock.patch.object(projection, "_in_shared_codex_service", return_value=True), \
                         mock.patch.object(projection, "_defer_until_proven",
                                           side_effect=lambda sid, include: projection._await_tui_and_project(sid, include)), \
-                        mock.patch.object(projection, "_send_projection",
-                                          side_effect=lambda command, _observation: reports.append(command)), \
                         mock.patch.object(projection, "session_title", return_value="fixture title"), \
                         mock.patch.object(projection, "_formatter_overrides", return_value=(None, None)), \
                         mock.patch.object(projection, "compose", return_value=("[46] codex", "fixture title")), \
                         mock.patch.object(projection, "header_title", return_value="fixture header"), \
                         mock.patch.dict(os.environ, {"HERDR_PANE_ID": "stale:pane",
-                                                     "CODEX_THREAD_ID": TREE_ROOT}, clear=True), \
+                                                     "CODEX_THREAD_ID": TREE_ROOT,
+                                                     "HERDR_SOCKET_PATH": "/inherited-service.sock"}, clear=True), \
                         mock.patch("tempfile.gettempdir", return_value=str(self.root)):
                     projection.project("codex", thread_id)
+                    self.assertEqual(os.environ["HERDR_SOCKET_PATH"], "/inherited-service.sock")
+                reports = [command for command, _env in self.report_calls]
                 self.assertEqual(len(reports), 2)
+                self.assertTrue(all(env.get("HERDR_SOCKET_PATH") == f"/isolated/{index}.sock"
+                                    for _command, env in self.report_calls))
                 self.assertEqual(reports[0][1:4], ["pane", "report-agent-session", pane])
                 self.assertEqual(reports[0][reports[0].index("--agent-session-id") + 1], thread_id)
                 self.assertEqual(reports[1][1:4], ["pane", "report-metadata", pane])
@@ -175,6 +185,33 @@ class CodexFooterBindingTest(unittest.TestCase):
         scan = self.scan_panes([42101, 42102])
         with scan[0], scan[1], scan[2]:
             self.assertIsNone(projection._codex_tui_pane(THREAD_A))
+
+    def test_same_pane_id_on_different_sockets_is_not_one_unique_endpoint(self):
+        self.add_frontend(42111, "wA:p1", THREAD_A, socket_path="/isolated/first.sock")
+        self.add_frontend(42112, "wA:p1", THREAD_A, socket_path="/isolated/second.sock")
+        scan = self.scan_panes([42111, 42112])
+        with scan[0], scan[1], scan[2]:
+            self.assertIsNone(projection._codex_tui_pane(THREAD_A))
+
+    def test_uuid_in_title_is_not_the_current_native_identity_field(self):
+        pid, pane = 42121, "wA:ptitle"
+        self.add_frontend(pid, pane, THREAD_A)
+        self.screens[pane] = ["Codex\n›\nfixture-project · " + THREAD_A] * 2
+        self.assertEqual(pane_ownership.verified_pane(
+            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
+        self.screens[pane] = ["Codex\n›\n" + THREAD_A + " · " + THREAD_B] * 2
+        self.assertEqual(pane_ownership.verified_pane(
+            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), pane)
+
+    def test_frontend_default_socket_does_not_inherit_service_socket(self):
+        pid, pane = 42131, "wA:pdefault"
+        self.add_frontend(pid, pane, THREAD_A)
+        scan = self.scan_panes([pid])
+        with scan[0], scan[1], scan[2], \
+                mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": "/wrong-service.sock"}, clear=True):
+            self.assertEqual(projection._codex_tui_pane(THREAD_A), pane)
+            self.assertIsNone((self.info_reads[-1][1] or {}).get("HERDR_SOCKET_PATH"))
+            self.assertEqual(os.environ["HERDR_SOCKET_PATH"], "/wrong-service.sock")
 
     def test_same_frontend_current_selection_is_read_again_on_the_next_callback(self):
         pid, pane = 42151, "wA:pcurrent"
@@ -211,7 +248,7 @@ class CodexFooterBindingTest(unittest.TestCase):
         cases = (
             screen(THREAD_A, prompt=False),
             screen(THREAD_A, clipped=True),
-            screen([THREAD_A, THREAD_B]),
+            "Codex\n›\n" + THREAD_A + " " + THREAD_B,
             screen(TREE_ROOT),
         )
         for index, content in enumerate(cases):

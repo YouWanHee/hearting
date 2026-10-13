@@ -83,6 +83,16 @@ class ApplyTuiConfigTest(unittest.TestCase):
         self.assertEqual(applied, defaults)
         self.assertEqual(applied["status_line"][0], "thread-id")
 
+    def test_existing_thread_id_moves_first_while_other_custom_items_keep_order(self):
+        self.config.write_text('[tui]\nstatus_line = ["project-name", "thread-title", '
+                               '"thread-id", "custom-item"]\nstatus_line_use_colors = false\n')
+        result = self.apply_config()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = tomllib.loads(self.config.read_text())["tui"]
+        self.assertEqual(applied["status_line"],
+                         ["thread-id", "project-name", "thread-title", "custom-item"])
+        self.assertIs(applied["status_line_use_colors"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

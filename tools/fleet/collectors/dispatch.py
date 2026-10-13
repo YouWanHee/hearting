@@ -3597,6 +3597,16 @@ def _read_cycle_record(path):
         return None
 
 
+def _read_cycle_hints(path):
+    """Reuse the producer's compact filename projection without repairing it."""
+    try:
+        import directory_record_index
+        held = directory_record_index._load(Path(path))
+        return held["groups"] if held is not None else {}
+    except (ImportError, OSError, TypeError, ValueError):
+        return {}
+
+
 _CYCLE_LABEL_INVENTORIES = {}  # root -> (directory stamp, names, next offset)
 _CYCLE_ROUTE_PATHS = {}       # (root, route id) -> exact observed cycle path
 
@@ -3609,13 +3619,18 @@ def _campaign_labels(jobs):
 
 
 def _campaign_labels_read(jobs):
-    """Read exact labels through the existing admission index or bounded cache.
+    """Read exact labels through compact producer hints or the bounded cache.
 
     Open cycles may precede admission. Their fallback inventories names once,
     reads at most 200 records per pass, and continues on the next detail tick.
     Never stat every historical record merely to select that bounded batch.
     """
     from ..work_titles import cycle_title
+    # Install-follow may preserve a prior collector cache. Retire only the full
+    # admission documents that this display reader no longer uses.
+    for path in list(_CYCLE_RECORD_CACHE):
+        if os.fspath(path).endswith(os.path.join(".runtime", "artifact-admission", "v1", "index.json")):
+            _CYCLE_RECORD_CACHE.pop(path, None)
     read_json = lambda path: _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
     by_root = {}
     for job in jobs:
@@ -3626,19 +3641,15 @@ def _campaign_labels_read(jobs):
     for root, route_ids in by_root.items():
         cycles_dir = os.path.join(root, ".runtime", "artifact-producer", "v1", "cycles")
         remaining = set(route_ids)
-        index_path = os.path.join(root, ".runtime", "artifact-admission", "v1", "index.json")
-        index = _stat_memo(_CYCLE_RECORD_CACHE, index_path, _read_cycle_record) or {}
-        if not isinstance(index, dict):
-            index = {}
-        routes = index.get("routes") or {}
-        own_routes = routes.get(index.get("artifact_root_id"), {}) if isinstance(routes, dict) else {}
-        if not isinstance(own_routes, dict):
-            own_routes = {}
+        hint_path = os.path.join(cycles_dir, ".cycle-routes-index.json")
+        hints = _stat_memo(_CYCLE_RECORD_CACHE, hint_path, _read_cycle_hints) or {}
         for rid in route_ids:
-            row = own_routes.get(rid) or {}
-            cycle_id = row.get("cycle_id") if isinstance(row, dict) else None
-            if isinstance(cycle_id, str) and re.fullmatch(r"[A-Za-z0-9_-]+", cycle_id):
-                _CYCLE_ROUTE_PATHS[(root, rid)] = os.path.join(cycles_dir, cycle_id + ".json")
+            for name in hints.get(rid, ()):
+                path = os.path.join(cycles_dir, name)
+                rec = _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
+                if isinstance(rec, dict) and rec.get("route_id") == rid:
+                    _CYCLE_ROUTE_PATHS[(root, rid)] = path
+                    break
             path = _CYCLE_ROUTE_PATHS.get((root, rid))
             if path:
                 rec = _stat_memo(_CYCLE_RECORD_CACHE, path, _read_cycle_record)
@@ -3656,7 +3667,8 @@ def _campaign_labels_read(jobs):
             # A producer adding files each tick must not reset us to the first
             # 200 names forever. The next completed sweep sees all new names.
             if not inventory or (inventory[0] != stamp and inventory[2] == 0):
-                names = sorted(name for name in os.listdir(cycles_dir) if name.endswith(".json"))
+                names = sorted(name for name in os.listdir(cycles_dir)
+                               if name.endswith(".json") and not name.startswith("."))
                 inventory = (stamp, names, 0)
             stamp, names, offset = inventory
             batch = names[offset:offset + 200]

@@ -27,11 +27,13 @@ _WORKER_ENV = ("AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH", "OPENCODE_DISPATC
                "FLEET_TITLE_REFRESH", "MEM_DISTILL")
 
 
-def codex_footer_threads(lines):
+def codex_footer_threads(lines, *, current_id_only=False):
     """Return complete thread UUIDs in the visible footer below Codex's prompt.
 
     A missing prompt or a UUID clipped by terminal width yields no match. Callers
     decide whether multiple visible ids are ambiguous for their operation.
+    Pane binding consumes only the first native thread-id field; the broader
+    discovery form remains available to the existing peer clear observer.
     """
     if not isinstance(lines, (list, tuple)):
         return set()
@@ -39,6 +41,12 @@ def codex_footer_threads(lines):
                    if isinstance(lines[i], str) and lines[i].lstrip().startswith("›")), None)
     if prompt is None:
         return set()
+    if current_id_only:
+        first = next((line.strip() for line in lines[prompt + 1:]
+                      if isinstance(line, str) and line.strip()), "")
+        first_field = re.split(r"\s+[·|•]\s*", first, maxsplit=1)[0].strip()
+        match = _THREAD_ID_RE.fullmatch(first_field)
+        return {match.group(0)} if match else set()
     return {match.group(0) for line in lines[prompt + 1:] if isinstance(line, str)
             for match in _THREAD_ID_RE.finditer(line)}
 
@@ -61,7 +69,7 @@ def _read_codex_footer_threads(pane, *, executable=None, socket_path=None):
         if result.returncode or len(result.stdout.encode("utf-8")) > 131072:
             return None
         visible = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\r", "")
-        return codex_footer_threads(visible.splitlines())
+        return codex_footer_threads(visible.splitlines(), current_id_only=True)
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return None
 

@@ -413,9 +413,14 @@ or runtime-state migration.
 For a native Codex client/server session, the ordinary lifecycle reports the
 current `Thread.id`. When its callback runs in a shared service, the normal pane
 observer may resolve that id by reading the native status line of a live
-foreground Codex TUI. Accept it only when the full current thread id is visible
-in a fresh footer sample, the exact foreground PID, process start and
-controlling TTY remain stable across the read, and one pane uniquely matches.
+foreground Codex TUI. The managed status line places `thread-id` first and
+preserves the other custom items. Accept only that first native identity field;
+UUIDs in titles, directories or other footer items remain display labels.
+The full current id must be visible in fresh footer samples, the exact
+foreground PID, process start and controlling TTY must remain stable, and one
+Herdr endpoint and pane must uniquely match. Keep that validated endpoint for
+the session report, number lookup and metadata report, including when the
+shared callback inherited another socket.
 A thread's `sessionId` is its tree root, not its current thread identity; a fork
 can share a root with another current thread. The callback payload, environment
 SID, cwd, title, inherited pane environment, shared-server ancestry and tree

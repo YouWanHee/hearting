@@ -65,8 +65,8 @@ if items is None:
     items = list(default_items)
 elif not isinstance(items, list) or any(not isinstance(item, str) for item in items):
     raise SystemExit(f"apply-tui-config: tui.status_line must be an array of strings in {config_path}")
-elif "thread-id" not in items:
-    items = ["thread-id", *items]
+else:
+    items = ["thread-id", *(item for item in items if item != "thread-id")]
 
 lines = text.splitlines()
 section_re = re.compile(r"^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$")
@@ -98,7 +98,7 @@ else:
                 end_idx += 1
         if not isinstance(assignment, list):
             raise SystemExit(f"apply-tui-config: could not read tui.status_line in {config_path}")
-        if "thread-id" not in assignment:
+        if assignment != items:
             indent = lines[status_idx][:len(lines[status_idx]) - len(lines[status_idx].lstrip())]
             lines[status_idx:end_idx] = [indent + "status_line = " + json.dumps(items)]
             tui_end -= end_idx - status_idx - 1

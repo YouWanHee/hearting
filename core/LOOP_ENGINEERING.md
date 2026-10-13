@@ -190,6 +190,10 @@ links: prefer the existing cycle easy title or one-line summary, then its
 recorded title and campaign title. Without a usable title, show a short readable
 name with locator dates and execution suffixes removed. Read titles in the
 existing detail pass; never wait for them before publishing basic observations.
+Display labels use existing compact route-to-cycle filename hints and the bounded
+cycle inventory. Validate the selected record's exact route and normal campaign
+metadata; do not deserialize or retain full artifact-admission documents for
+labels. Generic metadata readers retain their existing document contracts.
 The name does not repeat the same command or execution identity on its line.
 Keep technical terms, capability/stage identifiers and short keyboard actions
 in their original notation. Fleet's own labels and legends use short English
