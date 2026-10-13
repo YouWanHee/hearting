@@ -220,11 +220,11 @@ def is_steward(harness: str, session_id: str) -> bool:
         return False
     try:
         from fleet.collectors.herdr import _clear_gpu_session_aliases
-        from fleet.collectors.steward import role_targets
+        from fleet.collectors.steward import role_flag
         aliases = _clear_gpu_session_aliases(harness, session_id,
                                              os.environ.get("HERDR_PANE_ID"))
         # The normal hook owns its cwd even before herdr has published a SID.
-        return bool(role_targets(harness, session_id, aliases=aliases, cwd=os.getcwd()))
+        return role_flag(harness, session_id, aliases=aliases, cwd=os.getcwd())
     except Exception:
         pass
     return False
