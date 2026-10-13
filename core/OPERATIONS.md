@@ -1727,6 +1727,25 @@ missed is consumed by the ordinary lifecycle callback or the same
 `retire <predecessor>` call, without another exit action, pane closure, manual
 ledger edit or new recovery command. Cancelled and unverifiable requests grant
 no handover, and an existing transfer to another successor stays authoritative.
+If a completed successful retirement booked a stale headless session label,
+handover alone may read the original foreground identity from its exact native
+PID/start record. A label is stale only when it is the native session of a
+verified headless owner binding; any other label keeps the ordinary path, and a
+pending settlement leaves a stale one to that completed replay. The correction
+holds when the retained source is stable, owned by the current user and written
+before acceptance, and its native session is the registered parent of exactly
+one verified matching headless owner binding in canonical jobs. Unrelated
+missing historical sidecars leave that match intact; multiple verified matching
+attempts, including foreign or closed parents, are ambiguous.
+The original requester and pre-acceptance beside mark still govern succession,
+and the existing writer rechecks current open-route ownership. Unknown native
+identity or relation grants nothing, including through the stale booked label.
+Only a copy used for handover changes: duty identity, result and history remain
+intact, and completed replay performs no exit or pane action. This authority
+contract is shared by Claude, Codex and OpenCode; retained native source support
+depends on the harness. OpenCode's exact retained TUI selection can supply it;
+missing or disposed records and unsupported dead Claude/Codex identity remain
+unknown. Native source availability is not inferred from a label or saved SID.
 Replacement admission and lineage use that same parent judgment: a depth-1
 replacement may be launched by the registered parent or its ledger-confirmed
 successor. Parent attempt bindings remain exact, as do route, node, depth,

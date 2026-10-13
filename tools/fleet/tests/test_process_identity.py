@@ -54,6 +54,73 @@ class OpenCodeProcessTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(opencode._argv_session(argv), expected)
 
+    def test_retained_reader_uses_only_the_original_lifetime_and_keeps_legacy_mode(self):
+        self.record()
+        path = self.dir / f"{self.pid}-{self.start}.json"
+        path.chmod(0o664)
+        with unittest.mock.patch.object(opencode, "_proc_start_ticks", return_value=None):
+            self.assertEqual(opencode.session_of_process(self.pid, self.env), (None, ""))
+            record = opencode._tui_selection_record(self.pid, self.start, self.env)
+        self.assertEqual(record["value"]["sessionID"], SID)
+        self.assertGreater(record["source"]["written_at"], 0)
+        self.assertEqual(record["source"]["mtime"], path.stat().st_mtime)
+        for pid, start in ((True, self.start), (0, self.start), (self.pid, True),
+                           (self.pid, ""), (self.pid, "../x"), (self.pid, "0"),
+                           (self.pid, str(int(self.start) + 1))):
+            with self.subTest(pid=pid, start=start):
+                self.assertIsNone(opencode._tui_selection_record(pid, start, self.env))
+
+    def test_native_record_types_paths_and_provenance_refuse_unknown(self):
+        path = self.dir / f"{self.pid}-{self.start}.json"
+        for value in (False, None, [], {}, {"schema": "hearting-tui-selection-v1",
+                "pid": self.pid, "start": self.start, "sessionID": [SID]},
+                {"schema": "hearting-tui-selection-v1", "pid": True,
+                 "start": self.start, "sessionID": SID}):
+            with self.subTest(value=value):
+                path.write_text(json.dumps(value))
+                self.assertIsNone(opencode._tui_selection_record(self.pid, self.start, self.env))
+        for raw in (b"{", b"\xff", b" " * 1025):
+            path.write_bytes(raw)
+            self.assertIsNone(opencode._tui_selection_record(self.pid, self.start, self.env))
+        path.unlink()
+        path.symlink_to(self.dir / "absent")
+        self.assertIsNone(opencode._tui_selection_record(self.pid, self.start, self.env))
+        path.unlink()
+        os.mkfifo(path)
+        self.assertIsNone(opencode._tui_selection_record(self.pid, self.start, self.env))
+        path.unlink()
+        self.record()
+        uid = os.getuid()
+        with unittest.mock.patch.object(opencode.os, "getuid", return_value=uid + 1):
+            self.assertIsNone(opencode._tui_selection_record(self.pid, self.start, self.env))
+        with unittest.mock.patch.object(opencode.os, "open", side_effect=PermissionError()):
+            self.assertIsNone(opencode._tui_selection_record(self.pid, self.start, self.env))
+
+    def test_atomic_replacement_during_read_is_unknown_even_with_identical_bytes(self):
+        self.record()
+        path = self.dir / f"{self.pid}-{self.start}.json"
+        real = os.fstat
+        calls = 0
+        def replace(fd):
+            nonlocal calls
+            calls += 1
+            result = real(fd)
+            if calls == 2:
+                other = path.with_suffix(".new")
+                other.write_bytes(path.read_bytes())
+                os.replace(other, path)
+            return result
+        with unittest.mock.patch.object(opencode.os, "fstat", side_effect=replace):
+            self.assertIsNone(opencode._tui_selection_record(self.pid, self.start, self.env))
+
+    def test_written_at_is_optional_for_live_identity_but_not_retained_provenance(self):
+        for written in (None, "yesterday", "2026-10-07T00:00:00", False):
+            with self.subTest(written=written):
+                self.record(writtenAt=written)
+                record = opencode._tui_selection_record(self.pid, self.start, self.env)
+                self.assertIsNone(record["source"]["written_at"])
+                self.assertEqual(opencode.session_of_process(self.pid, self.env), (SID, "opencode-tui-selection"))
+
     def test_one_record_shape_for_every_harness(self):
         self.record()
         with unittest.mock.patch.dict(os.environ, self.env):
