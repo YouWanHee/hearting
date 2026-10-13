@@ -4497,7 +4497,6 @@ _ANSI_TOKEN = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b\][^\x07\x1b]*(?:\x07|
 _RULE_LINE = re.compile(r"^[\s\u2500-\u257f]*\u2500{8,}[\s\u2500-\u257f]*$")
 _OPENCODE_HOME_PLACEHOLDER = "askanything"
 # A whole thread id; a cut one (`…` in a narrow pane) or one inside a longer token is not.
-_THREAD_ID = re.compile(r"(?<![0-9A-Za-z-])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9A-Za-z-])")
 
 
 def _screen_lines(raw):
@@ -4616,16 +4615,9 @@ def _screen_ready(harness, lines):
 
 
 def _codex_footer_threads(lines):
-    """The whole thread ids on Codex's status line (the lines below its input box).
-
-    hearting's Codex status line carries `thread-title`, which shows the thread id until the
-    thread has a title -- right after `/clear` the new thread's id (measured on codex 0.160.0:
-    the rollout written at the first message carries the same id; herdr kept the old one)."""
-    idx = next((i for i in range(len(lines) - 1, -1, -1)
-                if _marker_remainder(lines[i], "\u203a") is not None), None)
-    if idx is None:
-        return set()
-    return {m.group(0) for cells in lines[idx + 1:] for m in _THREAD_ID.finditer(_plain(cells))}
+    """Shared native footer parser used by clear observation and pane ownership."""
+    from pane_ownership import codex_footer_threads
+    return codex_footer_threads([_plain(cells) for cells in lines])
 
 
 def _codex_rollout_exists(thread_id):

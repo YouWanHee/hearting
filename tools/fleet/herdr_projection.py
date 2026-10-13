@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 _TOOLS = str(Path(__file__).resolve().parents[1])
@@ -417,26 +418,52 @@ def _defer_until_proven(session_id: str, report_session: bool) -> None:
         pass
 
 
-def _codex_tui_pane(session_id: str):
-    """The herdr pane of the live Codex TUI proven to be on ``session_id``, or None.
+@contextmanager
+def _herdr_endpoint(socket_path):
+    """Use the proven frontend endpoint in this dedicated deferred reporter."""
+    inherited = os.environ.get("HERDR_SOCKET_PATH")
+    if socket_path:
+        os.environ["HERDR_SOCKET_PATH"] = socket_path
+    else:
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+    try:
+        yield
+    finally:
+        if inherited is None:
+            os.environ.pop("HERDR_SOCKET_PATH", None)
+        else:
+            os.environ["HERDR_SOCKET_PATH"] = inherited
+
+
+def _codex_tui_pane(session_id: str, *, transport=None):
+    """The unique pane whose live foreground Codex TUI proves ``session_id``, or None.
 
     Two panes resolving to one session (same-cwd TUIs sharing the fallback candidate)
     stay None: a badge on the wrong pane also misdirects peer messages.
     """
     from fleet.collectors import procscan
-    panes = set()
+    endpoints = set()
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or _comm(int(entry)) != "codex":
             continue
-        pane = procscan.read_environ(int(entry)).get("HERDR_PANE_ID")
+        frontend_env = procscan.read_environ(int(entry))
+        pane = frontend_env.get("HERDR_PANE_ID")
+        socket_path = frontend_env.get("HERDR_SOCKET_PATH")
         try:
             if pane:
-                proven = verified_pane(pane, "codex", session_id, pid=int(entry))
+                with _herdr_endpoint(socket_path):
+                    proven = verified_pane(pane, "codex", session_id, pid=int(entry),
+                                           socket_path=socket_path)
                 if proven:
-                    panes.add(proven)
+                    endpoints.add((proven, socket_path))
         except Exception:
             continue
-    return panes.pop() if len(panes) == 1 else None
+    if len(endpoints) != 1:
+        return None
+    pane, socket_path = endpoints.pop()
+    if transport is not None:
+        transport.update(socket_path=socket_path)
+    return pane
 
 
 def _await_tui_and_project(session_id: str, report_session: bool) -> None:
@@ -448,14 +475,20 @@ def _await_tui_and_project(session_id: str, report_session: bool) -> None:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        lock.close()
         return
-    deadline = time.monotonic() + _PROOF_WAIT_S
-    while time.monotonic() < deadline:
-        pane = _codex_tui_pane(session_id)
-        if pane:
-            _report("codex", session_id, pane, report_session)
-            return
-        time.sleep(2)
+    try:
+        deadline = time.monotonic() + _PROOF_WAIT_S
+        while time.monotonic() < deadline:
+            transport = {}
+            pane = _codex_tui_pane(session_id, transport=transport)
+            if pane:
+                with _herdr_endpoint(transport.get("socket_path")):
+                    _report("codex", session_id, pane, report_session)
+                return
+            time.sleep(2)
+    finally:
+        lock.close()
 
 
 def _session_lifecycle(harness, session_seq, session_start_source):

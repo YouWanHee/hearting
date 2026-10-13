@@ -35,6 +35,10 @@ class PaneOwnershipTest(unittest.TestCase):
 
     def runtime(self, harness="claude"):
         master, slave = pty.openpty()
+        env = os.environ.copy()
+        for name in ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                     "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "MEM_DISTILL"):
+            env.pop(name, None)
 
         def terminal():
             os.setsid()
@@ -42,7 +46,7 @@ class PaneOwnershipTest(unittest.TestCase):
 
         proc = subprocess.Popen([harness, "-c", "import time; time.sleep(60)"],
                                 executable=sys.executable, stdin=slave,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
                                 preexec_fn=terminal)
         os.close(slave)
         self.addCleanup(os.close, master)
