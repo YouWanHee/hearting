@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fleet import render
+from fleet import display_snapshot, render
 
 
 def owner(harness="codex", sid="sid-one"):
@@ -112,7 +112,10 @@ class GPUSessionLabelsTest(unittest.TestCase):
             (worktree / ".git").write_text("gitdir: %s\n" % gitdir)
             row = session(name=None)
             row.cwd = str(worktree)
-            self.assertEqual(render._gpu_session_label(owner(), [row])[0], "actual-repo [a1]")
+            observations = display_snapshot.build([row])
+            with mock.patch("fleet.model.project_of", side_effect=AssertionError("lookup during draw")):
+                self.assertEqual(render._gpu_session_label(owner(), [row], observations)[0],
+                                 "actual-repo [a1]")
 
     def test_no_tag_uses_short_id_and_observed_repo_not_harness(self):
         row = session(sid="abcdefgh-one", name=None)

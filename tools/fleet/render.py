@@ -8891,7 +8891,7 @@ def render_once(collect_all, hfilter, section, *, compute_hosts_refresh=None):
                              route_entities=snapshot.route_entities, observations=snapshot.observations,
                              resource_diagnostics=resource_diagnostics,
                              pending_delivery=snapshot.pending_delivery,
-                             display_snapshot=snapshot.display_snapshot)
+                             display_snapshot=getattr(snapshot, "display_snapshot", None))
     finally:
         _GIT_TELEMETRY = previous_git_telemetry
     colored = bool(getattr(sys.stdout, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
@@ -10099,7 +10099,7 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
                              resource_diagnostics=(snapshot.resource_diagnostics if snapshot
                                                    else resource_diagnostics),
                              pending_delivery=snapshot.pending_delivery if snapshot else None,
-                             display_snapshot=(snapshot.display_snapshot if snapshot else None))
+                             display_snapshot=getattr(snapshot, "display_snapshot", None))
         _RELOAD_FRAME = lines
         _RELOAD_FRAME_AT = min(now, _COMPUTE_HOSTS_SET_AT) if _COMPUTE_HOSTS_SET_AT is not None else now
         _RELOAD_FRAME_COMPUTE_AT = _COMPUTE_HOSTS_SET_AT
