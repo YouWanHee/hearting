@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" exec worker-state-compact.py compact-before",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" exec worker-state-compact.py compact-before --harness claude",
             "timeout": 10
           }
         ]
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" exec worker-state-compact.py compact-after",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" exec worker-state-compact.py compact-after --harness claude",
             "timeout": 10
           }
         ]

@@ -84,6 +84,18 @@ HANDOVER_KEEP_ROWS = 40
 PROMPT_LEDGER_THROTTLE_SEC = 20
 COMPACT_DEDUPE_SEC = 60
 AUTHOR_STALE_SEC = 10 * 60
+COMPACT_LOCK_WAIT_SEC = 1.0         # a compact hook waits this long for the seat lock, never longer
+COMPACT_CARD_SEAT_KINDS = ("pane", "native")   # seats of one session; never the shared project seat
+# The runtime compaction summary doubles as the seat card (capabilities/session-tidy.md):
+# the card's fields and order, in the user's language.
+COMPACT_CARD_INSTRUCTIONS = (
+    "Write this summary as a session handoff card in the user's language, with these six "
+    "fields in this order: work in progress; waiting decisions; next actions; related "
+    "references (paths, PRs, sessions); today's work (with PR, installed version or result "
+    "file pointers); user instructions (brief quotes, each marked finished, remaining or "
+    "deferred). Keep the details needed to continue the work inside those fields, within "
+    "about 90 lines."
+)
 
 
 class StateError(Exception):
@@ -170,14 +182,29 @@ def read_json(path: Path):
 
 
 @contextlib.contextmanager
-def seat_lock(seat_key: str) -> Iterator[None]:
-    """Serialize hook consumption, ledger appends and card writes for one seat."""
+def seat_lock(seat_key: str, *, wait: Optional[float] = None) -> Iterator[None]:
+    """Serialize hook consumption, ledger appends and card writes for one seat.
+
+    ``wait`` bounds the wait in seconds (``None``: as long as it takes); a lock still
+    held after it raises ``BlockingIOError``.
+    """
     lock_dir = ensure_dir(state_root() / "locks")
     path = lock_dir / f"{seat_key}.lock"
     _reject_symlink(path)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if wait is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
         yield
     finally:
         with contextlib.suppress(OSError):
@@ -634,7 +661,8 @@ def read_latest_card(seat: Seat) -> Optional[dict]:
 
 
 def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
-               now: Optional[float] = None, prompt_seq: Optional[int] = None) -> dict:
+               now: Optional[float] = None, prompt_seq: Optional[int] = None,
+               origin: Optional[str] = None) -> dict:
     """Write the seat's newest card (caller holds the seat lock)."""
     now = now_epoch() if now is None else now
     body = sanitize_body(body)
@@ -651,6 +679,8 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
         "cwd": cwd,
         "body": body,
     }
+    if origin:
+        card["origin"] = origin
     if prompt_seq is not None:
         card["prompt_seq"] = int(prompt_seq)    # lets enqueue notice a prompt typed after the card
     if previous and isinstance(previous.get("memory_refs"), dict):
@@ -888,7 +918,8 @@ def build_card_injection(card: dict, card_path: Path, now: float, cap: int) -> s
 
 def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript: str = "",
              cwd: str = "", reread: bool = False, env=None, now: Optional[float] = None,
-             emit: Optional[Callable[[str], None]] = None) -> str:
+             emit: Optional[Callable[[str], None]] = None, phase: Optional[str] = None,
+             compact_summary: str = "") -> str:
     """Record the session, and print the card / notices it is due exactly once.
 
     Returns the text that was emitted ("" for none). The receipt is written only
@@ -897,6 +928,15 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
     """
     env = os.environ if env is None else env
     if is_worker(env) or harness not in HARNESSES or not sid or event not in ("start", "prompt", "compact"):
+        return ""
+    if event == "compact" and phase == "before":
+        text = COMPACT_CARD_INSTRUCTIONS if harness in ("claude", "opencode") else ""
+        if text and emit:
+            emit(text)
+        return text
+    if event == "compact" and phase == "after":
+        _run_compact_after(harness, sid, compact_summary, cwd=cwd, transcript=transcript,
+                           env=env, now=now)
         return ""
     now = now_epoch() if now is None else now
     seat = resolve_seat(harness, cwd or None, env, sid, source)
@@ -947,7 +987,8 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
-            eligible = (not same_session) or epoch > int(author.get("epoch", 0) or 0)
+            eligible = (not same_session) or (
+                card.get("origin") != "runtime-compact" and epoch > int(author.get("epoch", 0) or 0))
             consumed = read_json(_consumed_path(seat))
             # One card generation is injected once for the whole seat: any receipt for it,
             # from any session, means the card has already been handed over.
@@ -1010,6 +1051,44 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         cached = _cut_bytes(kept + "\n" + text, 2 * INJECTION_MAX_BYTES)[0] if kept else text
         atomic_write_json(_reread_path(harness, sid), {"schema": SCHEMA, "epoch": epoch, "text": cached, "at": now})
         return text
+
+
+def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transcript: str,
+                       env, now: Optional[float]) -> None:
+    """Record one completed main compaction, save its summary as the seat card, then queue the tidy.
+
+    Only a session's own seat (pane or native) takes the card: a project fallback seat can be
+    shared by several sessions of one repository, and an automatic card there could replace
+    another session's card. The card and the queue are independent: a project seat, a busy
+    seat lock or a failed card write still queues the memory tidy. This path does not go
+    through ``cmd_enqueue``, so it never snapshots handover state or touches a clear booking,
+    and it never waits for the tidy.
+    """
+    now = now_epoch() if now is None else now
+    seat = resolve_seat(harness, cwd or None, env, sid, "compact")
+    prior = None
+    with contextlib.suppress(BaseException):
+        with seat_lock(seat.key, wait=COMPACT_LOCK_WAIT_SEC):
+            prior = session_summary(seat).get((harness, sid))
+            with contextlib.suppress(BaseException):
+                # SessionStart(source=compact) may have counted this compaction already.
+                compacting = not (prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
+                record_event(seat, harness, sid, "compact", source="compact",
+                             transcript=transcript or (prior or {}).get("transcript", ""),
+                             cwd=cwd, now=now, bump_epoch=compacting)
+            body = sanitize_body(summary)
+            if body and seat.kind in COMPACT_CARD_SEAT_KINDS:
+                with contextlib.suppress(BaseException):
+                    write_card(seat, harness, sid, body, cwd=cwd, now=now,
+                               prompt_seq=read_prompt_seq(seat), origin="runtime-compact")
+            with contextlib.suppress(BaseException):
+                reread_path = _reread_path(harness, sid)
+                _reject_symlink(reread_path)
+                with contextlib.suppress(FileNotFoundError):
+                    reread_path.unlink()
+    with contextlib.suppress(BaseException):
+        import session_tidy_runner as runner
+        runner.enqueue_item(seat, harness, sid, cwd, transcript or (prior or {}).get("transcript", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -1143,8 +1222,14 @@ def cmd_handoff(args) -> int:
 def cmd_hook(args) -> int:
     try:
         sid = args.session_id or session_from_env(args.harness)[1] or ""
+        summary = ""
+        if args.phase == "after":
+            payload = json.load(sys.stdin)
+            if isinstance(payload, dict) and isinstance(payload.get("summary"), str):
+                summary = payload["summary"]
         run_hook(args.harness, args.event, sid, source=args.source or "", transcript=args.transcript or "",
-                 cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout)
+                 cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout,
+                 phase=args.phase, compact_summary=summary)
     except BaseException:  # noqa: BLE001 - a hook is silent on every failure
         pass
     return 0
@@ -1208,6 +1293,7 @@ def build_parser() -> argparse.ArgumentParser:
     hook.add_argument("--transcript")
     hook.add_argument("--cwd")
     hook.add_argument("--reread", action="store_true")
+    hook.add_argument("--phase", choices=("before", "after"))
     hook.set_defaults(func=cmd_hook)
     enqueue = sub.add_parser("enqueue", help="queue the memory tidy and return at once")
     enqueue.add_argument("--harness", choices=HARNESSES)

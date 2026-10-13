@@ -19,6 +19,12 @@ Write the handoff card yourself, queue the memory tidy, and let the window clear
 when it is safe; the new session then picks the work up from the card by itself. Nothing
 here is required input and nothing waits for a confirmation.
 
+Runtime compaction already queues memory tidying for the main session and saves its
+completed summary as the seat card when that runtime provides it and the session has
+its own seat (pane or native; a shared project seat only queues the tidy). Do not enqueue a
+duplicate tidy for the same compaction; invoke this Skill when you need a separate
+handoff or tidy.
+
 Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 <받을 세션>` (same
 work, then pass the card to a peer session; only this calling window is cleared, never the
 target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.
