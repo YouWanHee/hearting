@@ -176,6 +176,36 @@ class CompactHookTest(unittest.TestCase):
             result = invoke(harness, payload)
             self.assertEqual((result.returncode, result.stdout), (0, ""))
 
+    def test_main_wrapper_discards_partial_output_and_fails_open_on_timeout(self):
+        fake_home = self.root / "fake-home"
+        utility_dir = fake_home / "utilities"
+        utility_dir.mkdir(parents=True)
+        helper = utility_dir / "worker-state-hook.py"
+        helper.write_text(
+            "import os,sys,time\n"
+            "print('partial ledger output', flush=True)\n"
+            "if os.environ.get('FAKE_COMPACT_MODE') == 'timeout': time.sleep(8)\n"
+            "raise SystemExit(2 if os.environ.get('AGENT_DISPATCH_STAGE_AUTHORITY') == '0' else 1)\n",
+            encoding="utf-8")
+        wrapper = ROOT / "hooks/worker-state-compact.py"
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("AGENT_", "MEM_", "CODEX_", "OPENCODE_", "FLEET_"))}
+        env.update({"AGENT_HOME": str(fake_home), "PYTHONDONTWRITEBYTECODE": "1",
+                    "XDG_STATE_HOME": str(self.state), "HERDR_PANE_ID": ""})
+        partial = subprocess.run([sys.executable, str(wrapper), "compact-before", "--harness", "claude"],
+                                 env={**env, "FAKE_COMPACT_MODE": "partial"}, text=True,
+                                 capture_output=True, timeout=8)
+        self.assertEqual((partial.returncode, partial.stdout), (0, ""))
+        timed = subprocess.run([sys.executable, str(wrapper), "compact-before", "--harness", "claude"],
+                               env={**env, "FAKE_COMPACT_MODE": "timeout"}, text=True,
+                               capture_output=True, timeout=8)
+        self.assertEqual((timed.returncode, timed.stdout), (0, ""))
+        sub = subprocess.run([sys.executable, str(wrapper), "compact-after", "--harness", "claude"],
+                             env={**env, "AGENT_DISPATCH_STAGE_AUTHORITY": "0"}, text=True,
+                             input="{}", capture_output=True, timeout=8)
+        self.assertEqual(sub.returncode, 2)
+        self.assertEqual(sub.stdout, "partial ledger output\n")
+
     def test_opencode_uses_v1_summary_lookup_context_not_prompt_and_passes_only_new_summary(self):
         if not shutil.which("node"):
             self.skipTest("node is not installed")
