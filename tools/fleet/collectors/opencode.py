@@ -17,10 +17,12 @@ assistant message's tokens object) / model context window, the window read from 
 own models.dev registry cache (~/.cache/opencode/models.json). The session-table column
 tokens_input is a cumulative cost-side aggregate, NOT the current context size.
 """
+import datetime
 import json
 import os
 import re
 import sqlite3
+import stat
 import time
 
 from ..model import ContextEvidence, SubAgent
@@ -212,29 +214,61 @@ def _argv_session(argv):
     return found
 
 
-def _tui_selection(pid, start, environ=None):
-    """The session the pane's own TUI says it shows (PR190 record), or None.
+def _tui_selection_record(pid, start, environ=None):
+    """Read the producer's exact lifetime record, including a retained dead one.
 
-    The TUI writes `<state>/hearting/tui-identity/<pid>-<start>.json` for its own
-    process and removes it on the home screen, so a record naming this exact pid
-    and start time is the current selection."""
+    No process, argv, cwd or expected-session lookup supplies this identity.
+    Source timestamps are observations; the retire consumer checks acceptance.
+    Live readers do not require a retirement timestamp or writtenAt."""
     env = os.environ if environ is None else environ
     home = env.get("HOME") or ""
     base = env.get("XDG_STATE_HOME") or (os.path.join(home, ".local", "state") if home else "")
-    if not base or not start:
+    if (not base or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or isinstance(start, bool) or not str(start).isdigit() or int(start) <= 0):
         return None
-    path = os.path.join(base, "hearting", "tui-identity", "%d-%s.json" % (int(pid), start))
+    path = os.path.join(base, "hearting", "tui-identity", "%d-%s.json" % (pid, start))
+    def generation(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_uid,
+                info.st_mtime_ns, info.st_ctime_ns)
     try:
-        with open(path, "rb") as handle:
-            raw = handle.read(TUI_SELECTION_MAX_BYTES + 1)
-        row = json.loads(raw.decode("utf-8")) if len(raw) <= TUI_SELECTION_MAX_BYTES else None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or before.st_size > TUI_SELECTION_MAX_BYTES):
+                return None
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                raw = handle.read(TUI_SELECTION_MAX_BYTES + 1)
+            if (len(raw) > TUI_SELECTION_MAX_BYTES or len(raw) != before.st_size
+                    or generation(before) != generation(os.fstat(fd))
+                    or generation(before) != generation(os.lstat(path))):
+                return None
+        finally:
+            os.close(fd)
+        row = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return None
     if (not isinstance(row, dict) or row.get("schema") != TUI_SELECTION_SCHEMA
-            or row.get("pid") != int(pid) or str(row.get("start")) != str(start)
-            or not SESSION_ID_RE.match(str(row.get("sessionID") or ""))):
+            or type(row.get("pid")) is not int or row["pid"] != pid
+            or isinstance(row.get("start"), bool) or str(row.get("start")) != str(start)
+            or not isinstance(row.get("sessionID"), str)
+            or not SESSION_ID_RE.fullmatch(row["sessionID"])):
         return None
-    return row["sessionID"]
+    written = None
+    try:
+        timestamp = datetime.datetime.fromisoformat(row["writtenAt"].replace("Z", "+00:00"))
+        if timestamp.tzinfo is not None:
+            written = timestamp.timestamp()
+    except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+        pass
+    return {"value": row, "source": {"generation": generation(before),
+            "mtime": before.st_mtime, "ctime": before.st_ctime, "written_at": written}}
+
+
+def _tui_selection(pid, start, environ=None):
+    """The exact TUI selection SID or None; live callers check /proc separately."""
+    record = _tui_selection_record(pid, start, environ)
+    return record["value"]["sessionID"] if record is not None else None
 
 
 def session_of_process(pid, environ=None):
