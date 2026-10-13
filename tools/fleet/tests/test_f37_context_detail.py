@@ -409,9 +409,9 @@ class ClaudeStreamSessionTest(unittest.TestCase):
             for row in rows:
                 stream.write(json.dumps(row) + "\n")
 
-    def _write_transcript(self, cwd, sid, rows):
+    def _write_transcript(self, cwd, sid, rows, home=None):
         encoded = "".join("-" if ch in "/._" else ch for ch in cwd)
-        project = os.path.join(self.tmp.name, "projects", encoded)
+        project = os.path.join(home or self.tmp.name, "projects", encoded)
         os.makedirs(project, exist_ok=True)
         path = os.path.join(project, sid + ".jsonl")
         with open(path, "w", encoding="utf-8") as stream:
@@ -631,6 +631,50 @@ class ClaudeStreamSessionTest(unittest.TestCase):
         self.assertIsNone(job.active_context_tokens)
         self.assertIsNone(job.context_window_tokens)
         self.assertIsNone(job.exec_tool)
+
+    def test_supervisor_uses_recorded_worker_home_over_global_same_session(self):
+        cwd = os.path.join(self.tmp.name, "worktree")
+        os.makedirs(cwd)
+        sid = "11111111-2222-3333-4444-555555555555"
+        job = self._job("att-isolated-owner")
+        job.cwd = cwd
+        worker_home = os.path.join(self.tmp.name, "isolated-worker")
+        job._registry_metadata = {"runtime_home": worker_home}
+        self._write_log(job, [self._supervisor(sid, cwd)])
+        self._write_transcript(cwd, sid, [
+            self._assistant(sid, "claude-fable-5", 999),
+        ])
+        self._write_transcript(cwd, sid, [
+            self._assistant(sid, "claude-opus-5-5", 240),
+            {"type": "result", "sessionId": sid,
+             "modelUsage": {"claude-opus-5-5": {"contextWindow": 1200}}},
+        ], home=worker_home)
+
+        dispatch_collector._enrich_claude_stream_session(job)
+
+        self.assertEqual(job._runtime_session_id, sid)
+        self.assertEqual(job.resolved_model, "claude-opus-5-5")
+        self.assertEqual(job.active_context_tokens, 240)
+        self.assertEqual(job.context_window_tokens, 1200)
+        self.assertEqual(job.ctx_pct, 20)
+        self.assertEqual(job._context_evidence.source, "claude-session-transcript")
+
+    def test_supervisor_missing_recorded_home_does_not_borrow_global_transcript(self):
+        cwd = os.path.join(self.tmp.name, "worktree")
+        os.makedirs(cwd)
+        sid = "11111111-2222-3333-4444-555555555555"
+        job = self._job("att-missing-isolated-owner")
+        job.cwd = cwd
+        job._registry_metadata = {"runtime_home": os.path.join(self.tmp.name, "missing-worker")}
+        self._write_log(job, [self._supervisor(sid, cwd)])
+        self._write_transcript(cwd, sid, [
+            self._assistant(sid, "claude-fable-5", 999),
+        ])
+
+        dispatch_collector._enrich_claude_stream_session(job)
+
+        self.assertIsNone(job.active_context_tokens)
+        self.assertIsNone(job.resolved_model)
 
     def test_supervisor_malformed_ambiguous_and_mismatched_evidence_is_denied(self):
         cwd = os.path.join(self.tmp.name, "worktree")

@@ -247,7 +247,8 @@ retain matching links, publish changed links and generated files atomically,
 and preserve foreign non-link collisions. Home preparation adds no waiting lock
 or caller step. The registry still admits exactly one child for an exact attempt;
 the observed runtime-home location is launch metadata, like its process identity,
-and does not turn a duplicate start into a different assignment.
+and does not turn a duplicate start into a different assignment. Fleet's native
+observations use that attempt's recorded home across the three harnesses.
 
 **Inline exceptions.** Main or a dispatch-depth-1 owner may run such work inline only when at least one holds: the work is `direct` scale or a micro-stage inside the checked `quick` one-shot owner; file or state boundaries make it genuinely non-separable; every route-sealed registered-headless candidate has a typed hard-unavailable result and the compiled fallback policy reaches inline; the work is tightly coupled to external GPU or process state a worker cannot reach; the user explicitly requires main-session execution; or the stage is so small that dispatch overhead clearly exceeds it. A native-subagent restriction is surface-local and is never evidence that registered headless is unavailable. A failed hook-trust or worktree-safety check is a stop/re-isolate condition, not inline authority; `failure_scope=exact-worktree,retry_on_isolated_worktree=1` retains the stricter fail-close rule below. Running `standard+` separable work inline without recording the concrete reason — in `plans/<slug>/_internal/metrics.md` for code cycles, or the experiment `_RUNLOG`/`_internal` for lab cycles — is a contract violation; this generalizes SD-17 beyond code stages.
 

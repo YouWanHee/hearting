@@ -1344,7 +1344,8 @@ def _supervised_claude_transcript(job, receipt_path):
     # Claude's project encoding is deterministic (`encode_project_dir`).  Do not
     # glob for this session id: a same-id file under another project is not evidence.
     encoded_cwd = encode_project_dir(announced_cwd)
-    project_dir = os.path.realpath(os.path.join(_proj_home(), "projects", encoded_cwd))
+    runtime_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home")
+    project_dir = os.path.realpath(os.path.join(runtime_home or _proj_home(), "projects", encoded_cwd))
     transcript = os.path.realpath(os.path.join(project_dir, session_id + ".jsonl"))
     try:
         if os.path.commonpath((project_dir, transcript)) != project_dir:
