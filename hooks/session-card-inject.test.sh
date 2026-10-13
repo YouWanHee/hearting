@@ -34,7 +34,8 @@ cat > "$TMP/bin/python3" <<'SH'
 case "${1:-}" in
   */worker-state-hook.py)
     if [ "${2:-}" = compact-after ]; then
-      "$REAL_PYTHON" - "$TIDY" <<'PY'
+      # The compact payload arrives on stdin; record it ledger-only so no detached tidy starts.
+      exec "$REAL_PYTHON" -c '
 import json, subprocess, sys
 payload = json.load(sys.stdin)
 sid = payload.get("sessionID") or payload.get("session_id") or ""
@@ -43,8 +44,7 @@ if sid:
     subprocess.run([sys.executable, sys.argv[1], "hook", "--harness", "opencode",
                     "--event", "compact", "--session-id", sid, "--cwd", cwd],
                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-PY
-      exit 0
+' "$TIDY"
     fi
     ;;
 esac

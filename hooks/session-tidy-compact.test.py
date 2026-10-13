@@ -83,6 +83,16 @@ class CompactHookTest(unittest.TestCase):
         self.assertEqual(st.read_latest_card(self.seat), card_before)
         self.assertEqual(st.session_summary(self.seat)[("claude", "sid-main")]["epoch"], 1)
 
+    def test_oversized_summary_is_cut_by_the_existing_card_limit(self):
+        summary = "진행 중: " + "가" * (st.CARD_BODY_MAX_BYTES // 3 + 500)
+        st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary=summary,
+                    cwd=str(self.cwd), env=self.env, now=1000)
+        body = st.read_latest_card(self.seat)["body"]
+        self.assertLessEqual(len(body.encode("utf-8")), st.CARD_BODY_MAX_BYTES)
+        self.assertTrue(summary.startswith(body))
+        self.assertEqual(body, st.sanitize_body(summary))
+        self.assertEqual(self.enqueue_mock.call_count, 1)
+
     def test_start_compact_then_after_keeps_one_epoch_and_excludes_author_card(self):
         st.run_hook("claude", "start", "sid-main", source="compact", cwd=str(self.cwd),
                     env=self.env, now=1000)
@@ -118,17 +128,38 @@ class CompactHookTest(unittest.TestCase):
                     cwd=str(self.cwd), env=self.env, now=1010)
         self.assertEqual(self.enqueue_mock.call_args.args[-1], "payload.jsonl")
 
-    def test_lock_competition_is_silent_at_the_hook_boundary(self):
+    def test_busy_seat_lock_skips_the_card_but_still_queues(self):
         args = SimpleNamespace(harness="claude", session_id="sid-main", event="compact",
-                               source=None, transcript=None, cwd=str(self.cwd), reread=False,
+                               source=None, transcript="payload.jsonl", cwd=str(self.cwd), reread=False,
                                phase="after")
-        with st.seat_lock(self.seat.key):
+        with st.seat_lock(self.seat.key), mock.patch.object(st, "COMPACT_LOCK_WAIT_SEC", 0.1):
             with mock.patch.object(st, "resolve_seat", return_value=self.seat), \
                  mock.patch("sys.stdin", io.StringIO('{"summary":"summary"}')), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(st.cmd_hook(args), 0)
                 self.assertEqual(output.getvalue(), "")
-        self.assertEqual(self.enqueue_mock.call_count, 0)
+        self.assertEqual(self.enqueue_mock.call_count, 1)
+        self.assertEqual(self.enqueue_mock.call_args.args[-1], "payload.jsonl")
+        self.assertIsNone(st.read_latest_card(self.seat))
+
+    def test_bounded_seat_lock_waits_for_a_short_holder(self):
+        import threading
+        held = threading.Event()
+
+        def holder():
+            with st.seat_lock(self.seat.key):
+                held.set()
+                import time
+                time.sleep(0.2)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        held.wait(2)
+        st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="summary",
+                    cwd=str(self.cwd), env=self.env, now=1000)
+        thread.join()
+        self.assertEqual(st.read_latest_card(self.seat)["body"], "summary")
+        self.assertEqual(self.enqueue_mock.call_count, 1)
 
     def test_card_write_failure_does_not_suppress_queue(self):
         with mock.patch.object(st, "write_card", side_effect=OSError("fixture")):
@@ -176,6 +207,51 @@ class CompactHookTest(unittest.TestCase):
             result = invoke(harness, payload)
             self.assertEqual((result.returncode, result.stdout), (0, ""))
 
+    def test_runtime_bridge_after_forwards_payload_and_prints_nothing(self):
+        fake_home = self.root / "fake-tidy-home"
+        (fake_home / "utilities").mkdir(parents=True)
+        capture = self.root / "tidy-calls.jsonl"
+        (fake_home / "utilities/session_tidy.py").write_text(
+            "import json,sys\n"
+            f"open({str(capture)!r}, 'a').write(json.dumps({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}) + '\\n')\n"
+            "print('ignored after output')\n", encoding="utf-8")
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("AGENT_", "MEM_", "CODEX_", "OPENCODE_", "FLEET_"))}
+        env.update({"AGENT_HOME": str(fake_home), "XDG_STATE_HOME": str(self.state),
+                    "PYTHONDONTWRITEBYTECODE": "1"})
+        bridge = ROOT / "utilities/worker-state-hook.py"
+        payloads = {
+            "claude": {"session_id": "sid-c", "cwd": str(self.cwd), "transcript_path": "c.jsonl",
+                       "compact_summary": "claude summary"},
+            "codex": {"session_id": "sid-x", "cwd": str(self.cwd), "transcript_path": "x.jsonl"},
+            "opencode": {"sessionID": "sid-o", "cwd": str(self.cwd), "summary": "opencode summary"},
+        }
+        for harness, payload in payloads.items():
+            result = subprocess.run([sys.executable, str(bridge), "compact-after", "--harness", harness],
+                                    input=json.dumps(payload), env=env, text=True,
+                                    capture_output=True, timeout=8)
+            self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        calls = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(calls), 3)
+        expected = {
+            "claude": ("sid-c", "c.jsonl", "claude summary"),
+            "codex": ("sid-x", "x.jsonl", ""),
+            "opencode": ("sid-o", None, "opencode summary"),
+        }
+        for call in calls:
+            argv = call["argv"]
+            harness = argv[argv.index("--harness") + 1]
+            sid, transcript, summary = expected[harness]
+            self.assertEqual(argv[:6], ["hook", "--harness", harness, "--event", "compact", "--phase"])
+            self.assertEqual(argv[6], "after")
+            self.assertEqual(argv[argv.index("--session-id") + 1], sid)
+            self.assertEqual(argv[argv.index("--cwd") + 1], str(self.cwd))
+            if transcript:
+                self.assertEqual(argv[argv.index("--transcript") + 1], transcript)
+            else:
+                self.assertNotIn("--transcript", argv)
+            self.assertEqual(json.loads(call["stdin"]), {"summary": summary})
+
     def test_main_wrapper_discards_partial_output_and_fails_open_on_timeout(self):
         fake_home = self.root / "fake-home"
         utility_dir = fake_home / "utilities"
@@ -194,11 +270,11 @@ class CompactHookTest(unittest.TestCase):
                     "XDG_STATE_HOME": str(self.state), "HERDR_PANE_ID": ""})
         partial = subprocess.run([sys.executable, str(wrapper), "compact-before", "--harness", "claude"],
                                  env={**env, "FAKE_COMPACT_MODE": "partial"}, text=True,
-                                 capture_output=True, timeout=8)
+                                 input="{}", capture_output=True, timeout=8)
         self.assertEqual((partial.returncode, partial.stdout), (0, ""))
         timed = subprocess.run([sys.executable, str(wrapper), "compact-before", "--harness", "claude"],
                                env={**env, "FAKE_COMPACT_MODE": "timeout"}, text=True,
-                               capture_output=True, timeout=8)
+                               input="{}", capture_output=True, timeout=8)
         self.assertEqual((timed.returncode, timed.stdout), (0, ""))
         sub = subprocess.run([sys.executable, str(wrapper), "compact-after", "--harness", "claude"],
                              env={**env, "AGENT_DISPATCH_STAGE_AUTHORITY": "0"}, text=True,
@@ -206,75 +282,120 @@ class CompactHookTest(unittest.TestCase):
         self.assertEqual(sub.returncode, 2)
         self.assertEqual(sub.stdout, "partial ledger output\n")
 
-    def test_opencode_uses_v1_summary_lookup_context_not_prompt_and_passes_only_new_summary(self):
+    def _opencode_fixture(self, scenario, extra_env=None):
+        """Run the real plugin against a fake v1 client; a python3 shim records every helper call."""
         if not shutil.which("node"):
             self.skipTest("node is not installed")
-        fake_bin = self.root / "bin"
+        fake_bin = self.root / f"bin-{scenario}"
         fake_bin.mkdir()
-        captured = self.root / "after.json"
-        child_captured = self.root / "child-after.json"
-        bridge_log = self.root / "bridge.log"
+        calls = self.root / f"calls-{scenario}.jsonl"
+        instructions = self.root / "instructions.txt"
+        instructions.write_text(st.COMPACT_CARD_INSTRUCTIONS + "\n", encoding="utf-8")
         shim = fake_bin / "python3"
         shim.write_text(
             "#!/bin/sh\n"
-            f"printf '%s\\n' \"$*\" >> {shlex.quote(str(bridge_log))}\n"
-            f"case \"$1\" in */worker-state-hook.py) case \"$2\" in\n"
-            "compact-before) "
-            "printf '%s\\n' \"Summarize this session using exactly these six card fields: work in progress; waiting decisions; next actions; related references; today's work; user instructions. Keep the summary concise and preserve actionable details.\"; exit 0 ;;\n"
-            f"compact-after) if [ -e {shlex.quote(str(captured))} ]; then cat > {shlex.quote(str(child_captured))}; else cat > {shlex.quote(str(captured))}; fi; exit 0 ;;\nesac; exit 0 ;;\nesac\n"
-            f"exec {shlex.quote(sys.executable)} \"$@\"\n", encoding="utf-8")
+            f"exec {shlex.quote(sys.executable)} -c '\n"
+            "import json, os, sys\n"
+            "argv = sys.argv[1:]\n"
+            "name = os.path.basename(argv[0]) if argv else \"\"\n"
+            "body = sys.stdin.read() if name == \"worker-state-hook.py\" else \"\"\n"
+            f"open({json.dumps(str(calls))}, \"a\").write(json.dumps({{\"argv\": argv, \"stdin\": body}}) + \"\\n\")\n"
+            "if name == \"worker-state-hook.py\":\n"
+            "    if os.environ.get(\"FAKE_LEDGER_FAIL\") == \"1\":\n"
+            "        sys.stderr.write(\"ledger missing\\n\"); raise SystemExit(2)\n"
+            "    if argv[1] == \"compact-before\":\n"
+            f"        sys.stdout.write(open({json.dumps(str(instructions))}).read())\n"
+            "' \"$@\"\n", encoding="utf-8")
         shim.chmod(0o700)
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
-        script = f'''import {{ AgentHarnessGuards }} from {json.dumps(plugin.as_uri())}
+        script = f"""import {{ AgentHarnessGuards }} from {json.dumps(plugin.as_uri())}
+const scenario = {json.dumps(scenario)}
 const sid = "ses_fixture"
-const now = Date.now()
-let reads = 0
-const old = {{ info: {{ id: "old-summary", sessionID: sid, role: "assistant", summary: true, finish: "stop", time: {{ created: now - 5000 }} }}, parts: [{{ type: "text", text: "old" }}] }}
-const fresh = {{ info: {{ id: "new-summary", sessionID: sid, role: "assistant", summary: true, finish: "stop", time: {{ created: Date.now() }} }}, parts: [{{ type: "text", text: "fresh summary" }}, {{ type: "image", text: "ignored" }}] }}
+const old = {{ info: {{ id: "old-summary", sessionID: sid, role: "assistant", summary: true, finish: "stop", time: {{ created: Date.now() - 5000 }} }}, parts: [{{ type: "text", text: "old" }}] }}
+const fresh = {{ info: {{ id: "new-summary", sessionID: sid, role: "assistant", summary: true, finish: "stop", time: {{ created: 0 }} }}, parts: [{{ type: "text", text: "fresh summary" }}, {{ type: "image", text: "ignored" }}] }}
 const calls = []
 const ctx = {{ directory: {json.dumps(str(self.cwd))}, worktree: {json.dumps(str(self.cwd))}, client: {{ session: {{
-  get: async (request) => {{ calls.push(["get", request]); return {{ data: {{ id: request.path.id, parentID: request.path.id === "ses_child" ? sid : null }} }} }},
+  get: async (request) => {{
+    calls.push(["get", request.path.id])
+    if (scenario === "unknown") throw new Error("lookup failed")
+    return {{ data: {{ id: request.path.id, parentID: request.path.id === "ses_child" ? sid : null }} }}
+  }},
   messages: async (request) => {{
-    calls.push(["messages", request])
-    if (reads++ === 0) return {{ data: [old] }}
+    calls.push(["messages", request.path.id, request.query, Boolean(request.signal)])
     fresh.info.time.created = Date.now()
     return {{ data: [old, fresh] }}
   }},
 }} }} }}
 const plugin = await AgentHarnessGuards(ctx)
+const result = {{ calls }}
 const output = {{ context: [], prompt: "keep this prompt" }}
-await plugin["experimental.session.compacting"]({{ sessionID: sid }}, output)
-await plugin.event({{ event: {{ type: "session.compacted", properties: {{ sessionID: sid }} }} }})
-const childOutput = {{ context: [], prompt: "child prompt" }}
-await plugin["experimental.session.compacting"]({{ sessionID: "ses_child" }}, childOutput)
-await plugin.event({{ event: {{ type: "session.compacted", properties: {{ sessionID: "ses_child" }} }} }})
-console.log(JSON.stringify({{ output, calls, childOutput }}))
-'''
+try {{
+  await plugin["experimental.session.compacting"]({{ sessionID: sid }}, output)
+  result.before = "ok"
+}} catch (error) {{ result.before = String(error.message || error) }}
+result.output = output
+try {{
+  await plugin.event({{ event: {{ type: "session.compacted", properties: {{ sessionID: sid }} }} }})
+  result.after = "ok"
+}} catch (error) {{ result.after = String(error.message || error) }}
+if (scenario === "main") {{
+  result.childOutput = {{ context: [], prompt: "child prompt" }}
+  await plugin["experimental.session.compacting"]({{ sessionID: "ses_child" }}, result.childOutput)
+  await plugin.event({{ event: {{ type: "session.compacted", properties: {{ sessionID: "ses_child" }} }} }})
+}}
+console.log(JSON.stringify(result))
+"""
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("AGENT_", "MEM_", "CODEX_", "OPENCODE_", "FLEET_"))}
         env.update({"AGENT_HOME": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1",
                     "XDG_STATE_HOME": str(self.state), "MEM_STORE": str(self.root / "mem"),
-                    "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
-                    "COMPACT_CAPTURE": str(captured)})
+                    "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")})
+        env.update(extra_env or {})
         result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=self.cwd,
-                                env=env, text=True, capture_output=True, timeout=10)
+                                env=env, text=True, capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        data = json.loads(result.stdout)
-        self.assertIn(st.COMPACT_CARD_INSTRUCTIONS, data["output"]["context"],
-                      {**data, "bridge": bridge_log.read_text(encoding="utf-8") if bridge_log.exists() else "missing",
-                       "stderr": result.stderr})
-        self.assertEqual(data["output"]["prompt"], "keep this prompt")
-        self.assertEqual([item[0] for item in data["calls"]], ["get", "messages", "messages", "get"])
-        self.assertTrue(all(call[1].get("path", {}).get("id") == "ses_fixture"
-                            for call in data["calls"][:3]))
-        self.assertEqual(data["calls"][3][1]["path"]["id"], "ses_child")
-        after = json.loads(captured.read_text(encoding="utf-8"))
-        self.assertEqual(after["summary"], "fresh summary")
-        self.assertEqual(after["worker"], False)
-        child_after = json.loads(child_captured.read_text(encoding="utf-8"))
-        self.assertEqual(child_after["worker"], True)
-        self.assertEqual(child_after.get("summary", ""), "")
+        recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()] \
+            if calls.exists() else []
+        hooks = [(Path(c["argv"][0]).name, c["argv"][1:], c["stdin"]) for c in recorded if c["argv"]]
+        return json.loads(result.stdout.strip().splitlines()[-1]), hooks
+
+    def test_opencode_main_gets_instructions_in_context_and_saves_only_the_new_summary(self):
+        data, hooks = self._opencode_fixture("main")
+        self.assertEqual(data["output"], {"context": [st.COMPACT_CARD_INSTRUCTIONS], "prompt": "keep this prompt"})
+        # identity once per sid (cached), the summary read only after compaction, nothing before it
+        self.assertEqual([c[:2] for c in data["calls"]],
+                         [["get", "ses_fixture"], ["messages", "ses_fixture"], ["get", "ses_child"]])
+        self.assertEqual(data["calls"][1][2]["limit"], 64)
+        self.assertTrue(data["calls"][1][3])
+        compact = [h for h in hooks if h[0] == "worker-state-hook.py"]
+        self.assertEqual([h[1] for h in compact], [["compact-before", "--harness", "opencode"],
+                                                   ["compact-after", "--harness", "opencode"]])
+        after = json.loads(compact[1][2])
+        self.assertEqual((after["sessionID"], after["summary"], after["worker"]),
+                         ("ses_fixture", "fresh summary", False))
+        # a native child session gets no instructions and no tidy at all
         self.assertEqual(data["childOutput"], {"context": [], "prompt": "child prompt"})
+        self.assertTrue(any(h[0] == "mem.py" and "_seen-reset" in h[1] for h in hooks))
+
+    def test_opencode_unknown_identity_keeps_the_ledger_only_compact_record(self):
+        data, hooks = self._opencode_fixture("unknown")
+        self.assertEqual(data["output"], {"context": [], "prompt": "keep this prompt"})
+        self.assertFalse(any(h[0] == "worker-state-hook.py" for h in hooks))
+        legacy = [h[1] for h in hooks if h[0] == "session_tidy.py"]
+        self.assertEqual(len(legacy), 1)
+        self.assertEqual(legacy[0][:6], ["hook", "--harness", "opencode", "--event", "compact", "--session-id"])
+        self.assertNotIn("--phase", legacy[0])
+        self.assertTrue(any(h[0] == "mem.py" and "_seen-reset" in h[1] for h in hooks))
+
+    def test_opencode_sub_session_ledger_failure_still_fails_closed(self):
+        data, hooks = self._opencode_fixture(
+            "subsession", {"AGENT_DISPATCH_STAGE_AUTHORITY": "0", "FAKE_LEDGER_FAIL": "1"})
+        self.assertIn("ledger missing", data["before"])
+        self.assertIn("ledger missing", data["after"])
+        self.assertEqual(data["output"]["context"], [])
+        self.assertEqual(data["calls"], [])
+        self.assertEqual([h[1] for h in hooks if h[0] == "worker-state-hook.py"],
+                         [["compact-before"], ["compact-after"]])
 
 
 if __name__ == "__main__":

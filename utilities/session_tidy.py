@@ -84,10 +84,16 @@ HANDOVER_KEEP_ROWS = 40
 PROMPT_LEDGER_THROTTLE_SEC = 20
 COMPACT_DEDUPE_SEC = 60
 AUTHOR_STALE_SEC = 10 * 60
+COMPACT_LOCK_WAIT_SEC = 1.0         # a compact hook waits this long for the seat lock, never longer
+# The runtime compaction summary doubles as the seat card (capabilities/session-tidy.md):
+# the card's fields and order, in the user's language.
 COMPACT_CARD_INSTRUCTIONS = (
-    "Summarize this session using exactly these six card fields: work in progress; "
-    "waiting decisions; next actions; related references; today's work; user instructions. "
-    "Keep the summary concise and preserve actionable details."
+    "Write this summary as a session handoff card in the user's language, with these six "
+    "fields in this order: work in progress; waiting decisions; next actions; related "
+    "references (paths, PRs, sessions); today's work (with PR, installed version or result "
+    "file pointers); user instructions (brief quotes, each marked finished, remaining or "
+    "deferred). Keep the details needed to continue the work inside those fields, within "
+    "about 90 lines."
 )
 
 
@@ -175,14 +181,29 @@ def read_json(path: Path):
 
 
 @contextlib.contextmanager
-def seat_lock(seat_key: str, *, blocking: bool = True) -> Iterator[None]:
-    """Serialize hook consumption, ledger appends and card writes for one seat."""
+def seat_lock(seat_key: str, *, wait: Optional[float] = None) -> Iterator[None]:
+    """Serialize hook consumption, ledger appends and card writes for one seat.
+
+    ``wait`` bounds the wait in seconds (``None``: as long as it takes); a lock still
+    held after it raises ``BlockingIOError``.
+    """
     lock_dir = ensure_dir(state_root() / "locks")
     path = lock_dir / f"{seat_key}.lock"
     _reject_symlink(path)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if wait is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
         yield
     finally:
         with contextlib.suppress(OSError):
@@ -927,8 +948,6 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if text and emit:
                 emit(text)
             return text
-
-
         if event == "prompt":
             bump_prompt_seq(seat, harness, sid, now)
         prior = session_summary(seat).get((harness, sid))
@@ -1033,41 +1052,41 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         return text
 
 
-
 def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transcript: str,
                        env, now: Optional[float]) -> None:
-    """Record one completed main compaction, save its summary when present, then queue tidy."""
+    """Record one completed main compaction, save its summary as the seat card, then queue the tidy.
+
+    The card and the queue are independent: a busy seat lock or a failed card write still
+    queues the memory tidy. This path does not go through ``cmd_enqueue``, so it never
+    snapshots handover state or touches a clear booking, and it never waits for the tidy.
+    """
     now = now_epoch() if now is None else now
     seat = resolve_seat(harness, cwd or None, env, sid, "compact")
-    row = None
     prior = None
-    with seat_lock(seat.key, blocking=False):
-        try:
+    with contextlib.suppress(BaseException):
+        with seat_lock(seat.key, wait=COMPACT_LOCK_WAIT_SEC):
             prior = session_summary(seat).get((harness, sid))
-            compacting = not (prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
-            saved_transcript = transcript or (prior or {}).get("transcript", "")
-            row = record_event(seat, harness, sid, "compact", source="compact", transcript=saved_transcript,
-                               cwd=cwd, now=now, bump_epoch=compacting)
-        except BaseException:
-            row = None
-        clean = sanitize_body(summary)
-        if clean:
             with contextlib.suppress(BaseException):
-                write_card(seat, harness, sid, clean, cwd=cwd, now=now,
-                           prompt_seq=read_prompt_seq(seat), origin="runtime-compact")
-        with contextlib.suppress(BaseException):
-            reread_path = _reread_path(harness, sid)
-            _reject_symlink(reread_path)
-            with contextlib.suppress(FileNotFoundError):
-                reread_path.unlink()
-    # Queue independently after releasing the seat lock. This path deliberately does
-    # not call cmd_enqueue: it never snapshots handover state or touches clear bookings.
-    try:
+                # SessionStart(source=compact) may have counted this compaction already.
+                compacting = not (prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
+                record_event(seat, harness, sid, "compact", source="compact",
+                             transcript=transcript or (prior or {}).get("transcript", ""),
+                             cwd=cwd, now=now, bump_epoch=compacting)
+            body = sanitize_body(summary)
+            if body:
+                with contextlib.suppress(BaseException):
+                    write_card(seat, harness, sid, body, cwd=cwd, now=now,
+                               prompt_seq=read_prompt_seq(seat), origin="runtime-compact")
+            with contextlib.suppress(BaseException):
+                reread_path = _reread_path(harness, sid)
+                _reject_symlink(reread_path)
+                with contextlib.suppress(FileNotFoundError):
+                    reread_path.unlink()
+    with contextlib.suppress(BaseException):
         import session_tidy_runner as runner
-        saved_transcript = transcript or (prior or {}).get("transcript", "") or (row or {}).get("transcript", "")
-        runner.enqueue_item(seat, harness, sid, cwd, saved_transcript)
-    except BaseException:
-        pass
+        runner.enqueue_item(seat, harness, sid, cwd, transcript or (prior or {}).get("transcript", ""))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------

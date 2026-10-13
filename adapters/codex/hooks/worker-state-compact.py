@@ -20,7 +20,7 @@ if active:
     sys.stdout.write(result.stdout or "")
     sys.stderr.write(result.stderr or "")
     raise SystemExit(result.returncode)
-if result.returncode == 0 and action == "compact-before" and "--harness" in sys.argv \
-        and sys.argv[sys.argv.index("--harness") + 1] in ("claude", "opencode"):
+harness = next((sys.argv[i + 1] for i in range(len(sys.argv) - 1) if sys.argv[i] == "--harness"), "")
+if result.returncode == 0 and action == "compact-before" and harness in ("claude", "opencode"):
     sys.stdout.write(result.stdout or "")
 raise SystemExit(0)

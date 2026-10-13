@@ -26,7 +26,7 @@ const designPattern = /(designs?\/|\/design\/|spec\/design|preview\.html$|slides
 const promptBySession = new Map()
 const turnBySession = new Map()
 const sessionInfoById = new Map()
-const compactSnapshotBySession = new Map()
+const compactStartedBySession = new Map()
 // Prompt-lifecycle context that must stay visible for every model call of a
 // session, not just its first one. OpenCode has no Claude-style
 // `additionalContext` that merges into the user turn and persists in history:
@@ -328,18 +328,24 @@ async function compactMessages(ctx, sid) {
   } catch { return null } finally { clearTimeout(timer) }
 }
 
+// A declared sub-session keeps its fail-closed worker ledger flush/re-anchor
+// (runWorkerState throws); everything below is the main-session compact tidy.
+function isCompactSubSession() {
+  return process.env.AGENT_DISPATCH_STAGE_AUTHORITY === "0" || Boolean(process.env.AGENT_DISPATCH_SUBSESSION_ID)
+}
+
 async function beforeCompact(ctx, input, output) {
   const sid = input?.sessionID || input?.sessionId || ""
-  if (process.env.AGENT_DISPATCH_STAGE_AUTHORITY === "0" || process.env.AGENT_DISPATCH_SUBSESSION_ID) {
-    runCompactHook("compact-before", input || {})
+  if (isCompactSubSession()) {
+    runWorkerState("compact-before", input || {})
     return
   }
   if (!sid || isWorkerSession()) return
   const info = await compactSessionInfo(ctx, sid)
   if (!info || info.parentID) return
-  const messages = await compactMessages(ctx, sid)
-  const prior = completedSummary(messages, sid)
-  compactSnapshotBySession.set(sid, { started: Date.now(), summaryID: prior?.id || "" })
+  // The summary message is created after this hook returns (session/compaction.ts),
+  // so a completed summary created at or after this time belongs to this compaction.
+  compactStartedBySession.set(sid, Date.now())
   const instructions = runCompactHook("compact-before", { ...input, worker: false })
   if (instructions && output && typeof output === "object") {
     if (!Array.isArray(output.context)) output.context = output.context ? [String(output.context)] : []
@@ -349,30 +355,28 @@ async function beforeCompact(ctx, input, output) {
 
 async function afterCompact(ctx, event) {
   const sid = event?.properties?.sessionID || ""
-  if (process.env.AGENT_DISPATCH_STAGE_AUTHORITY === "0" || process.env.AGENT_DISPATCH_SUBSESSION_ID) {
-    runCompactHook("compact-after", event || {})
-    return false
+  if (isCompactSubSession()) {
+    runWorkerState("compact-after", event || {})
+    return
   }
-  if (!sid || isWorkerSession()) return false
+  if (!sid || isWorkerSession()) return
+  const started = compactStartedBySession.get(sid)
+  compactStartedBySession.delete(sid)
   const info = await compactSessionInfo(ctx, sid)
-  if (!info) return false
-  const payload = { sessionID: sid, cwd: baseDir(ctx), worker: Boolean(info.parentID) }
-  if (info.parentID) { runCompactHook("compact-after", payload); return false }
-  const snapshot = compactSnapshotBySession.get(sid)
+  // Unknown identity: count the compaction in the ledger only, as before; no card or tidy.
+  if (!info) { collectCard("compact", sid, baseDir(ctx)); return }
+  if (info.parentID) return
   let summary = ""
-  if (snapshot) {
+  if (started) {
     const rows = await compactMessages(ctx, sid)
     const latest = completedSummary(rows, sid)
-    const created = compactInfoTime(latest)
-    if (latest && latest.id !== snapshot.summaryID && created >= snapshot.started) {
-      summary = (latest.parts || rows.find((row) => row?.info?.id === latest.id)?.parts || [])
+    if (latest && compactInfoTime(latest) >= started) {
+      summary = (rows.find((row) => row?.info?.id === latest.id)?.parts || [])
         .filter((part) => part?.type === "text" && typeof part.text === "string")
         .map((part) => part.text).join("\n")
     }
   }
-  compactSnapshotBySession.delete(sid)
-  runCompactHook("compact-after", { ...payload, summary })
-  return true
+  runCompactHook("compact-after", { sessionID: sid, cwd: baseDir(ctx), worker: false, summary })
 }
 
 // One native launch event and one publisher belong to this module/process, not
@@ -1232,11 +1236,11 @@ export const AgentHarnessGuards = async (ctx) => {
     }
     if (event && event.type === "session.compacted") {
       const sid = event.properties?.sessionID || ""
-      if (await afterCompact(ctx, event)) {
-        turnContextBySession.delete(sid)
-        cardBySession.delete(sid)
-        forgetShownCandidates(sid)
-      }
+      await afterCompact(ctx, event)
+      // The compacted session no longer holds this turn's card or candidates.
+      turnContextBySession.delete(sid)
+      cardBySession.delete(sid)
+      forgetShownCandidates(sid)
     }
     // session.idle fires after each turn (the session is waiting for the user).
     // It refreshes the summary and pane, starts the cycle checkpoint observation and
