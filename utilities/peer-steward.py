@@ -24,6 +24,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shlex
@@ -35,6 +36,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 _UTILITIES_DIR = Path(__file__).resolve().parent
 _UNSET_NAME = object()
@@ -1133,7 +1135,7 @@ def _mark_seat_successor(pane, beside, kind, session_id):
         pass
 
 
-def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None):
+def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None, recheck=None):
     """After `retire` proved the predecessor exited: when this session runs in the pane started
     beside the predecessor, its routes become this session's, across harnesses
     (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
@@ -1144,34 +1146,49 @@ def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=N
     try:
         with _seat_successor_lock(pane):
             return _seat_handover_locked(ident, own_sid, own_harness, pane,
-                                         requester=requester, accepted_at=accepted_at)
+                                         requester=requester, accepted_at=accepted_at, recheck=recheck)
     except OSError:
         return "error"
 
 
-def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, accepted_at=None):
+def _source_before_acceptance(source, accepted_at, *times):
+    values = (accepted_at, source.get("mtime"), source.get("ctime"), *times)
+    return (all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and v > 0 for v in values)
+            and all(v <= accepted_at for v in values[1:]))
+
+
+def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, accepted_at=None,
+                          recheck=None):
+    from opencode_session_runtime import _read_native_record, OpenCodeTransportError
     path = _seat_successor_path(pane)
     try:
-        mark_bytes = path.read_bytes()
-        mark = json.loads(mark_bytes)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(mark, dict) or mark.get("pane") != pane or mark.get("beside") != ident["pane"]:
+        record = _read_native_record(path)
+        if record is None:
+            return None
+        mark = json.loads(record["raw"])
+    except (OSError, ValueError, OpenCodeTransportError):
+        return "skipped:successor-unverified"
+    if (not isinstance(mark, dict) or type(mark.get("schema")) is not int or mark["schema"] != 1
+            or mark.get("pane") != pane or mark.get("beside") != ident["pane"]):
         return None
     server = requester.get("server", "default") if requester is not None else _HERDR_SESSION or "default"
     if mark.get("server", "default") != server:
         return "skipped:successor-unverified"
-    successor = mark.get("successor") or {}
+    successor = mark.get("successor")
+    if not isinstance(successor, dict):
+        return "skipped:successor-unverified"
     recorded = successor.get("session_id")
-    if (not own_sid or own_sid == "-" or ident.get("session_id") in {None, "", "-"}
+    if (not isinstance(own_sid, str) or not own_sid or own_sid == "-"
+            or not isinstance(recorded, str) or ident.get("session_id") in {None, "", "-"}
             or own_harness not in {"claude", "codex", "opencode"}
             or successor.get("harness") != own_harness or (recorded and recorded != own_sid)):
         return "skipped:successor-unverified"
     if requester is not None:
-        try:
-            if not accepted_at or not (0 < float(mark.get("at", 0)) <= float(accepted_at)):
-                return "skipped:successor-unverified"
-        except (TypeError, ValueError):
+        if (requester.get("pane") != pane or requester.get("server") != server
+                or requester.get("harness") != own_harness or requester.get("session_id") != own_sid
+                or ident.get("server", "default") != server
+                or not _source_before_acceptance(record["source"], accepted_at, mark.get("at"))):
             return "skipped:successor-unverified"
     try:
         import dispatch_seat_handover as handover
@@ -1179,29 +1196,117 @@ def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, 
         if requester is not None:
             import session_tidy
             booked["successor_seat"] = session_tidy._pane_seat_of(pane)
+        if _read_native_record(path) != record or (recheck is not None and not recheck()):
+            return "skipped:predecessor-unverified"
         row = handover.record_retire_handover(
             ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ, **booked)
     except Exception:  # noqa: BLE001 - the retire itself already succeeded
         return "error"
     try:
-        if row is not None and path.read_bytes() == mark_bytes:
+        if row is not None and _read_native_record(path) == record:
             path.unlink()
-    except OSError:
+    except (OSError, OpenCodeTransportError):
         pass
     return str(len(row["bindings"])) if row else "none"
+
+
+def _headless_session_bindings(session_id, jobs):
+    """Verified headless OpenCode owner sidecars whose native session is ``session_id``.
+
+    Only exact matches count: an unrelated owner without a readable sidecar is
+    no evidence either way, while matching foreign or closed owners still count."""
+    import dispatch_seat_handover as handover
+    import opencode_session_runtime as native
+    from dispatch_completion_join import current_attempt_row
+    matches = []
+    for aid, (_, meta) in handover.latest_rows(jobs).items() if jobs else ():
+        if (not handover.eligible_row(meta) or meta.get("worker_type") != "owner"
+                or meta.get("harness") != "opencode" or meta.get("transport") != "headless"
+                or meta.get("registered_worker") != "1"
+                or meta.get("execution_surface") != "registered-headless"):
+            continue
+        try:
+            row = current_attempt_row(Path(jobs), aid)
+            if row is None or row.metadata != meta:
+                continue
+            # The expected worktree is the registry row's, never the sidecar's own.
+            binding = native.read_binding_record(SimpleNamespace(
+                jobs=jobs, parent_attempt_id=aid, worktree=row.raw.split("\t")[3]))
+        except Exception:  # noqa: BLE001 - an unreadable sidecar proves no relation
+            continue
+        if binding is not None and binding["value"]["session_id"] == session_id:
+            matches.append((row, binding))
+    return matches
+
+
+def _retained_tui_selection(foreground):
+    tools = str(_UTILITIES_DIR.parent / "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from fleet.collectors.opencode import _tui_selection_record
+    return _tui_selection_record(foreground["pid"], foreground["start"])
+
+
+def _retire_predecessor(duty):
+    """Return a handover-only identity copy and the source generations it relied on.
+
+    A booked OpenCode label that is a verified headless owner session is stale.
+    Only a successful completed replay replaces it, with the original lifetime's
+    retained TUI selection, and only when that selection is the registered
+    parent of the one matching owner binding. Unknown never falls back to the
+    stale label; every other booking keeps the ordinary path."""
+    import dispatch_seat_handover as handover
+    intent = duty.get("intent") or {}
+    identity = intent.get("identity") or {}
+    booked = identity.get("session_id")
+    foreground = _retire_booked_foreground(duty)
+    if (not _handoff_lifetime_valid(foreground) or not isinstance(booked, str)
+            or booked in {"", "-"} or duty.get("state") in {"cancelled", "failed"}):
+        return None
+    if identity.get("harness") != "opencode":
+        return dict(identity), None
+    jobs = handover._default_jobs()
+    matches = _headless_session_bindings(booked, jobs)
+    complete = duty.get("state") == "complete"
+    # Read the foreground independently; the census never supplies its SID.
+    record = _retained_tui_selection(foreground) if complete else None
+    if not matches:
+        if record is not None and record["value"]["sessionID"] != booked:
+            return None  # the selection contradicts the label without a proven relation
+        return dict(identity), None
+    if (not complete or duty.get("result") not in {"normal-exit", "target-already-gone"}
+            or _retire_subject_state(duty) != "gone" or record is None or len(matches) != 1):
+        return None
+    sid = record["value"]["sessionID"]
+    argv = foreground.get("argv")
+    row, binding = matches[0]
+    accepted = duty.get("accepted_at")
+    if (sid == booked or not isinstance(argv, list) or not argv
+            or any(not isinstance(a, str) for a in argv)
+            or os.path.basename(argv[0]) != "opencode" or "run" in argv[1:]
+            or row.metadata.get("parent_sid") != sid
+            or not _source_before_acceptance(record["source"], accepted, record["source"]["written_at"])
+            or not _source_before_acceptance(binding["source"], accepted)
+            or handover.binding_of(jobs, row.metadata) not in handover.current_bindings("opencode", sid, jobs)):
+        return None
+    return {**identity, "session_id": sid}, (record, row.raw, binding)
 
 
 def _retire_handover(duty):
     """Consume only the accepted retirement's original succession, on any observer."""
     intent = duty.get("intent") or {}
     requester = intent.get("requester") or {}
-    foreground = _retire_booked_foreground(duty)
-    if (not isinstance(foreground, dict) or not foreground.get("pid") or not foreground.get("start")
-            or (intent.get("identity") or {}).get("session_id") in {None, "", "-"}):
+    try:
+        resolved = _retire_predecessor(duty)
+    except Exception:  # noqa: BLE001 - the retire itself already succeeded
+        return "error"
+    if resolved is None:
         return None
-    return _seat_handover(intent.get("identity") or {}, requester.get("session_id"),
+    identity, evidence = resolved
+    return _seat_handover(identity, requester.get("session_id"),
                           requester.get("harness"), requester=requester,
-                          accepted_at=duty.get("accepted_at"))
+                          accepted_at=duty.get("accepted_at"),
+                          recheck=(lambda: _retire_predecessor(duty) == resolved) if evidence else None)
 
 
 def _observed_start_agent(args, deadline=None, wait=False):

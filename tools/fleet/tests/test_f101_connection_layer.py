@@ -149,8 +149,8 @@ class PeerCorrelationTest(unittest.TestCase):
 
 
 class ConnectionLayerInsetOrderTest(unittest.TestCase):
-    """Subagent/GPU/peer strips share the inset and precede children.
-    Steward relations moved to under-id lines by the approved 1008 correction."""
+    """Subagent/GPU strips share the inset and precede children.
+    Peer direction now lives in the session identity row."""
 
     def test_three_strips_share_inset_and_precede_children(self):
         self.addCleanup(render.set_compute_hosts, None)
@@ -186,9 +186,7 @@ class ConnectionLayerInsetOrderTest(unittest.TestCase):
 
         subagent_i = idx(lambda t: render._ICON_SUBAGENT in t and "codex task" not in t)
         gpu_i = idx(lambda t: "GPU h1:0" in t)
-        peer_i = idx(lambda t: "←" in t and "peerB" in t)
-        # Each strip's leading CONTENT glyph is its own icon, so the shared-inset
-        # invariant is measured at the icon, not at the arrow that follows it.
+        # Each strip's leading CONTENT glyph is its own icon.
         plugin_i = idx(lambda t: "codex task" in t)
         dispatch_i = idx(lambda t: "job1" in t)
 
@@ -200,25 +198,19 @@ class ConnectionLayerInsetOrderTest(unittest.TestCase):
             text = rows[i]
             return render._dw(text[:text.index(glyph)])
 
-        offsets = {
-            "subagent": content_offset(subagent_i, render._ICON_SUBAGENT),
-            "gpu": content_offset(gpu_i, "●"),
-            "peer": content_offset(peer_i, render._ICON_PEER),
-        }
+        offsets = {"subagent": content_offset(subagent_i, render._ICON_SUBAGENT),
+                   "gpu": content_offset(gpu_i, "●")}
         self.assertEqual(len(set(offsets.values())), 1,
                          "inset offsets differ across strips: %r" % offsets)
         self.assertEqual(next(iter(offsets.values())), render._dw(render._SUBAGENT_IND))
 
-        for label, i in (("subagent", subagent_i), ("gpu", gpu_i), ("peer", peer_i)):
+        for label, i in (("subagent", subagent_i), ("gpu", gpu_i)):
             self.assertLess(i, plugin_i, "%s row must precede the plugin-agent row" % label)
             self.assertLess(i, dispatch_i, "%s row must precede the dispatch-child row" % label)
 
 
 class OffScreenPeerTest(unittest.TestCase):
-    """The received-message line no longer depends on whether the OTHER session is
-    rendered this tick. F-101g-(6) used to hide it along with the folded peer row, which
-    is what made the same receipt appear and disappear between ticks (user 2026-09-09:
-    "받는 세션도 좀 이상하긴하네 일관성이 없고"). Visibility now decides the LABEL only."""
+    """The inline relation survives off-board and folded peer rows."""
 
     def _fixture(self):
         a = Session(harness="claude", pid=1, cwd="/x/group1", slug="a", session_id="sidA",
@@ -241,18 +233,18 @@ class OffScreenPeerTest(unittest.TestCase):
     def test_link_survives_a_folded_target_and_is_named(self):
         a, b = self._fixture()
         rows = self._rows([a, b])
-        self.assertTrue(any("✉ ←" in t and "peerB" in t for t in rows))
+        self.assertTrue(any("← CL/sidB" in t for t in rows))
         self.assertTrue(any("folded" in t for t in rows))
 
     def test_visible_target_upgrades_the_label_to_its_badge(self):
         a, b = self._fixture()
         rows = self._rows([a, b], show_all=True)
-        self.assertTrue(any("✉ ← group2 [b0]" in t for t in rows))
+        self.assertTrue(any("← [b0]" in t for t in rows))
 
     def test_shape_is_identical_under_group_order_reversal(self):
         a, b = self._fixture()
-        forward = [t for t in self._rows([a, b]) if "✉ ←" in t]
-        reversed_ = [t for t in self._rows([b, a]) if "✉ ←" in t]
+        forward = [t for t in self._rows([a, b]) if "←" in t and "sidB" in t]
+        reversed_ = [t for t in self._rows([b, a]) if "←" in t and "sidB" in t]
         self.assertEqual(forward, reversed_)
         self.assertEqual(len(forward), 1)
 
@@ -293,33 +285,27 @@ class RelationLineBudgetTest(unittest.TestCase):
             steward_parents=[{"harness": "claude", "session_id": "sidE",
                               "name": "hearting-b0"}])
 
-    def _relation_rows(self, width=168):
-        peers = [self._busiest_session()]
-        for sid, tag in (("sidB", "b0"), ("sidC", "c0"), ("sidD", "d0"), ("sidE", "e0")):
-            peers.append(Session(harness="claude", pid=len(peers) + 1, cwd="/x/repo",
-                                 slug=sid, session_id=sid, liveness="working",
-                                 elapsed_min=1, session_tag=tag))
-        rows = _lines_text(render._build_lines(peers, [], "fleet", False, 0,
-                                               layout="wide", term_width=width))
-        return [t for t in rows if any(icon + " " + direction in t
-                                      for icon in (render._ICON_PEER, render._ICON_STEWARD)
-                                      for direction in ("→", "←"))]
+    def _relation_row(self, width=168):
+        row = self._busiest_session()
+        return render._plain(render._session_row(
+            row, narrow=False, name_width=max(4, width - 100)))
 
-    def test_a_session_with_every_relation_spends_one_peer_row(self):
-        rows = self._relation_rows()
-        self.assertEqual(len(rows), 1, "relation rows: %r" % rows)
+    def test_peer_relation_spends_no_extra_row(self):
+        row = self._relation_row()
+        self.assertIn("→", row)
+        self.assertIn("←", row)
+        self.assertNotIn(render._ICON_PEER, row)
 
     def test_each_row_carries_both_of_its_directions(self):
-        peer_row, = self._relation_rows()
-        self.assertIn("✉ →", peer_row)
-        self.assertIn("←", peer_row.split("✉ →", 1)[1])
+        row = self._relation_row()
+        self.assertIn("→", row)
+        self.assertIn("←", row)
 
     def test_the_icon_is_not_repeated_for_the_second_direction(self):
         # The icon says what the relation is — once per row. Repeating it would make the
         # second half read as a separate relation, which is what the two rows already did.
-        for row in self._relation_rows():
-            self.assertEqual(row.count(render._ICON_PEER)
-                             + row.count(render._ICON_STEWARD), 1)
+        row = self._relation_row()
+        self.assertEqual(row.count(render._ICON_PEER), 0)
 
     def test_a_single_direction_still_draws_one_row_not_a_dangling_arrow(self):
         line = render._peer_link_strip(

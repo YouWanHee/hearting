@@ -82,6 +82,21 @@ class NestedHomeRolloutTest(unittest.TestCase):
                 self.assertIsNone(codex._proc_rollout(4242, launch_dir,
                                                       os.path.join(tmp, "dot-codex")))
 
+    def test_same_cwd_concurrent_root_clients_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.path.join(tmp, "shared-worktree")
+            os.makedirs(cwd)
+            first = _make_rollout(os.path.join(tmp, "codex-home"), cwd, sid=
+                                  "019f78f9-c11c-7fb2-afed-ae3730e4d821")
+            second = _make_rollout(os.path.join(tmp, "codex-home"), cwd, sid=
+                                   "019f78f9-c11c-7fb2-afed-ae3730e4d822")
+            links = {"5": first, "6": second}
+            with mock.patch.object(codex.os, "listdir", return_value=list(links)), \
+                    mock.patch.object(codex.os, "readlink",
+                                      side_effect=lambda path: links[path.rsplit("/", 1)[-1]]):
+                self.assertIsNone(codex._proc_rollout(
+                    4242, cwd, os.path.join(tmp, "codex-home")))
+
     def test_non_rollout_fd_still_refused(self):
         # A random jsonl outside any sessions/ tree (or without the rollout filename
         # shape) must not be picked up.

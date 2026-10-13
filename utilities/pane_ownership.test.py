@@ -86,7 +86,8 @@ class PaneOwnershipTest(unittest.TestCase):
             self.assertEqual(st.read_latest_card(seat)["body"], "home-os 카드")
             consumed = st._consumed_path(pane_seat)
             before = consumed.read_bytes() if consumed.exists() else None
-            injected = st.run_hook("claude", "start", "home-os-successor", cwd=str(self.root))
+            injected = st.run_hook("claude", "start", "home-os-successor",
+                                   cwd=str(self.root), env=env)
             self.assertIn("home-os 카드", injected)
             self.assertNotIn("감독 카드", injected)
             self.assertEqual(consumed.read_bytes() if consumed.exists() else None, before)
@@ -126,16 +127,18 @@ class PaneOwnershipTest(unittest.TestCase):
         with mock.patch.object(po, "_process", return_value=None):
             self.assertEqual(self.verify(foreground.pid), "")
 
-    def test_shared_server_needs_exact_native_foreground_thread(self):
+    def test_shared_server_needs_exact_current_thread_not_fork_tree_root(self):
         foreground = self.runtime("codex")
         self.foreground(foreground)
         caller = (123, 1, 123, 0, -1, "server-start")
+        current_thread = "fork-current-thread"
+        tree_root = "original-tree-root"
         original = po._process
         with mock.patch.object(po, "_caller_runtime", return_value=(caller, True)), \
                 mock.patch.object(po, "_process", side_effect=lambda pid: caller if pid == 123 else original(pid)), \
-                mock.patch.object(po, "_native_session", return_value="actual-thread"):
-            self.assertEqual(self.verify(123, "codex", "inherited-thread"), "")
-            self.assertEqual(self.verify(123, "codex", "actual-thread"), "wB:p3N")
+                mock.patch.object(po, "_native_session", return_value=current_thread):
+            self.assertEqual(self.verify(123, "codex", tree_root), "")
+            self.assertEqual(self.verify(123, "codex", current_thread), "wB:p3N")
 
     def test_pane_hook_and_peer_use_the_same_refusal(self):
         from fleet import herdr_projection as hp
@@ -148,6 +151,17 @@ class PaneOwnershipTest(unittest.TestCase):
             spec.loader.exec_module(peer)
             with mock.patch.object(peer, "_current_session_identity", return_value=("home-os-sid", "claude")):
                 self.assertEqual(peer._caller_pane(), "")
+
+    def test_fake_inherited_codex_thread_and_registered_worker_cannot_report(self):
+        from fleet import herdr_projection as hp
+        env = {"CODEX_THREAD_ID": "inherited-fake-thread", "HERDR_PANE_ID": "wB:p3N"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hp, "runtime_identity", return_value=("codex", "selected-thread")), \
+                mock.patch.object(hp, "verified_pane", return_value="wB:p3N"):
+            self.assertFalse(hp.may_report("codex", "inherited-fake-thread"))
+            self.assertTrue(hp.may_report("codex", "selected-thread"))
+            with mock.patch.dict(os.environ, {"AGENT_SESSION_ROLE": "worker"}):
+                self.assertFalse(hp.may_report("codex", "selected-thread"))
 
     def test_inherited_pane_cannot_receive_or_retire_another_seats_dispatch(self):
         import dispatch_seat_handover as handover

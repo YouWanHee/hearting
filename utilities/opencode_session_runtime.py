@@ -6,11 +6,13 @@ retains completion, retry, cleanup, and notification decisions.
 from __future__ import annotations
 
 import json
+import errno
 import os
 from pathlib import Path
 import re
 import selectors
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -29,24 +31,58 @@ def binding_path(args) -> Path:
     return supervisor_lease_path(args.jobs, args.parent_attempt_id).with_suffix(".opencode-session.json")
 
 
-def read_binding(args) -> str:
-    path = binding_path(args)
-    if path.is_symlink():
-        raise OpenCodeTransportError("opencode-session-binding-unsafe")
-    if not path.exists():
-        return ""
-    if path.stat().st_size > 4096:
-        raise OpenCodeTransportError("opencode-session-binding-unsafe")
+def _read_native_record(path, limit=4096):
+    """Bounded descriptor read of a normal native file; no private-mode gate."""
+    def generation(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_uid,
+                info.st_mtime_ns, info.st_ctime_ns)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if os.path.lexists(path):  # includes dangling symlinks
+            raise OpenCodeTransportError("opencode-session-binding-unsafe")
+        return None
+    except OSError as exc:
+        reason = "unsafe" if exc.errno == errno.ELOOP else "invalid"
+        raise OpenCodeTransportError("opencode-session-binding-" + reason) from exc
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_size > limit):
+            raise OpenCodeTransportError("opencode-session-binding-unsafe")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(limit + 1)
+        if (len(raw) > limit or len(raw) != before.st_size
+                or generation(before) != generation(os.fstat(fd))
+                or generation(before) != generation(os.lstat(path))):
+            raise OpenCodeTransportError("opencode-session-binding-unsafe")
+        return {"raw": raw, "source": {"generation": generation(before),
+                "mtime": before.st_mtime, "ctime": before.st_ctime}}
+    except OSError as exc:
+        raise OpenCodeTransportError("opencode-session-binding-invalid") from exc
+    finally:
+        os.close(fd)
+
+
+def read_binding_record(args):
+    record = _read_native_record(binding_path(args))
+    if record is None:
+        return None
+    try:
+        value = json.loads(record["raw"])
         session = value["session_id"]
         if (value["attempt_id"] != args.parent_attempt_id
                 or value["worktree"] != os.path.realpath(args.worktree)
                 or not isinstance(session, str) or not SESSION_ID.fullmatch(session)):
             raise ValueError("binding mismatch")
-        return session
+        return {"value": value, "source": record["source"]}
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise OpenCodeTransportError("opencode-session-binding-invalid") from exc
+
+
+def read_binding(args) -> str:
+    record = read_binding_record(args)
+    return record["value"]["session_id"] if record is not None else ""
 
 
 def bind_session(args, session: str) -> None:

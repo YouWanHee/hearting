@@ -1,0 +1,52 @@
+{
+  "fixture_schema": "peer-navigation-v1",
+  "cwd": "/home/Uihyeop/hearting-wt/fleet-peer-inline-navigation-1013",
+  "rows": [
+    {
+      "harness": "codex", "session_id": "peer-nav-codex-a", "session_tag": "a1",
+      "title": "Same exact peer, both ways",
+      "sent": {"to_harness": "claude", "to_session_id": "peer-nav-claude-b", "to_name": "repo-b", "kind": "handoff", "age_min": 1},
+      "recv": {"from_harness": "claude", "from_session_id": "peer-nav-claude-b", "from_name": "repo-b", "kind": "notice", "age_min": 2}
+    },
+    {
+      "harness": "claude", "session_id": "peer-nav-claude-b", "session_tag": "b2",
+      "title": "Different outgoing and incoming peers",
+      "sent": {"to_harness": "opencode", "to_session_id": "peer-nav-opencode-c", "to_name": "foreign-label", "kind": "steer", "age_min": 3},
+      "recv": {"from_harness": "codex", "from_session_id": "peer-nav-offboard-d", "from_name": "socket:12345", "kind": "watch", "age_min": 4}
+    },
+    {
+      "harness": "opencode", "session_id": "peer-nav-opencode-c", "session_tag": "c3",
+      "title": "Cross harness same short id",
+      "sent": {"to_harness": "codex", "to_session_id": "peer-nav-same-id", "to_name": "", "kind": "gate-relay", "age_min": 5}
+    },
+    {
+      "harness": "codex", "session_id": "peer-nav-same-id", "session_tag": "a1",
+      "title": "Colliding tag, different exact identity",
+      "recv": {"from_harness": "opencode", "from_session_id": "peer-nav-same-id", "from_name": "", "kind": "handoff", "age_min": 6}
+    },
+    {
+      "harness": "claude", "session_id": "peer-nav-same-id", "session_tag": "b2",
+      "title": "Same SID on another harness",
+      "sent": {"to_harness": "claude", "to_session_id": "peer-nav-unknown-tag", "to_name": "old-readable-name", "kind": "notice", "age_min": 7}
+    },
+    {
+      "harness": "opencode", "session_id": "peer-nav-offboard-d", "session_tag": "d4",
+      "title": "Off-board peer fallback",
+      "recv": {"from_harness": "claude", "from_session_id": "peer-nav-ambiguous-alias", "from_name": "unresolved-alias", "kind": "watch", "age_min": 8}
+    },
+    {
+      "harness": "codex", "session_id": "peer-nav-no-peer", "session_tag": null,
+      "title": "No peer"
+    },
+    {
+      "harness": "claude", "session_id": "peer-nav-sent-only", "session_tag": "e5",
+      "title": "Sent only",
+      "sent": {"to_harness": "codex", "to_session_id": "peer-nav-offboard-d", "to_name": "", "kind": "handoff", "age_min": 9}
+    },
+    {
+      "harness": "opencode", "session_id": "peer-nav-recv-only", "session_tag": "f6",
+      "title": "Received only",
+      "recv": {"from_harness": "codex", "from_session_id": "peer-nav-offboard-d", "from_name": "", "kind": "notice", "age_min": 10}
+    }
+  ]
+}

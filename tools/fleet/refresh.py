@@ -51,6 +51,7 @@ class LiveSnapshot:
     observations: dict = field(default_factory=dict)
     pending_delivery: object = None
     tag_metadata: list = field(default_factory=list)
+    display_snapshot: object = None
     memory: object = None
     governor: object = None
     hearting: dict = None
@@ -63,9 +64,17 @@ class LiveSnapshot:
 def as_snapshot(value):
     """Legacy/test collectors may still return just their two row lists."""
     if isinstance(value, LiveSnapshot):
-        return value
-    sessions, jobs = value
-    return LiveSnapshot(sessions=list(sessions), jobs=list(jobs))
+        snapshot = value
+    else:
+        sessions, jobs = value
+        snapshot = LiveSnapshot(sessions=list(sessions), jobs=list(jobs))
+    if snapshot.display_snapshot is None:
+        try:
+            from .display_snapshot import build
+            snapshot.display_snapshot = build(snapshot.sessions, snapshot.jobs, snapshot.resources)
+        except Exception:
+            pass
+    return snapshot
 
 
 # Measured normal tick = 10-12s (attach_projections 5.64s + dispatch.collect

@@ -301,6 +301,15 @@ def merge(basic, detail):
         evidence = {"degradations": value.degradations,
                     "pending_delivery": value.pending_delivery,
                     "route_entities": value.route_entities}
+        try:
+            from .display_snapshot import merge as merge_display_snapshot
+            display_snapshot = merge_display_snapshot(
+                basic.display_snapshot, value.display_snapshot)
+        except Exception:
+            display_snapshot = basic.display_snapshot
+    else:
+        display_snapshot = basic.display_snapshot
     return replace(basic, sessions=sessions, jobs=jobs, resources=resources,
                    memory=value.memory, governor=value.governor,
-                   hearting=value.hearting or basic.hearting, **evidence)
+                   hearting=value.hearting or basic.hearting,
+                   display_snapshot=display_snapshot, **evidence)
