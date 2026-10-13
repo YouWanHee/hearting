@@ -410,23 +410,14 @@ a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
 
-For a native Codex client/server session, the ordinary lifecycle reports the
-current `Thread.id`. When its callback runs in a shared service, the normal pane
-observer may resolve that id by reading the native status line of a live
-foreground Codex TUI. The managed status line places `thread-id` first and
-preserves the other custom items. Accept only that first native identity field;
-UUIDs in titles, directories or other footer items remain display labels.
-The full current id must be visible in fresh footer samples, the exact
-foreground PID, process start and controlling TTY must remain stable, and one
-Herdr endpoint and pane must uniquely match. Keep that validated endpoint for
-the session report, number lookup and metadata report, including when the
-shared callback inherited another socket.
-A thread's `sessionId` is its tree root, not its current thread identity; a fork
-can share a root with another current thread. The callback payload, environment
-SID, cwd, title, inherited pane environment, shared-server ancestry and tree
-root alone are not pane proof. Missing, clipped, conflicting or stale footer or
-process evidence remains unknown, and registered workers never own a
-foreground pane.
+For native Codex callbacks in a shared service, the foreground TUI's first
+full `thread-id` footer field provides the current `Thread.id`; `sessionId`
+remains its tree root. Two fresh samples share stable foreground PID/start/TTY
+and one unique endpoint/pane, also used for reporting, number lookup and title.
+Managed apply preserves other custom footer items. UUIDs elsewhere, callback
+or environment SID, cwd, title, inherited pane and shared ancestry alone remain
+hints. Missing, clipped, conflicting or stale observations stay unknown;
+registered workers have no foreground pane ownership.
 
 For an unproven background caller, default `peer-steward start` locates the
 inherited pane's workspace by its live foreground directory in the caller's
