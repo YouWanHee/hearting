@@ -247,7 +247,7 @@ class OffScreenPeerTest(unittest.TestCase):
     def test_visible_target_upgrades_the_label_to_its_badge(self):
         a, b = self._fixture()
         rows = self._rows([a, b], show_all=True)
-        self.assertTrue(any("✉ ← [b0] group2" in t for t in rows))
+        self.assertTrue(any("✉ ← group2 [b0]" in t for t in rows))
 
     def test_shape_is_identical_under_group_order_reversal(self):
         a, b = self._fixture()
