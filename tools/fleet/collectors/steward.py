@@ -13,8 +13,9 @@ one definition of the rule — which entries count; a marker with none (an old
 handoff-only leftover) is treated as absent, so `steward_targets` holds evidence
 entries only. Nothing here writes, and a missing or unreadable marker root (or an
 unavailable ledger module) leaves every session's default (`steward=False`).
-Only targets whose existing session metadata confirms the same repository grant
-the displayed role. Foreign and unknown targets remain communication only.
+An explicit self-role entry keeps the flag without inventing a target. Target
+relations still require metadata confirming the same repository; foreign and
+unknown targets remain communication only.
 """
 import os
 import sqlite3
@@ -263,6 +264,38 @@ def role_targets(harness, session_id, *, aliases=(), markers=None, cwd=None, ses
     return _owner_targets(winners, harness, session_id)
 
 
+def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessions=None,
+              _targets=None):
+    """One display decision: exact self-role evidence or same-repository targets.
+
+    The CLI's unknown/- sentinel is a flag on the current session, never a
+    relationship target. Aliases must come from the caller's confirmed native
+    clear history, just as in ``role_targets``; marker history creates no rows.
+    """
+    if not session_id:
+        return False
+    if markers is None:
+        markers = read_markers()
+    mod = _peer_message_module()
+    evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
+    if evidence is None:
+        return False
+    harness = str(harness or "").lower()
+    for sid in (session_id, *aliases):
+        marker = markers.get((harness, sid))
+        if (not isinstance(marker, dict) or marker.get("session_id") != sid
+                or marker.get("harness", harness) != harness):
+            continue
+        if any(target.get("source") == "explicit" and target.get("kind") == "explicit"
+               and target.get("harness") == "unknown" and target.get("name") == "-"
+               and target.get("session_id") is None and not target.get("pane")
+               for target in evidence(marker)):
+            return True
+    targets = _targets if _targets is not None else role_targets(
+        harness, session_id, aliases=aliases, markers=markers, cwd=cwd, sessions=sessions)
+    return bool(targets)
+
+
 def enrich(sessions, markers=None):
     for s in sessions:
         s.steward = False
@@ -290,9 +323,10 @@ def enrich(sessions, markers=None):
         targets = role_targets(s.harness, s.session_id, markers=markers,
                                aliases=[sid for _harness, sid in keys[1:]],
                                cwd=getattr(s, "cwd", None), sessions=context, _winners=winners)
+        s.steward = role_flag(s.harness, s.session_id, markers=markers,
+                              aliases=[sid for _harness, sid in keys[1:]], _targets=targets)
         if not targets:
             continue
-        s.steward = True
         # `steward_evidence_targets` returns oldest-first — the stable order the
         # renderer's front-preserving +N fold relies on.
         s.steward_targets = list(targets)
