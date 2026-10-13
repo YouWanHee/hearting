@@ -69,6 +69,27 @@ event('step_finish', part={'reason':'stop'})
                          ['dispatch.supervisor.session', 'tool_use', 'dispatch.supervisor.session', 'tool_use'])
         self.assertNotIn('private', json.dumps(self.events))
 
+    def test_direct_and_resumed_native_processes_inherit_the_final_config_override(self):
+        self.program("""
+import os
+session = sys.argv[sys.argv.index('--session') + 1] if '--session' in sys.argv else None
+with open('config-trace', 'a') as f:
+ f.write(json.dumps({'session':session, 'config':os.environ.get('OPENCODE_CONFIG_CONTENT')}) + '\\n')
+event('step_start', part={})
+event('text', part={'text':'artifact: -\\nverdict: PASS\\nblocker: none'})
+event('step_finish', part={'reason':'stop'})
+""")
+        native_config = json.dumps({"provider": {"opencode-go": {"models": {
+            "glm-5.3-flash": {"limit": {"context": 600000, "input": 480000, "output": 8192}}
+        }}}}, separators=(",", ":"))
+        with unittest.mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": native_config,
+                                                    "XDG_CONFIG_HOME": str(self.root / "masked-config")}):
+            runtime.run_turn(self.args, "first", emit=self.events.append)
+            runtime.run_turn(self.args, "resume", emit=self.events.append)
+        rows = [json.loads(line) for line in (self.root / "config-trace").read_text().splitlines()]
+        self.assertEqual([row["session"] for row in rows], [None, "ses_native"])
+        self.assertEqual([row["config"] for row in rows], [native_config, native_config])
+
     def test_session_switch_is_rejected_and_original_binding_preserved(self):
         runtime.bind_session(self.args, 'ses_original')
         self.program("event('step_start', part={})\n")
@@ -314,7 +335,8 @@ with open(sys.argv[sys.argv.index('--fixture-state') + 1]) as s:
  if '--session' in sys.argv:
   assert state['outbox']['attempt_ids'] and not state['outbox'].get('consumed_attempt_ids'), state
 with open(os.environ['FAKE_TRACE'], 'a') as f:
- f.write(json.dumps({'event':'native-turn', 'session':session, 'resume':'--session' in sys.argv, 'prompt':prompt}) + '\\n')
+ f.write(json.dumps({'event':'native-turn', 'session':session, 'resume':'--session' in sys.argv, 'prompt':prompt,
+                      'config':os.environ.get('OPENCODE_CONFIG_CONTENT')}) + '\\n')
 text = 'artifact: -\\nverdict: PASS\\nblocker: none' if '--session' in sys.argv else 'artifact: -\\nverdict: BLOCKED\\nblocker: registered child running; report follows on wake'
 for kind, part in [('step_start',{}), ('text',{'text':text}), ('step_finish',{'reason':'stop'})]:
  print(json.dumps({'type':kind,'sessionID':session,'part':part}))
@@ -324,13 +346,17 @@ for kind, part in [('step_start',{}), ('text',{'text':text}), ('step_finish',{'r
         command = f.command() + ['--runtime-harness','opencode', '--opencode-command',
                                   shlex.join([sys.executable, str(native), '--fixture-state', str(f.state)])]
         result = subprocess.run(command, input='initial', text=True, capture_output=True,
-                                env=f.child_env(FAKE_TRACE=str(f.trace)), timeout=15)
+                                env=f.child_env(FAKE_TRACE=str(f.trace),
+                                                OPENCODE_CONFIG_CONTENT='{"provider":{"opencode-go":{"models":{"glm-5.3-flash":{"limit":{"context":600000,"input":480000,"output":8192}}}}}',
+                                                XDG_CONFIG_HOME=str(f.base/'masked-config')), timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         trace = [json.loads(line) for line in f.trace.read_text().splitlines()]
         self.assertEqual([t['event'] for t in trace], ['native-turn','join-start','join-end','native-turn'])
         turns = [t for t in trace if t['event']=='native-turn']
         self.assertEqual([t['session'] for t in turns], ['ses_actual','ses_actual'])
         self.assertEqual([t['resume'] for t in turns], [False, True])
+        self.assertEqual(turns[0]['config'], turns[1]['config'])
+        self.assertIn('"context":600000', turns[0]['config'])
         events = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(sum(e['type']=='result' for e in events), 1)
         self.assertEqual(events[-1]['runtime'], 'opencode')

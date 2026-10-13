@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +96,21 @@ class ModelProfileTest(unittest.TestCase):
             self.demand("important"), explicit_profile="deep"
         )
         self.assertIn("additional", result["reason"])
+
+    def test_context_budget_is_independent_of_profile_model_and_effort(self):
+        for adapter in ("claude", "codex", "opencode"):
+            path = ROOT / "adapters" / adapter / "config" / "models.conf"
+            values = PROFILE.load_config(path)
+            values["CFG_MODEL_CONTEXT_WINDOW"] = "600000"
+            for name in ("deep", "balanced-deep", "balanced", "light", "mini", "top"):
+                with self.subTest(adapter=adapter, profile=name):
+                    resolved = PROFILE.resolve_profile_values(adapter, values, name)
+                    self.assertEqual(resolved["context_window"], "600000")
+                    self.assertEqual(resolved["context_window_source"], "configured")
+            values.pop("CFG_MODEL_CONTEXT_WINDOW")
+            resolved = PROFILE.resolve_profile_values(adapter, values, "light")
+            self.assertEqual(resolved["context_window"], "800000")
+            self.assertEqual(resolved["context_window_source"], "default")
 
     def test_demand_reasons_and_axes_are_sealed(self):
         base = PROFILE.resolve_profile_demand(self.demand("important"))
@@ -335,8 +351,55 @@ class ModelProfileTest(unittest.TestCase):
                 args(adapter, "deep", capacity_retry=1, **concrete)
             )
             self.assertEqual(resolved["source"], "profile+capacity")
+            self.assertEqual(resolved["context_window"], "800000")
             self.assertEqual(resolved["model"], concrete["model"])
 
+    def test_context_fields_survive_role_explicit_pin_and_capacity_selection(self):
+        budget_key = {"claude": "effort", "codex": "reasoning", "opencode": "variant"}
+        for adapter, wrapper in WRAPPERS.items():
+            def attach(settings, _harness, *, error):
+                settings["context_window"] = "600000"
+                settings["context_window_source"] = "configured"
+                return settings
+
+            with self.subTest(adapter=adapter), mock.patch.object(
+                    wrapper.WRAPPER_COMMON, "attach_context_window", side_effect=attach):
+                profile = wrapper.resolve_model_settings(args(adapter, "deep"))
+                role = wrapper.resolve_model_settings(args(
+                    adapter, "deep", model_profile=None, model_role="fast implementer"))
+                explicit = wrapper.resolve_model_settings(args(
+                    adapter, "deep", model_profile=None, model_role=None,
+                    model="vendor/explicit-model", **{budget_key[adapter]: "high"}))
+                capacity = wrapper.resolve_model_settings(args(
+                    adapter, "deep", model="vendor/capacity-model",
+                    **{budget_key[adapter]: "high", "capacity_retry": 1}))
+                with mock.patch.object(wrapper, "route_selection_pin", return_value={
+                        "status": "applied", "model": "vendor/pinned-model", "effort": "xhigh"}):
+                    pin = wrapper.resolve_model_settings(args(adapter, "deep"))
+                    pin_capacity = wrapper.resolve_model_settings(args(
+                        adapter, "deep", model="vendor/retry-model",
+                        **{budget_key[adapter]: "high", "capacity_retry": 1}))
+                for resolved in (profile, role, explicit, capacity, pin, pin_capacity):
+                    self.assertEqual(resolved["context_window"], "600000")
+                    self.assertEqual(resolved["context_window_source"], "configured")
+                self.assertEqual(profile["source"], "profile")
+                self.assertEqual(role["source"], "role")
+                self.assertEqual(explicit["source"], "explicit")
+                self.assertEqual(capacity["source"], "profile+capacity")
+                self.assertEqual(pin["source"], "pin")
+                self.assertEqual(pin_capacity["source"], "pin+capacity")
+
+    def test_claude_launch_budget_overrides_stale_env_without_changing_hook_settings(self):
+        wrapper = WRAPPERS["claude"]
+        env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "300000",
+               "CLAUDE_CONFIG_DIR": "/runtime/claude",
+               "CLAUDE_HOOK_SETTINGS": '{"PreToolUse":["user-guard"]}'}
+        result = wrapper.apply_context_window_environment(
+            env, {"context_window": "600000"})
+        self.assertIs(result, env)
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "600000")
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/runtime/claude")
+        self.assertEqual(env["CLAUDE_HOOK_SETTINGS"], '{"PreToolUse":["user-guard"]}')
     def test_opencode_live_conf_collapses_deep_onto_balanced_deep_and_names_it(self):
         # 2026-09-30 사용자 결정: OpenCode declares no deep tier ("do not use it
         # for deep work"), so `deep` resolves onto balanced-deep and the
@@ -414,7 +477,7 @@ class ModelProfileTest(unittest.TestCase):
         resolved = wrapper.resolve_model_settings(args("opencode", "balanced-deep"))
         command = command_for(resolved)
         self.assertIn("--model", command)
-        self.assertIn("--variant xhigh", command)
+        self.assertIn(f"--variant {resolved['variant']}", command)
         # `runtime-default` (a user copy that declares no variant) is still omitted.
         command = command_for({**resolved, "variant": "runtime-default"})
         self.assertIn("--model", command)

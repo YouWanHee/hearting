@@ -174,14 +174,18 @@ def build_parser():
     p_session_name.add_argument("--json", action="store_true")
 
     # Explicit user-owned portable model selection; native runtime settings are separate.
-    p_model = sub.add_parser("model", help="Edit a runtime's user-owned Hearting model selection")
+    p_model = sub.add_parser("model", help="Query or edit a runtime's user-owned Hearting model settings")
     model_sub = p_model.add_subparsers(dest="model_command", required=True, parser_class=_UsageExitParser)
-    p_model_set = model_sub.add_parser("set", help="Set a declared tier, role alias, or profile model")
+    p_model_set = model_sub.add_parser("set", help="Set a model target or the common context window")
     p_model_set.add_argument("harness", choices=RUNTIMES)
-    p_model_set.add_argument("target", help="tier/profile/role name; optionally prefix tier/, profile/, or role/")
-    p_model_set.add_argument("model", help="Model identifier with optional @effort or @variant")
+    p_model_set.add_argument("target", help="tier/profile/role name, or context-window")
+    p_model_set.add_argument("model", help="Model identifier with optional @effort/@variant, or token count for context-window")
     p_model_set.add_argument("--dry-run", action="store_true")
     p_model_set.add_argument("--json", action="store_true")
+    p_model_get = model_sub.add_parser("get", help="Query a resolved common model setting")
+    p_model_get.add_argument("harness", choices=RUNTIMES)
+    p_model_get.add_argument("target", choices=("context-window",))
+    p_model_get.add_argument("--json", action="store_true")
 
     # Source → active runtime truth.  These parsers intentionally do not inherit
     # the legacy install channel's --plugin option: linked/packaged are mutually
@@ -303,6 +307,22 @@ def emit(result, as_json):
 
 
 def cmd_model(args):
+    if args.model_command == "get":
+        try:
+            return model_settings.get_context_window(
+                args.harness,
+                runtime=paths.runtime_home(args.harness, "global"),
+                source_root=paths.agent_home(),
+            )
+        except model_settings.ModelSettingsUsageError as exc:
+            return {"operation": "model-context-window-get", "status": "invalid-arguments",
+                    "exit": EXIT_USAGE, "runtime": args.harness, "config_path": None,
+                    "error": str(exc), "lines": [f"model get: {exc}"]}
+        except (model_settings.ModelSettingsError, safe_fs.SafetyError,
+                OSError, ValueError) as exc:
+            return {"operation": "model-context-window-get", "status": "blocked",
+                    "exit": EXIT_BLOCKED, "runtime": args.harness, "config_path": None,
+                    "error": str(exc), "lines": [f"model get: blocked: {exc}"]}
     try:
         result = model_settings.set_model(
             args.harness, args.target, args.model,

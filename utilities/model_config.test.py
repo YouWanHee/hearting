@@ -49,6 +49,40 @@ class ModelConfigTest(unittest.TestCase):
                     expected /= "opencode"
                 self.assertEqual(config.user_path(adapter, environ=environ), expected / "agent-config/models.conf")
 
+    def test_masked_worker_home_resolves_the_canonical_user_model_policy(self):
+        for adapter, variable in (
+            ("claude", "CLAUDE_CONFIG_DIR"),
+            ("codex", "CODEX_HOME"),
+            ("opencode", "XDG_CONFIG_HOME"),
+        ):
+            with self.subTest(adapter=adapter), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source"
+                shipped = source / "adapters" / adapter / "config" / "models.conf"
+                shipped.parent.mkdir(parents=True)
+                shipped.write_text(BASE + "CFG_MODEL_CONTEXT_WINDOW=800000\n", encoding="utf-8")
+                canonical = root / "canonical"
+                masked = root / "masked"
+                canonical_user = canonical / "agent-config/models.conf"
+                masked_user = masked / "agent-config/models.conf"
+                canonical_user.parent.mkdir(parents=True)
+                masked_user.parent.mkdir(parents=True)
+                canonical_user.write_text(
+                    BASE.replace("shipped-model", "canonical-user-model")
+                    + "CFG_MODEL_CONTEXT_WINDOW=600000\n", encoding="utf-8")
+                masked_user.write_text(
+                    BASE.replace("shipped-model", "masked-home-model")
+                    + "CFG_MODEL_CONTEXT_WINDOW=300000\n", encoding="utf-8")
+                env = {"HOME": str(root / "home"), variable: str(masked),
+                       "HEARTING_WORKER_HOME": str(masked),
+                       "HEARTING_MODEL_CONFIG_HOME": str(canonical)}
+                values, receipt = config.resolve_config(
+                    adapter, environ=env, source_root=source)
+                self.assertEqual(receipt.source, "user")
+                self.assertEqual(Path(receipt.selected_path), canonical_user)
+                self.assertEqual(values["CFG_TIER_DEEP_MODEL"], "canonical-user-model")
+                self.assertEqual(config.resolve_context_window(values), ("600000", "configured"))
+
     def test_valid_user_file_wins_as_a_complete_file(self):
         root = self.make_root()
         home = root / "home"
@@ -59,6 +93,51 @@ class ModelConfigTest(unittest.TestCase):
         self.assertEqual(receipt.source, "user")
         self.assertEqual(receipt.reason, "user-valid")
         self.assertEqual(values["CFG_USER_EXTRA"], "literal")
+
+    def test_context_window_is_optional_common_and_strictly_validated(self):
+        for adapter in config.ADAPTERS:
+            with self.subTest(adapter=adapter):
+                root = self.make_root(adapter, BASE + "CFG_MODEL_CONTEXT_WINDOW=800000\n")
+                home = root / "home"
+                user = home / "agent-config" / "models.conf"
+                user.parent.mkdir(parents=True)
+
+                # A complete pre-existing file without the new scalar remains
+                # selected whole and resolves its independent default in memory.
+                user.write_text(BASE, encoding="utf-8")
+                values, receipt = config.resolve_config(adapter, runtime=home, source_root=root)
+                self.assertEqual((receipt.source, receipt.reason), ("user", "user-valid"))
+                self.assertNotIn(config.CONTEXT_WINDOW_KEY, values)
+                self.assertEqual(config.resolve_context_window(values), ("800000", "default"))
+
+                for number in (100000, 1000000):
+                    user.write_text(BASE + f"{config.CONTEXT_WINDOW_KEY}={number}\n", encoding="utf-8")
+                    values, receipt = config.resolve_config(adapter, runtime=home, source_root=root)
+                    self.assertEqual(receipt.source, "user")
+                    self.assertEqual(config.resolve_context_window(values), (str(number), "configured"))
+
+                user.write_text(BASE + f"{config.CONTEXT_WINDOW_KEY}=\"0600000\" # retained comment\n", encoding="utf-8")
+                values, receipt = config.resolve_config(adapter, runtime=home, source_root=root)
+                self.assertEqual(receipt.source, "user")
+                self.assertEqual(config.resolve_context_window(values), ("600000", "configured"))
+
+                for invalid in ("99999", "1000001", "800k", "1m", "+800000", "-1",
+                                "800000.0", "1e6", "true", "", " 800000", "800000 ",
+                                '" 800000 "'):
+                    user.write_text(BASE + f"{config.CONTEXT_WINDOW_KEY}={invalid}\n", encoding="utf-8")
+                    values, receipt = config.resolve_config(adapter, runtime=home, source_root=root)
+                    self.assertEqual((receipt.source, receipt.reason),
+                                     ("shipped", "user-invalid-context-window"), invalid)
+                    self.assertEqual(config.resolve_context_window(values), ("800000", "configured"))
+
+        for invalid in ("99999", "1000001", "800k", "+800000", "true"):
+            root = self.make_root(shipped=BASE + f"{config.CONTEXT_WINDOW_KEY}={invalid}\n")
+            home = root / "home"
+            user = home / "agent-config" / "models.conf"
+            user.parent.mkdir(parents=True)
+            user.write_text(BASE, encoding="utf-8")
+            with self.subTest(shipped=invalid), self.assertRaises(config.ShippedConfigError):
+                config.resolve_config("claude", runtime=home, source_root=root)
 
     def test_a_tier_the_adapter_wrappers_read_by_name_stays_required(self):
         # Review R2-B1: the role mappers read CFG_TIER_DEEP_MODEL/EFFORT (and

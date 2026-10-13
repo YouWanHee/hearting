@@ -252,6 +252,24 @@ unsupported surfaces as `SKIP` with a reason, while credentials, sessions,
 databases, logs, and foreign caches remain outside its ownership. See
 [INSTALL_LAYOUT.md](INSTALL_LAYOUT.md) for the detailed mapping.
 
+## Model settings
+
+The three adapters share a requested context operating budget, independent of
+profile model and effort. It defaults to `800000` tokens; valid values range
+from `100000` to `1000000`. Query or change it through the existing model
+command group:
+
+```bash
+hearting model get codex context-window --json
+hearting model set claude context-window 800000
+hearting model set opencode context-window 800000
+```
+
+The query reports the selected user/shipped config and whether the value is
+configured or defaulted. Native model limits and service capacity can reduce
+the usable window. Changes apply to new launches; active sessions keep their
+captured settings.
+
 ## Develop the harness
 
 Maintainers build and activate a local immutable snapshot from a clean checkout:

@@ -170,7 +170,9 @@ def _candidate(adapter: str, values: dict[str, str], target: dict[str, str],
                model: str, budget: str | None) -> tuple[dict[str, str], dict[str, str]]:
     changed: dict[str, str] = {}
     suffix = "VARIANT" if adapter == "opencode" else "EFFORT"
-    if target["kind"] in {"tier", "role"}:
+    if target["kind"] == "scalar":
+        changed[target["key"]] = model
+    elif target["kind"] in {"tier", "role"}:
         tier = target["tier"]
         key = f"CFG_TIER_{tier}_MODEL"
         changed[key] = model
@@ -218,7 +220,15 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
               dry_run: bool = False, _locked: bool = False) -> dict[str, object]:
     if adapter not in model_config.ADAPTERS:
         raise ModelSettingsError(f"unknown harness: {adapter!r}")
-    model, explicit_budget = _parse_model(adapter, requested)
+    context_target = _norm(target_name) == "context-window" and "/" not in target_name
+    if context_target:
+        try:
+            model = model_config.parse_context_window(requested)
+        except model_config.ModelConfigError as exc:
+            raise ModelSettingsUsageError(str(exc)) from exc
+        explicit_budget = None
+    else:
+        model, explicit_budget = _parse_model(adapter, requested)
     runtime_path = model_config.runtime_home(adapter, runtime, environ)
     path = model_config.user_path(adapter, runtime=runtime_path)
     shipped = model_config.shipped_path(adapter, source_root=source_root)
@@ -250,7 +260,9 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
         except model_config.ModelConfigError as exc:
             raise ModelSettingsError(f"existing user config is malformed: {exc}") from exc
         reason = receipt.reason
-    target = _resolve_target(adapter, target_name, values, source_root=source_root)
+    target = ({"kind": "scalar", "name": "context-window",
+               "key": model_config.CONTEXT_WINDOW_KEY} if context_target else
+              _resolve_target(adapter, target_name, values, source_root=source_root))
     updated, changed = _candidate(adapter, values, target, model, explicit_budget)
     candidate = _edit_bytes(raw, changed)
     parsed = _parse_bytes(candidate)
@@ -273,7 +285,12 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
         except ValueError as exc:
             raise ModelSettingsError(
                 f"candidate profile {declared_profile} is invalid: {exc}") from exc
-    if target["kind"] == "profile":
+    if target["kind"] == "scalar":
+        try:
+            model_config.resolve_context_window(parsed)
+        except model_config.ModelConfigError as exc:
+            raise ModelSettingsError(f"candidate context window is invalid: {exc}") from exc
+    elif target["kind"] == "profile":
         try:
             model_profile.resolve_profile_values(adapter, parsed, target["profile"])
         except ValueError as exc:
@@ -282,30 +299,51 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
         tier = target["tier"]
         if not parsed.get(f"CFG_TIER_{tier}_MODEL"):
             raise ModelSettingsError(f"candidate does not declare tier {tier}")
-    old_profile_values = values
-    if target.get("profile") == "balanced" and "CFG_MODEL_PROFILE_BALANCED" not in values:
-        old_profile_values = model_config._derive_balanced_values(adapter, values)
-    old_model = (values.get(f"CFG_TIER_{target['tier']}_MODEL") if "tier" in target else
-                 model_profile.resolve_profile_values(adapter, old_profile_values, target["profile"])["model"])
-    old_budget = (values.get(f"CFG_TIER_{target['tier']}_{'VARIANT' if adapter == 'opencode' else 'EFFORT'}") if "tier" in target else
-                  model_profile.resolve_profile_values(adapter, old_profile_values, target["profile"])["budget"])
-    new_values = parsed
-    new_model = (new_values.get(f"CFG_TIER_{target['tier']}_MODEL") if "tier" in target else
-                 model_profile.resolve_profile_values(adapter, new_values, target["profile"])["model"])
-    new_budget = (new_values.get(f"CFG_TIER_{target['tier']}_{'VARIANT' if adapter == 'opencode' else 'EFFORT'}") if "tier" in target else
-                  model_profile.resolve_profile_values(adapter, new_values, target["profile"])["budget"])
-    if old_model == new_model and (explicit_budget is None or old_budget == new_budget):
+    context_fields: dict[str, object] = {}
+    if target["kind"] == "scalar":
+        old_context_window = model_config.resolve_context_window(values)[0]
+        new_context_window = model_config.resolve_context_window(parsed)[0]
+        old_model = old_budget = new_model = new_budget = None
+        unchanged = (target["key"] in values and old_context_window == new_context_window)
+        context_fields = {
+            "requested_context_window": new_context_window,
+            "old_context_window": old_context_window,
+            "new_context_window": new_context_window,
+        }
+    else:
+        old_profile_values = values
+        if target.get("profile") == "balanced" and "CFG_MODEL_PROFILE_BALANCED" not in values:
+            old_profile_values = model_config._derive_balanced_values(adapter, values)
+        old_model = (values.get(f"CFG_TIER_{target['tier']}_MODEL") if "tier" in target else
+                     model_profile.resolve_profile_values(adapter, old_profile_values, target["profile"])["model"])
+        old_budget = (values.get(f"CFG_TIER_{target['tier']}_{'VARIANT' if adapter == 'opencode' else 'EFFORT'}") if "tier" in target else
+                      model_profile.resolve_profile_values(adapter, old_profile_values, target["profile"])["budget"])
+        new_values = parsed
+        new_model = (new_values.get(f"CFG_TIER_{target['tier']}_MODEL") if "tier" in target else
+                     model_profile.resolve_profile_values(adapter, new_values, target["profile"])["model"])
+        new_budget = (new_values.get(f"CFG_TIER_{target['tier']}_{'VARIANT' if adapter == 'opencode' else 'EFFORT'}") if "tier" in target else
+                      model_profile.resolve_profile_values(adapter, new_values, target["profile"])["budget"])
+        unchanged = old_model == new_model and (explicit_budget is None or old_budget == new_budget)
+    if unchanged:
         return {"operation": "model-set", "status": "unchanged", "exit": 0,
                 "runtime": adapter, "config_path": str(path), "target": target,
                 "requested_model": requested, "old_model": old_model, "new_model": new_model,
                 "old_budget": old_budget, "new_budget": new_budget, "changed_keys": [],
-                "backup": None, "source_reason": reason, "lines": [f"model set: unchanged {adapter} {target['name']} -> {old_model}"]}
+                "backup": None, "source_reason": reason,
+                "lines": ([f"model set: unchanged {adapter} context-window -> {new_context_window} tokens"]
+                          if target["kind"] == "scalar" else
+                          [f"model set: unchanged {adapter} {target['name']} -> {old_model}"]),
+                **context_fields}
     if dry_run:
         return {"operation": "model-set", "status": "planned", "exit": 0,
                 "runtime": adapter, "config_path": str(path), "target": target,
                 "requested_model": requested, "old_model": old_model, "new_model": new_model,
                 "old_budget": old_budget, "new_budget": new_budget, "changed_keys": sorted(changed),
-                "backup": None, "source_reason": reason, "lines": [f"model set: would update {adapter} {target['name']} -> {new_model}"]}
+                "backup": None, "source_reason": reason,
+                "lines": ([f"model set: would update {adapter} context-window -> {new_context_window} tokens"]
+                          if target["kind"] == "scalar" else
+                          [f"model set: would update {adapter} {target['name']} -> {new_model}"]),
+                **context_fields}
     if not _locked:
         # Do all authoritative reads again after acquiring the stable canonical lock.
         # Concurrent cooperating edits therefore compose instead of losing keys.
@@ -325,8 +363,12 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
                              allow_leaf_symlink=False, expected=current)
     safe_fs.atomic_write_bytes(auth, candidate, mode, expected=current, create_parents=True)
     # A non-cooperating writer can race the final precheck->rename window; do not roll back a successor.
-    lines = [f"model set: {adapter} {target['name']} {old_model} -> {new_model}",
-             f"config: {path}", f"backup: {backup or 'none (new user config)'}"]
+    if target["kind"] == "scalar":
+        lines = [f"model set: {adapter} context-window {old_context_window} -> {new_context_window} tokens",
+                 f"config: {path}", f"backup: {backup or 'none (new user config)'}"]
+    else:
+        lines = [f"model set: {adapter} {target['name']} {old_model} -> {new_model}",
+                 f"config: {path}", f"backup: {backup or 'none (new user config)'}"]
     if target.get("shared"):
         lines.insert(1, f"shared tier: {target['tier']} (all consumers of this tier follow the change)")
     return {"operation": "model-set", "status": "changed", "exit": 0,
@@ -334,7 +376,36 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
             "requested_model": requested, "old_model": old_model, "new_model": new_model,
             "old_budget": old_budget, "new_budget": new_budget, "changed_keys": sorted(changed),
             "backup": str(backup) if backup else None, "source_reason": reason,
-            "lines": lines}
+            "lines": lines, **context_fields}
+
+
+def get_context_window(adapter: str, *, runtime: str | Path | None = None,
+                       environ: dict[str, str] | None = None,
+                       source_root: str | Path | None = None) -> dict[str, object]:
+    """Read the resolved common context request without touching user state."""
+    if adapter not in model_config.ADAPTERS:
+        raise ModelSettingsUsageError(f"unknown harness: {adapter!r}")
+    values, receipt = model_config.resolve_config(
+        adapter, runtime=runtime, environ=environ, source_root=source_root
+    )
+    value, provenance = model_config.resolve_context_window(values)
+    native = {
+        "codex": "Codex CLI and App Server model_context_window config",
+        "claude": "Claude CLAUDE_CODE_AUTO_COMPACT_WINDOW environment",
+        "opencode": "OpenCode selected-model limit.context, capped by installed native context/input limits",
+    }[adapter]
+    return {
+        "operation": "model-context-window-get", "status": "resolved", "exit": 0,
+        "runtime": adapter, "config_path": receipt.selected_path,
+        "source": receipt.source, "source_reason": receipt.reason,
+        "context_window": value, "provenance": provenance,
+        "native_application": native, "measured_effective_capacity": False,
+        "lines": [
+            f"model get: {adapter} context-window={value} ({provenance}; source={receipt.source}/{receipt.reason})",
+            f"config: {receipt.selected_path}", f"native application: {native}",
+            "effective service capacity is not measured by this query",
+        ],
+    }
 
 
 def _parse_bytes(raw: bytes) -> dict[str, str]:
