@@ -61,6 +61,11 @@ class AdapterV11Test(unittest.TestCase):
      self.assertFalse(jobs.exists(),output)
 
  def setUp(self):
+  import opencode_context_window
+  from fixtures.opencode_native_context import launch_context
+  native = mock.patch.object(opencode_context_window, "prepare_launch_context", side_effect=launch_context)
+  native.start()
+  self.addCleanup(native.stop)
   self.parent_procs=[]
   self.ambient_worker_env={
    key:value for key,value in os.environ.items()
@@ -387,7 +392,7 @@ class AdapterV11Test(unittest.TestCase):
    "worktree":"/work/repo","artifact_root":"/artifacts","nested_headless_network":False,
    "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
    "command_attempt_id":"att-stage-1","jobs_path":Path("/state/jobs.log"),
-   "sandbox":"workspace-write","resolved_model_settings":{"source":"inherit"},"approval":"inherit"})()
+   "sandbox":"workspace-write","resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
   command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
   self.assertIn(f"--add-dir {DC.dispatch_state_root(args.jobs_path)}",command)
   self.assertNotIn(f"--add-dir {ROOT / '.dispatch'}",command)
@@ -399,7 +404,7 @@ class AdapterV11Test(unittest.TestCase):
    "agent_home":ROOT,"dispatch_depth":2,"route_id":"rt-1","attempt_id":"att-stage-1",
    "sandbox":"workspace-write","launch_lifecycle":"foreground-scoped",
    "parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write",
-   "resolved_model_settings":{"source":"inherit"},"approval":"inherit"})()
+   "resolved_model_settings":{"source":"inherit","context_window":"800000"},"approval":"inherit"})()
   with mock.patch.dict(os.environ,{"AGENT_DISPATCH_CHILD":"1"},clear=False):
    command=wrapper.shell_command(args,Path("/prompt"),Path("/log"))
    self.assertEqual(wrapper.effective_runtime_sandbox(args),"danger-full-access")

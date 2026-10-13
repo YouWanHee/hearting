@@ -94,6 +94,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                 def record(event, **extra):
                     with open(trace, 'a', encoding='utf-8') as h:
                         h.write(json.dumps({'event': event, 'time': time.monotonic(), **extra}) + '\\n')
+                if any(arg.startswith('model_context_window=') for arg in sys.argv):
+                    record('server-start', argv=sys.argv[1:])
                 def send(value):
                     print(json.dumps(value), flush=True)
                 for line in sys.stdin:
@@ -251,9 +253,10 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def command(self, *, broken_app: Path | None = None) -> list[str]:
+    def command(self, *, broken_app: Path | None = None,
+                model_context_window: str | None = None) -> list[str]:
         app = broken_app or self.app
-        return [
+        command = [
             sys.executable,
             str(SUPERVISOR),
             "--worktree", str(self.base),
@@ -267,17 +270,30 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             "--join-timeout", "2",
             "--join-interval", "0.02",
         ]
+        if model_context_window is not None:
+            command += ["--model-context-window", model_context_window]
+        return command
 
-    def run_supervisor(self, **extra_env: str) -> subprocess.CompletedProcess[str]:
+    def run_supervisor(self, model_context_window: str | None = None,
+                       **extra_env: str) -> subprocess.CompletedProcess[str]:
         env = {**os.environ, "FAKE_TRACE": str(self.trace), **extra_env}
         return subprocess.run(
-            self.command(),
+            self.command(model_context_window=model_context_window),
             input="initial assignment",
             text=True,
             capture_output=True,
             env=env,
             timeout=10,
         )
+
+    def test_context_window_is_captured_by_supervised_server_across_resume(self):
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        result = self.run_supervisor(model_context_window="600000")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        launch = next(row for row in trace if row["event"] == "server-start")
+        self.assertEqual(launch["argv"][-2:], ["-c", "model_context_window=600000"])
+        self.assertEqual([row["turn"] for row in trace if row["event"] == "turn-start"], [1, 2])
 
 
     def test_mixed_model_resource_outboxes_restart_after_model_interruption(self):
@@ -1597,6 +1613,7 @@ class OneTurnStageTransportTest(unittest.TestCase):
             "--one-turn", "--worktree", str(self.root), "--sandbox", "workspace-write",
             "--approval", "on-request", "--network-access", "--writable-root", str(self.root),
             "--model", "model-pinned", "--reasoning", "xhigh", "--primary-git-commit",
+            "--model-context-window", "600000",
         ])
         output = io.StringIO()
         with mock.patch.object(self.supervisor, "commit_profile_config", return_value=profile) as build, \
@@ -1611,6 +1628,7 @@ class OneTurnStageTransportTest(unittest.TestCase):
             primary_commit=True,
         )
         self.assertIn("--profile-test", captured["command"])
+        self.assertEqual(captured["command"][-2:], ["-c", "model_context_window=600000"])
         self.assertEqual(captured["cwd"], str(self.root))
         requests = dict(captured["requests"])
         thread = requests["thread/start"]

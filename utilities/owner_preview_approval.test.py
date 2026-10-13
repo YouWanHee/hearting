@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -74,10 +75,11 @@ class OwnerRefineBase(PF.ProducerTestBase):
             dispatch_evidence={"tuples": [nested(harness, "codex")]}, unassigned=True,
             work_request={"text": "Refine the README", "owner_harness": harness}, route_plan=route_plan)
         self.path = Path(L.admit_runtime_route(self.root, self.route).route_file)
-        # Per-process ids: `worker_bootstrap.test.py` and `artifact_snapshot.test.py` load this fixture and may run in
-        # a sibling process at the same time; the process-wide tagged-descendant scan keys on the attempt id, so a
-        # shared literal made a sibling's live `capability-route.py complete` read as this owner's live descendant.
-        self.owner, self.child = f"att-preview-owner-{os.getpid()}", f"att-preview-review-{os.getpid()}"
+        # The process-wide descendant scan keys on attempt id. Each build must
+        # be distinct both from sibling processes and from an earlier case in
+        # this process whose observation helper may still be exiting.
+        identity = f"{os.getpid()}-{uuid.uuid4().hex}"
+        self.owner, self.child = f"att-preview-owner-{identity}", f"att-preview-review-{identity}"
         self.log = self.jobs.parent / "owner.jsonl"
         self.owner_meta = dict(
             attempt_id=self.owner, worker_type="owner", unit="_kernel/owner", dispatch_depth=1,
@@ -686,7 +688,7 @@ class OwnerGateReachesAPollingParentTest(PollingParentBase):
         self.assertNotEqual(self.release("proceed", worker=True).returncode, 0)
         self.assertEqual(self.resolution()["status"], "blocked")
         payload = self.release_in_process("proceed")
-        self.assertEqual(payload["owner_continuation"]["state"], "running")
+        self.assertEqual(payload["owner_continuation"]["state"], "running", payload)
         import dispatch_replacement as DR
         self.assertEqual(DR.owner_parked_gate(self.jobs, self.owner)["status"], "proceed")
 
@@ -835,7 +837,7 @@ class InlineReviewOwnerSettlesThroughAPollingParentTest(PollingParentBase):
         self.assertEqual(self.gate_records(), [])
         self.assert_asks(self.wait_while_owner_exits("BLOCKED"))
         payload = self.release_with_continuation()
-        self.assertEqual(payload["owner_continuation"]["state"], "running")
+        self.assertEqual(payload["owner_continuation"]["state"], "running", payload)
         self.assertEqual(len(self.launches), 1)
         import dispatch_replacement as DR
         row = DR._rows(self.jobs.read_text().splitlines())[self.continuation_aid][1]

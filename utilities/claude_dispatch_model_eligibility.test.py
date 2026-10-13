@@ -152,6 +152,8 @@ class ClaudeDispatchModelEligibilityTest(unittest.TestCase):
                 "granularity": "legacy",
                 "model": "sonnet",
                 "effort": "high",
+                "context_window": shipped_policy()["CFG_MODEL_CONTEXT_WINDOW"],
+                "context_window_source": "configured",
             },
         )
 

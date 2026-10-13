@@ -41,7 +41,7 @@ from execution_access import receipt_fragment as execution_access_receipt_fragme
 from stage_session_runtime import metadata as stage_session_metadata
 from model_config import (
     ModelConfigError, headless_model_refusal, main_session_only_models,
-    main_session_only_state, resolve_config, restricted_model,
+    main_session_only_state, resolve_config, resolve_context_window, restricted_model,
 )
 from owner_route_binding import OwnerRouteBindingError, validate_runtime_requirements
 import route_authority
@@ -870,6 +870,18 @@ def model_policy(harness: str, *, error) -> dict[str, str]:
     except ModelConfigError as exc:
         raise error("dispatch-model-policy-unavailable", str(exc)) from exc
     return values
+
+
+def attach_context_window(settings: dict[str, str], harness: str, *, error) -> dict[str, str]:
+    """Attach the common requested budget after any model-selection branch."""
+    try:
+        values, _receipt = resolve_config(harness, source_root=ROOT)
+        window, provenance = resolve_context_window(values)
+    except ModelConfigError as exc:
+        raise error("dispatch-model-policy-unavailable", str(exc)) from exc
+    settings["context_window"] = window
+    settings["context_window_source"] = provenance
+    return settings
 
 
 def require_headless_model(model: str, source: str, *, policy, error) -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from model_config import parse_context_window
 from codex_permission_profile import commit_profile_config, config_arguments
 from worker_runtime_home import codex_worker_arguments
 import json
@@ -707,6 +708,7 @@ def parser() -> argparse.ArgumentParser:
                        help="This run may commit: a primary checkout gets the commit-only .git profile")
     value.add_argument("--model")
     value.add_argument("--reasoning")
+    value.add_argument("--model-context-window", type=parse_context_window)
     value.add_argument("--join-interval", type=float, default=2.0)
     value.add_argument("--join-timeout", type=float, default=3600.0)
     value.add_argument("--max-join-reparks", type=int, default=6, help="Compatibility input; join deadlines no longer terminate owned work")
@@ -738,6 +740,11 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def context_window_arguments(args: argparse.Namespace) -> list[str]:
+    value = getattr(args, "model_context_window", None)
+    return [] if value is None else ["-c", f"model_context_window={value}"]
+
+
 def run_one_turn(args: argparse.Namespace) -> int:
     """Run a single stage/review turn without entering owner supervision."""
     prompt = sys.stdin.read()
@@ -756,6 +763,7 @@ def run_one_turn(args: argparse.Namespace) -> int:
         command += config_arguments(args.native_permission_profile)
 
     command += codex_worker_arguments()
+    command += context_window_arguments(args)
     server: AppServer | None = None
     completed_thread: str | None = None
     result_code = 70
@@ -860,6 +868,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.native_permission_profile is not None:
         command += config_arguments(args.native_permission_profile)
     command += codex_worker_arguments()
+    command += context_window_arguments(args)
     state_path = Path(args.state_file) if args.state_file else None
     lease_path = Path(args.lease_file)
     runtime_env = dict(os.environ)

@@ -18,6 +18,10 @@ ADAPTERS = ("claude", "codex", "opencode")
 SAFE_KEY = re.compile(r"^CFG_[A-Z0-9_]+$")
 SAFE_UNQUOTED = re.compile(r"^[A-Za-z0-9._:/ |,-]+$")
 ASSIGNMENT = re.compile(r"^(CFG_[A-Z0-9_]+)=(.*)$")
+CONTEXT_WINDOW_KEY = "CFG_MODEL_CONTEXT_WINDOW"
+CONTEXT_WINDOW_DEFAULT = 800000
+CONTEXT_WINDOW_MIN = 100000
+CONTEXT_WINDOW_MAX = 1000000
 
 
 class ModelConfigError(ValueError):
@@ -85,6 +89,9 @@ OPTIONAL_PROFILE_KEYS = frozenset({
     "CFG_MODEL_PROFILE_TOP", "CFG_MODEL_PROFILE_GRANULARITY_TOP",
     "CFG_MODEL_PROFILE_GRANULARITY_DEEP",
 })
+# New scalar policy is optional independently of profile completeness: old
+# complete user copies stay selected and receive the in-memory default.
+OPTIONAL_SCALAR_KEYS = frozenset({CONTEXT_WINDOW_KEY})
 # Policy keys a release added after a user copy was seeded. A complete user
 # copy without one stays selected whole-file, and the consumer sees the key
 # as absent (top review B2, 2026-09-10: the codex main-session-only key made
@@ -262,6 +269,11 @@ def runtime_home(
     env = os.environ if environ is None else environ
     if explicit is not None:
         return _absolute(explicit, "runtime home")
+    # A registered worker may mask its native home after launch. The worker
+    # home builder pins the original per-harness config directory here so
+    # descendants keep resolving the user's model policy through the mask.
+    if env.get("HEARTING_MODEL_CONFIG_HOME"):
+        return _absolute(env["HEARTING_MODEL_CONFIG_HOME"], "HEARTING_MODEL_CONFIG_HOME")
     home = _absolute(env.get("HOME") or str(Path.home()), "HOME")
     if adapter == "claude":
         return _absolute(env.get("CLAUDE_CONFIG_DIR") or home / ".claude", "CLAUDE_CONFIG_DIR")
@@ -319,6 +331,27 @@ def _parse_value(raw: str, lineno: int) -> str:
     return value
 
 
+def parse_context_window(value: object) -> str:
+    """Validate and canonicalize the common requested context budget."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+        raise ModelConfigError(
+            f"{CONTEXT_WINDOW_KEY} must be decimal ASCII digits"
+        )
+    number = int(value, 10)
+    if not CONTEXT_WINDOW_MIN <= number <= CONTEXT_WINDOW_MAX:
+        raise ModelConfigError(
+            f"{CONTEXT_WINDOW_KEY} must be between {CONTEXT_WINDOW_MIN} and {CONTEXT_WINDOW_MAX}"
+        )
+    return str(number)
+
+
+def resolve_context_window(values: Mapping[str, str]) -> tuple[str, str]:
+    """Return (normalized requested tokens, configured/default provenance)."""
+    if CONTEXT_WINDOW_KEY not in values:
+        return str(CONTEXT_WINDOW_DEFAULT), "default"
+    return parse_context_window(values[CONTEXT_WINDOW_KEY]), "configured"
+
+
 def parse_config(path: str | Path, *, allow_symlink: bool = True) -> dict[str, str]:
     """Parse a flat CFG file without evaluating shell syntax."""
     candidate = Path(path)
@@ -333,7 +366,8 @@ def parse_config(path: str | Path, *, allow_symlink: bool = True) -> dict[str, s
         raise ModelConfigError(f"configuration unreadable: {exc}") from exc
     values: dict[str, str] = {}
     for lineno, raw in enumerate(lines, 1):
-        line = raw.strip()
+        raw_assignment = raw.lstrip()
+        line = raw_assignment.strip()
         if not line or line.startswith("#"):
             continue
         match = ASSIGNMENT.fullmatch(line)
@@ -342,7 +376,22 @@ def parse_config(path: str | Path, *, allow_symlink: bool = True) -> dict[str, s
         key = match.group(1)
         if key in values:
             raise ModelConfigError(f"line {lineno} duplicates {key}")
-        values[key] = _parse_value(match.group(2), lineno)
+        if key == CONTEXT_WINDOW_KEY:
+            raw_match = ASSIGNMENT.fullmatch(raw_assignment)
+            raw_value = (raw_match.group(2) if raw_match and raw_match.group(1) == key
+                         else match.group(2))
+            # Keep malformed scalar text inert until the typed resolver can
+            # report the specific user-invalid-context-window reason. Do not
+            # normalize whitespace around an unquoted scalar into validity.
+            if "#" not in raw_value and raw_value != raw_value.strip():
+                values[key] = raw_value
+                continue
+            try:
+                values[key] = _parse_value(raw_value, lineno)
+            except ModelConfigError:
+                values[key] = raw_value
+        else:
+            values[key] = _parse_value(match.group(2), lineno)
     if not values:
         raise ModelConfigError("configuration has no CFG_ declarations")
     return values
@@ -362,6 +411,10 @@ def resolve_config(
         shipped_values = parse_config(shipped)
     except ModelConfigError as exc:
         raise ShippedConfigError(f"shipped configuration unusable: {exc}") from exc
+    try:
+        resolve_context_window(shipped_values)
+    except ModelConfigError as exc:
+        raise ShippedConfigError(f"shipped configuration has invalid context window: {exc}") from exc
 
     try:
         user_values = parse_config(selected_user, allow_symlink=False)
@@ -373,30 +426,36 @@ def resolve_config(
         else:
             reason = "user-malformed"
     else:
-        optional_balanced = set(OPTIONAL_PROFILE_KEYS) | set(OPTIONAL_POLICY_KEYS.get(adapter, frozenset()))
-        missing = set(shipped_values) - set(user_values)
-        unreferenced_tier = _unreferenced_tier_keys(missing - optional_balanced, user_values, adapter)
-        if missing - optional_balanced - unreferenced_tier:
-            reason = "user-incomplete"
+        try:
+            resolve_context_window(user_values)
+        except ModelConfigError:
+            reason = "user-invalid-context-window"
         else:
-            deriving = ("CFG_MODEL_PROFILE_BALANCED" in shipped_values
-                        and "CFG_MODEL_PROFILE_BALANCED" not in user_values)
-            try:
-                selected = _derive_balanced_values(adapter, user_values) if deriving else user_values
-                # Validate the extension when present; old unrelated config validation stays unchanged.
-                if "CFG_MODEL_PROFILE_BALANCED" in selected:
-                    from model_profile import resolve_profile_values
-                    resolve_profile_values(adapter, selected, "balanced")
-            except ValueError:
+            optional_balanced = (set(OPTIONAL_PROFILE_KEYS) | set(OPTIONAL_POLICY_KEYS.get(adapter, frozenset()))
+                                 | set(OPTIONAL_SCALAR_KEYS))
+            missing = set(shipped_values) - set(user_values)
+            unreferenced_tier = _unreferenced_tier_keys(missing - optional_balanced, user_values, adapter)
+            if missing - optional_balanced - unreferenced_tier:
                 reason = "user-incomplete"
             else:
-                return selected, ModelConfigReceipt(
-                    "hearting.model-config/v1", adapter, "user",
-                    "user-valid-derived-balanced" if deriving else "user-valid",
-                    str(selected_user), str(selected_user), str(shipped),
-                    "derived-from-user-light" if deriving else "explicit",
-                    ",".join(sorted(unreferenced_tier)),
-                )
+                deriving = ("CFG_MODEL_PROFILE_BALANCED" in shipped_values
+                            and "CFG_MODEL_PROFILE_BALANCED" not in user_values)
+                try:
+                    selected = _derive_balanced_values(adapter, user_values) if deriving else user_values
+                    # Validate the extension when present; old unrelated config validation stays unchanged.
+                    if "CFG_MODEL_PROFILE_BALANCED" in selected:
+                        from model_profile import resolve_profile_values
+                        resolve_profile_values(adapter, selected, "balanced")
+                except ValueError:
+                    reason = "user-incomplete"
+                else:
+                    return selected, ModelConfigReceipt(
+                        "hearting.model-config/v1", adapter, "user",
+                        "user-valid-derived-balanced" if deriving else "user-valid",
+                        str(selected_user), str(selected_user), str(shipped),
+                        "derived-from-user-light" if deriving else "explicit",
+                        ",".join(sorted(unreferenced_tier)),
+                    )
 
     return shipped_values, ModelConfigReceipt(
         "hearting.model-config/v1",
