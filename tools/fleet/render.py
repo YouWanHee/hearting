@@ -5244,17 +5244,18 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     previous_summary = None
     if now_text:
         previous_summary = now_text
-        now_text = None
     resource_now = _resource_now_text(entity)
     if resource_now is not None:
         now_text = resource_now
-    elif (not now_text and getattr(entity, "_details_pending", False)
-          and not _exec_detail_segs(entity)):
+    elif not now_text and not _exec_detail_segs(entity):
         # A basic observation is real state, but missing detail is not an idle
         # verdict or an empty NOW. Never invent a command/model turn here.
-        now_text = "loading"
-    if previous_summary and resource_now is None:
-        now_text = " · ".join(part for part in (now_text, previous_summary) if part)
+        if getattr(entity, "_details_error", False):
+            now_text = "unavailable (detail failed)"
+        elif getattr(entity, "_details_pending", False):
+            now_text = "loading"
+        elif hasattr(entity, "_details_pending"):
+            now_text = "unavailable"
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
@@ -9578,6 +9579,52 @@ def _handle_mouse_event(mx, my, bstate):
     return True
 
 
+def _base_navigation(ch, mouse_event):
+    """Only viewport movement is safe to handle without an intervening paint."""
+    if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE,
+              curses.KEY_HOME, curses.KEY_END, ord("k"), ord("j"), ord("g"), ord("G")):
+        return True
+    if ch == curses.KEY_MOUSE and mouse_event is not None:
+        state = mouse_event[2]
+        return state in (getattr(curses, "BUTTON4_PRESSED", 0),
+                         getattr(curses, "BUTTON5_PRESSED", 0)) and state != 0
+    return False
+
+
+def _drain_navigation(reader, stdscr, ch, mouse_event, body_h, timeout_ms):
+    """Apply a bounded burst in order; put the first action back for next paint.
+
+    Call only with a current painted viewport in base mode. Clamping each step
+    preserves reversals at either boundary, including Home/End and page moves.
+    """
+    global _OFFSET
+    deadline = time.monotonic() + .004
+    size = stdscr.getmaxyx()
+    try:
+        stdscr.timeout(0)
+        for _ in range(128):
+            if ch == curses.KEY_MOUSE:
+                _handle_mouse_event(*mouse_event)
+            else:
+                _handle_base_key(ch, body_h)
+                _OFFSET = _clamp_offset(_OFFSET, _CURRENT_BODY_COUNT, body_h)
+            if time.monotonic() >= deadline:
+                break
+            next_ch, next_mouse = reader.read(stdscr, timeout_ms=0)
+            if next_ch == curses.ERR:
+                break  # incomplete packets stay in the reader; never wait for a tail
+            if (not _base_navigation(next_ch, next_mouse)
+                    or stdscr.getmaxyx() != size):
+                reader.ready.insert(0, (next_ch, next_mouse))
+                break
+            ch, mouse_event = next_ch, next_mouse
+        else:
+            # The final iteration already consumed its successor. Preserve it.
+            reader.ready.insert(0, (ch, mouse_event))
+    finally:
+        stdscr.timeout(timeout_ms)
+
+
 class _CursesInput:
     """Read keypad-off curses bytes and decode complete keys and SGR mouse packets.
 
@@ -10464,7 +10511,10 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 continue
 
             # --- base mode: scroll keys UNCHANGED (F-27 regression budget = 0) ---
-            if _handle_base_key(ch, body_h):
+            if (hit_current and not _SELECT_MODE and _PENDING_KILL is None
+                    and _base_navigation(ch, mouse_event)):
+                _drain_navigation(input_reader, stdscr, ch, mouse_event, body_h, timeout_ms)
+            elif _handle_base_key(ch, body_h):
                 pass
             elif ch == curses.KEY_MOUSE:
                 mx, my, bstate = (mouse_event if mouse_event is not None

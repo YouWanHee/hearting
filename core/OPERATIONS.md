@@ -1953,6 +1953,16 @@ fields. Public assistant text supplies a bounded fallback while the summary is
 absent; only unfinished native tool state represents a running command. The
 first publication skips database snapshots, and later reads reuse unchanged
 source metadata. This observation leaves running owners and resources intact.
+Across all harnesses, Fleet NOW uses the current exact native command or summary
+before a detail placeholder. `loading` means the matching detail observation has
+not completed; a successful empty observation says `unavailable`, and a failed
+read remains visible as a detail failure. A bounded native read that advances
+its source during enrichment still belongs to its captured basic observation;
+newer basic activity, changed process/session/attempt or route bindings cannot
+borrow that old NOW. Base-mode navigation may drain a bounded consecutive burst
+into one paint, applying and clamping every move in order. Selection, resize,
+folds, clicks and confirmations retain their own paint/action boundary; unread
+actions stay queued. Terminal reads remain bounded and restore the poll timeout.
 Depth-1 frame cards use the owner model/gauge and routing layout on every harness.
 Owner stage/status labels share one right-aligned position: the owner/child
 divider when worker or resource children exist (including folded workers),
