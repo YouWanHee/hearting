@@ -410,6 +410,19 @@ a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
 
+For a native Codex client/server session, the ordinary lifecycle reports the
+current `Thread.id`. When its callback runs in a shared service, the normal pane
+observer may resolve that id by reading the native status line of a live
+foreground Codex TUI. Accept it only when the full current thread id is visible
+in a fresh footer sample, the exact foreground PID, process start and
+controlling TTY remain stable across the read, and one pane uniquely matches.
+A thread's `sessionId` is its tree root, not its current thread identity; a fork
+can share a root with another current thread. The callback payload, environment
+SID, cwd, title, inherited pane environment, shared-server ancestry and tree
+root alone are not pane proof. Missing, clipped, conflicting or stale footer or
+process evidence remains unknown, and registered workers never own a
+foreground pane.
+
 For an unproven background caller, default `peer-steward start` locates the
 inherited pane's workspace by its live foreground directory in the caller's
 repository (linked worktrees included). It reuses an observed empty shell or

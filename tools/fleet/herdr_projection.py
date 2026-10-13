@@ -418,7 +418,7 @@ def _defer_until_proven(session_id: str, report_session: bool) -> None:
 
 
 def _codex_tui_pane(session_id: str):
-    """The herdr pane of the live Codex TUI proven to be on ``session_id``, or None.
+    """The unique pane whose live foreground Codex TUI proves ``session_id``, or None.
 
     Two panes resolving to one session (same-cwd TUIs sharing the fallback candidate)
     stay None: a badge on the wrong pane also misdirects peer messages.
@@ -428,10 +428,13 @@ def _codex_tui_pane(session_id: str):
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or _comm(int(entry)) != "codex":
             continue
-        pane = procscan.read_environ(int(entry)).get("HERDR_PANE_ID")
+        frontend_env = procscan.read_environ(int(entry))
+        pane = frontend_env.get("HERDR_PANE_ID")
         try:
             if pane:
-                proven = verified_pane(pane, "codex", session_id, pid=int(entry))
+                proven = verified_pane(
+                    pane, "codex", session_id, pid=int(entry),
+                    socket_path=frontend_env.get("HERDR_SOCKET_PATH"))
                 if proven:
                     panes.add(proven)
         except Exception:
@@ -448,14 +451,18 @@ def _await_tui_and_project(session_id: str, report_session: bool) -> None:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        lock.close()
         return
-    deadline = time.monotonic() + _PROOF_WAIT_S
-    while time.monotonic() < deadline:
-        pane = _codex_tui_pane(session_id)
-        if pane:
-            _report("codex", session_id, pane, report_session)
-            return
-        time.sleep(2)
+    try:
+        deadline = time.monotonic() + _PROOF_WAIT_S
+        while time.monotonic() < deadline:
+            pane = _codex_tui_pane(session_id)
+            if pane:
+                _report("codex", session_id, pane, report_session)
+                return
+            time.sleep(2)
+    finally:
+        lock.close()
 
 
 def _session_lifecycle(harness, session_seq, session_start_source):

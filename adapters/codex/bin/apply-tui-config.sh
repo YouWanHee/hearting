@@ -2,7 +2,9 @@
 # apply-tui-config.sh — apply harness-recommended Codex TUI preferences to the
 # runtime-owned $CODEX_HOME/config.toml without taking ownership of that file.
 #
-# Only the [tui] status_line and status_line_use_colors keys are managed here.
+# The [tui] status_line and status_line_use_colors keys are the only keys this
+# command manages. Existing status-line entries and an explicit color choice
+# are preserved; the current thread id is added once at the front.
 # Project trust, hook trust hashes, plugin state, model defaults, credentials
 # pointers, sessions, logs, caches, and other runtime state remain untouched.
 set -eu
@@ -18,7 +20,7 @@ FRAGMENT="$AGENT_HOME/adapters/codex/config/tui-statusline.toml"
 
 case "${1:-}" in
   -h|--help)
-    echo "usage: apply-tui-config.sh   # updates [tui] status_line keys in \$CODEX_HOME/config.toml"
+    echo "usage: apply-tui-config.sh   # adds the current-thread footer item in \$CODEX_HOME/config.toml"
     exit 0 ;;
   "")
     ;;
@@ -31,60 +33,83 @@ esac
 mkdir -p "$CODEX_HOME"
 
 python3 - "$CONFIG" "$FRAGMENT" <<'PY'
+import json
 import pathlib
 import re
 import sys
+import tomllib
 
 config_path = pathlib.Path(sys.argv[1])
 fragment_path = pathlib.Path(sys.argv[2])
 
-fragment = fragment_path.read_text(encoding="utf-8")
-wanted = {}
-for key in ("status_line", "status_line_use_colors"):
-    match = re.search(rf"(?m)^{key}\s*=\s*(.+)$", fragment)
-    if not match:
-        raise SystemExit(f"apply-tui-config: missing {key} in {fragment_path}")
-    wanted[key] = f"{key} = {match.group(1).strip()}"
+fragment_data = tomllib.loads(fragment_path.read_text(encoding="utf-8"))
+fragment_tui = fragment_data.get("tui")
+default_items = fragment_tui.get("status_line") if isinstance(fragment_tui, dict) else None
+default_colors = fragment_tui.get("status_line_use_colors") if isinstance(fragment_tui, dict) else None
+if (not isinstance(default_items, list) or "thread-id" not in default_items
+        or any(not isinstance(item, str) for item in default_items)
+        or not isinstance(default_colors, bool)):
+    raise SystemExit(f"apply-tui-config: invalid tui defaults in {fragment_path}")
 
 text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+try:
+    current = tomllib.loads(text) if text.strip() else {}
+except tomllib.TOMLDecodeError as exc:
+    raise SystemExit(f"apply-tui-config: invalid TOML in {config_path}: {exc}")
+tui = current.get("tui", {})
+if not isinstance(tui, dict):
+    raise SystemExit(f"apply-tui-config: [tui] must be a table in {config_path}")
+
+items = tui.get("status_line")
+if items is None:
+    items = list(default_items)
+elif not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+    raise SystemExit(f"apply-tui-config: tui.status_line must be an array of strings in {config_path}")
+elif "thread-id" not in items:
+    items = ["thread-id", *items]
+
 lines = text.splitlines()
-
-section_re = re.compile(r"^\s*\[[^\]]+\]\s*$")
-tui_start = None
-tui_end = None
-for idx, line in enumerate(lines):
-    if re.match(r"^\s*\[tui\]\s*$", line):
-        tui_start = idx
-        tui_end = len(lines)
-        for j in range(idx + 1, len(lines)):
-            if section_re.match(lines[j]):
-                tui_end = j
-                break
-        break
-
+section_re = re.compile(r"^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$")
+key_re = re.compile(r"^\s*status_line\s*=")
+tui_start = next((i for i, line in enumerate(lines)
+                  if re.match(r"^\s*\[tui\]\s*(?:#.*)?$", line)), None)
 if tui_start is None:
     if lines and lines[-1].strip():
         lines.append("")
-    lines.extend(["[tui]", wanted["status_line"], wanted["status_line_use_colors"]])
+    lines.extend(["[tui]", "status_line = " + json.dumps(items),
+                  "status_line_use_colors = " + str(tui.get("status_line_use_colors", default_colors)).lower()])
 else:
-    seen = set()
-    key_re = re.compile(r"^\s*(status_line|status_line_use_colors)\s*=")
-    new_section = []
-    for line in lines[tui_start:tui_end]:
-        match = key_re.match(line)
-        if match:
-            key = match.group(1)
-            if key not in seen:
-                new_section.append(wanted[key])
-                seen.add(key)
-            continue
-        new_section.append(line)
-    for key in ("status_line", "status_line_use_colors"):
-        if key not in seen:
-            new_section.append(wanted[key])
-    lines = lines[:tui_start] + new_section + lines[tui_end:]
+    tui_end = next((i for i in range(tui_start + 1, len(lines))
+                    if section_re.match(lines[i])), len(lines))
+    status_idx = next((i for i in range(tui_start + 1, tui_end)
+                       if key_re.match(lines[i])), None)
+    if status_idx is None:
+        lines.insert(tui_end, "status_line = " + json.dumps(items))
+        tui_end += 1
+    else:
+        end_idx = status_idx + 1
+        assignment = None
+        while end_idx <= tui_end:
+            chunk = "[tui]\n" + "\n".join(lines[status_idx:end_idx]) + "\n"
+            try:
+                assignment = tomllib.loads(chunk)["tui"]["status_line"]
+                break
+            except (tomllib.TOMLDecodeError, KeyError):
+                end_idx += 1
+        if not isinstance(assignment, list):
+            raise SystemExit(f"apply-tui-config: could not read tui.status_line in {config_path}")
+        if "thread-id" not in assignment:
+            indent = lines[status_idx][:len(lines[status_idx]) - len(lines[status_idx].lstrip())]
+            lines[status_idx:end_idx] = [indent + "status_line = " + json.dumps(items)]
+            tui_end -= end_idx - status_idx - 1
 
-new_text = "\n".join(lines) + "\n"
+    color_re = re.compile(r"^\s*status_line_use_colors\s*=")
+    has_colors = any(color_re.match(lines[i]) for i in range(tui_start + 1, tui_end))
+    if not has_colors:
+        color_value = tui.get("status_line_use_colors", default_colors)
+        lines.insert(tui_end, "status_line_use_colors = " + str(color_value).lower())
+
+new_text = "\n".join(lines) + ("\n" if lines else "")
 if config_path.exists() and config_path.read_text(encoding="utf-8") == new_text:
     changed = False
 else:
