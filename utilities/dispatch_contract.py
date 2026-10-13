@@ -3558,12 +3558,21 @@ def _cleanup_receipt_reason(metadata: dict[str, str]) -> str:
             return ""
         return "attempt-cleanup-proven" if (
             record.get("receipt_type") == CLEANUP_RECEIPT_TYPE
+            and record.get("contract_version") == RECOVERY_CONTRACT_VERSION
             and record.get("attempt_id") == metadata.get("attempt_id")
+            and record.get("route_id") == metadata.get("route_id", "")
+            and record.get("route_hash") == metadata.get("route_hash", "")
+            and record.get("node_or_group_leg") == (metadata.get("route_node", "") or metadata.get("batch_route_node", ""))
             and record.get("binding_digest") == _cancellation_quiescence_binding_digest(metadata)
             and _canonical_sha256(record) == metadata.get("cleanup_receipt_digest")
             and record.get("namespace_authority") is True
             and record.get("process_group", {}).get("state") == "empty"
+            and record.get("process_group", {}).get("pgid") == metadata.get("pgid")
+            and record.get("process_group", {}).get("proof") == GROUP_REAP_PROOF
             and record.get("attempt_tagged_descendants", {}).get("state") == "empty"
+            and record.get("attempt_tagged_descendants", {}).get("attempt_id") == metadata.get("attempt_id")
+            and record.get("attempt_tagged_descendants", {}).get("proof") == ATTEMPT_DESCENDANT_PROOF
+            and record.get("proof_source") in {"exact-teardown", "authenticated-namespace-portable", "namespace-extinct"}
         ) else ""
     except (ValueError, TypeError, AttributeError):
         return ""
@@ -3578,6 +3587,55 @@ def _portable_cleanup_receipt(metadata: dict[str, str]) -> bool:
         record.get("proof_source") == "authenticated-namespace-portable"
         and record.get("portable_receipt_digest") == _portable_teardown_receipt_digest(metadata)
     )
+
+
+def _settled_cleanup_receipt(metadata: dict[str, str]) -> bool:
+    """A complete normal settlement or the existing authenticated watcher drain."""
+    if not _cleanup_receipt_reason(metadata):
+        return False
+    record = json.loads(base64.b64decode(metadata["cleanup_receipt_b64"], validate=True))
+    return record.get("proof_source") == "exact-teardown" or _portable_cleanup_receipt(metadata)
+
+
+def _cleanup_observation_diagnostic(metadata, *, group=None, descendants=None):
+    """Return observations for an existing guard result without publishing output.
+
+    No proc environment or later re-observation is included. Diagnostics confer
+    no authority and must never prevent the original refusal.
+    """
+    payload = {"attempt_id": metadata.get("attempt_id", ""),
+               "binding_digest": _cancellation_quiescence_binding_digest(metadata),
+               "observed_at": datetime.now(timezone.utc).isoformat(),
+               "scope": "guard-time", "pid": metadata.get("pid", ""),
+               "pid_start": metadata.get("pid_start", ""), "pgid": metadata.get("pgid", "")}
+    for name, observation in (("process_group", group), ("attempt_tagged_descendants", descendants)):
+        if observation is not None:
+            payload[name] = {"state": observation.state, "reason": observation.reason[:240]}
+    return payload
+
+
+def _terminal_cleanup_values(metadata: dict[str, str]) -> dict[str, str]:
+    """Preserve full cleanup at the existing first terminal write, without a gate.
+
+    The caller holds the row lock and commits these exact-bound values together
+    with the result and delivery identity. An unavailable proof adds no write.
+    """
+    if _cleanup_receipt_reason(metadata):
+        return {}
+    try:
+        if attempt_governed_process_quiescence(metadata).state == "live":
+            return {}
+        proof = prove_attempt_quiescence(metadata, max_wait_seconds=0,
+                                         allow_namespace_extinct=True)
+        if not proof.proven:
+            return {}
+        record = _cancellation_quiescence_receipt_record(metadata, proof)
+        record["receipt_type"] = CLEANUP_RECEIPT_TYPE
+        return {"cleanup_receipt_b64": base64.b64encode(
+                    json.dumps(record, sort_keys=True).encode()).decode(),
+                "cleanup_receipt_digest": _canonical_sha256(record)}
+    except (OSError, ValueError, DispatchContractError):
+        return {}
 
 
 def resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False) -> dict[str, object]:
@@ -3614,14 +3672,14 @@ def _resolve_attempt_cleanup(jobs: Path, attempt_id: str, *, apply: bool = False
     # A namespace-extinct verdict is quiescent only from a host-like observer.
     # Still seal the existing cleanup receipt when its proof holds, so a later
     # sandboxed reader of this row sees the same settled state.
-    extinct = process.state == "quiescent" and process.reason == NAMESPACE_EXTINCT_REASON
-    if process.state == "quiescent" and not extinct:
+    if process.state == "quiescent" and (
+            _cleanup_receipt_reason(metadata) or _detached_group_drain_receipt(metadata)):
         return {**result, "settled": True, "reason": process.reason}
     if process.state == "live":
         return {**result, "reason": process.reason}
     proof = prove_attempt_quiescence(metadata, max_wait_seconds=0, allow_namespace_extinct=True)
     if not proof.proven:
-        if extinct:
+        if process.state == "quiescent":
             return {**result, "settled": True, "reason": process.reason}
         return {**result, "reason": process.reason,
                 "group_state": proof.process_group_state, "descendant_state": proof.descendant_state,
@@ -3786,13 +3844,18 @@ def attempt_process_quiescence(
         # positive descendant branch above proves additional live evidence.
         return result
     if probe.state == "unverifiable":
-        # The trusted watcher already proved this exact attempt drained. A
+        # Normal cleanup or the trusted watcher proved this exact attempt drained. A
         # later unrelated private environment must not undo that receipt and
         # make recovery reseal it forever. Current positive tags won above;
         # require the authoritative current group to remain empty as well.
-        if (terminal_receipt and _portable_cleanup_receipt(metadata)
+        group = (process_group_observation(int(metadata["pgid"]))
+                 if attempt_scan_namespace_authority(metadata)
+                 and metadata.get("pgid", "").isdigit() else None)
+        if group is not None and group.state == "populated":
+            return ProcessQuiescence("live", "attempt-process-group-live", group.members[0][0] if group.members else None)
+        if (terminal_receipt and _settled_cleanup_receipt(metadata)
                 and attempt_scan_namespace_authority(metadata)
-                and process_group_observation(int(metadata["pgid"])).state == "empty"):
+                and group is not None and group.state == "empty"):
             return result
         # SD-79/80/89: the observer that produced a complete post-exit receipt
         # may itself have disappeared before a successor or retry is launched.
@@ -3802,7 +3865,8 @@ def attempt_process_quiescence(
         if (
             terminal_receipt
             and probe.reason == "observer-namespace-mismatch"
-            and (_post_exit_receipt_reason(metadata) or _cleanup_receipt_reason(metadata))
+            and (_post_exit_receipt_reason(metadata) or (
+                _cleanup_receipt_reason(metadata) and not _settled_cleanup_receipt(metadata)))
         ):
             return result
         return ProcessQuiescence("unverifiable", "attempt-descendant-unverifiable")
@@ -9849,6 +9913,7 @@ def marker_bound_delivery_transaction(
                 "failure_class": "pass",
                 "classifier_source": "marker-bound-delivery-v1",
             }
+            values.update(_terminal_cleanup_values({**metadata, **values}))
             values.update(_delivery_intent_values(fields, {**metadata, **values}))
             fields[5] = _updated_attempt_metadata(
                 fields[5], values, terminal=True,
@@ -10519,6 +10584,7 @@ def close_attempt_row(
                 key: value for key, value in (evidence or {}).items()
                 if value not in (None, "")
             })
+            values.update(_terminal_cleanup_values({**metadata, **values}))
             values.update(_delivery_intent_values(fields, {**metadata, **values}))
             try:
                 fields[5] = _updated_attempt_metadata(
@@ -10768,6 +10834,7 @@ def _commit_attempt_terminal(
                 if value not in (None, "")
             }
         )
+        values.update(_terminal_cleanup_values({**metadata, **values}))
         values.update(_delivery_intent_values(fields, {**metadata, **values}))
         fields[1] = "done"
         fields[5] = _updated_attempt_metadata(fields[5], values, terminal=True)
@@ -10977,6 +11044,7 @@ def close_attempt_row_if(
                 key: value for key, value in (evidence or {}).items()
                 if value not in (None, "")
             })
+            values.update(_terminal_cleanup_values({**metadata, **values}))
             values.update(_delivery_intent_values(fields, {**metadata, **values}))
             try:
                 fields[5] = _updated_attempt_metadata(

@@ -426,6 +426,97 @@ def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
         raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
 
 
+def unfinished_batch_input(jobs, route, nodes, group, parent_attempt, prompt, admissions, *, route_file):
+    """Restore sealed unfinished membership before selecting a fresh round.
+
+    Registered members use the historical input reader. With no registered
+    member, the sealed input must match every admission-selected stable id.
+    Current row/process validation and admission of missing legs still follow.
+    """
+    from recovery_history import INPUT_SCHEMA, RecoveryHistoryError, _read, read_batch_input
+    if not admissions or not parent_attempt or not jobs.exists():
+        return None
+    rows = []
+    for line in jobs.read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 6:
+            rows.append((fields, parse_registry_metadata(fields[5])))
+    by_id = {meta.get("attempt_id"): (fields, meta) for fields, meta in rows}
+    directory = jobs.resolve().parent / "automatic-replacements" / "batch-inputs"
+    candidates = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = _read(path)
+            if not payload or payload.get("route_id") != route["route_id"]:
+                continue
+            raw = payload.get("manifest", {})
+            if not isinstance(raw, dict):
+                raise BatchError("batch-prior-binding-invalid", "manifest shape")
+            if (raw.get("parent_attempt_id") != parent_attempt
+                    or (raw.get("parallel_group") or raw.get("replica_group")) != group):
+                continue
+            manifest, digest, _ = verify_manifest(raw)
+            if {m["route_node"] for m in manifest["members"]} != {n["id"] for n in nodes}:
+                raise BatchError("replacement-batch-source-drift", "node census")
+            members = manifest["members"]
+            present = [by_id[m["attempt_id"]] for m in members if m["attempt_id"] in by_id]
+            if len(present) == len(members) and not any(
+                    fields[1] == "open" and meta.get("launch_claimed") == "0"
+                    for fields, meta in present):
+                continue
+            # The common logical census selects history, including replacement
+            # originals. A sealed file cannot revive a superseded physical id.
+            eligible = True
+            for member in members:
+                admission = admissions.get(member["route_node"])
+                if admission is None:
+                    eligible = False
+                    break
+                aid = member["attempt_id"]
+                if aid in by_id:
+                    if aid not in admission.current_attempt_ids:
+                        eligible = False
+                        break
+                else:
+                    node = next(n for n in nodes if n["id"] == member["route_node"])
+                    expected = stable_attempt_id(route, node, "", "", parent_attempt,
+                        member["harness"], member["fallback_ordinal"],
+                        review_round=admission.budget.next_round)
+                    if aid != expected:
+                        eligible = False
+                        break
+            if not eligible:
+                continue
+            options = payload.get("options", {})
+            if not isinstance(options, dict):
+                raise BatchError("replacement-batch-source-drift", "options shape")
+            if (payload.get("schema") != INPUT_SCHEMA
+                    or payload.get("jobs") != str(jobs.resolve())
+                    or payload.get("route_hash") != route["route_hash"]
+                    or manifest["route_id"] != route["route_id"]
+                    or payload.get("manifest_digest") != digest
+                    or path.stem != digest.split(":")[1]
+                    or options.get("parallel_group") != group
+                    or options.get("route") != str(route_file.resolve())
+                    or options.get("parent") != os.environ.get("AGENT_DISPATCH_SELF_SLUG")
+                    or options.get("prompt_text") != prompt
+                    or any(m["assignment_sha256"] != "sha256:" + hashlib.sha256(
+                        prompt.encode("utf-8")).hexdigest() for m in members)):
+                raise BatchError("replacement-batch-source-drift")
+            if present:
+                payload = read_batch_input(jobs, [meta for _, meta in present],
+                    source_route=route, group=group, prompt=prompt,
+                    node_ids={n["id"] for n in nodes})
+            candidates.append(payload)
+        except RecoveryHistoryError as exc:
+            raise BatchError(exc.reason, exc.detail) from exc
+        except (ReplicaBatchContractError, TypeError, KeyError) as exc:
+            raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
+    if len(candidates) > 1:
+        raise BatchError("batch-prior-binding-ambiguous", group)
+    return candidates[0] if candidates else None
+
+
 def prior_batch_assignments(payload: dict, route: dict, nodes: list[dict], parent_identity: dict):
     members = {m["route_node"]: m for m in payload["manifest"]["members"]}
     assignments = []
@@ -1490,6 +1581,9 @@ def wrapper_result(
     else:
         launch_state = "failed"
         reason = fields.get("reason", "invalid-wrapper-receipt")[:160]
+    cleanup_diagnostics = [line.partition("=")[2][:4096]
+                           for line in (stdout + stderr).splitlines()
+                           if line.startswith("cleanup_diagnostics=")][-8:]
     return {
         **leg,
         "exit_code": proc.returncode,
@@ -1501,6 +1595,7 @@ def wrapper_result(
         "launch_state": launch_state,
         "reason": reason,
         **({"detail": fields["detail"]} if fields.get("detail") else {}),
+        **({"cleanup_diagnostics": cleanup_diagnostics} if cleanup_diagnostics else {}),
     }
 
 
@@ -1701,6 +1796,7 @@ def existing_leg_result(
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             marker = None
+        readiness_state = "unsettled"
         if (
             isinstance(node, dict)
             and isinstance(marker, dict)
@@ -1716,6 +1812,7 @@ def existing_leg_result(
                     "launch_state": "existing",
                     "reason": "existing-completed-attempt",
                 }
+            readiness_state = readiness.state
             terminal_reason = readiness.reason
         else:
             terminal_reason = "completion-marker-not-current"
@@ -1725,6 +1822,7 @@ def existing_leg_result(
             "check": "failed",
             "launch_state": "failed",
             "reason": "existing-completed-attempt-" + terminal_reason,
+            "readiness_state": readiness_state,
         }
     return {
         **common,
@@ -2281,6 +2379,8 @@ def main(argv: list[str] | None = None) -> int:
         # `len(prior)+1 > max_round` comparison.
         planned_revision_nodes: set[str] = set()
         round_admissions = {}
+        replay_budget_errors = []
+        round_errors = {}
         for capped_node in nodes:
             capped_node_id = str(capped_node["id"])
             if not DISPATCH_NODE.REVIEW_ROUND_CAP.is_round_capped_node(capped_node):
@@ -2307,16 +2407,53 @@ def main(argv: list[str] | None = None) -> int:
                     f"round={budget.next_round} max_round={budget.cap}",
                     route_node=capped_node_id)
                 error.next_action, error.retry_when = choice.next_action, choice.retry_when
-                raise error
-        # Only an unmet group opens a new round. A successful group replay
-        # retains its sealed attempts and spends no fresh capacity.
-        historical_batch_attempts = (frozenset().union(*(
-            admission.prior_attempt_ids for admission in round_admissions.values()
-        )) if any(admission.gate_unmet for admission in round_admissions.values()) else frozenset())
-        prior_input = None if partial is not None else prior_batch_input(
+                # Exhaustion can still return an exact successful group. All
+                # identity/input/readiness checks below must prove that replay
+                # before any reservation or input publication. Other refusals
+                # (especially live/unsettled) keep their original priority.
+                if (budget.state not in {"exhausted", "blocked-live"}
+                        or (budget.state == "exhausted" and admission.requires_next_round)):
+                    raise error
+                round_errors[capped_node_id] = error
+        unfinished_input = None if partial is not None else unfinished_batch_input(
             jobs, route, nodes, args.parallel_group,
             os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
-            prior_attempt_ids=historical_batch_attempts)
+            round_admissions, route_file=route_path)
+        for node_id, error in round_errors.items():
+            admission = round_admissions[node_id]
+            if unfinished_input is not None and args.action == "start":
+                member = next(m for m in unfinished_input["manifest"]["members"]
+                              if m["route_node"] == node_id)
+                # Only an existing exact member may bypass fresh-round
+                # exhaustion/live admission. Its process/readiness is checked
+                # below; absent members still owe the common budget.
+                if (member["attempt_id"] in admission.current_attempt_ids
+                        and admission.budget.state in {"blocked-live", "exhausted"}
+                        and (admission.budget.state == "blocked-live"
+                             or not admission.requires_next_round)):
+                    continue
+            if (args.action == "start" and admission.budget.state == "exhausted"
+                    and not admission.requires_next_round):
+                replay_budget_errors.append(error)
+            else:
+                raise error
+        next_generation = any(admission.requires_next_round
+                              for admission in round_admissions.values())
+        if unfinished_input is None and next_generation and replay_budget_errors:
+            raise replay_budget_errors[0]
+        # One admission-selected exclusion feeds both raw history readers.
+        # Replay retains current physical members (and their original manifest).
+        historical_batch_attempts = frozenset().union(*(
+            admission.physical_attempt_ids - (
+                frozenset(m["attempt_id"] for m in unfinished_input["manifest"]["members"])
+                if unfinished_input is not None else
+                frozenset() if next_generation else admission.current_attempt_ids)
+            for admission in round_admissions.values()
+        ))
+        prior_input = unfinished_input or (None if partial is not None else prior_batch_input(
+            jobs, route, nodes, args.parallel_group,
+            os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
+            prior_attempt_ids=historical_batch_attempts))
         if prior_input is not None:
             assignments = prior_batch_assignments(prior_input, route, nodes, parent_identity)
             independence = "persona"
@@ -2373,6 +2510,9 @@ def main(argv: list[str] | None = None) -> int:
             completion_marker_gate(
                 str(route_path), str(node["id"]), args.action, agent_home, jobs,
                 planned_revision_nodes=planned_revision_nodes,
+                **({"attempt_id": next(m["attempt_id"] for m in unfinished_input["manifest"]["members"]
+                                       if m["route_node"] == node["id"])}
+                   if unfinished_input is not None else {}),
             )
     except (
         BatchError,
@@ -2696,6 +2836,24 @@ def main(argv: list[str] | None = None) -> int:
                 results.append(existing)
     except BatchError as exc:
         return fail(exc.reason, 73, detail=exc.detail, admitted=0, spawned=0)
+
+    # Exact readiness can change after the admission observation. Preserve
+    # its refusal before considering the budget for absent/fresh work.
+    if replay_budget_errors:
+        for result in results:
+            state = result.get("readiness_state")
+            if state in {"draining", "unverifiable", "unsettled"}:
+                reason = {"draining": "prior-attempt-still-live",
+                          "unverifiable": "prior-attempt-unverifiable",
+                          "unsettled": "round-unsettled"}[state]
+                return fail(reason, 65 if state == "unsettled" else 78,
+                            detail=f"{result['node']}:{result['attempt_id']}:{result['reason']}",
+                            admitted=0, spawned=0)
+    if replay_budget_errors and (pending_legs or len(results) != len(legs)
+            or any(result.get("reason") != "existing-completed-attempt" for result in results)):
+        error = replay_budget_errors[0]
+        return fail(error.reason, 65, detail=error.detail, admitted=0, spawned=0,
+                    next_action=error.next_action, retry_when=error.retry_when)
 
     if partial is not None and (
         len(pending_legs) > 1

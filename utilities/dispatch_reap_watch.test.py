@@ -969,7 +969,7 @@ class DrainScanRetryTest(unittest.TestCase):
             "attempt_tagged_descendants": (mock.Mock(side_effect=scans) if scans is not None
                                            else D.attempt_tagged_descendants),
             # Stop right after the receipt write: the rest of the watcher is not under test.
-            "annotate_attempt_row": lambda jobs, aid, values: annotated.append(values) and False,
+            "annotate_attempt_row_if": lambda jobs, aid, values, predicate, **kwargs: annotated.append(values) and False,
         }
         args = SimpleNamespace(jobs=Path("/nonexistent/jobs.log"), attempt_id="att-drain-retry", pid=1,
                                pid_start="1", pgid=1, interval=0.01, drain_interval_max=0.02,

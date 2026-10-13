@@ -148,7 +148,10 @@ def logical_round_records(rows, *, jobs=None):
                 continue
         except (replacement.DC.DispatchContractError, KeyError):
             continue
-        replaced[original] = (candidate_fields, candidate)
+        # Ephemeral projection only: the same canonical proof supplies raw
+        # consumers with both physical members without counting two rounds.
+        replaced[original] = (candidate_fields, {**candidate,
+            "logical_round_attempt_ids": frozenset((original, target))})
         consumed.add(target)
     return [replaced.get(meta.get('attempt_id'), (fields, meta))
             for fields, meta in rows if meta.get('attempt_id') not in consumed]

@@ -436,6 +436,55 @@ class DispatchBatchTest(unittest.TestCase):
         self.assertEqual(error.exception.reason, "batch-prior-manifest-proof-missing")
         self.assertEqual(self.jobs.read_bytes(), before)
 
+    def test_unfinished_input_discovers_zero_rows_and_register_only_exact_members(self):
+        self.jobs.touch()
+        self.seal_original_input()
+        legs = self.legs()
+        admissions = {leg['node']: SimpleNamespace(
+            budget=SimpleNamespace(next_round=1), current_attempt_ids=frozenset())
+            for leg in legs}
+        def read():
+            with mock.patch.dict(os.environ, {'AGENT_DISPATCH_SELF_SLUG': 'owner'}):
+                return BATCH.unfinished_batch_input(self.jobs, self.route,
+                    self.route['nodes'], 'plan', 'att-parent-fixture', BATCH.DEFAULT_PROMPT,
+                    admissions, route_file=self.route_path)
+        payload = read()
+        self.assertIsNotNone(payload)
+        before = self.jobs.read_bytes()
+        for admission in admissions.values():
+            admission.budget.next_round = 2
+        self.assertIsNone(read(), 'older generation cannot bind a new admission')
+        self.assertEqual(self.jobs.read_bytes(), before)
+        for admission in admissions.values():
+            admission.budget.next_round = 1
+        for leg in legs:
+            self.write_existing(leg, claimed='0', live_identity=False)
+            admissions[leg['node']].current_attempt_ids = frozenset((leg['attempt_id'],))
+        rows = self.jobs.read_bytes()
+        self.assertEqual(read(), payload)
+        self.assertEqual(self.jobs.read_bytes(), rows)
+        from recovery_history import batch_input_path
+        path = batch_input_path(self.jobs, payload['manifest_digest'])
+        for field, value in (('route', str(self.base / 'foreign.json')), ('parent', 'foreign-owner')):
+            changed = dict(payload, options=dict(payload['options'], **{field: value}))
+            path.write_text(json.dumps(changed))
+            with self.assertRaises(BATCH.BatchError) as error:
+                read()
+            self.assertEqual(error.exception.reason, 'replacement-batch-source-drift')
+            path.write_text(json.dumps(payload))
+        for field in ('options', 'manifest'):
+            path.write_text(json.dumps(dict(payload, **{field: None})))
+            with self.assertRaises(BATCH.BatchError):
+                read()
+            path.write_text(json.dumps(payload))
+        changed = json.loads(json.dumps(payload))
+        changed['manifest']['members'][0]['route_node'] = 'foreign-node'
+        path.write_text(json.dumps(changed))
+        with self.assertRaises(BATCH.BatchError) as error:
+            read()
+        self.assertEqual(error.exception.reason, 'replacement-batch-source-drift')
+        path.write_text(json.dumps(payload))
+
     def test_sd160_capacity_ratios_choose_healthy_same_harness_personas(self):
         for strategy in ("balanced", "capacity-aware"):
             for headroom in (71, 77):
@@ -946,7 +995,7 @@ class DispatchBatchTest(unittest.TestCase):
             "changed-display", "changed-owner-label", "att-parent-fixture", "codex", 1,
             review_round=2))
 
-    def _same_owner_next_review_round(self, prompt, parent_harness):
+    def _same_owner_next_review_round(self, prompt, parent_harness, *, notes=None, one_sided_revision=False):
         # Use the lab's actual review kinds/units and derived alternative id.
         # Only launch/process boundaries are faked; admission, both sealed
         # inputs, attempt matching and the round census run for real.
@@ -954,7 +1003,8 @@ class DispatchBatchTest(unittest.TestCase):
         self._configure_lab_review()
         assignments = self.common_patches()[1]
         for index, leg in enumerate(self.legs()):
-            self.write_existing(leg, status="done", note="completed-review-blocking", append=index != 0)
+            self.write_existing(leg, status="done",
+                note=notes[index] if notes else "completed-review-blocking", append=index != 0)
         self.seal_original_input()
         original_rows = self.jobs.read_bytes()
         source = BATCH.prior_batch_input(self.jobs, self.route, self.route["nodes"],
@@ -970,6 +1020,11 @@ class DispatchBatchTest(unittest.TestCase):
                 communicate=lambda: (success_receipt(command), ""), poll=lambda: 0)
 
         with contextlib.ExitStack() as stack:
+            if one_sided_revision:
+                # The canonical reader's proved supersession affects one leg;
+                # batch must still apply its existing full-group round policy.
+                stack.enter_context(mock.patch.object(BATCH.DISPATCH_NODE.ROUTE,
+                    "_dependency_revisions", return_value=[{"supersedes": [self.legs()[0]["attempt_id"]]}]))
             for name, value in (("load_route", self.route), ("resolve_agent_home", self.base),
                                 ("resolve_global_registry", SimpleNamespace(path=self.jobs)),
                                 ("assign_harnesses", (assignments, "cross-harness", {})),
@@ -1042,6 +1097,26 @@ class DispatchBatchTest(unittest.TestCase):
              mock.patch.object(BATCH, "completion_attempt_readiness", return_value=SimpleNamespace(state="ready")):
             self._assert_duplicate_batch_state(completed=True)
 
+    def _assert_exhausted_replay_readiness(self, state, reason, code):
+        # Admission observed settled rows; exact readiness subsequently changes.
+        self._configure_lab_review()
+        self.route["continuation_budget"] = {"review_round_cap": 1}
+        import route_identity
+        self.route["route_hash"] = route_identity.route_hash(self.route)
+        with mock.patch.object(BATCH, "completion_marker_is_current", return_value=state != "unsettled"), \
+             mock.patch.object(BATCH, "completion_attempt_readiness",
+                 return_value=SimpleNamespace(state=state, reason="attempt-descendant-" + state)):
+            self._assert_duplicate_batch_state(completed=True, refusal=(code, reason))
+
+    def test_exhausted_replay_preserves_draining_refusal(self):
+        self._assert_exhausted_replay_readiness("draining", "prior-attempt-still-live", 78)
+
+    def test_exhausted_replay_preserves_unverifiable_refusal(self):
+        self._assert_exhausted_replay_readiness("unverifiable", "prior-attempt-unverifiable", 78)
+
+    def test_exhausted_replay_preserves_unsettled_refusal(self):
+        self._assert_exhausted_replay_readiness("unsettled", "round-unsettled", 65)
+
     def test_same_owner_opens_next_review_round_with_changed_prompt(self):
         self._same_owner_next_review_round("closure check after fixes", "codex")
 
@@ -1050,6 +1125,14 @@ class DispatchBatchTest(unittest.TestCase):
 
     def test_same_owner_next_review_round_works_for_opencode_parent(self):
         self._same_owner_next_review_round("closure check after fixes", "opencode")
+
+    def test_mixed_pass_fail_opens_the_group_without_reclassifying_pass(self):
+        self._same_owner_next_review_round("mixed verdict correction", "codex",
+            notes=("completed-marker", "completed-review-blocking"))
+
+    def test_one_sided_supersession_opens_a_full_group_generation(self):
+        self._same_owner_next_review_round("one superseded peer", "claude",
+            notes=("completed-marker", "completed-marker"), one_sided_revision=True)
 
     def test_group_requires_two_to_four_depth_two_nodes_with_same_dependencies(self):
         self.assertEqual(
@@ -2666,6 +2749,19 @@ class DispatchBatchTest(unittest.TestCase):
             BATCH._record_failed_legs(self.route, [result], self.base)
         self.assertEqual(record.call_args.kwargs["detail"], detail)
 
+    def test_guard_time_cleanup_diagnostics_survive_failed_wrapper(self):
+        diagnostic = json.dumps({"attempt_id": "att-prior", "scope": "guard-time",
+            "process_group": {"state": "empty", "reason": ""},
+            "attempt_tagged_descendants": {"state": "unverifiable", "reason": "procfs-environ-denied"}})
+        result = BATCH.wrapper_result(
+            {"node": "impl-review", "adapter": "codex", "attempt_id": "att-new"},
+            SimpleNamespace(returncode=73),
+            "check=failed\nreason=prior-attempt-unverifiable\nchild_spawned=0\n",
+            "cleanup_diagnostics=" + diagnostic + "\n")
+        self.assertEqual(result["exit_code"], 73)
+        self.assertEqual(result["reason"], "prior-attempt-unverifiable")
+        self.assertEqual([json.loads(item) for item in result["cleanup_diagnostics"]], [json.loads(diagnostic)])
+
     def test_duplicate_batch_state_does_not_claim_concurrent_launch(self):
         self._assert_duplicate_batch_state()
 
@@ -2674,7 +2770,7 @@ class DispatchBatchTest(unittest.TestCase):
              mock.patch.object(BATCH, "completion_attempt_readiness", return_value=SimpleNamespace(state="ready")):
             self._assert_duplicate_batch_state(completed=True)
 
-    def _assert_duplicate_batch_state(self, *, completed=False):
+    def _assert_duplicate_batch_state(self, *, completed=False, refusal=None):
         stack, assignments = self.common_patches()
         output = io.StringIO()
         for leg in self.legs(assignments):
@@ -2685,6 +2781,7 @@ class DispatchBatchTest(unittest.TestCase):
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 marker.write_text(json.dumps({"attempt_id": leg["attempt_id"]}))
 
+        original_rows = self.jobs.read_bytes()
         with stack:
             stack.enter_context(mock.patch("dispatch_capacity_evidence.active_limits", side_effect=AssertionError("live replay spends no quota")))
             stack.enter_context(mock.patch.object(BATCH.DISPATCH_NODE, "resolve_checked_tuple", side_effect=resolve_side_effect))
@@ -2707,6 +2804,15 @@ class DispatchBatchTest(unittest.TestCase):
             }))
             with contextlib.redirect_stdout(output):
                 rc = BATCH.main(self.argv())
+        self.assertEqual(self.jobs.read_bytes(), original_rows)
+        reserve.assert_not_called()
+        popen.assert_not_called()
+        if refusal:
+            self.assertEqual(rc, refusal[0], output.getvalue())
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["reason"], refusal[1])
+            self.assertEqual((receipt["admitted"], receipt["spawned"]), (0, 0))
+            return
         self.assertEqual(rc, 0)
         receipt = json.loads(output.getvalue())
         self.assertEqual(receipt["state"], "idempotent-existing")
@@ -4075,10 +4181,11 @@ class GroupLegReviewRoundCapTest(unittest.TestCase):
                         node_id = inner_argv[inner_argv.index("--route-node") + 1]
                         captured[node_id] = list(inner_argv)
                         recovery_context[node_id] = kw["env"].get("AGENT_DISPATCH_RETRY_BRIEF", "")
-                    return subprocess.CompletedProcess(inner_argv, 0, stdout="", stderr="")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="", received_signal=None)
 
                 with mock.patch.dict(os.environ, leg_env, clear=True), \
                      mock.patch.object(sys, "argv", ["dispatch-node.py"] + command[2:]), \
+                     mock.patch.object(BATCH.DISPATCH_NODE, "run_forwarding_termination", side_effect=fake_inner_run), \
                      mock.patch.object(BATCH.DISPATCH_NODE.subprocess, "run", side_effect=fake_inner_run):
                     try:
                         BATCH.DISPATCH_NODE.main()

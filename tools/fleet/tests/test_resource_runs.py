@@ -61,7 +61,8 @@ class ResourceRunFleetTest(unittest.TestCase):
     def test_top_level_lab_summary_is_absent_in_both_views(self):
         rows = [self.row("gpu-%d" % i) for i in range(5)]
         rows += [self.row("old", "exited"), self.row("stale", "stale")]
-        with mock.patch.object(render, "_COMPUTE_HOSTS", None):
+        with mock.patch.object(render, "_COMPUTE_HOSTS", None), \
+                mock.patch.object(render.time, "time", return_value=1722744000):
             for process in (False, True):
                 render.set_process_view(process)
                 for show_all in (False, True):

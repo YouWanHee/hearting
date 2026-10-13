@@ -371,6 +371,11 @@ class RoundAdmission:
  reviewed_input: object = None
  prior_attempt_ids: frozenset[str] = frozenset()
  gate_unmet: bool = False
+ # Logical representatives remain the compatibility census above. Physical
+ # membership is forwarded by the canonical replacement projection only.
+ physical_attempt_ids: frozenset[str] = frozenset()
+ current_attempt_ids: frozenset[str] = frozenset()
+ requires_next_round: bool = False
 
 
 def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=True):
@@ -480,6 +485,20 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
       if item.get("node_id")==node["id"]
       and item.get("evidence")=={k:reviewed_input[k] for k in ("path","sha256")})
  budget = REVIEW_ROUND_CAP.round_budget(route, node, classified_rows, revisions=dependency_revisions)
+ def physical_members(meta):
+  members = meta.get("logical_round_attempt_ids")
+  # Raw registry metadata is strings. Only the ephemeral projection's typed
+  # set carries canonical membership authority; a stored lookalike cannot
+  # exclude another physical row.
+  return members if isinstance(members, frozenset) else frozenset(
+      (meta["attempt_id"],) if meta.get("attempt_id") else ())
+ unmet = REVIEW_ROUND_CAP.gate_unmet(classified_rows,
+      node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test"))
+ last_verdict_id = next((meta.get("attempt_id") for status,meta in reversed(classified_rows)
+     if REVIEW_ROUND_CAP.classify_round_row(status,meta,
+         worker_type=meta.get("worker_type") or node.get("worker_type") or "review") == "verdict"), None)
+ superseded = bool(last_verdict_id and any(
+     last_verdict_id in (revision.get("supersedes") or ()) for revision in dependency_revisions))
  return RoundAdmission(
   budget=budget,
   auto_revisions=auto_revisions if record_auto_revisions else (),
@@ -488,8 +507,12 @@ def admit_round(route, node, jobs, *, owner_attempt_id=None, exclude_slug=None, 
   ),
   reviewed_input=reviewed_input,
   prior_attempt_ids=frozenset(meta["attempt_id"] for _cols,meta in rows if meta.get("attempt_id")),
-  gate_unmet=REVIEW_ROUND_CAP.gate_unmet(classified_rows,
-      node.get("worker_type") or ("review" if node.get("kind")=="review-worker" else "test")),
+  gate_unmet=unmet,
+  physical_attempt_ids=frozenset().union(*(physical_members(meta) for _cols,meta in rows)),
+  current_attempt_ids=frozenset(physical_members(rows[-1][1])) if rows else frozenset(),
+  # Supersession is selection authority even after its allowance is spent:
+  # exhausted fresh work must not be mistaken for a current exact replay.
+  requires_next_round=unmet or superseded or budget.closure_check_used,
  )
 
 

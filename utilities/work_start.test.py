@@ -2510,8 +2510,9 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         self.owner.update(self.d.parse_registry_metadata(replacement.seal_launch_input(args, "codex", "Continue unchanged deploy")))
         self.write_owner(self.owner, "running")
         owner_input.initialize_owner_input(self.jobs, "att-owner", "app-server-turn")
-        self.owner.update(note="dead-worker-blocked", failure_class="blocked", launch_outcome="reaped-before-publish")
-        self.write_owner(self.owner, "done")
+        self.assertTrue(self.d.close_attempt_row(self.jobs,"att-owner","dead-worker-blocked",
+                                                evidence={"failure_class":"blocked"}))
+        self.owner=self.cr._find_attempt_row_metadata(self.jobs,"att-owner")
         self.answer = self.f.output / "owner-answer.md"; self.answer.write_text("The installed fix supports exact settled self disposition.\n")
         self.request_path = Path(self.f.prepared["request"])
         self.request = json.loads(self.request_path.read_text()); self.request_bytes = self.request_path.read_bytes()
@@ -2531,17 +2532,16 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         evidence = self.f.output / "security.json"
         evidence.write_text(json.dumps({"verdict":"PASS", "findings":[], "gate_met":True}))
         meta = dict(self.f.meta, attempt_id="att-security", route_node=node["id"], log_file=str(self.f.base/"security.jsonl"))
+        # The normal completion writer receives the real settled process
+        # identity, rather than a late identity overwrite without a receipt.
+        child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,
+                               start_new_session=True,env={**os.environ,"AGENT_DISPATCH_ATTEMPT_ID":"att-security"})
+        meta.update(self.d.process_launch_identity(child.pid))
+        child.communicate(timeout=5)
         with self.jobs.open("a") as handle:
             handle.write("\t".join([self.cr.datetime.now(self.cr.timezone.utc).isoformat(), "running", str(self.f.repo), str(self.f.repo), "security",
                                        ",".join(f"{k}={v}" for k,v in meta.items())])+"\n")
         self.cr.complete_node(self.f.route,node,node["id"],evidence,jobs=self.jobs,attempt_id="att-security")
-        child=subprocess.Popen([sys.executable,"-c","import sys;sys.stdin.read()"],stdin=subprocess.PIPE,start_new_session=True)
-        start=self.d.process_start_ticks(child.pid); ns=self.d.process_namespace_identity(child.pid);child.communicate(timeout=5)
-        lines=self.jobs.read_text().splitlines()
-        for i,line in enumerate(lines):
-            if self.d.parse_registry_metadata(line.split("\t")[5]).get("attempt_id")=="att-security":
-                lines[i]+=f",pid={child.pid},pid_start={start},pgid={child.pid},pid_ns={ns},pid_observer_ns={ns}"
-        self.jobs.write_text("\n".join(lines)+"\n")
         self.security_bytes=evidence.read_bytes()
 
     def cli(self, arguments, env):
