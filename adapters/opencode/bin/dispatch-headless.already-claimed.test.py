@@ -25,6 +25,11 @@ NOTE_UNVERIFIED = ("this place cannot see whether the earlier attempt is still r
 
 class AlreadyClaimedTest(unittest.TestCase):
     def setUp(self):
+        import opencode_context_window
+        from fixtures.opencode_native_context import launch_context
+        native = mock.patch.object(opencode_context_window, "prepare_launch_context", side_effect=launch_context)
+        native.start()
+        self.addCleanup(native.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

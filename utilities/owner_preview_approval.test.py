@@ -686,7 +686,7 @@ class OwnerGateReachesAPollingParentTest(PollingParentBase):
         self.assertNotEqual(self.release("proceed", worker=True).returncode, 0)
         self.assertEqual(self.resolution()["status"], "blocked")
         payload = self.release_in_process("proceed")
-        self.assertEqual(payload["owner_continuation"]["state"], "running")
+        self.assertEqual(payload["owner_continuation"]["state"], "running", payload)
         import dispatch_replacement as DR
         self.assertEqual(DR.owner_parked_gate(self.jobs, self.owner)["status"], "proceed")
 

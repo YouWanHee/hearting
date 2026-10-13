@@ -103,6 +103,10 @@ class ForegroundInterruptedCloseTest(unittest.TestCase):
                 mock.patch.object(wrapper, "reconcile_launch_lifecycle", return_value=resolution),
                 mock.patch.object(wrapper, "wait_foreground", side_effect=wait_and_mark),
             ]
+            if harness == "opencode":
+                from fixtures.opencode_native_context import launch_context
+                patches.append(mock.patch.object(wrapper.opencode_context,
+                    "prepare_launch_context", side_effect=launch_context))
             if hasattr(wrapper, "check_runtime_projection"):
                 patches.append(mock.patch.object(wrapper, "check_runtime_projection", return_value=0))
             if hasattr(wrapper, "ensure_runtime_home_projection"):

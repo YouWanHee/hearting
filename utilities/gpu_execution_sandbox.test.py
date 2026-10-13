@@ -73,7 +73,7 @@ class GpuSandboxTest(unittest.TestCase):
                       jobs_path=self.state / "jobs.log", attempt_id="att-gpu", command_attempt_id=None,
                       resolved_completion_delivery="one-shot", report_bundle_root=None, max_continuations=12,
                       route_id=None, nested_headless_network=False, write_scope=None,
-                      resolved_model_settings={"source": "inherit"}, approval="never", execution_access_grant=None)
+                      resolved_model_settings={"source": "inherit", "context_window": "800000"}, approval="never", execution_access_grant=None)
         values.update(changes)
         return argparse.Namespace(**values)
 

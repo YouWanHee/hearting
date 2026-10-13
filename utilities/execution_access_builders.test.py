@@ -138,7 +138,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             parent_harness="codex",
             parent_transport="headless",
             parent_sandbox="workspace-write",
-            resolved_model_settings={"source": "inherit"},
+            resolved_model_settings={"source": "inherit", "context_window": "800000"},
             approval="never",
             execution_access_grant=grant,
         )
@@ -153,7 +153,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             report_bundle_root=None,
             owner_route_binding=None,
             max_continuations=None,
-            resolved_model_settings={"source": "inherit"},
+            resolved_model_settings={"source": "inherit", "context_window": "800000"},
             resolved_permission_posture={
                 "mode": "allowlist",
                 "mode_flag": "acceptEdits",
@@ -164,7 +164,7 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
             execution_access_grant=grant,
         )
 
-    def test_no_request_builders_are_byte_identical_to_base(self) -> None:
+    def test_no_request_builders_keep_base_access_flags_with_common_window(self) -> None:
         prompt = self.root / "prompt.txt"
         log = self.root / "log.jsonl"
         for delivery in ("one-shot", "app-server-supervised"):
@@ -175,6 +175,12 @@ class ExecutionAccessBuilderTest(unittest.TestCase):
                 # Keep every permission/sandbox/path byte pinned to the base.
                 self.assertIn("codex exec --cd", base)
                 base = base.replace("codex exec --cd", "codex exec --ephemeral --cd", 1)
+            # The launch budget changed independently of access grants. Remove
+            # exactly its new argument pair; all other bytes stay pinned.
+            window_flag = (" -c model_context_window=800000" if delivery == "one-shot"
+                           else " --model-context-window 800000")
+            self.assertEqual(current.count(window_flag), 1)
+            current = current.replace(window_flag, "", 1)
             self.assertEqual(base, current)
         for delivery in ("one-shot", "session-resume-supervised"):
             current = self.claude.shell_command(self.claude_args(delivery), prompt, log)

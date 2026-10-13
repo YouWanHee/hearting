@@ -24,7 +24,7 @@ def args_for(worker_type="stage", **overrides):
         intensity="standard", completion_delivery="auto", approval="never",
         sandbox="workspace-write", nested_headless_network=False,
         resolved_model_settings={"source": "resolved", "model": "model-test",
-                                "reasoning": "medium"},
+                                "reasoning": "medium", "context_window": "800000"},
         execution_access_grant=argparse.Namespace(
             additional_writable_roots=(Path("/tmp/stage/access-root"),)),
         agent_home=Path("/tmp/stage/home"), max_continuations=None,
@@ -75,7 +75,7 @@ class StageTelemetryTransportTest(unittest.TestCase):
         self.assertNotIn("codex-exec", command)
 
     def test_raw_unavailable_fallback_remains_exec_json_and_review_uses_same_probe(self):
-        args = args_for(worker_type="review", resolved_model_settings={"source": "inherit"},
+        args = args_for(worker_type="review", resolved_model_settings={"source": "inherit", "context_window": "800000"},
                         worker_runtime_env={"HEARTING_CODEX_WORKER_OVERRIDES": '["features.apps=false","features.multi_agent=false"]'})
         with mock.patch.object(WH, "codex_app_server_available", return_value=False) as probe:
             self.assertEqual(WH.resolve_completion_delivery(args), "one-shot")

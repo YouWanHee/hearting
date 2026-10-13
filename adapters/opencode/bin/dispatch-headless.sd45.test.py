@@ -521,6 +521,10 @@ class OpenCodePermissionDefault(unittest.TestCase):
 
 class ForegroundReviewStartPathTest(unittest.TestCase):
     def setUp(self):
+        from fixtures.opencode_native_context import launch_context
+        native = mock.patch.object(WH.opencode_context, "prepare_launch_context", side_effect=launch_context)
+        native.start()
+        self.addCleanup(native.stop)
         # This suite exercises admission and watcher ordering, not a user's
         # installed runtime. Keep that external readiness boundary isolated.
         projection = mock.patch.object(WH, "check_runtime_projection", return_value=0)

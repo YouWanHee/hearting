@@ -277,7 +277,7 @@ class PrimaryCommitBuilderTest(unittest.TestCase):
             agent_home=str(self.base / "home"), worker_type=worker_type, write_scope=None,
             sandbox="workspace-write", launch_lifecycle="detached", parent_harness="codex",
             parent_transport="headless", parent_sandbox="workspace-write",
-            resolved_model_settings={"source": "inherit"}, approval="never",
+            resolved_model_settings={"source": "inherit", "context_window": "800000"}, approval="never",
             execution_access_grant=None, state_root=None)
         values.update(extra)
         return argparse.Namespace(**values)
