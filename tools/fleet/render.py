@@ -4368,14 +4368,18 @@ def _peer_inline_options(session, tag_by_key=None):
                             "from_harness")
         sid = entry.get("to_session_id" if direction == "sent" else
                         "from_session_id")
-        return (str(harness or "").lower(), sid) if isinstance(sid, str) and sid else None
+        harness = str(harness or "").lower()
+        if harness not in {"claude", "codex", "opencode"} or not isinstance(sid, str) or not sid:
+            return None
+        return harness, sid
 
     peer_ids = [identity for identity in (key(sent, "sent"), key(recv, "recv"))
                 if identity is not None]
 
     if not sent and not recv:
         return []
-    same = bool(sent and recv and key(sent, "sent") == key(recv, "recv"))
+    sent_key = key(sent, "sent")
+    same = sent_key is not None and sent_key == key(recv, "recv")
     if same:
         endpoint_segs, _minimal = endpoint(sent, "sent", peer_ids)
         full = [(" ↔ ", None)] + endpoint_segs
@@ -9577,8 +9581,8 @@ def _handle_mouse_event(mx, my, bstate):
 class _CursesInput:
     """Read keypad-off curses bytes and decode complete keys and SGR mouse packets.
 
-    ncurses' keypad mouse decoder can wait indefinitely after an SGR prefix. Reading one
-    byte per frame leaves that decision here, so an unfinished packet cannot stop refresh.
+    ncurses' keypad mouse decoder can wait indefinitely after an SGR prefix. Decoding
+    bounded available bytes here lets an unfinished packet yield without delaying refresh.
     """
 
     _SGR_PREFIX = b"\x1b[<"
@@ -9753,10 +9757,31 @@ class _CursesInput:
             return 27, None
         return self._fallback_bytes(raw)
 
-    def read(self, stdscr):
+    def read(self, stdscr, *, timeout_ms=100):
+        result = self._read_one(stdscr)
+        if result[0] != self.curses.ERR or not (self.pending or self.discarding_sgr):
+            return result
+        # A complete arrow already in curses' buffer should not pay for a full
+        # render after each byte. Never wait for a missing tail or consume a
+        # second complete action before its predecessor has been dispatched.
+        try:
+            stdscr.timeout(0)
+            for _ in range(self._MAX_SEQUENCE):
+                code = stdscr.getch()
+                if code == self.curses.ERR:
+                    break
+                result = self._read_one(stdscr, code)
+                if result[0] != self.curses.ERR or not (self.pending or self.discarding_sgr):
+                    break
+            return result
+        finally:
+            stdscr.timeout(timeout_ms)
+
+    def _read_one(self, stdscr, code=None):
         if self.ready:
             return self._ready_event()
-        code = stdscr.getch()
+        if code is None:
+            code = stdscr.getch()
         now = time.monotonic()
         if code == self.curses.ERR:
             return self._expire(now)
@@ -10336,9 +10361,12 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             # Wake at the next 0.1s spinner frame while staying key-responsive. Collection
             # is independent, so a slow ps/dispatch/git call cannot pause this cadence.
             _nb = (int(time.time() * 10) + 1) / 10.0
-            stdscr.timeout(max(20, min(100, int((_nb - time.time()) * 1000) + 1)))
-            ch, mouse_event = (input_reader.read(stdscr) if input_reader is not None
-                               else (stdscr.getch(), None))
+            timeout_ms = max(20, min(100, int((_nb - time.time()) * 1000) + 1))
+            stdscr.timeout(timeout_ms)
+            if input_reader is not None:
+                ch, mouse_event = input_reader.read(stdscr, timeout_ms=timeout_ms)
+            else:
+                ch, mouse_event = stdscr.getch(), None
             now = time.time()
             now_mono = time.monotonic()
             pump.request_due(now=now_mono)

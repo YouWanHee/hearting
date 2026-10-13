@@ -70,6 +70,25 @@ class PeerInlineTest(unittest.TestCase):
                 self.assertIn("←", identity)
                 self.assertNotIn("↔", identity)
 
+    def test_unproven_endpoints_keep_separate_directions(self):
+        cases = (
+            ({"to_harness": "claude"}, {"from_harness": "claude"}),
+            ({"to_session_id": self.peer_id}, {"from_session_id": self.peer_id}),
+            ({"to_harness": "unknown", "to_session_id": self.peer_id},
+             {"from_harness": "unknown", "from_session_id": self.peer_id}),
+            ({"kind": "steer"}, {"kind": "report"}),
+        )
+        for sent, received in cases:
+            with self.subTest(sent=sent, received=received):
+                row = _session(sent, received)
+                for option in render._peer_inline_options(row, self.tags):
+                    text = _plain(option)
+                    self.assertIn("→", text)
+                    self.assertIn("←", text)
+                    self.assertNotIn("↔", text)
+                self.assertEqual(row.to_dict()["peer_last_sent"], sent)
+                self.assertEqual(row.to_dict()["peer_last_recv"], received)
+
     def test_colliding_tags_are_qualified_and_disambiguated(self):
         sent_id, received_id = "peerAAAA1", "peerBBBB2"
         row = _session({"to_harness": "claude", "to_session_id": sent_id},

@@ -1871,7 +1871,8 @@ the existing session L1/L2: a short on-board tag (or harness-qualified short SID
 is shown with `→`/`←`, and opposite directions combine as `↔` only for the same
 exact `(harness, full session_id)`. No peer row is added; names, repository, kind,
 age and full identity remain available in the existing JSON/ledger detail. Narrow
-layouts preserve both directions. This communication display does not change the
+layouts preserve both directions. Missing endpoint identity never combines two
+directions into a same-peer arrow. This communication display does not change the
 role decision below. The pane pid probe
 (`herdr pane process-info`) is what places an OpenCode session in its herdr pane. The
 steward marker under `<dispatch-state-root>/peer-steward/` is a **role** flag, not a

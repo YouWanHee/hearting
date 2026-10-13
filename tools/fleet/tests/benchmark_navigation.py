@@ -351,6 +351,7 @@ def _pty_child(source_tree, fixture_path, telemetry_fd, width, mode):
     counts = {"build": 0, "project_of": 0, "tag_resolver": 0}
     orig_build, orig_draw = render._build_lines, render._draw
     orig_read = render._CursesInput.read
+    orig_flush = curses.doupdate
     orig_select, orig_base = render._handle_select_key, render._handle_base_key
     from fleet import details, gitinfo, model
     orig_merge = details.merge
@@ -382,9 +383,9 @@ def _pty_child(source_tree, fixture_path, telemetry_fd, width, mode):
         current["merge"] = {"start_ns": start, "end_ns": time.perf_counter_ns()}
         return result
 
-    def read(reader, stdscr):
+    def read(reader, stdscr, **kwargs):
         wall0, thread0 = time.perf_counter_ns(), time.thread_time_ns()
-        ch, mouse = orig_read(reader, stdscr)
+        ch, mouse = orig_read(reader, stdscr, **kwargs)
         if ch != curses.ERR and ch != getattr(curses, "KEY_RESIZE", -9999):
             current["event_id"] += 1
             current["record"] = {"event_id": current["event_id"], "key": ch,
@@ -426,6 +427,7 @@ def _pty_child(source_tree, fixture_path, telemetry_fd, width, mode):
             record["draw_process_cpu_ns"] = time.process_time_ns()
             record["draw_ns"] = record["draw_end_ns"] - record["decoded_ns"]
             record["build_ns"] = current["last_build_ns"]
+            record["flush_ns"] = current.get("last_flush_ns", 0)
             record["selection_mode"] = bool(render._SELECT_MODE)
             record["cursor"] = render._CURSOR_ID
             record["offset"] = render._OFFSET
@@ -435,6 +437,14 @@ def _pty_child(source_tree, fixture_path, telemetry_fd, width, mode):
             _emit(telemetry_fd, {"kind": "painted", **record})
         return result
 
+    def flush():
+        start = time.perf_counter_ns()
+        try:
+            return orig_flush()
+        finally:
+            current["last_flush_ns"] = time.perf_counter_ns() - start
+
+    curses.doupdate = flush
     render.project_of, model.project_of = project, model_project
     render._resolve_session_tag = tag
     render._build_lines, render._draw = build, draw
@@ -548,8 +558,10 @@ def _pty_run(source_tree, fixture_path, evidence_dir, width, mode, replicate, ke
                 raise TimeoutError("PTY child did not start")
         if mode == "selection":
             send(b"s", warmup=True)
-        key_bytes = (b"j" if mode == "selection" else b"\x1b[B")
-        other = (b"k" if mode == "selection" else b"\x1b[A")
+        # Exercise the arrow decoder in selection mode too, so its latency
+        # includes the same escape-sequence path as the user's navigation.
+        key_bytes = b"\x1b[B"
+        other = b"\x1b[A"
         for i in range(10):
             send(key_bytes if i % 2 == 0 else other, warmup=True)
         measured = []
@@ -589,6 +601,8 @@ def _pty_run(source_tree, fixture_path, evidence_dir, width, mode, replicate, ke
                     row.get("selection_ns", 0) for row in measured) / 1e6,
                 "mean_child_build_ms": statistics.mean(
                     row.get("build_ns", 0) for row in measured) / 1e6,
+                "mean_child_flush_ms": statistics.mean(
+                    row.get("flush_ns", 0) for row in measured) / 1e6,
                 "mean_child_draw_after_decode_ms": statistics.mean(
                     row.get("draw_ns", 0) for row in measured) / 1e6,
                 "parent_raw_pty_bytes": len(transcript),

@@ -242,6 +242,10 @@ Terminal input decoding never waits inside the frame loop for the rest of a key
 or mouse packet. Incomplete sequences are consumed incrementally, and only
 complete valid events are dispatched; the mouse default, explicit opt-out,
 keyboard behavior, and click safety remain intact.
+Already buffered bytes of one incomplete event are drained with bounded,
+nonblocking reads before another full render. Missing bytes still yield to the
+frame loop, and decoding stops at the first complete event so queued actions
+retain their order and confirmation boundary.
 Once an SGR mouse prefix is recognized, malformed contents are consumed through
 their terminator or a short internal expiry and are never replayed as commands.
 Unsupported button, modifier, motion, and wheel combinations are inert. Pending,
