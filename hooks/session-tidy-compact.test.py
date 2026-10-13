@@ -22,6 +22,32 @@ sys.path.insert(0, str(ROOT / "utilities"))
 import session_tidy as st  # noqa: E402
 import session_tidy_runner as runner  # noqa: E402
 
+# Markers a dispatched test runner inherits; a main-session case must not see them.
+WORKER_MARKERS = ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                  "AGENT_DISPATCH_STAGE_AUTHORITY", "AGENT_DISPATCH_SUBSESSION_ID",
+                  "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "MEM_DISTILL")
+_NODE_STDIN_EOF = None
+
+
+def node_stdin_reaches_eof() -> bool:
+    """Whether Node's spawnSync ``input`` reaches the child as EOF here.
+
+    Some tool sandboxes deliver the bytes but never close the child's stdin, so any
+    helper that reads its payload to the end waits until the spawn timeout. The plugin
+    fixtures below need a normal host to say anything about the plugin.
+    """
+    global _NODE_STDIN_EOF
+    if _NODE_STDIN_EOF is None:
+        probe = ('const r = require("node:child_process").spawnSync("cat", [], '
+                 '{ input: "x", encoding: "utf8", timeout: 2000, killSignal: "SIGKILL" }); '
+                 'process.stdout.write(r.status === 0 && r.stdout === "x" ? "eof" : "hang")')
+        try:
+            result = subprocess.run(["node", "-e", probe], text=True, capture_output=True, timeout=10)
+            _NODE_STDIN_EOF = result.stdout == "eof"
+        except (OSError, subprocess.SubprocessError):
+            _NODE_STDIN_EOF = False
+    return _NODE_STDIN_EOF
+
 
 class CompactHookTest(unittest.TestCase):
     def setUp(self):
@@ -35,6 +61,8 @@ class CompactHookTest(unittest.TestCase):
         envpatch = mock.patch.dict("os.environ", self.env)
         envpatch.start()
         self.addCleanup(envpatch.stop)
+        for key in WORKER_MARKERS:
+            os.environ.pop(key, None)
         self.seat = st.Seat("pane", "fixture-seat", pane="w1:p1", harness="claude", project_key="fixture")
         self.resolve = mock.patch.object(st, "resolve_seat", return_value=self.seat)
         self.resolve.start()
@@ -309,6 +337,8 @@ class CompactHookTest(unittest.TestCase):
         """Run the real plugin against a fake v1 client; a python3 shim records every helper call."""
         if not shutil.which("node"):
             self.skipTest("node is not installed")
+        if not node_stdin_reaches_eof():
+            self.skipTest("node spawnSync input never reaches EOF in this sandbox; run on a normal host")
         fake_bin = self.root / f"bin-{scenario}"
         fake_bin.mkdir()
         calls = self.root / f"calls-{scenario}.jsonl"
