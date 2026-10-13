@@ -152,6 +152,42 @@ class ModelContextLaunchTest(unittest.TestCase):
                     cwd="/tmp", environ={"OPENCODE_CONFIG_CONTENT": "{}"}, command="opencode",
                 )
 
+    def test_configured_custom_model_needs_no_standard_catalog_entry(self):
+        configured = {
+            "model": "local/custom",
+            "permission": {"*": "deny"},
+            "provider": {"local": {
+                "options": {"baseURL": "https://custom.invalid"},
+                "models": {"custom": {"limit": {
+                    "context": 64000, "input": 48000, "output": 8192,
+                }}},
+            }},
+        }
+        with mock.patch.object(context, "_native_limits", side_effect=
+                context.OpenCodeContextError("no standard model record")), mock.patch.object(
+                context, "_resolved_config", side_effect=[configured, configured]):
+            launch = context.prepare_launch_context(
+                model="local/custom", context_window="800000",
+                config_content=json.dumps(configured), cwd="/tmp", environ={},
+            )
+        self.assertEqual(launch["catalog_limits"], {
+            "context": None, "input": None, "output": None,
+        })
+        self.assertEqual(launch["applied_limits"], {
+            "context": 64000, "input": 48000, "output": 8192,
+        })
+        self.assertEqual(json.loads(launch["config_content"]), configured)
+
+    def test_missing_catalog_and_native_context_remain_unknown(self):
+        with mock.patch.object(context, "_native_limits", side_effect=
+                context.OpenCodeContextError("no standard model record")), mock.patch.object(
+                context, "_resolved_config", return_value={"model": "local/custom"}):
+            with self.assertRaisesRegex(context.OpenCodeContextError, "no standard model record"):
+                context.prepare_launch_context(
+                    model="local/custom", context_window="800000",
+                    config_content="{}", cwd="/tmp", environ={},
+                )
+
     def test_installed_opencode_resolves_and_consumes_merged_limits_without_a_model_call(self):
         executable = shutil.which("opencode") or "/home/Uihyeop/.opencode/bin/opencode"
         if not Path(executable).is_file():
@@ -236,6 +272,36 @@ class ModelContextLaunchTest(unittest.TestCase):
             if applied["input"] is not None:
                 self.assertEqual(effective_record["limit"]["input"], applied["input"])
             self.assertEqual(effective_record["limit"]["output"], applied["output"])
+
+            custom = {
+                "model": "local/custom", "plugin": [], "permission": {"*": "deny"},
+                "provider": {"local": {
+                    "npm": "@ai-sdk/openai-compatible", "name": "Local fixture",
+                    "options": {"baseURL": "http://127.0.0.1:9/v1"},
+                    "models": {"custom": {"name": "Custom fixture", "limit": {
+                        "context": 64000, "input": 48000, "output": 8192,
+                    }}},
+                }},
+            }
+            custom_launch = context.prepare_launch_context(
+                model="local/custom", context_window="800000",
+                config_content=json.dumps(custom), cwd=str(root), environ=env,
+                command=executable,
+            )
+            self.assertIsNone(custom_launch["catalog_limits"]["context"])
+            self.assertEqual(custom_launch["final_limits"], {
+                "context": 64000, "input": 48000, "output": 8192,
+            })
+            custom_listed = subprocess.run(
+                [executable, "models", "local", "--verbose"], cwd=root,
+                env={**env, "OPENCODE_CONFIG_CONTENT": custom_launch["config_content"]},
+                text=True, capture_output=True, timeout=30, check=False,
+            )
+            self.assertEqual(custom_listed.returncode, 0, custom_listed.stderr)
+            custom_record = next(item for item in context._json_objects(custom_listed.stdout)
+                                 if item.get("providerID") == "local" and item.get("id") == "custom")
+            self.assertEqual(custom_record["limit"]["context"], 64000)
+            self.assertEqual(custom_record["limit"]["input"], 48000)
 
 
 if __name__ == "__main__":

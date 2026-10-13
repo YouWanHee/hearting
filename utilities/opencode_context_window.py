@@ -239,8 +239,15 @@ def prepare_launch_context(*, model: str, context_window: str | int,
     selected_model = before_config.get("model") if model == "inherit" else model
     if not isinstance(selected_model, str) or selected_model.count("/") < 1:
         raise OpenCodeContextError("selected OpenCode model is not declared by resolved native config")
-    catalog_limits = _native_limits(selected_model, env=env)
     configured_limits = _model_limits(before_config, selected_model)
+    try:
+        catalog_limits = _native_limits(selected_model, env=env)
+    except OpenCodeContextError:
+        # Native custom models need no models.dev record. Their existing
+        # context declaration is already the consumer's operating limit.
+        if configured_limits["context"] is None:
+            raise
+        catalog_limits = {"context": None, "input": None, "output": None}
     limits = _minimum_limits(catalog_limits, configured_limits)
     updated, applied = apply_context_override(config_content, selected_model, context_window, limits)
     final_env = {**env, "OPENCODE_CONFIG_CONTENT": updated}
