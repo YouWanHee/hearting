@@ -692,6 +692,8 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         pass
 
     observations["jobs"] = _observation_health(job_key, "jobs", job_error)
+    from ..display_snapshot import build as build_display_snapshot
+    display_snapshot = build_display_snapshot(sessions, jobs, resource_jobs)
     snapshot = LiveSnapshot(
         sessions=sessions, jobs=jobs, resources=resource_jobs,
         usage_snapshots=usage_snapshots, node_evidence=node_evidence,
@@ -699,6 +701,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
         malformed=malformed,
         resource_diagnostics=copy.deepcopy(resource_diagnostics),
         observations=observations, tag_metadata=copy.deepcopy(tag_metadata),
+        display_snapshot=display_snapshot,
     )
     if not sessions and not jobs and node_evidence:
         from ..projection import terminal_route_entities

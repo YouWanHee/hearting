@@ -409,6 +409,15 @@ a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
 
+For a native Codex client/server session, the ordinary lifecycle must carry the
+selected current thread's authoritative receipt to its exact frontend process
+and pane through the existing hook/metadata path. A thread's `sessionId` is its
+tree root, not its current thread identity; a fork can therefore share a root
+with another current thread. Do not bind a pane from cwd, title, inherited pane
+environment, shared-server ancestry, or the tree root alone. Keep PID/start and
+current-selection checks, and reject registered workers from foreground pane
+ownership.
+
 For an unproven background caller, default `peer-steward start` locates the
 inherited pane's workspace by its live foreground directory in the caller's
 repository (linked worktrees included). It reuses an observed empty shell or
@@ -1857,8 +1866,13 @@ agent start|prompt|read|wait`), because `ListAgents` never surfaces a Codex sess
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for
 OpenCode) and `from.name` (the sender's registry name, Claude
-only today). Fleet joins sent/recv counts and the `← <name> · kind · age` subtitle on the
-exact session id, so a child row shows its steward on every harness; the pane pid probe
+only today). Fleet keeps sent/recv counts and exact directional peer identity in
+the existing session L1/L2: a short on-board tag (or harness-qualified short SID)
+is shown with `→`/`←`, and opposite directions combine as `↔` only for the same
+exact `(harness, full session_id)`. No peer row is added; names, repository, kind,
+age and full identity remain available in the existing JSON/ledger detail. Narrow
+layouts preserve both directions. This communication display does not change the
+role decision below. The pane pid probe
 (`herdr pane process-info`) is what places an OpenCode session in its herdr pane. The
 steward marker under `<dispatch-state-root>/peer-steward/` is a **role** flag, not a
 side effect of talking: it is raised only by `peer-steward.py
