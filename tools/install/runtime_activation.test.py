@@ -1097,7 +1097,14 @@ class CodexIdentityConfigTest(unittest.TestCase):
                 self.assertEqual(bool(result["conflicts"]), expected_conflict)
                 if expected_conflict:
                     self.assertEqual(result["conflicts"], ["features.default_mode_request_user_input"])
-                    self.assertEqual(config.read_text(encoding="utf-8"), original)
+                    content = config.read_bytes()
+                    self.assertTrue(content.startswith(original.encode("utf-8")))
+                    self.assertIn(self.BEGIN.encode("utf-8"), content)
+                    import tomllib
+                    parsed = tomllib.loads(content.decode("utf-8"))
+                    self.assertEqual(parsed["features"]["default_mode_request_user_input"],
+                                     tomllib.loads(original)["features"]["default_mode_request_user_input"])
+                    self.assertIsNone(result["managed_config"]["feature"])
                 else:
                     self.assertIsNone(result["managed_config"]["feature"])
                     import tomllib
@@ -1128,7 +1135,12 @@ class CodexIdentityConfigTest(unittest.TestCase):
                 result = self._merge(config, self._release(root))
                 if conflict:
                     self.assertEqual(result["conflicts"], ["features.default_mode_request_user_input"])
-                    self.assertEqual(config.read_text(encoding="utf-8"), original)
+                    content = config.read_bytes()
+                    self.assertTrue(content.startswith(original.encode("utf-8")))
+                    self.assertIn(self.BEGIN.encode("utf-8"), content)
+                    parsed = self._feature_parsed(config)
+                    self.assertIs(parsed["features"]["apps"], False)
+                    self.assertIsNone(result["managed_config"]["feature"])
                 else:
                     self.assertEqual(result["conflicts"], [])
                     self.assertTrue(config.read_text(encoding="utf-8").startswith(original))
@@ -1234,7 +1246,7 @@ class CodexIdentityConfigTest(unittest.TestCase):
                 self.assertEqual(self._unmerge(config, record), [])
                 self.assertEqual(config.read_text(encoding="utf-8"), edited)
 
-    def test_a_feature_conflict_after_activation_keeps_the_earlier_receipt(self):
+    def test_a_feature_conflict_after_activation_drops_the_feature_receipt_and_keeps_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = root / "config.toml"
@@ -1247,7 +1259,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
             second = self._merge(config, release, {"managed_config": {"codex_identity": first["managed_config"]}})
             self.assertEqual(second["conflicts"], ["features.default_mode_request_user_input"])
             self.assertEqual(config.read_text(encoding="utf-8"), edited)
-            self.assertEqual(second["managed_config"], first["managed_config"])
+            self.assertEqual(second["managed_config"]["inserted"], first["managed_config"]["inserted"])
+            self.assertIsNone(second["managed_config"]["feature"])
             self._unmerge(config, {"managed_config": {"codex_identity": second["managed_config"]}})
             self.assertIn("default_mode_request_user_input = false", config.read_text(encoding="utf-8"))
             self.assertNotIn(self.BEGIN, config.read_text(encoding="utf-8"))
