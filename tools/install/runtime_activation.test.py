@@ -520,6 +520,29 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
                 self.assertNotIn(sibling, destinations)
                 self.assertIn(state_dir / "transactions", destinations)
 
+    def test_codex_projection_failure_before_state_commit_restores_native_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                original_prepare = activation._prepare_runtime_config
+
+                def project_then_fail(*args, **kwargs):
+                    original_prepare(*args, **kwargs)
+                    raise activation.ActivationError("injected after native projection")
+
+                activation._prepare_runtime_config = project_then_fail
+                try:
+                    with self.assertRaisesRegex(activation.ActivationError, "injected"):
+                        activation.activate("codex", "linked", str(source))
+                finally:
+                    activation._prepare_runtime_config = original_prepare
+                config = activation.paths.runtime_home("codex") / "config.toml"
+                backup = config.with_name(activation.CODEX_IDENTITY_BACKUP)
+                self.assertFalse(config.exists())
+                self.assertFalse(backup.exists())
+                self.assertFalse(activation._state_path("codex").exists())
+
 
 class RuntimeActivationConflictPreflightTest(unittest.TestCase):
     def test_codex_conflict_refuses_before_capture(self):
@@ -789,6 +812,62 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertEqual(result["conflicts"], [])
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
             self._assert_clears_inherited(config)
+
+    def test_native_window_restores_without_identity_record_and_deletes_created_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text("model_context_window = 800000\n", encoding="utf-8")
+            state = {"managed_config": {"native_context": {"codex": {
+                "file_created": True, "keys": {"model_context_window": {
+                    "baseline": {"present": False}, "projected": 800000}}}}}}
+            self.assertEqual(self._unmerge(config, state), [str(config)])
+            self.assertFalse(config.exists())
+
+    def test_native_window_restores_independently_when_identity_block_was_edited(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            edited = self.BEGIN + "\n[shell_environment_policy.filters]\n# user edit\n" + self.END + "\n"
+            config.write_text("model_context_window = 800000\n\n" + edited, encoding="utf-8")
+            state = {"managed_config": {
+                "codex_identity": {"inserted": self.BEGIN + "\nold block\n" + self.END + "\n"},
+                "native_context": {"codex": {"file_created": False, "keys": {
+                    "model_context_window": {"baseline": {"present": True, "value": 640000},
+                                              "projected": 800000}}}}}}
+            self._unmerge(config, state)
+            text = config.read_text(encoding="utf-8")
+            self.assertIn("model_context_window = 640000", text)
+            self.assertIn("# user edit", text)
+
+    def test_empty_original_config_is_retained_after_window_removal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text("model_context_window = 800000\n", encoding="utf-8")
+            state = {"managed_config": {"native_context": {"codex": {
+                "file_created": False, "keys": {"model_context_window": {
+                    "baseline": {"present": False}, "projected": 800000}}}}}}
+            self._unmerge(config, state)
+            self.assertTrue(config.is_file())
+            self.assertEqual(config.read_text(encoding="utf-8"), "")
+
+    def test_legacy_record_without_identity_block_keeps_user_empty_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_text("", encoding="utf-8")
+            self.assertEqual(self._unmerge(config, {"managed_config": {}}), [])
+            self.assertTrue(config.is_file())
+
+    def test_dry_run_leaves_native_config_bytes_mode_and_mtime_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "config.toml"
+            config.write_bytes(b'model_context_window = 800000 # keep\r\nmodel = "x"\r\n')
+            config.chmod(0o640)
+            before = (config.read_bytes(), config.stat().st_mode, config.stat().st_mtime_ns)
+            state = {"managed_config": {"native_context": {"codex": {
+                "file_created": False, "keys": {"model_context_window": {
+                    "baseline": {"present": False}, "projected": 800000}}}}}}
+            self._unmerge(config, state, dry_run=True)
+            self.assertEqual((config.read_bytes(), config.stat().st_mode,
+                              config.stat().st_mtime_ns), before)
 
     def test_the_block_is_appended_after_user_content_and_the_rest_stays_runtime_owned(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -26,6 +26,101 @@ _INTEGER = re.compile(r"[+-]?(?:0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+|[0-9_]+)")
 _HEADER = re.compile(r"[ \t]*\[")
 
 
+def _native_key_record(previous, adapter: str, current_present: bool, current,
+                       desired, *, extra=None) -> dict:
+    """Carry a valid activation baseline only while the projected value still matches."""
+    managed = previous.get("managed_config", {}) if isinstance(previous, dict) else {}
+    native = managed.get("native_context", {}) if isinstance(managed, dict) else {}
+    runtime_record = native.get(adapter, {}) if isinstance(native, dict) else {}
+    keys = runtime_record.get("keys", {}) if isinstance(runtime_record, dict) else {}
+    old = keys.get(_CONTEXT_KEY if adapter == "codex" else
+                   "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW") if isinstance(keys, dict) else None
+    value_type = int if adapter == "codex" else str
+    valid_old = (isinstance(old, dict) and isinstance(old.get("baseline"), dict)
+                 and type(old["baseline"].get("present")) is bool
+                 and (not old["baseline"]["present"] or "value" in old["baseline"])
+                 and type(old.get("projected")) is value_type
+                 and (adapter != "codex" or old["projected"] > 0))
+    if valid_old and adapter == "codex" and old["baseline"]["present"]:
+        valid_old = type(old["baseline"].get("value")) is int and old["baseline"]["value"] > 0
+    if valid_old and current_present and type(current) is value_type and current == old["projected"]:
+        baseline = dict(old["baseline"])
+        carry_extra = dict(old)
+    else:
+        baseline = {"present": bool(current_present)}
+        if current_present:
+            baseline["value"] = current
+        carry_extra = {}
+    record = {**carry_extra, "baseline": baseline, "projected": desired}
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if key == "env_present" and "env_present" in carry_extra:
+                continue
+            record[key] = value
+    return record
+
+
+def _native_restore_action(record, current_present: bool, current, *, adapter: str):
+    """Return (action, baseline value) only for a well-formed exact-match receipt."""
+    value_type = int if adapter == "codex" else str
+    if not isinstance(record, dict) or type(record.get("projected")) is not value_type:
+        return "keep", None
+    if adapter == "codex" and record["projected"] < 1:
+        return "keep", None
+    baseline = record.get("baseline")
+    if (not isinstance(baseline, dict) or type(baseline.get("present")) is not bool
+            or (baseline["present"] and "value" not in baseline)):
+        return "keep", None
+    if not current_present or type(current) is not value_type or current != record["projected"]:
+        return "keep", None
+    if baseline["present"]:
+        value = baseline.get("value")
+        if adapter == "codex" and (type(value) is not int or value < 1):
+            return "keep", None
+        return "restore", value
+    return "delete", None
+
+
+def _remove_codex_root(raw: bytes) -> bytes:
+    text, parsed = _parse_toml(raw)
+    span, _ = _root_scan(text)
+    if not span:
+        return raw
+    line_start = text.rfind("\n", 0, span[0]) + 1
+    line_end = text.find("\n", span[1])
+    if line_end < 0:
+        line_end = len(text)
+        newline = ""
+    else:
+        newline = "\r\n" if text[line_end - 1] == "\r" else "\n"
+    line = text[line_start:line_end]
+    comment = line.find("#", span[1] - line_start)
+    replacement = ""
+    if comment >= 0:
+        replacement = "#" + line[comment + 1:] + newline
+    candidate = (text[:line_start] + replacement + text[line_end + (1 if newline else 0):]).encode("utf-8")
+    try:
+        after = tomllib.loads(candidate.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise NativeContextError(f"Codex context restoration is invalid: {exc}") from exc
+    if _CONTEXT_KEY in after or {k:v for k,v in parsed.items() if k != _CONTEXT_KEY} != after:
+        raise NativeContextError("Codex context restoration changed unrelated settings")
+    return candidate
+
+
+def restore_codex_context(raw: bytes, record: dict) -> tuple[bytes, bool]:
+    """Restore one root key while preserving every other TOML byte and parsed value."""
+    text, parsed = _parse_toml(raw)
+    current = parsed.get(_CONTEXT_KEY)
+    action, baseline = _native_restore_action(
+        record, _CONTEXT_KEY in parsed, current, adapter="codex")
+    if action == "keep":
+        return raw, False
+    if action == "restore":
+        return _edit_codex(raw, baseline), True
+    return _remove_codex_root(raw), True
+
+
 def _parse_toml(raw: bytes) -> tuple[str, dict]:
     try:
         text = raw.decode("utf-8")
@@ -197,8 +292,10 @@ def project_context_window(adapter: str, *, runtime, source_root, previous=None,
                 "path": result.get("path"), "previous": result.get("previous_context_window"),
                 "desired": desired, "changed": bool(result.get("context_changed")),
                 "source": receipt.source, "merge": result,
+                "native_context": result.get("native_context"),
                 "report_lines": list(result.get("report_lines", []))}
     path = runtime_home / "config.toml"
+    config_existed = path.exists()
     try:
         original = path.read_bytes() if path.exists() else b""
     except OSError as exc:
@@ -213,6 +310,40 @@ def project_context_window(adapter: str, *, runtime, source_root, previous=None,
         if root is not None and type(root) is not int:
             raise NativeContextError("Codex root model_context_window must be an integer")
         old = str(root) if root is not None else None
+    parsed_before = tomllib.loads(original.decode("utf-8")) if original else {}
+    old_present = _CONTEXT_KEY in parsed_before
+    record = _native_key_record(previous, adapter, old_present,
+                                parsed_before.get(_CONTEXT_KEY), number,
+                                extra=None)
+    if isinstance(previous, dict):
+        prior_managed = previous.get("managed_config", {})
+        prior_native = prior_managed.get("native_context", {}) if isinstance(prior_managed, dict) else {}
+        prior_codex = prior_native.get("codex", {}) if isinstance(prior_native, dict) else {}
+        prior_keys = prior_codex.get("keys", {}) if isinstance(prior_codex, dict) else {}
+        prior_key = prior_keys.get(_CONTEXT_KEY) if isinstance(prior_keys, dict) else None
+        prior_baseline = prior_key.get("baseline") if isinstance(prior_key, dict) else None
+        prior_record_valid = (
+            isinstance(prior_baseline, dict)
+            and type(prior_baseline.get("present")) is bool
+            and (not prior_baseline["present"] or "value" in prior_baseline)
+            and type(prior_key.get("projected")) is int
+            and prior_key["projected"] > 0
+            and (not prior_baseline["present"]
+                 or (type(prior_baseline.get("value")) is int and prior_baseline["value"] > 0))
+        )
+        if (prior_record_valid and isinstance(prior_codex, dict)
+                and isinstance(prior_codex.get("file_created"), bool)):
+            record["file_created"] = prior_codex["file_created"]
+        elif prior_key is None:
+            identity = prior_managed.get("codex_identity") if isinstance(prior_managed, dict) else None
+            backup = path.with_name("config.toml.pre-harness-identity")
+            record["file_created"] = bool(isinstance(identity, dict)
+                                          and isinstance(identity.get("inserted"), str)
+                                          and identity["inserted"] and not backup.exists())
+        else:
+            record["file_created"] = False
+    else:
+        record["file_created"] = not config_existed
     candidate = _edit_codex(original, number)
     changed = _publish(path, candidate, source=original,
                        owner="native-context:codex-root-window",
@@ -229,4 +360,7 @@ def project_context_window(adapter: str, *, runtime, source_root, previous=None,
     return {"kind": "context-window-projected", "runtime": adapter,
             "path": str(path), "previous": old, "desired": desired,
             "changed": changed, "source": receipt.source, "provenance": provenance,
+            "native_context": {"codex": {"file_created": record.pop("file_created"),
+                                             "keys": {_CONTEXT_KEY: record}}},
+            "pre_projection_exists": config_existed, "pre_projection_bytes": original,
             "report_lines": lines}

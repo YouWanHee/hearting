@@ -436,6 +436,7 @@ done
 printf '%s\n' 'CFG_TIER_DEEP_MODEL=user-custom' \
   > "$HOME/.codex/agent-config/models.conf"
 MODEL_CONFIG_STAMP=$(stat -c '%y' "$HOME/.codex/agent-config/models.conf")
+MODEL_CONFIG_HASH=$(sha256sum "$HOME/.codex/agent-config/models.conf" | cut -d ' ' -f 1)
 harness runtime refresh --runtime codex --json >/dev/null
 test "$(stat -c '%y' "$HOME/.codex/agent-config/models.conf")" = "$MODEL_CONFIG_STAMP" || fail "model config refresh changed mtime"
 grep -q '^CFG_TIER_DEEP_MODEL=user-custom$' \
@@ -1229,6 +1230,9 @@ grep -q '^CFG_TIER_DEEP_MODEL=user-custom$' \
   "$HOME/.codex/agent-config/models.conf" \
   || fail "Codex uninstall removed or rewrote the user model config"
 test "$(stat -c '%y' "$HOME/.codex/agent-config/models.conf")" = "$MODEL_CONFIG_STAMP" || fail "model config lifecycle changed mtime"
+test "$(sha256sum "$HOME/.codex/agent-config/models.conf" | cut -d ' ' -f 1)" = "$MODEL_CONFIG_HASH" || fail "model config bytes changed during uninstall"
+test ! -e "$HOME/.codex/config.toml" && test ! -e "$HOME/.codex/config.toml.pre-harness-identity" \
+  || fail "uninstall left Codex native config residue"
 harness runtime status --runtime codex --json > "$TMP/uninstalled-codex.json" || true
 python3 - "$TMP/uninstalled-codex.json" <<'PY'
 import json, sys
@@ -1252,8 +1256,7 @@ assert settings["theme"] == "user"
 hooks=settings.get("hooks", {})
 assert not hooks.get("SessionStart"), hooks
 assert "statusLine" not in settings, settings
-# The interactive context window stays as a user setting after uninstall.
-assert settings["env"] == {"USER_FLAG": "keep", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000"}, settings
+assert settings["env"] == {"USER_FLAG": "keep"}, settings
 assert settings["enabledPlugins"]["foreign@fixture"] is True
 PY
 ok "claude uninstall unmerges managed hooks, statusline, and env while keeping user settings"

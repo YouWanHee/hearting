@@ -59,6 +59,35 @@ class NativeContextTests(unittest.TestCase):
         self.assertEqual(updated.count(b"model_context_window = 760000"), 1)
         self.assertTrue(any("profile" in line for line in result["report_lines"]))
 
+    def test_codex_absent_baseline_restoration_keeps_trailing_comment_and_crlf(self):
+        config = self.home / "config.toml"
+        original = b"# keep\r\nmodel = \"x\"\r\n[profile.foo]\r\nmodel_context_window = 900000\r\n"
+        config.write_bytes(original)
+        self.seed_models()
+        result = native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
+        record = result["native_context"]["codex"]["keys"]["model_context_window"]
+        self.assertEqual(record["baseline"], {"present": False})
+        self.assertTrue(result["native_context"]["codex"]["file_created"] is False)
+        projected = config.read_bytes()
+        restored, changed = native_context.restore_codex_context(projected, record)
+        self.assertTrue(changed)
+        self.assertEqual(restored, original)
+
+    def test_codex_baseline_value_restores_only_on_exact_match(self):
+        record = {"baseline": {"present": True, "value": 640000}, "projected": 760000}
+        before = b'model_context_window = 760000 # managed\r\nmodel = "x"\r\n'
+        restored, changed = native_context.restore_codex_context(before, record)
+        self.assertTrue(changed)
+        self.assertEqual(restored, b'model_context_window = 640000 # managed\r\nmodel = "x"\r\n')
+        edited, changed = native_context.restore_codex_context(
+            before.replace(b"760000", b"810000"), record)
+        self.assertFalse(changed)
+        self.assertIn(b"810000", edited)
+        malformed, changed = native_context.restore_codex_context(
+            before, {"baseline": {"present": False}, "projected": True})
+        self.assertFalse(changed)
+        self.assertEqual(malformed, before)
+
     def test_codex_insert_precedes_table_and_ignores_multiline_string_header(self):
         config = self.home / "config.toml"
         config.write_text('note = """\n[not-a-table]\nmodel_context_window = 5\n"""\n\n[model]\nname="x"',
@@ -150,6 +179,41 @@ class NativeContextTests(unittest.TestCase):
             config_path=settings)
         # The merge's teardown path deliberately excludes the operating preference.
         self.assertEqual(json.loads(settings.read_text())["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "760000")
+
+    def test_claude_context_receipt_restores_prior_value_and_empty_container(self):
+        settings = self.home / "settings.json"
+        settings.write_text(json.dumps({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "640000",
+                                                  "USER_KEY": "keep"}}), encoding="utf-8")
+        self.seed_models("claude", "760000")
+        projected = native_context.project_context_window(
+            "claude", runtime=self.home, source_root=ROOT,
+            claude_merge=lambda **kwargs: runtime_activation._merge_claude_settings(
+                ROOT, None, config_path=settings, **kwargs), context_only=True)
+        record = projected["native_context"]["claude"]["keys"][
+            "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW"]
+        self.assertEqual(record["baseline"], {"present": True, "value": "640000"})
+        runtime_activation._unmerge_claude_settings(
+            {"managed_config": {"native_context": projected["native_context"]}},
+            "global", config_path=settings)
+        self.assertEqual(json.loads(settings.read_text())["env"], {
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "640000", "USER_KEY": "keep"})
+
+    def test_claude_uninstall_removes_activation_added_empty_env_but_keeps_original_empty_env(self):
+        for had_env in (False, True):
+            with self.subTest(had_env=had_env):
+                settings = self.home / ("settings-%s.json" % had_env)
+                original = {"env": {}} if had_env else {}
+                settings.write_text(json.dumps(original), encoding="utf-8")
+                projected = native_context._native_key_record(
+                    None, "claude", False, None, "760000", extra={"env_present": had_env})
+                data = {"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "760000"}}
+                settings.write_text(json.dumps(data), encoding="utf-8")
+                runtime_activation._unmerge_claude_settings(
+                    {"managed_config": {"native_context": {"claude": {"keys": {
+                        "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW": projected}}}}},
+                    "global", config_path=settings)
+                actual = json.loads(settings.read_text(encoding="utf-8"))
+                self.assertEqual(actual, {"env": {}} if had_env else {})
 
     def test_model_set_repairs_native_drift_even_when_scalar_is_unchanged(self):
         self.seed_models()

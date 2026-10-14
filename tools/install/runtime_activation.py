@@ -1374,14 +1374,14 @@ def _merge_claude_settings(
             env = data.get("env", {})
             if not isinstance(env, dict):
                 raise ActivationError(f"Claude settings env is not an object: {config}")
-            return data, env.get(key)
+            return data, key in env, env.get(key), "env" in data
 
-        data, before = read_settings()
+        data, present, before, env_present = read_settings()
         changed = desired is not None and before != desired
         if changed:
             if not native_locked:
                 with safe_fs.TargetLock(config):
-                    data, before = read_settings()
+                    data, present, before, env_present = read_settings()
                     changed = before != desired
                     if changed:
                         env = data.get("env", {})
@@ -1393,8 +1393,13 @@ def _merge_claude_settings(
                 env[key] = desired
                 data["env"] = env
                 _atomic_json(config, data)
+        from native_context import _native_key_record
+        record = (_native_key_record(previous, "claude", present, before, desired,
+                                     extra={"env_present": env_present})
+                  if desired is not None else None)
         return {"kind": "claude-context-window-projected", "path": str(config),
                 "previous_context_window": before, "context_changed": changed,
+                "native_context": {"claude": {"keys": {f"env.{key}": record}}} if record else None,
                 "managed_values": {"env": {key: desired}} if desired is not None else {},
                 "report_lines": ([f"context window: claude {before or 'unset'} -> {desired} tokens",
                                   f"settings: {config}"] if changed else [])}
@@ -1408,6 +1413,11 @@ def _merge_claude_settings(
     config = config_path or _config_path("claude", scope, "settings.json")
     original = config.read_bytes() if config.exists() else None
     data = _read_json_object(config, "Claude settings") if config.exists() else {}
+    context_key = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+    original_env = data.get("env", {})
+    context_present = isinstance(original_env, dict) and context_key in original_env
+    context_before = original_env.get(context_key) if isinstance(original_env, dict) else None
+    env_container_present = "env" in data
     if context_window is not None and "env" in data and not isinstance(data.get("env"), dict):
         raise ActivationError(f"Claude settings env is not an object: {config}")
     hooks = data.setdefault("hooks", {})
@@ -1565,15 +1575,13 @@ def _merge_claude_settings(
 
     if changed:
         _atomic_json(config, data)
-    context_key = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
-    context_previous = None
-    if original:
-        try:
-            original_data = json.loads(original.decode("utf-8"))
-            original_env = original_data.get("env", {}) if isinstance(original_data, dict) else {}
-            context_previous = original_env.get(context_key) if isinstance(original_env, dict) else None
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            pass
+    context_previous = context_before if context_present else None
+    native_context = None
+    if context_window is not None:
+        from native_context import _native_key_record
+        record = _native_key_record(previous, "claude", context_present, context_before,
+                                   str(context_window), extra={"env_present": env_container_present})
+        native_context = {"claude": {"keys": {f"env.{context_key}": record}}}
     return {
         "kind": "claude-settings-merged",
         "path": str(config),
@@ -1583,6 +1591,7 @@ def _merge_claude_settings(
         "conflicts": conflicts,
         "previous_context_window": context_previous,
         "context_changed": context_window is not None and context_previous != str(context_window),
+        "native_context": native_context,
         "report_lines": ([f"context window: claude {context_previous or 'unset'} -> {context_window} tokens",
                           f"settings: {config}"] if context_window is not None and context_previous != str(context_window) else []),
     }
@@ -1783,7 +1792,9 @@ def _atomic_text(path: Path, text: str, mode: Optional[int] = None) -> None:
 
 
 def _merge_codex_identity_config(
-    active_root: Path, previous: Optional[dict], scope: str = "global"
+    active_root: Path, previous: Optional[dict], scope: str = "global", *,
+    pre_projection_exists: bool | None = None, pre_projection_bytes: bytes | None = None,
+    file_created: bool | None = None,
 ) -> dict:
     """Merge the fragment into ``$CODEX_HOME/config.toml`` as one delimited block.
 
@@ -1809,6 +1820,16 @@ def _merge_codex_identity_config(
             tomllib.loads(original)
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ActivationError(f"invalid Codex config: {config}: {exc}") from exc
+    backup_original = original
+    if pre_projection_exists is False:
+        backup_original = ""
+    elif pre_projection_exists is True and pre_projection_bytes is not None:
+        try:
+            backup_original = pre_projection_bytes.decode("utf-8")
+            import tomllib
+            tomllib.loads(backup_original)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ActivationError(f"invalid Codex config preimage: {config}: {exc}") from exc
     previous_record = {}
     if previous:
         candidate = previous.get("managed_config", {}).get("codex_identity")
@@ -1848,10 +1869,10 @@ def _merge_codex_identity_config(
     if not _codex_identity_candidate_ok(candidate_text, set_values, excluded):
         result["conflicts"] = ["shell_environment_policy"]
         return result
-    if config.exists():
+    if config.exists() and file_created is not True:
         backup = config.with_name(CODEX_IDENTITY_BACKUP)
         if not backup.exists():
-            _atomic_text(backup, original)
+            _atomic_text(backup, backup_original)
     _atomic_text(config, candidate_text)
     result["managed_config"] = {"inserted": separator + block}
     return result
@@ -1860,32 +1881,75 @@ def _merge_codex_identity_config(
 def _unmerge_codex_identity_config(
     state: dict, scope: str, dry_run: bool = False
 ) -> List[str]:
-    """Remove the block activation inserted, only while its text is still exactly what it wrote."""
+    """Independently unmerge the identity block and exact-match native window key."""
+    from native_context import restore_codex_context, _publish
     managed = (state.get("managed_config") or {}) if isinstance(state, dict) else {}
     record = managed.get("codex_identity") if isinstance(managed, dict) else None
     inserted = record.get("inserted") if isinstance(record, dict) else None
-    if not isinstance(inserted, str) or not inserted:
-        return []
+    native = managed.get("native_context") if isinstance(managed, dict) else None
+    codex_native = native.get("codex", {}) if isinstance(native, dict) else {}
+    keys = codex_native.get("keys", {}) if isinstance(codex_native, dict) else {}
+    window_record = keys.get("model_context_window") if isinstance(keys, dict) else None
+    has_native = isinstance(window_record, dict)
+    baseline = window_record.get("baseline") if has_native else None
+    valid_native = (
+        has_native
+        and type(window_record.get("projected")) is int
+        and window_record["projected"] > 0
+        and isinstance(baseline, dict)
+        and type(baseline.get("present")) is bool
+        and (not baseline["present"] or
+             (type(baseline.get("value")) is int and baseline["value"] > 0))
+    )
     config = _config_path("codex", scope, "config.toml")
     if not config.is_file():
         return []
     try:
-        text = config.read_text(encoding="utf-8")
+        original_bytes = config.read_bytes()
+        text = original_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return []
-    if text.count(inserted) != 1:
-        return []
-    remaining = text.replace(inserted, "", 1)
-    # Activation backs up a config it found, so no backup means activation created this
-    # file; once the block is gone nothing of the user's is left in it.
-    created_by_activation = not config.with_name(CODEX_IDENTITY_BACKUP).exists()
+    remaining = text
+    block_removed = isinstance(inserted, str) and bool(inserted) and remaining.count(inserted) == 1
+    if block_removed:
+        remaining = remaining.replace(inserted, "", 1)
+    try:
+        restored, _ = restore_codex_context(remaining.encode("utf-8"), window_record)
+        remaining = restored.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        remaining = remaining
+    backup = config.with_name(CODEX_IDENTITY_BACKUP)
+    if valid_native and isinstance(codex_native.get("file_created"), bool):
+        created_by_activation = codex_native["file_created"]
+    elif isinstance(native, dict) and "codex" in native:
+        created_by_activation = False
+    else:
+        # Legacy records: activation backs up a config it found, so a removed block with no
+        # backup means activation created this file. Without that block the file is the user's.
+        created_by_activation = block_removed and not backup.exists()
+    changed = remaining.encode("utf-8") != original_bytes
+    removed_file = not remaining.strip() and created_by_activation
     if not dry_run:
-        if not remaining.strip() and created_by_activation:
-            # destructive-ok: reason=remove the config file activation created for its block alone; boundary=$CODEX_HOME/config.toml left empty with no pre-activation backup
-            config.unlink()
-        else:
-            _atomic_text(config, remaining)
-    return [str(config)]
+        if removed_file:
+            try:
+                with safe_fs.TargetLock(config):
+                    current = safe_fs.capture_state(config, include_payload=True)
+                    if (current.kind != "file" or current.payload != original_bytes
+                            or os.lstat(config).st_nlink != 1):
+                        return []
+                    auth = safe_fs.authority(config, owner="runtime-deactivate:codex-config",
+                                             allowed_paths=(config,), allow_leaf_symlink=False,
+                                             expected=current)
+                    safe_fs.remove_exact(auth, expected=current)
+            except safe_fs.SafetyError as exc:
+                raise ActivationError(str(exc)) from exc
+        elif changed:
+            try:
+                _publish(config, remaining.encode("utf-8"),
+                         owner="runtime-deactivate:codex-native-context", source=original_bytes)
+            except ValueError as exc:
+                raise ActivationError(str(exc)) from exc
+    return [str(config)] if changed or removed_file else []
 
 
 def _seed_opencode_tui_entry(active_root: Path, previous: Optional[dict], scope: str = "global") -> dict:
@@ -2078,9 +2142,17 @@ def _prepare_runtime_config(
                                                native_locked=native_locked)
         except NativeContextError as exc:
             raise ActivationError(str(exc)) from exc
-        result = _merge_codex_identity_config(active_root, previous, scope)
+        native = projected.get("native_context") or {}
+        codex_record = native.get("codex", {}) if isinstance(native, dict) else {}
+        result = _merge_codex_identity_config(
+            active_root, previous, scope,
+            pre_projection_exists=projected.get("pre_projection_exists"),
+            pre_projection_bytes=projected.get("pre_projection_bytes"),
+            file_created=codex_record.get("file_created") if isinstance(codex_record, dict) else None,
+        )
         result.setdefault("report_lines", []).extend(projected["report_lines"])
         result["context_projection"] = projected
+        result["native_context"] = native
         return [result]
     if runtime == "opencode":
         return [_seed_opencode_tui_entry(active_root, previous, scope)]
@@ -2618,6 +2690,11 @@ def _activation_owned_paths(
     ]
     if runtime == "claude":
         destinations.append(_config_path(runtime, scope, "settings.json"))
+    elif runtime == "codex":
+        destinations.extend((
+            _config_path(runtime, scope, "config.toml"),
+            _config_path(runtime, scope, CODEX_IDENTITY_BACKUP),
+        ))
 
     discovery: set[Path] = set()
     for root in roots:
@@ -3027,6 +3104,24 @@ def activate(
                                                  native_locked=True)
         for change in config_changes:
             context_report_lines.extend(change.get("report_lines", []))
+        previous_managed = (previous or {}).get("managed_config", {})
+        previous_native = previous_managed.get("native_context", {}) if isinstance(previous_managed, dict) else {}
+        native_context = dict(previous_native) if isinstance(previous_native, dict) else {}
+        projected_native = next((change.get("native_context") for change in config_changes
+                                 if isinstance(change.get("native_context"), dict)), None)
+        if projected_native:
+            for adapter_name, adapter_record in projected_native.items():
+                old_adapter = native_context.get(adapter_name, {})
+                old_adapter = dict(old_adapter) if isinstance(old_adapter, dict) else {}
+                new_adapter = dict(adapter_record) if isinstance(adapter_record, dict) else {}
+                old_keys = old_adapter.get("keys", {})
+                new_keys = new_adapter.get("keys", {})
+                merged_keys = dict(old_keys) if isinstance(old_keys, dict) else {}
+                if isinstance(new_keys, dict):
+                    merged_keys.update(new_keys)
+                old_adapter.update(new_adapter)
+                old_adapter["keys"] = merged_keys
+                native_context[adapter_name] = old_adapter
         state = {
             "schema": SCHEMA,
             "runtime": runtime,
@@ -3043,6 +3138,7 @@ def activate(
             "session_action": SESSION_ACTIONS[runtime],
             "external_dependencies": [],
             "managed_config": {
+                "native_context": native_context,
                 "claude_hooks": next(
                     (
                         change["managed_hooks"]
@@ -3318,11 +3414,12 @@ def _unmerge_claude_settings(
         return []
     managed_hooks = managed_config.get("claude_hooks", {})
     managed_values = managed_config.get("claude_values", {})
+    native_context = managed_config.get("native_context", {})
     if not isinstance(managed_hooks, dict):
         managed_hooks = {}
     if not isinstance(managed_values, dict):
         managed_values = {}
-    if not managed_hooks and not managed_values:
+    if not managed_hooks and not managed_values and not native_context:
         return []
     config = config_path or _config_path("claude", scope, "settings.json")
     if not config.exists():
@@ -3361,6 +3458,23 @@ def _unmerge_claude_settings(
                 changed = True
         if not current_env:
             data.pop("env")
+    claude_native = native_context.get("claude", {}) if isinstance(native_context, dict) else {}
+    native_keys = claude_native.get("keys", {}) if isinstance(claude_native, dict) else {}
+    window_record = native_keys.get("env.CLAUDE_CODE_AUTO_COMPACT_WINDOW") if isinstance(native_keys, dict) else None
+    current_env = data.get("env")
+    if isinstance(current_env, dict):
+        key = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+        from native_context import _native_restore_action
+        action, baseline = _native_restore_action(
+            window_record, key in current_env, current_env.get(key), adapter="claude")
+        if action == "restore":
+            current_env[key] = baseline
+            changed = True
+        elif action == "delete":
+            current_env.pop(key)
+            changed = True
+            if not current_env and isinstance(window_record, dict) and window_record.get("env_present") is False:
+                data.pop("env", None)
     if changed and not dry_run:
         _atomic_json(config, data)
     return [str(config)] if changed else []

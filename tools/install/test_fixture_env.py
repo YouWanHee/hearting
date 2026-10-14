@@ -25,6 +25,7 @@ class FixtureEnvironmentTest(unittest.TestCase):
                 "XDG_CACHE_HOME": "/outside/cache",
                 "TMPDIR": "/outside/tmp",
                 "AGENT_DISPATCH_JOBS": "/outside/jobs.log",
+                "HEARTING_MODEL_CONFIG_HOME": "/outside/model-config",
                 "PATH": os.environ.get("PATH", ""),
             }
             env = fixture_env.build_environment(root / "fixture", source, base=hostile)
@@ -36,6 +37,8 @@ class FixtureEnvironmentTest(unittest.TestCase):
                         Path(env[key]).is_relative_to(fixture),
                         f"{key} escaped fixture: {env[key]}",
                     )
+            self.assertNotIn("HEARTING_MODEL_CONFIG_HOME", env)
+            self.assertIn("unset HEARTING_MODEL_CONFIG_HOME", fixture_env.shell_exports(env))
             self.assertEqual(env["ZDOTDIR"], env["HOME"])
             self.assertEqual(env["AGENT_HOME"], str(source))
 
