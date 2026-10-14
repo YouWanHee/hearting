@@ -27,7 +27,7 @@
 ▍    ┆  │   ⠋ codex    exec worker                        │
 ▍    ┆  │  3m       gpt-6.1-sol (medium)       code-exec… │
 ▍    ┆  │           running                               │
-▍    ┆  │        ────────────────   —                     │
+▍    ┆  │           ────────────────   —                  │
 ▍    ┆  ╰─────────────────────────────────────────────────╯
 ▍    ┆  ╭─  ⠋ opencode childless-owner ───────────────────╮
 ▍    ┆  │  —        gpt-6.1-sol (high)       code owner   │
