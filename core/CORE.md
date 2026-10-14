@@ -289,7 +289,7 @@ directly under the artifact root. Inside a cycle, the first segment below
 exactly the keys of `BUCKET_TYPES` in `utilities/artifact_producer.py`, and
 `artifact_producer.test.py` fails when the two differ. Another first segment (for example `shards/`) is not a
 bucket. A file outside a bucket stays where it was written and carries type
-`file`; nothing moves it. Compose shows the capability's default bucket as the
+`file`; nothing moves it. A `raw-results` directory and its ancestors also stay at their exact payload paths; first-seal finalize may register a non-empty tree with one directory-bundle descriptor, while `raw-results` is not a bucket. Compose shows the capability's default bucket as the
 output folder.
 Payload paths retain valid UTF-8 names, so report images and audio with Korean
 filenames remain in checkpoint and sealed manifests.
