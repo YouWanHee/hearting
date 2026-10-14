@@ -814,6 +814,12 @@ def _budget_exhausted(jobs, source, *, lines=None, route=None, capacity=False):
     return legacy_budget_exhausted(jobs, lines, source, route=route)
 
 
+def _plain_retry_successor(rows, aid):
+    """Does an ordinary same-node retry, not a replacement claim, already continue this attempt?"""
+    return any((meta.get('automatic_retry_of') == aid or meta.get('prior_attempt_id') == aid)
+               and not meta.get('replacement_family_id') for _, meta in rows.values())
+
+
 def _no_competing_successor(rows, aid, replacement=None):
     competing = any(other != replacement and (candidate.get('automatic_retry_of') == aid
                     or candidate.get('prior_attempt_id') == aid) for other, (_, candidate) in rows.items())
