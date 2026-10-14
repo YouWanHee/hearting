@@ -2007,11 +2007,11 @@ def _merge_codex_identity_config(
         identity_text, previous_record.get("feature")
     )
     if feature_conflict:
-        # A user-owned or unsafe `features` form: the file stays as the user has it and an
-        # earlier receipt stays recorded so deactivation can still find its own block.
+        # A user-owned or unsafe `features` form stays byte-for-byte intact, while the
+        # required identity block is still merged and remains removable by its receipt.
+        final_text = identity_text
+        feature_record = None
         result["conflicts"] = [feature_conflict]
-        result["managed_config"] = previous_record or None
-        return result
     if final_text != original:
         if config.exists() and file_created is not True:
             backup = config.with_name(CODEX_IDENTITY_BACKUP)

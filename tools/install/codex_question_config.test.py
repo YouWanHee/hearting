@@ -57,12 +57,13 @@ class CodexQuestionConfigTests(unittest.TestCase):
         self.assertIsNone(result["managed_config"]["feature"])
         self.assertEqual(tomllib.loads(config.read_text())["features"]["default_mode_request_user_input"], True)
 
-    def test_false_non_boolean_and_unextendable_inline_or_dotted_forms_are_preserved_conflicts(self):
+    def test_feature_conflicts_preserve_user_bytes_and_merge_removable_identity(self):
         cases = (
             '[features]\ndefault_mode_request_user_input = false\n',
             '[features]\ndefault_mode_request_user_input = "true"\n',
             'features = { apps = false }\n',
             'features.apps = false\n',
+            'features = false\n',
         )
         for original in cases:
             with self.subTest(original=original):
@@ -70,6 +71,18 @@ class CodexQuestionConfigTests(unittest.TestCase):
                 self.home.mkdir()
                 config, result = self.activate(original)
                 self.assertEqual(result["conflicts"], ["features.default_mode_request_user_input"])
+                merged = config.read_text(encoding="utf-8")
+                self.assertIn(original, merged)
+                self.assertIn(runtime_activation.CODEX_IDENTITY_BEGIN, merged)
+                self.assertIsNone(result["managed_config"]["feature"])
+                old = runtime_activation._config_path
+                runtime_activation._config_path = lambda *_args, **_kwargs: config
+                try:
+                    runtime_activation._unmerge_codex_identity_config(
+                        {"managed_config": {"codex_identity": result["managed_config"]}}, "global"
+                    )
+                finally:
+                    runtime_activation._config_path = old
                 self.assertEqual(config.read_text(encoding="utf-8"), original)
 
     def test_a_repeated_activation_over_its_own_output_is_byte_identical(self):

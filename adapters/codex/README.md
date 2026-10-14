@@ -92,7 +92,8 @@ project Claude Skill, Agent, command, hook, or statusline files into Codex.
 Native Codex owns question timing. Runtime activation enables
 `features.default_mode_request_user_input` in interactive `$CODEX_HOME/config.toml`
 when the existing feature table can be safely extended; explicit false and
-unsupported feature forms are preserved and reported as a config conflict.
+unsupported feature forms are preserved and reported as a config conflict, while
+the harness identity block is still merged.
 Worker homes override the feature to false. In Default mode use the waiting
 `request_user_input`: its countdown is hidden for 60 seconds, then visibly
 counts down for 60 seconds before submitting an empty answer. Typing or pasting
