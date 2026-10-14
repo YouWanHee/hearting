@@ -125,8 +125,8 @@ class NativeContextTests(unittest.TestCase):
         (codex_home / "agent-config/models.conf").write_text(
             (ROOT / "adapters/codex/config/models.conf").read_text())
         (codex_home / "config.toml").write_text("model_context_window = 800000\n[broken\n")
-        env = {**os.environ, "HOME": str(self.home), "CODEX_HOME": str(codex_home),
-               "HEARTING_FIXTURE_ROOT": str(self.home)}
+        env = {**os.environ, "HOME": str(self.home), "ZDOTDIR": str(self.home),
+               "CODEX_HOME": str(codex_home), "HEARTING_FIXTURE_ROOT": str(self.home)}
         env.pop("HEARTING_MODEL_CONFIG_HOME", None)
         with patch.dict(os.environ, env, clear=True):
             with self.assertRaisesRegex(runtime_activation.ActivationError, "invalid Codex config TOML"):
@@ -203,8 +203,9 @@ class NativeContextTests(unittest.TestCase):
         (codex_config / "models.conf").write_text(
             (ROOT / "adapters/codex/config/models.conf").read_text().replace(
                 "CFG_MODEL_CONTEXT_WINDOW=800000", "CFG_MODEL_CONTEXT_WINDOW=760000"))
-        env = {**os.environ, "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(claude_home),
-               "CODEX_HOME": str(codex_home), "HEARTING_FIXTURE_ROOT": str(self.home)}
+        env = {**os.environ, "HOME": str(self.home), "ZDOTDIR": str(self.home),
+               "CLAUDE_CONFIG_DIR": str(claude_home), "CODEX_HOME": str(codex_home),
+               "HEARTING_FIXTURE_ROOT": str(self.home)}
         env.pop("HEARTING_MODEL_CONFIG_HOME", None)
         with patch.dict(os.environ, env, clear=True):
             with safe_fs.TargetLocks((claude_home / "settings.json", codex_home / "config.toml")):
