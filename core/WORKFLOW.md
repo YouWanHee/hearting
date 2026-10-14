@@ -1000,6 +1000,7 @@ An owner that needs a person's answer at a node no declared gate covers ends
 `owner-blocked` with that report. The answer sent with `correct` starts one
 replacement owner that receives it and continues the route. No gate, close, or
 recompose is needed.
+A normally exited owner whose readable final result has only a handoff-format error waits for an answer through the same `correct` path; its contract failure remains recorded without an automatic retry.
 
 A continuation route projects this contract onto its suffix. It drops a gate
 whose gated entry node was cut, never rebinds a retained raising continuation to

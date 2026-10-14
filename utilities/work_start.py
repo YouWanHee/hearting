@@ -1885,12 +1885,22 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
         # It stopped for an answer no declared gate carries. The answer, sent to it, is the way on
         # (an answered stop is a pause, so a spent replacement budget does not end it).
         report = _owner_report(route, metadata)
+        format_only = route_authority.owner_result_format_only_end(status, metadata)
+        if format_only:
+            opening = "The owner ended with a handoff-format error and is waiting for an answer."
+        else:
+            opening = f"The owner stopped {owner_stop} and is waiting for an answer."
+        if report:
+            report_context = "owner_report says what it needs."
+        elif metadata.get("log_file"):
+            report_context = "No readable owner_report is available; the original result is in owner_log_file " + str(metadata["log_file"]) + "."
+        else:
+            report_context = "No readable owner_report or owner log is available."
         return {**result, "state": "needs-attention", "reason": "owner-" + ("blocked" if owner_stop == "BLOCKED" else "failed"),
                 "required_action": "answer-blocked-owner" if owner_stop == "BLOCKED" else "answer-failed-owner",
                 "result": _outcome(jobs, aid),
                 **({"owner_report": report} if report else {}),
-                "next_step": f"The owner stopped {owner_stop} and is waiting for an answer; owner_report says what it "
-                    "needs. Get the person's answer (or fix what it names), then run correction_command with "
+                "next_step": f"{opening} {report_context} Get the person's answer (or fix what it names), then run correction_command with "
                     "--message-file <answer file>: that continues this route at once in a replacement owner that "
                     "receives the answer. Do not close or recompose the route."}
     if replacement.get("state") == "needs-attention":

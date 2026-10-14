@@ -483,6 +483,7 @@ stamp path in `core/HOOKS.md`.
   the answer and continues the route in the same call. The continuation is a
   replacement owner whose shared `recovery_instructions` carry the answer
   (`dispatch_replacement` `corrected`), the same on every adapter.
+  A normally exited owner whose readable final result has only a handoff-format error uses the same answer path; its contract failure remains recorded without an automatic retry.
   A Codex delivery uses a distinct strict `human-gate` receipt and `hg-dlv-*`
   gateway identity. It binds the route id/hash/file, gate raise epoch, exact
   live owner attempt and sealed batch, immutable registry, recipient thread and

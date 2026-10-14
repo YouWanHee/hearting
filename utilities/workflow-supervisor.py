@@ -249,7 +249,8 @@ def resume_recovered_resource_owner(route, ledger):
                 owner = (row.get("owner_wait") or {}).get("parent_attempt_id")
                 target, _ = INPUT._target(armed["jobs"], owner)
                 if (target.metadata.get("parent_close_requested") == "1"
-                        or INPUT.route_authority.answerable_owner_end(target.status, target.metadata) != "BLOCKED"):
+                        or INPUT.route_authority.answerable_owner_end(target.status, target.metadata) != "BLOCKED"
+                        or INPUT.route_authority.owner_result_format_only_end(target.status, target.metadata)):
                     continue
                 if INPUT.supervisor_lease_is_held(armed["jobs"], target.metadata):
                     pending.append({"node": node, "action": "wait-owner-resume", "reason": "owner-lease-held"})

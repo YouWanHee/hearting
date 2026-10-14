@@ -1111,6 +1111,29 @@ class WorkStartTest(unittest.TestCase):
             self.assertIn(token,result['next_step'])
         self.assertEqual(len(self.calls),3)   # nothing new launched while it waits
 
+    def test_format_only_owner_end_waits_for_correction_without_launching(self):
+        owner = self._parked_owner_row()
+        original = next(line for line in self.jobs.read_text().splitlines()
+                        if 'attempt_id='+owner+',' in line)
+        additions = (",note=dead-contract,failure_class=contract"
+                     ",classifier_source=supervisor-terminal-v1,process_exit=0"
+                     ",reconcile_reason=final-handoff-invalid,terminal_event=claude-result"
+                     ",log_file=" + str(Path(self.tmp.name) / "owner.log"))
+        corrected = original.replace(",note=dead-worker-blocked,failure_class=blocked", "") + additions
+        self.jobs.write_text(self.jobs.read_text().replace(original, corrected))
+        stable = self.jobs.read_bytes()
+        with mock.patch('dispatch_replacement.owner_parked_gate', return_value=None):
+            results = [self.start() for _ in range(3)]
+        self.assertEqual([(r['state'], r['reason'], r['required_action']) for r in results],
+                         [('needs-attention', 'owner-blocked', 'answer-blocked-owner')] * 3)
+        self.assertIn('correction_command', results[0])
+        self.assertIn('--message-file', results[0]['next_step'])
+        self.assertIn('handoff-format error', results[0]['next_step'])
+        self.assertIn('owner_log_file ' + str(Path(self.tmp.name) / 'owner.log'), results[0]['next_step'])
+        self.assertNotIn('owner_report says', results[0]['next_step'])
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.jobs.read_bytes(), stable)
+
     def test_a_readable_fail_after_spent_replacement_points_to_the_working_correction(self):
         owner = self._parked_owner_row()
         self.jobs.write_text(self.jobs.read_text().replace('dead-worker-blocked', 'dead-worker-fail')
@@ -2568,6 +2591,7 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         """Fake only native launch; preserve replacement admission and route validation."""
         self.assertEqual(Path(command[1]).name,"dispatch-owner.py")
         self.native_calls.append(command)
+        self.launch_env = dict(kwargs.get("env") or {})
         aid=command[command.index("--attempt-id")+1]
         source_id=command[command.index("--automatic-retry-of")+1]
         source=self.replacement._rows(self.jobs.read_text().splitlines())[source_id][1]
@@ -2599,7 +2623,8 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"independent-review-required"):
             ship_parent_deploy.reviews(self.f.route,deploy,self.jobs,self.request)
         env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
-        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off")
+        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off",
+                   OWNER_ROUTE_SENTINEL="direct-correct",CODEX_DISPATCH_SANDBOX_FORCE="workspace-write")
         defaults=dict(W.start_work.__kwdefaults__)
         W.start_work.__kwdefaults__["run"]=self.native_owner_launch
         self.addCleanup(setattr,W.start_work,"__kwdefaults__",defaults)
@@ -2701,6 +2726,8 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
         for index in range(2):
             receipt=self.cli(correct,env)[-1]
             self.assertEqual(receipt["state"],"running",receipt)
+            self.assertEqual(self.launch_env.get("OWNER_ROUTE_SENTINEL"), "direct-correct")
+            self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"), "workspace-write")
             self.assertEqual(receipt["parent_next"],"bounded-wait")
             argv=shlex.split(receipt["parent_next_command"])
             self.assertEqual(Path(argv[1]).name,"capability-route.py")

@@ -1555,6 +1555,26 @@ class ReplacementTest(unittest.TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('You replace exact-dead attempt', text)
 
+    def test_format_only_contract_end_keeps_contract_proof_and_carries_answer(self):
+        meta = self._blocked_owner()
+        meta.update(note='dead-contract', failure_class='contract',
+                    classifier_source='supervisor-terminal-v1', process_exit='0',
+                    reconcile_reason='pass-blocker-not-none', terminal_event='turn.completed')
+        self.write(meta)
+        self.jobs.write_text(self.jobs.read_text().replace('\topen\t', '\tdone\t'))
+        fields, stored = R._rows(self.jobs.read_text().splitlines())['att-source']
+        self.assertTrue(R.route_authority.owner_result_format_only_end(fields[1], stored))
+        self.assertTrue(self._answer()['retained'])
+        result, commands = self._launch()
+        self.assertEqual((len(commands), result['reason']), (1, 'replacement-launch-pending'))
+        self.assertEqual(result['record']['proof']['source_result'], 'CONTRACT')
+        text = R.recovery_instructions(SimpleNamespace(automatic_retry_of='att-source', worker_type='owner',
+                                       jobs_path=self.jobs, attempt_id=result['record']['replacement_attempt_id']))
+        self.assertIn('handoff-format error and received an answer', text)
+        self.assertIn('final result had a handoff-format error', text)
+        self.assertIn('approved: start the full run', text)
+        self.assertNotIn('ended BLOCKED', text)
+
     def test_runtime_death_receives_correction_on_the_same_route_without_replaying_reviews(self):
         meta = self._blocked_owner()
         meta.pop('launch_outcome', None)
