@@ -286,6 +286,32 @@ class _CodexFixture:
         os.makedirs(self.home, exist_ok=True)
         Path(self.home, "config.toml").write_text(text)
 
+    def test_ambiguous_native_window_never_invents_a_trigger(self):
+        for percent, usable in ((33, 28500), (37, 37001)):
+            with self.subTest(percent=percent):
+                self.catalogue(percent=percent)
+                payload, row = self._policy_case(usable=usable, active=10000)
+                self.assertEqual(payload["context_window_tokens"], usable)
+                self.assertEqual(payload["active_context_tokens"], 10000)
+                self.assertEqual(payload["context_policy"]["state"], "unknown")
+                self.assertEqual(payload["context_policy"]["reason"],
+                                 "codex-applied-trigger-not-uniquely-determined")
+                self.assertIsNone(payload["context_policy"]["effective_window_tokens"])
+                self.assertIsNone(payload["context_display_window_tokens"])
+                self.assertIsNone(payload["ctx_pct"])
+                self.assertNotIn("%", row)
+
+    def test_limit_clamp_can_resolve_the_ambiguous_native_window(self):
+        self.catalogue(percent=33)
+        self.config("model_auto_compact_token_limit = 20000\n")
+        payload, row = self._policy_case(usable=28500, active=10000)
+        self.assertEqual(payload["context_window_tokens"], 28500)
+        self.assertIsNone(payload["context_policy"]["effective_window_tokens"])
+        self.assertEqual(payload["context_policy"]["state"], "applied")
+        self.assertEqual(payload["context_display_window_tokens"], 20000)
+        self.assertEqual(payload["ctx_pct"], 50)
+        self.assertIn("50%", row)
+
     def rollout(self, *, version=CODEX_VERSION, model="gpt-6.1-sol", usable=760_000,
                 active=360_000, sid=CODEX_SID):
         directory = os.path.join(self.home, "sessions", "2026", "10", "14")
@@ -309,6 +335,10 @@ class _CodexFixture:
 
 
 class CodexInteractiveTest(_CodexFixture, unittest.TestCase):
+    def _policy_case(self, **kwargs):
+        _session, payload, row = self._collect(self.rollout(**kwargs))
+        return payload, row
+
     def _collect(self, path):
         session = Session(harness="codex", pid=4343, cwd=self.cwd, liveness="working",
                           elapsed_min=5, slug="project")
@@ -328,7 +358,7 @@ class CodexInteractiveTest(_CodexFixture, unittest.TestCase):
         # token_count's 760000 is 95% of the configured 800000; auto-compaction fires at
         # 90% of that window (ModelInfo::auto_compact_token_limit), not at the usable cap.
         self.assertEqual(payload["context_window_tokens"], 760_000)
-        self.assertEqual(payload["context_policy"]["effective_window_tokens"], 800_000)
+        self.assertIsNone(payload["context_policy"]["effective_window_tokens"])
         self.assertEqual(payload["context_display_window_tokens"], 720_000)
         self.assertEqual(payload["ctx_pct"], 50)
         self.assertEqual(payload["context_policy"]["runtime_version"], CODEX_VERSION)
@@ -387,6 +417,10 @@ class CodexInteractiveTest(_CodexFixture, unittest.TestCase):
 
 
 class CodexRegisteredTest(_CodexFixture, unittest.TestCase):
+    def _policy_case(self, **kwargs):
+        self.rollout(**kwargs)
+        return self._collect(self._job(kwargs["usable"], kwargs["active"]))
+
     def setUp(self):
         super().setUp()
         self.logs = os.path.join(self.tmp.name, ".dispatch", "logs")

@@ -137,6 +137,33 @@ class CodexStartupPolicyTest(unittest.TestCase):
             with self.subTest(created=created):
                 self.assertEqual(self.policy(session_created_at=created)["state"], "unknown")
 
+    def test_floored_usable_window_requires_an_invariant_final_trigger(self):
+        # 33% admits windows 86364..86366 with three distinct native triggers.
+        # 95% admits 800000..800001, both with trigger 720000. A lower configured
+        # limit can also make all otherwise distinct native triggers agree.
+        cases = ((33, 28500, None, None, None),
+                 (37, 37001, None, None, None),
+                 (95, 760000, None, 720000, None),
+                 (33, 28500, 70000, 70000, None),
+                 (33, 28500, 77728, None, None),
+                 (100, 800000, None, 720000, 800000))
+        for percent, usable, limit, trigger, window in cases:
+            with self.subTest(percent=percent, usable=usable, limit=limit):
+                document = json.loads((self.home / "models_cache.json").read_text())
+                document["models"][0]["effective_context_window_percent"] = percent
+                (self.home / "models_cache.json").write_text(json.dumps(document))
+                (self.home / "config.toml").write_text(
+                    "" if limit is None else f"model_auto_compact_token_limit = {limit}\n")
+                self.start = time.time()
+                _CODEX_EXECUTION_INPUTS.clear()
+                policy = self.policy(usable_window_tokens=usable)
+                self.assertEqual(policy["effective_window_tokens"], window)
+                self.assertEqual(policy["applied_trigger_tokens"], trigger)
+                self.assertEqual(policy["state"], "applied" if trigger else "unknown")
+                if trigger is None:
+                    self.assertEqual(policy["reason"],
+                                     "codex-applied-trigger-not-uniquely-determined")
+
 
 if __name__ == "__main__":
     unittest.main()

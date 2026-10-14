@@ -336,9 +336,13 @@ def codex_applied_policy(*, runtime_version, model, usable_window_tokens, sessio
     percent = _digits(entry.get("effective_context_window_percent")) if entry else None
     if not percent or percent > 100:
         return unknown("codex-model-catalogue-percent-not-verified")
-    window = -(-usable * 100 // percent)
-    if window * percent // 100 != usable:
+    # The native usable window is floored, so its inverse can name several
+    # original windows. Only an invariant final trigger is exact evidence.
+    lower = -(-usable * 100 // percent)
+    upper = -(-(usable + 1) * 100 // percent) - 1
+    if lower > upper or lower * percent // 100 != usable:
         return unknown("codex-usable-window-not-derivable")
+    window = lower if lower == upper else None
     if overrides["ambiguous"]:
         return unknown("codex-compaction-config-not-interpretable", effective_window_tokens=window)
     # A configured `model_auto_compact_token_limit` replaces the catalogue's; either is
@@ -346,9 +350,15 @@ def codex_applied_policy(*, runtime_version, model, usable_window_tokens, sessio
     limit = overrides["limit"]
     if limit is None:
         limit = _digits(entry.get("auto_compact_token_limit"))
-    trigger = window * 9 // 10
+    trigger = lower * 9 // 10
+    upper_trigger = upper * 9 // 10
     if limit is not None:
         trigger = min(trigger, limit)
+        upper_trigger = min(upper_trigger, limit)
+    # Both operations are monotone; equal endpoints prove the whole interval.
+    if trigger != upper_trigger:
+        return unknown("codex-applied-trigger-not-uniquely-determined",
+                       effective_window_tokens=window)
     return context_policy_snapshot(
         **base, effective_window_tokens=window, applied_trigger_tokens=trigger,
         enabled=True, enforced=True)
