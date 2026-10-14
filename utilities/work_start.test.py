@@ -1130,6 +1130,7 @@ class WorkStartTest(unittest.TestCase):
         self.assertIn('--message-file', results[0]['next_step'])
         self.assertIn('handoff-format error', results[0]['next_step'])
         self.assertIn('owner_log_file ' + str(Path(self.tmp.name) / 'owner.log'), results[0]['next_step'])
+        self.assertEqual(results[0]['owner_log_file'], str(Path(self.tmp.name) / 'owner.log'))
         self.assertNotIn('owner_report says', results[0]['next_step'])
         self.assertEqual(len(self.calls), 3)
         self.assertEqual(self.jobs.read_bytes(), stable)
@@ -2623,8 +2624,7 @@ class CoupledReviewSelfDispositionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"independent-review-required"):
             ship_parent_deploy.reviews(self.f.route,deploy,self.jobs,self.request)
         env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
-        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off",
-                   OWNER_ROUTE_SENTINEL="direct-correct",CODEX_DISPATCH_SANDBOX_FORCE="workspace-write")
+        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off")
         defaults=dict(W.start_work.__kwdefaults__)
         W.start_work.__kwdefaults__["run"]=self.native_owner_launch
         self.addCleanup(setattr,W.start_work,"__kwdefaults__",defaults)
@@ -2719,6 +2719,7 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
         import ship_parent_deploy
         env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
         env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off")
+        env.update(OWNER_ROUTE_SENTINEL="direct-correct",CODEX_DISPATCH_SANDBOX_FORCE="danger-full-access")
         defaults=dict(W.start_work.__kwdefaults__)
         W.start_work.__kwdefaults__["run"]=self.native_owner_launch
         self.addCleanup(setattr,W.start_work,"__kwdefaults__",defaults)
@@ -2727,7 +2728,7 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
             receipt=self.cli(correct,env)[-1]
             self.assertEqual(receipt["state"],"running",receipt)
             self.assertEqual(self.launch_env.get("OWNER_ROUTE_SENTINEL"), "direct-correct")
-            self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"), "workspace-write")
+            self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"), "danger-full-access")
             self.assertEqual(receipt["parent_next"],"bounded-wait")
             argv=shlex.split(receipt["parent_next_command"])
             self.assertEqual(Path(argv[1]).name,"capability-route.py")
@@ -2764,6 +2765,63 @@ class CoupledBlockedReviewDispositionTest(CoupledReviewSelfDispositionTest):
         self.assertEqual(self.request_path.read_bytes(),self.request_bytes)
         for path,raw in self.f.preserved.items():
             if path!=self.jobs:self.assertEqual(path.read_bytes(),raw)
+
+    def test_format_only_replacement_waits_then_corrects_through_public_cli(self):
+        import dispatch_supervisor_terminal as terminal
+        import dispatch_replacement
+        env={k:v for k,v in os.environ.items() if not k.startswith(("AGENT_","CODEX_","CLAUDE_","OPENCODE_"))}
+        env.update(CODEX_THREAD_ID="parent",AGENT_DISPATCH_JOBS=str(self.jobs),AGENT_ARTIFACT_CHECKPOINT="off",
+                   OWNER_ROUTE_SENTINEL="direct-correct",CODEX_DISPATCH_SANDBOX_FORCE="danger-full-access")
+        defaults=dict(W.start_work.__kwdefaults__)
+        W.start_work.__kwdefaults__["run"]=self.native_owner_launch
+        self.addCleanup(setattr,W.start_work,"__kwdefaults__",defaults)
+
+        first=self.cli(["correct","--jobs",str(self.jobs),"--attempt-id","att-owner",
+                        "--message-file",str(self.answer)],env)[-1]
+        self.assertEqual(first["state"],"running",first)
+        self.assertEqual(len(self.native_calls),1)
+        self.assertEqual(self.launch_env.get("OWNER_ROUTE_SENTINEL"),"direct-correct")
+        self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"),"danger-full-access")
+
+        malformed=(f"artifact: {self.f.output/'replacement-report.md'}\n"
+                   "verdict: BLOCKED — explanation\nblocker: format-only owner result")
+        classification=terminal.classify_codex_result(malformed)
+        self.assertEqual(classification.note,"dead-contract")
+        report=self.f.output/"replacement-report.md"
+        report.write_text("format-only owner result\n")
+        log=self.f.base/"format-only-owner.jsonl"
+        log.write_text(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":malformed}})+"\n"+
+                       json.dumps({"type":"turn.completed"})+"\n")
+        first_owner=self.cr._current_owner_attempt(self.jobs,"att-owner")
+        self.native_children[-1].communicate(timeout=5)
+        metadata=self.cr._find_attempt_row_metadata(self.jobs,first_owner)
+        metadata.update(note=classification.note,**classification.evidence(),log_file=str(log))
+        self.write_owner(metadata,"done")
+
+        starts=[self.cli(["start","--route",str(self.f.path),"--jobs",str(self.jobs)],env)[-1]
+                for _ in range(2)]
+        for receipt in starts:
+            self.assertEqual((receipt["state"],receipt["reason"],receipt["required_action"]),
+                             ("needs-attention","owner-blocked","answer-blocked-owner"),receipt)
+            self.assertIn("correction_command",receipt)
+        self.assertEqual(len(self.native_calls),1)
+
+        corrected=self.cli(["correct","--jobs",str(self.jobs),"--attempt-id",first_owner,
+                            "--message-file",str(self.answer)],env)[-1]
+        self.assertEqual(corrected["state"],"running",corrected)
+        self.assertEqual(len(self.native_calls),2)
+        self.assertEqual(self.launch_env.get("OWNER_ROUTE_SENTINEL"),"direct-correct")
+        self.assertEqual(self.launch_env.get("CODEX_DISPATCH_SANDBOX_FORCE"),"danger-full-access")
+        current=self.cr._current_owner_attempt(self.jobs,"att-owner")
+        source_meta=self.cr._find_attempt_row_metadata(self.jobs,first_owner)
+        family,_,_=dispatch_replacement.source_binding(self.jobs,source_meta)
+        record=dispatch_replacement._read(dispatch_replacement._record_path(self.jobs,family))
+        self.assertEqual(record["proof"]["source_result"],"CONTRACT")
+        recovery_args=SimpleNamespace(automatic_retry_of=first_owner,attempt_id=current,
+                                      jobs_path=str(self.jobs),worker_type="owner")
+        recovery=dispatch_replacement.recovery_instructions(recovery_args)
+        self.assertIn(self.answer.read_text().strip(),recovery)
+        self.assertEqual(self.cr._find_attempt_row_metadata(self.jobs,first_owner)["note"],"dead-contract")
 
     def test_actual_parent_only_normal_complete_and_strict_unchanged_32pins(self):
         import ship_parent_deploy

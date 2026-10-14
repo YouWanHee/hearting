@@ -1900,6 +1900,7 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
                 "required_action": "answer-blocked-owner" if owner_stop == "BLOCKED" else "answer-failed-owner",
                 "result": _outcome(jobs, aid),
                 **({"owner_report": report} if report else {}),
+                **({"owner_log_file": str(metadata["log_file"])} if not report and metadata.get("log_file") else {}),
                 "next_step": f"{opening} {report_context} Get the person's answer (or fix what it names), then run correction_command with "
                     "--message-file <answer file>: that continues this route at once in a replacement owner that "
                     "receives the answer. Do not close or recompose the route."}
