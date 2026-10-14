@@ -65,7 +65,7 @@ Interactive completion uses Codex's native queue, addressed to the caller's
 The exact-batch sidecar checks consumed and pending messages before sending;
 ambiguous sends may repeat. Only an exact Hearting item may restart an interrupted
 parent. The TUI owns questions and approvals; headless owners keep their separate
-supervisor. Default mode asks via waiting `request_user_input` (`default_mode_request_user_input`); after 60 s hidden + 60 s visible countdown it submits empty (typing cancels). Empty is no decision: restate at turn end (Fleet keeps `answer needed`); `_async` is fallback.
+supervisor. Default mode asks via waiting `request_user_input` (`default_mode_request_user_input`); it submits empty at 120 s (countdown from 60 s; typing cancels). Empty is no decision: restate at turn end (Fleet keeps `answer needed`); `_async`: fallback.
 Arbitrary detached shell output still does not auto-resume. For non-dispatch
 long-running work, obey `preflight.sh loop-info runtime-watch` and its explicit automatic-follow-up-impossible fallback
 instead of ending with a detached completion promise.
