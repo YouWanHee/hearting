@@ -75,6 +75,14 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                 expected += " " * (render._NAME_COL - render._dw(expected)) + now + " · age unknown"
             self.assertEqual(text(row), expected)
 
+    def test_successful_empty_summary_is_explicitly_dim(self):
+        row = self._session(summary=None)
+        row._details_pending = False
+        row._details_error = False
+        segments = render._context_detail_row(row, term_width=168, now_key="now_main")[0]
+        self.assertIn("no summary yet", text([segments]))
+        self.assertIn(("no summary yet", "dim"), segments)
+
     def test_stale_and_dead_rows_suppress_cached_detail(self):
         for state in ("stale", "dead"):
             row = render._context_detail_row(

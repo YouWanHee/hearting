@@ -506,6 +506,21 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
         self.assertEqual(probes, [])
         self.assertEqual(spawns, [])
 
+    def test_claude_cursor_migration_bypasses_fresh_sidecar_and_forwards_identity(self):
+        identity = "claude-transcript-v1:" + os.path.realpath(self.transcript)
+        titles.write("migrating", "이전 제목", summary="이전 요약", offset=1,
+                     cursor_kind="receipt-log-v0", now=time.time())
+        captured = []
+        with mock.patch.object(rt, "worker_argv", return_value=[sys.executable]), \
+                mock.patch.object(rt, "_executable_available", return_value=True), \
+                mock.patch.object(rt.subprocess, "Popen",
+                                  side_effect=lambda argv, **_kw: captured.append(list(argv)) or object()):
+            self.assertTrue(rt.maybe_spawn(
+                "claude", "migrating", self.transcript,
+                refresh_source={"kind": "claude-transcript", "cursor_kind": identity}))
+        argv = captured[0]
+        self.assertEqual(argv[argv.index("--cursor-kind") + 1], identity)
+
     def test_tiny_peer_only_append_skips_probe_but_short_new_user_work_refreshes(self):
         offset = os.path.getsize(self.transcript)
         ts = time.time() - 10 * rt.DEBOUNCE_SEC
@@ -725,6 +740,55 @@ class StormGuardTest(_ConfigHomeMixin, unittest.TestCase):
 
 
 class DeltaOffsetTest(_ConfigHomeMixin, unittest.TestCase):
+
+    def test_claude_source_identity_migration_reads_from_zero_and_rebinds_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "worker-session.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"message": "WORKER_HOME_ONLY conversation"}) + "\n")
+            identity = "claude-transcript-v1:" + os.path.realpath(path)
+            old_cursor = "receipt-log-v0"
+            titles.write("dispatch-att-migrate", "이전 제목", summary="이전 요약",
+                         summary_ts=123.0, offset=os.path.getsize(path) + 1000,
+                         cursor_kind=old_cursor, now=time.time())
+            prompts = []
+            original = rt.run_worker
+            rt.run_worker = lambda prompt, **_kwargs: prompts.append(prompt) or (
+                "TITLE: 새 대화 요약\nNOW: worker home 대화를 확인 중"
+            )
+            try:
+                rt.main(["--harness", "claude", "--sid", "dispatch-att-migrate",
+                         "--transcript", path, "--cursor-kind", identity, "--priority"])
+            finally:
+                rt.run_worker = original
+            sidecar = titles.read("dispatch-att-migrate")
+            self.assertIn("WORKER_HOME_ONLY conversation", prompts[0])
+            self.assertEqual(sidecar["cursor_kind"], identity)
+            self.assertEqual(sidecar["offset"], os.path.getsize(path))
+            self.assertEqual(sidecar["summary"], "worker home 대화를 확인 중")
+
+    def test_claude_cursor_migration_provider_failure_preserves_old_cursor_and_summary_age(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "worker-session.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"message": "new worker transcript"}) + "\n")
+            old_ts = time.time() - 900
+            titles.write("dispatch-att-migrate-fail", "이전 제목", summary="이전 요약",
+                         summary_ts=old_ts, offset=1, cursor_kind="receipt-log-v0", now=old_ts)
+            original = rt.run_worker
+            rt.run_worker = lambda *_args, **_kwargs: ""
+            try:
+                rt.main(["--harness", "claude", "--sid", "dispatch-att-migrate-fail",
+                         "--transcript", path,
+                         "--cursor-kind", "claude-transcript-v1:" + os.path.realpath(path),
+                         "--priority"])
+            finally:
+                rt.run_worker = original
+            sidecar = titles.read("dispatch-att-migrate-fail")
+            self.assertEqual(sidecar["cursor_kind"], "receipt-log-v0")
+            self.assertEqual(sidecar["offset"], 1)
+            self.assertEqual(sidecar["summary"], "이전 요약")
+            self.assertEqual(sidecar["summary_ts"], old_ts)
 
     def test_read_delta_from_offset(self):
         with tempfile.TemporaryDirectory() as tmp:

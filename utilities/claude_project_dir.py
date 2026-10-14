@@ -21,6 +21,8 @@ Usage from shell: `python3 claude_project_dir.py <path>` prints the name.
 from __future__ import annotations
 
 import sys
+import os
+from pathlib import Path
 
 MAX_NAME_LENGTH = 200
 _BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -61,6 +63,33 @@ def encode_project_dir(path: str) -> str:
     if len(name) <= MAX_NAME_LENGTH:
         return name
     return f"{name[:MAX_NAME_LENGTH]}-{_java_hash_base36(path)}"
+
+
+def resolve_session_transcript(session_id: str, cwd: str, *, expected_cwd: str,
+                               runtime_home: str) -> tuple[Path | None, str | None]:
+    """Resolve the one Claude transcript belonging to an announced attempt."""
+    if (not isinstance(session_id, str) or session_id in {".", ".."}
+            or not session_id or any(ch in session_id for ch in "/\\")
+            or any(ord(ch) < 32 for ch in session_id)):
+        return None, "invalid-supervisor-session-event"
+    if (not isinstance(cwd, str) or not os.path.isabs(cwd)
+            or not isinstance(expected_cwd, str) or not os.path.isabs(expected_cwd)):
+        return None, "invalid-supervisor-session-event"
+    if not isinstance(runtime_home, str) or not runtime_home or not os.path.isabs(runtime_home):
+        return None, "invalid-supervisor-session-event"
+    try:
+        if os.path.realpath(cwd) != os.path.realpath(expected_cwd):
+            return None, "supervisor-worktree-mismatch"
+        projects = Path(runtime_home) / "projects"
+        project_dir = (projects / encode_project_dir(cwd)).resolve()
+        transcript = (project_dir / (session_id + ".jsonl")).resolve()
+        if os.path.commonpath((str(projects.resolve()), str(project_dir))) != str(projects.resolve()):
+            return None, "invalid-supervisor-session-event"
+        if os.path.commonpath((str(project_dir), str(transcript))) != str(project_dir):
+            return None, "invalid-supervisor-session-event"
+    except (OSError, TypeError, ValueError):
+        return None, "invalid-supervisor-session-event"
+    return (transcript, None) if transcript.is_file() else (None, None)
 
 
 if __name__ == "__main__":

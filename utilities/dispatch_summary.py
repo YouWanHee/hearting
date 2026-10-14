@@ -31,7 +31,7 @@ if str(TOOLS) not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from claude_project_dir import encode_project_dir  # noqa: E402
+from claude_project_dir import resolve_session_transcript  # noqa: E402
 from dispatch_contract import (  # noqa: E402
     DispatchContractError,
     PID_HOST_NAMESPACE_PROOF,
@@ -256,6 +256,8 @@ def launch_summary_owner(
     review_artifact_root: str | Path | None = None,
     review_cycle_id: str | None = None,
     review_lease_nonce: str | None = None,
+    runtime_home: str | Path | None = None,
+    attempt_cwd: str | Path | None = None,
 ) -> dict[str, str]:
     """Launch and prove one exact-attempt supervisor; return registry metadata."""
 
@@ -287,6 +289,10 @@ def launch_summary_owner(
     ]
     if prompt is not None:
         argv += ["--prompt", str(prompt)]
+    if runtime_home is not None:
+        argv += ["--runtime-home", str(runtime_home)]
+    if attempt_cwd is not None:
+        argv += ["--attempt-cwd", str(attempt_cwd)]
     if review_artifact_root is not None:
         argv += [
             "--review-artifact-root", str(review_artifact_root),
@@ -363,8 +369,8 @@ def _log_signature(path: Path) -> tuple[int, int]:
         return 0, 0
 
 
-def _claude_projects_root() -> Path:
-    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+def _claude_projects_root(home: str | Path | None = None) -> Path:
+    home = home or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     return Path(home) / "projects"
 
 
@@ -392,6 +398,9 @@ def announced_session(
             head = handle.read(max(1, int(scan)))
     except OSError:
         return False, None
+    found: dict[str, str] | None = None
+    saw_supervisor = False
+    terminal_seen = False
     for raw in head.split(b"\n"):
         if not raw.strip():
             continue
@@ -399,49 +408,63 @@ def announced_session(
             row = json.loads(raw.decode("utf-8", "replace"))
         except ValueError:
             # A torn trailing line is not evidence either way; keep waiting.
+            if found is not None:
+                return True, found
             return False, None
-        if (isinstance(row, dict) and row.get("type") != "dispatch.supervisor.session"
-                and str(row.get("type") or "").startswith("dispatch.supervisor.")):
-            continue
-        if not isinstance(row, dict) or row.get("type") != "dispatch.supervisor.session":
-            return True, None
-        session_id = row.get("session_id")
-        if isinstance(session_id, str) and ATTEMPT_RE.fullmatch(session_id):
-            announced = {"session_id": session_id, "cwd": row.get("cwd") or ""}
+        if isinstance(row, dict) and str(row.get("type") or "").startswith("dispatch.supervisor."):
+            saw_supervisor = True
+            terminal_seen = terminal_seen or row.get("type") == "dispatch.supervisor.terminal"
+            if row.get("type") != "dispatch.supervisor.session":
+                continue
+            if found is not None:
+                return True, {"invalid": "multiple-supervisor-session-events"}
+            session_id = row.get("session_id")
+            cwd = row.get("cwd")
+            if not (isinstance(session_id, str) and ATTEMPT_RE.fullmatch(session_id)
+                    and isinstance(cwd, str) and os.path.isabs(cwd)):
+                return True, {"invalid": "invalid-supervisor-session-event"}
+            found = {"session_id": session_id, "cwd": cwd}
             if row.get("runtime"):
-                announced["runtime"] = row["runtime"]
+                found["runtime"] = row["runtime"]
             if row.get("runtime") == "opencode":
-                announced["parent_attempt_id"] = row.get("parent_attempt_id") or ""
-            return True, announced
-        return True, None
+                found["parent_attempt_id"] = row.get("parent_attempt_id") or ""
+            continue
+        if not isinstance(row, dict):
+            return (True, {"invalid": "invalid-supervisor-session-event"}) if saw_supervisor else (True, None)
+        terminal_seen = terminal_seen or row.get("type") in {"result", "turn.completed", "turn.failed"}
+        if not str(row.get("type") or "").startswith("dispatch.supervisor."):
+            if saw_supervisor or found is not None:
+                continue
+            return True, None
+    if found is not None:
+        return True, found
+    if saw_supervisor:
+        if terminal_seen:
+            return True, {"invalid": "missing-supervisor-session-event"}
+        return False, None
     return False, None
 
 
-def session_transcript(announced: dict[str, str]) -> Path | None:
+def session_transcript(announced: dict[str, str], *, expected_cwd: str | None = None,
+                       runtime_home: str | Path | None = None) -> Path | None:
     """Resolve one exact runtime transcript for an announced child session.
 
     Exact ``<session id>.jsonl`` only.  A missing transcript returns None rather
     than borrowing a same-cwd neighbour, which would stamp another session's text
     onto this attempt's NOW line.
     """
-    session_id = announced.get("session_id") or ""
-    if not ATTEMPT_RE.fullmatch(session_id):
-        return None
-    root = _claude_projects_root()
-    cwd = announced.get("cwd") or ""
-    candidates = []
-    if cwd:
-        candidates.append(root / _encoded_cwd(cwd) / f"{session_id}.jsonl")
-    # The runtime may resolve the project dir from a realpath that differs from the
-    # launch cwd (symlinked worktrees), so fall back to an exact session-id match.
-    candidates.extend(sorted(root.glob(f"*/{session_id}.jsonl")))
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
+    effective_home = str(runtime_home) if runtime_home is not None else str(
+        Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")))
+    expected = str(expected_cwd if expected_cwd is not None else announced.get("cwd") or "")
+    path, _reason = resolve_session_transcript(
+        announced.get("session_id") or "", announced.get("cwd") or "",
+        expected_cwd=expected, runtime_home=effective_home)
+    return path
 
 
-def _summary_source(log_path: Path, cache: dict[str, Any]) -> Path | None:
+def _summary_source(log_path: Path, cache: dict[str, Any], *,
+                    runtime_home: str | Path | None = None,
+                    attempt_cwd: str | Path | None = None) -> Path | None:
     """Return the file whose bytes feed this attempt's title/NOW refresh.
 
     Supervised owners follow the announced child transcript and wait for it: the
@@ -458,6 +481,9 @@ def _summary_source(log_path: Path, cache: dict[str, Any]) -> Path | None:
             return None
         cache["announced"] = announced
     announced = cache["announced"]
+    if isinstance(announced, dict) and announced.get("invalid"):
+        cache["source_reason"] = announced["invalid"]
+        return None
     if announced is None:
         cache["source"] = log_path
         return log_path
@@ -481,9 +507,13 @@ def _summary_source(log_path: Path, cache: dict[str, Any]) -> Path | None:
                                                    "session_id": announced["session_id"]})
             return db
         return None
-    transcript = session_transcript(announced)
+    transcript = session_transcript(announced, expected_cwd=str(attempt_cwd) if attempt_cwd else None,
+                                    runtime_home=runtime_home)
     if transcript is not None:
-        cache["source"] = transcript
+        cache.update(source=transcript, refresh_source={
+            "kind": "claude-transcript",
+            "cursor_kind": "claude-transcript-v1:" + str(transcript.resolve()),
+        })
     return transcript
 
 
@@ -521,6 +551,8 @@ def supervise(
     review_artifact_root: str | Path | None = None,
     review_cycle_id: str | None = None,
     review_lease_nonce: str | None = None,
+    runtime_home: str | Path | None = None,
+    attempt_cwd: str | Path | None = None,
 ) -> int:
     """Follow one governed process and maintain its attempt-scoped summary."""
 
@@ -583,6 +615,10 @@ def supervise(
             "started_at": started_at,
             "last_refresh_phase": None,
         }
+        if runtime_home is not None:
+            state["runtime_home"] = str(runtime_home)
+        if attempt_cwd is not None:
+            state["attempt_cwd"] = str(attempt_cwd)
         if review_fd is not None:
             state.update(
                 review_governed_lease=REVIEW_GOVERNED_LEASE_KIND,
@@ -601,7 +637,8 @@ def supervise(
         source = log_path
         while True:
             live, terminal_reason = _proc_live(target_pid, target_start)
-            resolved = _summary_source(log_path, source_cache)
+            resolved = _summary_source(log_path, source_cache, runtime_home=runtime_home,
+                                       attempt_cwd=attempt_cwd)
             if resolved is not None and resolved != source:
                 source = resolved
                 state.update(summary_source=str(source))
@@ -635,10 +672,28 @@ def supervise(
                 break
             time.sleep(max(0.05, poll))
 
-        # The child transcript, not the receipt log, is what settles for a supervised
-        # owner; both resolve through the same source so the quiet window watches the
-        # bytes the final refresh will actually read.
-        source = _summary_source(log_path, source_cache) or source
+        # Give late supervisor announcements/transcripts the existing bounded final
+        # settling window. Never substitute the control receipt for supervised input.
+        source = _summary_source(log_path, source_cache, runtime_home=runtime_home,
+                                 attempt_cwd=attempt_cwd)
+        # Codex native streams can be empty at process exit while their receipt
+        # is still the canonical source. The no-fallback rule is specific to a
+        # supervised Claude receipt, which carries no conversation bytes.
+        if source is None and harness != "claude":
+            source = log_path
+            source_cache["source"] = source
+        source_wait_deadline = time.monotonic() + max(0.0, final_grace)
+        while source is None and time.monotonic() < source_wait_deadline:
+            time.sleep(min(max(0.05, poll), 0.25))
+            source = _summary_source(log_path, source_cache, runtime_home=runtime_home,
+                                     attempt_cwd=attempt_cwd)
+        if source is None:
+            state.update(status="degraded", terminal_reason=terminal_reason,
+                         summary_source_reason=source_cache.get("source_reason", "summary_source_unavailable"),
+                         final_refresh_started=False, final_refresh_complete=False,
+                         finished_at=time.time())
+            _atomic_write(state_path, state)
+            return 0
         quiet_since = time.monotonic()
         last_signature = _log_signature(source)
         quiet_deadline = time.monotonic() + max(log_quiet * 4, 2.0)
@@ -667,7 +722,9 @@ def supervise(
                 stamps = _opencode_source_signatures(str(source))
                 source_ts = max((info[4] / 1e9 for info in stamps.values() if info), default=float("inf"))
                 db_fresh = (sidecar.get("ts") or 0) >= source_ts
-            if (db_fresh if db_source else offset >= final_size) and sidecar.get("summary"):
+            expected_cursor = db_source.get("cursor_kind") if isinstance(db_source, dict) else None
+            cursor_matches = not expected_cursor or sidecar.get("cursor_kind") == expected_cursor
+            if cursor_matches and (db_fresh if db_source and db_source.get("kind") == "opencode-db" else offset >= final_size) and sidecar.get("summary"):
                 final_complete = True
                 break
             if not final_started:
@@ -765,6 +822,8 @@ def ensure_attempt_owner(jobs: str | Path, attempt_id: str) -> dict[str, Any]:
                 target_pid=int(raw_pid),
                 target_start=target_start,
                 prompt_path=retained_prompt,
+                runtime_home=metadata.get("runtime_home"),
+                attempt_cwd=fields[3],
             )
         except (OSError, ValueError) as exc:
             return {"state": "failed", "reason": str(exc)}
@@ -803,6 +862,8 @@ def main(argv: list[str] | None = None) -> int:
     supervise_parser.add_argument("--pid", required=True, type=int)
     supervise_parser.add_argument("--proc-start", required=True)
     supervise_parser.add_argument("--prompt")
+    supervise_parser.add_argument("--runtime-home")
+    supervise_parser.add_argument("--attempt-cwd")
     supervise_parser.add_argument("--poll", type=float, default=DEFAULT_POLL)
     supervise_parser.add_argument("--initial-delay", type=float, default=DEFAULT_INITIAL_DELAY)
     supervise_parser.add_argument("--periodic-debounce", type=int, default=DEFAULT_PERIODIC_DEBOUNCE)
@@ -832,6 +893,8 @@ def main(argv: list[str] | None = None) -> int:
         periodic_debounce=args.periodic_debounce,
         final_grace=args.final_grace,
         log_quiet=args.log_quiet,
+        runtime_home=args.runtime_home,
+        attempt_cwd=args.attempt_cwd,
         review_artifact_root=args.review_artifact_root,
         review_cycle_id=args.review_cycle_id,
         review_lease_nonce=args.review_lease_nonce,
