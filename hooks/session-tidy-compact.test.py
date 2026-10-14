@@ -510,14 +510,19 @@ const ctx = {{ directory: {json.dumps(str(self.cwd))}, worktree: {json.dumps(str
     fresh.info.time.created = Date.now()
     return {{ data: [old, compactParent, fresh] }}
   }},
-  ...(scenario === "status-idle" ? {{ status: async (request) => {{
+  ...(["status-idle", "status-missing"].includes(scenario) ? {{ status: async (request) => {{
     calls.push(["status", sid, request.query])
+    if (scenario === "status-missing") return {{ data: {{}} }}
     return {{ data: {{ [sid]: {{ type: "idle" }} }} }}
   }} }} : {{}}),
 }} }} }}
 const plugin = await AgentHarnessGuards(ctx)
 const result = {{ calls }}
 const output = {{ context: [], prompt: "keep this prompt" }}
+if (scenario === "status-missing") {{
+  await plugin.event({{ event: {{ type: "session.status", properties: {{ sessionID: sid, status: {{ type: "idle" }} }} }} }})
+  result.preBookingIdleEmitted = true
+}}
 try {{
   await plugin["experimental.session.compacting"]({{ sessionID: sid }}, output)
   result.before = "ok"
@@ -576,6 +581,13 @@ console.log(JSON.stringify(result))
         payload = json.loads(runtime[0][2])
         self.assertEqual((payload["sessionID"], payload["status"]), ("ses_fixture", "idle"))
         self.assertGreater(payload["observed_at"], 0)
+
+    def test_opencode_prebooking_cached_idle_is_not_relabelled_when_current_status_is_missing(self):
+        data, hooks = self._opencode_fixture("status-missing")
+        self.assertTrue(data["preBookingIdleEmitted"])
+        self.assertIn(["status", "ses_fixture", None], data["calls"])
+        runtime = [h for h in hooks if h[0] == "worker-state-hook.py" and h[1][0] == "runtime-status"]
+        self.assertEqual(runtime, [])
 
     def test_opencode_unknown_identity_keeps_the_ledger_only_compact_record(self):
         data, hooks = self._opencode_fixture("unknown")

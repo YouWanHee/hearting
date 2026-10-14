@@ -315,7 +315,7 @@ async function currentCompactRuntimeStatus(ctx, sid) {
     ])
     const data = sdkResponseData(result)
     const value = data?.[sid] || data?.status?.[sid]
-    if (value == null) return runtimeStatusBySession.get(sid)?.status === "idle" ? "idle" : ""
+    if (value == null) return ""
     return typeof value === "string" ? value : String(value?.type || "")
   } catch { return "" } finally { clearTimeout(timer) }
 }

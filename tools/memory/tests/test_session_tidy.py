@@ -1398,10 +1398,25 @@ class OpenCodeCompactObservationTest(TidyCase):
                               compact_context=context)
             clear.schedule_for_enqueue(seat, "opencode", self.SID, str(self.cwd), compact_context=context)
             req = clear.read_reservation(seat.key)
-            self.assertEqual(st.run_hook("opencode", "runtime-status", self.SID, cwd=str(self.cwd),
-                                         compact_context={"status": "idle", "observed_at": req["created"] + 1},
-                                         env=os.environ), "booking=pending")
+            stale = st.run_hook("opencode", "runtime-status", self.SID, cwd=str(self.cwd),
+                                compact_context={"status": "idle",
+                                                 "observed_at": (req["created"] - 5) * 1000},
+                                env=os.environ)
+            self.assertEqual(stale, "")
+            held = clear.read_reservation(seat.key)
+            self.assertNotIn("runtime_status", held)
+            self.assertEqual(clear.compact_observation(held)["state"], "pending")
             snapshot_calls, send_calls = [], []
+            idle_events, observations = [], []
+
+            def observe_new_idle(_seconds):
+                idle_events.append(st.run_hook(
+                    "opencode", "runtime-status", self.SID, cwd=str(self.cwd),
+                    compact_context={"status": "idle", "observed_at": (req["created"] + 1) * 1000},
+                    env=os.environ))
+                accepted = clear.read_reservation(seat.key)
+                observations.append((accepted["runtime_status"], clear.compact_observation(accepted)["state"]))
+
             with mock.patch.object(handover, "write_snapshot_locked",
                                    side_effect=lambda *a, **k: snapshot_calls.append(1) or 1):
                 result = clear.run_helper(
@@ -1409,11 +1424,17 @@ class OpenCodeCompactObservationTest(TidyCase):
                     steward=lambda *_a: send_calls.append("clear") or {
                         "cleared": "true", "new_session": "sid-next"},
                     continuer=lambda *_a: send_calls.append("continue") or {"continued": "true"},
-                    sleep=lambda _s: None)
+                    sleep=observe_new_idle)
             with self.iso.patched_environ():
                 saved = st.read_latest_card(seat)
         self.assertEqual(result, "continued")
         self.assertEqual(send_calls, ["clear", "continue"])
+        self.assertEqual(idle_events, ["booking=pending"])
+        self.assertEqual(len(observations), 1)
+        runtime_status, observation_state = observations[0]
+        self.assertEqual((runtime_status["sid"], runtime_status["status"]), (self.SID, "idle"))
+        self.assertGreater(runtime_status["observed_at"], req["created"])
+        self.assertEqual(observation_state, "ready")
         self.assertEqual(snapshot_calls, [1])
         self.assertIn("새 세션에서 볼 결론", saved["body"])
         self.assertIn(str(self.iso.opencode_db), saved["body"])
