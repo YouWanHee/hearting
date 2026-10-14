@@ -57,11 +57,11 @@ class GpuOwnerResourceStartTest(unittest.TestCase):
         self.f.env["COMPUTE_HOSTS_CONFIG"] = str(inventory)
         self.f.env["AGENT_RESOURCE_RUN_INDEX"] = str(self.f.root / "resource-index.json")
 
-    def readiness(self, cwd, jobs, parent, children, *, gpu_route=None):
+    def readiness(self, cwd, jobs, parent, children, *, gpu_route=None, owner_harnesses=None):
         with mock.patch.object(P.NESTED, "command_check", return_value=("supported", "fixture", "")), \
              mock.patch.object(P.NESTED, "prospective_owner_registry_check", return_value=(True, "")):
             return P.generate(worktree=Path(cwd), jobs=Path(jobs),
-                owner_harnesses=[parent], child_harnesses=children,
+                owner_harnesses=list(owner_harnesses or [parent]), child_harnesses=children,
                 codex_execution_selection=G.select(gpu_route))
 
     def compose(self):

@@ -1367,13 +1367,14 @@ class SelectionPinInheritanceTest(PinnedStartBase):
         seen = []
         with mock.patch.object(R, "_compose_default_children", return_value=("codex",)), \
                 mock.patch.object(R, "_compose_readiness",
-                                  side_effect=lambda *a: seen.append(a[3]) or {"tuples": [], "candidates": []}):
+                                  side_effect=lambda *a, **kw: seen.append((a[3], kw.get("owner_harnesses"))) or {"tuples": [], "candidates": []}):
             REAL_PROPOSAL_READINESS(self.route, self.jobs)
         self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1], ("codex",))
         with mock.patch.object(R, "_compose_default_children", wraps=R._compose_default_children) as children, \
                 mock.patch.object(R, "_compose_readiness", return_value={"tuples": [], "candidates": []}):
             REAL_PROPOSAL_READINESS(self.route, self.jobs)
-        self.assertEqual(children.call_args.args[0], self.pins_sealed_on_frame())
+        self.assertIn(mock.call(self.pins_sealed_on_frame()), children.call_args_list)
 
 
 class CatalogueInputTest(F.FramedBase):

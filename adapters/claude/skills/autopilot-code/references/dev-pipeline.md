@@ -22,6 +22,11 @@ Each tuple answers "may the parent of a dispatch-depth-2 node spawn that child?"
 readiness generator so the caller never has to reproduce the prospective-owner context or
 assemble the evidence schema by hand.
 
+Automatic `compose` and post-frame proposal assembly inspect every enabled prospective owner
+against the selected child pool and seal each actual owner/worktree probe. Keep a manual
+`--owner-harness` invocation scoped to diagnosing that exact target; automatic selection uses
+the sealed evidence and the existing allocation policy.
+
 ```bash
 python3 "$AGENT_HOME/utilities/dispatch-readiness.py" \
   --worktree "$WORKTREE" --jobs "$CANONICAL_JOBS" \

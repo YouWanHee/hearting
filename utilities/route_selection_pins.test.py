@@ -223,8 +223,11 @@ class ComposeSealTest(IsolatedCase):
                     with mock.patch.object(R, "_compose_readiness", return_value={
                             "tuples": evidence(parent=harness)["tuples"]}) as probe:
                         route = self.compose(pins=pins, dispatch_evidence=inherited)
-                    if inherited is None or harness != "claude":
-                        self.assertEqual(probe.call_args.args[2], harness)
+                    if inherited is None:
+                        self.assertEqual(probe.call_args.kwargs["owner_harnesses"],
+                                         ("claude", "codex", "opencode"))
+                    elif harness != "claude":
+                        self.assertEqual(probe.call_args.args[2], harness)  # exact pinned-owner top-up
                     else:
                         probe.assert_not_called()
                     self.assertIn(harness, {row["parent_harness"] for row in route["dispatch_evidence"]["tuples"]})

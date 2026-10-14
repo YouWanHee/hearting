@@ -7345,6 +7345,26 @@ class FixtureRegistryGuardTest(unittest.TestCase):
 
 class ComposeRouteTest(TestRoute):
  """SD-135: `compose` seals a preset-free shape/subgraph through the same sealer."""
+ def test_automatic_depth_two_evidence_uses_enabled_prospective_owner_pool(self):
+  readiness = self.evidence()
+  enabled = ("claude", "codex", "opencode")
+  for caller in enabled:
+   with self.subTest(caller=caller), \
+        mock.patch.object(R, "_compose_default_children", return_value=enabled), \
+        mock.patch.object(R, "_compose_readiness", return_value=readiness) as probe:
+    route = self.compose(dispatch_evidence=None, parent_harness=caller,
+                         children=["claude", "codex", "opencode"])
+   self.assertEqual(probe.call_args.kwargs["owner_harnesses"], enabled)
+   self.assertEqual({row["parent_harness"] for row in route["dispatch_evidence"]["tuples"]},
+                    {row["parent_harness"] for row in readiness["tuples"]})
+   R.verify_route(route, R.ROOT)
+
+ def test_owner_and_worker_pins_do_not_add_disabled_automatic_owners(self):
+  self.assertEqual(R._compose_default_owners(), R._compose_default_children())
+  pins = {"owner": {"harness": "gemini"}, "worker": {"harness": "opencode"}}
+  with mock.patch.object(R, "_compose_default_children", return_value=("claude", "codex")):
+   self.assertEqual(R._compose_default_owners(pins), ("claude", "codex"))
+
  def test_auto_owner_close_retains_verification_and_every_leg_input(self):
   for intensity in ("strong","thorough","adversarial"):
    route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity=intensity,

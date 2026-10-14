@@ -3472,7 +3472,8 @@ def _compose_default_jobs():
     return stable_state_root(os.environ) / "jobs.log"
 
 
-def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None):
+def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None,
+                       owner_harnesses=None):
     spec = importlib.util.spec_from_file_location(
         "hearting_dispatch_readiness", ROOT / "utilities" / "dispatch-readiness.py")
     module = importlib.util.module_from_spec(spec)
@@ -3480,7 +3481,8 @@ def _compose_readiness(cwd, jobs, parent_harness, children, *, gpu_route=None):
     try:
         return module.generate(
             worktree=Path(cwd), jobs=Path(jobs),
-            owner_harnesses=[parent_harness], child_harnesses=list(children),
+            owner_harnesses=list(owner_harnesses) if owner_harnesses is not None else [parent_harness],
+            child_harnesses=list(children),
             **({"codex_execution_selection": GPU_SANDBOX.select(gpu_route)}
                if gpu_route and GPU_SANDBOX.gpu_resource_nodes(gpu_route) else {}),
         )
@@ -3832,6 +3834,19 @@ def _compose_default_children(pins=None):
     return tuple(children)
 
 
+def _compose_default_owners(pins=None):
+    """Return enabled prospective owners; exact pinned-owner probes stay separate.
+
+    Reuse the existing enabled-pool loader so owner discovery has the same fallback
+    and policy source as child discovery. A disabled owner pin is not an automatic
+    candidate; its dedicated pin probe and refusal path remain authoritative.
+    """
+    # Enabled pins are already present in this policy pool. Do not pass the
+    # whole pin map to the child helper: worker/frame pins are not owner inputs,
+    # and disabled owner pins are handled by the exact-target probe below.
+    return _compose_default_children()
+
+
 def _apply_selection_pins(route, pins):
     """Seal `pins` into `route` and stamp the worker pin on every depth-2 node.
 
@@ -4043,6 +4058,8 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             if node.get("model_profile") and node["id"] not in explicit_profiles:
                 explicit_profiles[node["id"]] = node["model_profile"]
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
+    resume_depth_two = resume_graph and any(
+        node.get("dispatch_depth") == 2 for node in selected_recipe["standard_plus"]["nodes"])
     gpu_route = {"capability": capability, "nodes": selected_recipe["standard_plus"]["nodes"],
                  "selection": {"promotion_signals": [{"signal": s} for s in signals]}}
     if (shape == "staged" and not owner_only and dispatch_evidence is not None
@@ -4064,13 +4081,13 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                 row for row in dispatch_evidence["tuples"] if row.get("parent_harness") != "codex"
             ] + readiness["tuples"]}
     owner_pin = (selection_pins or {}).get("owner", {}).get("harness")
-    probe_parent = owner_pin if shape == "staged" and owner_pin else parent_harness
-    if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
-        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), probe_parent,
+    if (shape in ("staged", "framed") or resume_depth_two) and not owner_only and dispatch_evidence is None:
+        readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
                                        children or _compose_default_children(selection_pins),
-                                       gpu_route=gpu_route if shape == "staged" else None)
+                                       gpu_route=gpu_route if shape == "staged" else None,
+                                       owner_harnesses=_compose_default_owners(selection_pins))
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
-    elif shape == "staged" and not owner_only and owner_pin and not any(
+    if shape == "staged" and not owner_only and owner_pin and not any(
             row.get("parent_harness") == owner_pin and row.get("status") == "supported"
             and row.get("launch_authority") == "conductor"
             for row in (dispatch_evidence or {}).get("tuples", [])):
@@ -4082,9 +4099,14 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         dispatch_evidence = {**dispatch_evidence,
                              "tuples": dispatch_evidence["tuples"] + readiness["tuples"]}
     if (shape == "solo" or owner_only or resume_graph) and registered_headless_evidence is None:
-        readiness = readiness or _compose_readiness(cwd, jobs or _compose_default_jobs(),
-                                                    parent_harness, children or _compose_default_children(selection_pins))
-        registered_headless_evidence = {"candidates": readiness["candidates"]}
+        # Resume routes keep their legacy caller-scoped quick candidates even
+        # when their staged depth-2 tuples now include the enabled owner pool.
+        candidate_readiness = readiness
+        if resume_depth_two or candidate_readiness is None:
+            candidate_readiness = _compose_readiness(
+                cwd, jobs or _compose_default_jobs(), parent_harness,
+                children or _compose_default_children(selection_pins))
+        registered_headless_evidence = {"candidates": candidate_readiness["candidates"]}
     common = dict(
         signals=signals, transport=None, transport_evidence=transport_evidence,
         tracking=tracking, tracked_gate_evidence=gate, slug=slug,
@@ -4185,7 +4207,8 @@ def proposal_readiness(frame_route, jobs):
     """One read-only readiness probe shared by every proposal leg's memory compile."""
     from dispatch_parent_completion import default_parent_harness
     return _compose_readiness(frame_route["cwd"], jobs, default_parent_harness("claude"),
-                              _compose_default_children(_frame_pin_rows(frame_route) or None))
+                              _compose_default_children(_frame_pin_rows(frame_route) or None),
+                              owner_harnesses=_compose_default_owners(_frame_pin_rows(frame_route) or None))
 
 
 def _leg_compose_kwargs(leg_args, *, frame_route, frame_cycle_id, slug):
