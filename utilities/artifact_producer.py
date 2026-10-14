@@ -5826,6 +5826,22 @@ def _stream_file_facts(path: Path) -> Tuple[str, int]:
     return "sha256:" + hasher.hexdigest(), size
 
 
+def _manifest_bundle_directories(document: Mapping[str, Any]) -> Set[str]:
+    """The raw trees already represented by directory-bundle rows in a sealed document."""
+    bundle_artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                        if isinstance(row, Mapping) and row.get("type") == "directory-bundle"}
+    directories: Set[str] = set()
+    for row in document.get("artifact_revisions", []) or []:
+        if not isinstance(row, Mapping) or row.get("artifact_id") not in bundle_artifacts:
+            continue
+        artifact = bundle_artifacts[row.get("artifact_id")]
+        title = artifact.get("title")
+        if (row.get("media_type") == artifact_directory_bundle.MEDIA_TYPE
+                and isinstance(title, str) and title and ".." not in title.split("/")):
+            directories.add("artifacts/" + title)
+    return directories
+
+
 def _scan_cycle_facts(directory: Path, *, excluded: List[str],
                       excluded_symlinks: List[str],
                       known: Optional[Mapping[str, Sequence[Any]]] = None,
@@ -5843,19 +5859,8 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
         raise ProducerError("artifacts-dir-missing", str(artifacts))
-    bundle_directories = set()
     document = _read_json(directory / "manifest.json")
-    if isinstance(document, Mapping):
-        bundle_artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
-                            if isinstance(row, Mapping) and row.get("type") == "directory-bundle"}
-        for row in document.get("artifact_revisions", []) or []:
-            if not isinstance(row, Mapping) or row.get("artifact_id") not in bundle_artifacts:
-                continue
-            artifact = bundle_artifacts[row.get("artifact_id")]
-            title = artifact.get("title")
-            if (row.get("media_type") == artifact_directory_bundle.MEDIA_TYPE
-                    and isinstance(title, str) and title and ".." not in title.split("/")):
-                bundle_directories.add("artifacts/" + title)
+    bundle_directories = _manifest_bundle_directories(document) if isinstance(document, Mapping) else set()
     for entry in _walk_files(directory):
         rel = entry.relative_to(directory).as_posix()
         if rel == artifact_locator.CYCLE_BINDING or not rel.startswith("artifacts/"):
@@ -6252,6 +6257,9 @@ def _prescan_cycle(root: Path, cycle_id: str, *,
             return None  # a link or a pipe is for the locked command to refuse, never to be read here
         document = json.loads(manifest_path.read_bytes().decode("utf-8"))
         scan = _Prescan(artifact_manifest.manifest_digest(document), [], {}, [], [])
+        # A sealed cycle's current directory selection is only a race snapshot. Its
+        # manifest decides whether those paths stay file rows or are bundle coverage.
+        scan.bundle_selection = list(artifact_directory_bundle.select_outermost(manifest_path.parent / "artifacts"))
         scan.facts = _scan_cycle_facts(
             manifest_path.parent, excluded=scan.excluded, excluded_symlinks=scan.excluded_symlinks,
             known=_read_refresh_state(root, cycle_id).get("files", {}), fingerprints=scan.fingerprints)
@@ -6732,7 +6740,8 @@ def _pruned_directory(parts: Sequence[str]) -> bool:
             or _browser_profile(parts, directory=True))
 
 
-def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, ...]]):
+def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, ...]],
+                 bundle_directories: Sequence[Tuple[str, ...]] = ()):
     """Entries under `top` in name order, depth first, as `(parts, DirEntry, is_dir)`.
 
     `after` is the last entry an earlier run finished: everything up to it is
@@ -6745,22 +6754,23 @@ def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, .
     for entry in entries:
         parts = prefix + (entry.name,)
         is_dir = entry.is_dir(follow_symlinks=False)
-        enter = is_dir and not _pruned_directory(parts)
+        inside_bundle = any(parts[:len(bundle)] == bundle for bundle in bundle_directories)
+        enter = is_dir and not _pruned_directory(parts) and not inside_bundle
         if after is not None:
             head = after[:len(parts)]
             if parts < head:
                 continue
             if parts == after:
                 if enter:
-                    yield from _walk_sorted(entry.path, parts, None)
+                    yield from _walk_sorted(entry.path, parts, None, bundle_directories)
                 continue
             if parts == head:
                 if enter:
-                    yield from _walk_sorted(entry.path, parts, after)
+                    yield from _walk_sorted(entry.path, parts, after, bundle_directories)
                 continue
         yield parts, entry, is_dir
         if enter:
-            yield from _walk_sorted(entry.path, parts, None)
+            yield from _walk_sorted(entry.path, parts, None, bundle_directories)
 
 
 def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str, Sequence[Any]],
@@ -6779,13 +6789,19 @@ def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str,
     scan = _RefreshScan(from_top=after is None)
     last_parts: Optional[Tuple[str, ...]] = None
     processed = 0
-    for parts, entry, is_dir in _walk_sorted(str(artifacts), (), after):
+    document = _read_json(directory / "manifest.json")
+    bundle_directories = _manifest_bundle_directories(document) if isinstance(document, Mapping) else set()
+    bundle_parts = {tuple(path.removeprefix("artifacts/").split("/")) for path in bundle_directories}
+    for parts, entry, is_dir in _walk_sorted(str(artifacts), (), after, bundle_parts):
         if processed and budget.walk_exhausted():
             scan.complete, scan.cursor = False, "/".join(last_parts) if last_parts else cursor
             return scan
         budget.walked += 1
         processed += 1
         rel = "artifacts/" + "/".join(parts)
+        if parts in bundle_parts:
+            last_parts = parts
+            continue
         if entry.is_symlink():
             scan.excluded_symlinks.append(rel)
             last_parts = parts
@@ -6843,9 +6859,11 @@ def _confirmed_absent(directory: Path, document: Mapping[str, Any], scan: _Refre
     remaining = (_UNLIMITED if budget.max_walk_entries == _UNLIMITED
                  else max(0, int(budget.max_walk_entries) - budget.walked))
     allowance = remaining + REFRESH_ABSENCE_CHECK_FLOOR
+    bundle_directories = _manifest_bundle_directories(document)
     for row in document.get("artifact_revisions", []) or []:
         rel = row.get("locator", {}).get("path") if isinstance(row, dict) else None
-        if not isinstance(rel, str) or rel in scan.visited or _outside_inclusion_rule(rel):
+        if (not isinstance(rel, str) or rel in scan.visited or _outside_inclusion_rule(rel)
+                or any(rel.startswith(path + "/") for path in bundle_directories)):
             continue
         if allowance <= 0:
             break
