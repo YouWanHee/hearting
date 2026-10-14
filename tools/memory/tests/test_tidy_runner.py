@@ -357,6 +357,30 @@ class RunnerCase(unittest.TestCase):
                 pass
         self.assertEqual(left, [], "detached processes were still running at the end of the test")
 
+    def test_project_queue_round_trip_uses_the_callers_card_slot(self):
+        with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
+            seat_b = st.resolve_seat("claude", str(self.cwd), sid="runner-B")
+            seat_a = st.resolve_seat("claude", str(self.cwd), sid="runner-A")
+            with st.seat_lock(seat_b.key):
+                st.write_card(seat_b, "claude", "runner-B", "B card", cwd=str(self.cwd))
+            with st.seat_lock(seat_a.key):
+                st.write_card(seat_a, "claude", "runner-A", "A card", cwd=str(self.cwd))
+            with mock.patch.object(runner, "start_detached", return_value=0):
+                item = runner.enqueue_item(st.seat_for_project("claude", seat_b.project_key),
+                                           "claude", "runner-B", str(self.cwd))
+            self.assertEqual((item["seat"]["sid"], item["card_generation"]), ("runner-B", 1))
+            run_dir = self.iso.root / "assemble"
+            run_dir.mkdir()
+            bundle = runner.assemble(item, "batch-project", run_dir)
+            doc = json.loads(bundle.path.read_text(encoding="utf-8"))
+            self.assertEqual(doc["card"], "B card")
+            before_a = st.read_latest_card(seat_a)
+            with mock.patch.object(runner, "memory_refs", return_value=([{"id": "mem-B"}], 0)), \
+                    mock.patch.object(runner, "coverage_note", return_value="covered"):
+                runner.publish_memory(item, "batch-project", run_dir, bundle, "applied")
+            self.assertEqual(st.read_latest_card(seat_a), before_a)
+            self.assertEqual(st.read_latest_card(seat_b)["memory_refs"]["refs"], [{"id": "mem-B"}])
+
     # -- memory ------------------------------------------------------------
 
     def mem(self, *args):
