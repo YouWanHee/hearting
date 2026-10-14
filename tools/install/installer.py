@@ -77,7 +77,8 @@ def build_parser():
     common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     common.add_argument(
         "--runtime", action="append", choices=RUNTIMES, dest="runtimes",
-        help="Target runtime (repeatable); defaults to the positional target or all runtimes.",
+        help="Target runtime (repeatable); defaults to the positional target or all runtimes "
+             "(verify: the runtimes installed in this scope).",
     )
     common.add_argument("--scope", choices=["global", "project"], default="global")
     common.add_argument("--dry-run", action="store_true", help="Print the plan without applying it")
@@ -279,12 +280,35 @@ def build_parser():
     return p
 
 
-def resolve_runtimes(args):
-    """Combine a positional target and repeated ``--runtime`` options."""
+def installed_runtimes(scope, *, activated_only=False):
+    """Return the runtimes installed in ``scope``, in ``RUNTIMES`` order.
+
+    A runtime is installed when it has an activation record or, unless
+    ``activated_only``, a legacy copy-install manifest.
+    """
+    installed = []
+    for runtime in RUNTIMES:
+        records = [paths.harness_state_dir(runtime, scope) / "activation.json"]
+        if not activated_only:
+            records.append(manifest._manifest_path(runtime, scope))
+        if any(record.exists() or record.is_symlink() for record in records):
+            installed.append(runtime)
+    return installed
+
+
+def resolve_runtimes(args, installed_only=False):
+    """Combine a positional target and repeated ``--runtime`` options.
+
+    With ``installed_only``, no target or ``all`` names the runtimes installed
+    in this scope, so a runtime that was never installed here is not checked
+    as a broken one. With none installed it still names every runtime.
+    """
     if args.runtimes:
         return list(args.runtimes)
     target = getattr(args, "target", None)
     if target in (None, "all"):
+        if installed_only:
+            return installed_runtimes(getattr(args, "scope", "global")) or list(RUNTIMES)
         return list(RUNTIMES)
     return [target]
 
@@ -482,7 +506,7 @@ def cmd_install(args):
 
 
 def cmd_verify(args):
-    runtimes = resolve_runtimes(args)
+    runtimes = resolve_runtimes(args, installed_only=True)
     all_checks = []
     ok = True
     for rt in runtimes:
@@ -816,6 +840,10 @@ def cmd_status(args):
         healthy = freshness in ("fresh", "not-activated")
         checks.append({"id": f"{rt}.status", "ok": healthy, "detail": detail})
         lines.append(f"{rt}: {detail}")
+        # A runtime with neither an activation nor a copy install has no
+        # version to disagree with the installed ones.
+        if freshness == "not-activated" and version == "not-installed":
+            continue
         observed.append({"runtime": rt, "version": version,
                          "source_root": (activation or {}).get("source_root")})
     versions = sorted({row["version"] for row in observed if row["version"]})
@@ -1117,9 +1145,20 @@ def cmd_uninstall(args):
     return {"runtime": runtimes, "channel": "dev", "checks": checks, "drift": [], "exit": EXIT_OK, "lines": lines}
 
 
-def _runtime_targets(value):
+# Commands that read an existing activation: for them ``all`` names the
+# activated runtimes, so a runtime never activated here is not refused or
+# reported missing. ``activate`` keeps every runtime.
+_ACTIVATED_RUNTIME_COMMANDS = {"status", "doctor", "refresh"}
+
+
+def _runtime_targets(value, command=None, scope="global"):
     values = value if isinstance(value, list) else [value]
     if not values or "all" in values:
+        if command in _ACTIVATED_RUNTIME_COMMANDS:
+            activated = installed_runtimes(scope, activated_only=True)
+            if activated:
+                return [runtime for runtime in runtime_activation.RUNTIMES
+                        if runtime in activated or runtime in values]
         return list(runtime_activation.RUNTIMES)
     result = []
     for runtime in values:
@@ -1142,7 +1181,7 @@ def _runtime_emit_shape(command, reports, exit_code, lines):
 
 
 def cmd_runtime(args):
-    targets = _runtime_targets(args.runtime)
+    targets = _runtime_targets(args.runtime, args.runtime_command, args.scope)
     reports = []
     lines = []
     exit_code = EXIT_OK
