@@ -313,6 +313,11 @@ def apply_runtime_config(config: Mapping[str, object], *, environ: Mapping[str, 
                 continue
             input_cap = native_limits.get("input", configured_limits.get("input"))
             output_cap = native_limits.get("output", configured_limits.get("output"))
+            # A config entry makes OpenCode rebuild the catalog record (dropping
+            # e.g. tiered cost), so add one only where the budget lowers a limit.
+            if (model_id not in config_models and cap <= int(requested)
+                    and (type(input_cap) is not int or input_cap <= cap)):
+                continue
             try:
                 content, _limits = apply_context_override(
                     content, model, requested,

@@ -33,7 +33,8 @@ class OpenCodeContextPluginTest(unittest.TestCase):
             catalog = {
                 "openai": {"env": ["OPENAI_API_KEY"], "models": {
                     "gpt": {"limit": {"context": 1000000, "input": 922000, "output": 8192}},
-                    "second": {"limit": {"context": 900000, "input": 850000, "output": 7000}}}},
+                    "second": {"limit": {"context": 900000, "input": 850000, "output": 7000}},
+                    "small": {"limit": {"context": 300000, "input": 250000, "output": 4096}}}},
                 "provider-without-input": {"models": {"tiny": {
                     "limit": {"context": 500000, "output": 4096}}}},
                 "recent-provider": {"models": {"second": {
@@ -85,6 +86,8 @@ console.log(JSON.stringify({{ after, again, disabled, restricted, elapsed_ms: pe
             self.assertEqual(after["provider"]["recent-provider"]["models"]["second"]["limit"],
                              {"context": 600000, "input": 600000, "output": 7000})
             self.assertNotIn("unloaded-catalog-only", after["provider"])
+            # Native limits already under the budget: no entry, so OpenCode keeps the catalog record.
+            self.assertNotIn("small", after["provider"]["openai"]["models"])
             self.assertEqual(result["disabled"]["provider"]["openai"], config["provider"]["openai"])
             self.assertNotIn("recent-provider", result["disabled"]["provider"])
             self.assertNotIn("recent-provider", result["restricted"]["provider"])
