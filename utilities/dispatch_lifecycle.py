@@ -32,7 +32,7 @@ DETACHED = "detached"
 FOREGROUND_SCOPED = "foreground-scoped"
 LIFECYCLES = (DETACHED, FOREGROUND_SCOPED)
 
-FOREGROUND_TIMEOUT_DEFAULT = 3600.0  # 1h: what a non-positive/non-finite request clamps to
+FOREGROUND_TIMEOUT_DEFAULT = 14400.0  # 4h: the default wait, and what a non-positive/non-finite request clamps to
 FOREGROUND_TIMEOUT_MAX = 86400.0  # 24h hard ceiling: no finite request may be effectively infinite
 _REVIEW_WITNESS_UNLOCK_TIMEOUT = 1.0
 _REVIEW_WITNESS_POLL_INTERVAL = 0.02

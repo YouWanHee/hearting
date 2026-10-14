@@ -1696,7 +1696,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     p.add_argument("--broker-root", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--broker-timeout", type=float, help=argparse.SUPPRESS)
     p.add_argument("--direct-timeout", type=float, default=DIRECT_TIMEOUT_DEFAULT)
-    p.add_argument("--foreground-timeout", type=float, default=3600.0)
+    p.add_argument("--foreground-timeout", type=float, default=FOREGROUND_TIMEOUT_DEFAULT)
     p.add_argument("--progress-window-seconds", type=float, default=300.0)
     p.add_argument("--watchdog-max-windows", type=int, default=12)
     p.add_argument("--native-attempt-id")
