@@ -114,6 +114,28 @@ class ReadersResolveAwkwardPathsTest(unittest.TestCase):
         self.assertEqual(resolve_session_transcript(
             sid, cwd, expected_cwd=cwd, runtime_home=str(self.base / "missing")), (None, None))
 
+    def test_symlinked_worktree_finds_the_physical_project_dir(self):
+        physical = self.base / "physical" / "wt"
+        physical.mkdir(parents=True)
+        cwd = str(self.base / "link-wt")
+        os.symlink(physical, cwd, target_is_directory=True)
+        home = self.base / "home"
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        real = home / "projects" / encode_project_dir(str(physical)) / (sid + ".jsonl")
+        real.parent.mkdir(parents=True)
+        real.write_text("physical", encoding="utf-8")
+        path, reason = resolve_session_transcript(
+            sid, cwd, expected_cwd=str(physical), runtime_home=str(home))
+        self.assertIsNone(reason)
+        self.assertEqual(path.read_text(), "physical")
+        # The lexical project dir still wins when Claude Code named it that way.
+        lexical = home / "projects" / encode_project_dir(cwd) / (sid + ".jsonl")
+        lexical.parent.mkdir(parents=True)
+        lexical.write_text("lexical", encoding="utf-8")
+        path, _ = resolve_session_transcript(
+            sid, cwd, expected_cwd=cwd, runtime_home=str(home))
+        self.assertEqual(path.read_text(), "lexical")
+
     def test_session_transcript_rejects_path_escape(self):
         cwd = str(self.base / "repo")
         projects = self.base / "home" / "projects"
