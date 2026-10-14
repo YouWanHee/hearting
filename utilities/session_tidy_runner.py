@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import dataclasses
 import datetime
 import fcntl
 import hashlib
@@ -218,16 +219,26 @@ def _log(run_dir: Path, text: str) -> None:
             handle.write(f"{st.iso_utc(_now())} {text}\n")
 
 
+def _card_seat(item: dict) -> "st.Seat":
+    """Restore the project author's card identity, including for older queue rows."""
+    seat = st.Seat(**item["seat"])
+    if seat.kind == "project":
+        return dataclasses.replace(seat, harness=item.get("harness") or seat.harness,
+                                       sid=item.get("sid") or seat.sid)
+    return seat
+
+
 # ---------------------------------------------------------------------------
 # enqueue: write the entry, start the detached runner, return
 # ---------------------------------------------------------------------------
 
 def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: str = "") -> dict:
+    queue_seat = dataclasses.replace(seat, harness=harness, sid=sid) if seat.kind == "project" else seat
     item = {"schema": SCHEMA, "id": new_id(), "created": _now(), "status": "queued", "updated": _now(),
-            "seat": seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd, "transcript": transcript,
+            "seat": queue_seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd, "transcript": transcript,
             "attempts": 0}
     with contextlib.suppress(BaseException):
-        card = st.read_latest_card(seat)
+        card = st.read_latest_card(_card_seat(item))
         if card:
             item["card_generation"] = int(card.get("generation", 0) or 0)   # the card this batch was queued under
     write_item(item)
@@ -413,6 +424,7 @@ def _unread_entry(target: dict, chunk) -> dict:
 
 def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
     seat = st.Seat(**item["seat"])
+    card_seat = _card_seat(item)
     project_key = st.project_key_for(item["cwd"])
     sessions, cursors, choices, skipped, unread = [], [], [], [], []
     remaining = TOTAL_CHUNK_BYTES
@@ -458,7 +470,7 @@ def assemble(item: dict, batch: str, run_dir: Path) -> Bundle:
     pending = _pending_decisions(project_key)
     conversation = "\n".join(s["text"] for s in sessions)
     records, groups = existing_records(item["cwd"], conversation) if (sessions or pending or choices) else ([], [])
-    card = st.read_latest_card(seat)
+    card = st.read_latest_card(card_seat)
     doc = {"schema_version": 1, "batch_id": batch, "created": st.iso_utc(_now()), "cwd": item["cwd"],
            "project_key": project_key, "seat": {"kind": seat.kind, "key": seat.key},
            "caller": {"harness": item["harness"], "sid": item["sid"]},
@@ -924,7 +936,7 @@ def publish_memory(item: dict, batch: str, run_dir: Path, bundle: Optional[Bundl
     """Refresh the seat card's "참고할 기억" list (never touches the card itself); best effort."""
     with contextlib.suppress(BaseException):
         refs, more = memory_refs(run_dir, bundle) if status != "failed" or journal_ids(run_dir) else ([], 0)
-        st.update_memory_refs(st.Seat(**item["seat"]), batch=batch, status=status, refs=refs, more=more,
+        st.update_memory_refs(_card_seat(item), batch=batch, status=status, refs=refs, more=more,
                               coverage=coverage_note(bundle) if bundle else "", detail=detail,
                               result_path=str(run_dir / "result.json"),
                               source_generation=item.get("card_generation"))

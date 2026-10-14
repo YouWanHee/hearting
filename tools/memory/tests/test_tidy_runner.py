@@ -487,6 +487,63 @@ class EnqueueTest(RunnerCase):
         self.assertEqual(self.notices(), ["[정리] 새로 정리할 대화가 없습니다."])
 
 
+class ProjectCardSlotRunTest(RunnerCase):
+
+    def test_project_queue_round_trip_uses_the_callers_card_slot(self):
+        with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
+            seat_b = st.resolve_seat("claude", str(self.cwd), sid="runner-B")
+            seat_a = st.resolve_seat("claude", str(self.cwd), sid="runner-A")
+            with st.seat_lock(seat_b.key):
+                st.write_card(seat_b, "claude", "runner-B", "B card", cwd=str(self.cwd))
+            with st.seat_lock(seat_a.key):
+                st.write_card(seat_a, "claude", "runner-A", "A card", cwd=str(self.cwd))
+            with mock.patch.object(runner, "start_detached", return_value=0):
+                item = runner.enqueue_item(st.seat_for_project("claude", seat_b.project_key),
+                                           "claude", "runner-B", str(self.cwd))
+            self.assertEqual((item["seat"]["sid"], item["card_generation"]), ("runner-B", 1))
+            run_dir = st.state_root() / "runs" / "batch-project"
+            run_dir.mkdir(parents=True)
+            bundle = runner.assemble(item, "batch-project", run_dir)
+            doc = json.loads(bundle.path.read_text(encoding="utf-8"))
+            self.assertEqual(doc["card"], "B card")
+            before_a = st.read_latest_card(seat_a)
+            with mock.patch.object(runner, "memory_refs", return_value=([{"id": "mem-B"}], 0)), \
+                    mock.patch.object(runner, "coverage_note", return_value="covered"):
+                runner.publish_memory(item, "batch-project", run_dir, bundle, "applied")
+            self.assertEqual(st.read_latest_card(seat_a), before_a)
+            self.assertEqual(st.read_latest_card(seat_b)["memory_refs"]["refs"], [{"id": "mem-B"}])
+
+
+class ProjectCardHandoffTest(RunnerCase):
+
+    def test_project_handoff_sends_and_marks_only_the_callers_card(self):
+        for sid in ("runner-A", "runner-B"):
+            started = self.cli("hook", "--harness", "claude", "--event", "start", "--session-id", sid,
+                               HERDR_PANE_ID="")
+            self.assertEqual(started.returncode, 0, started.stderr)
+        for sid, body in (("runner-B", "B1 body"), ("runner-A", "A1 body")):
+            wrote = self.cli("card", "--harness", "claude", "--session-id", sid, "--text", body,
+                             HERDR_PANE_ID="")
+            self.assertEqual(wrote.returncode, 0, wrote.stderr)
+        with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
+            seat_a = st.resolve_seat("claude", str(self.cwd), sid="runner-A")
+            seat_b = st.resolve_seat("claude", str(self.cwd), sid="runner-B")
+            before_a = st.read_latest_card(seat_a)
+        result = self.cli("handoff", "peer-pane", "--harness", "claude", "--session-id", "runner-B",
+                          HERDR_PANE_ID="", FAKE_PEER_VERDICT="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^prompted=true target=peer-pane .* exit=0$")
+        sent = [json.loads(line) for line in (self.fake / "steward.jsonl").read_text().splitlines()]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["body"].strip(), "B1 body")
+        with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
+            after_a = st.read_latest_card(seat_a)
+            after_b = st.read_latest_card(seat_b)
+        self.assertEqual(after_a, before_a)
+        self.assertEqual(after_b["body"], "B1 body")
+        self.assertTrue(after_b["handed_off"])
+
+
 class AutoClearTest(RunnerCase):
     """``enqueue`` inside herdr: the memory runner and the clear helper are two detached
     processes that never wait for each other (fake herdr and fake ``peer-steward.py clear``)."""

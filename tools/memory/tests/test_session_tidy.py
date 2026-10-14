@@ -273,6 +273,148 @@ class CardConsumeTest(TidyCase):
         self.assertIn("오래된 카드", got)                                      # an old card is never dropped
 
 
+class ProjectFallbackTest(TidyCase):
+
+    def test_project_seat_sid_round_trips_without_changing_legacy_constructors(self):
+        with self.library({"HERDR_PANE_ID": ""}):
+            project = st.resolve_seat("claude", str(self.cwd), sid="sid-roundtrip")
+            pane5 = st.Seat("pane", "pane-key", "pane-id", "claude", "")
+            pane6 = st.Seat("pane", "pane-key", "pane-id", "claude", "", None)
+            self.assertEqual(st.seat_from_dict(project.as_dict()), project)
+            self.assertEqual(st.Seat(**project.as_dict()), project)
+            self.assertEqual((pane5.sid, pane6.sid), ("", ""))
+
+    def test_legacy_project_card_stays_with_its_author_and_new_author_gets_a_new_slot(self):
+        with self.library({"HERDR_PANE_ID": ""}):
+            shared = st.seat_for_project("claude", st.project_key_for(str(self.cwd)))
+            author_a = st.dataclasses.replace(shared, sid="legacy-A")
+            author_b = st.dataclasses.replace(shared, sid="new-B")
+            with st.seat_lock(shared.key):
+                st.write_card(shared, "claude", "legacy-A", "legacy body", cwd=str(self.cwd))
+                self.assertEqual(st.card_key(author_a), shared.key)
+                continued = st.write_card(author_a, "claude", "legacy-A", "continued body", cwd=str(self.cwd))
+                separate = st.write_card(author_b, "claude", "new-B", "new body", cwd=str(self.cwd))
+            self.assertEqual(continued["generation"], 2)
+            self.assertEqual(separate["generation"], 1)
+            self.assertEqual(st.card_key(author_b), st._digest("project-card", shared.key, "new-B"))
+            self.assertTrue((self.state / "card-history" / shared.key / "00000001.json").is_file())
+            self.assertEqual(st.read_latest_project_card(shared)[0]["body"], "new body")
+
+    def test_latest_project_lookup_uses_a_fixed_pointer_without_card_enumeration(self):
+        with self.library({"HERDR_PANE_ID": ""}):
+            seat = st.resolve_seat("claude", str(self.cwd), sid="pointer-A")
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "claude", "pointer-A", "pointed body", cwd=str(self.cwd))
+            with mock.patch.object(Path, "glob", side_effect=AssertionError("card enumeration")):
+                card, chosen = st.read_latest_project_card(seat)
+            self.assertEqual((card["body"], chosen.sid), ("pointed body", "pointer-A"))
+
+    def test_live_project_authors_keep_separate_cards_and_do_not_receive_each_others(self):
+        self.hook("claude", "start", "sid-A", pane=None)
+        self.hook("claude", "start", "sid-B", pane=None)
+        self.card("sid-B", "B1", pane=None)
+        self.card("sid-A", "A1", pane=None)
+        with self.library({"HERDR_PANE_ID": ""}):
+            a = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            b = st.resolve_seat("claude", str(self.cwd), sid="sid-B")
+            self.assertEqual(a.key, b.key)
+            self.assertNotEqual(st.card_key(a), st.card_key(b))
+            self.assertEqual(st.read_latest_card(a)["body"], "A1")
+            self.assertEqual(st.read_latest_card(b)["body"], "B1")
+        for sid in ("sid-A", "sid-B"):
+            self.assertEqual(self.hook("claude", "prompt", sid, pane=None), "")
+            self.assertEqual(self.hook("claude", "start", sid, "--source", "resume", pane=None), "")
+        self.card("sid-A", "A2", pane=None)
+        self.card("sid-B", "B2", pane=None)
+        self.assertEqual(self.hook("claude", "prompt", "sid-A", pane=None), "")
+        self.assertEqual(self.hook("claude", "prompt", "sid-B", pane=None), "")
+        with self.library({"HERDR_PANE_ID": ""}):
+            self.assertEqual(st.read_latest_card(a)["generation"], 2)
+            self.assertEqual(st.read_latest_card(b)["generation"], 2)
+        self.assertEqual(len(list((self.state / "cards").glob("*.json"))), 2)
+
+    def test_project_compaction_prefers_the_callers_newer_card_over_the_seat_latest(self):
+        self.hook("claude", "start", "sid-A", pane=None)
+        self.hook("claude", "start", "sid-B", pane=None)
+        self.card("sid-A", "A1", pane=None)
+        self.card("sid-B", "B1", pane=None)
+        resumed = self.hook("claude", "start", "sid-A", "--source", "compact", pane=None)
+        self.assertIn("A1", resumed)
+        self.assertNotIn("B1", resumed)
+        self.assertEqual(self.hook("claude", "prompt", "sid-A", pane=None), "")
+        self.assertEqual(self.hook("claude", "prompt", "sid-B", pane=None), "")
+
+    def test_project_card_clear_is_delivered_once_for_claude_and_codex(self):
+        for harness, author, successor, following in (
+                ("claude", "claude-author", "claude-next", "claude-last"),
+                ("codex", "codex-author", "codex-next", "codex-last")):
+            self.card(author, f"{harness}-card", harness=harness, pane=None)
+            first = self.hook(harness, "start", successor, "--source", "clear", pane=None)
+            self.assertIn(f"{harness}-card", first)
+            self.assertEqual(self.hook(harness, "prompt", successor, pane=None), "")
+            self.assertEqual(self.hook(harness, "start", following, "--source", "clear", pane=None), "")
+
+    def test_late_project_memory_revision_is_retried_after_failed_emit_once(self):
+        self.hook("claude", "start", "author-A", pane=None)
+        self.card("author-A", "layer A", pane=None)
+        self.assertIn("layer A", self.hook("claude", "start", "successor-C", pane=None))
+        with self.library({"HERDR_PANE_ID": ""}):
+            author = st.resolve_seat("claude", str(self.cwd), sid="author-A")
+            st.update_memory_refs(author, batch="late-B", status="applied", refs=[{"id": "mem-late"}],
+                                 now=200)
+
+            def broken(_text):
+                raise BrokenPipeError()
+
+            with self.assertRaises(BrokenPipeError):
+                st.run_hook("claude", "prompt", "successor-C", cwd=str(self.cwd), now=201, emit=broken)
+        got = self.hook("claude", "prompt", "successor-C", pane=None)
+        self.assertIn("mem-late", got)
+        self.assertNotIn("[세션 카드]", got)
+        self.assertEqual(self.hook("claude", "prompt", "successor-C", pane=None), "")
+        with self.library({"HERDR_PANE_ID": ""}):
+            receipt = st.read_json(st._consumed_path(author))
+        self.assertEqual((receipt["generation"], receipt["memory_revision"]), (1, 1))
+
+    def test_legacy_shared_project_card_is_delivered_once_without_moving_its_files(self):
+        self.hook("claude", "start", "legacy-author", pane=None)
+        with self.library({"HERDR_PANE_ID": ""}):
+            seat = st.seat_for_project("claude", st.project_key_for(str(self.cwd)))
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "claude", "legacy-author", "legacy handoff", cwd=str(self.cwd))
+            old_path = st.card_json_path(seat)
+        received = self.hook("claude", "start", "legacy-next", pane=None)
+        self.assertIn("legacy handoff", received)
+        self.assertEqual(self.hook("claude", "start", "legacy-following", pane=None), "")
+        self.assertTrue(old_path.is_file())
+        self.assertFalse((self.state / "project-latest" / f"{seat.key}.json").exists())
+
+    def test_project_delivery_requires_strict_replacement_but_unknown_author_is_eligible(self):
+        with self.library({"HERDR_PANE_ID": ""}):
+            seat = st.resolve_seat("claude", str(self.cwd), sid="same-time-author")
+            st.record_event(seat, "claude", "same-time-author", "start", now=100)
+            st.write_card(seat, "claude", "same-time-author", "strict card", cwd=str(self.cwd), now=150)
+            st.record_event(seat, "claude", "same-time-author", "prompt", now=200)
+            # Equal first_seen/last_seen is not a replacement.
+            output = st.run_hook("claude", "start", "equal-successor", cwd=str(self.cwd), now=200)
+            self.assertEqual(output, "")
+            # A valid card whose author is absent from the ledger retains notice-compatible delivery.
+            unknown = st.dataclasses.replace(seat, sid="missing-ledger-author")
+            st.write_card(unknown, "claude", "missing-ledger-author", "unknown author card",
+                          cwd=str(self.cwd), now=300)
+            self.assertIn("unknown author card",
+                          st.run_hook("claude", "start", "unknown-author-successor", cwd=str(self.cwd), now=301))
+
+    def test_project_resolve_caller_keeps_ledger_seat_but_never_borrows_its_sid(self):
+        self.hook("claude", "start", "ledger-author", pane=None)
+        with self.library({"HERDR_PANE_ID": ""}):
+            seat, harness, sid = st.resolve_caller(None, None, str(self.cwd))
+        self.assertEqual((seat.kind, harness), ("project", "claude"))
+        self.assertTrue(sid.startswith("unknown-"))
+        self.assertEqual(seat.sid, sid)
+        self.assertNotEqual(sid, "ledger-author")
+
+
 class SeatTest(TidyCase):
 
     def test_verified_pane_is_the_seat_else_harness_and_project(self):

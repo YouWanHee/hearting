@@ -28,10 +28,11 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
 State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 (directories 0700, files 0600, temp file + rename, symlinks refused):
 
-    cards/<seat>.json|.md   latest card (canonical JSON + readable text)
-    card-history/<seat>/    bounded older cards
+    cards/<card>.json|.md latest card (canonical JSON + readable text)
+    card-history/<card>/   bounded older cards
+    consumed/<card>.json   receipts by card key: pane/native use the seat key; project seats use the author session
+    project-latest/<seat>.json  newest project-seat card's author
     sessions/<seat>.jsonl   seat ledger: one line per hook/card event
-    consumed/<seat>.json    who already received the latest card generation (+ the "참고할 기억" revision)
     reread/<harness>-<sid>  the injection a session just consumed (OpenCode re-emits)
     notices/<seat>.json     result lines waiting for the next start/prompt
     locks/<seat>.lock       flock for the read-modify-write above
@@ -314,19 +315,23 @@ class Seat:
     harness: str = ""
     project_key: str = ""
     native: Optional[dict] = None
+    sid: str = ""
 
     def as_dict(self) -> dict:
         result = {"kind": self.kind, "key": self.key, "pane": self.pane,
                   "harness": self.harness, "project_key": self.project_key}
         if self.native is not None:
             result["native"] = self.native
+        if self.sid:
+            result["sid"] = self.sid
         return result
 
 
 def seat_from_dict(data: dict) -> Seat:
     return Seat(str(data.get("kind") or ""), str(data.get("key") or ""),
                 str(data.get("pane") or ""), str(data.get("harness") or ""),
-                str(data.get("project_key") or ""), data.get("native"))
+                str(data.get("project_key") or ""), data.get("native"),
+                str(data.get("sid") or ""))
 
 
 def seat_for_project(harness: str, project_key: str) -> Seat:
@@ -471,7 +476,8 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
     if native:
         return Seat("native", _digest("native", harness, native["home"], native["job"], native["start"]),
                     harness=harness or "", native=native)
-    return seat_for_project(harness or "unknown", project_key_for(cwd))
+    project = seat_for_project(harness or "unknown", project_key_for(cwd))
+    return dataclasses.replace(project, sid=sid or "")
 
 
 # ---------------------------------------------------------------------------
@@ -632,12 +638,58 @@ def _fold_ledger(seat: Seat) -> None:
 # Cards
 # ---------------------------------------------------------------------------
 
+def card_key(seat: Seat) -> str:
+    """Return the storage key for this author; sid-less project calls retain the shared legacy key."""
+    if seat.kind != "project" or not seat.sid:
+        return seat.key
+    keyed = _digest("project-card", seat.key, seat.sid)
+    if (state_root() / "cards" / f"{keyed}.json").exists():
+        return keyed
+    # Keep the old shared file and its history/receipts with its original author.
+    legacy = read_json(state_root() / "cards" / f"{seat.key}.json")
+    author = legacy.get("author") if isinstance(legacy, dict) else None
+    if isinstance(legacy, dict) and legacy.get("schema") == SCHEMA and isinstance(legacy.get("body"), str) \
+            and isinstance(author, dict) \
+            and (author.get("harness"), author.get("sid")) == (seat.harness, seat.sid):
+        return seat.key
+    return keyed
+
+
 def card_json_path(seat: Seat) -> Path:
-    return state_root() / "cards" / f"{seat.key}.json"
+    return state_root() / "cards" / f"{card_key(seat)}.json"
 
 
 def card_text_path(seat: Seat) -> Path:
-    return state_root() / "cards" / f"{seat.key}.md"
+    return state_root() / "cards" / f"{card_key(seat)}.md"
+
+
+def _project_latest_path(seat: Seat) -> Path:
+    return state_root() / "project-latest" / f"{seat.key}.json"
+
+
+def read_latest_project_card(seat: Seat) -> tuple[Optional[dict], Seat]:
+    """Read the pointed-to project card in constant time, or the pre-pointer shared card."""
+    path = _project_latest_path(seat)
+    pointer = read_json(path)
+    if path.exists() or path.is_symlink():
+        if not isinstance(pointer, dict):
+            return None, seat
+        harness, sid = pointer.get("harness"), pointer.get("sid")
+        if not isinstance(harness, str) or not harness or not isinstance(sid, str) or not sid:
+            return None, seat
+        chosen = dataclasses.replace(seat, harness=harness, sid=sid)
+        card = read_latest_card(chosen)
+        author = (card or {}).get("author") or {}
+        if not card or (author.get("harness"), author.get("sid")) != (harness, sid):
+            return None, seat
+        return card, chosen
+    # One fixed legacy path is the only fallback; never enumerate author card files.
+    card = read_latest_card(dataclasses.replace(seat, sid=""))
+    if not card:
+        return None, seat
+    author = card.get("author") or {}
+    harness, sid = author.get("harness") or seat.harness, author.get("sid") or ""
+    return card, dataclasses.replace(seat, harness=harness, sid=sid)
 
 
 def sanitize_body(text: str) -> str:
@@ -663,7 +715,7 @@ def read_latest_card(seat: Seat) -> Optional[dict]:
 def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
                now: Optional[float] = None, prompt_seq: Optional[int] = None,
                origin: Optional[str] = None) -> dict:
-    """Write the seat's newest card (caller holds the seat lock)."""
+    """Write this author's newest card (caller holds the shared seat lock)."""
     now = now_epoch() if now is None else now
     body = sanitize_body(body)
     summary = session_summary(seat).get((harness, sid))
@@ -686,13 +738,15 @@ def write_card(seat: Seat, harness: str, sid: str, body: str, *, cwd: str = "",
     if previous and isinstance(previous.get("memory_refs"), dict):
         card["memory_refs"] = previous["memory_refs"]   # layer B outlives the card: only its revision moves it
     if previous:
-        history = ensure_dir(state_root() / "card-history" / seat.key)
+        history = ensure_dir(state_root() / "card-history" / card_key(seat))
         atomic_write_json(history / f"{int(previous.get('generation', 0)):08d}.json", previous)
         for old in sorted(history.glob("*.json"))[:-CARD_HISTORY_KEEP]:
             with contextlib.suppress(OSError):
                 old.unlink()
     atomic_write_json(card_json_path(seat), card)
     atomic_write(card_text_path(seat), render_card_text(card).encode("utf-8"))
+    if seat.kind == "project" and seat.sid:
+        atomic_write_json(_project_latest_path(seat), {"harness": seat.harness or harness, "sid": seat.sid})
     return card
 
 
@@ -786,7 +840,7 @@ def update_memory_refs(seat: Seat, *, batch: str, status: str, refs: list, more:
 # ---------------------------------------------------------------------------
 
 def _consumed_path(seat: Seat) -> Path:
-    return state_root() / "consumed" / f"{seat.key}.json"
+    return state_root() / "consumed" / f"{card_key(seat)}.json"
 
 
 def _write_consumed(seat: Seat, **fields) -> None:
@@ -861,7 +915,6 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
     if not items:
         return []
     sessions = summary if summary is not None else session_summary(seat)
-    me = sessions.get((harness, sid))
     out = []
     for item in items:
         author = item.get("author") or {}
@@ -870,14 +923,24 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
             out.append(item)
             continue
         theirs = sessions.get(a_key)
+        replaced = _appeared_after(sessions, harness, sid, a_key)
         if theirs is None:
-            out.append(item)          # author unknown to the ledger: nobody else will show it
+            if replaced:
+                out.append(item)      # author unknown to the ledger: nobody else will show it
             continue
-        replaced = bool(me) and me["first_seen"] > theirs["last_seen"]
         stale = now - theirs["last_seen"] > AUTHOR_STALE_SEC
         if replaced and (seat.kind in ("pane", "native") or stale):
             out.append(item)
     return out
+
+
+def _appeared_after(sessions: dict, harness: str, sid: str, author_key: tuple[str, str]) -> bool:
+    """Whether this session began after the author's last recorded activity."""
+    author = sessions.get(author_key)
+    if author is None:
+        return True
+    me = sessions.get((harness, sid))
+    return bool(me and me["first_seen"] > author["last_seen"])
 
 
 def _ago(seconds: float) -> str:
@@ -951,13 +1014,15 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             return text
         if event == "prompt":
             bump_prompt_seq(seat, harness, sid, now)
-        prior = session_summary(seat).get((harness, sid))
+        sessions = session_summary(seat)
+        prior = sessions.get((harness, sid))
         # SessionStart(source=compact) and a separate compact event describe the same
         # compaction; count it once.
         compacting = (event == "compact" or source == "compact") and not (
             prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
         row = record_event(seat, harness, sid, event, source=source, transcript=transcript,
                            cwd=cwd, now=now, bump_epoch=compacting)
+        sessions[(harness, sid)] = row
         if event == "compact":
             return ""
         if event == "start" and seat.kind in ("pane", "native"):
@@ -973,13 +1038,25 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 handed = handover.record_locked(seat, harness, sid, event, source, now)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
-        notices = pending_notices(seat, harness, sid, now=now)
+        notices = pending_notices(seat, harness, sid, now=now, summary=sessions)
         notice_block = ""
         if notices:
             notice_block = "\n".join(f"[정리 결과] {n['text']}" for n in notices)
             notice_block = _cut_bytes(notice_block, NOTICE_MAX_BYTES)[0]
             parts.append(notice_block)
-        card = read_latest_card(seat)
+        card_seat = seat
+        own_card = read_latest_card(seat) if seat.kind == "project" else None
+        own_author = (own_card or {}).get("author") or {}
+        own_card_due = bool(own_card
+                            and (own_author.get("harness"), own_author.get("sid")) == (harness, sid)
+                            and own_card.get("origin") != "runtime-compact"
+                            and epoch > int(own_author.get("epoch", 0) or 0))
+        if own_card_due:
+            card = own_card
+        elif seat.kind == "project":
+            card, card_seat = read_latest_project_card(seat)
+        else:
+            card = read_latest_card(seat)
         card_due = False
         memory_due = False
         memory = None
@@ -987,11 +1064,19 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
-            eligible = (not same_session) or (
-                card.get("origin") != "runtime-compact" and epoch > int(author.get("epoch", 0) or 0))
-            consumed = read_json(_consumed_path(seat))
-            # One card generation is injected once for the whole seat: any receipt for it,
-            # from any session, means the card has already been handed over.
+            if seat.kind == "project" and own_card_due:
+                eligible = True
+            elif seat.kind == "project" and not same_session:
+                eligible = _appeared_after(sessions, harness, sid,
+                                           (author.get("harness") or "", author.get("sid") or ""))
+            elif seat.kind == "project":
+                eligible = (card.get("origin") != "runtime-compact"
+                            and epoch > int(author.get("epoch", 0) or 0))
+            else:
+                eligible = (not same_session) or (
+                    card.get("origin") != "runtime-compact" and epoch > int(author.get("epoch", 0) or 0))
+            consumed = read_json(_consumed_path(card_seat))
+            # A card generation is consumed once within its author slot.
             taken = isinstance(consumed, dict) and consumed.get("generation") == card.get("generation") \
                 and bool(consumed.get("receipts"))
             card_due = eligible and not taken
@@ -1016,7 +1101,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if resume_text:
                 parts.append(resume_text)
             if card_due:
-                parts.append(build_card_injection(card, card_text_path(seat), now, room))
+                parts.append(build_card_injection(card, card_text_path(card_seat), now, room))
             if memory_text:
                 parts.append(memory_text)
         if not card and handed and handover is not None:
@@ -1028,17 +1113,17 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             return ""
         (emit or (lambda t: None))(text)
         if card_due:
-            consumed = read_json(_consumed_path(seat))
+            consumed = read_json(_consumed_path(card_seat))
             receipts = list(consumed.get("receipts", [])) if isinstance(consumed, dict) \
                 and consumed.get("generation") == card.get("generation") else []
             receipts.append(_receipt(harness, sid, epoch))
-            _write_consumed(seat, generation=card["generation"], receipts=receipts[-200:])
+            _write_consumed(card_seat, generation=card["generation"], receipts=receipts[-200:])
         if memory_due:
-            consumed = read_json(_consumed_path(seat))
+            consumed = read_json(_consumed_path(card_seat))
             same = isinstance(consumed, dict) and consumed.get("memory_revision") == memory["revision"]
             receipts = list(consumed.get("memory_receipts", [])) if same else []
             receipts.append(_receipt(harness, sid, epoch))
-            _write_consumed(seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
+            _write_consumed(card_seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
         if notices:
             shown = {n["id"] for n in notices}
             data = read_json(_notices_path(seat))
@@ -1117,7 +1202,8 @@ def _guess_seat_from_ledgers(cwd: str) -> tuple[Optional[Seat], Optional[dict]]:
 
 def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
     """(seat, harness, session id) of the calling session; ids come from the arguments,
-    the harness variables, then the seat ledger, and as a last resort a fresh ``unknown-`` id."""
+    harness variables and, for pane/native seats, the seat ledger. Project ledger inference
+    selects only the shared seat and harness; an absent caller id gets a fresh ``unknown-`` id."""
     explicit_sid = bool(sid)
     if not sid:
         harness, sid = session_from_env(harness)
@@ -1132,10 +1218,19 @@ def resolve_caller(harness, sid, cwd: str) -> Optional[tuple[Seat, str, str]]:
             return None
         if record and not explicit_sid:
             sid = record["sessionId"]
-    if not sid or not harness:
+    if seat.kind == "project":
+        # Ledger inference still chooses the project seat and harness when neither
+        # was supplied, but a neighboring session is never evidence of this caller's id.
+        if not detected:
+            guessed_seat, ledger_row = _guess_seat_from_ledgers(cwd)
+            if guessed_seat is not None and ledger_row:
+                seat = guessed_seat
+                harness = ledger_row.get("harness") or ""
+        harness = harness or detected or "unknown"
+        sid = sid or f"unknown-{secrets.token_hex(4)}"
+        seat = dataclasses.replace(seat, harness=harness, sid=sid)
+    elif not sid or not harness:
         ledger_row = latest_session(seat, harness)
-        if ledger_row is None and seat.kind == "project" and not detected:
-            seat, ledger_row = _guess_seat_from_ledgers(cwd)
         if ledger_row:
             harness = harness or ledger_row["harness"]
             sid = sid or ledger_row["sid"]
