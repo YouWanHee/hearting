@@ -313,6 +313,8 @@ class Session:
     # Exact privacy-minimal decision/approval evidence. Content is impossible
     # in the sidecar schema; only kind/source/time reach this public projection.
     interaction_state: Optional[dict] = None
+    # Additional privacy-minimal waits from independent exact evidence sources.
+    interaction_observations: list = field(default_factory=list)
     mtime: Optional[float] = None       # newest transcript/db mtime (epoch sec) for liveness
     liveness: str = "unknown"
     # --- F-25/F-26 registry first-class fields (all Optional → absent harness = None) ---
@@ -1498,17 +1500,19 @@ def classify_session(ev_in, now, stale_min=SESSION_STALE_MIN, key=None):
         return out("unknown", 2, "session-identity", "current session claims conflict")
 
     interaction_wait = ev_in.get("interaction_wait")
-    if (
-        isinstance(interaction_wait, dict)
-        and interaction_wait.get("kind") in INTERACTION_KINDS
-    ):
-        source = interaction_wait.get("source")
-        source = source if isinstance(source, str) and source else "unknown"
+    waits = ([interaction_wait] if isinstance(interaction_wait, dict) else [])
+    if isinstance(interaction_wait, list):
+        waits.extend(row for row in interaction_wait if isinstance(row, dict))
+    valid_waits = [row for row in waits if row.get("kind") in INTERACTION_KINDS]
+    if valid_waits:
+        sources = sorted({str(row.get("source") or "unknown") for row in valid_waits})
+        kinds = sorted({str(row["kind"]) for row in valid_waits})
+        source = "+".join(sources)
         return out(
             "blocked",
             2,
             "interaction:%s" % source,
-            "unresolved %s wait" % interaction_wait["kind"],
+            "unresolved %s wait" % "+".join(kinds),
         )
 
     status = ev_in.get("status")

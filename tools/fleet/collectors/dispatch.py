@@ -1129,6 +1129,11 @@ def _candidate_jobs_paths(override=None):
     return result
 
 
+def human_gate_registry_paths(override=None):
+    """Exact read-only registry candidates for route-bound human-gate observation."""
+    return tuple(_candidate_jobs_paths(override))
+
+
 # --- job liveness = transcript mtime (dispatch-liveness.sh reuse, PRD §7) ---
 def _proj_home():
     """Runtime telemetry home (projects/sessions/.statusline) — Claude Code config dir.

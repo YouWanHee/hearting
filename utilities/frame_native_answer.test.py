@@ -57,18 +57,24 @@ class RecordTest(unittest.TestCase):
                    "tool_response": {"answers": {QUESTIONS[1]["question"]: "둘 다"}}}
         seen = []
 
-        def record(route, jobs, asked):
+        def candidate(route, jobs, asked):
             seen.append(route["route_id"])
-            return Path("/kept/answers.native.json") if route["route_id"] == "rt-older" else None
+            return (Path("/candidate/answers.native.json"), {}) if route["route_id"] == "rt-older" else None
         import tempfile
         import work_start
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet import route as route_reader
         with tempfile.TemporaryDirectory() as tmp:
             files = []
             for name in ("rt-newer", "rt-older"):
                 files.append(Path(tmp) / f"{name}.json")
                 files[-1].write_text(json.dumps({"route_id": name}), encoding="utf-8")
             with mock.patch.object(N, "_session_routes", return_value=[str(p) for p in files]), \
-                    mock.patch.object(work_start, "record_native_answer", side_effect=record):
+                    mock.patch.object(route_reader, "load", side_effect=lambda p: json.loads(Path(p).read_text())), \
+                    mock.patch.object(work_start, "native_answer_candidate", side_effect=candidate), \
+                    mock.patch.object(work_start, "record_native_answer", return_value=Path("/kept/answers.native.json")):
                 told = json.loads(self.run_hook("--claude", payload))
         self.assertEqual(seen, ["rt-newer", "rt-older"])
         self.assertIn("/kept/answers.native.json", told["hookSpecificOutput"]["additionalContext"])

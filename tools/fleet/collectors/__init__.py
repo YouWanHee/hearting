@@ -456,6 +456,14 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     except Exception:
         pass
 
+    # The journal wait joins after exact resume aliases and before the one liveness pass.
+    try:
+        from . import interaction as _interaction
+        _interaction.enrich_human_gates(sessions, jobs_path=jobs_path)
+    except Exception as exc:
+        observations["human-gates"] = _observation_health(
+            job_key, "human-gates", "%s: %s" % (type(exc).__name__, str(exc)[:160]))
+
     # One shared live assignment pass; peer trailers and Herdr read the same snapshot.
     tag_metadata = []
     try:

@@ -1958,8 +1958,11 @@ def _unused_badge(s, compact=False):
 
 def _interaction_badge(s):
     state = getattr(s, "interaction_state", None)
-    label = _INTERACTION_LABEL.get(state.get("kind")) if isinstance(state, dict) else None
-    return " " + label if label else ""
+    kinds = [state.get("kind")] if isinstance(state, dict) else []
+    kinds.extend(row.get("kind") for row in (getattr(s, "interaction_observations", None) or [])
+                 if isinstance(row, dict))
+    labels = list(dict.fromkeys(_INTERACTION_LABEL[kind] for kind in kinds if kind in _INTERACTION_LABEL))
+    return " " + " + ".join(labels) if labels else ""
 
 
 def _interaction_chip(s):

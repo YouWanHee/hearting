@@ -345,7 +345,7 @@ def _is_number(value):
 
 
 def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
-    """Validated ledger lines from the tail `max_bytes` of one session's ledger file."""
+    """Validated ledger lines from one session ledger; ``None`` reads its full history."""
     try:
         path = ledger_path(harness, session_id)
     except ValueError:
@@ -358,7 +358,7 @@ def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
         return []
     try:
         with open(path, "rb") as handle:
-            offset = max(0, meta.st_size - max_bytes)
+            offset = max(0, meta.st_size - max_bytes) if max_bytes is not None else 0
             handle.seek(offset)
             data = handle.read()
     except OSError:
@@ -385,12 +385,12 @@ def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
     return result
 
 
-def session_lines(session):
+def session_lines(session, *, full_history=False):
     """Every ledger line reachable from `session`'s own id and its resume aliases, ts-merged."""
     from . import session_registry
     merged = []
     for harness, sid in session_registry.session_join_keys(session):
-        merged.extend(read_tail(harness, sid))
+        merged.extend(read_tail(harness, sid, max_bytes=None if full_history else TAIL_BYTES))
     merged.sort(key=lambda item: item.get("ts") or 0)
     return merged
 

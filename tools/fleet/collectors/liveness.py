@@ -93,7 +93,9 @@ def collect_evidence(sess):
         # F-47: the shared classifier separates owned tool execution from the
         # model's waiting state; this layer only carries process evidence.
         "exec_child": getattr(sess, "exec_child", None),
-        "interaction_wait": getattr(sess, "interaction_state", None),
+        "interaction_wait": ([getattr(sess, "interaction_state", None)]
+                             if isinstance(getattr(sess, "interaction_state", None), dict) else [])
+                            + list(getattr(sess, "interaction_observations", None) or []),
         "mtime": sess.mtime,
         # `_has_transcript` is set by the claude enricher; other harnesses fall back to
         # "an mtime exists at all", which is the same signal they had pre-F-25.
