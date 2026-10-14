@@ -263,6 +263,7 @@ def _adopt_child_titles(sessions, jobs):
         if not getattr(job, '_dispatch_context_owned', False):
             for field_name in (
                     'ctx_pct', 'active_context_tokens', 'context_window_tokens',
+                    'context_display_window_tokens', 'context_policy',
                     'session_input_tokens', 'session_cached_input_tokens',
                     'session_output_tokens', 'session_reasoning_output_tokens',
                     'session_total_tokens', 'exec_tool'):

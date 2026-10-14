@@ -5284,7 +5284,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     indent = " " * max(0, int(indent_width))
     available = max(0, (term_width or _SUMMARY_FALLBACK_W) - _dw(indent))
     gauge_width = _compact_context_gauge_width(available, depth=depth)
-    track = _context_gauge_track(getattr(entity, "context_window_tokens", None))
+    track = _context_gauge_track(getattr(entity, "context_display_window_tokens", None))
     if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
             and 0 <= pct <= 100):
         shown_pct = int(round(pct))

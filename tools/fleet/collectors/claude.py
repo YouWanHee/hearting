@@ -13,6 +13,7 @@ falling back to the matching registry's statusUpdatedAt.
 """
 import datetime
 import json
+import math
 import os
 import re
 import sys
@@ -394,27 +395,48 @@ def _apply_statusline(sess, d):
         sess.effort = eff
     cw = d.get("context_window") or {}
     up = cw.get("used_percentage")
-    if isinstance(up, (int, float)):
-        sess.ctx_pct = min(99, round(up))
+    raw_percentage = (up if isinstance(up, (int, float)) and not isinstance(up, bool)
+                      and math.isfinite(up) and 0 <= up <= 100 else None)
+    sess.ctx_pct = None
     current = cw.get("current_usage") or {}
+    def count(value):
+        if type(value) is int and value >= 0:
+            return value
+        if isinstance(value, float) and math.isfinite(value) and value >= 0:
+            return int(value)
+        return None
     if isinstance(current, dict):
-        active_parts = [
-            current.get("input_tokens"),
-            current.get("cache_creation_input_tokens"),
-            current.get("cache_read_input_tokens"),
-        ]
-        if any(isinstance(value, (int, float)) for value in active_parts):
-            sess.active_context_tokens = int(sum(
-                value for value in active_parts if isinstance(value, (int, float))))
-    window = cw.get("context_window_size")
-    if isinstance(window, (int, float)) and window > 0:
-        sess.context_window_tokens = int(window)
+        active_parts = [count(current.get(key)) for key in (
+            "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+        if any(value is not None for value in active_parts):
+            sess.active_context_tokens = sum(value or 0 for value in active_parts)
+    window = count(cw.get("context_window_size"))
+    if window is not None and window > 0:
+        sess.context_window_tokens = window
     ti, to = cw.get("total_input_tokens"), cw.get("total_output_tokens")
-    if isinstance(ti, (int, float)) or isinstance(to, (int, float)):
-        sess.tokens = int((ti or 0) + (to or 0))
-        sess.session_input_tokens = int(ti) if isinstance(ti, (int, float)) else None
-        sess.session_output_tokens = int(to) if isinstance(to, (int, float)) else None
+    ti, to = count(ti), count(to)
+    if ti is not None or to is not None:
+        sess.tokens = (ti or 0) + (to or 0)
+        sess.session_input_tokens = ti
+        sess.session_output_tokens = to
         sess.session_total_tokens = sess.tokens
+    from ..context_policy import claude_applied_policy
+    from ..token_budget import context_policy_snapshot, context_policy_used_pct
+    request = d.get("hearting_context_request")
+    version = d.get("version") if isinstance(d.get("version"), str) else None
+    if isinstance(request, dict):
+        policy = claude_applied_policy(
+            runtime_version=version, model_id=m.get("id") if isinstance(m.get("id"), str) else None,
+            raw_window_tokens=window, request=request, session_id=sess.session_id)
+    else:
+        policy = context_policy_snapshot(
+            source="claude-statusline", runtime_version=version, session_id=sess.session_id,
+            reason="statusline-tap-has-no-compaction-request")
+    policy["raw_percentage"] = raw_percentage
+    sess.context_policy = policy
+    sess.context_display_window_tokens = (
+        policy["applied_trigger_tokens"] if policy["state"] == "applied" else None)
+    sess.ctx_pct = context_policy_used_pct(sess.active_context_tokens, policy)
     rl = d.get("rate_limits") or {}
 
     def pct(k):

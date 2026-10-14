@@ -23,6 +23,8 @@ from fleet.model import Session  # noqa: E402
 from fleet.token_budget import (  # noqa: E402
     DIRECTIVE_TEXTS,
     codex_context_used_pct,
+    context_policy_snapshot,
+    context_policy_used_pct,
     find_codex_rollout,
     parse_codex_token_count,
     policy_band,
@@ -86,6 +88,35 @@ def token_line(active=82_000, window=112_000, total=150_000, timestamp=None):
 
 class PureTelemetryTest(unittest.TestCase):
 
+    def test_display_percent_uses_native_trigger_and_keeps_raw_capacity_separate(self):
+        policy = context_policy_snapshot(
+            source="claude-autocompact-state", runtime_version="2.1.299",
+            configured_request_tokens=1_000_000, effective_window_tokens=900_000,
+            applied_trigger_tokens=800_000, enabled=True, enforced=True,
+            session_id=SID)
+        self.assertEqual(context_policy_used_pct(400_000, policy), 50)
+        self.assertEqual(policy["effective_window_tokens"], 900_000)
+        self.assertEqual(policy["configured_request_tokens"], 1_000_000)
+        self.assertEqual(context_policy_used_pct(0, policy), 0)
+        self.assertEqual(context_policy_used_pct(799_999, policy), 99)
+        self.assertEqual(context_policy_used_pct(800_000, policy), 100)
+        self.assertEqual(context_policy_used_pct(900_000, policy), 100)
+
+    def test_disabled_unknown_and_zero_trigger_never_invent_a_percentage(self):
+        disabled = context_policy_snapshot(
+            source="native", disabled=True, applied_trigger_tokens=0, session_id=SID)
+        unknown = context_policy_snapshot(
+            source="native", applied_trigger_tokens=800_000, session_id=SID)
+        zero_trigger = context_policy_snapshot(
+            source="native", applied_trigger_tokens=0,
+            enabled=True, enforced=True, session_id=SID)
+        self.assertEqual((disabled["state"], context_policy_used_pct(0, disabled)),
+                         ("disabled", None))
+        self.assertEqual((unknown["state"], context_policy_used_pct(1, unknown)),
+                         ("unknown", None))
+        self.assertEqual((zero_trigger["state"], context_policy_used_pct(0, zero_trigger)),
+                         ("applied", None))
+
     def test_codex_formula_boundaries(self):
         self.assertEqual(codex_context_used_pct(81_000, 112_000), 69)
         self.assertEqual(codex_context_used_pct(82_000, 112_000), 70)
@@ -111,6 +142,15 @@ class PureTelemetryTest(unittest.TestCase):
         missing = parse_codex_token_count(json.dumps({"payload": {}}))
         self.assertEqual((missing.status, missing.reason),
                          ("unknown", "not-token-count"))
+
+    def test_nonfinite_and_boolean_counters_are_unknown(self):
+        for value in (float("nan"), float("inf"), True):
+            with self.subTest(value=value):
+                event = json.loads(token_line())
+                event["payload"]["info"]["last_token_usage"]["total_tokens"] = value
+                parsed = parse_codex_token_count(json.dumps(event), session_id=SID)
+                self.assertIsNone(parsed.active_context_tokens)
+                self.assertIsNone(parsed.context_used_pct)
 
     def test_exact_session_lookup_rejects_ambiguous_and_stale(self):
         with tempfile.TemporaryDirectory() as home:
@@ -174,6 +214,10 @@ class CollectorSemanticsTest(unittest.TestCase):
         }})
         self.assertEqual(sess.active_context_tokens, 15_000)
         self.assertEqual(sess.context_window_tokens, 200_000)
+        self.assertIsNone(sess.context_display_window_tokens)
+        self.assertIsNone(sess.ctx_pct)
+        self.assertEqual(sess.context_policy["state"], "unknown")
+        self.assertEqual(sess.context_policy["raw_percentage"], 50)
         self.assertEqual(sess.session_total_tokens, 100_000)
         self.assertIsNone(sess.session_cached_input_tokens)
 
@@ -211,8 +255,62 @@ class CollectorSemanticsTest(unittest.TestCase):
                 else:
                     os.environ["OPENCODE_MODELS"] = old_models
             self.assertEqual(sess.active_context_tokens, 25_000)
-            self.assertEqual(sess.context_window_tokens, 100_000)
+            self.assertIsNone(sess.context_window_tokens)
+            self.assertIsNone(sess.context_display_window_tokens)
+            self.assertEqual(sess.ctx_pct, None)
+            self.assertEqual(sess.context_policy["state"], "unknown")
             self.assertEqual(sess.session_total_tokens, 95_000)
+
+    def test_zero_latest_request_is_not_replaced_by_cumulative_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "opencode.db")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE session (id, slug, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, time_updated, parent_id, directory, title)")
+            con.execute("CREATE TABLE message (session_id, time_updated, data)")
+            con.execute("INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "oc-zero", "slug", "agent", json.dumps({"id": "model-x"}), 0.1,
+                80_000, 10_000, 5_000, 1000, None, "/repo", "title"))
+            con.execute("INSERT INTO message VALUES (?,?,?)", (
+                "oc-zero", 1000, json.dumps({"role": "assistant", "finish": "stop",
+                                             "time": {"completed": 1}, "tokens": {
+                    "input": 0, "output": 0, "cache": {"read": 0, "write": 0}}})))
+            con.commit()
+            con.close()
+            models = os.path.join(tmp, "models.json")
+            Path(models).write_text(json.dumps({"provider": {"models": {
+                "model-x": {"limit": {"context": 100_000}}}}}), encoding="utf-8")
+            old_db, old_models = os.environ.get("OPENCODE_DB"), os.environ.get("OPENCODE_MODELS")
+            try:
+                os.environ["OPENCODE_DB"] = db
+                os.environ["OPENCODE_MODELS"] = models
+                opencode._REG.update(ts=0.0, map=None, by_provider=None)
+                sess = Session(harness="opencode", pid=1, cwd="/repo")
+                opencode.enrich(sess)
+            finally:
+                if old_db is None:
+                    os.environ.pop("OPENCODE_DB", None)
+                else:
+                    os.environ["OPENCODE_DB"] = old_db
+                if old_models is None:
+                    os.environ.pop("OPENCODE_MODELS", None)
+                else:
+                    os.environ["OPENCODE_MODELS"] = old_models
+            self.assertEqual(sess.active_context_tokens, 0)
+            self.assertIsNone(sess.context_window_tokens)
+            self.assertIsNone(sess.ctx_pct)
+
+    def test_unfinished_zero_row_is_neither_a_reading_nor_cumulative_input(self):
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE message (session_id, time_updated, data)")
+        con.execute("INSERT INTO message VALUES (?,?,?)", (
+            "s", 2, json.dumps({"role": "assistant", "time": {"created": 2}, "tokens": {
+                "input": 0, "output": 0, "cache": {"read": 0, "write": 0}}})))
+        self.assertIsNone(opencode._last_request_context(con, "s"))
+        con.execute("INSERT INTO message VALUES (?,?,?)", (
+            "s", 1, json.dumps({"role": "assistant", "finish": "stop", "tokens": {
+                "input": 100, "output": 5, "cache": {"read": 20, "write": 0}}})))
+        self.assertEqual(opencode._last_request_context(con, "s"), 125)
+        con.close()
 
 
 class TransitionPolicyTest(unittest.TestCase):
