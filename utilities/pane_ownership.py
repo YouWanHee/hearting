@@ -288,6 +288,12 @@ def verified_pane(pane, harness, sid=None, *, pid=None, executable=None, server=
                 continue
             if harness == "codex" and pid is not None and _registered_worker(foreground[0]):
                 continue
+            # A current footer proves selection only for the caller's physical
+            # frontend (or the existing shared-service path). An inherited pane
+            # hint cannot transfer ownership to another foreground Codex process.
+            if (harness == "codex" and sid and not service
+                    and own[0] != foreground[0]):
+                continue
             native_sid = _native_session(foreground[0], harness) if sid else ""
             physical = (not service and own[0] == foreground[0]
                         and (pid is None or not sid or native_sid == sid))
