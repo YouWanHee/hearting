@@ -239,6 +239,21 @@ restart 중 무엇이 필요한지 `session_action`으로 알려줍니다.
 cache는 소유하지 않습니다. 자세한 매핑은
 [INSTALL_LAYOUT.md](INSTALL_LAYOUT.md)를 참고하세요.
 
+## 모델 설정
+
+세 runtime은 profile model과 effort와 독립적인 요청 context operating budget을
+공유합니다. 기본값은 `800000` tokens이며 허용 범위는 `100000`부터
+`1000000`입니다. 활성화와 성공한 편집은 값을 Claude의 네이티브 환경
+설정과 Codex의 root config key에 투영합니다. OpenCode는 runtime 시작 때
+이미 불러온 provider의 catalog 모델 중 한도가 budget보다 큰 모델에 cap을
+설정합니다. 기존 네이티브 모델 한도와 서비스 용량에 따라 실제 사용 가능한
+창은 더 작을 수 있습니다. 실행 중인 Codex daemon이 만드는 thread를 포함해
+새 세션과 thread부터 갱신된 설정을 사용하며, 활성 세션은 시작 때 받은
+설정을 유지합니다.
+세 runtime 모두 대화형 메인 세션의 최신 요청 입력이 500K를 넘으면 정리를
+권장하고 700K를 넘으면 즉시 정리를 알립니다. 세션당 한 번이며 worker와
+subagent는 제외됩니다.
+
 ## Harness 개발
 
 Maintainer는 managed release 대신 live checkout을 사용할 수 있습니다.

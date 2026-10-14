@@ -6,6 +6,7 @@ import { createHash } from "node:crypto"
 
 const pluginDir = path.dirname(fileURLToPath(import.meta.url))
 const pluginRoot = path.resolve(pluginDir, "../../..")
+const python3 = existsSync("/usr/bin/python3") ? "/usr/bin/python3" : "python3"
 const envRoot = process.env.AGENT_HOME ? path.resolve(process.env.AGENT_HOME) : ""
 const isHarnessRoot = (candidate) =>
   candidate &&
@@ -19,6 +20,7 @@ const sessionTidy = path.join(root, "utilities", "session_tidy.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
+const contextWindowHelper = path.join(root, "utilities", "opencode_context_window.py")
 const frameNativeAnswer = path.join(root, "utilities", "frame_native_answer.py")
 const startReceipt = path.join(root, "utilities", "start_receipt.py")
 const routeGateTools = new Set(["write", "edit", "multiedit", "patch", "apply_patch", "bash"])
@@ -80,8 +82,8 @@ async function contextAlert(ctx, sid, output) {
         .sort((a, b) => (b.time?.created || 0) - (a.time?.created || 0)
           || String(b.id || "").localeCompare(String(a.id || "")))[0]
       if (!latest?.tokens) return ""
-      const result = spawnSync("python3", [path.join(root, "utilities", "context_alert.py")], {
-        input: JSON.stringify({ session_id: sid, tokens: latest.tokens }),
+      const result = spawnSync(python3, [path.join(root, "utilities", "context_alert.py")], {
+        input: JSON.stringify({ session_id: sid, tokens: latest.tokens }) + "\n",
         encoding: "utf8", timeout: 1000,
       })
       return result.status === 0 ? (result.stdout || "").trim() : ""
@@ -1223,6 +1225,47 @@ export const AgentHarnessGuards = async (ctx) => {
 
   return ({
   dispose: () => { completionCarrier.dispose(); retirePaneContext(ctx) },
+  async config(input) {
+    const config = input && typeof input === "object" ? input : {}
+    const child = spawnSync(python3, [contextWindowHelper], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      input: JSON.stringify({ config }) + "\n",
+      encoding: "utf8",
+      timeout: 2000,
+      maxBuffer: 4 * 1024 * 1024,
+    })
+    if (child.status !== 0) {
+      process.stderr.write(`hearting: context window config hook unavailable (${child.error?.code || child.status || "unknown"})\n`)
+      return config
+    }
+    try {
+      const result = JSON.parse(child.stdout || "{}")
+      const projected = result?.config?.provider
+      if (!projected || typeof projected !== "object") return config
+      if (!config.provider || typeof config.provider !== "object") config.provider = {}
+      for (const [providerID, provider] of Object.entries(projected)) {
+        if (!provider || typeof provider.models !== "object") continue
+        if (!config.provider[providerID]) config.provider[providerID] = provider
+        else {
+          const targetProvider = config.provider[providerID]
+          if (!targetProvider.models || typeof targetProvider.models !== "object") targetProvider.models = {}
+          for (const [modelID, model] of Object.entries(provider.models)) {
+            if (!targetProvider.models[modelID]) targetProvider.models[modelID] = model
+            else if (model?.limit && typeof model.limit === "object") {
+              targetProvider.models[modelID].limit = {
+                ...(targetProvider.models[modelID].limit || {}), ...model.limit,
+              }
+            }
+          }
+        }
+      }
+      return config
+    } catch {
+      process.stderr.write("hearting: context window config hook returned invalid data\n")
+      return config
+    }
+  },
   event: async ({ event }) => {
     if (event && event.type === "session.created") {
       const info = event.properties?.info

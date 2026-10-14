@@ -204,11 +204,16 @@ def token_budget_timeout() -> float:
     return min(5.0, max(0.05, value))
 
 
-def emit_context(event_name: str, parts: list[str]) -> None:
+def emit_context(event_name: str, parts: list[str], *, system_message: str = "") -> None:
     context = "\n".join(part.strip() for part in parts if part.strip())
-    if not context:
+    output = {}
+    if context:
+        output["hookSpecificOutput"] = {"hookEventName": event_name, "additionalContext": context}
+    if system_message.strip():
+        output["systemMessage"] = system_message.strip()
+    if not output:
         return
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}}, ensure_ascii=False), flush=True)
+    print(json.dumps(output, ensure_ascii=False), flush=True)
 
 
 def load_token_receipt(path: Path) -> dict[str, Any] | None:
@@ -410,6 +415,19 @@ def main() -> int:
     # context and can recursively create model work (D-42).
     if is_worker_session():
         return 0
+    context_notice = ""
+    try:
+        from context_alert import codex_notice
+        event_name = nested_string(payload, "hook_event_name", "event_name", "event")
+        normalized = {
+            "hook_event_name": event_name,
+            "session_id": interaction_session_id(payload),
+            "transcript_path": nested_string(payload, "transcript_path", "transcriptPath"),
+        }
+        context_notice = codex_notice(normalized)
+    except Exception:
+        # The notice is advisory; ordinary prompt lifecycle remains available.
+        context_notice = ""
     current_cwd = cwd(payload)
     interaction_sid = interaction_session_id(payload)
     try:
@@ -454,7 +472,9 @@ def main() -> int:
     # Phase 1 token self-regulation is transition-only. Normal, unknown,
     # native-owned, and repeated bands return an empty string (zero injection).
     parts.append(token_budget_context(current_cwd, sid))
-    emit_context("UserPromptSubmit", parts)
+    if context_notice:
+        parts.append(context_notice)
+    emit_context("UserPromptSubmit", parts, system_message=context_notice)
     # Commit acknowledgement only after successful synchronous hook rendering.
     from dispatch_session_sweep import ack_delivered
     for root, records in batches:

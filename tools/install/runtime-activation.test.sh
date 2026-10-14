@@ -1252,7 +1252,8 @@ assert settings["theme"] == "user"
 hooks=settings.get("hooks", {})
 assert not hooks.get("SessionStart"), hooks
 assert "statusLine" not in settings, settings
-assert settings["env"] == {"USER_FLAG": "keep"}, settings
+# The interactive context window stays as a user setting after uninstall.
+assert settings["env"] == {"USER_FLAG": "keep", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000"}, settings
 assert settings["enabledPlugins"]["foreign@fixture"] is True
 PY
 ok "claude uninstall unmerges managed hooks, statusline, and env while keeping user settings"
