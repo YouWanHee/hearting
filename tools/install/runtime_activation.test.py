@@ -544,6 +544,49 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
                 self.assertFalse(activation._state_path("codex").exists())
 
 
+class NativeContextLifecycleTest(unittest.TestCase):
+    """Activate, refresh, then deactivate: what activation added leaves, what the user had stays."""
+
+    def _lifecycle(self, runtime, seed=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                home = activation.paths.runtime_home(runtime)
+                name = "settings.json" if runtime == "claude" else "config.toml"
+                config = home / name
+                if seed is not None:
+                    config.parent.mkdir(parents=True, exist_ok=True)
+                    config.write_bytes(seed)
+                activation.activate(runtime, "linked", str(source))
+                activation.activate(runtime, "linked", str(source))
+                activation.deactivate(runtime)
+                backup = home / activation.CODEX_IDENTITY_BACKUP
+                return (config.read_bytes() if config.exists() else None,
+                        backup.read_bytes() if backup.exists() else None)
+
+    def test_codex_clean_home_leaves_no_config_or_backup(self):
+        self.assertEqual(self._lifecycle("codex"), (None, None))
+
+    def test_codex_manual_window_survives_with_its_bytes(self):
+        seed = b"# mine\nmodel_context_window = 800000\nmodel = \"x\"\n"
+        config, backup = self._lifecycle("codex", seed)
+        self.assertEqual(config, seed)
+        self.assertEqual(backup, seed)
+
+    def test_claude_clean_home_drops_the_added_window(self):
+        config, _ = self._lifecycle("claude")
+        env = json.loads(config).get("env", {})
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
+
+    def test_claude_manual_window_survives(self):
+        seed = json.dumps({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000",
+                                   "USER_FLAG": "keep"}}).encode()
+        config, _ = self._lifecycle("claude", seed)
+        self.assertEqual(json.loads(config)["env"],
+                         {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000", "USER_FLAG": "keep"})
+
+
 class RuntimeActivationConflictPreflightTest(unittest.TestCase):
     def test_codex_conflict_refuses_before_capture(self):
         with tempfile.TemporaryDirectory() as temporary:
