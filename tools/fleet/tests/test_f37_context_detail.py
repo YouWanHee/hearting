@@ -157,6 +157,24 @@ class ContextDetailTruthTableTest(unittest.TestCase):
             {"dim"},
         )
 
+    def test_card_worker_gauge_shares_the_owner_gauge_column(self):
+        def gauge_col(job, depth):
+            visible = text(render._dispatch_summary_detail_row(
+                job, depth=depth, term_width=200, in_card=True))
+            return render._dw(visible[:next(i for i, ch in enumerate(visible) if ch in (FULL, EMPTY))])
+
+        owner = DispatchJob(
+            key="code", slug="owner", harness="codex", depth=1, worker_type="owner",
+            liveness="working", summary="NOW", ctx_pct=13,
+            context=ContextProjection(13, "ok", "codex"))
+        for depth in (2, 3):
+            with self.subTest(depth=depth):
+                worker = DispatchJob(
+                    key="code", slug="worker", harness="claude", depth=depth,
+                    worker_type="worker", liveness="working", summary="NOW", ctx_pct=20,
+                    context=ContextProjection(20, "ok", "claude"))
+                self.assertEqual(gauge_col(worker, depth), gauge_col(owner, 1))
+
     def test_malformed_legacy_percentage_is_unavailable_not_clamped(self):
         for malformed in (-1, 101, True, "63"):
             with self.subTest(malformed=malformed):
