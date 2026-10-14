@@ -2058,20 +2058,26 @@ def _prepare_runtime_config(
     runtime: str, active_root: Path, previous: Optional[dict], scope: str = "global", *,
     native_locked: bool = False,
 ) -> List[dict]:
-    from native_context import project_context_window
+    from native_context import NativeContextError, project_context_window
     if runtime == "claude":
-        projected = project_context_window(
-            runtime, runtime=paths.runtime_home(runtime, scope), source_root=active_root,
-            previous=previous, scope=scope, native_locked=native_locked,
-            claude_merge=lambda **kwargs: _merge_claude_settings(active_root, previous, scope, **kwargs),
-        )
+        try:
+            projected = project_context_window(
+                runtime, runtime=paths.runtime_home(runtime, scope), source_root=active_root,
+                previous=previous, scope=scope, native_locked=native_locked,
+                claude_merge=lambda **kwargs: _merge_claude_settings(active_root, previous, scope, **kwargs),
+            )
+        except NativeContextError as exc:
+            raise ActivationError(str(exc)) from exc
         result = projected.get("merge", {})
         result.setdefault("report_lines", projected["report_lines"])
         return [result]
     if runtime == "codex":
-        projected = project_context_window(runtime, runtime=paths.runtime_home(runtime, scope),
-                                           source_root=active_root, previous=previous, scope=scope,
-                                           native_locked=native_locked)
+        try:
+            projected = project_context_window(runtime, runtime=paths.runtime_home(runtime, scope),
+                                               source_root=active_root, previous=previous, scope=scope,
+                                               native_locked=native_locked)
+        except NativeContextError as exc:
+            raise ActivationError(str(exc)) from exc
         result = _merge_codex_identity_config(active_root, previous, scope)
         result.setdefault("report_lines", []).extend(projected["report_lines"])
         result["context_projection"] = projected

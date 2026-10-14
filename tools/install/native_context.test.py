@@ -70,6 +70,68 @@ class NativeContextTests(unittest.TestCase):
         self.assertLess(text.index("model_context_window = 760000"), text.index("[model]"))
         self.assertIn("[not-a-table]\nmodel_context_window = 5", text)
 
+    def test_codex_insert_skips_escaped_triple_quote_inside_multiline_string(self):
+        config = self.home / "config.toml"
+        original = ('prompt = """\ntext \\"""\n[profiles.fake]\nstill string content\n"""\n'
+                    '[profiles.real]\nmodel = "m"\n')
+        config.write_text(original, encoding="utf-8")
+        self.seed_models()
+        native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
+        text = config.read_text(encoding="utf-8")
+        head, tail = original.split("[profiles.real]")
+        self.assertEqual(text, head + "model_context_window = 760000\n[profiles.real]" + tail)
+        parsed = native_context.tomllib.loads(text)
+        self.assertEqual(parsed["model_context_window"], 760000)
+        self.assertIn("[profiles.fake]", parsed["prompt"])
+
+    def test_codex_one_line_strings_holding_triple_quotes_do_not_open_multiline(self):
+        config = self.home / "config.toml"
+        strings = 'a = "x \\"\\"\\" y"\nb = \'"""\'\nc = "\'\'\'"\n'
+        config.write_text(strings + "[t]\nx = 1\n", encoding="utf-8")
+        self.seed_models()
+        native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
+        self.assertEqual(config.read_text(encoding="utf-8"),
+                         strings + "model_context_window = 760000\n[t]\nx = 1\n")
+        config.write_text(strings + "model_context_window = 5\n[t]\nx = 1\n", encoding="utf-8")
+        native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
+        self.assertEqual(config.read_text(encoding="utf-8"),
+                         strings + "model_context_window = 760000\n[t]\nx = 1\n")
+
+    def test_codex_replaces_real_root_key_after_key_shaped_string_line(self):
+        config = self.home / "config.toml"
+        config.write_text('p = """\nmodel_context_window = 1\n"""\nq = \'\'\'\n'
+                          'model_context_window = 2\n\'\'\'\nmodel_context_window = 3\n[t]\n',
+                          encoding="utf-8")
+        self.seed_models()
+        native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
+        self.assertEqual(config.read_text(encoding="utf-8"),
+                         'p = """\nmodel_context_window = 1\n"""\nq = \'\'\'\n'
+                         'model_context_window = 2\n\'\'\'\nmodel_context_window = 760000\n[t]\n')
+
+    def test_codex_misplaced_edit_fails_closed_and_leaves_config(self):
+        config = self.home / "config.toml"
+        config.write_text('prompt = """\nbody\n"""\n[t]\n', encoding="utf-8")
+        self.seed_models()
+        before = config.read_bytes()
+        # Simulate a scanner miss that would land the key inside the string.
+        with patch.object(native_context, "_root_scan", return_value=(None, before.index(b"body"))):
+            with self.assertRaisesRegex(native_context.NativeContextError, "root model_context_window"):
+                native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
+        self.assertEqual(config.read_bytes(), before)
+
+    def test_activation_reports_projection_failure_as_activation_error(self):
+        codex_home = self.home / ".codex"
+        (codex_home / "agent-config").mkdir(parents=True)
+        (codex_home / "agent-config/models.conf").write_text(
+            (ROOT / "adapters/codex/config/models.conf").read_text())
+        (codex_home / "config.toml").write_text("model_context_window = 800000\n[broken\n")
+        env = {**os.environ, "HOME": str(self.home), "CODEX_HOME": str(codex_home),
+               "HEARTING_FIXTURE_ROOT": str(self.home)}
+        env.pop("HEARTING_MODEL_CONFIG_HOME", None)
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(runtime_activation.ActivationError, "invalid Codex config TOML"):
+                runtime_activation._prepare_runtime_config("codex", ROOT, None)
+
     def test_claude_context_only_overwrites_managed_value_and_deactivate_keeps_it(self):
         settings = self.home / "settings.json"
         settings.write_text(json.dumps({"other": {"keep": 1}, "env": {

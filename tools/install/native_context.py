@@ -20,117 +20,110 @@ class NativeContextError(ValueError):
     pass
 
 
-def _toml_root_value(raw: bytes) -> tuple[int, int] | None:
-    """Return the byte span of the single root numeric value, excluding comments."""
+_CONTEXT_KEY = "model_context_window"
+_ROOT_KEY = re.compile(r"""[ \t]*(?:model_context_window|"model_context_window"|'model_context_window')[ \t]*=[ \t]*""")
+_INTEGER = re.compile(r"[+-]?(?:0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+|[0-9_]+)")
+_HEADER = re.compile(r"[ \t]*\[")
+
+
+def _parse_toml(raw: bytes) -> tuple[str, dict]:
     try:
         text = raw.decode("utf-8")
-        parsed = tomllib.loads(text)
+        return text, tomllib.loads(text)
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise NativeContextError(f"invalid Codex config TOML: {exc}") from exc
-    value = parsed.get("model_context_window")
-    if value is not None and (type(value) is not int or value < 1):
-        raise NativeContextError("Codex root model_context_window must be a positive integer")
 
-    # TOML's root table ends at its first real table header. Config syntax has
-    # already been validated, so a root assignment can be found line-wise.
-    header = re.compile(r'^\s*\[')
-    key = re.compile(r'^\s*(?:model_context_window|"model_context_window")\s*=\s*')
-    offset = 0
-    multiline = None
-    escaped = False
+
+def _skip_multiline(text: str, index: int, quote: str) -> int:
+    """Return the offset after a multiline string whose body starts at ``index``."""
+    while index < len(text):
+        if quote == '"' and text[index] == "\\":
+            index += 2
+            continue
+        if text.startswith(quote * 3, index):
+            end = index + 3
+            # Up to two quotes may sit directly before the closing delimiter.
+            while end < len(text) and text[end] == quote and end - index < 5:
+                end += 1
+            return end
+        index += 1
+    return index
+
+
+def _skip_string(text: str, index: int, quote: str) -> int:
+    """Return the offset after a one-line string whose body starts at ``index``."""
+    while index < len(text) and text[index] != "\n":
+        if quote == '"' and text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == quote:
+            return index + 1
+        index += 1
+    return index
+
+
+def _root_scan(text: str) -> tuple[tuple[int, int] | None, int]:
+    """Find the root key's value span and the first table header, outside strings and comments."""
     found = None
-    for line in text.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        at_root = multiline is None
-        if at_root and header.match(body):
-            break
-        match = key.match(body) if at_root else None
-        if match:
-            tail = body[match.end():]
-            number = re.match(r"[+-]?\d+", tail)
-            if not number:
-                raise NativeContextError("Codex root model_context_window is not a plain integer")
-            end = offset + match.end() + number.end()
-            found = (offset + match.end(), end)
-            break
-        # Track TOML multiline strings so a header/key-shaped string body is
-        # never mistaken for root syntax.
-        index = 0
-        while index < len(body):
-            char = body[index]
-            if multiline:
-                if multiline == '"""':
-                    if body.startswith('"""', index) and not escaped:
-                        multiline = None
-                        index += 3
-                        continue
-                elif multiline == "'''" and body.startswith("'''", index):
-                    multiline = None
-                    index += 3
-                    continue
-                if multiline == '"""' and char == "\\" and not escaped:
-                    escaped = True
-                else:
-                    escaped = False
-                index += 1
-                continue
-            if body.startswith('"""', index):
-                multiline = '"""'; index += 3; continue
-            if body.startswith("'''", index):
-                multiline = "'''"; index += 3; continue
-            if char == "#":
-                break
+    index, line_start, depth = 0, True, 0
+    while index < len(text):
+        if line_start:
+            line_start = False
+            if depth == 0 and _HEADER.match(text, index):
+                return found, index
+            key = _ROOT_KEY.match(text, index) if depth == 0 and found is None else None
+            if key:
+                number = _INTEGER.match(text, key.end())
+                if not number:
+                    raise NativeContextError("Codex root model_context_window is not a plain integer")
+                found = (key.end(), number.end())
+        char = text[index]
+        if char == "\n":
+            line_start = True
             index += 1
-        offset += len(line)
-    if found is None:
-        return None
-    return (len(text[:found[0]].encode("utf-8")),
-            len(text[:found[1]].encode("utf-8")))
+        elif char == "#":
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline
+        elif text.startswith('"""', index) or text.startswith("'''", index):
+            index = _skip_multiline(text, index + 3, char)
+        elif char in "\"'":
+            index = _skip_string(text, index + 1, char)
+        else:
+            # A multi-line array or inline table may hold lines that look like headers.
+            depth += 1 if char in "[{" else -1 if char in "]}" else 0
+            index += 1
+    return found, len(text)
+
+
+def _verify_codex(original: dict, candidate: bytes, desired: int) -> None:
+    """Only the root key may differ; anything else means the edit landed in the wrong place."""
+    try:
+        parsed = tomllib.loads(candidate.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise NativeContextError(f"Codex context projection is invalid: {exc}") from exc
+    if parsed.get(_CONTEXT_KEY) != desired:
+        raise NativeContextError("Codex context projection did not set the root model_context_window")
+    before = {key: value for key, value in original.items() if key != _CONTEXT_KEY}
+    after = {key: value for key, value in parsed.items() if key != _CONTEXT_KEY}
+    if before != after and repr(before) != repr(after):
+        raise NativeContextError("Codex context projection would change other settings; config left unchanged")
 
 
 def _edit_codex(raw: bytes, desired: int) -> bytes:
-    try:
-        text = raw.decode("utf-8")
-        tomllib.loads(text)
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise NativeContextError(f"invalid Codex config TOML: {exc}") from exc
-    span = _toml_root_value(raw)
+    text, parsed = _parse_toml(raw)
+    value = parsed.get(_CONTEXT_KEY)
+    if value is not None and (type(value) is not int or value < 1):
+        raise NativeContextError("Codex root model_context_window must be a positive integer")
+    span, header = _root_scan(text)
     if span:
-        return raw[:span[0]] + str(desired).encode() + raw[span[1]:]
-    newline = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines(keepends=True)
-    insert = len(text)
-    offset = 0
-    multiline = None
-    for line in lines:
-        body = line.rstrip("\r\n")
-        if multiline is None and re.match(r"^\s*\[", body):
-            insert = offset
-            break
-        index = 0
-        while index < len(body):
-            if multiline == '"""' and body.startswith('"""', index):
-                multiline = None; index += 3; continue
-            if multiline == "'''" and body.startswith("'''", index):
-                multiline = None; index += 3; continue
-            if multiline is None and body.startswith('"""', index):
-                multiline = '"""'; index += 3; continue
-            if multiline is None and body.startswith("'''", index):
-                multiline = "'''"; index += 3; continue
-            if multiline is None and body[index] == "#":
-                break
-            index += 1
-        offset += len(line)
-    prefix = text[:insert]
-    suffix = text[insert:]
-    if prefix and not prefix.endswith(("\n", "\r")):
-        prefix += newline
-    addition = f"model_context_window = {desired}{newline}"
-    candidate = (prefix + addition + suffix).encode("utf-8")
-    try:
-        tomllib.loads(candidate.decode("utf-8"))
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise NativeContextError(f"Codex context projection is invalid: {exc}") from exc
+        candidate = (text[:span[0]] + str(desired) + text[span[1]:]).encode("utf-8")
+    else:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        prefix, suffix = text[:header], text[header:]
+        if prefix and not prefix.endswith(("\n", "\r")):
+            prefix += newline
+        candidate = (prefix + f"{_CONTEXT_KEY} = {desired}{newline}" + suffix).encode("utf-8")
+    _verify_codex(parsed, candidate, desired)
     return candidate
 
 
@@ -183,9 +176,12 @@ def project_context_window(adapter: str, *, runtime, source_root, previous=None,
     if adapter not in model_config.ADAPTERS:
         raise NativeContextError(f"unknown harness: {adapter}")
     runtime_home = Path(runtime).expanduser().absolute()
-    values, receipt = model_config.resolve_config(adapter, runtime=runtime_home,
-                                                 source_root=source_root)
-    desired, provenance = model_config.resolve_context_window(values)
+    try:
+        values, receipt = model_config.resolve_config(adapter, runtime=runtime_home,
+                                                     source_root=source_root)
+        desired, provenance = model_config.resolve_context_window(values)
+    except model_config.ModelConfigError as exc:
+        raise NativeContextError(str(exc)) from exc
     number = int(desired)
     if adapter == "opencode":
         return {"kind": "context-window-projected", "runtime": adapter,
@@ -203,7 +199,10 @@ def project_context_window(adapter: str, *, runtime, source_root, previous=None,
                 "source": receipt.source, "merge": result,
                 "report_lines": list(result.get("report_lines", []))}
     path = runtime_home / "config.toml"
-    original = path.read_bytes() if path.exists() else b""
+    try:
+        original = path.read_bytes() if path.exists() else b""
+    except OSError as exc:
+        raise NativeContextError(f"cannot read Codex config: {exc}") from exc
     old = None
     if original:
         try:
