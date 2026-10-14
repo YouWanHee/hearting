@@ -586,8 +586,9 @@ long-run launch (`compute-hosts run`, `nohup|setsid … python … train|run.py`
 asks whether this session's route-chain ledger names any route for that
 folder's canonical artifact root — composed, compiled, continued or started,
 open or closed. If not, it refuses that call and prints one paste-ready
-`capability-route.py compose --shape direct …` line; once any route exists
-there, every later call of that session×folder passes. It does not check which
+`capability-route.py compose --shape direct …` line for one atomic, reversible
+inline change; other new work omits `--shape` so the frame decides. Once any
+route exists there, every later call of that session×folder passes. It does not check which
 route, its freshness, lineage, stage or proof. Registered owners and workers,
 artifact roots, the temp directory, runtime homes, CI and dev activation pass;
 any judgement failure passes; `HEARTING_ROUTE_GATE=off` turns it off.
