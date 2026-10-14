@@ -47,6 +47,7 @@ from dispatch_contract import (  # noqa: E402
     residue_live_pids,
     tagged_residue_receipt,
 )
+from claude_project_dir import resolve_session_transcript
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
 from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
@@ -1327,32 +1328,12 @@ def _supervised_claude_transcript(job, receipt_path):
     session_id = announcement.get("session_id")
     announced_cwd = announcement.get("cwd")
     job_cwd = getattr(job, "cwd", None)
-    if not (
-        isinstance(session_id, str)
-        and re.fullmatch(r"[A-Za-z0-9._-]+", session_id)
-        and isinstance(announced_cwd, str)
-        and os.path.isabs(announced_cwd)
-        and isinstance(job_cwd, str)
-        and os.path.isabs(job_cwd)
-    ):
-        return None, "invalid-supervisor-session-event"
-    try:
-        if os.path.realpath(announced_cwd) != os.path.realpath(job_cwd):
-            return None, "supervisor-worktree-mismatch"
-    except (OSError, TypeError, ValueError):
-        return None, "supervisor-worktree-mismatch"
-    # Claude's project encoding is deterministic (`encode_project_dir`).  Do not
-    # glob for this session id: a same-id file under another project is not evidence.
-    encoded_cwd = encode_project_dir(announced_cwd)
     runtime_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home")
-    project_dir = os.path.realpath(os.path.join(runtime_home or _proj_home(), "projects", encoded_cwd))
-    transcript = os.path.realpath(os.path.join(project_dir, session_id + ".jsonl"))
-    try:
-        if os.path.commonpath((project_dir, transcript)) != project_dir:
-            return None, "invalid-supervisor-session-event"
-    except (TypeError, ValueError):
-        return None, "invalid-supervisor-session-event"
-    return (transcript, None) if os.path.isfile(transcript) else (None, None)
+    transcript, reason = resolve_session_transcript(
+        session_id, announced_cwd, expected_cwd=job_cwd,
+        runtime_home=runtime_home or _proj_home(),
+    )
+    return (str(transcript), None) if transcript else (None, reason)
 
 
 def _parse_claude_stream_tail(path):

@@ -1049,6 +1049,7 @@ def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
     return WRAPPER_COMMON.attach_summary_owner(
         args, log_path, prompt_path, identity,
         harness="opencode", summary_launcher=launch_summary_owner,
+        runtime_home=(getattr(args, "worker_runtime_env", None) or {}).get("OPENCODE_CONFIG_DIR"),
     )
 
 def append_job(jobs: Path, args: argparse.Namespace) -> bool:
@@ -1698,9 +1699,10 @@ def main(argv: list[str]) -> int:
             # secondary alive signal independent of the OpenCode SQLite mtime.
             "OPENCODE_DISPATCH_SLUG": args.slug,
         }
-        dispatch_env.update(prepare_worker_home(args.agent_home, 'opencode',
-                                                args.worker_type, args.attempt_id,
-                                                env=dispatch_env))
+        args.worker_runtime_env = prepare_worker_home(args.agent_home, 'opencode',
+                                                     args.worker_type, args.attempt_id,
+                                                     env=dispatch_env)
+        dispatch_env.update(args.worker_runtime_env)
         if _supervised_owner(args):
             lease = supervisor_lease_path(jobs, args.attempt_id)
             dispatch_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(lease.with_suffix(".json"))

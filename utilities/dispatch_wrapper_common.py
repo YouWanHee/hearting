@@ -727,7 +727,7 @@ def close_job_row(jobs: Path, slug: str, worktree: str, reason: str, reset: str,
 
 
 def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity, *,
-                         harness: str, summary_launcher):
+                         harness: str, summary_launcher, runtime_home: str | None = None):
     """Attach the summary owner; the wrapper passes its harness name and its own
     `launch_summary_owner`, looked up in its module at call time so tests that
     patch the wrapper's name keep working."""
@@ -739,6 +739,8 @@ def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity, *,
         prompt_path=prompt_path,
         target_pid=int(identity["pid"]),
         target_start=identity["pid_start"],
+        runtime_home=runtime_home,
+        attempt_cwd=getattr(args, "worktree", None),
         review_artifact_root=review["artifact_root"] if review else None,
         review_cycle_id=review["cycle_id"] if review else None,
         review_lease_nonce=args.review_governed_lease_nonce if review else None,

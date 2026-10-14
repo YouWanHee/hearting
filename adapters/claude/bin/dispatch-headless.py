@@ -1202,6 +1202,7 @@ def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
     return WRAPPER_COMMON.attach_summary_owner(
         args, log_path, prompt_path, identity,
         harness="claude", summary_launcher=launch_summary_owner,
+        runtime_home=(getattr(args, "worker_runtime_env", None) or {}).get("CLAUDE_CONFIG_DIR"),
     )
 
 def append_job(jobs: Path, args: argparse.Namespace) -> bool:
