@@ -15,6 +15,8 @@ This is the portable capability contract for `session-tidy`. It defines runtime-
 
 ## Invocation Semantics
 
+Claude Code, Codex, and OpenCode give the interactive main session a non-blocking notice based on the latest request's input usage: strictly above 500,000 tokens recommends `/session-tidy`, and strictly above 700,000 asks for tidying now. Each threshold is emitted once per native session ID; a jump across both emits the urgent notice once and consumes both. Compaction does not reset these notices. Owners, workers, auxiliary/reviewer sessions, and subagents are excluded. These notices do not change the runtime's compaction policy.
+
 Runtime compaction counts as a session tidy invocation by the main session. Each completed compaction queues memory tidying without clearing the window; when the runtime accepts summary instructions, use the six card fields (work in progress, waiting decisions, next actions, related references, today's work, and user instructions), and when the completed summary is available, save it as the seat card if the session has its own seat (a verified pane or native target); a shared project fallback seat only queues memory tidying, so one session's compaction never replaces another session's card. Never block or delay compaction to complete tidying. Worker sessions are excluded.
 
 At a shared project fallback seat each session keeps its own card, so one session's card never replaces another's; a different session receives only the seat's newest card, once, and only if it first appeared after that card's author was last active.

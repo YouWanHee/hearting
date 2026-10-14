@@ -1361,16 +1361,55 @@ def _without_hooks(entries: list, drop: set) -> list:
 
 
 def _merge_claude_settings(
-    active_root: Path, previous: Optional[dict], scope: str = "global"
+    active_root: Path, previous: Optional[dict], scope: str = "global", *,
+    context_window: str | None = None, context_only: bool = False,
+    config_path: Path | None = None, native_locked: bool = False,
 ) -> dict:
+    if context_only:
+        config = config_path or _config_path("claude", scope, "settings.json")
+        key = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+        desired = str(context_window) if context_window is not None else None
+        def read_settings():
+            data = _read_json_object(config, "Claude settings") if config.exists() else {}
+            env = data.get("env", {})
+            if not isinstance(env, dict):
+                raise ActivationError(f"Claude settings env is not an object: {config}")
+            return data, env.get(key)
+
+        data, before = read_settings()
+        changed = desired is not None and before != desired
+        if changed:
+            if not native_locked:
+                with safe_fs.TargetLock(config):
+                    data, before = read_settings()
+                    changed = before != desired
+                    if changed:
+                        env = data.get("env", {})
+                        env[key] = desired
+                        data["env"] = env
+                        _atomic_json(config, data)
+            else:
+                env = data.get("env", {})
+                env[key] = desired
+                data["env"] = env
+                _atomic_json(config, data)
+        return {"kind": "claude-context-window-projected", "path": str(config),
+                "previous_context_window": before, "context_changed": changed,
+                "managed_values": {"env": {key: desired}} if desired is not None else {},
+                "report_lines": ([f"context window: claude {before or 'unset'} -> {desired} tokens",
+                                  f"settings: {config}"] if changed else [])}
     source = _read_json_object(_claude_hook_source(active_root), "Claude hook source")
     source_hooks = source.get("hooks")
     if not isinstance(source_hooks, dict) or not source_hooks:
         raise ActivationError("Claude hook source has no hooks object")
     desired_values = _claude_managed_values(source)
-    config = _config_path("claude", scope, "settings.json")
+    if context_window is not None:
+        desired_values["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_window)
+    config = config_path or _config_path("claude", scope, "settings.json")
     original = config.read_bytes() if config.exists() else None
     data = _read_json_object(config, "Claude settings") if config.exists() else {}
+    if context_window is not None and "env" in data and not isinstance(data.get("env"), dict):
+        raise ActivationError(f"Claude settings env is not an object: {config}")
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ActivationError(f"Claude settings hooks is not an object: {config}")
@@ -1499,6 +1538,8 @@ def _merge_claude_settings(
             current_value = current_env.get(key, missing_value)
             previous_value = previous_env.get(key, missing_value)
             if (
+                (key == "CLAUDE_CODE_AUTO_COMPACT_WINDOW" and context_window is not None)
+                or
                 current_value is missing_value
                 or current_value == desired_value
                 or (
@@ -1524,6 +1565,15 @@ def _merge_claude_settings(
 
     if changed:
         _atomic_json(config, data)
+    context_key = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+    context_previous = None
+    if original:
+        try:
+            original_data = json.loads(original.decode("utf-8"))
+            original_env = original_data.get("env", {}) if isinstance(original_data, dict) else {}
+            context_previous = original_env.get(context_key) if isinstance(original_env, dict) else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            pass
     return {
         "kind": "claude-settings-merged",
         "path": str(config),
@@ -1531,6 +1581,10 @@ def _merge_claude_settings(
         "managed_hooks": source_hooks,
         "managed_values": managed_values,
         "conflicts": conflicts,
+        "previous_context_window": context_previous,
+        "context_changed": context_window is not None and context_previous != str(context_window),
+        "report_lines": ([f"context window: claude {context_previous or 'unset'} -> {context_window} tokens",
+                          f"settings: {config}"] if context_window is not None and context_previous != str(context_window) else []),
     }
 
 
@@ -2001,12 +2055,27 @@ def _activation_protected_paths(runtime: str, scope: str = "global") -> List[Pat
 
 
 def _prepare_runtime_config(
-    runtime: str, active_root: Path, previous: Optional[dict], scope: str = "global"
+    runtime: str, active_root: Path, previous: Optional[dict], scope: str = "global", *,
+    native_locked: bool = False,
 ) -> List[dict]:
+    from native_context import project_context_window
     if runtime == "claude":
-        return [_merge_claude_settings(active_root, previous, scope)]
+        projected = project_context_window(
+            runtime, runtime=paths.runtime_home(runtime, scope), source_root=active_root,
+            previous=previous, scope=scope, native_locked=native_locked,
+            claude_merge=lambda **kwargs: _merge_claude_settings(active_root, previous, scope, **kwargs),
+        )
+        result = projected.get("merge", {})
+        result.setdefault("report_lines", projected["report_lines"])
+        return [result]
     if runtime == "codex":
-        return [_merge_codex_identity_config(active_root, previous, scope)]
+        projected = project_context_window(runtime, runtime=paths.runtime_home(runtime, scope),
+                                           source_root=active_root, previous=previous, scope=scope,
+                                           native_locked=native_locked)
+        result = _merge_codex_identity_config(active_root, previous, scope)
+        result.setdefault("report_lines", []).extend(projected["report_lines"])
+        result["context_projection"] = projected
+        return [result]
     if runtime == "opencode":
         return [_seed_opencode_tui_entry(active_root, previous, scope)]
     return []
@@ -2945,9 +3014,13 @@ def activate(
     # the only point where "what did the installer leave here" is still
     # observable for a dest activation is about to adopt for the first time.
     replaced_installer_symlink_targets = _capture_replaced_installer_targets(previous, desired)
+    context_report_lines: List[str] = []
 
     def commit_state(owned):
-        config_changes = _prepare_runtime_config(runtime, active_root, previous, scope)
+        config_changes = _prepare_runtime_config(runtime, active_root, previous, scope,
+                                                 native_locked=True)
+        for change in config_changes:
+            context_report_lines.extend(change.get("report_lines", []))
         state = {
             "schema": SCHEMA,
             "runtime": runtime,
@@ -3032,7 +3105,10 @@ def activate(
         commit_callback=commit_state,
     )
     retired_memory_state.retire()  # distiller-era state files, once; silent
-    return status(runtime, scope)
+    report = status(runtime, scope)
+    if context_report_lines:
+        report["report_lines"] = context_report_lines
+    return report
 
 
 def _status_missing(runtime: str, scope: str) -> dict:
@@ -3224,7 +3300,7 @@ def refresh(runtime: str, scope: str = "global") -> dict:
 
 
 def _unmerge_claude_settings(
-    state: dict, scope: str, dry_run: bool = False
+    state: dict, scope: str, dry_run: bool = False, *, config_path: Path | None = None
 ) -> List[str]:
     """Remove what the activation record still proves it owns.
 
@@ -3242,7 +3318,7 @@ def _unmerge_claude_settings(
         managed_values = {}
     if not managed_hooks and not managed_values:
         return []
-    config = _config_path("claude", scope, "settings.json")
+    config = config_path or _config_path("claude", scope, "settings.json")
     if not config.exists():
         return []
     try:
@@ -3272,6 +3348,8 @@ def _unmerge_claude_settings(
     current_env = data.get("env")
     if isinstance(managed_env, dict) and isinstance(current_env, dict):
         for key, value in managed_env.items():
+            if key == "CLAUDE_CODE_AUTO_COMPACT_WINDOW":
+                continue
             if current_env.get(key) == value:
                 current_env.pop(key)
                 changed = True

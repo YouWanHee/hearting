@@ -70,6 +70,76 @@ def claude_usage(transcript: object, session_id: str) -> int | None:
     return None
 
 
+def codex_usage(transcript: object, session_id: str) -> int | None:
+    """Read the exact main-session Codex rollout's latest input usage."""
+    if not isinstance(transcript, (str, os.PathLike)) or not transcript or not session_id:
+        return None
+    try:
+        path = Path(transcript)
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 512 * 1024 * 1024:
+            return None
+        with path.open("rb") as handle:
+            head = handle.read(min(info.st_size, 64 * 1024)).splitlines()
+            meta = None
+            for raw in head:
+                try:
+                    row = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(row, dict) and row.get("type") == "session_meta":
+                    meta = row.get("payload")
+                    break
+            if not isinstance(meta, dict) or meta.get("id") != session_id:
+                return None
+            source = meta.get("source")
+            if isinstance(source, dict) and source.get("subagent"):
+                return None
+            start = max(0, info.st_size - 8 * 1024 * 1024)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            lines = handle.read().splitlines()
+        for raw in reversed(lines):
+            try:
+                row = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            payload = row.get("payload")
+            if row.get("type") != "event_msg" or not isinstance(payload, dict) \
+                    or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            usage = info.get("last_token_usage") if isinstance(info, dict) else None
+            return input_tokens(usage, ("input_tokens",))
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
+
+def codex_notice(payload: dict) -> str:
+    """Return the shared once-per-session notice for a Codex main prompt."""
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "UserPromptSubmit":
+        return ""
+    sid = payload.get("session_id")
+    if not isinstance(sid, str) or not sid or not main_session():
+        return ""
+    transcript = payload.get("transcript_path")
+    if not isinstance(transcript, str) or not transcript:
+        try:
+            from fleet.token_budget import find_codex_rollout
+            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+            transcript, reason = find_codex_rollout(home, sid)
+            if reason != "ok":
+                return ""
+        except Exception:
+            return ""
+    tokens = codex_usage(transcript, sid)
+    return notice("codex", sid, tokens)
+
+
 def notice(harness: str, session_id: str, tokens: int | None, *, state_dir=None, env=None) -> str:
     """Atomically consume newly exceeded thresholds. Any unavailable state is silent."""
     if (not main_session(env) or not session_id or not isinstance(tokens, int)
@@ -126,7 +196,10 @@ def claude_notice(payload: dict) -> str:
 def main() -> None:
     # OpenCode supplies only the latest assistant's token fields, never bodies.
     try:
-        payload = json.load(sys.stdin)
+        raw = sys.stdin.readline(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            return
+        payload = json.loads(raw)
         if not isinstance(payload, dict) or not isinstance(payload.get("session_id"), str):
             return
         usage = payload.get("tokens")

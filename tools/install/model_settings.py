@@ -325,12 +325,31 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
                       model_profile.resolve_profile_values(adapter, new_values, target["profile"])["budget"])
         unchanged = old_model == new_model and (explicit_budget is None or old_budget == new_budget)
     if unchanged:
+        projected = None
+        if target["kind"] == "scalar" and not dry_run and adapter in {"claude", "codex"}:
+            try:
+                from native_context import project_context_window
+                if adapter == "claude":
+                    import runtime_activation
+                    projected = project_context_window(
+                        adapter, runtime=runtime_path, source_root=source_root,
+                        claude_merge=lambda **kwargs: runtime_activation._merge_claude_settings(
+                            Path(source_root or model_config.repository_root()), None,
+                            "global", config_path=runtime_path / "settings.json", **kwargs),
+                        context_only=True)
+                else:
+                    projected = project_context_window(adapter, runtime=runtime_path,
+                                                       source_root=source_root)
+            except Exception as exc:
+                raise ModelSettingsError(
+                    f"models.conf is unchanged at {path}; native context projection failed: {exc}") from exc
         return {"operation": "model-set", "status": "unchanged", "exit": 0,
                 "runtime": adapter, "config_path": str(path), "target": target,
                 "requested_model": requested, "old_model": old_model, "new_model": new_model,
                 "old_budget": old_budget, "new_budget": new_budget, "changed_keys": [],
                 "backup": None, "source_reason": reason,
-                "lines": ([f"model set: unchanged {adapter} context-window -> {new_context_window} tokens"]
+                "lines": ([f"model set: unchanged {adapter} context-window -> {new_context_window} tokens",
+                           *(projected or {}).get("report_lines", [])]
                           if target["kind"] == "scalar" else
                           [f"model set: unchanged {adapter} {target['name']} -> {old_model}"]),
                 **context_fields}
@@ -362,10 +381,33 @@ def set_model(adapter: str, target_name: str, requested: str, *, runtime: str | 
     auth = safe_fs.authority(path, owner="model-settings:set", allowed_paths=(path,),
                              allow_leaf_symlink=False, expected=current)
     safe_fs.atomic_write_bytes(auth, candidate, mode, expected=current, create_parents=True)
+    projection_lines = []
+    if target["kind"] == "scalar" and adapter in {"claude", "codex"}:
+        try:
+            from native_context import project_context_window
+            if adapter == "claude":
+                import runtime_activation
+                projected = project_context_window(
+                    adapter, runtime=runtime_path, source_root=source_root,
+                    claude_merge=lambda **kwargs: runtime_activation._merge_claude_settings(
+                        Path(source_root or model_config.repository_root()), None,
+                        "global", config_path=runtime_path / "settings.json", **kwargs),
+                    context_only=True)
+            else:
+                projected = project_context_window(adapter, runtime=runtime_path,
+                                                   source_root=source_root)
+            projection_lines = [line for line in projected.get("report_lines", [])
+                                if not line.startswith("context window:")]
+            if projected.get("path"):
+                projection_lines.append(f"native context: {projected['path']}")
+        except Exception as exc:
+            raise ModelSettingsError(
+                f"models.conf was saved at {path}, but native context projection failed: {exc}") from exc
     # A non-cooperating writer can race the final precheck->rename window; do not roll back a successor.
     if target["kind"] == "scalar":
         lines = [f"model set: {adapter} context-window {old_context_window} -> {new_context_window} tokens",
                  f"config: {path}", f"backup: {backup or 'none (new user config)'}"]
+        lines.extend(projection_lines)
     else:
         lines = [f"model set: {adapter} {target['name']} {old_model} -> {new_model}",
                  f"config: {path}", f"backup: {backup or 'none (new user config)'}"]

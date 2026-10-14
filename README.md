@@ -266,9 +266,15 @@ hearting model set opencode context-window 800000
 ```
 
 The query reports the selected user/shipped config and whether the value is
-configured or defaulted. Native model limits and service capacity can reduce
-the usable window. Changes apply to new launches; active sessions keep their
-captured settings.
+configured or defaulted. Activation and successful edits project the value to
+Claude's native environment setting and Codex's root config key; OpenCode
+configures a cap for models it already loads when the runtime starts. Existing native model limits
+and service capacity can reduce the usable window. New sessions use the updated
+settings; active sessions keep their captured settings, and an already running
+Codex daemon may need a restart before newly created threads inherit a change.
+All three runtimes also show the interactive main session a once-per-session
+notice above 500K input tokens and an urgent notice above 700K. Workers and
+subagents are excluded.
 
 ## Develop the harness
 
