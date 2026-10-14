@@ -1618,8 +1618,71 @@ class DirectoryBundleFinalizeTest(ProducerTestBase):
             self.assertEqual(P._sealed_source_files(cycle, record, "artifacts/reports",
                                                      cycle / "artifacts/reports"),
                              [("report.md", m.digest_bytes(b"report"), len(b"report"))])
-        self.assertEqual(P._sealed_source_files(cycle, record, "artifacts/raw-results", raw),
-                         [("x.bin", m.digest_bytes(b"raw"), len(b"raw"))])
+        source_rows = P._sealed_source_files(cycle, record, "artifacts/raw-results", raw)
+        self.assertEqual(source_rows, [("x.bin", m.digest_bytes(b"raw"), len(b"raw"))])
+        expected_rows = [{"path": path, "sha256": digest_value, "byte_size": size}
+                         for path, digest_value, size in source_rows]
+        (raw / "x.bin").write_bytes(b"late raw mutation")
+        with mock.patch.object(P.artifact_directory_bundle, "scan_tree",
+                               side_effect=AssertionError("historical source tree rehashed")):
+            self.assertTrue(P._published_source_matches(
+                self.root, record, json.loads((cycle / "manifest.json").read_text()),
+                "artifacts/raw-results", expected_rows))
+
+    def test_existing_workflow_evidence_in_raw_tree_keeps_reserved_individual_row(self):
+        import artifact_workflow_groups as workflow
+
+        self.activate()
+        route_one, file_one = self.route(slug="bundle-workflow-one", campaign_key="bundle-workflow")
+        one = P.begin(self.root, route_file=file_one, capability="autopilot-code",
+                      intensity="direct", campaign_key="bundle-workflow")
+        route_two, file_two = self.route(slug="bundle-workflow-two", campaign_key="bundle-workflow")
+        two = P.begin(self.root, route_file=file_two, capability="autopilot-code",
+                      intensity="direct", campaign_key="bundle-workflow")
+        raw = self.write_output(one, "raw-results/evidence.md", b"raw workflow evidence")
+        report = self.write_output(two, "reports/evidence.md", b"report workflow evidence")
+
+        def reserve(output, route, path):
+            record = P.read_cycle_record(self.root, output["cycle_id"])
+            relative = path.relative_to(Path(output["cycle_dir"])).as_posix()
+            digest_value = m.digest_bytes(path.read_bytes())
+            document = P.build_manifest(
+                self.root, record, route, (), state="completed", primary=None,
+                allow_open_route=True, allocator=P.artifact_identity.IdAllocator(), now=1,
+                interim=True, facts=[(relative, digest_value, path.stat().st_size)])
+            P.reservation_path(self.root, output["cycle_id"]).parent.mkdir(parents=True, exist_ok=True)
+            P.reservation_path(self.root, output["cycle_id"]).write_bytes(
+                P._json_bytes(P._reservation_payload(record, document, None)))
+            P.open_manifest_path(self.root, output["cycle_id"]).parent.mkdir(parents=True, exist_ok=True)
+            P.open_manifest_path(self.root, output["cycle_id"]).write_bytes(m.canonical_bytes(document))
+            return next(row for row in document["artifact_revisions"] if row["locator"]["path"] == relative)
+
+        reserved_raw = reserve(one, route_one, raw)
+        reserve(two, route_two, report)
+        cycle_one = Path(one["cycle_dir"])
+        cycle_two = Path(two["cycle_dir"])
+        camp = one["campaign_id"]
+        relation = {"from_cycle_id": one["cycle_id"], "to_cycle_id": two["cycle_id"],
+                    "kind": "precedes", "rationale": "The later cycle consumes prior evidence.",
+                    "evidence_refs": [
+                        {"path": raw.relative_to(self.root).as_posix()},
+                        {"path": report.relative_to(self.root).as_posix()},
+                    ]}
+        proposal = {"groups": [{"title": "Bundle workflow evidence",
+                    "members": [{"cycle_id": one["cycle_id"], "stage_label": "first"},
+                                {"cycle_id": two["cycle_id"], "stage_label": "second"}],
+                    "relations": [relation]}]}
+        plan = workflow.prepare(self.root, camp, proposal)
+        workflow.apply(self.root, plan)
+        self.close(route_one, file_one)
+        P.finalize(self.root, cycle_id=one["cycle_id"])
+        document = json.loads((cycle_one / "manifest.json").read_text(encoding="utf-8"))
+        raw_row = next(row for row in document["artifact_revisions"]
+                       if row["locator"]["path"] == "artifacts/raw-results/evidence.md")
+        self.assertEqual(raw_row["artifact_id"], reserved_raw["artifact_id"])
+        self.assertEqual(raw_row["artifact_revision_id"], reserved_raw["artifact_revision_id"])
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle_one), ())
+        self.assertEqual(report.read_bytes(), b"report workflow evidence")
 
     def test_raw_only_bundle_can_be_primary_and_exact_primary_leaf_stays_individual(self):
         self.activate()

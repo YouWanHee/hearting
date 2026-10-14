@@ -283,12 +283,14 @@ def _evidence_owner(root: Path, path: Any, endpoints: tuple[Path, Path]) -> tupl
 
 def _bind_evidence(root: Path, campaign: Mapping[str, Any], ref: Mapping[str, Any],
                    endpoints: tuple[tuple[str, Path], tuple[str, Path]],
-                   *, remaining: int | None = None) -> dict[str, str]:
+                   *, remaining: int | None = None,
+                   manifest_overrides: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, str]:
     if not isinstance(ref, dict) or set(ref) not in ({"path"}, EVIDENCE_FIELDS):
         raise WorkflowGroupError("evidence-fields-invalid")
     absolute, directory = _evidence_owner(root, ref["path"], (endpoints[0][1], endpoints[1][1]))
     cycle_id = next(cid for cid, cdir in endpoints if cdir == directory)
-    manifest = _manifest(root, campaign, cycle_id, directory)
+    manifest = ((manifest_overrides or {}).get(cycle_id)
+                or _manifest(root, campaign, cycle_id, directory))
     rel = str(absolute.relative_to(directory)).replace(os.sep, "/")
     exact = [row for row in manifest.get("artifact_revisions", [])
              if isinstance(row, dict) and isinstance(row.get("locator"), dict)

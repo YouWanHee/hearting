@@ -496,6 +496,9 @@ def _bundle_coverage(cycle_root: Path, document: Dict[str, Any]):
             covered = artifact_directory_bundle.verify_coverage(cycle_root, rel, row)
             body = artifact_directory_bundle.parse_descriptor((cycle_root / rel).read_bytes())
             directory = body["directory"]["path"]
+            if artifacts.get(row.get("artifact_id"), {}).get("title") != directory[len("artifacts/"):]:
+                violations.append(Violation("bundle-title-directory-mismatch", rel, "bundle title does not match body"))
+                continue
             if any(directory == prior or directory.startswith(prior + "/")
                    or prior.startswith(directory + "/") for prior in directories):
                 violations.append(Violation("bundle-directory-overlap", directory, "overlapping directory bundles"))

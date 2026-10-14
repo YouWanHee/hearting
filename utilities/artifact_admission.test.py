@@ -584,7 +584,7 @@ class TestStagingSafety(AdmissionContractBase):
         bundle_id = "a_" + "b" * 32
         doc["artifacts"].append({"artifact_id": bundle_id, "cycle_id": doc["cycle"]["cycle_id"],
                                  "role": "output", "type": "directory-bundle",
-                                 "capability": "autopilot-code", "title": "artifacts/raw-results"})
+                                 "capability": "autopilot-code", "title": "raw-results"})
         doc["artifact_revisions"].append({"artifact_revision_id": "ar_" + "c" * 32,
             "artifact_id": bundle_id, "revision_sequence": 1,
             "content_digest": tree.descriptor_digest, "byte_size": len(tree.descriptor),
@@ -607,6 +607,13 @@ class TestStagingSafety(AdmissionContractBase):
         self.assertEqual(violations[0].code, "bundle-descriptor-revision-mismatch")
         source_codes = {row.code for row in adm._verify_staging_source(src, doc)}
         self.assertIn("staging-undeclared-extra-file", source_codes)
+        doc["artifact_revisions"][-1]["content_digest"] = tree.descriptor_digest
+        doc["artifact_revisions"][-1]["media_type"] = "application/json"
+        doc["artifacts"][-1]["type"] = "doc"
+        coverage, violations = adm._bundle_coverage(src, doc)
+        self.assertEqual((coverage, violations), (set(), []))
+        generic_codes = {row.code for row in adm._verify_staging_source(src, doc)}
+        self.assertIn("staging-undeclared-extra-file", generic_codes)
 
 # ---------------------------------------------------------------------------
 # F-1 defence (graft G-2) and the non-scope invariants

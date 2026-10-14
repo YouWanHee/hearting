@@ -2948,7 +2948,120 @@ def _bundle_inventory_holds(directory: Path, tree: artifact_directory_bundle.Tre
     return actual == tuple(sorted(expected, key=lambda row: row[0].encode("utf-8")))
 
 
-def _bundle_exact_evidence_facts(directory: Path, trees: Sequence[artifact_directory_bundle.Tree],
+def _bundle_workflow_evidence_facts(root: Path, record: Mapping[str, Any], directory: Path,
+                                    trees: Sequence[artifact_directory_bundle.Tree]) -> List[Tuple[str, str, int]]:
+    selected = {f"{tree.directory}/{leaf.path}": leaf for tree in trees for leaf in tree.leaves}
+    if not selected:
+        return []
+    try:
+        import artifact_workflow_groups as workflow_groups
+        declaration = workflow_groups._load_existing(
+            workflow_groups.declaration_path(root, record["campaign_id"]))
+    except Exception:
+        return []
+    if not isinstance(declaration, Mapping):
+        return []
+    candidate_refs = []
+    for group in declaration.get("groups", []) if isinstance(declaration.get("groups"), list) else []:
+        for relation in group.get("relations", []) if isinstance(group, Mapping) and isinstance(group.get("relations"), list) else []:
+            if not isinstance(relation, Mapping):
+                continue
+            for ref in relation.get("evidence_refs", []) if isinstance(relation.get("evidence_refs"), list) else []:
+                if not isinstance(ref, Mapping) or not isinstance(ref.get("path"), str):
+                    continue
+                try:
+                    rel = (Path(root) / ref["path"]).relative_to(directory).as_posix()
+                except (ValueError, OSError):
+                    continue
+                if rel in selected:
+                    candidate_refs.append((ref, relation))
+    if not candidate_refs:
+        return []
+    campaign = read_campaign(root, record["campaign_id"])
+    identity = artifact_lifecycle.read_root_identity(root)
+    if campaign is None or identity is None:
+        return []
+    reserved, status = read_interim_reservation(root, record)
+    open_doc = _read_json(open_manifest_path(root, record["cycle_id"])) or {}
+    synthetic = copy.deepcopy(open_doc) if isinstance(open_doc, Mapping) else {}
+    synthetic.update({
+        "artifact_root_id": identity.artifact_root_id,
+        "repository_id": identity.repository_id,
+        "campaign": {"campaign_id": campaign["campaign_id"]},
+        "cycle": {"cycle_id": record["cycle_id"], "campaign_id": record["campaign_id"], "state": "open"},
+    })
+    synthetic.setdefault("artifacts", [])
+    synthetic.setdefault("artifact_revisions", [])
+    preserved = {}
+    for rel, leaf in selected.items():
+        reservation = reserved.artifacts.get(rel) if reserved is not None else None
+        revision = reserved.revision_for(rel, leaf.digest) if reserved is not None else None
+        if reservation is None or revision is None:
+            continue
+        existing = [row for row in synthetic["artifact_revisions"]
+                    if isinstance(row, Mapping) and isinstance(row.get("locator"), Mapping)
+                    and row["locator"].get("path") == rel]
+        if existing:
+            if (len(existing) != 1 or existing[0].get("artifact_id") != reservation.artifact_id
+                    or existing[0].get("artifact_revision_id") != revision.artifact_revision_id
+                    or existing[0].get("content_digest") != leaf.digest):
+                return []
+            preserved[rel] = leaf
+            continue
+        synthetic["artifacts"].append({"artifact_id": reservation.artifact_id, "cycle_id": record["cycle_id"]})
+        synthetic["artifact_revisions"].append({
+            "artifact_id": reservation.artifact_id,
+            "artifact_revision_id": revision.artifact_revision_id,
+            "content_digest": leaf.digest,
+            "locator": {"kind": "cycle-relative", "path": rel},
+        })
+        preserved[rel] = leaf
+    if status in ("unreadable", "identity-mismatch"):
+        return []
+    try:
+        validated = workflow_groups._validate_document(
+            root, campaign, directory, identity.artifact_root_id, identity.repository_id,
+            declaration)
+    except workflow_groups.WorkflowGroupError as exc:
+        return []
+    facts = {}
+    for group in validated.get("groups", []):
+        for relation in group.get("relations", []):
+            for ref in relation.get("evidence_refs", []):
+                try:
+                    rel = (Path(root) / ref["path"]).relative_to(directory).as_posix()
+                except (KeyError, ValueError, OSError):
+                    continue
+                leaf = preserved.get(rel)
+                if not leaf:
+                    continue
+                endpoints = []
+                for endpoint_id in (relation.get("from_cycle_id"), relation.get("to_cycle_id")):
+                    if endpoint_id == record["cycle_id"]:
+                        endpoints.append((endpoint_id, directory))
+                        continue
+                    endpoint_record = read_cycle_record(root, endpoint_id)
+                    if endpoint_record is None:
+                        return []
+                    endpoints.append((endpoint_id, cycle_dir(
+                        root, endpoint_record["campaign_id"], endpoint_id, endpoint_record)))
+                try:
+                    bound = workflow_groups._bind_evidence(
+                        root, campaign, ref, tuple(endpoints),
+                        manifest_overrides={record["cycle_id"]: synthetic})
+                except workflow_groups.WorkflowGroupError as exc:
+                    return []
+                if bound.get("sha256") == leaf.digest:
+                    facts[rel] = (rel, leaf.digest, leaf.size)
+    candidate_paths = {(Path(root) / ref["path"]).relative_to(directory).as_posix()
+                       for ref, _relation in candidate_refs}
+    if len(facts) != len(candidate_paths):
+        return []
+    return [facts[rel] for rel in sorted(facts)]
+
+
+def _bundle_exact_evidence_facts(root: Path, record: Mapping[str, Any], directory: Path,
+                                trees: Sequence[artifact_directory_bundle.Tree],
                                 route: Mapping[str, Any], primary: Optional[str]) -> List[Tuple[str, str, int]]:
     """Keep existing exact primary and terminal file evidence as individual rows."""
     selected = {f"{tree.directory}/{leaf.path}": leaf for tree in trees for leaf in tree.leaves}
@@ -2973,7 +3086,9 @@ def _bundle_exact_evidence_facts(directory: Path, trees: Sequence[artifact_direc
         leaf = selected.get(rel)
         if leaf is not None and proof.get("evidence_digest") in (None, leaf.digest.removeprefix("sha256:")):
             candidates.add(rel)
-    return [(rel, selected[rel].digest, selected[rel].size) for rel in sorted(candidates)]
+    facts = [(rel, selected[rel].digest, selected[rel].size) for rel in sorted(candidates)]
+    facts.extend(_bundle_workflow_evidence_facts(root, record, directory, trees))
+    return list({rel: (rel, digest, size) for rel, digest, size in facts}.values())
 
 
 def _bundle_locator(directory: str) -> str:
@@ -5309,7 +5424,8 @@ def finalize(
                     facts.append((rel, digest_value, size))
         if violations:
             raise ProducerError("output-invalid", ";".join(violations))
-        for rel, digest_value, size in _bundle_exact_evidence_facts(directory, bundle_trees, route, primary):
+        for rel, digest_value, size in _bundle_exact_evidence_facts(
+                root, record, directory, bundle_trees, route, primary):
             if all(row[0] != rel for row in facts):
                 facts.append((rel, digest_value, size))
         bundle_facts, bundle_metadata = _publish_bundle_descriptors(root, cycle_id, directory, bundle_trees)
@@ -7764,6 +7880,40 @@ def _check_shared_base(expected: Optional[str], actual: Optional[str]) -> None:
                             "merge against latest in a new cycle before admission")
 
 
+def _shared_source_intersects_bundle(directory: Path, document: Mapping[str, Any], source_rel: str) -> bool:
+    artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                 if isinstance(row, Mapping)}
+    for row in document.get("artifact_revisions", []) or []:
+        if not isinstance(row, Mapping) or row.get("media_type") != artifact_directory_bundle.MEDIA_TYPE:
+            continue
+        if artifacts.get(row.get("artifact_id"), {}).get("type") != "directory-bundle":
+            continue
+        title = artifacts[row.get("artifact_id")].get("title")
+        if not isinstance(title, str) or not title:
+            continue
+        tree_rel = "artifacts/" + title
+        intersects = (tree_rel == source_rel or tree_rel.startswith(source_rel + "/")
+                      or source_rel.startswith(tree_rel + "/"))
+        if not intersects:
+            continue
+        locator = row.get("locator")
+        rel = locator.get("path") if isinstance(locator, Mapping) else None
+        if not isinstance(rel, str):
+            continue
+        try:
+            descriptor = (directory / rel).read_bytes()
+            if (len(descriptor) != row.get("byte_size")
+                    or "sha256:" + hashlib.sha256(descriptor).hexdigest() != row.get("content_digest")):
+                raise ProducerError("bundle-descriptor-revision-mismatch", rel)
+            body = artifact_directory_bundle.parse_descriptor(descriptor)
+        except (OSError, artifact_directory_bundle.DirectoryBundleError) as exc:
+            raise ProducerError("bundle-descriptor-invalid", rel) from exc
+        if body["directory"]["path"] != tree_rel:
+            raise ProducerError("bundle-title-directory-mismatch", rel)
+        return True
+    return False
+
+
 def _sealed_source_files(directory: Path, record: Mapping[str, Any], source_rel: str,
                          source_path: Path) -> List[Tuple[str, str, int]]:
     """Bind both the receipt and payload to the sealed manifest, not mutable disk."""
@@ -7781,22 +7931,29 @@ def _sealed_source_files(directory: Path, record: Mapping[str, Any], source_rel:
             expected[rel] = (row["content_digest"], row["byte_size"])
         if row.get("artifact_id") not in bundle_artifacts or row.get("media_type") != artifact_directory_bundle.MEDIA_TYPE:
             continue
-        descriptor_rel = row.get("locator", {}).get("path", "")
-        try:
-            body = artifact_directory_bundle.parse_descriptor((directory / descriptor_rel).read_bytes())
-        except (OSError, artifact_directory_bundle.DirectoryBundleError) as exc:
-            raise ProducerError("source-bundle-descriptor-invalid", descriptor_rel) from exc
-        tree_rel = body["directory"]["path"]
+        artifact = next(item for item in document.get("artifacts", [])
+                        if isinstance(item, Mapping) and item.get("artifact_id") == row.get("artifact_id"))
+        title = artifact.get("title")
+        if not isinstance(title, str) or not title:
+            continue
+        tree_rel = "artifacts/" + title
         intersects = (tree_rel == source_rel or tree_rel.startswith(source_rel + "/")
                       or source_rel.startswith(tree_rel + "/"))
         if not intersects:
             continue
         if source_rel.startswith(tree_rel + "/"):
             raise ProducerError("shared-bundle-subtree-unsupported", source_rel)
-        descriptor_bytes = (directory / descriptor_rel).read_bytes()
-        if (len(descriptor_bytes) != row.get("byte_size")
-                or "sha256:" + hashlib.sha256(descriptor_bytes).hexdigest() != row.get("content_digest")):
-            raise ProducerError("bundle-descriptor-revision-mismatch", descriptor_rel)
+        descriptor_rel = row.get("locator", {}).get("path", "")
+        try:
+            descriptor_bytes = (directory / descriptor_rel).read_bytes()
+            if (len(descriptor_bytes) != row.get("byte_size")
+                    or "sha256:" + hashlib.sha256(descriptor_bytes).hexdigest() != row.get("content_digest")):
+                raise ProducerError("bundle-descriptor-revision-mismatch", descriptor_rel)
+            body = artifact_directory_bundle.parse_descriptor(descriptor_bytes)
+        except (OSError, artifact_directory_bundle.DirectoryBundleError) as exc:
+            raise ProducerError("source-bundle-descriptor-invalid", descriptor_rel) from exc
+        if body["directory"]["path"] != tree_rel:
+            raise ProducerError("bundle-title-directory-mismatch", descriptor_rel)
         try:
             tree = artifact_directory_bundle.scan_tree(directory, tree_rel)
         except artifact_directory_bundle.DirectoryBundleError as exc:
@@ -7854,6 +8011,79 @@ def _published_source_rows(document: Mapping[str, Any], source_rel: str) -> List
     return sorted(rows)
 
 
+def _published_source_matches(root: Path, record: Optional[Mapping[str, Any]],
+                              document: Mapping[str, Any], source_rel: str,
+                              expected_rows: Sequence[Mapping[str, Any]]) -> bool:
+    expected = [(row.get("path"), row.get("sha256"), row.get("byte_size"))
+                for row in expected_rows if isinstance(row, Mapping)]
+    actual = _published_source_rows(document, source_rel)
+    artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                 if isinstance(row, Mapping)}
+    bundles = []
+    for revision in document.get("artifact_revisions", []) or []:
+        if (not isinstance(revision, Mapping)
+                or revision.get("media_type") != artifact_directory_bundle.MEDIA_TYPE
+                or artifacts.get(revision.get("artifact_id"), {}).get("type") != "directory-bundle"):
+            continue
+        title = artifacts[revision["artifact_id"]].get("title")
+        if isinstance(title, str) and title:
+            bundles.append(("artifacts/" + title, revision))
+    intersecting = [(tree_rel, revision) for tree_rel, revision in bundles
+                    if (tree_rel == source_rel or tree_rel.startswith(source_rel + "/")
+                        or source_rel.startswith(tree_rel + "/"))]
+    if not intersecting:
+        return actual == sorted(expected)
+    directory = None
+    if record is not None:
+        try:
+            directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+        except (ProducerError, KeyError):
+            directory = None
+    # A deleted/missing source is judged from the immutable shared publication's
+    # own inventory, without reopening raw source bytes.
+    if directory is None or not directory.is_dir():
+        return True
+    coverage_prefixes = []
+    for tree_rel, revision in intersecting:
+        if source_rel.startswith(tree_rel + "/"):
+            return False  # a shared source cut through a bundle cannot preserve closure
+        locator = revision.get("locator")
+        descriptor_rel = locator.get("path") if isinstance(locator, Mapping) else None
+        if not isinstance(descriptor_rel, str):
+            return True
+        try:
+            data = (directory / descriptor_rel).read_bytes()
+            if (len(data) != revision.get("byte_size")
+                    or "sha256:" + hashlib.sha256(data).hexdigest() != revision.get("content_digest")):
+                return True
+            body = artifact_directory_bundle.parse_descriptor(data)
+        except (OSError, artifact_directory_bundle.DirectoryBundleError):
+            return True
+        if body["directory"]["path"] != tree_rel:
+            return False
+        prefix = "" if source_rel == tree_rel else tree_rel[len(source_rel) + 1:]
+        covered = [(path, digest, size) for path, digest, size in expected
+                   if isinstance(path, str) and (path.startswith(prefix + "/") if prefix else True)]
+        leaves = [[path[len(prefix) + 1:] if prefix else path, digest, size]
+                  for path, digest, size in covered]
+        leaves.sort(key=lambda row: row[0].encode("utf-8"))
+        tree_digest = "sha256:" + hashlib.sha256(artifact_directory_bundle._canonical(leaves)).hexdigest()
+        if (len(leaves) != body["file_count"] or sum(row[2] for row in leaves) != body["total_bytes"]
+                or tree_digest != body["tree_digest"]):
+            return False
+        coverage_prefixes.append(prefix)
+    def covered_path(path: Any) -> bool:
+        if not isinstance(path, str):
+            return False
+        for prefix in coverage_prefixes:
+            if path.startswith(prefix + "/") if prefix else True:
+                return True
+        return False
+    expected_direct = sorted(row for row in expected if not covered_path(row[0]))
+    actual_direct = sorted(row for row in actual if not covered_path(row[0]))
+    return actual_direct == expected_direct
+
+
 def _check_published_provenance(root: Path, revision: Mapping[str, Any], expected_rows: Sequence[Mapping[str, Any]],
                                 *, code: str) -> None:
     """A finished publication is judged by what it recorded (§45 D-127): the source
@@ -7870,7 +8100,7 @@ def _check_published_provenance(root: Path, revision: Mapping[str, Any], expecte
     rel = source.get("path", "")
     if not rel.startswith("artifacts/") or ".." in rel.split("/"):
         raise ProducerError(code, "source path")
-    if _published_source_rows(document, rel) != sorted((r["path"], r["sha256"], r["byte_size"]) for r in expected_rows):
+    if not _published_source_matches(root, record, document, rel, expected_rows):
         raise ProducerError(code, "source identity")
 
 
@@ -8497,7 +8727,10 @@ def admit_shared(
                 raise ProducerError("shared-publication-unresolved", str(pending_id))
         dropped = sorted({str(name) for name in drop_components if str(name)})
         drop_decisions = [{"name": name, "reason": drop_reason or "unspecified"} for name in dropped]
-        source_rows = _sealed_source_files(directory, record, source_rel, source_path) if kind == "spec" else None
+        document = _read_json(directory / "manifest.json") or {}
+        bundle_intersects = _shared_source_intersects_bundle(directory, document, source_rel)
+        source_rows = (_sealed_source_files(directory, record, source_rel, source_path)
+                       if kind == "spec" or bundle_intersects else None)
         merged_tree = None
         merge_proof = None
         if kind == "spec":
