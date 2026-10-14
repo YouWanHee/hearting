@@ -1075,6 +1075,19 @@ class RegistryConfirmArmTest(unittest.TestCase):
         self.assertEqual((record["state"], record["arms"], record["session_id"]), ("waiting", 1, "session-1"))
         self.assertEqual(record["holder"][0], str(os.getpid()))
 
+    def test_codex_and_opencode_owner_attempts_arm_the_original_claude_parent(self) -> None:
+        for harness in ("codex", "opencode"):
+            attempt_id = f"att-{harness}-owner"
+            with self.subTest(harness=harness):
+                self.jobs.write_text(self.row(attempt_id=attempt_id, harness=harness,
+                    parent_sid="session-1", parent_completion_delivery="claude-parent-runtime"),
+                    encoding="utf-8")
+                launch = self.arm()
+                assert launch is not None
+                self.assertEqual((launch.attempt_id, launch.session_id), (attempt_id, "session-1"))
+                ledger = self.ledger(attempt_id)
+                self.assertEqual((ledger["state"], ledger["session_id"]), ("waiting", "session-1"))
+
     def test_a_wave_of_starts_is_armed_one_row_per_call_oldest_first(self) -> None:
         # Five concurrent fleet owners (2026-09-01) made every same-session
         # candidate window ambiguous for the old command-slug narrowing. The

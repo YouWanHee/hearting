@@ -20,6 +20,36 @@ SPEC.loader.exec_module(READINESS)
 
 
 class DispatchReadinessTest(unittest.TestCase):
+    def test_three_enabled_prospective_owners_probe_the_complete_child_inventory(self) -> None:
+        observed = []
+
+        def evaluate(args):
+            observed.append(args)
+            return {
+                "parent_harness": args.parent_harness,
+                "parent_transport": args.parent_transport,
+                "parent_sandbox": args.parent_sandbox,
+                "child_harness": args.child_harness,
+                "launch_authority": args.launch_authority,
+                "checked_worktree": args.worktree,
+                "status": "unsupported" if (args.parent_harness, args.child_harness) == ("codex", "opencode") else "supported",
+                "probe_source": "fixture",
+            }
+
+        owners = ["claude", "codex", "opencode"]
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            READINESS.NESTED, "evaluate", side_effect=evaluate
+        ):
+            root = Path(raw)
+            result = READINESS.generate(worktree=root, jobs=root / "jobs.log",
+                owner_harnesses=owners, child_harnesses=owners)
+        self.assertEqual(len(observed), 9)
+        self.assertEqual({row.parent_harness for row in observed}, set(owners))
+        self.assertEqual({row.child_harness for row in observed}, set(owners))
+        self.assertEqual({(row["parent_harness"], row["child_harness"]): row["status"]
+                          for row in result["tuples"]}[ ("codex", "opencode") ], "unsupported")
+        self.assertEqual({row["checked_worktree"] for row in result["tuples"]}, {str(root.resolve())})
+
     def test_codex_parent_automatically_uses_prospective_owner_contract(self) -> None:
         observed = []
 
