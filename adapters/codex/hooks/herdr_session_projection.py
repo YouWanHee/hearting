@@ -1,6 +1,6 @@
 """Fail-soft projection of an existing Codex session into an existing Herdr pane.
 
-The shape of that projection — `[<tag>] <harness>[ ⚑]` plus the existing summary — is
+The shape of that projection — `[<tag>] [⚑ ]<harness>` plus the existing summary — is
 shared with Claude and OpenCode in `tools/fleet/herdr_projection.py`, because a pane
 header that means one thing in one harness and another thing in the next is exactly the
 identity confusion it exists to remove. This module stays as the Codex hook entry point

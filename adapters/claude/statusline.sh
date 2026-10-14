@@ -123,7 +123,7 @@ try:
                              registry_name=inputs.get("registry_name"),
                              title=session_name or None, slug=None, cwd=cwd)
     # 2026-09-09 사용자 결정: statusline 은 제목만 진다. `[46]` 식별 배지는 herdr pane
-    # 상단 제목(`[46] claude ⚑ <요약>`)이 소유한다 — 하네스마다 다른 내부 상태줄에서
+    # 상단 제목(`[46] ⚑ claude <요약>`)이 소유한다 — 하네스마다 다른 내부 상태줄에서
     # 억지로 신원을 맞추는 대신 세 하네스가 공유하는 바깥 표면 하나에 둔다.
     # 제목이 없어 이름이 디렉토리로 떨어지면 왼쪽 `📁 <dir>` 세그먼트와 같은 말이 되므로
     # 그 경우엔 아무것도 출력하지 않는다.

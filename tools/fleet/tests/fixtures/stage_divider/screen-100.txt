@@ -11,8 +11,8 @@
 
   SESSIONS   narrow · press w to cycle
 ▾ ● bundle/
-▍ ⠋ [aa] claude     aa ▾4
-▍    ⚑  3h 00m      Opus (high)              -
+▍ ⠋ [aa] ⚑ claude   aa ▾4
+▍    ┆  3h 00m      Opus (high)              -
 ▍    ┆              ────────────────   —    NOW owner work · age unknown
 ▍    ┆  ╭─  ⠋ claude   gpu-owner ─────────────────────────────────────────────────────────────────╮
 ▍    ┆  │  —        Opus (high)              code owner                                           │
@@ -33,7 +33,7 @@
 ▍    ┆  │           ────────────────   —                                                          │
 ▍    ┆  ╰──────────────────────────────────────────────────────────────────────────── scaffold ───╯
 ▍ ⠋ [bb] codex      bb
-▍    ┆  3h 00m      gpt-6.1-sol (medium)     -
+▍       3h 00m      gpt-6.1-sol (medium)     -
 ▍                   ────────────────   —
 
   session: ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch

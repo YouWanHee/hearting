@@ -269,19 +269,20 @@ class RuntimeProjectionTest(unittest.TestCase):
                     _, rows = self.project(root, sid, title=title)
                     self.assertEqual(rows[1][-1], "[%s] codex %s" % (minted_tag(sid), title))
 
-    def test_pane_header_order_is_number_then_harness_then_steward(self):
-        """User-fixed 2026-09-09 format `[번호] 하네스 (⚑) 요약`, one shape everywhere."""
+    def test_pane_header_order_is_number_then_steward_then_harness(self):
+        """User-fixed format `[번호] (⚑) 하네스 요약` (2026-09-09; ⚑ moved before the harness
+        2026-10-14), one shape everywhere."""
         for harness in ("claude", "codex", "opencode"):
             self.assertEqual(compose(harness, "s", tag="3a", steward=False, title="사이클"),
                              ("[3a] %s" % harness, "사이클"))
             self.assertEqual(compose(harness, "s", tag="b0", steward=True, title="감독")[0],
-                             "[b0] %s ⚑" % harness)
+                             "[b0] ⚑ %s" % harness)
         # No tag resolves: the badge slot is dropped rather than shown empty or faked.
         self.assertEqual(compose("claude", "s", tag=None, steward=False, title="t")[0],
                          "claude")
         # Budgets are herdr's; a long title is clipped, never wrapped into the agent cell.
         agent, title = compose("codex", "s", tag="3a", steward=True, title="가" * 80)
-        self.assertEqual(agent, "[3a] codex ⚑")
+        self.assertEqual(agent, "[3a] ⚑ codex")
         self.assertLess(len(title), 80)
 
     def test_claude_hook_reports_current_session_and_metadata_together(self):
@@ -994,8 +995,8 @@ class PaneHeaderIdentityTest(unittest.TestCase):
 
     def test_the_steward_mark_rides_with_the_identity(self):
         from tools.fleet.herdr_projection import header_title
-        self.assertTrue(header_title("[94] claude ⚑", "v6 Release").startswith(
-            "[94] claude ⚑ "))
+        self.assertTrue(header_title("[94] ⚑ claude", "v6 Release").startswith(
+            "[94] ⚑ claude "))
 
     def test_an_identity_with_no_summary_still_shows_the_number(self):
         # The number is the part the user called the important one; a session whose
