@@ -39,12 +39,15 @@ another adapter.
 ## Routing and Execution
 
 <!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Ordinary execution is one command, the same in every harness:
-
 ```
 hearting run capability-route compose --start --prompt-file <task> \
-  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+  [--shape direct] [--campaign-key <stream>]
 ```
+
+Use `--shape direct` only for one atomic, reversible inline change; otherwise
+omit it and let the frame decide. Other shape-free flags are hints. Follow
+decided routes under §0.2.1; person-named stages use
+`--shape staged --graph <stage,…>`.
 
 `hearting` is on PATH. `hearting run <utility>` runs that harness utility from
 `AGENT_HOME` when it is set (dev activation: that checkout), else from the
@@ -76,17 +79,19 @@ Message another session only with `hearting run peer-steward prompt
 <name-or-pane> --body-file <file>`; reply text addressed to it reaches nobody.
 <!-- END generated from core/fragments/bootstrap-dispatch.md -->
 
-Route by `core/WORKFLOW.md §0.2`: the semantic precedence names the
-capability that owns the artifacts; §0.2.1 then picks the **shape** of the
-work before any preset: new non-direct work defaults to `framed` (exceptions
-there). `direct`, `solo`, `staged`, and `framed` go through
-`hearting run capability-route compose` (cwd, artifact root,
-tracking, drift verdict, spec-read gate, and both eligibility probes default
-from the checkout; a staged `--graph execute,test,report` is your own stage
-subgraph of the owning capability). Use the preset recipe
-(`capability-route.py compile`) only when the request names the entry's full
-loop or a promotion signal or spec-backed flow requires it; never bend a
-loosely matching request into the nearest preset graph. Apply §0.3. For
+Route by `core/WORKFLOW.md §0.2`: semantic precedence names the capability
+that owns the artifacts. The main session decides only whether the work is
+direct (§0.2.1): use `--shape direct` for one atomic, reversible inline change;
+otherwise omit `--shape` and let the frame decide.
+
+Use `hearting run capability-route compose`; without `--shape`, capability,
+mode, graph, and profile flags are routing hints only. Follow frame- or
+person-decided shapes under §0.2.1; person-named stages use
+`--shape staged --graph <stage,…>`. Cwd, artifact root, tracking, drift verdict,
+spec-read gate, and both eligibility probes default from the checkout. Use the
+preset recipe (`capability-route.py compile`) only when the request names the
+entry's full loop or a promotion signal or spec-backed flow requires it; never
+bend a loosely matching request into the nearest preset graph. Apply §0.3. For
 `direct`/`solo` routes user-authored turns receive the §0.4 card; received
 peer envelopes use the one `[경로]` line `compose` prints plus one clause
 of scope, unless the work is destructive or

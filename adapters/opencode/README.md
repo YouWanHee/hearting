@@ -344,7 +344,7 @@ provide `profile_demand` on every ad-hoc unit. Missing fields fail closed.
 `stages [--capability <name>] [--json]` prints the part catalog a graph is
 assembled from: every stage as `capability:stage` with its one-line summary,
 inputs and outputs, `unit_choices`, `shareable`, `start_approval`, optional parts,
-and the parts of other recipes this host can borrow. `compose --graph` accepts a
+and the parts of other recipes this host can borrow. `compose --shape staged --graph` accepts a
 host stage id or a shareable `capability:stage` (for example
 `inspect,autopilot-research:retrieval,autopilot-research:synthesis,report`); a
 borrowed part is written under `parts/<capability>/<stage>/` inside the host's own
@@ -352,7 +352,8 @@ artifact scope. Claude reaches both through `adapters/claude/bin/capability-rout
 Codex and OpenCode through `preflight.sh compose|stages`; every surface forwards
 the arguments unmodified and prints the same output.
 
-When assembling `staged` routes, follow the shared
+A shape-omitted `--graph` is a frame routing hint. Assemble `staged` routes only
+for a frame brief or person-named stage list; follow the shared
 [WORKFLOW §0.2.1 guidance](../../core/WORKFLOW.md#021-shape-before-preset-sd-135).
 
 The five portable profiles are deep, balanced-deep, balanced, light and mini.

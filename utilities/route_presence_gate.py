@@ -438,8 +438,9 @@ def refusal(root: str, top: Path, kind: str, target: str, env) -> str:
         "compose", "--shape", "direct", "--campaign-key", shlex.quote(_campaign_key(root, top)),
         "--slug", shlex.quote(_slug_word(stem)), "--cwd", shlex.quote(str(top))])
     return (f"hearting: this session has no route for {root} yet (core/WORKFLOW.md §0.4). "
-            f"Run this once, then retry:\n{command}\n"
-            "Bigger work: use --shape solo, staged or framed instead. "
+            f"For one atomic, reversible inline change, run this once, then retry:\n{command}\n"
+            "For other new work, omit --shape and use compose --start --prompt-file <task>; the frame decides the route. "
+            "Follow an already-decided frame or person-specified route under core/WORKFLOW.md §0.2.1. "
             "To continue a route you already have: capability-route.py start --route <route-file>.")
 
 

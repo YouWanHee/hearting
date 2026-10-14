@@ -10713,7 +10713,7 @@ def main():
     cp.add_argument("--explicit-profiles", help="JSON file mapping demanded node ids to explicit profiles")
     cp.add_argument("--profile", choices=sorted(PROFILE.PORTABLE_PROFILES),
                     help="explicit model budget for owner and model nodes; node-specific --explicit-profiles takes precedence")
-    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route; --capability, --capability-mode, --graph and --profile are recorded as hints only); default staged with --graph, else direct")
+    cp.add_argument("--shape",choices=COMPOSE_SHAPES,default=None,help="direct (inline) | solo (one registered owner) | staged (capability recipe, optionally narrowed by --graph) | framed (two top frame legs propose the route; --capability, --capability-mode, --graph and --profile are recorded as hints only); default: framed; use --shape direct for inline work; --graph without --shape is a frame routing hint")
     cp.add_argument("--graph",default=None,help="optional staged subgraph in your order (see `capability-route.py stages --capability <cap>` for valid ids); incompatible inherited parallel presets are omitted; optional :unit override, e.g. execute,test,report")
     cp.add_argument("--execution-scope", choices=("complete", "report"), default=None,
                     help="optional scope already selected in the existing start confirmation; it is not approval evidence")
@@ -10873,7 +10873,7 @@ def main():
                     print("  borrow "+line(node))
         return 0
     if a.command=="compose":
-        shape=a.shape or ("staged" if a.graph else "direct")
+        shape=a.shape or "framed"
         if a.start and (a.explain or a.prompt_file is None):
             raise ValueError("compose-start-requires-task: use --start --prompt-file <task>, without --explain")
         cwd=a.cwd or os.getcwd()

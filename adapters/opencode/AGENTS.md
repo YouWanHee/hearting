@@ -76,12 +76,15 @@ partial. OpenCode native UI/config owns model and context fields.
 ## Dispatch
 
 <!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Ordinary execution is one command, the same in every harness:
-
 ```
 hearting run capability-route compose --start --prompt-file <task> \
-  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+  [--shape direct] [--campaign-key <stream>]
 ```
+
+Use `--shape direct` only for one atomic, reversible inline change; otherwise
+omit it and let the frame decide. Other shape-free flags are hints. Follow
+decided routes under §0.2.1; person-named stages use
+`--shape staged --graph <stage,…>`.
 
 `hearting` is on PATH. `hearting run <utility>` runs that harness utility from
 `AGENT_HOME` when it is set (dev activation: that checkout), else from the
@@ -113,20 +116,23 @@ Message another session only with `hearting run peer-steward prompt
 <name-or-pane> --body-file <file>`; reply text addressed to it reaches nobody.
 <!-- END generated from core/fragments/bootstrap-dispatch.md -->
 
-Route by `core/WORKFLOW.md §0.2`: precedence names the capability that owns
-the artifacts; §0.2.1 then picks the work **shape** before any preset:
-new non-direct work defaults to `framed` (exceptions there).
-`direct`/`solo`/`staged`/`framed` go through `hearting run capability-route compose`
-(flags, spec-read gate and probes default from
-the checkout; a staged `--graph execute,test,report` is your own stage
-subgraph). Use the preset recipe (`preflight.sh route --capability …`) only
-when the request names the entry's full loop or a promotion signal or
-spec-backed flow requires it. Apply §0.3. `direct`/`solo` routes carry the
-§0.4 card through `question` on user-authored turns; received peer envelopes
-use one `[경로]` line plus a scope clause, unless the work is destructive or
-external-facing; otherwise present the §0.4 five-field card before material
-work unless already approved, and close with the §0.5 card. Load full
-capability detail only in the acting owner or worker.
+Route by `core/WORKFLOW.md §0.2`: semantic precedence names the capability
+that owns the artifacts. The main session decides only whether the work is
+direct (§0.2.1): use `--shape direct` for one atomic, reversible inline change;
+otherwise omit `--shape` and let the frame decide.
+
+Use `hearting run capability-route compose`; without `--shape`, capability,
+mode, graph, and profile flags are routing hints only. Follow frame- or
+person-decided shapes under §0.2.1; person-named stages use
+`--shape staged --graph <stage,…>`. Flags, spec-read gate, and probes default
+from the checkout. Use the preset recipe (`preflight.sh route --capability …`)
+only when the request names the entry's full loop or a promotion signal or
+spec-backed flow requires it. Apply §0.3. Direct routes carry the §0.4 card
+through `question` on user-authored turns; received peer envelopes use one
+`[경로]` line plus a scope clause, unless destructive or external-facing;
+otherwise present the §0.4 five-field card before material work unless already
+approved, and close with the §0.5 card. Load full capability detail only in
+the acting owner or worker.
 
 Check `preflight.sh headless [--check] <worktree>`. `preflight.sh dispatch
 --dry-run|--register|--start` runs the raw wrapper; the route commands above

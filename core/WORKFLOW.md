@@ -244,42 +244,37 @@ An entry's recipe is an assembly preset: the default when nothing else is
 chosen and an example of how its parts fit together. The route is the sealed
 stage list, assembled from the part catalog (`capabilities/topologies.json`
 recipes plus `part_catalog`, SD-165).
-Before proposing a route, choose the **shape** of the work from its size; the
-shape and explicit choices determine the route; defaults only fill omissions:
+The main session decides only whether the work is direct. For one atomic,
+reversible inline change, use `compose --shape direct`. Otherwise use
+`compose --start --prompt-file <task>` with no `--shape`; the frame chooses
+the capability, stages, and solo or staged shape.
 
-| Shape | When | Route |
+| Main decision | Command | Result |
 |---|---|---|
-| `direct` | one atomic, reversible change the session makes and checks inline | `capability-route.py compose` — the inline node, dispatch depth 0 |
-| `solo` | one bounded piece of work that deserves its own registered session but no separate stages | `compose --shape solo` — one registered dispatch-depth-1 owner, no dispatch depth 2 |
-| `staged` | work with separate stages | `compose --shape staged` uses the capability's standard recipe; optional `--graph <stage,…>` selects a subgraph — list a capability's parts (stage ids, summaries, inputs/outputs, units, human gates, `shareable`, `start_approval`, optional and borrowable parts) with `capability-route.py stages [--capability <cap>]` before guessing at `--graph` |
-| `framed` | **the default for new non-direct work**; capability and stages are not yet chosen | `compose --shape framed` — one frame leg (both `top` legs with `--intensity strong` or higher, for uncertain or hard-to-reverse work) proposes the smallest route, one interview confirms it, and the runtime starts its first leg only (SD-164) |
+| One atomic, reversible inline change | `compose --shape direct` | inline node, dispatch depth 0 |
+| Other new work | `compose --start --prompt-file <task>` | framed; frame proposes the smallest route and the existing interview confirms it |
 
-**`framed` is the default; four cases skip the frame.** Work that is not
-`direct` starts with `compose --shape framed --campaign-key <stream> --start
---prompt-file <task>`. `--capability`, `--capability-mode`, `--graph` and
-`--profile` are only hints to the frame legs — recorded only: not sealed, not
-refused; `--pin` applies as usual. Use `staged`/`solo` as before when (1) the
-person named the capability and its stages, (2) the work continues a stopped
-route, (3) the main session composes the next leg of an approved proposal from
-its `next_leg`, or (4) the same campaign already holds an approved frame
-decision (`shards/frame/route-decision.json`) and the new instruction is inside
-its scope: reuse that record, and choose `framed` again only when the scope
-changed. The main session judges the scope; nothing picks a campaign's latest
-record automatically. `direct` is unchanged. A route made from a proposal
-(`compose --route-plan <record>#<i>`, a command the runtime prints) has no frame
-nodes, and neither has a `solo` or `staged` compose: those shapes are chosen for
-decided work, so they compile without the recipe's frame pair (a route sealed
-earlier keeps the frame nodes it was sealed with). A `framed` route's one leg
-is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own
-frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered
-automatically; a frame-rule `top` that stops at a usage limit is retried once at
-`deep` through the SD-157 replacement lineage, and the lowering is recorded.
-The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를
-조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or,
-with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
+`solo` means one registered owner; `staged` means separate stages. Shape
+omission starts a framed route. `--capability`, `--capability-mode`, `--graph`,
+and `--profile` without a shape are routing hints recorded for the frame, not
+sealed choices. `--pin` applies as usual.
 
-**Staged assembly guidance.** New non-direct work defaults to `framed`; assemble
-`staged` directly when the whole route is already decided under the cases above.
+Skip a new frame only when a frame or the person already decided the shape:
+resume a stopped route, follow the runtime-printed `next_leg`, continue within
+an approved frame decision of the same campaign, or follow the person's
+explicit capability and stages. The main session judges whether follow-up
+stays within that approved scope. Its own judgment that work is already
+decided is not an exception. Use the decided shape explicitly; a person-named
+stage list uses `--shape staged --graph <stage,…>`. A route made from a
+proposal (`compose --route-plan <record>#<i>`, a command the runtime prints)
+has no frame nodes, and neither has a `solo` or `staged` compose: those shapes
+compile without the recipe's frame pair (a route sealed earlier keeps the
+frame nodes it was sealed with).
+
+A `framed` route's one leg is `deep`; both legs of a two-leg `framed` route and of a preset recipe's own frame pair are `top`: a pin with a profile or an explicit profile wins and is not lowered automatically; a frame-rule `top` that stops at a usage limit is retried once at `deep` through the SD-157 replacement lineage, and the lowering is recorded. The `[경로]` card of `framed` adds the compiler's two lines: "frame이 방향과 경로를 조립해 제안합니다" and the cost line, "비용: frame 한 갈래 · 방향 확인 질문 1회" or, with both legs, "비용: 최상위 모델 두 갈래 · 방향 확인 질문 1회".
+
+**Staged assembly guidance.** Staged assembly guidance is for frame brief
+authors and routes whose capability and stages the person explicitly named.
 These advisory points add no prerequisite or required stage:
 
 - Name `--capability` and `--capability-mode`, and select only the needed parts.
@@ -372,7 +367,8 @@ budget and start approval) and writing under
 `parts/plan/<id>/`; one that cannot be placed is named in `read_notes`.
 
 For execution, use `compose --campaign-key <stream> --start --prompt-file
-<task>` with the selected shape/graph. The slug comes from the task; the
+<task>` with no `--shape` for framed work or an explicit decided shape. Use
+`--shape direct` only for one atomic, reversible inline change. The slug comes from the task; the
 campaign defaults to this session's latest stream in the same artifact root,
 else to the one active stream of the routes sealed for this folder, and otherwise
 is an existing or new stream key, `--parent-cycle`, or an explicit `--unassigned`
@@ -590,8 +586,9 @@ long-run launch (`compute-hosts run`, `nohup|setsid … python … train|run.py`
 asks whether this session's route-chain ledger names any route for that
 folder's canonical artifact root — composed, compiled, continued or started,
 open or closed. If not, it refuses that call and prints one paste-ready
-`capability-route.py compose --shape direct …` line; once any route exists
-there, every later call of that session×folder passes. It does not check which
+`capability-route.py compose --shape direct …` line for one atomic, reversible
+inline change; other new work omits `--shape` so the frame decides. Once any
+route exists there, every later call of that session×folder passes. It does not check which
 route, its freshness, lineage, stage or proof. Registered owners and workers,
 artifact roots, the temp directory, runtime homes, CI and dev activation pass;
 any judgement failure passes; `HEARTING_ROUTE_GATE=off` turns it off.
@@ -1175,8 +1172,10 @@ references a unit in `roles/units/`, and routing happens at entry only — a
 dispatch-depth-2 worker never routes and never selects another worker. Enumerated
 recipes are curated fast paths, not the default. For a request no recipe fits, the
 entry composes its own route from the same catalog (**compose-on-demand**, §0.2.1):
-`capability-route.py compose` seals a `direct`, `solo`, or `staged` shape. Staged
-uses the capability recipe unless `--graph` selects a subgraph. Both use the same
+`capability-route.py compose` defaults to `framed`; `--shape direct` selects
+inline work. Explicit `solo` and `staged` shapes remain available for decisions
+already made by a frame or the person; `--shape staged --graph <stage,…>`
+selects that decided subgraph. Both use the same
 validator and seal; a subgraph embeds its recipe as `composed: true`. Confirmation
 follows §0.4 (`[경로]` for small work, the card or SD-123 pair otherwise).
 Composition changes route *shape only* — it never bypasses the §0.1
