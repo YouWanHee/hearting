@@ -1598,6 +1598,12 @@ class DirectoryBundleFinalizeTest(ProducerTestBase):
         raw_file = cycle / "artifacts/experiments/r1/raw-results/hidden.tmp"
         raw_file.write_bytes(b"changed after seal")
         self.assertEqual(P.finalize(self.root, cycle_id=result["cycle_id"])["status"], "already-sealed")
+        self.assertTrue(any("bundle-tree-mismatch:artifacts/experiments/r1/raw-results" in failure
+                            for failure in P.artifact_lifecycle.verify_artifact_revisions(document, cycle)))
+        with mock.patch.object(P.artifact_directory_bundle, "scan_tree",
+                               side_effect=AssertionError("status or completed replay rehashed source")):
+            self.assertEqual(P.status(self.root)["cycle_counts"], {"sealed": 1})
+            P.checkpoint(self.root, cycle_id=result["cycle_id"])
         self.assertEqual(sealed["status"], "sealed")
 
     def test_shared_source_coverage_only_scans_an_intersecting_bundle(self):
