@@ -100,9 +100,10 @@ Route by `core/WORKFLOW.md §0.2`. The main session decides only whether the wor
 direct (§0.2.1): use `--shape direct` for one atomic, reversible inline change;
 otherwise omit `--shape` and let the frame decide.
 
-`hearting run capability-route compose`; shape-free flags are hints.
-Person-named stages use `--shape staged --graph <stage,…>` (§0.2.1). Preset
-routes cover loops/promotions. Apply §§0.3–0.5.
+Use `hearting run capability-route compose`; presets: loops/promotions.
+Apply §0.3. Peer envelopes get one
+`[경로]` line unless destructive/external-facing; else the §0.4 card unless
+approved. Close with §0.5.
 
 <!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
 ```

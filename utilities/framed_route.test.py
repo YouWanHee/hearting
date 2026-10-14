@@ -364,7 +364,7 @@ class FramedRouteCompileTest(FramedBase):
         # Omission seals a frame; --graph alone remains only a routing hint.
         omitted = [sys.executable, str(HERE / "capability-route.py"), "compose", "--cwd", str(R.ROOT),
                    "--artifact-root", str(self.root), "--spec-read", "fixture", "--prompt-file", str(task),
-                   "--slug", "omitted-shape", "--unassigned"]
+                   "--dispatch-evidence", str(evidence), "--slug", "omitted-shape", "--unassigned"]
         explained = subprocess.run(omitted + ["--explain"], text=True, capture_output=True, env=env, check=False)
         self.assertEqual(explained.returncode, 0, explained.stderr)
         explanation = json.loads(explained.stdout.strip().splitlines()[-1])
