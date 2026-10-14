@@ -1626,6 +1626,9 @@ class DirectoryBundleFinalizeTest(ProducerTestBase):
                              [("report.md", m.digest_bytes(b"report"), len(b"report"))])
         source_rows = P._sealed_source_files(cycle, record, "artifacts/raw-results", raw)
         self.assertEqual(source_rows, [("x.bin", m.digest_bytes(b"raw"), len(b"raw"))])
+        with self.assertRaises(P.ProducerError) as unsupported:
+            P._sealed_source_files(cycle, record, "artifacts/raw-results/nested", raw / "nested")
+        self.assertEqual(unsupported.exception.code, "shared-bundle-subtree-unsupported")
         expected_rows = [{"path": path, "sha256": digest_value, "byte_size": size}
                          for path, digest_value, size in source_rows]
         (raw / "x.bin").write_bytes(b"late raw mutation")
