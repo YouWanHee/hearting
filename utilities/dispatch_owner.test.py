@@ -1807,12 +1807,19 @@ class OwnerAllocationRouteChainTest(unittest.TestCase):
                 route_hash="sha256:chain", route_node="owner", registry_digest="sha256:registry",
                 write_scope="source-scoped", completion_gate="standard-complete")
 
+            # Replace the probes after the eligibility module executes: its own
+            # definitions would otherwise overwrite them, and the route would
+            # then depend on real harness CLIs being on PATH.
             module_from_spec = importlib.util.module_from_spec
             def fixture_module(spec):
                 module = module_from_spec(spec)
                 if spec.name == "hearting_nested_dispatch_eligibility":
-                    module.command_check = lambda child, worktree: ("supported", "fixture-command", "")
-                    module.prospective_owner_registry_check = lambda args: (True, "")
+                    exec_module = spec.loader.exec_module
+                    def exec_with_fixture_probes(target):
+                        exec_module(target)
+                        target.command_check = lambda child, worktree: ("supported", "fixture-command", "")
+                        target.prospective_owner_registry_check = lambda args: (True, "")
+                    spec.loader.exec_module = exec_with_fixture_probes
                 return module
 
             cases = (("claude", "codex", {"claude": 2, "codex": 0, "opencode": 4}),
