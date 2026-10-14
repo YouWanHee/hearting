@@ -312,6 +312,16 @@ class NativeContextTests(unittest.TestCase):
             native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
         self.assertEqual(config.read_bytes(), before)
 
+    def test_codex_non_positive_original_is_refused_before_projection(self):
+        # Nothing is projected or recorded, so uninstall never has such a baseline to restore.
+        config = self.home / "config.toml"
+        self.seed_models()
+        for original in (b"model_context_window = 0\n", b"model_context_window = -5\n"):
+            config.write_bytes(original)
+            with self.assertRaisesRegex(native_context.NativeContextError, "positive integer"):
+                native_context.project_context_window("codex", runtime=self.home, source_root=ROOT)
+            self.assertEqual(config.read_bytes(), original)
+
 
 if __name__ == "__main__":
     unittest.main()
