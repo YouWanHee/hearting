@@ -98,6 +98,10 @@ class GpuOwnerResourceStartTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(c, "attach_summary_owner", return_value={}))
             stack.enter_context(mock.patch.object(c, "owner_frame_launch_gate"))
             stack.enter_context(mock.patch.object(c, "completion_marker_gate"))
+            stack.enter_context(mock.patch("dispatch_lifecycle.pid_namespace_evidence", return_value={
+                "lifecycle_selector_source": "host-like", "lifecycle_nspid_width": "1",
+                "lifecycle_pid1_class": "system-init",
+            }))
             for name in ("launch_orphan_watch", "launch_reap_watch"):
                 stack.enter_context(mock.patch.object(c, name, return_value=os.getpid()))
             def sidecar(args, _):
@@ -227,7 +231,14 @@ class GpuOwnerResourceStartTest(unittest.TestCase):
     def test_forced_workspace_choice_reaches_normal_owner_grant_and_launch(self):
         self.f.env["CODEX_DISPATCH_SANDBOX_FORCE"] = "workspace-write"
         path, route = self.compose()
-        self.assertEqual("workspace-write", route["dispatch_evidence"]["tuples"][0]["parent_sandbox"])
+        tuples = route["dispatch_evidence"]["tuples"]
+        codex_rows = [row for row in tuples if row["parent_harness"] == "codex"]
+        other_rows = [row for row in tuples if row["parent_harness"] != "codex"]
+        self.assertTrue(codex_rows)
+        self.assertTrue(all(row["parent_sandbox"] == "workspace-write" for row in codex_rows))
+        self.assertTrue(all(row["parent_sandbox"] ==
+                            self.r.WRAPPER_PARENT_SANDBOXES[row["parent_harness"]][0]
+                            for row in other_rows))
         launched = self.owner(path, route)
         self.assertEqual(0, launched["exit_code"], launched)
         _, row = self.f.row(launched["attempt_id"])

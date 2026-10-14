@@ -4058,8 +4058,6 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
             if node.get("model_profile") and node["id"] not in explicit_profiles:
                 explicit_profiles[node["id"]] = node["model_profile"]
     owner_only = shape == "staged" and _single_owner_nodes(selected_recipe["standard_plus"]["nodes"])
-    resume_depth_two = resume_graph and any(
-        node.get("dispatch_depth") == 2 for node in selected_recipe["standard_plus"]["nodes"])
     gpu_route = {"capability": capability, "nodes": selected_recipe["standard_plus"]["nodes"],
                  "selection": {"promotion_signals": [{"signal": s} for s in signals]}}
     if (shape == "staged" and not owner_only and dispatch_evidence is not None
@@ -4081,7 +4079,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                 row for row in dispatch_evidence["tuples"] if row.get("parent_harness") != "codex"
             ] + readiness["tuples"]}
     owner_pin = (selection_pins or {}).get("owner", {}).get("harness")
-    if (shape in ("staged", "framed") or resume_depth_two) and not owner_only and dispatch_evidence is None:
+    if shape in ("staged", "framed") and not owner_only and dispatch_evidence is None:
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), parent_harness,
                                        children or _compose_default_children(selection_pins),
                                        gpu_route=gpu_route if shape == "staged" else None,
@@ -4099,14 +4097,10 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         dispatch_evidence = {**dispatch_evidence,
                              "tuples": dispatch_evidence["tuples"] + readiness["tuples"]}
     if (shape == "solo" or owner_only or resume_graph) and registered_headless_evidence is None:
-        # Resume routes keep their legacy caller-scoped quick candidates even
-        # when their staged depth-2 tuples now include the enabled owner pool.
-        candidate_readiness = readiness
-        if resume_depth_two or candidate_readiness is None:
-            candidate_readiness = _compose_readiness(
-                cwd, jobs or _compose_default_jobs(), parent_harness,
-                children or _compose_default_children(selection_pins))
-        registered_headless_evidence = {"candidates": candidate_readiness["candidates"]}
+        readiness = readiness or _compose_readiness(
+            cwd, jobs or _compose_default_jobs(), parent_harness,
+            children or _compose_default_children(selection_pins))
+        registered_headless_evidence = {"candidates": readiness["candidates"]}
     common = dict(
         signals=signals, transport=None, transport_evidence=transport_evidence,
         tracking=tracking, tracked_gate_evidence=gate, slug=slug,
