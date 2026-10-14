@@ -459,7 +459,11 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     # The journal wait joins after exact resume aliases and before the one liveness pass.
     try:
         from . import interaction as _interaction
-        _interaction.enrich_human_gates(sessions, jobs_path=jobs_path)
+        for failed_session, reason in _interaction.enrich_human_gates(sessions, jobs_path=jobs_path) or ():
+            identity = "%s:%s" % (getattr(failed_session, "harness", "unknown"),
+                                   getattr(failed_session, "session_id", "unknown"))
+            observations["human-gates:" + identity] = _observation_health(
+                identity, "human-gates", reason)
     except Exception as exc:
         observations["human-gates"] = _observation_health(
             job_key, "human-gates", "%s: %s" % (type(exc).__name__, str(exc)[:160]))

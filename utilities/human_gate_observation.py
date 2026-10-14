@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +14,87 @@ if str(ROOT / "utilities") not in sys.path:
 
 import frame_interview as FI
 import workflow_state as WS
+
+_CACHE_LIMIT = 256
+_JOURNAL_CACHE = OrderedDict()
+_JSON_CACHE = OrderedDict()
+_OBSERVATION_CACHE = OrderedDict()
+
+
+def _stamp(path):
+    """Stable identity for an existing or missing input; never follows symlinks."""
+    try:
+        meta = Path(path).lstat()
+        return (meta.st_dev, meta.st_ino, meta.st_mtime_ns, meta.st_ctime_ns, meta.st_size)
+    except OSError:
+        return None
+
+
+def _cached(cache, key, loader):
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    value = loader()
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _CACHE_LIMIT:
+        cache.popitem(last=False)
+    return value
+
+
+def _stable_read(path, cache):
+    before = _stamp(path)
+    if before is None:
+        return None
+    key = (str(path), before)
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    try:
+        value = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    after = _stamp(path)
+    if before != after:
+        return None
+    return _cached(cache, key, lambda: value)
+
+
+def _journal(ledger):
+    stamp = _stamp(ledger.journal_path)
+    if stamp is None:
+        return []
+    key = (str(ledger.journal_path), stamp)
+    def parse():
+        raw = _stable_read(ledger.journal_path, _JOURNAL_CACHE)
+        if raw is None:
+            return []
+        entries = []
+        for line in raw.splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict):
+                entries.append(item)
+        return entries
+    return _cached(_OBSERVATION_CACHE, ("journal", key), parse)
+
+
+def _json_file(path):
+    stamp = _stamp(path)
+    if stamp is None:
+        return None
+    key = ("json", str(path), stamp)
+    def parse():
+        raw = _stable_read(path, _JSON_CACHE)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    return _cached(_OBSERVATION_CACHE, key, parse)
 
 def _inside(path, root):
     try:
@@ -24,8 +106,8 @@ def _inside(path, root):
 
 def _valid_frame_answer(interview_path, route, answer_path):
     try:
-        interview = json.loads(interview_path.read_text(encoding="utf-8"))
-        answers = json.loads(answer_path.read_text(encoding="utf-8"))
+        interview = _json_file(interview_path)
+        answers = _json_file(answer_path)
         if not FI.is_interview(interview):
             return False
         if interview.get("route_id") != route.get("route_id"):
@@ -53,7 +135,7 @@ def pending_human_waits(route, *, jobs, outcome=None):
             return []
         ledger_root, _ = WS.ledger_root_for(jobs)
         ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], root=ledger_root)
-        journal = [row for row in ledger.journal()
+        journal = [row for row in _journal(ledger)
                    if row.get("route_id") == route["route_id"]
                    and row.get("route_hash") == route["route_hash"]]
     except (OSError, ValueError, TypeError, KeyError):
@@ -94,7 +176,7 @@ def pending_human_waits(route, *, jobs, outcome=None):
                     question_path = Path(artifact).resolve(strict=True)
                     digest = resolution.get("artifact_sha256")
                     current = not digest or hashlib.sha256(question_path.read_bytes()).hexdigest() == digest
-                    if current and FI.is_interview(json.loads(question_path.read_text(encoding="utf-8"))):
+                    if current and FI.is_interview(_json_file(question_path)):
                         if (_valid_frame_answer(question_path, route, question_path.parent / "answers.native.json")
                                 or _valid_frame_answer(question_path, route, question_path.parent / "answers.json")):
                             continue

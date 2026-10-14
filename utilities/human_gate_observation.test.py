@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import human_gate_observation as H  # noqa: E402
@@ -44,6 +45,21 @@ class PendingWaitTest(unittest.TestCase):
     def test_mismatched_route_identity_has_no_observation(self):
         route = dict(self.route, route_id="rt-unrelated")
         self.assertEqual(H.pending_human_waits(route, jobs=self.jobs), [])
+
+    def test_journal_parse_cache_invalidates_on_same_size_rewrite(self):
+        import workflow_state as WS
+        ledger = WS.WorkflowLedger(self.route["route_id"], self.route["route_hash"], jobs=self.jobs)
+        first = H._journal(ledger)
+        with mock.patch.object(H.json, "loads", wraps=H.json.loads) as loads:
+            self.assertEqual(H._journal(ledger), first)
+            self.assertEqual(loads.call_count, 0)
+            raw = ledger.journal_path.read_text(encoding="utf-8")
+            changed = raw.replace("BLOCKED_HUMAN_GATE", "CANCELLED_________")
+            self.assertEqual(len(changed), len(raw))
+            ledger.journal_path.write_text(changed, encoding="utf-8")
+            parsed = H._journal(ledger)
+            self.assertEqual(loads.call_count, 1)
+            self.assertEqual(parsed[0]["workflow_state"], "CANCELLED_________")
 
 
 if __name__ == "__main__":
