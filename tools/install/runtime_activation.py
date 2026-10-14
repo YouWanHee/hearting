@@ -1660,6 +1660,140 @@ CODEX_IDENTITY_BEGIN = (
 )
 CODEX_IDENTITY_END = "# <<< hearting harness identity <<<"
 CODEX_IDENTITY_BACKUP = "config.toml.pre-harness-identity"
+CODEX_INTERACTIVE_QUESTION_KEY = "default_mode_request_user_input"
+CODEX_QUESTION_CONFLICT = "features." + CODEX_INTERACTIVE_QUESTION_KEY
+_CODEX_FEATURE_HEADER = re.compile(
+    r"""(?m)^[ \t]*\[[ \t]*(?:features|"features"|'features')[ \t]*\][ \t]*(?:#[^\n]*)?(?:\r?\n|\Z)"""
+)
+_CODEX_FEATURE_LINE = re.compile(
+    r"(?m)^[ \t]*" + CODEX_INTERACTIVE_QUESTION_KEY + r"[ \t]*=[ \t]*true[ \t]*(?:#[^\n]*)?(?:\r?\n|\Z)"
+)
+_CODEX_FEATURE_LINE_TEXT = CODEX_INTERACTIVE_QUESTION_KEY + " = true\n"
+
+
+def _codex_feature_value(data: dict):
+    """``(present, value)``; ``features`` that is not a table is reported as a non-true value."""
+    features = data.get("features")
+    if features is None:
+        return False, None
+    if not isinstance(features, dict):
+        return True, None
+    if CODEX_INTERACTIVE_QUESTION_KEY not in features:
+        return False, None
+    return True, features[CODEX_INTERACTIVE_QUESTION_KEY]
+
+
+def _codex_feature_state(text: str) -> str:
+    """``true`` | ``missing`` | ``conflict`` for the interactive question feature in ``text``."""
+    import tomllib
+
+    try:
+        data = tomllib.loads(text) if text.strip() else {}
+    except ValueError:
+        return "conflict"
+    present, value = _codex_feature_value(data)
+    if not present:
+        return "missing"
+    return "true" if value is True else "conflict"
+
+
+def _codex_feature_insert(text: str, previous: Optional[dict]):
+    """``(text, record, conflict)``: make the feature true without touching a user byte.
+
+    An existing ``true`` is respected as written (a prior receipt is carried only while its key
+    line is still present exactly once). A missing key is inserted as one line under a real
+    ``[features]`` header, or under a new header at the end; every candidate is parsed and may
+    differ from the original only by that key. Anything else is a conflict and stays untouched.
+    """
+    import copy
+    import tomllib
+
+    try:
+        data = tomllib.loads(text) if text.strip() else {}
+    except ValueError:
+        return text, None, CODEX_QUESTION_CONFLICT
+    present, value = _codex_feature_value(data)
+    if present:
+        if value is not True:
+            return text, None, CODEX_QUESTION_CONFLICT
+        carried = previous if isinstance(previous, dict) and previous.get("line") else None
+        if carried and len(_CODEX_FEATURE_LINE.findall(text)) != 1:
+            carried = None
+        return text, carried, None
+    if data.get("features") is not None and not isinstance(data.get("features"), dict):
+        return text, None, CODEX_QUESTION_CONFLICT
+    expected = copy.deepcopy(data)
+    expected.setdefault("features", {})[CODEX_INTERACTIVE_QUESTION_KEY] = True
+
+    def accepted(candidate: str) -> bool:
+        try:
+            return tomllib.loads(candidate) == expected
+        except ValueError:
+            return False
+
+    for match in _CODEX_FEATURE_HEADER.finditer(text):
+        lead = "" if match.group(0).endswith("\n") else "\n"
+        candidate = text[:match.end()] + lead + _CODEX_FEATURE_LINE_TEXT + text[match.end():]
+        if accepted(candidate):
+            return candidate, {"line": _CODEX_FEATURE_LINE_TEXT, "header": ""}, None
+    header = ""
+    if text:
+        header = ("" if text.endswith("\n") else "\n") + "\n"
+    header += "[features]\n"
+    candidate = text + header + _CODEX_FEATURE_LINE_TEXT
+    if accepted(candidate):
+        return candidate, {"line": _CODEX_FEATURE_LINE_TEXT, "header": header}, None
+    return text, None, CODEX_QUESTION_CONFLICT
+
+
+def _codex_feature_remove(text: str, record: Optional[dict]) -> str:
+    """Remove only the recorded key line (and its activation-created header once empty).
+
+    The user's own value wins: a key that is no longer ``true`` (or is gone) leaves the text as
+    it is, and a header that still holds any user key is never removed or merged away.
+    """
+    import copy
+    import tomllib
+
+    if not isinstance(record, dict) or not record.get("line"):
+        return text
+    try:
+        data = tomllib.loads(text) if text.strip() else {}
+    except ValueError:
+        return text
+    present, value = _codex_feature_value(data)
+    if not present or value is not True:
+        return text
+    expected = copy.deepcopy(data)
+    del expected["features"][CODEX_INTERACTIVE_QUESTION_KEY]
+    stripped = None
+    for match in _CODEX_FEATURE_LINE.finditer(text):
+        candidate = text[:match.start()] + text[match.end():]
+        try:
+            if tomllib.loads(candidate) == expected:
+                stripped = candidate
+                break
+        except ValueError:
+            continue
+    if stripped is None:
+        return text
+    header = record.get("header")
+    if isinstance(header, str) and header:
+        # Only an activation-created header whose table holds no user key goes: removing it
+        # must parse to exactly the data the file had without the key line.
+        without_header = copy.deepcopy(expected)
+        if without_header.get("features") == {}:
+            del without_header["features"]
+        position = stripped.find(header)
+        while position != -1:
+            candidate = stripped[:position] + stripped[position + len(header):]
+            try:
+                if tomllib.loads(candidate) == without_header:
+                    return candidate
+            except ValueError:
+                pass
+            position = stripped.find(header, position + 1)
+    return stripped
 
 
 def _codex_identity_fragment(active_root: Path):
@@ -1846,46 +1980,63 @@ def _merge_codex_identity_config(
     if status == "conflict":
         result["conflicts"] = conflicts
         return result
-    if status == "satisfied":
+    identity_text = original
+    identity_inserted = None
+    if status != "satisfied":
+        if existing == block:
+            recorded = previous_record.get("inserted")
+            identity_inserted = recorded if isinstance(recorded, str) and block in recorded else block
+        else:
+            if existing is not None:
+                recorded = previous_record.get("inserted")
+                if isinstance(recorded, str) and recorded in original:
+                    without_block = original.replace(recorded, "", 1)
+                status, conflicts = _codex_identity_assess(without_block, set_values, excluded)
+                if status == "conflict":
+                    result["conflicts"] = conflicts
+                    return result
+            separator = ""
+            if without_block:
+                separator = ("" if without_block.endswith("\n") else "\n") + "\n"
+            identity_text = without_block + separator + block
+            if not _codex_identity_candidate_ok(identity_text, set_values, excluded):
+                result["conflicts"] = ["shell_environment_policy"]
+                return result
+            identity_inserted = separator + block
+    final_text, feature_record, feature_conflict = _codex_feature_insert(
+        identity_text, previous_record.get("feature")
+    )
+    if feature_conflict:
+        # A user-owned or unsafe `features` form: the file stays as the user has it and an
+        # earlier receipt stays recorded so deactivation can still find its own block.
+        result["conflicts"] = [feature_conflict]
+        result["managed_config"] = previous_record or None
         return result
-    if existing == block:
-        recorded = previous_record.get("inserted")
-        result["managed_config"] = {
-            "inserted": recorded if isinstance(recorded, str) and block in recorded else block,
-        }
-        return result
-    if existing is not None:
-        recorded = previous_record.get("inserted")
-        if isinstance(recorded, str) and recorded in original:
-            without_block = original.replace(recorded, "", 1)
-        status, conflicts = _codex_identity_assess(without_block, set_values, excluded)
-        if status == "conflict":
-            result["conflicts"] = conflicts
-            return result
-    separator = ""
-    if without_block:
-        separator = ("" if without_block.endswith("\n") else "\n") + "\n"
-    candidate_text = without_block + separator + block
-    if not _codex_identity_candidate_ok(candidate_text, set_values, excluded):
-        result["conflicts"] = ["shell_environment_policy"]
-        return result
-    if config.exists() and file_created is not True:
-        backup = config.with_name(CODEX_IDENTITY_BACKUP)
-        if not backup.exists():
-            _atomic_text(backup, backup_original)
-    _atomic_text(config, candidate_text)
-    result["managed_config"] = {"inserted": separator + block}
+    if final_text != original:
+        if config.exists() and file_created is not True:
+            backup = config.with_name(CODEX_IDENTITY_BACKUP)
+            if not backup.exists():
+                _atomic_text(backup, backup_original)
+        _atomic_text(config, final_text)
+    if identity_inserted is not None or feature_record is not None:
+        result["managed_config"] = {"inserted": identity_inserted, "feature": feature_record}
     return result
 
 
 def _unmerge_codex_identity_config(
     state: dict, scope: str, dry_run: bool = False
 ) -> List[str]:
-    """Independently unmerge the identity block and exact-match native window key."""
+    """Independently unmerge the question feature line, the identity block and the
+    exact-match native window key.
+
+    The feature key line goes first (validated by parsing, so a user key is never moved), then
+    the identity block as one exact span. A feature the user changed or removed is left alone.
+    """
     from native_context import restore_codex_context, _publish
     managed = (state.get("managed_config") or {}) if isinstance(state, dict) else {}
     record = managed.get("codex_identity") if isinstance(managed, dict) else None
     inserted = record.get("inserted") if isinstance(record, dict) else None
+    feature = record.get("feature") if isinstance(record, dict) else None
     native = managed.get("native_context") if isinstance(managed, dict) else None
     codex_native = native.get("codex", {}) if isinstance(native, dict) else {}
     keys = codex_native.get("keys", {}) if isinstance(codex_native, dict) else {}
@@ -1909,7 +2060,7 @@ def _unmerge_codex_identity_config(
         text = original_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return []
-    remaining = text
+    remaining = _codex_feature_remove(text, feature)
     block_removed = isinstance(inserted, str) and bool(inserted) and remaining.count(inserted) == 1
     if block_removed:
         remaining = remaining.replace(inserted, "", 1)
@@ -2074,8 +2225,15 @@ def _codex_identity_health(active_root: Path, scope: str = "global") -> tuple[bo
         status, conflicts = _codex_identity_assess(before + after, set_values, excluded)
     except ValueError:
         return True, []
+    feature = _codex_feature_state(text)
+    if feature == "conflict":
+        conflicts = list(conflicts) + [CODEX_QUESTION_CONFLICT]
     if status == "conflict":
         return False, conflicts
+    if feature == "conflict":
+        return False, conflicts
+    if feature == "missing":
+        return True, []
     if status == "satisfied":
         return False, []
     return existing is None, []

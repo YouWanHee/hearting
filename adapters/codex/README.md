@@ -89,14 +89,18 @@ project Claude Skill, Agent, command, hook, or statusline files into Codex.
 | autopilot routing | Codex exposes `autopilot-*` as native Skills/plugin entries and can select matching Skills from descriptions, but the adapter does not emulate Claude slash-command routing. `prompt-signal` emits the portable routing contract and Codex-native entrypoint surface; for spec-backed work, rely on spec-read/capability gates plus the relevant Skill or explicit dispatch wrapper |
 | subagent delegation | Codex supports native subagent workflows, but they are explicit or main-dispatched. Run `adapters/codex/bin/preflight.sh subagent-info --check` to verify the `multi_agent` runtime feature and projected custom agents before claiming delegation parity. Use prompt-directed subagents or `preflight.sh dispatch`; do not treat UI/status state as an automatic delegation trigger |
 
-Native Codex owns question timing. Codex 0.160 Default mode exposes only
-`request_user_input_async`: the box is answerable only while the asking turn
-runs (its 30 s countdown is cosmetic) and is dropped at turn end, so a late
-answer arrives as an ordinary typed message. The blocking tool (feature
-`default_mode_request_user_input`, under development) auto-resolves with empty
-answers outside Plan mode and is therefore not enabled. Empty answers never
-satisfy a human decision gate; the session restates an open decision question
-at turn end and uses the next reply as its answer. The normal frame start
+Native Codex owns question timing. Runtime activation enables
+`features.default_mode_request_user_input` in interactive `$CODEX_HOME/config.toml`
+when the existing feature table can be safely extended; explicit false and
+unsupported feature forms are preserved and reported as a config conflict.
+Worker homes override the feature to false. In Default mode use the waiting
+`request_user_input`: its countdown is hidden for 60 seconds, then visibly
+counts down for 60 seconds before submitting an empty answer. Typing or pasting
+cancels the countdown and the box waits for submit. Empty answers never satisfy
+a human decision gate; restate an open question at turn end and keep Fleet's
+ledger based `answer needed` indication active until a real answer is recorded.
+Use `request_user_input_async` only when the waiting tool is unavailable. Do not
+open repeated boxes or switch to Plan mode. The normal frame start
 receipt keeps `human_wait.question_block` and the existing interview artifact;
 empty/timeout/accepted responses return the same pending question without
 saving answers or releasing approval. A plain resume waits for the answer

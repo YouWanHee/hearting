@@ -644,8 +644,9 @@ itself, in this order, and never leaves it to a helper:
 1. Ask first whether the restatement is right — that sentence, verbatim,
    with 예 / 아니오(고쳐 말하기) — and record a correction in the user's words.
 2. Put the `[방향 확인]` five-field summary as the card above.
-3. Ask each interview question through the native question tool (Claude
-   `AskUserQuestion`, Codex `request_user_input`, OpenCode `question`), one topic
+3. Ask the understanding sentence first, then the registered interview
+   questions in the same native question batch. Use Claude `AskUserQuestion`,
+   Codex `request_user_input`, or OpenCode `question`, one topic
    per question, the recommended option first and labelled
    (권장), each option with its one-line meaning; never paraphrase a question
    into harness vocabulary, and never add questions the interview does not
@@ -979,9 +980,10 @@ be replaced by another run.
 Human decisions have no elapsed-time default. A question window closing or an
 empty response does not release, reject, or cancel the durable gate. Its owner
 keeps the exact question and gate available for a later real answer; independent
-authorized work can continue. Managed question surfaces disable automatic empty
-answers where the runtime supports this. Otherwise the owner leaves a plain-text
-question for a later reply instead of repeatedly opening expiring prompts.
+authorized work can continue. A question surface that submits an empty answer
+after a timeout does not answer the gate; the question stays for a later real
+answer. Otherwise the owner leaves a plain-text question for a later reply
+instead of repeatedly opening expiring prompts.
 An owner that raises a gate calls the bounded `await-release` once; when the gate
 is still blocked it ends its turn with `verdict: BLOCKED`, naming the gate as its
 blocker. That parked stop is a pause, not a failure, and no model turn runs while
