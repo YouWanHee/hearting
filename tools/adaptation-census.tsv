@@ -345,3 +345,4 @@ tool-deferred	test-baseline.tsv
 tool-deferred	test-durations.tsv
 tool-deferred	test-isolation.tsv
 tool-deferred	web-bundle
+utility-deferred	artifact_directory_bundle.py

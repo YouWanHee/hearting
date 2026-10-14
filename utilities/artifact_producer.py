@@ -64,6 +64,7 @@ import artifact_index  # noqa: E402
 import artifact_lifecycle  # noqa: E402
 import artifact_locator  # noqa: E402
 import artifact_manifest  # noqa: E402
+import artifact_directory_bundle  # noqa: E402
 import artifact_campaign  # noqa: E402
 import route_identity  # noqa: E402
 import route_lineage  # noqa: E402
@@ -334,11 +335,14 @@ def _copy_tree_files(source: Path, target: Path) -> Tuple[List[Tuple[str, str, i
         if not entry.is_file():
             violations.append(f"non-regular-file:{rel}")
             continue
-        data = entry.read_bytes()
         dst = target / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        _write_exclusive(dst, data)
-        rows.append((rel, _digest(data), len(data)))
+        try:
+            digest_value, size = artifact_directory_bundle.copy_file_streaming(entry, dst)
+        except artifact_directory_bundle.DirectoryBundleError as exc:
+            violations.append(f"{exc.code}:{rel}")
+            continue
+        rows.append((rel, digest_value, size))
     for current, _dirs, _files in os.walk(str(target)):
         _fsync_dir(Path(current))
     return rows, violations
@@ -1340,7 +1344,11 @@ def _write_journal(root: Path, cycle_id: str, **fields: Any) -> None:
     path = journal_path(root, cycle_id)
     _ensure_dir(path.parent)
     payload = {"schema_version": 1, "cycle_id": cycle_id, "updated_at": _rfc3339()}
+    previous = _read_json(path) or {}
+    if isinstance(previous, Mapping) and previous.get("cycle_id", cycle_id) == cycle_id:
+        payload.update(previous)
     payload.update(fields)
+    payload["updated_at"] = _rfc3339()
     _write_atomic(path, _json_bytes(payload), 0o600)
 
 
@@ -2897,6 +2905,287 @@ def _output_paths(directory: Path, *, exclude_hidden: bool = False,
     return ([], violations) if violations else (paths, violations)
 
 
+def _scan_directory_bundles(directory: Path, *, selected_out: Optional[List[str]] = None) -> List[artifact_directory_bundle.Tree]:
+    try:
+        selected = artifact_directory_bundle.select_outermost(Path(directory) / "artifacts")
+        if selected_out is not None:
+            selected_out[:] = selected
+        trees = []
+        for rel in selected:
+            try:
+                trees.append(artifact_directory_bundle.scan_tree(directory, rel))
+            except artifact_directory_bundle.DirectoryBundleError as exc:
+                if exc.code == "tree-empty":
+                    continue
+                raise ProducerError("directory-bundle-" + exc.code, exc.path or rel) from exc
+        return trees
+    except artifact_directory_bundle.DirectoryBundleError as exc:
+        raise ProducerError("directory-bundle-" + exc.code, exc.path or str(directory)) from exc
+
+
+def _bundle_tree_fingerprints(tree: artifact_directory_bundle.Tree) -> Dict[str, List[int]]:
+    base = tree.directory
+    rows = {base: list(tree.directories[0][1])}
+    for inner, fingerprint in tree.directories:
+        if inner:
+            rows[f"{base}/{inner}"] = list(fingerprint)
+    for leaf in tree.leaves:
+        rows[f"{base}/{leaf.path}"] = list(leaf.fingerprint)
+    return rows
+
+
+def _bundle_inventory_holds(directory: Path, tree: artifact_directory_bundle.Tree) -> bool:
+    expected = []
+    for inner, identity in tree.directories:
+        if inner:
+            expected.append((inner, "directory", tuple(identity)))
+    for leaf in tree.leaves:
+        expected.append((leaf.path, "file", tuple(leaf.fingerprint)))
+    try:
+        actual = artifact_directory_bundle.scan_inventory(directory, tree.directory)
+    except artifact_directory_bundle.DirectoryBundleError:
+        return False
+    return actual == tuple(sorted(expected, key=lambda row: row[0].encode("utf-8")))
+
+
+def _bundle_workflow_evidence_facts(root: Path, record: Mapping[str, Any], directory: Path,
+                                    trees: Sequence[artifact_directory_bundle.Tree]) -> List[Tuple[str, str, int]]:
+    selected = {f"{tree.directory}/{leaf.path}": leaf for tree in trees for leaf in tree.leaves}
+    if not selected:
+        return []
+    try:
+        import artifact_workflow_groups as workflow_groups
+        declaration = workflow_groups._load_existing(
+            workflow_groups.declaration_path(root, record["campaign_id"]))
+    except Exception:
+        return []
+    if not isinstance(declaration, Mapping):
+        return []
+    candidate_refs = []
+    for group in declaration.get("groups", []) if isinstance(declaration.get("groups"), list) else []:
+        for relation in group.get("relations", []) if isinstance(group, Mapping) and isinstance(group.get("relations"), list) else []:
+            if not isinstance(relation, Mapping):
+                continue
+            for ref in relation.get("evidence_refs", []) if isinstance(relation.get("evidence_refs"), list) else []:
+                if not isinstance(ref, Mapping) or not isinstance(ref.get("path"), str):
+                    continue
+                try:
+                    rel = (Path(root) / ref["path"]).relative_to(directory).as_posix()
+                except (ValueError, OSError):
+                    continue
+                if rel in selected:
+                    candidate_refs.append((ref, relation))
+    if not candidate_refs:
+        return []
+    campaign = read_campaign(root, record["campaign_id"])
+    identity = artifact_lifecycle.read_root_identity(root)
+    if campaign is None or identity is None:
+        return []
+    reserved, status = read_interim_reservation(root, record)
+    open_doc = _read_json(open_manifest_path(root, record["cycle_id"])) or {}
+    synthetic = copy.deepcopy(open_doc) if isinstance(open_doc, Mapping) else {}
+    synthetic.update({
+        "artifact_root_id": identity.artifact_root_id,
+        "repository_id": identity.repository_id,
+        "campaign": {"campaign_id": campaign["campaign_id"]},
+        "cycle": {"cycle_id": record["cycle_id"], "campaign_id": record["campaign_id"], "state": "open"},
+    })
+    synthetic.setdefault("artifacts", [])
+    synthetic.setdefault("artifact_revisions", [])
+    preserved = {}
+    for rel, leaf in selected.items():
+        reservation = reserved.artifacts.get(rel) if reserved is not None else None
+        revision = reserved.revision_for(rel, leaf.digest) if reserved is not None else None
+        if reservation is None or revision is None:
+            continue
+        existing = [row for row in synthetic["artifact_revisions"]
+                    if isinstance(row, Mapping) and isinstance(row.get("locator"), Mapping)
+                    and row["locator"].get("path") == rel]
+        if existing:
+            if (len(existing) != 1 or existing[0].get("artifact_id") != reservation.artifact_id
+                    or existing[0].get("artifact_revision_id") != revision.artifact_revision_id
+                    or existing[0].get("content_digest") != leaf.digest):
+                return []
+            preserved[rel] = leaf
+            continue
+        synthetic["artifacts"].append({"artifact_id": reservation.artifact_id, "cycle_id": record["cycle_id"]})
+        synthetic["artifact_revisions"].append({
+            "artifact_id": reservation.artifact_id,
+            "artifact_revision_id": revision.artifact_revision_id,
+            "content_digest": leaf.digest,
+            "locator": {"kind": "cycle-relative", "path": rel},
+        })
+        preserved[rel] = leaf
+    if status in ("unreadable", "identity-mismatch"):
+        return []
+    try:
+        validated = workflow_groups._validate_document(
+            root, campaign, directory, identity.artifact_root_id, identity.repository_id,
+            declaration)
+    except workflow_groups.WorkflowGroupError as exc:
+        return []
+    facts = {}
+    for group in validated.get("groups", []):
+        for relation in group.get("relations", []):
+            for ref in relation.get("evidence_refs", []):
+                try:
+                    rel = (Path(root) / ref["path"]).relative_to(directory).as_posix()
+                except (KeyError, ValueError, OSError):
+                    continue
+                leaf = preserved.get(rel)
+                if not leaf:
+                    continue
+                endpoints = []
+                for endpoint_id in (relation.get("from_cycle_id"), relation.get("to_cycle_id")):
+                    if endpoint_id == record["cycle_id"]:
+                        endpoints.append((endpoint_id, directory))
+                        continue
+                    endpoint_record = read_cycle_record(root, endpoint_id)
+                    if endpoint_record is None:
+                        return []
+                    endpoints.append((endpoint_id, cycle_dir(
+                        root, endpoint_record["campaign_id"], endpoint_id, endpoint_record)))
+                try:
+                    bound = workflow_groups._bind_evidence(
+                        root, campaign, ref, tuple(endpoints),
+                        manifest_overrides={record["cycle_id"]: synthetic})
+                except workflow_groups.WorkflowGroupError as exc:
+                    return []
+                if bound.get("sha256") == leaf.digest:
+                    facts[rel] = (rel, leaf.digest, leaf.size)
+    candidate_paths = {(Path(root) / ref["path"]).relative_to(directory).as_posix()
+                       for ref, _relation in candidate_refs}
+    if len(facts) != len(candidate_paths):
+        return []
+    return [facts[rel] for rel in sorted(facts)]
+
+
+def _bundle_exact_evidence_facts(root: Path, record: Mapping[str, Any], directory: Path,
+                                trees: Sequence[artifact_directory_bundle.Tree],
+                                route: Mapping[str, Any], primary: Optional[str]) -> List[Tuple[str, str, int]]:
+    """Keep existing exact primary and terminal file evidence as individual rows."""
+    selected = {f"{tree.directory}/{leaf.path}": leaf for tree in trees for leaf in tree.leaves}
+    candidates = set()
+    primary_rel = _cycle_relative_primary(primary, directory)
+    if isinstance(primary_rel, str) and primary_rel in selected:
+        candidates.add(primary_rel)
+    try:
+        route_module = artifact_lifecycle._load_capability_route()
+        observations = route_module.terminal_gate_observation(
+            route, jobs=os.environ.get("AGENT_DISPATCH_JOBS") or None)
+    except Exception:
+        observations = {}
+    for proof in observations.values() if isinstance(observations, Mapping) else ():
+        evidence = proof.get("evidence") if isinstance(proof, Mapping) and proof.get("passed") is True else None
+        if not isinstance(evidence, str) or not os.path.isabs(evidence):
+            continue
+        try:
+            rel = Path(evidence).relative_to(directory).as_posix()
+        except ValueError:
+            continue
+        leaf = selected.get(rel)
+        if leaf is not None and proof.get("evidence_digest") in (None, leaf.digest.removeprefix("sha256:")):
+            candidates.add(rel)
+    facts = [(rel, selected[rel].digest, selected[rel].size) for rel in sorted(candidates)]
+    facts.extend(_bundle_workflow_evidence_facts(root, record, directory, trees))
+    return list({rel: (rel, digest, size) for rel, digest, size in facts}.values())
+
+
+def _bundle_locator(directory: str) -> str:
+    if directory == "artifacts/raw-results":
+        return "artifacts/_internal/directory-bundles/raw-results.json"
+    suffix = hashlib.sha256(directory.encode("utf-8")).hexdigest()
+    return f"artifacts/_internal/directory-bundles/nested-{suffix}.json"
+
+
+def _publish_bundle_descriptors(root: Path, cycle_id: str, cycle_directory: Path,
+                                trees: Sequence[artifact_directory_bundle.Tree]):
+    """Journal ownership before publishing canonical descriptor bytes."""
+    journal = _read_json(journal_path(root, cycle_id)) or {}
+    old_rows = [dict(row) for row in journal.get("directory_bundles", []) if isinstance(row, Mapping)]
+    if not trees:
+        if old_rows:
+            raise ProducerError("directory-bundle-owned-tree-missing", cycle_id)
+        return [], {}
+    old_by_directory = {row.get("directory"): row for row in old_rows}
+    entries = []
+    targets = []
+    parent = cycle_directory / "artifacts" / "_internal" / "directory-bundles"
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            raise ProducerError("directory-bundle-parent-unsafe", str(parent))
+        parent_fd = artifact_directory_bundle._open_directory_chain(parent)
+        os.close(parent_fd)
+    except OSError as exc:
+        raise ProducerError("directory-bundle-write-failed", str(exc)) from exc
+    for tree in trees:
+        previous = old_by_directory.get(tree.directory)
+        locator = previous.get("locator") if previous else _bundle_locator(tree.directory)
+        if not isinstance(locator, str) or not locator.startswith("artifacts/_internal/directory-bundles/"):
+            raise ProducerError("directory-bundle-journal-invalid", str(locator))
+        if previous is None:
+            stem = Path(locator).stem
+            suffix = 1
+            candidate = locator
+            while os.path.lexists(cycle_directory / candidate):
+                suffix += 1
+                candidate = f"artifacts/_internal/directory-bundles/{stem}-{suffix}.json"
+            locator = candidate
+        destination = cycle_directory / locator
+        old_digest = previous.get("descriptor_digest") if previous else None
+        prior_digest = previous.get("previous_descriptor_digest") if previous else None
+        existing_digest = None
+        if os.path.lexists(destination):
+            try:
+                st = os.lstat(destination)
+                if not stat.S_ISREG(st.st_mode):
+                    raise ProducerError("directory-bundle-owned-file-unsafe", locator)
+                existing_digest = _stream_file_facts(destination)[0]
+            except OSError as exc:
+                raise ProducerError("directory-bundle-owned-file-unreadable", locator) from exc
+            if existing_digest not in {old_digest, prior_digest, tree.descriptor_digest}:
+                raise ProducerError("directory-bundle-owned-file-changed", locator)
+        row = {"directory": tree.directory, "locator": locator,
+               "descriptor_digest": tree.descriptor_digest,
+               "previous_descriptor_digest": existing_digest if existing_digest != tree.descriptor_digest else None}
+        entries.append(row)
+        targets.append((tree, row, destination, existing_digest))
+    _write_journal(root, cycle_id, state="preparing", directory_bundles=entries)
+    for tree, row, destination, existing_digest in targets:
+        if existing_digest == tree.descriptor_digest:
+            continue
+        temp = destination.with_name("." + destination.name + ".tmp-" + os.urandom(6).hex())
+        _write_exclusive(temp, tree.descriptor)
+        try:
+            if existing_digest is None:
+                try:
+                    os.link(temp, destination, follow_symlinks=False)
+                except FileExistsError as exc:
+                    raise ProducerError("directory-bundle-publish-collision", row["locator"]) from exc
+                temp.unlink()
+            else:
+                if _stream_file_facts(destination)[0] != existing_digest:
+                    raise ProducerError("directory-bundle-owned-file-changed", row["locator"])
+                os.replace(temp, destination)
+            _fsync_dir(destination.parent)
+        finally:
+            try: temp.unlink()
+            except OSError: pass
+    _write_journal(root, cycle_id, directory_bundles=[
+        {key: value for key, value in row.items() if key != "previous_descriptor_digest"}
+        for row in entries])
+    facts = [(row["locator"], tree.descriptor_digest, len(tree.descriptor))
+             for tree, row, _destination, _existing in targets]
+    metadata = {}
+    for tree, row, _destination, _existing in targets:
+        metadata[row["locator"]] = {
+            "type": "directory-bundle", "media_type": artifact_directory_bundle.MEDIA_TYPE,
+            "title": tree.directory[len("artifacts/"):],
+        }
+    return facts, metadata
+
+
 def _is_support_locator(rel: str) -> bool:
     """A path through a CORE §3 support name that is not a cycle bucket (`_internal/`, `shards/`)."""
     return any(part in SUPPORT_SEGMENTS for part in rel.split("/")[1:])
@@ -3233,6 +3522,7 @@ def build_manifest(
     reserved: Optional["InterimReservation"] = None,
     interim: bool = False,
     facts: Optional[Sequence[Tuple[str, str, int]]] = None,
+    bundle_metadata: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Build the D-6 cycle document.
 
@@ -3284,14 +3574,17 @@ def build_manifest(
         arev_id = same.artifact_revision_id if same else allocator.allocate("artifact_revision")
         revision_provenance = provenance(digest, same.recorded_in if same else None)
         inner = rel[len("artifacts/"):]
+        bundle = (bundle_metadata or {}).get(rel)
         artifacts.append({
             "artifact_id": art_id, "cycle_id": record["cycle_id"],
             "role": "support" if rel in support_rels else ("primary" if rel == primary_rel else "output"),
-            "type": _bucket_type(inner), "capability": record["capability"], "title": inner,
+            "type": bundle.get("type") if bundle else _bucket_type(inner),
+            "capability": record["capability"], "title": bundle.get("title", inner) if bundle else inner,
         })
         revisions.append({
             "artifact_revision_id": arev_id, "artifact_id": art_id, "revision_sequence": 1,
-            "content_digest": digest, "byte_size": byte_size, "media_type": _media_type(rel),
+            "content_digest": digest, "byte_size": byte_size,
+            "media_type": bundle.get("media_type") if bundle else _media_type(rel),
             "locator": {"kind": "cycle-relative", "path": rel}, "provenance": revision_provenance,
         })
         reuse_event = same is not None and same.event_id and same.stream_id and same.recorded_at
@@ -3802,7 +4095,8 @@ def _route_release_supports_interim(route: Mapping[str, Any]) -> Tuple[bool, str
     return (Path(path) / INTERIM_SUPPORT_MARKER).is_file(), path
 
 
-def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: CheckpointLimits) -> Dict[str, Any]:
+def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: CheckpointLimits,
+                    *, excluded_paths: Sequence[str] = ()) -> Dict[str, Any]:
     """Bounded walk of `artifacts/`.  Returns `facts` (locator, digest, size),
     the refreshed digest cache, exclusion counts and the newest file mtime, or a
     `skip` reason as soon as a limit is exceeded (the walk stops there)."""
@@ -3816,6 +4110,10 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
     for current, dirs, files in os.walk(str(artifacts), followlinks=False):
         kept_dirs = []
         for name in sorted(dirs):
+            if name == "raw-results":
+                if os.path.islink(os.path.join(current, name)):
+                    excluded["non-regular"] += 1
+                continue  # prune before any contained file consumes visit or byte limits
             if name.startswith("."):
                 excluded["hidden"] += 1
             elif os.path.islink(os.path.join(current, name)):
@@ -3824,10 +4122,13 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
                 kept_dirs.append(name)
         dirs[:] = kept_dirs
         for name in sorted(files):
+            path = os.path.join(current, name)
+            rel = Path(path).relative_to(directory).as_posix()
+            if rel in excluded_paths:
+                continue
             visited += 1
             if visited > limits.max_walk_entries:
                 return {"skip": "walk-limit", "visited": visited}
-            path = os.path.join(current, name)
             try:
                 info = os.lstat(path)
             except OSError:
@@ -3846,7 +4147,6 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
             if info.st_size > limits.max_file_bytes:
                 excluded["oversize"] += 1
                 continue
-            rel = Path(path).relative_to(directory).as_posix()
             locator = artifact_manifest.validate_locator_path(rel)
             if not locator.ok:
                 excluded["invalid-locator"] += 1
@@ -3999,7 +4299,10 @@ def _checkpoint_cycle(
         return skipped("min-interval", next_eligible_at=_rfc3339(observed_scan + interval))
     limits = limits or CheckpointLimits()
     previous_stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
-    scan = _checkpoint_scan(directory, previous_stats, limits)
+    owned = _read_json(journal_path(root, cid)) or {}
+    owned_paths = [row.get("locator") for row in owned.get("directory_bundles", [])
+                   if isinstance(row, Mapping) and isinstance(row.get("locator"), str)]
+    scan = _checkpoint_scan(directory, previous_stats, limits, excluded_paths=owned_paths)
     try:
         with _checkpoint_lock(root, cid, timeout=0.0):
             result = _checkpoint_commit(
@@ -5094,19 +5397,39 @@ def finalize(
         support_locators = tuple(_placed_locator(value, placements) for value in support_locators)
         excluded_hidden: List[str] = []
         excluded_symlinks: List[str] = []
+        bundle_trees: List[artifact_directory_bundle.Tree] = []
         if first_close_read:
             if prescan.error is not None:
                 raise prescan.error
             violations, facts = prescan.violations, prescan.facts
+            bundle_trees = prescan.bundles
             excluded_hidden, excluded_symlinks = list(prescan.excluded), list(prescan.excluded_symlinks)
         else:
-            # Only for files adopted just now (they were moved in under this lock) or a cycle
-            # whose first read could not be made: read here, as the close always did.
-            rows, violations = _enumerate_output(directory, exclude_hidden=exclude_hidden, excluded=excluded_hidden,
-                                                 excluded_symlinks=excluded_symlinks)
-            facts = [(rel, _digest(data), len(data)) for rel, data in rows]
+            # Fallback after a just-completed adoption uses the same bounded
+            # facts and raw-tree collector as the unlocked first-close scan.
+            bundle_trees = _scan_directory_bundles(directory)
+            paths, violations = _output_paths(directory, exclude_hidden=exclude_hidden,
+                                              excluded=excluded_hidden,
+                                              excluded_symlinks=excluded_symlinks)
+            bundle_dirs = [tree.directory for tree in bundle_trees]
+            journal = _read_json(journal_path(root, cycle_id)) or {}
+            owned = {row.get("locator") for row in journal.get("directory_bundles", [])
+                     if isinstance(row, Mapping)}
+            paths = [(rel, entry) for rel, entry in paths
+                     if rel not in owned and not any(rel.startswith(prefix + "/") for prefix in bundle_dirs)]
+            facts = []
+            if not violations:
+                for rel, entry in paths:
+                    digest_value, size = _stream_file_facts(entry)
+                    facts.append((rel, digest_value, size))
         if violations:
             raise ProducerError("output-invalid", ";".join(violations))
+        for rel, digest_value, size in _bundle_exact_evidence_facts(
+                root, record, directory, bundle_trees, route, primary):
+            if all(row[0] != rel for row in facts):
+                facts.append((rel, digest_value, size))
+        bundle_facts, bundle_metadata = _publish_bundle_descriptors(root, cycle_id, directory, bundle_trees)
+        facts.extend(bundle_facts)
         if not facts:
             # D-9: no durable output, no lineage. Unchanged except that an
             # abandoned empty cycle also carries its sealed abandon_reason
@@ -5143,6 +5466,7 @@ def finalize(
                 allow_open_route=allow_open_route, allocator=alloc, now=now,
                 abandon_reason=abandon_reason, support_locators=support_locators,
                 reserved=candidate, facts=facts,
+                bundle_metadata=bundle_metadata,
             )
             report = artifact_manifest.validate(document)
             if not report.ok:
@@ -5324,6 +5648,10 @@ def _recover_exact_cycle_locked(root: Path, cycle_id: str, expected_binding: Opt
         _commit_sealed(root, record, document, journal["manifest_digest"], now=now)
         return _verify_sealed_cycle_locked(root, read_cycle_record(root, cycle_id), expected_binding)
     if journal is not None:
+        if journal.get("directory_bundles"):
+            # Preparing descriptor ownership is before the manifest commit
+            # point. Keep it so the same finalize can resume the owned path.
+            return {"status": "open", "cycle_id": cycle_id, "directory_bundles_prepared": True}
         # Nothing crossed the manifest commit point; the same cycle can
         # re-enter finalize. No other journal or cycle is read or changed.
         _drop_unpublished_snapshot(root, cycle_id, journal)
@@ -5498,6 +5826,22 @@ def _stream_file_facts(path: Path) -> Tuple[str, int]:
     return "sha256:" + hasher.hexdigest(), size
 
 
+def _manifest_bundle_directories(document: Mapping[str, Any]) -> Set[str]:
+    """The raw trees already represented by directory-bundle rows in a sealed document."""
+    bundle_artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                        if isinstance(row, Mapping) and row.get("type") == "directory-bundle"}
+    directories: Set[str] = set()
+    for row in document.get("artifact_revisions", []) or []:
+        if not isinstance(row, Mapping) or row.get("artifact_id") not in bundle_artifacts:
+            continue
+        artifact = bundle_artifacts[row.get("artifact_id")]
+        title = artifact.get("title")
+        if (row.get("media_type") == artifact_directory_bundle.MEDIA_TYPE
+                and isinstance(title, str) and title and ".." not in title.split("/")):
+            directories.add("artifacts/" + title)
+    return directories
+
+
 def _scan_cycle_facts(directory: Path, *, excluded: List[str],
                       excluded_symlinks: List[str],
                       known: Optional[Mapping[str, Sequence[Any]]] = None,
@@ -5515,9 +5859,13 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
         raise ProducerError("artifacts-dir-missing", str(artifacts))
+    document = _read_json(directory / "manifest.json")
+    bundle_directories = _manifest_bundle_directories(document) if isinstance(document, Mapping) else set()
     for entry in _walk_files(directory):
         rel = entry.relative_to(directory).as_posix()
         if rel == artifact_locator.CYCLE_BINDING or not rel.startswith("artifacts/"):
+            continue
+        if any(rel.startswith(path + "/") for path in bundle_directories):
             continue
         if os.path.islink(str(entry)):
             excluded_symlinks.append(rel)
@@ -5872,6 +6220,11 @@ class _Prescan:
     paths: List[str] = field(default_factory=list)
     violations: List[str] = field(default_factory=list)
     error: Optional[ProducerError] = None
+    bundles: List[artifact_directory_bundle.Tree] = field(default_factory=list)
+    bundle_fingerprints: Dict[str, List[int]] = field(default_factory=dict)
+    bundle_selection: List[str] = field(default_factory=list)
+    root: Optional[Path] = None
+    cycle_id: Optional[str] = None
 
 
 def _prescan_cycle(root: Path, cycle_id: str, *,
@@ -5904,6 +6257,9 @@ def _prescan_cycle(root: Path, cycle_id: str, *,
             return None  # a link or a pipe is for the locked command to refuse, never to be read here
         document = json.loads(manifest_path.read_bytes().decode("utf-8"))
         scan = _Prescan(artifact_manifest.manifest_digest(document), [], {}, [], [])
+        # A sealed cycle's current directory selection is only a race snapshot. Its
+        # manifest decides whether those paths stay file rows or are bundle coverage.
+        scan.bundle_selection = list(artifact_directory_bundle.select_outermost(manifest_path.parent / "artifacts"))
         scan.facts = _scan_cycle_facts(
             manifest_path.parent, excluded=scan.excluded, excluded_symlinks=scan.excluded_symlinks,
             known=_read_refresh_state(root, cycle_id).get("files", {}), fingerprints=scan.fingerprints)
@@ -5924,14 +6280,25 @@ def _prescan_open_cycle(root: Path, record: Mapping[str, Any], *, exclude_hidden
     directory = cycle_dir(root, record["campaign_id"], cycle_id, record)
     if _path_entry_present(directory / "manifest.json"):
         return None  # a close that stopped after its manifest is for recovery to finish
-    scan = _Prescan("", [], {}, [], [], open_cycle=True, directory=directory)
+    scan = _Prescan("", [], {}, [], [], open_cycle=True, directory=directory, root=root, cycle_id=cycle_id)
     try:
+        scan.bundles = _scan_directory_bundles(directory, selected_out=scan.bundle_selection)
+        for tree in scan.bundles:
+            scan.bundle_fingerprints.update(_bundle_tree_fingerprints(tree))
         paths, scan.violations = _output_paths(directory, exclude_hidden=exclude_hidden, excluded=scan.excluded,
                                                excluded_symlinks=scan.excluded_symlinks)
     except ProducerError as error:
         scan.error = error  # raised where the locked close always raised it
         return scan
+    bundle_dirs = [tree.directory for tree in scan.bundles]
+    journal = _read_json(journal_path(root, cycle_id)) or {}
+    owned_paths = {row.get("locator") for row in journal.get("directory_bundles", [])
+                   if isinstance(row, Mapping) and isinstance(row.get("locator"), str)}
+    paths = [(rel, entry) for rel, entry in paths
+             if not any(rel.startswith(prefix + "/") for prefix in bundle_dirs)
+             and rel not in owned_paths]
     scan.paths = [rel for rel, _entry in paths]
+    scan.paths.extend(scan.bundle_fingerprints)
     known = _read_refresh_state(root, cycle_id).get("files", {})
     for rel, entry in paths:
         try:
@@ -5987,7 +6354,9 @@ def _prescan_misses(directory: Path, prescan: _Prescan, rels: Sequence[str], *,
     misses: List[str] = []
     for rel in rels:
         try:
-            held = _fingerprint(os.lstat(str(directory / rel))) == prescan.fingerprints.get(rel)
+            info = os.lstat(str(directory / rel))
+            expected = prescan.bundle_fingerprints.get(rel, prescan.fingerprints.get(rel))
+            held = list(artifact_directory_bundle._identity(info)) == expected if rel in prescan.bundle_fingerprints else _fingerprint(info) == expected
         except OSError:
             held = False
         if not held:
@@ -6000,6 +6369,15 @@ def _prescan_misses(directory: Path, prescan: _Prescan, rels: Sequence[str], *,
         except OSError:
             pass
         misses.append(rel)
+    try:
+        current_selection = list(artifact_directory_bundle.select_outermost(directory / "artifacts"))
+    except artifact_directory_bundle.DirectoryBundleError:
+        current_selection = ["!unsafe-selection!"]
+    if current_selection != prescan.bundle_selection:
+        misses.append("@bundle-selection")
+    if any(not _bundle_inventory_holds(directory, tree) for tree in prescan.bundles):
+        misses.extend(tree.directory for tree in prescan.bundles
+                      if tree.directory not in misses and not _bundle_inventory_holds(directory, tree))
     return misses
 
 
@@ -6017,7 +6395,47 @@ def _reread_misses(prescan: _Prescan, misses: Sequence[str]) -> None:
     directory = prescan.directory
     read = {rel: (digest, size) for rel, digest, size in prescan.facts}
     gone = set()
+    if "@bundle-selection" in misses:
+        try:
+            prescan.bundles = _scan_directory_bundles(directory, selected_out=prescan.bundle_selection)
+            prescan.bundle_fingerprints = {}
+            for tree in prescan.bundles:
+                prescan.bundle_fingerprints.update(_bundle_tree_fingerprints(tree))
+            prescan.fingerprints = {}
+            prescan.paths = []
+            paths, prescan.violations = _output_paths(
+                directory, excluded=prescan.excluded, excluded_symlinks=prescan.excluded_symlinks)
+            bundle_dirs = [tree.directory for tree in prescan.bundles]
+            journal = _read_json(journal_path(prescan.root, prescan.cycle_id)) or {}
+            owned_paths = {row.get("locator") for row in journal.get("directory_bundles", [])
+                           if isinstance(row, Mapping) and isinstance(row.get("locator"), str)}
+            paths = [(rel, entry) for rel, entry in paths
+                     if rel not in owned_paths and not any(rel.startswith(prefix + "/") for prefix in bundle_dirs)]
+            prescan.facts = []
+            for rel, entry in paths:
+                info = os.lstat(entry)
+                digest_value, size = _stream_file_facts(entry)
+                after = os.lstat(entry)
+                if _fingerprint(info) != _fingerprint(after):
+                    raise ProducerError("output-changed-while-reading", rel)
+                prescan.paths.append(rel)
+                prescan.fingerprints[rel] = _fingerprint(info)
+                prescan.facts.append((rel, digest_value, size))
+            prescan.paths.extend(prescan.bundle_fingerprints)
+            return
+        except (ProducerError, OSError, artifact_directory_bundle.DirectoryBundleError) as exc:
+            raise ProducerError("output-changed-while-reading", str(exc)) from exc
+    if any(rel in prescan.bundle_fingerprints for rel in misses):
+        old_bundle_paths = set(prescan.bundle_fingerprints)
+        prescan.bundles = _scan_directory_bundles(prescan.directory)
+        prescan.bundle_fingerprints = {}
+        for tree in prescan.bundles:
+            prescan.bundle_fingerprints.update(_bundle_tree_fingerprints(tree))
+        prescan.paths = [rel for rel in prescan.paths if rel not in old_bundle_paths]
+        prescan.paths.extend(prescan.bundle_fingerprints)
     for rel in misses:
+        if rel in prescan.bundle_fingerprints:
+            continue
         path = directory / rel
         try:
             before = os.lstat(str(path))
@@ -6322,7 +6740,8 @@ def _pruned_directory(parts: Sequence[str]) -> bool:
             or _browser_profile(parts, directory=True))
 
 
-def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, ...]]):
+def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, ...]],
+                 bundle_directories: Sequence[Tuple[str, ...]] = ()):
     """Entries under `top` in name order, depth first, as `(parts, DirEntry, is_dir)`.
 
     `after` is the last entry an earlier run finished: everything up to it is
@@ -6335,22 +6754,23 @@ def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, .
     for entry in entries:
         parts = prefix + (entry.name,)
         is_dir = entry.is_dir(follow_symlinks=False)
-        enter = is_dir and not _pruned_directory(parts)
+        inside_bundle = any(parts[:len(bundle)] == bundle for bundle in bundle_directories)
+        enter = is_dir and not _pruned_directory(parts) and not inside_bundle
         if after is not None:
             head = after[:len(parts)]
             if parts < head:
                 continue
             if parts == after:
                 if enter:
-                    yield from _walk_sorted(entry.path, parts, None)
+                    yield from _walk_sorted(entry.path, parts, None, bundle_directories)
                 continue
             if parts == head:
                 if enter:
-                    yield from _walk_sorted(entry.path, parts, after)
+                    yield from _walk_sorted(entry.path, parts, after, bundle_directories)
                 continue
         yield parts, entry, is_dir
         if enter:
-            yield from _walk_sorted(entry.path, parts, None)
+            yield from _walk_sorted(entry.path, parts, None, bundle_directories)
 
 
 def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str, Sequence[Any]],
@@ -6369,13 +6789,19 @@ def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str,
     scan = _RefreshScan(from_top=after is None)
     last_parts: Optional[Tuple[str, ...]] = None
     processed = 0
-    for parts, entry, is_dir in _walk_sorted(str(artifacts), (), after):
+    document = _read_json(directory / "manifest.json")
+    bundle_directories = _manifest_bundle_directories(document) if isinstance(document, Mapping) else set()
+    bundle_parts = {tuple(path.removeprefix("artifacts/").split("/")) for path in bundle_directories}
+    for parts, entry, is_dir in _walk_sorted(str(artifacts), (), after, bundle_parts):
         if processed and budget.walk_exhausted():
             scan.complete, scan.cursor = False, "/".join(last_parts) if last_parts else cursor
             return scan
         budget.walked += 1
         processed += 1
         rel = "artifacts/" + "/".join(parts)
+        if parts in bundle_parts:
+            last_parts = parts
+            continue
         if entry.is_symlink():
             scan.excluded_symlinks.append(rel)
             last_parts = parts
@@ -6433,9 +6859,11 @@ def _confirmed_absent(directory: Path, document: Mapping[str, Any], scan: _Refre
     remaining = (_UNLIMITED if budget.max_walk_entries == _UNLIMITED
                  else max(0, int(budget.max_walk_entries) - budget.walked))
     allowance = remaining + REFRESH_ABSENCE_CHECK_FLOOR
+    bundle_directories = _manifest_bundle_directories(document)
     for row in document.get("artifact_revisions", []) or []:
         rel = row.get("locator", {}).get("path") if isinstance(row, dict) else None
-        if not isinstance(rel, str) or rel in scan.visited or _outside_inclusion_rule(rel):
+        if (not isinstance(rel, str) or rel in scan.visited or _outside_inclusion_rule(rel)
+                or any(rel.startswith(path + "/") for path in bundle_directories)):
             continue
         if allowance <= 0:
             break
@@ -7155,6 +7583,9 @@ def _recover_locked(root: Path, *, now: Optional[float] = None,
                         continue
                     result["rolled_forward"].append(cycle_id)
                     continue
+                if journal.get("directory_bundles"):
+                    result["open"].append(cycle_id)
+                    continue
                 # Crash before the commit point: cycle stays open.
                 _drop_unpublished_snapshot(root, cycle_id, journal)
                 entry.unlink()
@@ -7467,6 +7898,40 @@ def _check_shared_base(expected: Optional[str], actual: Optional[str]) -> None:
                             "merge against latest in a new cycle before admission")
 
 
+def _shared_source_intersects_bundle(directory: Path, document: Mapping[str, Any], source_rel: str) -> bool:
+    artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                 if isinstance(row, Mapping)}
+    for row in document.get("artifact_revisions", []) or []:
+        if not isinstance(row, Mapping) or row.get("media_type") != artifact_directory_bundle.MEDIA_TYPE:
+            continue
+        if artifacts.get(row.get("artifact_id"), {}).get("type") != "directory-bundle":
+            continue
+        title = artifacts[row.get("artifact_id")].get("title")
+        if not isinstance(title, str) or not title:
+            continue
+        tree_rel = "artifacts/" + title
+        intersects = (tree_rel == source_rel or tree_rel.startswith(source_rel + "/")
+                      or source_rel.startswith(tree_rel + "/"))
+        if not intersects:
+            continue
+        locator = row.get("locator")
+        rel = locator.get("path") if isinstance(locator, Mapping) else None
+        if not isinstance(rel, str):
+            continue
+        try:
+            descriptor = (directory / rel).read_bytes()
+            if (len(descriptor) != row.get("byte_size")
+                    or "sha256:" + hashlib.sha256(descriptor).hexdigest() != row.get("content_digest")):
+                raise ProducerError("bundle-descriptor-revision-mismatch", rel)
+            body = artifact_directory_bundle.parse_descriptor(descriptor)
+        except (OSError, artifact_directory_bundle.DirectoryBundleError) as exc:
+            raise ProducerError("bundle-descriptor-invalid", rel) from exc
+        if body["directory"]["path"] != tree_rel:
+            raise ProducerError("bundle-title-directory-mismatch", rel)
+        return True
+    return False
+
+
 def _sealed_source_files(directory: Path, record: Mapping[str, Any], source_rel: str,
                          source_path: Path) -> List[Tuple[str, str, int]]:
     """Bind both the receipt and payload to the sealed manifest, not mutable disk."""
@@ -7474,11 +7939,50 @@ def _sealed_source_files(directory: Path, record: Mapping[str, Any], source_rel:
     if document is None or artifact_manifest.manifest_digest(document) != record.get("manifest_digest"):
         raise ProducerError("source-manifest-mismatch", source_rel)
     expected = {}
+    bundle_coverage: Dict[str, Tuple[str, int]] = {}
+    bundle_artifacts = {row.get("artifact_id") for row in document.get("artifacts", [])
+                        if isinstance(row, Mapping) and row.get("type") == "directory-bundle"}
     for row in document.get("artifact_revisions", []):
         path = row.get("locator", {}).get("path", "")
         if path == source_rel or path.startswith(source_rel + "/"):
             rel = path[len(source_rel) + 1:] if path != source_rel else source_path.name
             expected[rel] = (row["content_digest"], row["byte_size"])
+        if row.get("artifact_id") not in bundle_artifacts or row.get("media_type") != artifact_directory_bundle.MEDIA_TYPE:
+            continue
+        artifact = next(item for item in document.get("artifacts", [])
+                        if isinstance(item, Mapping) and item.get("artifact_id") == row.get("artifact_id"))
+        title = artifact.get("title")
+        if not isinstance(title, str) or not title:
+            continue
+        tree_rel = "artifacts/" + title
+        intersects = (tree_rel == source_rel or tree_rel.startswith(source_rel + "/")
+                      or source_rel.startswith(tree_rel + "/"))
+        if not intersects:
+            continue
+        if source_rel.startswith(tree_rel + "/"):
+            raise ProducerError("shared-bundle-subtree-unsupported", source_rel)
+        descriptor_rel = row.get("locator", {}).get("path", "")
+        try:
+            descriptor_bytes = (directory / descriptor_rel).read_bytes()
+            if (len(descriptor_bytes) != row.get("byte_size")
+                    or "sha256:" + hashlib.sha256(descriptor_bytes).hexdigest() != row.get("content_digest")):
+                raise ProducerError("bundle-descriptor-revision-mismatch", descriptor_rel)
+            body = artifact_directory_bundle.parse_descriptor(descriptor_bytes)
+        except (OSError, artifact_directory_bundle.DirectoryBundleError) as exc:
+            raise ProducerError("source-bundle-descriptor-invalid", descriptor_rel) from exc
+        if body["directory"]["path"] != tree_rel:
+            raise ProducerError("bundle-title-directory-mismatch", descriptor_rel)
+        try:
+            tree = artifact_directory_bundle.scan_tree(directory, tree_rel)
+        except artifact_directory_bundle.DirectoryBundleError as exc:
+            raise ProducerError(exc.code, exc.path or descriptor_rel) from exc
+        if tree.body != body:
+            raise ProducerError("bundle-tree-mismatch", tree_rel)
+        for leaf in tree.leaves:
+            full = f"{tree_rel}/{leaf.path}"
+            rel = full[len(source_rel) + 1:] if full != source_rel else source_path.name
+            bundle_coverage[rel] = (leaf.digest, leaf.size)
+    expected.update(bundle_coverage)
     paths = sorted(source_path.rglob("*")) if source_path.is_dir() else [source_path]
     actual = {}
     for path in paths:
@@ -7486,8 +7990,11 @@ def _sealed_source_files(directory: Path, record: Mapping[str, Any], source_rel:
             raise ProducerError("source-invalid", str(path))
         if path.is_file():
             rel = path.relative_to(source_path).as_posix() if source_path.is_dir() else path.name
-            data = path.read_bytes()
-            actual[rel] = (_digest(data), len(data))
+            try:
+                digest_value, size = _stream_file_facts(path)
+            except (OSError, ProducerError) as exc:
+                raise ProducerError("source-invalid", str(path)) from exc
+            actual[rel] = (digest_value, size)
     if actual != expected:
         raise ProducerError("source-manifest-mismatch", source_rel)
     return [(rel, digest, size) for rel, (digest, size) in sorted(actual.items())]
@@ -7522,6 +8029,79 @@ def _published_source_rows(document: Mapping[str, Any], source_rel: str) -> List
     return sorted(rows)
 
 
+def _published_source_matches(root: Path, record: Optional[Mapping[str, Any]],
+                              document: Mapping[str, Any], source_rel: str,
+                              expected_rows: Sequence[Mapping[str, Any]]) -> bool:
+    expected = [(row.get("path"), row.get("sha256"), row.get("byte_size"))
+                for row in expected_rows if isinstance(row, Mapping)]
+    actual = _published_source_rows(document, source_rel)
+    artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                 if isinstance(row, Mapping)}
+    bundles = []
+    for revision in document.get("artifact_revisions", []) or []:
+        if (not isinstance(revision, Mapping)
+                or revision.get("media_type") != artifact_directory_bundle.MEDIA_TYPE
+                or artifacts.get(revision.get("artifact_id"), {}).get("type") != "directory-bundle"):
+            continue
+        title = artifacts[revision["artifact_id"]].get("title")
+        if isinstance(title, str) and title:
+            bundles.append(("artifacts/" + title, revision))
+    intersecting = [(tree_rel, revision) for tree_rel, revision in bundles
+                    if (tree_rel == source_rel or tree_rel.startswith(source_rel + "/")
+                        or source_rel.startswith(tree_rel + "/"))]
+    if not intersecting:
+        return actual == sorted(expected)
+    directory = None
+    if record is not None:
+        try:
+            directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+        except (ProducerError, KeyError):
+            directory = None
+    # A deleted/missing source is judged from the immutable shared publication's
+    # own inventory, without reopening raw source bytes.
+    if directory is None or not directory.is_dir():
+        return True
+    coverage_prefixes = []
+    for tree_rel, revision in intersecting:
+        if source_rel.startswith(tree_rel + "/"):
+            return False  # a shared source cut through a bundle cannot preserve closure
+        locator = revision.get("locator")
+        descriptor_rel = locator.get("path") if isinstance(locator, Mapping) else None
+        if not isinstance(descriptor_rel, str):
+            return True
+        try:
+            data = (directory / descriptor_rel).read_bytes()
+            if (len(data) != revision.get("byte_size")
+                    or "sha256:" + hashlib.sha256(data).hexdigest() != revision.get("content_digest")):
+                return True
+            body = artifact_directory_bundle.parse_descriptor(data)
+        except (OSError, artifact_directory_bundle.DirectoryBundleError):
+            return True
+        if body["directory"]["path"] != tree_rel:
+            return False
+        prefix = "" if source_rel == tree_rel else tree_rel[len(source_rel) + 1:]
+        covered = [(path, digest, size) for path, digest, size in expected
+                   if isinstance(path, str) and (path.startswith(prefix + "/") if prefix else True)]
+        leaves = [[path[len(prefix) + 1:] if prefix else path, digest, size]
+                  for path, digest, size in covered]
+        leaves.sort(key=lambda row: row[0].encode("utf-8"))
+        tree_digest = "sha256:" + hashlib.sha256(artifact_directory_bundle._canonical(leaves)).hexdigest()
+        if (len(leaves) != body["file_count"] or sum(row[2] for row in leaves) != body["total_bytes"]
+                or tree_digest != body["tree_digest"]):
+            return False
+        coverage_prefixes.append(prefix)
+    def covered_path(path: Any) -> bool:
+        if not isinstance(path, str):
+            return False
+        for prefix in coverage_prefixes:
+            if path.startswith(prefix + "/") if prefix else True:
+                return True
+        return False
+    expected_direct = sorted(row for row in expected if not covered_path(row[0]))
+    actual_direct = sorted(row for row in actual if not covered_path(row[0]))
+    return actual_direct == expected_direct
+
+
 def _check_published_provenance(root: Path, revision: Mapping[str, Any], expected_rows: Sequence[Mapping[str, Any]],
                                 *, code: str) -> None:
     """A finished publication is judged by what it recorded (§45 D-127): the source
@@ -7538,7 +8118,7 @@ def _check_published_provenance(root: Path, revision: Mapping[str, Any], expecte
     rel = source.get("path", "")
     if not rel.startswith("artifacts/") or ".." in rel.split("/"):
         raise ProducerError(code, "source path")
-    if _published_source_rows(document, rel) != sorted((r["path"], r["sha256"], r["byte_size"]) for r in expected_rows):
+    if not _published_source_matches(root, record, document, rel, expected_rows):
         raise ProducerError(code, "source identity")
 
 
@@ -8165,7 +8745,10 @@ def admit_shared(
                 raise ProducerError("shared-publication-unresolved", str(pending_id))
         dropped = sorted({str(name) for name in drop_components if str(name)})
         drop_decisions = [{"name": name, "reason": drop_reason or "unspecified"} for name in dropped]
-        source_rows = _sealed_source_files(directory, record, source_rel, source_path) if kind == "spec" else None
+        document = _read_json(directory / "manifest.json") or {}
+        bundle_intersects = _shared_source_intersects_bundle(directory, document, source_rel)
+        source_rows = (_sealed_source_files(directory, record, source_rel, source_path)
+                       if kind == "spec" or bundle_intersects else None)
         merged_tree = None
         merge_proof = None
         if kind == "spec":

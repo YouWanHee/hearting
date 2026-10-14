@@ -19,6 +19,7 @@ here that cannot be rebuilt from published manifests.
 from contextlib import contextmanager, ExitStack
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -35,6 +36,7 @@ import atomic_publish
 import artifact_index
 import artifact_locator
 import artifact_manifest
+import artifact_directory_bundle
 import dispatch_lock_order
 from artifact_identity import IdAllocator, RootIdentity
 from artifact_manifest import Violation
@@ -435,21 +437,28 @@ def _stage_tree(
         os.fsync(fh.fileno())
 
     if staging_source is not None:
-        for path_value, _digest, _size, _media in artifact_manifest.declared_locators(document):
+        paths = {row[0] for row in artifact_manifest.declared_locators(document)
+                 if isinstance(row[0], str)}
+        coverage, _ = _bundle_coverage(Path(staging_source), document)
+        paths.update(coverage)
+        copied = set()
+        for path_value in sorted(paths):
             if not isinstance(path_value, str):
+                continue
+            if path_value in copied:
                 continue
             src = Path(staging_source) / path_value
             dst = cycle_content_dir / path_value
             dst.parent.mkdir(parents=True, exist_ok=True)
             if os.path.islink(str(src)) or not os.path.isfile(str(src)):
                 continue  # surfaced as a violation by _verify_staged_files
-            with open(str(src), "rb") as rfh, open(str(dst), "wb") as wfh:
-                wfh.write(rfh.read())
-                wfh.flush()
-                # Payload bytes must be durable before the publish rename makes
-                # the folder canonical; a crash must not leave a truncated file
-                # behind a matching journal digest.
-                os.fsync(wfh.fileno())
+            try:
+                artifact_directory_bundle.copy_file_streaming(src, dst)
+            except artifact_directory_bundle.DirectoryBundleError:
+                # Preserve the admission API's structured rejection path;
+                # staged verification reports the missing or mismatched row.
+                continue
+            copied.add(path_value)
 
     for dirpath, _dirnames, _filenames in os.walk(str(staging)):
         _fsync_dir(Path(dirpath))
@@ -462,6 +471,43 @@ def _walk_all_entries(top: Path):
         for name in dirnames + filenames:
             full = os.path.join(dirpath, name)
             yield Path(full)
+
+
+def _bundle_coverage(cycle_root: Path, document: Dict[str, Any]):
+    """Return validated directory-bundle leaves and typed violations."""
+    artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
+                 if isinstance(row, Mapping)}
+    paths = set()
+    violations = []
+    directories = []
+    for row in document.get("artifact_revisions", []) or []:
+        if not isinstance(row, Mapping):
+            continue
+        artifact = artifacts.get(row.get("artifact_id"), {})
+        media = row.get("media_type")
+        if artifact.get("type") != "directory-bundle" and media != artifact_directory_bundle.MEDIA_TYPE:
+            continue
+        locator = row.get("locator")
+        rel = locator.get("path") if isinstance(locator, Mapping) else None
+        if artifact.get("type") != "directory-bundle" or media != artifact_directory_bundle.MEDIA_TYPE or not isinstance(rel, str):
+            violations.append(Violation("bundle-type-media-mismatch", str(rel or "$"), "bundle declaration mismatch"))
+            continue
+        try:
+            covered = artifact_directory_bundle.verify_coverage(cycle_root, rel, row)
+            body = artifact_directory_bundle.parse_descriptor((cycle_root / rel).read_bytes())
+            directory = body["directory"]["path"]
+            if artifacts.get(row.get("artifact_id"), {}).get("title") != directory[len("artifacts/"):]:
+                violations.append(Violation("bundle-title-directory-mismatch", rel, "bundle title does not match body"))
+                continue
+            if any(directory == prior or directory.startswith(prior + "/")
+                   or prior.startswith(directory + "/") for prior in directories):
+                violations.append(Violation("bundle-directory-overlap", directory, "overlapping directory bundles"))
+                continue
+            directories.append(directory)
+            paths.update(covered)
+        except artifact_directory_bundle.DirectoryBundleError as exc:
+            violations.append(Violation(exc.code, exc.path or rel, exc.detail))
+    return paths, violations
 
 
 def _verify_staging_source(
@@ -486,6 +532,9 @@ def _verify_staging_source(
     for path_value, _digest, _size, _media in artifact_manifest.declared_locators(document):
         if isinstance(path_value, str):
             declared_paths.add(path_value)
+    coverage, coverage_violations = _bundle_coverage(source, document)
+    violations.extend(coverage_violations)
+    declared_paths.update(coverage)
 
     for entry in _walk_all_entries(source):
         rel = os.path.relpath(str(entry), str(source)).replace(os.sep, "/")
@@ -542,6 +591,8 @@ def _verify_staged_files(
             )
 
     declared = artifact_manifest.declared_locators(document)
+    coverage, coverage_violations = _bundle_coverage(cycle_content_dir, document)
+    violations.extend(coverage_violations)
     declared_paths = set()
     for path_value, digest, size, _media in declared:
         if not isinstance(path_value, str):
@@ -567,7 +618,14 @@ def _verify_staged_files(
                 )
             )
         if isinstance(digest, str):
-            actual_digest = artifact_manifest.digest_bytes(full.read_bytes())
+            hasher = hashlib.sha256()
+            with open(full, "rb") as stream:
+                while True:
+                    chunk = stream.read(artifact_directory_bundle.CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+            actual_digest = "sha256:" + hasher.hexdigest()
             if actual_digest != digest:
                 violations.append(
                     Violation(
@@ -576,6 +634,7 @@ def _verify_staged_files(
                         "expected {0}, got {1}".format(digest, actual_digest),
                     )
                 )
+    declared_paths.update(coverage)
 
     all_files = set()
     for entry in _walk_all_entries(cycle_content_dir):

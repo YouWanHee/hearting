@@ -1514,6 +1514,514 @@ class BrowserProfileCollectionTest(ProducerTestBase):
                          ["locator-invalid-component:artifacts/bad|name.txt"])
 
 
+class DirectoryBundleFinalizeTest(ProducerTestBase):
+    def test_bundle_cardinality_1_100_10000(self):
+        self.activate()
+        observed = []
+        for count in (1, 100, 10000):
+            route, route_file = self.route(slug=f"bundle-cardinality-{count}")
+            result = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                             intensity="direct", campaign_key=f"bundle-cardinality-{count}")
+            cycle = Path(result["cycle_dir"])
+            raw = cycle / "artifacts" / "raw-results"
+            raw.mkdir(parents=True)
+            for index in range(count):
+                (raw / f"f{index:05d}.bin").write_bytes(b"x")
+            self.write_output(result, "reports/final_report.md", b"same report\n")
+            self.close(route, route_file)
+            sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+            document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+            artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+            bundle_rows = [row for row in document["artifact_revisions"]
+                           if artifacts[row["artifact_id"]]["type"] == "directory-bundle"]
+            report_rows = [row for row in document["artifact_revisions"]
+                           if row["locator"]["path"] == "artifacts/reports/final_report.md"]
+            self.assertEqual(len(bundle_rows), 1)
+            self.assertEqual(len(report_rows), 1)
+            self.assertEqual(artifacts[report_rows[0]["artifact_id"]]["role"], "primary")
+            counts = (len(document["artifacts"]), len(document["artifact_revisions"]), len(document["events"]))
+            observed.append(counts)
+            self.assertEqual(sealed["artifact_count"], 2)
+        self.assertEqual(observed, [(2, 2, 4)] * 3)
+
+    def test_raw_tree_added_after_prescan_is_rescanned_before_seal(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        report = self.write_output(result, "reports/final_report.md", b"report\n")
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        scan = P._prescan_open_cycle(self.root, record, exclude_hidden=False, budget=None)
+        raw = cycle / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "late.bin").write_bytes(b"late")
+        misses = P._prescan_misses(cycle, scan, scan.paths)
+        self.assertIn("@bundle-selection", misses)
+        P._reread_misses(scan, misses)
+        self.assertEqual([tree.directory for tree in scan.bundles], ["artifacts/raw-results"])
+        self.assertNotIn("artifacts/raw-results/late.bin", {row[0] for row in scan.facts})
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"], _prescan=scan)
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+        self.assertEqual(report.read_bytes(), b"report\n")
+
+    def test_first_seal_registers_one_bundle_and_keeps_report_primary(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "experiments" / "r1" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "hidden.tmp").write_bytes(b"raw bytes")
+        (raw / "nested").mkdir()
+        (raw / "nested" / "raw-results").mkdir()
+        (raw / "nested" / "raw-results" / "inside.bin").write_bytes(b"nested bytes")
+        report = self.write_output(result, "reports/final_report.md", b"report\n")
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        cycle = Path(result["cycle_dir"])
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+        revisions = document["artifact_revisions"]
+        bundles = [row for row in revisions if artifacts[row["artifact_id"]]["type"] == "directory-bundle"]
+        self.assertEqual(len(bundles), 1)
+        row = bundles[0]
+        self.assertEqual(row["media_type"], "application/vnd.hearting.directory-bundle+json")
+        self.assertEqual(row["byte_size"], (cycle / row["locator"]["path"]).stat().st_size)
+        self.assertEqual(artifacts[row["artifact_id"]]["role"], "output")
+        self.assertEqual(report.read_bytes(), b"report\n")
+        self.assertEqual(sum(1 for item in revisions if item["locator"]["path"].startswith(
+            "artifacts/experiments/r1/raw-results/")), 0)
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+        facts = P._scan_cycle_facts(cycle, excluded=[], excluded_symlinks=[])
+        fact_paths = {row[0] for row in facts}
+        self.assertIn(row["locator"]["path"], fact_paths)
+        self.assertNotIn("artifacts/experiments/r1/raw-results/hidden.tmp", fact_paths)
+        raw_file = cycle / "artifacts/experiments/r1/raw-results/hidden.tmp"
+        raw_file.write_bytes(b"changed after seal")
+        self.assertEqual(P.finalize(self.root, cycle_id=result["cycle_id"])["status"], "already-sealed")
+        self.assertTrue(any("bundle-tree-mismatch:artifacts/experiments/r1/raw-results" in failure
+                            for failure in P.artifact_lifecycle.verify_artifact_revisions(document, cycle)))
+        with mock.patch.object(P.artifact_directory_bundle, "scan_tree",
+                               side_effect=AssertionError("status or completed replay rehashed source")):
+            self.assertEqual(P.status(self.root)["cycle_counts"], {"sealed": 1})
+            P.checkpoint(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed")
+
+    def test_existing_sealed_manifest_never_rebundled(self):
+        """A legacy file-per-row provisional seal keeps that registration unit on refresh."""
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        report = self.write_output(result, "reports/final_report.md", b"report before\n")
+        raw = cycle / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "one.bin").write_bytes(b"one")
+        (raw / "two.bin").write_bytes(b"two")
+        evidence = self.write_output(result)
+
+        # This models an older producer: it used the normal collector and emitted one row
+        # per raw file. Selection is disabled only while creating the initial sealed document.
+        with mock.patch.object(P, "_scan_directory_bundles", return_value=[]):
+            first = P.finalize(self.root, cycle_id=result["cycle_id"], allow_open_route=True)
+        self.assertEqual(first["cycle_state"], "active")
+        manifest_path = cycle / "manifest.json"
+        first_raw = manifest_path.read_bytes()
+        first_document = json.loads(first_raw)
+        first_revision = first_document["manifest_revision_id"]
+        first_events = list(first_document["events"])
+        first_report = next(row for row in first_document["artifact_revisions"]
+                            if row["locator"]["path"] == "artifacts/reports/final_report.md")
+        first_raw_rows = {
+            row["locator"]["path"]: (row["artifact_id"], row["artifact_revision_id"],
+                                      row["locator"], row["content_digest"])
+            for row in first_document["artifact_revisions"]
+            if row["locator"]["path"].startswith("artifacts/raw-results/")
+        }
+        self.assertEqual(set(first_raw_rows), {
+            "artifacts/raw-results/one.bin", "artifacts/raw-results/two.bin"})
+        snapshot = P.artifact_lifecycle.manifest_snapshot_path(
+            self.root, result["cycle_id"], first_revision)
+
+        # A late, proven close and a regular report edit use §46's refresh projection.
+        unproven, created = R.close_route(route, route_file, jobs=self.jobs)
+        self.assertTrue(created)
+        self.assertFalse(unproven["terminal_gate_proven"])
+        terminal = next(node for node in route["nodes"] if node.get("terminal"))
+        R.write_completion_marker(route, terminal, terminal["id"], evidence, jobs=self.jobs)
+        proven, created = R.close_route(route, route_file, jobs=self.jobs)
+        self.assertTrue(created and proven["terminal_gate_proven"])
+        report.write_bytes(b"report after\n")
+        refreshed = P.refresh_cycle(self.root, result["cycle_id"], trigger="explicit")
+        self.assertEqual(refreshed["status"], "emitted", refreshed)
+        current_raw = manifest_path.read_bytes()
+        current = json.loads(current_raw)
+        rows = {row["locator"]["path"]: row for row in current["artifact_revisions"]}
+        current_raw_rows = {
+            path: (rows[path]["artifact_id"], rows[path]["artifact_revision_id"],
+                   rows[path]["locator"], rows[path]["content_digest"])
+            for path in first_raw_rows
+        }
+        self.assertEqual(current_raw_rows, first_raw_rows)
+        self.assertEqual(current["cycle"]["state"], "completed")
+        self.assertEqual(refreshed["manifest_digest"], m.manifest_digest(current))
+        self.assertNotEqual(current["manifest_revision_id"], first_revision)
+        self.assertEqual(current["events"][:len(first_events)], first_events)
+        self.assertEqual({event["event_type"] for event in current["events"][len(first_events):]},
+                         {"artifact.revision.recorded", "cycle.completed", "route.terminal.recorded"})
+        self.assertEqual(snapshot.read_bytes(), first_raw)
+        self.assertEqual((raw / "one.bin").read_bytes(), b"one")
+        self.assertEqual((raw / "two.bin").read_bytes(), b"two")
+        self.assertEqual(rows["artifacts/reports/final_report.md"]["content_digest"],
+                         m.digest_bytes(b"report after\n"))
+        self.assertNotEqual(rows["artifacts/reports/final_report.md"]["artifact_revision_id"],
+                            first_report["artifact_revision_id"])
+        current_artifacts = {row["artifact_id"]: row for row in current["artifacts"]}
+        self.assertEqual([row for row in current["artifact_revisions"]
+                          if current_artifacts[row["artifact_id"]]["type"] == "directory-bundle"], [])
+        self.assertEqual(list((cycle / "artifacts").rglob("directory-bundles/*.json")), [])
+
+        # The finalize refresh path also keeps the old row unit when it sees a later report edit.
+        second_snapshot = current_raw
+        second_revision = current["manifest_revision_id"]
+        report.write_bytes(b"report changed again\n")
+        finalized = P.finalize(self.root, cycle_id=result["cycle_id"], state="completed")
+        self.assertTrue(finalized["refreshed"], finalized)
+        final_raw = manifest_path.read_bytes()
+        final = json.loads(final_raw)
+        final_artifacts = {row["artifact_id"]: row for row in final["artifacts"]}
+        final_rows = {row["locator"]["path"]: row for row in final["artifact_revisions"]}
+        self.assertNotEqual(final["manifest_revision_id"], second_revision)
+        self.assertEqual({path: (final_rows[path]["artifact_id"],
+                                 final_rows[path]["artifact_revision_id"],
+                                 final_rows[path]["locator"], final_rows[path]["content_digest"])
+                          for path in first_raw_rows}, first_raw_rows)
+        self.assertEqual(final["events"][:len(current["events"])], current["events"])
+        self.assertEqual(P.artifact_lifecycle.manifest_snapshot_path(
+            self.root, result["cycle_id"], second_revision).read_bytes(), second_snapshot)
+        self.assertEqual(final_rows["artifacts/reports/final_report.md"]["content_digest"],
+                         m.digest_bytes(b"report changed again\n"))
+        self.assertEqual([row for row in final["artifact_revisions"]
+                          if final_artifacts[row["artifact_id"]]["type"] == "directory-bundle"], [])
+        self.assertEqual(list((cycle / "artifacts").rglob("directory-bundles/*.json")), [])
+
+    def test_bundle_sealed_manifest_refresh_keeps_raw_tree_bundled(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        report = self.write_output(result, "reports/final_report.md", b"report before\n")
+        raw = cycle / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "input.bin").write_bytes(b"raw input")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+
+        manifest_path = cycle / "manifest.json"
+        first_raw = manifest_path.read_bytes()
+        first = json.loads(first_raw)
+        first_revision = first["manifest_revision_id"]
+        first_events = list(first["events"])
+        first_artifacts = {row["artifact_id"]: row for row in first["artifacts"]}
+        first_report = next(row for row in first["artifact_revisions"]
+                            if row["locator"]["path"] == "artifacts/reports/final_report.md")
+        bundle = next(row for row in first["artifact_revisions"]
+                      if first_artifacts[row["artifact_id"]]["type"] == "directory-bundle")
+        descriptor = cycle / bundle["locator"]["path"]
+        descriptor_bytes = descriptor.read_bytes()
+        self.assertEqual(len([row for row in first["artifact_revisions"]
+                              if row["locator"]["path"].startswith("artifacts/raw-results/")]), 0)
+        snapshot = P.artifact_lifecycle.manifest_snapshot_path(
+            self.root, result["cycle_id"], first_revision)
+
+        report.write_bytes(b"report after\n")
+        refreshed = P.refresh_cycle(self.root, result["cycle_id"], trigger="explicit")
+        self.assertEqual(refreshed["status"], "emitted", refreshed)
+        current_raw = manifest_path.read_bytes()
+        current = json.loads(current_raw)
+        current_artifacts = {row["artifact_id"]: row for row in current["artifacts"]}
+        current_bundle = next(row for row in current["artifact_revisions"]
+                              if current_artifacts[row["artifact_id"]]["type"] == "directory-bundle")
+        self.assertEqual((current_bundle["artifact_id"], current_bundle["artifact_revision_id"],
+                          current_bundle["locator"], current_bundle["content_digest"]),
+                         (bundle["artifact_id"], bundle["artifact_revision_id"], bundle["locator"],
+                          bundle["content_digest"]))
+        self.assertNotEqual(current["manifest_revision_id"], first_revision)
+        self.assertEqual(current["events"][:len(first_events)], first_events)
+        self.assertEqual([event["event_type"] for event in current["events"][len(first_events):]],
+                         ["artifact.revision.recorded"])
+        self.assertEqual(snapshot.read_bytes(), first_raw)
+        self.assertEqual(descriptor.read_bytes(), descriptor_bytes)
+        self.assertEqual(len(list((cycle / "artifacts" / "_internal" / "directory-bundles").glob("*.json"))), 1)
+        self.assertEqual([row for row in current["artifact_revisions"]
+                          if row["locator"]["path"].startswith("artifacts/raw-results/")], [])
+        revisions = {row["locator"]["path"]: row for row in current["artifact_revisions"]}
+        self.assertEqual(revisions["artifacts/reports/final_report.md"]["content_digest"],
+                         m.digest_bytes(b"report after\n"))
+        self.assertNotEqual(revisions["artifacts/reports/final_report.md"]["artifact_revision_id"],
+                            first_report["artifact_revision_id"])
+        self.assertEqual(len(current["artifact_revisions"]), len(first["artifact_revisions"]))
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(current, cycle), ())
+
+    def test_shared_source_coverage_only_scans_an_intersecting_bundle(self):
+        from unittest import mock
+
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "x.bin").write_bytes(b"raw")
+        report = self.write_output(result, "reports/report.md", b"report")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        cycle = Path(result["cycle_dir"])
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        with mock.patch.object(P.artifact_directory_bundle, "scan_tree",
+                               side_effect=AssertionError("outside bundle was read")):
+            self.assertEqual(P._sealed_source_files(cycle, record, "artifacts/reports",
+                                                     cycle / "artifacts/reports"),
+                             [("report.md", m.digest_bytes(b"report"), len(b"report"))])
+        source_rows = P._sealed_source_files(cycle, record, "artifacts/raw-results", raw)
+        self.assertEqual(source_rows, [("x.bin", m.digest_bytes(b"raw"), len(b"raw"))])
+        with self.assertRaises(P.ProducerError) as unsupported:
+            P._sealed_source_files(cycle, record, "artifacts/raw-results/nested", raw / "nested")
+        self.assertEqual(unsupported.exception.code, "shared-bundle-subtree-unsupported")
+        expected_rows = [{"path": path, "sha256": digest_value, "byte_size": size}
+                         for path, digest_value, size in source_rows]
+        (raw / "x.bin").write_bytes(b"late raw mutation")
+        with mock.patch.object(P.artifact_directory_bundle, "scan_tree",
+                               side_effect=AssertionError("historical source tree rehashed")):
+            self.assertTrue(P._published_source_matches(
+                self.root, record, json.loads((cycle / "manifest.json").read_text()),
+                "artifacts/raw-results", expected_rows))
+
+    def test_existing_workflow_evidence_in_raw_tree_keeps_reserved_individual_row(self):
+        import artifact_workflow_groups as workflow
+
+        self.activate()
+        route_one, file_one = self.route(slug="bundle-workflow-one", campaign_key="bundle-workflow")
+        one = P.begin(self.root, route_file=file_one, capability="autopilot-code",
+                      intensity="direct", campaign_key="bundle-workflow")
+        route_two, file_two = self.route(slug="bundle-workflow-two", campaign_key="bundle-workflow")
+        two = P.begin(self.root, route_file=file_two, capability="autopilot-code",
+                      intensity="direct", campaign_key="bundle-workflow")
+        raw = self.write_output(one, "raw-results/evidence.md", b"raw workflow evidence")
+        report = self.write_output(two, "reports/evidence.md", b"report workflow evidence")
+
+        def reserve(output, route, path):
+            record = P.read_cycle_record(self.root, output["cycle_id"])
+            relative = path.relative_to(Path(output["cycle_dir"])).as_posix()
+            digest_value = m.digest_bytes(path.read_bytes())
+            document = P.build_manifest(
+                self.root, record, route, (), state="completed", primary=None,
+                allow_open_route=True, allocator=P.artifact_identity.IdAllocator(), now=1,
+                interim=True, facts=[(relative, digest_value, path.stat().st_size)])
+            P.reservation_path(self.root, output["cycle_id"]).parent.mkdir(parents=True, exist_ok=True)
+            P.reservation_path(self.root, output["cycle_id"]).write_bytes(
+                P._json_bytes(P._reservation_payload(record, document, None)))
+            P.open_manifest_path(self.root, output["cycle_id"]).parent.mkdir(parents=True, exist_ok=True)
+            P.open_manifest_path(self.root, output["cycle_id"]).write_bytes(m.canonical_bytes(document))
+            return next(row for row in document["artifact_revisions"] if row["locator"]["path"] == relative)
+
+        reserved_raw = reserve(one, route_one, raw)
+        reserve(two, route_two, report)
+        cycle_one = Path(one["cycle_dir"])
+        cycle_two = Path(two["cycle_dir"])
+        camp = one["campaign_id"]
+        relation = {"from_cycle_id": one["cycle_id"], "to_cycle_id": two["cycle_id"],
+                    "kind": "precedes", "rationale": "The later cycle consumes prior evidence.",
+                    "evidence_refs": [
+                        {"path": raw.relative_to(self.root).as_posix()},
+                        {"path": report.relative_to(self.root).as_posix()},
+                    ]}
+        proposal = {"groups": [{"title": "Bundle workflow evidence",
+                    "members": [{"cycle_id": one["cycle_id"], "stage_label": "first"},
+                                {"cycle_id": two["cycle_id"], "stage_label": "second"}],
+                    "relations": [relation]}]}
+        plan = workflow.prepare(self.root, camp, proposal)
+        workflow.apply(self.root, plan)
+        self.close(route_one, file_one)
+        P.finalize(self.root, cycle_id=one["cycle_id"])
+        document = json.loads((cycle_one / "manifest.json").read_text(encoding="utf-8"))
+        raw_row = next(row for row in document["artifact_revisions"]
+                       if row["locator"]["path"] == "artifacts/raw-results/evidence.md")
+        self.assertEqual(raw_row["artifact_id"], reserved_raw["artifact_id"])
+        self.assertEqual(raw_row["artifact_revision_id"], reserved_raw["artifact_revision_id"])
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle_one), ())
+        self.assertEqual(report.read_bytes(), b"report workflow evidence")
+
+    def test_raw_only_bundle_can_be_primary_and_exact_primary_leaf_stays_individual(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        leaf = raw / "selected.txt"
+        leaf.write_bytes(b"chosen")
+        self.close(route, route_file)
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"], primary="artifacts/raw-results/selected.txt")
+        cycle = Path(result["cycle_dir"])
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        roles = {row["title"]: row["role"] for row in document["artifacts"]}
+        self.assertIn("artifacts/raw-results/selected.txt", rows)
+        self.assertEqual(rows["artifacts/raw-results/selected.txt"]["content_digest"], m.digest_bytes(b"chosen"))
+        self.assertEqual(roles["raw-results/selected.txt"], "primary")
+        self.assertEqual(sealed["artifact_count"], 2)
+
+    def test_raw_only_bundle_is_the_default_primary(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "x").write_bytes(b"raw")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
+        artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+        bundles = [artifacts[row["artifact_id"]] for row in document["artifact_revisions"]
+                   if artifacts[row["artifact_id"]]["type"] == "directory-bundle"]
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(bundles[0]["role"], "primary")
+
+    def test_terminal_evidence_inside_bundle_keeps_an_individual_row(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        evidence = raw / "terminal-evidence.md"
+        evidence.write_text("terminal evidence\n", encoding="utf-8")
+        route_module = P.artifact_lifecycle._load_capability_route()
+        for node in route["nodes"]:
+            if node.get("terminal") is True:
+                route_module.write_completion_marker(route, node, node["id"], evidence)
+        outcome, _ = route_module.close_route(route, route_file, commit="b" * 40,
+                                              summary="bundle evidence fixture")
+        self.assertTrue(outcome["terminal_gate_proven"], outcome)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        cycle = Path(result["cycle_dir"])
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        self.assertIn("artifacts/raw-results/terminal-evidence.md", rows)
+        self.assertEqual(rows["artifacts/raw-results/terminal-evidence.md"]["content_digest"],
+                         m.digest_bytes(evidence.read_bytes()))
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+
+    def test_identical_user_descriptor_collision_is_preserved_and_bundle_uses_suffix(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        raw = cycle / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "x").write_bytes(b"x")
+        tree = P.artifact_directory_bundle.scan_tree(cycle, "artifacts/raw-results")
+        user = cycle / "artifacts/_internal/directory-bundles/raw-results.json"
+        user.parent.mkdir(parents=True)
+        user.write_bytes(tree.descriptor)
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+        revisions = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        self.assertIn("artifacts/_internal/directory-bundles/raw-results.json", revisions)
+        self.assertIn("artifacts/_internal/directory-bundles/raw-results-2.json", revisions)
+        self.assertEqual(user.read_bytes(), tree.descriptor)
+        generated = revisions["artifacts/_internal/directory-bundles/raw-results-2.json"]
+        self.assertEqual(artifacts[generated["artifact_id"]]["type"], "directory-bundle")
+        self.assertEqual(generated["content_digest"], tree.descriptor_digest)
+
+    def test_precommit_bundle_journal_survives_recovery_and_external_change_fails(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "x").write_bytes(b"x")
+        self.close(route, route_file)
+        trees = P._scan_directory_bundles(Path(result["cycle_dir"]))
+        P._publish_bundle_descriptors(self.root, result["cycle_id"], Path(result["cycle_dir"]), trees)
+        journal = P._read_json(P.journal_path(self.root, result["cycle_id"]))
+        locator = journal["directory_bundles"][0]["locator"]
+        self.assertIn(result["cycle_id"], P.recover(self.root)["producer"]["open"])
+        descriptor = Path(result["cycle_dir"]) / locator
+        descriptor.write_bytes(b"external change")
+        with self.assertRaises(P.ProducerError) as caught:
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(caught.exception.code, "directory-bundle-owned-file-changed")
+
+    def test_precommit_raw_change_reuses_owned_locator_with_new_descriptor(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        payload = raw / "x"
+        payload.write_bytes(b"one")
+        self.close(route, route_file)
+        directory = Path(result["cycle_dir"])
+        first_tree = P._scan_directory_bundles(directory)
+        P._publish_bundle_descriptors(self.root, result["cycle_id"], directory, first_tree)
+        journal = P._read_json(P.journal_path(self.root, result["cycle_id"]))
+        first = journal["directory_bundles"][0]
+        payload.write_bytes(b"two")
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((directory / "manifest.json").read_text())
+        bundle_row = next(row for row in document["artifact_revisions"]
+                          if row["media_type"] == "application/vnd.hearting.directory-bundle+json")
+        self.assertEqual(bundle_row["locator"]["path"], first["locator"])
+        self.assertNotEqual(bundle_row["content_digest"], first["descriptor_digest"])
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, directory), ())
+        self.assertEqual(sealed["status"], "sealed")
+
+    def test_manifest_commit_crash_rolls_bundle_forward_without_reissue(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "x").write_bytes(b"x")
+        self.close(route, route_file)
+        with self.assertRaises(adm.AdmissionRecoveryRequired):
+            P.finalize(self.root, cycle_id=result["cycle_id"], crash_after_manifest=True)
+        journal = P._read_json(P.journal_path(self.root, result["cycle_id"]))
+        owned = journal["directory_bundles"][0]
+        descriptor = Path(result["cycle_dir"]) / owned["locator"]
+        descriptor_bytes = descriptor.read_bytes()
+        recovered = P.recover(self.root)
+        self.assertIn(result["cycle_id"], recovered["producer"]["rolled_forward"])
+        self.assertEqual(descriptor.read_bytes(), descriptor_bytes)
+        document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, Path(result["cycle_dir"])), ())
+        self.assertEqual(P.finalize(self.root, cycle_id=result["cycle_id"])["status"], "already-sealed")
+
+    def test_precommit_crash_before_tmp_and_after_descriptor_resumes_same_transaction(self):
+        from unittest import mock
+
+        for fault in ("before-temp", "after-descriptor"):
+            route, route_file = self.route(slug="bundle-crash-" + fault)
+            result = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                             intensity="direct", campaign_key="bundle-crash-" + fault)
+            raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+            raw.mkdir(parents=True)
+            (raw / "x").write_bytes(b"x")
+            self.close(route, route_file)
+            if fault == "before-temp":
+                original = P._write_exclusive
+                def fail_temp(path, data, mode=0o644):
+                    if ".tmp-" in Path(path).name:
+                        raise OSError("injected crash before temp write")
+                    return original(path, data, mode)
+                with mock.patch.object(P, "_write_exclusive", side_effect=fail_temp):
+                    with self.assertRaises(OSError):
+                        P.finalize(self.root, cycle_id=result["cycle_id"])
+            else:
+                with mock.patch.object(P.artifact_lifecycle, "preserve_manifest_snapshot",
+                                       side_effect=OSError("injected crash after descriptor")):
+                    with self.assertRaises(OSError):
+                        P.finalize(self.root, cycle_id=result["cycle_id"])
+            journal = P._read_json(P.journal_path(self.root, result["cycle_id"]))
+            self.assertTrue(journal["directory_bundles"])
+            P.recover(self.root)
+            retry = P.finalize(self.root, cycle_id=result["cycle_id"])
+            self.assertEqual(retry["status"], "sealed")
+            document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
+            self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(
+                document, Path(result["cycle_dir"])), ())
+
+
 class RecoveryTest(ProducerTestBase):
     def _sealing_crash(self):
         self.activate()

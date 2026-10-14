@@ -566,6 +566,55 @@ class TestStagingSafety(AdmissionContractBase):
             doc, src, "k-extra", expect_code="staging-undeclared-extra-file"
         )
 
+    def test_directory_bundle_coverage_joins_source_and_staged_inventory(self):
+        import artifact_directory_bundle as bundles
+
+        doc, base_src = self._doc_and_src()
+        src = self.scratch / "bundle-source"
+        src.mkdir()
+        (src / "plan.md").write_bytes((base_src / "plan.md").read_bytes())
+        raw = src / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "hidden.tmp").write_bytes(b"covered")
+        tree = bundles.scan_tree(src, "artifacts/raw-results")
+        descriptor_path = "artifacts/_internal/directory-bundles/raw-results.json"
+        descriptor = src / descriptor_path
+        descriptor.parent.mkdir(parents=True)
+        descriptor.write_bytes(tree.descriptor)
+        bundle_id = "a_" + "b" * 32
+        doc["artifacts"].append({"artifact_id": bundle_id, "cycle_id": doc["cycle"]["cycle_id"],
+                                 "role": "output", "type": "directory-bundle",
+                                 "capability": "autopilot-code", "title": "raw-results"})
+        doc["artifact_revisions"].append({"artifact_revision_id": "ar_" + "c" * 32,
+            "artifact_id": bundle_id, "revision_sequence": 1,
+            "content_digest": tree.descriptor_digest, "byte_size": len(tree.descriptor),
+            "media_type": bundles.MEDIA_TYPE,
+            "locator": {"kind": "cycle-relative", "path": descriptor_path},
+            "provenance": doc["artifact_revisions"][0]["provenance"]})
+
+        covered, violations = adm._bundle_coverage(src, doc)
+        self.assertEqual(covered, {"artifacts/raw-results/hidden.tmp"})
+        self.assertEqual(violations, [])
+        self.assertEqual(adm._verify_staging_source(src, doc), [])
+        stage = self.scratch / "stage"
+        published = self.scratch / "published"
+        staged_cycle = adm._stage_tree(stage, published, published, doc, src)
+        self.assertEqual((staged_cycle / "artifacts/raw-results/hidden.tmp").read_bytes(), b"covered")
+        self.assertEqual(adm._verify_staged_files(staged_cycle, doc), [])
+        doc["artifact_revisions"][-1]["content_digest"] = "sha256:" + "0" * 64
+        coverage, violations = adm._bundle_coverage(src, doc)
+        self.assertEqual(coverage, set())
+        self.assertEqual(violations[0].code, "bundle-descriptor-revision-mismatch")
+        source_codes = {row.code for row in adm._verify_staging_source(src, doc)}
+        self.assertIn("staging-undeclared-extra-file", source_codes)
+        doc["artifact_revisions"][-1]["content_digest"] = tree.descriptor_digest
+        doc["artifact_revisions"][-1]["media_type"] = "application/json"
+        doc["artifacts"][-1]["type"] = "doc"
+        coverage, violations = adm._bundle_coverage(src, doc)
+        self.assertEqual((coverage, violations), (set(), []))
+        generic_codes = {row.code for row in adm._verify_staging_source(src, doc)}
+        self.assertIn("staging-undeclared-extra-file", generic_codes)
+
 # ---------------------------------------------------------------------------
 # F-1 defence (graft G-2) and the non-scope invariants
 # ---------------------------------------------------------------------------

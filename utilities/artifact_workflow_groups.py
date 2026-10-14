@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import artifact_admission as admission  # noqa: E402
+import artifact_directory_bundle  # noqa: E402
 import artifact_identity as identity  # noqa: E402
 import artifact_lifecycle as lifecycle  # noqa: E402
 import artifact_producer as producer  # noqa: E402
@@ -282,15 +283,38 @@ def _evidence_owner(root: Path, path: Any, endpoints: tuple[Path, Path]) -> tupl
 
 def _bind_evidence(root: Path, campaign: Mapping[str, Any], ref: Mapping[str, Any],
                    endpoints: tuple[tuple[str, Path], tuple[str, Path]],
-                   *, remaining: int | None = None) -> dict[str, str]:
+                   *, remaining: int | None = None,
+                   manifest_overrides: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, str]:
     if not isinstance(ref, dict) or set(ref) not in ({"path"}, EVIDENCE_FIELDS):
         raise WorkflowGroupError("evidence-fields-invalid")
     absolute, directory = _evidence_owner(root, ref["path"], (endpoints[0][1], endpoints[1][1]))
+    cycle_id = next(cid for cid, cdir in endpoints if cdir == directory)
+    manifest = ((manifest_overrides or {}).get(cycle_id)
+                or _manifest(root, campaign, cycle_id, directory))
+    rel = str(absolute.relative_to(directory)).replace(os.sep, "/")
+    exact = [row for row in manifest.get("artifact_revisions", [])
+             if isinstance(row, dict) and isinstance(row.get("locator"), dict)
+             and row["locator"].get("path") == rel]
+    if not exact:
+        artifacts = {row.get("artifact_id"): row for row in manifest.get("artifacts", [])
+                     if isinstance(row, dict)}
+        for revision in manifest.get("artifact_revisions", []) or []:
+            if not isinstance(revision, dict) or revision.get("media_type") != artifact_directory_bundle.MEDIA_TYPE:
+                continue
+            artifact = artifacts.get(revision.get("artifact_id"), {})
+            locator = revision.get("locator")
+            descriptor_rel = locator.get("path") if isinstance(locator, dict) else None
+            if artifact.get("type") != "directory-bundle" or not isinstance(descriptor_rel, str):
+                continue
+            try:
+                _no_symlink(root, Path(descriptor_rel))
+                body = artifact_directory_bundle.parse_descriptor(_regular(directory / descriptor_rel))
+            except (OSError, WorkflowGroupError, artifact_directory_bundle.DirectoryBundleError):
+                continue
+            if rel.startswith(body["directory"]["path"] + "/"):
+                raise WorkflowGroupError("evidence-coverage-leaf-unsupported", str(ref["path"]))
     raw = _evidence_bytes(root, absolute.relative_to(root), remaining=remaining)
     digest = _digest(raw)
-    cycle_id = next(cid for cid, cdir in endpoints if cdir == directory)
-    manifest = _manifest(root, campaign, cycle_id, directory)
-    rel = str(absolute.relative_to(directory)).replace(os.sep, "/")
     rows = [row for row in manifest.get("artifact_revisions", [])
             if isinstance(row, dict) and isinstance(row.get("locator"), dict)
             and row["locator"].get("path") == rel and row.get("content_digest") == digest]
