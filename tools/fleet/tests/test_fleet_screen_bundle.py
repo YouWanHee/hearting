@@ -472,7 +472,7 @@ class BundleTest(unittest.TestCase):
             self.assertEqual([render._dw(row[:re.search(r"(?:\d+%|—) +(\S)", row).start(1)]) for row in where],
                              [render._NAME_COL] * 2)
             self.assertEqual(where[0][render._STEWARD_LINE_COL], "⚑" if width == 168 else "┆")
-            self.assertEqual(where[1][render._STEWARD_LINE_COL], " ")
+            self.assertEqual(where[1][render._STEWARD_LINE_COL], "┆" if width == 168 else " ")
             if width != 168:
                 elapsed = [row for row in rows if "3h 00m" in row and "MODEL" in row]
                 self.assertEqual([row.index("3h 00m") for row in elapsed], [render._SESSION_DETAIL_COL] * 2)
