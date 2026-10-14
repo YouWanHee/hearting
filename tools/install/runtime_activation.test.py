@@ -1050,9 +1050,15 @@ class CodexIdentityConfigTest(unittest.TestCase):
             result = self._merge(config, self._release(root))
             edited = config.read_text(encoding="utf-8").replace('"CLAUDECODE"', '"MINE"')
             config.write_text(edited, encoding="utf-8")
+            # Each insertion is unmerged on its own: the edited block stays exactly as the
+            # user left it, while the untouched question feature line still goes.
+            expected = activation._codex_feature_remove(edited, result["managed_config"]["feature"])
+            self.assertNotEqual(expected, edited)
+            self.assertIn('"MINE"', expected)
             self.assertEqual(
-                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}}), [])
-            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}}),
+                [str(config)])
+            self.assertEqual(config.read_text(encoding="utf-8"), expected)
 
     def test_invalid_toml_takes_the_existing_activation_error_path(self):
         with tempfile.TemporaryDirectory() as temporary:
