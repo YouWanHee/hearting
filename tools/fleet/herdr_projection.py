@@ -8,7 +8,7 @@ pane header, where the shape is ours to fix (user 2026-09-09: "그 바깥에 장
 맞겠다"). The header reads
 
     [3a] claude   통신 표시 일관성 수정
-    [b0] claude ⚑ 하팅 감독 — 네 세션 관리
+    [b0] ⚑ claude 하팅 감독 — 네 세션 관리
 
 Both halves go into `title`, because that is the only field herdr paints above the pane:
 `display_agent` is reported too and herdr stores it, but a pane whose `display_agent` said
@@ -291,7 +291,7 @@ def refresh_tag_metadata(agents) -> None:
 
 def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None,
             label=None) -> tuple:
-    """→ ``(display_agent, title)`` in the fixed order number → harness → ⚑ → summary.
+    """→ ``(display_agent, title)`` in the fixed order number → ⚑ → harness → summary.
 
     ``label`` lets a user formatter rename the middle harness word; the badge and the
     steward mark stay ours, so a personal formatter cannot quietly delete the two things
@@ -305,9 +305,9 @@ def compose(harness: str, session_id: str, *, tag=None, steward=None, title=None
     if title is None:
         title = session_title(harness, session_id)
     middle = sanitize_title(label) or harness or "agent"
-    agent = ("[%s] %s" % (tag, middle)) if tag else middle
     if steward:
-        agent += " " + _STEWARD_MARK
+        middle = _STEWARD_MARK + " " + middle
+    agent = ("[%s] %s" % (tag, middle)) if tag else middle
     return clip_cells(agent, _AGENT_W), clip_cells(sanitize_title(title), _TITLE_W)
 
 
@@ -315,7 +315,7 @@ _HEADER_W = 72           # herdr paints one string above the pane; give the summ
 
 
 def header_title(agent: str, title: str) -> str:
-    """`[6b] claude ⚑ 요약` — the ONE string herdr actually paints above the pane.
+    """`[6b] ⚑ claude 요약` — the ONE string herdr actually paints above the pane.
 
     `display_agent` is reported as well, but herdr does not paint it on the pane header.
     Measured 2026-09-10: four panes carried `[6b] claude` in `display_agent` for hours
@@ -323,7 +323,7 @@ def header_title(agent: str, title: str) -> str:
     something once `title` was filled — the user watched exactly that A/B happen and
     reported "제목은 뜨는데 id는 여전히 안뜨는데. 그게 중요한건데".
 
-    So the requested format — number, harness, steward mark, then the summary
+    So the requested format — number, steward mark, harness, then the summary
     (user 2026-09-09: "세션 번호를 herdr의 pane 상단 제목에 뜨게끔 하자 요약과 더불어서",
     "맨 앞에 harness 이름은 뜨게끔") — is joined here, into the field that reaches the
     header. The badge comes first and is never the part that gets clipped: a summary

@@ -5,7 +5,7 @@ Claude Code's own herdr integration (`herdr-agent-state.sh`, installed and overw
 herdr) reports lifecycle STATE and the session id. It reports no title, so a Claude pane
 header stayed anonymous while Codex panes already carried one. This hearting-owned hook
 adds the display-only half through the shared projector, so all three harnesses put the
-same thing in the same order: `[<tag>] <harness>[ ⚑]` and the summary Fleet's title
+same thing in the same order: `[<tag>] [⚑ ]<harness>` and the summary Fleet's title
 worker already computed.
 
 Fail-soft by construction: reads stdin, never writes stdout, and exits 0 on every path.
