@@ -1639,6 +1639,21 @@ class DirectoryBundleFinalizeTest(ProducerTestBase):
         self.assertEqual(roles["raw-results/selected.txt"], "primary")
         self.assertEqual(sealed["artifact_count"], 2)
 
+    def test_raw_only_bundle_is_the_default_primary(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "x").write_bytes(b"raw")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((Path(result["cycle_dir"]) / "manifest.json").read_text())
+        artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+        bundles = [artifacts[row["artifact_id"]] for row in document["artifact_revisions"]
+                   if artifacts[row["artifact_id"]]["type"] == "directory-bundle"]
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(bundles[0]["role"], "primary")
+
     def test_terminal_evidence_inside_bundle_keeps_an_individual_row(self):
         self.activate()
         route, route_file, result = self.begin()
@@ -1702,6 +1717,29 @@ class DirectoryBundleFinalizeTest(ProducerTestBase):
         with self.assertRaises(P.ProducerError) as caught:
             P.finalize(self.root, cycle_id=result["cycle_id"])
         self.assertEqual(caught.exception.code, "directory-bundle-owned-file-changed")
+
+    def test_precommit_raw_change_reuses_owned_locator_with_new_descriptor(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        raw = Path(result["cycle_dir"]) / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        payload = raw / "x"
+        payload.write_bytes(b"one")
+        self.close(route, route_file)
+        directory = Path(result["cycle_dir"])
+        first_tree = P._scan_directory_bundles(directory)
+        P._publish_bundle_descriptors(self.root, result["cycle_id"], directory, first_tree)
+        journal = P._read_json(P.journal_path(self.root, result["cycle_id"]))
+        first = journal["directory_bundles"][0]
+        payload.write_bytes(b"two")
+        sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((directory / "manifest.json").read_text())
+        bundle_row = next(row for row in document["artifact_revisions"]
+                          if row["media_type"] == "application/vnd.hearting.directory-bundle+json")
+        self.assertEqual(bundle_row["locator"]["path"], first["locator"])
+        self.assertNotEqual(bundle_row["content_digest"], first["descriptor_digest"])
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, directory), ())
+        self.assertEqual(sealed["status"], "sealed")
 
     def test_manifest_commit_crash_rolls_bundle_forward_without_reissue(self):
         self.activate()

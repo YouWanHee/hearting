@@ -3996,6 +3996,8 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
         kept_dirs = []
         for name in sorted(dirs):
             if name == "raw-results":
+                if os.path.islink(os.path.join(current, name)):
+                    excluded["non-regular"] += 1
                 continue  # prune before any contained file consumes visit or byte limits
             if name.startswith("."):
                 excluded["hidden"] += 1

@@ -79,6 +79,40 @@ class InterimManifestTest(CheckpointTestBase):
         self.assertEqual(report.read_bytes(), b"report")
         self.assertEqual(sorted(p.name for p in raw.iterdir()), [f"f{index:02d}.bin" for index in range(25)])
 
+    def test_pruned_raw_reservation_is_kept_and_exact_primary_id_continues(self):
+        cycle = Path(self.result["cycle_dir"])
+        raw = self.write_output(self.result, "raw-results/evidence.md", b"evidence")
+        report = self.write_output(self.result, "reports/final_report.md", b"report")
+        record = P.read_cycle_record(self.root, self.cycle_id)
+        facts = [(raw.relative_to(cycle).as_posix(), "sha256:" + hashlib.sha256(raw.read_bytes()).hexdigest(), raw.stat().st_size),
+                 (report.relative_to(cycle).as_posix(), "sha256:" + hashlib.sha256(report.read_bytes()).hexdigest(), report.stat().st_size)]
+        reserved_doc = P.build_manifest(
+            self.root, record, self.route_obj, (), state="completed", primary=None,
+            allow_open_route=True, allocator=P.artifact_identity.IdAllocator(), now=1,
+            interim=True, facts=facts,
+        )
+        raw_row = next(row for row in reserved_doc["artifact_revisions"]
+                       if row["locator"]["path"] == "artifacts/raw-results/evidence.md")
+        P.reservation_path(self.root, self.cycle_id).parent.mkdir(parents=True, exist_ok=True)
+        P.reservation_path(self.root, self.cycle_id).write_bytes(
+            P._json_bytes(P._reservation_payload(record, reserved_doc, None)))
+        P.open_manifest_path(self.root, self.cycle_id).parent.mkdir(parents=True, exist_ok=True)
+        P.open_manifest_path(self.root, self.cycle_id).write_bytes(m.canonical_bytes(reserved_doc))
+
+        checkpoint = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(checkpoint["status"], "emitted", checkpoint)
+        interim = self.interim()
+        self.assertNotIn("artifacts/raw-results/evidence.md", _ids_by_path(interim))
+        ledger = self.ledger()
+        self.assertEqual(ledger["artifacts"]["artifacts/raw-results/evidence.md"]["artifact_id"],
+                         raw_row["artifact_id"])
+        self.close(self.route_obj, self.route_file)
+        P.finalize(self.root, cycle_id=self.cycle_id, primary="artifacts/raw-results/evidence.md")
+        sealed = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        raw_sealed = next(row for row in sealed["artifact_revisions"]
+                          if row["locator"]["path"] == "artifacts/raw-results/evidence.md")
+        self.assertEqual(raw_sealed["artifact_id"], raw_row["artifact_id"])
+
     def legacy_move(self, rel, to):
         """What a release before the move's removal left: the file at `to` and its ledger row."""
         cycle = Path(self.result["cycle_dir"])
