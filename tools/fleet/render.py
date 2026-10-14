@@ -5255,7 +5255,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
         elif getattr(entity, "_details_pending", False):
             now_text = "loading"
         elif hasattr(entity, "_details_pending"):
-            now_text = "unavailable"
+            now_text = "no summary yet"
     main_detail = indent_width is None and depth == 0
     if indent_width is None:
         indent_width = _CONTEXT_INDENT_W + 2 * max(0, depth)
@@ -5313,7 +5313,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
             if clipped:
                 if sep:
                     tail.append((sep, None))
-                tail.append((clipped, now_key))
+                tail.append((clipped, "dim" if now_text == "no summary yet" else now_key))
         if tail:
             segs.append((" " * gap, None))
             segs.extend(tail)

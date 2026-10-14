@@ -41,7 +41,7 @@ class DispatchSummaryTest(unittest.TestCase):
             "FLEET_TITLE_MAX_STARTS": "4",
             "FLEET_TITLE_COMMAND": shlex.join([
                 sys.executable, "-c",
-                "print('TITLE: Dispatch Summary Owner\\nNOW: 분사 작업 요약을 갱신하고 있습니다')",
+                "print('TITLE: 분사 작업 요약\\nNOW: 분사 작업 요약을 갱신하고 있습니다')",
             ]),
         })
         os.environ.pop("FLEET_TITLE_DISABLE", None)
@@ -120,7 +120,7 @@ class DispatchSummaryTest(unittest.TestCase):
         child.wait(timeout=5)
         self.assertEqual(rc, 0)
         sidecar = titles.read(S.summary_sid(attempt), harness="codex")
-        self.assertEqual(sidecar["title"], "Dispatch Summary Owner")
+        self.assertEqual(sidecar["title"], "분사 작업 요약")
         self.assertEqual(sidecar["summary"], "분사 작업 요약을 갱신하고 있습니다")
         self.assertEqual(sidecar["offset"], log.stat().st_size)
         state = json.loads(S.owner_state_path("codex", attempt).read_text())
@@ -256,7 +256,7 @@ class DispatchSummaryTest(unittest.TestCase):
                 "execution_surface=registered-headless,registered_worker=1,"
                 "fallback_hop=same-harness-headless,worker_type=owner,"
                 f"attempt_id={attempt},harness=claude,pid={worker.pid},"
-                f"pid_start={start},log_file={log}\n",
+                f"pid_start={start},runtime_home={self.tmp.name}/worker-home,log_file={log}\n",
                 encoding="utf-8",
             )
             owner_start = S.process_observation(owner.pid)[1]
@@ -288,6 +288,9 @@ class DispatchSummaryTest(unittest.TestCase):
             self.assertEqual(second, {"state": "existing", "reason": "owner-live"})
             launch.assert_called_once()
             self.assertEqual(launch.call_args.kwargs["prompt_path"], prompt)
+            self.assertEqual(launch.call_args.kwargs["runtime_home"],
+                             f"{self.tmp.name}/worker-home")
+            self.assertEqual(launch.call_args.kwargs["attempt_cwd"], "/wt")
             self.assertIn("summary_owner=dispatch-v1", jobs.read_text())
         finally:
             for process in (worker, owner):
@@ -387,10 +390,16 @@ class DispatchSummaryTest(unittest.TestCase):
                 S.launch_summary_owner(
                     attempt_id=attempt, harness="codex", transcript=log,
                     target_pid=worker.pid, target_start=start, prompt_path=prompt,
+                    runtime_home=Path(self.tmp.name) / "worker-home",
+                    attempt_cwd="/exact/worktree",
                 )
             self.assertEqual(captured["argv"].count("--prompt"), 1)
             prompt_index = captured["argv"].index("--prompt")
             self.assertEqual(captured["argv"][prompt_index + 1], str(prompt))
+            self.assertEqual(captured["argv"][captured["argv"].index("--runtime-home") + 1],
+                             str(Path(self.tmp.name) / "worker-home"))
+            self.assertEqual(captured["argv"][captured["argv"].index("--attempt-cwd") + 1],
+                             "/exact/worktree")
             self.assertNotIn("secret anchor contents", " ".join(captured["argv"]))
             self.assertNotIn("secret anchor contents", " ".join(captured["env"].values()))
         finally:
@@ -424,6 +433,75 @@ class DispatchSummaryTest(unittest.TestCase):
         self.assertEqual(announced["session_id"], "11111111-2222-3333-4444-555555555555")
         # No transcript on disk yet -> wait, never fall back to the receipt log.
         self.assertIsNone(S._summary_source(log, {}))
+
+    def test_terminal_supervised_source_absence_degrades_without_refreshing_receipt(self):
+        attempt = "att-no-native-source"
+        session_id = "11111111-2222-3333-4444-555555555555"
+        log = Path(self.tmp.name) / f"owner.{attempt}.claude.jsonl"
+        log.write_text(self._announce(session_id, "/missing-worktree"), encoding="utf-8")
+        child = subprocess.Popen(["sleep", "0.1"], start_new_session=True)
+        start = S.process_observation(child.pid)[1]
+        with mock.patch.object(S, "_refresh", side_effect=AssertionError("receipt refresh")):
+            self.assertEqual(S.supervise(
+                attempt_id=attempt, harness="claude", transcript=log,
+                target_pid=child.pid, target_start=start, poll=0.02,
+                initial_delay=0, final_grace=0.1, log_quiet=0.01,
+                runtime_home=Path(self.tmp.name) / "worker-home",
+                attempt_cwd="/missing-worktree"), 0)
+        child.wait(timeout=2)
+        state = json.loads(S.owner_state_path("claude", attempt).read_text())
+        self.assertEqual(state["status"], "degraded")
+        self.assertEqual(state["summary_source_reason"], "summary_source_unavailable")
+        self.assertFalse(state["final_refresh_started"])
+        self.assertIsNone(titles.read(S.summary_sid(attempt), harness="claude"))
+
+    def test_duplicate_supervisor_announcements_are_invalid(self):
+        log = Path(self.tmp.name) / "owner.att-duplicate.claude.jsonl"
+        event = self._announce("11111111-2222-3333-4444-555555555555", "/wt")
+        log.write_text(event + event, encoding="utf-8")
+        decided, announced = S.announced_session(log)
+        self.assertTrue(decided)
+        self.assertEqual(announced["invalid"], "multiple-supervisor-session-events")
+        self.assertIsNone(S._summary_source(log, {}))
+
+    def test_late_supervisor_announcement_after_control_and_receipt_rows_is_used(self):
+        log = Path(self.tmp.name) / "owner.att-late.claude.jsonl"
+        session_id = "11111111-2222-3333-4444-555555555555"
+        log.write_text(
+            json.dumps({"type": "dispatch.supervisor.started"}) + "\n"
+            + json.dumps({"type": "result", "result": "PASS"}) + "\n"
+            + self._announce(session_id, "/wt"), encoding="utf-8")
+        decided, announced = S.announced_session(log)
+        self.assertTrue(decided)
+        self.assertEqual(announced["session_id"], session_id)
+        waiting = Path(self.tmp.name) / "owner.att-late-wait.claude.jsonl"
+        waiting.write_text(json.dumps({"type": "dispatch.supervisor.started"}) + "\n")
+        self.assertEqual(S.announced_session(waiting), (False, None))
+        waiting.write_text(waiting.read_text() + self._announce(session_id, "/wt"),
+                           encoding="utf-8")
+        self.assertEqual(S.announced_session(waiting)[1]["session_id"], session_id)
+        missing = Path(self.tmp.name) / "owner.att-terminal-no-session.claude.jsonl"
+        missing.write_text(json.dumps({"type": "dispatch.supervisor.started"}) + "\n"
+                           + json.dumps({"type": "result", "result": "PASS"}) + "\n")
+        decided, announced = S.announced_session(missing)
+        self.assertTrue(decided)
+        self.assertEqual(announced["invalid"], "missing-supervisor-session-event")
+
+    def test_late_transcript_file_is_re_resolved_without_caching_absence(self):
+        from claude_project_dir import encode_project_dir
+        session_id = "11111111-2222-3333-4444-555555555555"
+        log = Path(self.tmp.name) / "owner.att-late-file.claude.jsonl"
+        log.write_text(self._announce(session_id, "/late-worktree"), encoding="utf-8")
+        home = Path(self.tmp.name) / "late-worker-home"
+        cache = {}
+        self.assertIsNone(S._summary_source(log, cache, runtime_home=home,
+                                            attempt_cwd="/late-worktree"))
+        self.assertNotIn("source", cache)
+        source = home / "projects" / encode_project_dir("/late-worktree") / (session_id + ".jsonl")
+        source.parent.mkdir(parents=True)
+        source.write_text("late conversation", encoding="utf-8")
+        self.assertEqual(S._summary_source(log, cache, runtime_home=home,
+                                           attempt_cwd="/late-worktree"), source)
 
     def test_one_shot_log_stays_its_own_summary_source(self):
         log = Path(self.tmp.name) / "owner.att-oneshot.claude.jsonl"
@@ -517,21 +595,23 @@ class DispatchSummaryTest(unittest.TestCase):
         session_id = "99999999-8888-7777-6666-555555555555"
         config = Path(self.tmp.name) / "config"
         os.environ["CLAUDE_CONFIG_DIR"] = str(config)
-        # Encoded-cwd hit.
-        encoded = config / "projects" / "-home-user-cairn-wt-hook-sweep"
+        # Only the exact encoded cwd in the selected home is eligible.
+        from claude_project_dir import encode_project_dir
+        cwd = "/home/user/agent_note.wt/hook_sweep"
+        encoded = config / "projects" / encode_project_dir(cwd)
         encoded.mkdir(parents=True)
         exact = encoded / f"{session_id}.jsonl"
         exact.write_text("{}\n", encoding="utf-8")
         self.assertEqual(
             S.session_transcript(
-                {"session_id": session_id, "cwd": "/home/user/agent_note.wt/hook_sweep"}),
+                {"session_id": session_id, "cwd": cwd}, expected_cwd=cwd,
+                runtime_home=config),
             exact,
         )
-        # A cwd that does not encode to the runtime's project dir still resolves by id.
-        self.assertEqual(
-            S.session_transcript({"session_id": session_id, "cwd": "/somewhere/else"}),
-            exact,
-        )
+        # A same-id transcript under a different project is never borrowed.
+        self.assertIsNone(S.session_transcript(
+            {"session_id": session_id, "cwd": "/somewhere/else"},
+            expected_cwd="/somewhere/else", runtime_home=config))
         # A missing transcript never borrows a same-dir neighbour.
         self.assertIsNone(
             S.session_transcript({"session_id": "00000000-0000-0000-0000-000000000000",
@@ -546,15 +626,29 @@ class DispatchSummaryTest(unittest.TestCase):
         """
         attempt = "att-supervised-e2e"
         session_id = "abcdabcd-1234-5678-9abc-abcdabcdabcd"
-        config = Path(self.tmp.name) / "config"
-        os.environ["CLAUDE_CONFIG_DIR"] = str(config)
-        project = config / "projects" / "-wt-owner"
+        producer_home = Path(self.tmp.name) / "producer-home"
+        worker_home = Path(self.tmp.name) / "worker-home"
+        os.environ["CLAUDE_CONFIG_DIR"] = str(producer_home)
+        from claude_project_dir import encode_project_dir
+        project = worker_home / "projects" / encode_project_dir("/wt/owner")
+        decoy_project = producer_home / "projects" / encode_project_dir("/wt/owner")
         project.mkdir(parents=True)
+        decoy_project.mkdir(parents=True)
         transcript = project / f"{session_id}.jsonl"
+        (decoy_project / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "PRODUCER_HOME_DECOY"}]}}) + "\n",
+            encoding="utf-8")
         transcript.write_text(json.dumps({
             "type": "assistant",
-            "message": {"content": [{"type": "text", "text": "owner turn one"}]},
+            "message": {"content": [{"type": "text", "text": "WORKER_HOME_ONLY owner turn one"}]},
         }) + "\n", encoding="utf-8")
+        provider_script = (
+            "import sys; p=sys.argv[-1]; "
+            "assert 'WORKER_HOME_ONLY' in p and 'PRODUCER_HOME_DECOY' not in p; "
+            "print('TITLE: 작업 홈 요약\\nNOW: worker home conversation')"
+        )
+        os.environ["FLEET_TITLE_COMMAND"] = shlex.join([sys.executable, "-c", provider_script])
         log = Path(self.tmp.name) / f"owner.{attempt}.claude.jsonl"
         log.write_text(self._announce(session_id, "/wt/owner"), encoding="utf-8")
         child = subprocess.Popen([
@@ -562,7 +656,7 @@ class DispatchSummaryTest(unittest.TestCase):
             "import pathlib,sys,time,json; time.sleep(.4); "
             "p=pathlib.Path(sys.argv[1]); f=p.open('a'); "
             "f.write(json.dumps({'type':'assistant','message':{'content':"
-            "[{'type':'text','text':'owner turn two'}]}})+'\\n'); f.close(); time.sleep(.25)",
+            "[{'type':'text','text':'WORKER_HOME_ONLY owner turn two'}]}})+'\\n'); f.close(); time.sleep(.25)",
             str(transcript),
         ], start_new_session=True)
         start = S.process_observation(child.pid)[1]
@@ -572,12 +666,20 @@ class DispatchSummaryTest(unittest.TestCase):
             target_pid=child.pid, target_start=start,
             poll=0.05, initial_delay=0, periodic_debounce=90,
             final_grace=8, log_quiet=0.05,
+            runtime_home=worker_home, attempt_cwd="/wt/owner",
         )
         child.wait(timeout=5)
         self.assertEqual(rc, 0)
         sidecar = titles.read(S.summary_sid(attempt), harness="claude")
-        self.assertEqual(sidecar["title"], "Dispatch Summary Owner")
-        self.assertEqual(sidecar["summary"], "분사 작업 요약을 갱신하고 있습니다")
+        self.assertEqual(sidecar["title"], "작업 홈 요약")
+        self.assertEqual(sidecar["summary"], "worker home conversation")
+        from types import SimpleNamespace
+        from fleet import render
+        card = render._context_detail_row(SimpleNamespace(
+            summary=sidecar["summary"], summary_ts=sidecar["summary_ts"],
+            liveness="working", _details_pending=False, _details_error=False),
+            term_width=168)
+        self.assertIn("worker home conversation", render._plain(card[0]))
         # The cursor tracks the transcript, never the receipt log.
         self.assertEqual(sidecar["offset"], transcript.stat().st_size)
         self.assertNotEqual(sidecar["offset"], log.stat().st_size)

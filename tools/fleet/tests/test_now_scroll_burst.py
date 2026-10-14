@@ -52,7 +52,7 @@ class NowTest(unittest.TestCase):
                 source = LiveSnapshot(jobs=[row])
                 detail = details.DetailSnapshot(details.state_key(source), copy.deepcopy(source))
                 merged = details.merge(source, detail).jobs[0]
-                self.assertIn('unavailable', now(merged))
+                self.assertIn('no summary yet', now(merged))
                 self.assertNotIn('loading', now(merged))
                 self.assertIn('loading', now(row))  # immutable basic observation
 
@@ -138,7 +138,7 @@ class NowTest(unittest.TestCase):
             observers['_enrich_claude_stream_session'].side_effect = None
             observers['effective_qa'].return_value = ('quick', 'fixture')
             recovered = details.merge(merged, details._enrich(merged)).jobs[0]
-            self.assertIn('unavailable', now(recovered))
+            self.assertIn('no summary yet', now(recovered))
             self.assertNotIn('detail failed', now(recovered))
 
 

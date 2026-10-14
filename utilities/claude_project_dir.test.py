@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 sys.path.insert(0, str(ROOT))
 
-from claude_project_dir import encode_project_dir  # noqa: E402
+from claude_project_dir import encode_project_dir, resolve_session_transcript  # noqa: E402
 
 # A real directory Claude Code 2.1.280 created (206 characters): the 200-char
 # cut plus `-` + base36(|java hash|) of the original cwd.
@@ -95,6 +95,58 @@ class ReadersResolveAwkwardPathsTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(
                     collector._newest_transcript_path(str(home), cwd, "sid-1"), str(transcript))
+
+    def test_session_transcript_is_bound_to_home_and_exact_cwd(self):
+        cwd = str(self.base / "repo with spaces")
+        home_a, home_b = self.base / "home-a", self.base / "home-b"
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        for home, text in ((home_a, "worker"), (home_b, "decoy")):
+            transcript = home / "projects" / encode_project_dir(cwd) / (sid + ".jsonl")
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(text, encoding="utf-8")
+        path, reason = resolve_session_transcript(
+            sid, cwd, expected_cwd=cwd, runtime_home=str(home_a))
+        self.assertIsNone(reason)
+        self.assertEqual(path.read_text(), "worker")
+        self.assertEqual(resolve_session_transcript(
+            sid, cwd, expected_cwd=str(self.base / "other"), runtime_home=str(home_a)),
+            (None, "supervisor-worktree-mismatch"))
+        self.assertEqual(resolve_session_transcript(
+            sid, cwd, expected_cwd=cwd, runtime_home=str(self.base / "missing")), (None, None))
+
+    def test_symlinked_worktree_finds_the_physical_project_dir(self):
+        physical = self.base / "physical" / "wt"
+        physical.mkdir(parents=True)
+        cwd = str(self.base / "link-wt")
+        os.symlink(physical, cwd, target_is_directory=True)
+        home = self.base / "home"
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        real = home / "projects" / encode_project_dir(str(physical)) / (sid + ".jsonl")
+        real.parent.mkdir(parents=True)
+        real.write_text("physical", encoding="utf-8")
+        path, reason = resolve_session_transcript(
+            sid, cwd, expected_cwd=str(physical), runtime_home=str(home))
+        self.assertIsNone(reason)
+        self.assertEqual(path.read_text(), "physical")
+        # The lexical project dir still wins when Claude Code named it that way.
+        lexical = home / "projects" / encode_project_dir(cwd) / (sid + ".jsonl")
+        lexical.parent.mkdir(parents=True)
+        lexical.write_text("lexical", encoding="utf-8")
+        path, _ = resolve_session_transcript(
+            sid, cwd, expected_cwd=cwd, runtime_home=str(home))
+        self.assertEqual(path.read_text(), "lexical")
+
+    def test_session_transcript_rejects_path_escape(self):
+        cwd = str(self.base / "repo")
+        projects = self.base / "home" / "projects"
+        projects.mkdir(parents=True)
+        (projects / encode_project_dir(cwd)).symlink_to(self.base, target_is_directory=True)
+        self.assertEqual(resolve_session_transcript(
+            "../escape", cwd, expected_cwd=cwd, runtime_home=str(self.base / "home")),
+            (None, "invalid-supervisor-session-event"))
+        self.assertEqual(resolve_session_transcript(
+            "sid", cwd, expected_cwd=cwd, runtime_home=str(self.base / "home")),
+            (None, "invalid-supervisor-session-event"))
 
 
 if __name__ == "__main__":

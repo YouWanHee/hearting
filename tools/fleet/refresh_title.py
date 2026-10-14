@@ -1758,6 +1758,8 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
     if not sid:
         return False
     source_kind = (refresh_source or {}).get("kind") if isinstance(refresh_source, dict) else None
+    cursor_identity = ((refresh_source or {}).get("cursor_kind")
+                       if source_kind == "claude-transcript" else None)
     if source_kind == "opencode-db":
         if not refresh_source.get("db_path") or not os.path.isfile(refresh_source["db_path"]):
             return False
@@ -1765,6 +1767,7 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
         return False
     now = time.time() if now is None else now
     previous = titles.read(sid, harness=harness) or {}
+    cursor_migrating = bool(cursor_identity and previous.get("cursor_kind") != cursor_identity)
     anchor = anchor_text or (read_prompt_anchor(prompt_path) if prompt_path else "")
     if not anchor and transcript and source_kind != "opencode-db" and previous.get("title"):
         anchor = read_origin(transcript, harness)
@@ -1772,7 +1775,8 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
     ts = previous.get("ts") if isinstance(previous.get("ts"), (int, float)) else 0
     failures = _summary_failures(previous)
     retry_delay = SUMMARY_RETRY_DELAYS[failures - 1] if failures else debounce
-    if ts and now - ts <= retry_delay and not language_changed:
+    if (ts and now - ts <= retry_delay and not language_changed and not cursor_migrating
+            and quota_class not in ("initial", "final")):
         return False
     try:
         if source_kind == "opencode-db":
@@ -1782,11 +1786,12 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
             transcript_mtime = os.path.getmtime(transcript) if transcript else now
     except OSError:
         return False
-    if ts and transcript_mtime <= ts and not failures and not language_changed:
+    if (ts and transcript_mtime <= ts and not failures and not language_changed
+            and not cursor_migrating and quota_class not in ("initial", "final")):
         return False
     if (source_kind != "opencode-db" and previous.get("title") and previous.get("summary")
             and not failures and not language_changed and not priority
-            and quota_class not in ("initial", "final")):
+            and quota_class not in ("initial", "final") and not cursor_migrating):
         offset = previous.get("offset")
         if isinstance(offset, int):
             try:
@@ -1856,6 +1861,8 @@ def maybe_spawn(harness, sid, transcript=None, now=None, debounce=DEBOUNCE_SEC,
                  refresh_source.get("session_id") or sid]
     else:
         argv += ["--transcript", transcript]
+    if cursor_identity:
+        argv += ["--cursor-kind", cursor_identity]
     if prompt_path:
         argv += ["--prompt", prompt_path]
     if priority:
@@ -1977,6 +1984,7 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--transcript")
     source.add_argument("--opencode-db")
+    parser.add_argument("--cursor-kind")
     parser.add_argument("--opencode-session")
     parser.add_argument("--anchor-stdin", action="store_true")
     parser.add_argument("--lockdir")
@@ -2012,7 +2020,10 @@ def main(argv=None):
         if args.harness != "opencode" and (args.opencode_db or args.opencode_session):
             return 0
         previous = titles.read(args.sid, harness=args.harness) or {}
+        cursor_migrating = bool(args.cursor_kind and
+                                previous.get("cursor_kind") != args.cursor_kind)
         offset = previous.get("offset", 0) if isinstance(previous.get("offset"), int) else 0
+        previous_offset = offset
         previous_title = previous.get("title", "") if isinstance(previous.get("title"), str) else ""
         previous_summary = previous.get("summary") if isinstance(previous.get("summary"), str) else None
         # A prior NOW proves this session has already had its first refresh.
@@ -2027,7 +2038,12 @@ def main(argv=None):
                 or isinstance(previous_summary_ts, bool)):
             previous_summary_ts = None
         previous_failures = _summary_failures(previous)
-        cursor_kind = None
+        cursor_kind = args.cursor_kind
+        if cursor_kind and (args.harness != "claude" or not args.transcript
+                            or not cursor_kind.startswith("claude-transcript-v1:")):
+            return 0
+        if cursor_kind and previous.get("cursor_kind") != cursor_kind:
+            offset = 0
         anchor = ""
         explicit_anchor = _user_text(explicit_anchor)
         if args.opencode_db:
@@ -2095,16 +2111,19 @@ def main(argv=None):
                       and not args.priority and args.quota_class not in ("initial", "final")
                       and _minor_peer_delta(delta))
         if not delta.strip() or minor_peer:
+            stored_cursor_kind = (previous.get("cursor_kind") if cursor_migrating
+                                  else cursor_kind)
+            stored_offset = (previous.get("offset", 0) if cursor_migrating else new_offset)
             titles.write(
                 args.sid,
                 previous_title,
                 source=source,
-                offset=new_offset,
+                offset=stored_offset,
                 harness=args.harness,
                 summary=previous_summary,
                 summary_ts=previous_summary_ts,
                 summary_failures=previous_failures,
-                cursor_kind=cursor_kind,
+                cursor_kind=stored_cursor_kind,
                 summary_error=previous.get("summary_error"),
                 title_ts=previous.get("title_ts"),
             )
@@ -2133,12 +2152,14 @@ def main(argv=None):
             title if title else previous_title,
             source=_language_source(("refresher:" + answered) if (title and answered)
                                     else (_provider_source() if title else source), observation),
-            offset=new_offset if summary else offset,
+            offset=(new_offset if summary else
+                    previous_offset if cursor_migrating else offset),
             harness=args.harness,
             summary=summary or previous_summary,
             summary_ts=None if summary else previous_summary_ts,
             summary_failures=summary_failures,
-            cursor_kind=cursor_kind,
+            cursor_kind=(cursor_kind if summary or not cursor_migrating
+                         else previous.get("cursor_kind")),
             summary_error=provider_box.get("error"),
             title_ts=time.time() if title else previous.get("title_ts"),
         )
