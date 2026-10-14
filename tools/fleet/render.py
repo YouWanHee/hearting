@@ -8450,7 +8450,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         if live_order is not None:
             shown = live_order.reconcile_sessions(name, shown)
         shown, steward_edges = _steward_hierarchy(shown)
-        session_starts, session_identity_rows, steward_markers = {}, set(), {}
+        session_starts, session_detail_rows, session_identity_rows, steward_markers = {}, {}, set(), {}
         rendered_parent_sids = set()  # ambiguous enrichment must not duplicate a dispatch tree
         for s in shown:
             if getattr(s, "mem_worker", False):
@@ -8517,10 +8517,13 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             if _selectable_session(s):
                 _SELECTABLE.append(_select_entry(s, _n0))    # F-27 target map
             if _srow:
-                lines.extend(_srow(s, is_parent=bool(nested_n), child_count=nested_n,
-                                   term_width=term_width,
-                                   show_projection_stage=not suppress_session_stage,
-                                   tag_by_key=tag_by_key))
+                session_rows = _srow(s, is_parent=bool(nested_n), child_count=nested_n,
+                                     term_width=term_width,
+                                     show_projection_stage=not suppress_session_stage,
+                                     tag_by_key=tag_by_key)
+                lines.extend(session_rows)
+                if len(session_rows) > 1:
+                    session_detail_rows[id(s)] = _n0 + 1
             else:
                 lines.append(_session_row(s, narrow, is_parent=bool(nested_n),
                                           child_count=nested_n,
@@ -8534,6 +8537,7 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
             # subtitles keep the dim supporting weight (see _dispatch_summary_detail_row).
             detail = _context_detail_row(s, term_width=_context_content_width(term_width), now_key="now_main")
             if detail:
+                session_detail_rows.setdefault(id(s), len(lines))
                 lines.extend(detail)
             # F-103: the route chain lives in the session's stage cell (last three nodes);
             # it has no line of its own.
@@ -8573,9 +8577,9 @@ def _build_unbounded_lines(sessions, jobs, section, narrow, malformed, layout="w
         connector_rows = set()
         for parent, targets in steward_edges.items():
             if parent in session_starts and targets:
-                stop = session_starts.get(id(targets[-1]))
+                stop = session_detail_rows.get(id(targets[-1]))
                 if stop is not None:
-                    connector_rows.update(range(session_starts[parent] + 1, stop))
+                    connector_rows.update(range(session_starts[parent] + 1, stop + 1))
         for idx in sorted(connector_rows - session_identity_rows - steward_markers.keys()):
             if lines[idx]:
                 lines[idx] = _under_id_connector(lines[idx])

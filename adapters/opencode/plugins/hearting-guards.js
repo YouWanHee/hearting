@@ -472,12 +472,15 @@ function registerPaneContext(ctx) {
   if (paneNativeOrigin === undefined) paneNativeOrigin = ownNativePaneOrigin()
   let ownsOrigin = false
   try { ownsOrigin = !!paneNativeOrigin && realpathSync(ctx.directory) === paneNativeOrigin.directory } catch {}
-  const binding = { active: true, ownsOrigin, refreshPending: false, originObserved: false }
+  const binding = { active: true, ownsOrigin, refreshPending: false, originObserved: false,
+    generation: null, startupTimer: null, startupQueued: false, startupScheduled: false,
+    startupRunning: false }
   paneContexts.set(ctx, binding)
   if (ownsOrigin) {
     if (paneOwningContext) retirePaneContext(paneOwningContext)
     paneOwningContext = ctx
     paneProjectionGeneration++
+    binding.generation = paneProjectionGeneration
     paneProjectionRetryAt.delete(paneNativeOrigin.sid)
   }
   return binding
@@ -486,6 +489,11 @@ function registerPaneContext(ctx) {
 function retirePaneContext(ctx) {
   const binding = paneContexts.get(ctx)
   if (!binding) return
+  if (binding.startupTimer !== null) {
+    clearTimeout(binding.startupTimer)
+    binding.startupTimer = null
+    binding.startupQueued = false
+  }
   binding.active = false
   if (paneOwningContext === ctx) {
     paneProjectionGeneration++
@@ -497,6 +505,12 @@ function retirePaneContext(ctx) {
 
 function invalidatePaneOrigin(sid) {
   if (paneNativeOrigin?.sid === sid) {
+    const binding = paneOwningContext && paneContexts.get(paneOwningContext)
+    if (binding?.startupTimer !== null && binding?.startupTimer !== undefined) {
+      clearTimeout(binding.startupTimer)
+      binding.startupTimer = null
+      binding.startupQueued = false
+    }
     paneNativeOrigin.state = "invalidated"
     paneProjectionGeneration++
   }
@@ -774,13 +788,14 @@ async function projectPane(sid, ctx, retry = false) {
     }
     const reportSession = verified && paneNativeOrigin.state !== "invalidated"
     const startup = reportSession && paneNativeOrigin.state === "pending"
+    const startSource = startup ? (paneNativeOrigin.bare ? "startup" : "resume") : null
     // A pruned import-time release must not take both publisher paths down:
     // resolve the live root/helper here so async and sync share one target.
     const target = resolvePublisherTarget()
     const args = [target.helper, "--harness", "opencode", "--session-id", sid]
     if (reportSession) {
       args.push("--seq", String(++paneReportSequence))
-      if (startup) args.push("--session-start-source", "startup")
+      if (startSource) args.push("--session-start-source", startSource)
     } else args.push("--no-report-session")
     const slot = { child: null }
     panePublisherSlot = slot // Reserve before spawn, including synchronous reentrancy.
@@ -852,6 +867,30 @@ async function projectPane(sid, ctx, retry = false) {
   } catch (error) {
     peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid, ...publisherErrorFields(error) })
   } finally { if (paneProjectionBusy.get(sid) === binding) paneProjectionBusy.delete(sid) }
+}
+
+function scheduleInitialPaneProjection(ctx, binding, sid) {
+  const origin = paneNativeOrigin
+  if (!sid || !binding?.active || !binding.ownsOrigin || paneOwningContext !== ctx
+      || !origin || origin.sid !== sid || origin.state !== "pending"
+      || binding.startupScheduled || !process.env.HERDR_PANE_ID || isWorkerSession()) return
+  binding.startupScheduled = true
+  binding.startupQueued = true
+  const generation = paneProjectionGeneration
+  const timer = setTimeout(() => {
+    if (binding.startupTimer !== timer) return
+    binding.startupTimer = null
+    binding.startupQueued = false
+    if (!binding.active || paneOwningContext !== ctx || binding.generation !== generation
+        || generation !== paneProjectionGeneration || paneNativeOrigin !== origin
+        || origin.sid !== sid || origin.state !== "pending"
+        || !process.env.HERDR_PANE_ID || isWorkerSession()) return
+    binding.startupRunning = true
+    Promise.resolve().then(() => projectPane(sid, ctx)).catch(() => {}).finally(() => {
+      binding.startupRunning = false
+    })
+  }, 0)
+  binding.startupTimer = timer
 }
 
 function collectPreflight(command, args) {
@@ -1221,6 +1260,7 @@ export const AgentHarnessGuards = async (ctx) => {
   // Reuse the process-bound selector; a directory/SDK root cannot pick a recipient.
   if (paneBinding.ownsOrigin && paneNativeOrigin?.sid) {
     await completionCarrier.activate(paneNativeOrigin.sid)
+    scheduleInitialPaneProjection(ctx, paneBinding, paneNativeOrigin.sid)
   }
 
   return ({

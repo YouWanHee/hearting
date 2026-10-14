@@ -1934,8 +1934,13 @@ the first character inside `[id]`, drawn as a dashed `┆` on every row rather t
 a box border. Session detail text and box left edges clear that
 column by two spaces, even without a connector; model, routing, NOW and box
 right-edge anchors stay fixed. The supervisor flag appears once on the first row
-below its ID, in the connector column; subsequent rows use `┆`. A supervisor with
-no visible target keeps only that flag. Resource-waiting owners share a NOW projection across harnesses with
+below its ID, in the connector column; subsequent rows use `┆`. The connector
+continues through the last visible target's first existing detail row, including
+when both cards are short; it does not cover an identity chip or create a blank
+row just to extend the line. Hidden, folded, cross-repository, and other-group
+targets remain unconnected. A supervisor with no visible target keeps only that
+flag. Idle process view remains limited to observed route or process work,
+independently of steward flags. Resource-waiting owners share a NOW projection across harnesses with
 the exact resource's node and command, observed host/GPU, declared counters
 when available, elapsed time and last-log age. Missing observations remain named
 (`대기`, `로그 없음`, or unknown host/GPU), without borrowed session activity or

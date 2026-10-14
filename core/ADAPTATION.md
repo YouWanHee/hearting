@@ -176,6 +176,21 @@ that pane's existing same-harness, same-repository seat history for display only
 another live session keeps its own ID. These aliases grant no report, wake or write
 authority and add no state ledger, user confirmation or caller flag.
 
+For an OpenCode TUI whose own native invocation has one explicit `-s` or
+`--session` selector, the plugin schedules one cancellable next-event-loop-turn
+projection after activating its existing completion carrier. The initializer
+returns without awaiting the SDK. Before calling the existing projection path,
+the timer revalidates the owning directory binding, generation, and same native
+selector; disposal cancels a queued timer, while existing invalidation makes a
+late SDK result non-authoritative. SDK timeout, failure, or an abort-ignoring late
+reply cannot authorize a session report. The explicit resume selector carries
+`resume` provenance to the publisher; a bare TUI selection retains its existing
+startup provenance. An already-running callback keeps the existing busy and
+pending-refresh behavior, and a live publisher keeps its single slot. The one-shot
+timer does not retry when it completes. Other adapters use their native start and
+resume lifecycles while preserving the same publisher, provenance, and receipt
+distinctions.
+
 OpenCode identity and completion helpers resolve a live harness root at invocation
 time if their import-time release has been removed, using the existing core root
 order. They preserve the exact session and inherited dispatch registry across that

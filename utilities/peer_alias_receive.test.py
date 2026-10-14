@@ -674,6 +674,232 @@ function fixture(options = {}) {
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout)
 
+    def run_agent_initializer_fixture(self, body, timeout=10, pane_id=True, worker=False):
+        """Run the actual AgentHarnessGuards initializer with isolated native/runtime edges."""
+        source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text()
+        origin_start = source.index("function ownNativePaneOrigin() {")
+        origin_end = source.index("\n}\n\nlet paneNativeOrigin", origin_start) + 2
+        source = source[:origin_start] + '''function ownNativePaneOrigin() {
+  return {pid: process.pid, start: "77", sid: "ses_A", bare: false,
+    directory: realpathSync(process.cwd()), state: "pending"}
+}''' + source[origin_end:]
+        source = source.replace('import { spawnSync, spawn } from "node:child_process"',
+            "const spawnSync = globalThis.__fixtureSpawnSync; const spawn = globalThis.__fixtureSpawn")
+        source = source.replace("markPluginLoaded(dispatchSlug())", "// fixture: plugin marker disabled")
+        source = source.replace("if (!isWorkerSession()) reconnectPeerObligations()", "if (!isWorkerSession()) {}")
+        source += '''\nexport const __fixturePaneState = () => {
+  const binding = paneOwningContext && paneContexts.get(paneOwningContext)
+  return {originState: paneNativeOrigin?.state, timerQueued: !!binding?.startupQueued,
+    startupRunning: !!binding?.startupRunning, refreshPending: !!binding?.refreshPending,
+    hasPublisher: !!panePublisherSlot, busy: [...paneProjectionBusy.keys()]}
+}\n'''
+        with tempfile.TemporaryDirectory() as tmp:
+            module_path = Path(tmp) / "hearting-guards-fixture.mjs"
+            module_path.write_text(source)
+            js = r'''
+import { pathToFileURL } from "node:url";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
+globalThis.__fixtureTimers = [];
+globalThis.__fixtureChildren = [];
+globalThis.__fixturePublishers = [];
+globalThis.__fixtureSyncCalls = [];
+globalThis.setTimeout = (cb, ms, ...args) => {
+  if (ms === 0) {
+    const timer = {cb, cancelled: false, startupTimer: true};
+    globalThis.__fixtureTimers.push(timer);
+    return timer;
+  }
+  return realSetTimeout(cb, ms, ...args);
+};
+globalThis.clearTimeout = timer => {
+  if (timer?.startupTimer) { timer.cancelled = true; return; }
+  return realClearTimeout(timer);
+};
+globalThis.__fixtureSpawnSync = (exe, args, options) => {
+  globalThis.__fixtureSyncCalls.push({exe, args, options});
+  return {status: 0, stdout: ""};
+};
+globalThis.__fixtureSpawn = (exe, args, options) => {
+  const child = new EventEmitter();
+  child.args = Array.from(args);
+  child.pid = 700 + globalThis.__fixtureChildren.length;
+  child.stdout = new PassThrough();
+  child.stdin = new PassThrough();
+  child.unref = () => {};
+  child.kill = () => { throw Error("fixture must not signal children"); };
+  globalThis.__fixtureChildren.push(child);
+  if (child.args[0].endsWith("herdr_projection.py")) {
+    globalThis.__fixturePublishers.push(child);
+    setImmediate(() => child.emit("spawn"));
+  } else {
+    setImmediate(() => { child.stdout.end("null"); child.emit("close", 0); });
+  }
+  return child;
+};
+const guardModule = await import(pathToFileURL(process.env.FIXTURE_GUARDS).href);
+const {AgentHarnessGuards, __fixturePaneState} = guardModule;
+const settleTurn = () => new Promise(resolve => setImmediate(resolve));
+const fireStartupTimer = index => {
+  const timer = globalThis.__fixtureTimers[index];
+  if (!timer || timer.cancelled) throw Error("startup timer missing or cancelled");
+  timer.cb();
+};
+''' + body
+            env = dict(os.environ)
+            for key in tuple(env):
+                if key.startswith(("AGENT_DISPATCH_", "AGENT_SESSION_", "AGENT_RUNTIME_", "HERDR_")):
+                    env.pop(key, None)
+            env.pop("OPENCODE_DISPATCH_SLUG", None)
+            env.update({"AGENT_HOME": str(ROOT), "AGENT_ARTIFACT_CHECKPOINT": "off",
+                        "FIXTURE_GUARDS": str(module_path)})
+            if pane_id:
+                env["HERDR_PANE_ID"] = "fixture-pane"
+            else:
+                env.pop("HERDR_PANE_ID", None)
+            if worker:
+                env["AGENT_SESSION_ROLE"] = "worker"
+            run = subprocess.run(["node", "--input-type=module", "-e", js], env=env,
+                                 capture_output=True, text=True, timeout=timeout)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(run.stdout)
+
+    def test_opencode_agent_initializer_returns_before_sdk_and_publishes_resume_once(self):
+        result = self.run_agent_initializer_fixture(r'''
+let returned = false, sdkCalls = 0, prompts = 0, logs = [];
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {
+  app: {log: async ({body}) => logs.push(body)}, session: {
+    get: async ({path, signal}) => {
+      sdkCalls++;
+      if (!returned) return await new Promise(() => {});
+      if (path.id !== "ses_A" || !signal) throw Error("wrong exact SDK lookup");
+      return {data: {id: "ses_A", parentID: null}};
+    },
+    promptAsync: async () => { prompts++; throw Error("promptAsync is outside this fixture"); },
+  },
+}};
+const hooks = await Promise.race([AgentHarnessGuards(ctx), new Promise((_, reject) =>
+  realSetTimeout(() => reject(Error("initializer awaited SDK readiness")), 500))]);
+returned = true;
+if (sdkCalls !== 0 || globalThis.__fixtureTimers.length !== 1) throw Error("initializer barrier not respected");
+fireStartupTimer(0);
+await settleTurn(); await settleTurn();
+const args = globalThis.__fixturePublishers.map(child => child.args);
+if (sdkCalls !== 1 || args.length !== 1) throw Error("resume did not publish exactly once");
+if (!args[0].includes("--session-start-source") || !args[0].includes("resume")) throw Error("resume provenance missing");
+const state = __fixturePaneState();
+hooks.dispose();
+globalThis.__fixturePublishers[0].emit("exit", 0);
+globalThis.__fixturePublishers[0].emit("close", 0);
+if (prompts !== 0) throw Error("fixture ran promptAsync");
+console.log(JSON.stringify({sdkCalls, args, state, prompts, logs: logs.map(row => row.extra?.reason)}));
+''')
+        self.assertEqual(result["sdkCalls"], 1)
+        self.assertEqual(len(result["args"]), 1)
+        args = result["args"][0]
+        self.assertEqual(args[args.index("--session-start-source") + 1], "resume")
+        self.assertEqual(result["state"]["originState"], "spent")
+        self.assertTrue(result["state"]["hasPublisher"])  # one child held the live slot
+        self.assertEqual(result["prompts"], 0)
+
+    def test_opencode_startup_and_normal_callbacks_keep_single_flight_and_pending_refresh(self):
+        result = self.run_agent_initializer_fixture(r'''
+let returned = false, sdkCalls = 0, releaseFirst, prompts = 0;
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {
+  app: {log: async () => {}}, session: {
+    get: async ({path}) => {
+      if (path.id !== "ses_A") throw Error("wrong SID");
+      sdkCalls++;
+      if (sdkCalls === 1) return await new Promise(resolve => {releaseFirst = resolve});
+      return {data: {id: "ses_A", parentID: null}};
+    },
+    promptAsync: async () => { prompts++; throw Error("promptAsync must not run"); },
+  },
+}};
+const hooks = await AgentHarnessGuards(ctx); returned = true;
+const callback = () => hooks["chat.message"]({sessionID: "ses_A", messageID: "fixture-turn"},
+  {message: {sessionID: "ses_A", agent: "title"}, parts: []});
+const beforeTimer = callback();
+await settleTurn();
+const duringWait = callback();
+await duringWait;
+fireStartupTimer(0);
+await settleTurn();
+const waiting = __fixturePaneState();
+if (sdkCalls !== 1 || globalThis.__fixturePublishers.length !== 0) throw Error("busy SDK call duplicated");
+releaseFirst({data: {id: "ses_A", parentID: null}});
+await beforeTimer; await settleTurn();
+const firstCount = globalThis.__fixturePublishers.length;
+const whileLive = callback(); await whileLive;
+const liveState = __fixturePaneState();
+const first = globalThis.__fixturePublishers[0];
+first.emit("exit", 0); first.emit("close", 0);
+await callback(); await settleTurn();
+const afterRefresh = __fixturePaneState();
+const args = globalThis.__fixturePublishers.map(child => child.args);
+if (sdkCalls !== 2 || firstCount !== 1 || args.length !== 2) throw Error("normal callback refresh was lost or duplicated");
+if (liveState.refreshPending !== true || afterRefresh.refreshPending !== false) throw Error("pending refresh lifecycle mismatch");
+if (globalThis.__fixturePublishers[1] === first) throw Error("publisher fixture identity reused");
+hooks.dispose();
+globalThis.__fixturePublishers[1].emit("exit", 0);
+globalThis.__fixturePublishers[1].emit("close", 0);
+if (prompts !== 0) throw Error("fixture ran promptAsync");
+console.log(JSON.stringify({sdkCalls, args, waiting, liveState, afterRefresh, prompts}));
+''')
+        self.assertEqual(result["sdkCalls"], 2)
+        self.assertEqual(len(result["args"]), 2)
+        first, second = result["args"]
+        self.assertEqual(first[first.index("--session-start-source") + 1], "resume")
+        self.assertNotIn("--session-start-source", second)
+        self.assertEqual(result["waiting"]["busy"], ["ses_A"])
+        self.assertFalse(result["waiting"]["refreshPending"])
+        self.assertTrue(result["liveState"]["refreshPending"])
+        self.assertFalse(result["afterRefresh"]["refreshPending"])
+        self.assertEqual(result["prompts"], 0)
+
+    def test_opencode_dispose_cancels_the_initializer_startup_timer(self):
+        result = self.run_agent_initializer_fixture(r'''
+let sdkCalls = 0;
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {
+  app: {log: async () => {}}, session: {
+    get: async () => {sdkCalls++; return {data: {id: "ses_A"}};},
+    promptAsync: async () => {throw Error("promptAsync must not run");},
+  },
+}};
+const hooks = await AgentHarnessGuards(ctx);
+const queued = __fixturePaneState();
+hooks.dispose();
+const cancelled = globalThis.__fixtureTimers[0].cancelled;
+if (!cancelled) throw Error("dispose left startup timer armed");
+if (!globalThis.__fixtureTimers[0].cancelled) fireStartupTimer(0);
+await settleTurn();
+console.log(JSON.stringify({queued, cancelled, sdkCalls, publishers: globalThis.__fixturePublishers.length,
+  state: __fixturePaneState()}));
+''')
+        self.assertEqual(result["queued"]["timerQueued"], True)
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(result["sdkCalls"], 0)
+        self.assertEqual(result["publishers"], 0)
+        self.assertEqual(result["state"]["originState"], "invalidated")
+
+    def test_opencode_initializer_does_not_schedule_without_pane_or_for_worker(self):
+        body = r'''
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {
+  app: {log: async () => {}}, session: {promptAsync: async () => {throw Error("unexpected prompt");}},
+}};
+const hooks = await AgentHarnessGuards(ctx);
+const state = __fixturePaneState();
+hooks.dispose();
+console.log(JSON.stringify({timers: globalThis.__fixtureTimers.length, state}));
+'''
+        for label, kwargs in (("no-pane", {"pane_id": False}), ("worker", {"worker": True})):
+            with self.subTest(case=label):
+                result = self.run_agent_initializer_fixture(body, **kwargs)
+                self.assertEqual(result["timers"], 0)
+                self.assertFalse(result["state"]["timerQueued"])
+
     def test_opencode_native_selector_keeps_pure_invocation_and_rejects_mixed_continue(self):
         result = self.run_pane_projection_fixture(r'''
 const f = fixture();
@@ -734,7 +960,7 @@ console.log(JSON.stringify({before, gets, commands: f.commands, unavailable: una
         self.assertEqual(result["before"], [0, 0])
         self.assertEqual(result["gets"], 1)
         self.assertEqual(result["commands"], [["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
-                                              "--seq", "1000001", "--session-start-source", "startup"]])
+                                              "--seq", "1000001", "--session-start-source", "resume"]])
         self.assertEqual(result["unavailable"], [])
         self.assertEqual(result["reads"], ["/proc/self/cmdline", "/proc/self/stat"])
 
@@ -753,7 +979,7 @@ for (const response of [{data: {id: "ses_A"}}, {id: "ses_A", parentID: null},
 console.log(JSON.stringify(commands));
 ''')
         startup = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
-                   "--seq", "1000001", "--session-start-source", "startup"]
+                   "--seq", "1000001", "--session-start-source", "resume"]
         metadata = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
         self.assertEqual(result, [startup, startup] + [metadata] * 6)
 
@@ -776,7 +1002,7 @@ console.log(JSON.stringify({gets, commands: f.commands, sdk}));
         self.assertEqual(result["commands"], [
             ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"],
             ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
-             "--seq", "1000001", "--session-start-source", "startup"]])
+             "--seq", "1000001", "--session-start-source", "resume"]])
         self.assertEqual(result["sdk"], [["sdk-timeout", False], ["verified", True]])
 
     def test_opencode_spent_startup_and_child_slot_survive_reload_and_observer_timeout(self):
@@ -796,7 +1022,7 @@ console.log(JSON.stringify({whileAlive, commands: f.commands,
 ''')
         self.assertEqual(result["whileAlive"], 1)
         prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
-        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
+        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
             prefix + ["--seq", "1000002"], prefix + ["--seq", "1000003"], prefix + ["--no-report-session"]])
         self.assertTrue(result["timeout"])
 
@@ -832,10 +1058,10 @@ await noPid.scope.projectPane("ses_A", other);
 console.log(JSON.stringify({commands: f.commands, noPid: noPid.commands}));
 ''')
         prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
-        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
-            prefix + ["--seq", "1000002", "--session-start-source", "startup"], prefix + ["--seq", "1000003"]])
-        self.assertEqual(result["noPid"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
-            prefix + ["--seq", "1000002", "--session-start-source", "startup"]])
+        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
+            prefix + ["--seq", "1000002", "--session-start-source", "resume"], prefix + ["--seq", "1000003"]])
+        self.assertEqual(result["noPid"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
+            prefix + ["--seq", "1000002", "--session-start-source", "resume"]])
 
     def test_opencode_spawn_error_fallback_uses_same_invocation_once_and_preserves_errno(self):
         result = self.run_pane_projection_fixture(r'''
@@ -853,7 +1079,7 @@ console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs,
  thrown: {commands: thrown.commands, sync: thrown.sync, logs: thrown.logs}}));
 ''')
         prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
-        startup = prefix + ["--seq", "1000001", "--session-start-source", "startup"]
+        startup = prefix + ["--seq", "1000001", "--session-start-source", "resume"]
         refresh = prefix + ["--seq", "1000002"]
         for record in [result, result["thrown"]]:
             self.assertEqual(record["commands"], [startup, refresh])
@@ -947,7 +1173,7 @@ console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs}));
 '''.replace("%%OBSERVATION%%", json.dumps(observation)).replace("%%LIVE%%", str(live))
         result = self.run_pane_projection_fixture(body)
         startup = [helper, "--harness", "opencode", "--session-id", "ses_A",
-                   "--seq", "1000001", "--session-start-source", "startup"]
+                   "--seq", "1000001", "--session-start-source", "resume"]
         refresh = [helper, "--harness", "opencode", "--session-id", "ses_A", "--seq", "1000002"]
         self.assertEqual(result["commands"], [startup, refresh])
         self.assertEqual(len(result["sync"]), 1)
@@ -980,8 +1206,8 @@ console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs}));
 '''.replace("%%LIVE%%", str(live)).replace("%%HELPER%%", helper).replace("%%OTHER%%", str(other))
         result = self.run_pane_projection_fixture(body)
         prefix = [helper, "--harness", "opencode", "--session-id", "ses_A"]
-        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"],
-            prefix + ["--seq", "1000002", "--session-start-source", "startup"]])
+        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
+            prefix + ["--seq", "1000002", "--session-start-source", "resume"]])
         self.assertEqual(len(result["sync"]), 1)
         attempt = result["sync"][0]
         self.assertEqual(attempt["args"], result["commands"][0])

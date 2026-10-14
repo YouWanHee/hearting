@@ -200,6 +200,87 @@ class StewardOrderTest(unittest.TestCase):
         self.assertLess(first, second)
 
 
+class StewardConnectorRowsTest(unittest.TestCase):
+    """Connect visible endpoints through their first existing detail row only."""
+
+    def _session(self, sid, tag, **over):
+        base = dict(harness="codex", pid=1, cwd="/tmp/steward-short-project",
+                    slug=sid, title=sid + " short", session_id=sid, session_tag=tag,
+                    model="gpt-6.1-sol", liveness="idle", elapsed_min=5, ctx_pct=25,
+                    summary=sid + " detail")
+        base.update(over)
+        return Session(**base)
+
+    def _build(self, sessions, width):
+        with mock.patch.object(render, "_PROCESS_VIEW", False):
+            return render._build_lines(sessions, [], "both", False, 0,
+                                       layout=render._layout_mode(width), term_width=width)
+
+    def _row_index(self, lines, marker):
+        return next(i for i, row in enumerate(lines) if row and marker in _text(row))
+
+    def test_short_cards_connect_to_the_last_targets_first_existing_detail_row(self):
+        for width in (60, 100, 120, 150, 168):
+            with self.subTest(width=width):
+                parent = self._session("parent-id", "be", steward=True)
+                first = self._session("first-id", "7a")
+                last = self._session("last-id", "31")
+                targets = [
+                    {"harness": "codex", "session_id": "first-id"},
+                    {"harness": "codex", "session_id": "last-id"},
+                ]
+                parent.steward_targets = None
+                plain = self._build([parent, first, last], width)
+                parent.steward_targets = targets
+                marked = self._build([parent, first, last], width)
+
+                self.assertEqual(len(marked), len(plain))  # no synthetic connector row
+                parent_row = self._row_index(marked, "[be]")
+                first_row = self._row_index(marked, "[7a]")
+                last_row = self._row_index(marked, "[31]")
+                self.assertNotIn("┆", _text(marked[parent_row]))
+                self.assertNotIn("┆", _text(marked[first_row]))
+                self.assertNotIn("┆", _text(marked[last_row]))
+                self.assertIn(("⚑", "tag_steward"), marked[parent_row + 1])
+                for marker in ("[7a]", "[31]"):
+                    marked_target = self._row_index(marked, marker)
+                    plain_target = self._row_index(plain, marker)
+                    before = _text(plain[plain_target + 1])
+                    after = _text(marked[marked_target + 1])
+                    self.assertEqual(after, before[:render._STEWARD_LINE_COL] + "┆"
+                                     + before[render._STEWARD_LINE_COL + 1:])
+                    self.assertIn(("┆", "dim"), marked[marked_target + 1])
+                    self.assertEqual(_text(marked[marked_target + 1])[render._STEWARD_LINE_COL], "┆")
+                self.assertEqual(sum(_text(row).count("⚑") for row in marked if row), 1)
+
+    def test_hidden_cross_group_and_ambiguous_targets_do_not_draw_a_connector(self):
+        cases = []
+
+        hidden_parent = self._session("hidden-parent", "be", steward=True,
+            steward_targets=[{"harness": "codex", "session_id": "hidden-target"}])
+        hidden = self._session("hidden-target", "7a", liveness="stale")
+        cases.append(("hidden", [hidden_parent, hidden]))
+
+        other_group_parent = self._session("other-group-parent", "be", steward=True,
+            steward_targets=[{"harness": "codex", "session_id": "other-group-target"}])
+        other_group = self._session("other-group-target", "7a", cwd="/tmp/another-project")
+        cases.append(("other-group", [other_group_parent, other_group]))
+
+        ambiguous_parent = self._session("ambiguous-parent", "be", steward=True,
+            steward_targets=[{"harness": "codex", "session_id": "old-target"}])
+        alias_a = self._session("target-a", "7a")
+        alias_b = self._session("target-b", "31")
+        alias_a._gpu_session_aliases = ["old-target"]
+        alias_b._gpu_session_aliases = ["old-target"]
+        cases.append(("ambiguous-alias", [ambiguous_parent, alias_a, alias_b]))
+
+        for label, sessions in cases:
+            with self.subTest(case=label):
+                lines = self._build(sessions, 150)
+                self.assertFalse(any("┆" in _text(row) for row in lines if row))
+                self.assertEqual(sum(_text(row).count("⚑") for row in lines if row), 1)
+
+
 class StewardCollectorTest(unittest.TestCase):
     def setUp(self):
         repository = mock.patch.object(steward, "_repository_key", side_effect=lambda cwd: cwd or None)
