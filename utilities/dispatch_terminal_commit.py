@@ -264,9 +264,22 @@ def _commit_state_path(request: TerminalCommitRequest) -> Path:
 
 
 def _record_attempt(request: TerminalCommitRequest, reason: str, detail: str = "") -> None:
+    # One record per distinct refusal. A caller that keeps retrying a settlement
+    # which keeps failing the same way bumps that record's count and last time
+    # instead of adding a file per retry; concurrent writers may drop a count.
     slot = _commit_state_path(request).parent / "attempts"
-    event = hashlib.sha256(f"{time.time_ns()}:{reason}:{detail}".encode()).hexdigest()
-    _atomic_json(slot / f"{event}.json", {"reason": reason, "detail": detail, "event": event})
+    event = hashlib.sha256(f"{reason}:{detail}".encode()).hexdigest()
+    path = slot / f"{event}.json"
+    now = time.time_ns()
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = None
+    previous = previous if isinstance(previous, dict) else {}
+    count, first = previous.get("count"), previous.get("first_ns")
+    _atomic_json(path, {"reason": reason, "detail": detail, "event": event,
+                        "count": (count if isinstance(count, int) and count > 0 else 0) + 1,
+                        "first_ns": first if isinstance(first, int) else now, "last_ns": now})
 
 
 @contextmanager

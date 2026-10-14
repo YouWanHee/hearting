@@ -131,6 +131,21 @@ class ProducerBindingTests(unittest.TestCase):
         with self.assertRaises(T.TerminalCommitError):
             T.producer_binding_path(self.root, "../route", "att-owner")
 
+    def test_a_repeated_refusal_keeps_one_counted_record_instead_of_a_file_per_retry(self):
+        # A settlement retried every few seconds against the same refusal once
+        # left hundreds of thousands of records in one terminal slot.
+        request = T.TerminalCommitRequest(self.route_file, "att-owner", self.jobs, self.root)
+        for _ in range(3):
+            T._record_attempt(request, "producer-finalize-failed", "parent-cycle-not-sealed: " + self.cycle_id)
+        T._record_attempt(request, "recovery-unavailable", "material-primary-required")
+        attempts = T.terminal_slot(self.root, "rt-abcdef12", "att-owner") / "attempts"
+        records = sorted((json.loads(path.read_text(encoding="utf-8")) for path in attempts.iterdir()),
+                         key=lambda record: record["reason"])
+        self.assertEqual([(record["reason"], record["count"]) for record in records],
+                         [("producer-finalize-failed", 3), ("recovery-unavailable", 1)])
+        self.assertLessEqual(records[0]["first_ns"], records[0]["last_ns"])
+        self.assertEqual(records[1]["first_ns"], records[1]["last_ns"])
+
     def test_owner_prerequisites_keep_resource_evidence_and_do_not_invent_a_second_owner(self):
         # SD-154 A-2: `_marker_identity_row`'s own evidence-sha recompute is now
         # `evidence_currency`'s result (single recompute site, A-SD154-8), which
