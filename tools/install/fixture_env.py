@@ -36,6 +36,8 @@ _SCRUB = {
     "MEM_RECALL_RECEIPTS",
     "HEARTING_SAFE_LOCK_ROOT",
     "HEARTING_FIXTURE_ROOT",
+    # A dispatched worker points this at the real runtime home; fixtures must not inherit it.
+    "HEARTING_MODEL_CONFIG_HOME",
 }
 _GIT_CONFIG_KEYS = {"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}
 
@@ -116,8 +118,10 @@ def prepare_environment(env: Mapping[str, str]) -> None:
 
 def shell_exports(env: Mapping[str, str]) -> str:
     keys = sorted(_SCRUB | _GIT_CONFIG_KEYS | {"PYTHONDONTWRITEBYTECODE"})
+    # A scrubbed key the fixture does not set must also leave the calling shell.
     return "\n".join(
-        f"export {key}={shlex.quote(env[key])}" for key in keys if key in env
+        f"export {key}={shlex.quote(env[key])}" if key in env else f"unset {key}"
+        for key in keys
     )
 
 
