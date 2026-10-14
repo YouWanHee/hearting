@@ -56,6 +56,19 @@ class DirectoryBundleTests(unittest.TestCase):
             with self.assertRaises(B.DirectoryBundleError):
                 B.scan_tree(Path(tmp), "artifacts/raw-results/../raw-results")
 
+    def test_scan_and_copy_reject_symlink_ancestor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real"
+            (real / "artifacts" / "raw-results").mkdir(parents=True)
+            (real / "artifacts" / "raw-results" / "x").write_bytes(b"x")
+            alias = root / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            with self.assertRaises(B.DirectoryBundleError):
+                B.scan_tree(alias, "artifacts/raw-results")
+            with self.assertRaises(B.DirectoryBundleError):
+                B.copy_file_streaming(alias / "artifacts" / "raw-results" / "x", root / "copy")
+
     def test_streaming_hash_and_copy_memory_bound(self):
         self.assertEqual(B.CHUNK_BYTES, 1024 * 1024)
         with tempfile.TemporaryDirectory() as tmp:

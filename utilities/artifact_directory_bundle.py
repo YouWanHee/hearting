@@ -45,6 +45,36 @@ def _identity(st: os.stat_result) -> Tuple[int, int, int, int, int]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def _open_directory_chain(path: Path) -> int:
+    """Open every absolute path component without following a symlink."""
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(absolute.anchor or "/", flags)
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_relative_directory(root_fd: int, relative: str) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.dup(root_fd)
+    try:
+        for part in relative.split("/"):
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _canonical(value: Any) -> bytes:
     try:
         return json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -156,28 +186,37 @@ def _hash_fd(fd: int, rel: str) -> Tuple[str, int, Tuple[int, int, int, int, int
 
 
 def scan_tree(cycle_root: Path, directory: str) -> Tree:
-    root = Path(cycle_root).resolve()
+    root = Path(os.path.abspath(cycle_root))
     if not artifact_manifest.validate_locator_path(directory).ok:
         raise DirectoryBundleError("tree-locator-invalid", directory)
-    base = root / directory
+    root_fd = None
     try:
-        if not stat.S_ISDIR(os.lstat(base).st_mode):
-            raise DirectoryBundleError("tree-not-directory", directory)
+        root_fd = _open_directory_chain(root)
+        base_fd = _open_relative_directory(root_fd, directory)
     except OSError as exc:
-        raise DirectoryBundleError("tree-missing", directory, str(exc)) from exc
+        if root_fd is not None:
+            os.close(root_fd)
+        raise DirectoryBundleError("tree-ancestor-unsafe", directory, str(exc)) from exc
+    base_stat = os.fstat(base_fd)
+    if not stat.S_ISDIR(base_stat.st_mode):
+        os.close(base_fd)
+        os.close(root_fd)
+        raise DirectoryBundleError("tree-not-directory", directory)
     leaves: List[Leaf] = []
     dirs: List[Tuple[str, Tuple[int, int, int, int, int]]] = []
     listing: List[Tuple[str, str, Tuple[int, int, int, int, int]]] = []
-    stack = [(base, "")]
-    while stack:
-        current, inner = stack.pop()
-        st = os.lstat(current)
+    stack = [(base_fd, "")]
+    opened_dirs = [base_fd]
+    try:
+      while stack:
+        current_fd, inner = stack.pop()
+        st = os.fstat(current_fd)
         dirs.append((inner, _identity(st)))
         try:
-            with os.scandir(current) as it:
+            with os.scandir(current_fd) as it:
                 entries = sorted(it, key=lambda e: e.name.encode("utf-8"))
         except OSError as exc:
-            raise DirectoryBundleError("tree-read-failed", str(current), str(exc)) from exc
+            raise DirectoryBundleError("tree-read-failed", inner, str(exc)) from exc
         for entry in entries:
             rel_inner = f"{inner}/{entry.name}" if inner else entry.name
             rel = f"{directory}/{rel_inner}"
@@ -191,7 +230,16 @@ def scan_tree(cycle_root: Path, directory: str) -> Tree:
                 if not artifact_manifest.validate_locator_path(rel).ok:
                     raise DirectoryBundleError("tree-locator-invalid", rel)
                 listing.append((rel_inner, "directory", _identity(pre)))
-                stack.append((Path(entry.path), rel_inner))
+                try:
+                    child_fd = os.open(entry.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                                       getattr(os, "O_NOFOLLOW", 0), dir_fd=current_fd)
+                except OSError as exc:
+                    raise DirectoryBundleError("tree-ancestor-unsafe", rel, str(exc)) from exc
+                if _identity(os.fstat(child_fd)) != _identity(pre):
+                    os.close(child_fd)
+                    raise DirectoryBundleError("output-changed-while-reading", rel)
+                opened_dirs.append(child_fd)
+                stack.append((child_fd, rel_inner))
                 continue
             if not stat.S_ISREG(pre.st_mode):
                 raise DirectoryBundleError("tree-non-regular", rel)
@@ -199,7 +247,7 @@ def scan_tree(cycle_root: Path, directory: str) -> Tree:
                 raise DirectoryBundleError("tree-locator-invalid", rel)
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
             try:
-                fd = os.open(entry.path, flags)
+                fd = os.open(entry.name, flags, dir_fd=current_fd)
             except OSError as exc:
                 raise DirectoryBundleError("tree-open-failed", rel, str(exc)) from exc
             try:
@@ -210,13 +258,20 @@ def scan_tree(cycle_root: Path, directory: str) -> Tree:
             finally:
                 os.close(fd)
             try:
-                post = os.lstat(entry.path)
+                post = os.stat(entry.name, dir_fd=current_fd, follow_symlinks=False)
             except OSError as exc:
                 raise DirectoryBundleError("output-changed-while-reading", rel, str(exc)) from exc
             if _identity(post) != fingerprint:
                 raise DirectoryBundleError("output-changed-while-reading", rel)
             leaves.append(Leaf(rel_inner, digest, size, fingerprint))
             listing.append((rel_inner, "file", fingerprint))
+    except BaseException:
+      raise
+    finally:
+      for open_fd in opened_dirs:
+        try: os.close(open_fd)
+        except OSError: pass
+      os.close(root_fd)
     if not leaves:
         raise DirectoryBundleError("tree-empty", directory)
     leaves.sort(key=lambda leaf: leaf.path.encode("utf-8"))
@@ -226,50 +281,72 @@ def scan_tree(cycle_root: Path, directory: str) -> Tree:
             "tree_digest": tree_digest, "digest_algorithm": ALGORITHM}
     descriptor = canonical_descriptor_bytes(body)
     # Final inventory detects additions, removals, replacements, and directory races.
-    check = scan_inventory(base, directory)
+    check = scan_inventory(root, directory)
     if check != tuple(sorted(listing, key=lambda x: x[0].encode("utf-8"))):
         raise DirectoryBundleError("output-changed-while-reading", directory, "tree inventory changed")
     return Tree(directory, tuple(leaves), tuple(dirs), body, descriptor,
                 "sha256:" + hashlib.sha256(descriptor).hexdigest())
 
 
-def scan_inventory(base: Path, directory: str):
+def scan_inventory(cycle_root: Path, directory: str):
     rows = []
-    stack = [(Path(base), "")]
-    while stack:
-        current, inner = stack.pop()
-        try:
-            entries = list(os.scandir(current))
-        except OSError as exc:
-            raise DirectoryBundleError("tree-read-failed", str(current), str(exc)) from exc
-        for entry in entries:
-            rel = f"{inner}/{entry.name}" if inner else entry.name
+    root_fd = _open_directory_chain(cycle_root)
+    base_fd = _open_relative_directory(root_fd, directory)
+    stack = [(base_fd, "")]
+    opened_dirs = [base_fd]
+    try:
+        while stack:
+            current_fd, inner = stack.pop()
             try:
-                st = entry.stat(follow_symlinks=False)
+                entries = list(os.scandir(current_fd))
             except OSError as exc:
-                raise DirectoryBundleError("tree-read-failed", rel, str(exc)) from exc
-            if stat.S_ISDIR(st.st_mode):
-                rows.append((rel, "directory", _identity(st)))
-                stack.append((Path(entry.path), rel))
-            elif stat.S_ISREG(st.st_mode):
-                rows.append((rel, "file", _identity(st)))
-            else:
-                raise DirectoryBundleError("tree-unsafe-entry", f"{directory}/{rel}")
-    return tuple(sorted(rows, key=lambda x: x[0].encode("utf-8")))
+                raise DirectoryBundleError("tree-read-failed", inner, str(exc)) from exc
+            for entry in entries:
+                rel = f"{inner}/{entry.name}" if inner else entry.name
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise DirectoryBundleError("tree-read-failed", rel, str(exc)) from exc
+                if stat.S_ISDIR(st.st_mode):
+                    rows.append((rel, "directory", _identity(st)))
+                    child = os.open(entry.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                                    getattr(os, "O_NOFOLLOW", 0), dir_fd=current_fd)
+                    if _identity(os.fstat(child)) != _identity(st):
+                        os.close(child)
+                        raise DirectoryBundleError("output-changed-while-reading", f"{directory}/{rel}")
+                    opened_dirs.append(child)
+                    stack.append((child, rel))
+                elif stat.S_ISREG(st.st_mode):
+                    rows.append((rel, "file", _identity(st)))
+                else:
+                    raise DirectoryBundleError("tree-unsafe-entry", f"{directory}/{rel}")
+        return tuple(sorted(rows, key=lambda x: x[0].encode("utf-8")))
+    finally:
+        for fd in opened_dirs:
+            try: os.close(fd)
+            except OSError: pass
+        os.close(root_fd)
 
 
 def verify_coverage(cycle_root: Path, descriptor_path: str, row: Mapping[str, Any]) -> Tuple[str, ...]:
     if row.get("media_type") != MEDIA_TYPE:
         raise DirectoryBundleError("bundle-media-type-invalid", descriptor_path)
-    path = Path(cycle_root) / descriptor_path
+    root_fd = _open_directory_chain(Path(cycle_root))
     try:
-        st = os.lstat(path)
+        parent_rel, leaf_name = descriptor_path.rsplit("/", 1)
+        parent_fd = _open_relative_directory(root_fd, parent_rel)
+        st = os.stat(leaf_name, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(st.st_mode):
             raise DirectoryBundleError("bundle-descriptor-not-regular", descriptor_path)
-        with open(path, "rb") as stream:
+        fd = os.open(leaf_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+                     getattr(os, "O_NONBLOCK", 0), dir_fd=parent_fd)
+        with os.fdopen(fd, "rb") as stream:
             data = stream.read()
     except OSError as exc:
         raise DirectoryBundleError("bundle-descriptor-unreadable", descriptor_path, str(exc)) from exc
+    finally:
+        os.close(root_fd)
+        if 'parent_fd' in locals(): os.close(parent_fd)
     digest = "sha256:" + hashlib.sha256(data).hexdigest()
     if st.st_size != row.get("byte_size") or digest != row.get("content_digest"):
         raise DirectoryBundleError("bundle-descriptor-revision-mismatch", descriptor_path)
@@ -285,14 +362,20 @@ def copy_file_streaming(source: Path, destination: Path, *, expected_digest: str
     """Copy one regular payload with bounded reads, no-follow leaf open, and fsync."""
     src = Path(source)
     dst = Path(destination)
+    parent_fd = None
+    fd = None
     try:
-        before_path = os.lstat(src)
+        parent_fd = _open_directory_chain(src.parent)
+        before_path = os.stat(src.name, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(before_path.st_mode):
             raise DirectoryBundleError("tree-non-regular", str(src))
-        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(src.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+                     getattr(os, "O_NONBLOCK", 0), dir_fd=parent_fd)
     except DirectoryBundleError:
+        if parent_fd is not None: os.close(parent_fd)
         raise
     except OSError as exc:
+        if parent_fd is not None: os.close(parent_fd)
         raise DirectoryBundleError("tree-open-failed", str(src), str(exc)) from exc
     digest = hashlib.sha256()
     size = 0
@@ -323,9 +406,12 @@ def copy_file_streaming(source: Path, destination: Path, *, expected_digest: str
             pass
         raise
     finally:
-        os.close(fd)
+        if fd is not None: os.close(fd)
+        if parent_fd is not None: os.close(parent_fd)
     try:
-        after_path = os.lstat(src)
+        check_parent_fd = _open_directory_chain(src.parent)
+        after_path = os.stat(src.name, dir_fd=check_parent_fd, follow_symlinks=False)
+        os.close(check_parent_fd)
     except OSError as exc:
         dst.unlink(missing_ok=True)
         raise DirectoryBundleError("output-changed-while-reading", str(src), str(exc)) from exc
