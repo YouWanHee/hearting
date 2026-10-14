@@ -33,7 +33,7 @@
 ▍    ┆  │           ────────────────   —                                                          │
 ▍    ┆  ╰──────────────────────────────────────────────────────────────────────────── scaffold ───╯
 ▍ ⠋ [bb] codex      bb
-▍       3h 00m      gpt-6.1-sol (medium)     -
+▍    ┆  3h 00m      gpt-6.1-sol (medium)     -
 ▍                   ────────────────   —
 
   session: ⠹ working   ● idle   [id] session   [id] steward   ▾N child jobs   ↳ dispatch
