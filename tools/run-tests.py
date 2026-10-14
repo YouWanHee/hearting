@@ -286,8 +286,9 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     xdg_data = tmpdir / "xdg-data"
     xdg_cache = tmpdir / "xdg-cache"
     runner_tmp = tmpdir / "tmp"
+    tidy_test_isolation = runner_tmp / "tidy-isolation"
     tmux_tmp = tmpdir / "tmux"
-    for d in (home, xdg_state, xdg_data, xdg_cache, runner_tmp, tmux_tmp):
+    for d in (home, xdg_state, xdg_data, xdg_cache, runner_tmp, tidy_test_isolation, tmux_tmp):
         d.mkdir(parents=True, exist_ok=True)
 
     env: dict[str, str] = {}
@@ -313,6 +314,10 @@ def build_isolated_env(tmpdir: Path, repo_root: Path = ROOT) -> dict[str, str]:
     env["XDG_DATA_HOME"] = str(xdg_data)
     env["XDG_CACHE_HOME"] = str(xdg_cache)
     env["TMPDIR"] = str(runner_tmp)
+    # Session-tidy tests create their own nested isolated roots. Keep those
+    # beneath this suite's already-selected and registered temp root so the
+    # tests work when the host's traditional /var/tmp is read-only.
+    env["HEARTING_TIDY_TEST_ISOLATION_BASE"] = str(tidy_test_isolation)
     # tmux picks its socket from TMUX_TMPDIR (default /tmp), not TMPDIR, so a
     # suite that starts tmux would otherwise create sessions on the
     # developer's live default server and fire its plugins. TMUX/TMUX_PANE

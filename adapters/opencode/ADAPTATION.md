@@ -525,6 +525,6 @@ approval defaults. Cross-launch propagation is not implemented by this slice.
 
 ## Runtime compaction tidy
 
-- **Runtime support:** compacting accepts context additions; the successful compacted event identifies a session whose completed assistant summary is readable through the v1 plugin client.
-- **Adapter realization:** shared instructions go into `output.context`; bounded client lookup feeds shared card saving (own pane/native seat only) and memory queueing.
-- **Fallback:** missing matching summary or lookup failure queues memory only for an already identified main session; an unreadable session identity is recorded ledger-only without tidy; a third-party prompt replacement may bypass the instructions. No idle-compaction policy is added.
+- **Runtime support:** compacting accepts context additions; the compacted event exposes the completed assistant summary and a v1 lookup of the matching parent compaction part identifies `auto=true` versus manual.
+- **Adapter realization:** shared instructions go into `output.context`; the compact summary id, parent/retained boundary and existing `session.status`/`session.idle` callbacks feed the shared card and clear helper. Only a successful auto summary card at the exact main pane can book clear. The helper requires a terminal ordinary assistant after its matching user plus native idle after compaction, waits at most three hours, and preserves a bounded recent tail and source DB path.
+- **Fallback:** missing matching part, unknown/manual trigger, missing/empty summary, card-write failure, project/outside-herdr seat, and worker/sub-session never auto-clear; known main sessions still queue memory. An unreadable session identity remains ledger-only. Status observations are limited to the pending compact sid; plugin failure never blocks compaction.

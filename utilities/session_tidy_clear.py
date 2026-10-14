@@ -3,12 +3,15 @@
 
 ``session_tidy.py enqueue`` books one clear of the calling window
 (:func:`schedule_for_enqueue`) and starts this file as a detached helper.  The helper
-waits (one bounded ``herdr agent wait``, at most 600 s) until the window is idle and
-then asks ``peer-steward.py clear`` -- the only code that judges the input box and types
-into the pane.  Nothing waits for the memory tidy: the two run on their own.
+waits (one bounded ``herdr agent wait`` for ordinary tidy, at most 600 s) until the
+window is idle and then asks ``peer-steward.py clear`` -- the only code that judges the
+input box and types into the pane. Compact bookings poll idle in bounded intervals for
+up to 10,800 s and also require read-only transcript evidence that the compacted turn
+ended. Nothing waits for the memory tidy: the two run on their own.
 
 The booking is ``clear/<seat>.json`` (0600, seat lock, atomic write): the exact pane,
-harness, session id, card generation, prompt count, nonce and 600 s deadline.  A newer
+harness, session id, card generation, prompt count, nonce and deadline (600 s for ordinary
+tidy, 10,800 s for eligible automatic compaction). A newer
 tidy replaces it (new nonce); a helper that finds another nonce, or no booking, stops
 without writing anything.  ``enqueue --no-clear`` removes it.
 
@@ -56,6 +59,8 @@ import session_tidy as st  # noqa: E402
 
 SCHEMA = 1
 CLEAR_DEADLINE_SEC = 600.0
+COMPACT_CLEAR_DEADLINE_SEC = 10_800.0
+COMPACT_POLL_SEC = 1.0
 OBSERVE_WAIT_SEC = 20.0
 STEWARD_TIMEOUT_SEC = 180.0
 # The built-in command that starts a fresh conversation in each harness.
@@ -67,6 +72,7 @@ CONTINUE_WINDOW_SEC = 120.0
 REASON_TEXT = {
     "new-input": "새 입력이 있었습니다",
     "timeout": "10분 안에 입력 대기 상태가 되지 않았습니다",
+    "compact-timeout": "압축 뒤 작업이 끝났는지 3시간 안에 확인되지 않았습니다",
     "expired": "예약 시간이 지났습니다",
     "card-changed": "카드가 다시 쓰였습니다",
     "form-open": "선택·확인 창이 열려 있습니다",
@@ -83,6 +89,7 @@ REASON_TEXT = {
     "not-idle-native": "세션이 입력 대기 상태가 아닙니다",
     "partial-send": "명령 입력이 끝났는지 확인하지 못했습니다",
     "arrival-not-observed": "명령이 도착했는지 확인하지 못했습니다",
+    "clear-in-flight": "이미 창 비우기를 전송 중입니다",
 }
 # Continue skips the person caused (or chose) themselves: no result line for these.
 CONTINUE_QUIET = frozenset({"new-input", "draft", "card-changed", "handed-off", "no-card", "superseded", "off"})
@@ -197,7 +204,12 @@ def _start_helper(seat_key: str, nonce: str) -> int:
 
 
 def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, opt_out: bool = False,
-                         no_continue: bool = False, now: Optional[float] = None) -> str:
+                         no_continue: bool = False, now: Optional[float] = None,
+                         compact_context: Optional[dict] = None,
+                         lock_wait: Optional[float] = None,
+                         expected_booking_nonce: Optional[str] = None,
+                         compact_started_at: Optional[float] = None,
+                         inherit_continue_off: bool = False) -> str:
     """Book the clear and start its helper; the ``clear=...`` words ``enqueue`` prints.
 
     ``clear=scheduled``      the window is cleared by itself once it is idle, then continued;
@@ -208,16 +220,67 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
     """
     now = st.now_epoch() if now is None else now
     hint = CLEAR_COMMAND.get(harness, "/clear")
+    compact = None
+    if compact_context is not None:
+        card = st.read_latest_card(seat)
+        metadata = (card or {}).get("compact")
+        author = (card or {}).get("author") or {}
+        if (harness not in ("claude", "opencode") or compact_context.get("trigger") != "auto"
+                or seat.kind not in ("pane", "native") or not metadata
+                or metadata.get("identity") != compact_context.get("identity")
+                or (author.get("harness"), author.get("sid")) != (harness, sid)):
+            return "clear=skipped reason=compact-ineligible"
+        compact = {key: compact_context.get(key) for key in
+                   ("identity", "trigger", "transcript", "transcript_identity", "summary_id", "parent_id",
+                    "tail_start_id", "compaction_part_id", "boundary_offset")
+                   if compact_context.get(key) is not None}
     if opt_out:
         cancel(seat)
         return "clear=off"
     native = seat.kind == "native" and seat.native and harness == "claude"
     if not native and (seat.kind != "pane" or not seat.pane or harness not in CLEAR_COMMAND or herdr_command() is None):
+        if compact:
+            return "clear=skipped reason=outside-herdr"
         cancel(seat)
         return f"clear=manual hint={hint}"
-    with st.seat_lock(seat.key):
+    with st.seat_lock(seat.key, wait=lock_wait):
+        existing = read_reservation(seat.key)
+        if compact and existing and existing.get("status") == "reserved" \
+                and (existing.get("compact") or {}).get("identity") == compact.get("identity"):
+            return "clear=scheduled"
+        if compact and existing and existing.get("status") == "reserved" \
+                and (existing.get("harness"), existing.get("sid")) != (harness, sid):
+            return "clear=skipped reason=booking-target-changed"
+        claim = existing.get("clear_claim") if existing and existing.get("status") == "reserved" \
+            and isinstance(existing.get("clear_claim"), dict) else {}
+        if compact and claim.get("state") == "sending" \
+                and now - float(claim.get("at", 0) or 0) < STEWARD_TIMEOUT_SEC:
+            # One clear is being typed right now; a compaction must not revive it with a new nonce.
+            return "clear=skipped reason=clear-in-flight"
+        if compact and expected_booking_nonce is not None:
+            current_nonce = existing.get("nonce") if existing and existing.get("status") == "reserved" else ""
+            if current_nonce != expected_booking_nonce:
+                return "clear=skipped reason=booking-changed"
+        if compact and compact_started_at is not None and existing \
+                and float(existing.get("created", 0) or 0) > compact_started_at:
+            return "clear=skipped reason=booking-changed"
         card = st.read_latest_card(seat)
+        if compact and (not card or (card.get("compact") or {}).get("identity") != compact.get("identity")):
+            return "clear=skipped reason=card-changed"
         seq = st.read_prompt_seq(seat)
+        inherited = (inherit_continue_off and expected_booking_nonce is not None
+                     and existing and existing.get("nonce") == expected_booking_nonce)
+        if expected_booking_nonce is None:
+            inherited = bool(existing and existing.get("status") == "reserved"
+                             and float(existing.get("deadline", 0) or 0) >= now
+                             and existing.get("harness") == harness and existing.get("sid") == sid
+                             and int(existing.get("prompt_seq", -1)) == seq
+                             and existing.get("continue_off"))
+        inherit_stop = bool(compact and inherited and existing.get("status") == "reserved"
+                            and float(existing.get("deadline", 0) or 0) >= now
+                            and existing.get("harness") == harness and existing.get("sid") == sid
+                            and int(existing.get("prompt_seq", -1)) == seq
+                            and existing.get("continue_off"))
         author = (card or {}).get("author") or {}
         stale = bool(card) and (author.get("harness"), author.get("sid")) == (harness, sid) \
             and card.get("prompt_seq") is not None and int(card["prompt_seq"]) != seq
@@ -225,13 +288,17 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
             _remove_reservation(seat.key)
             return "clear=skipped reason=new-input"
         nonce = secrets.token_hex(8)
-        _write_reservation({
+        duration = COMPACT_CLEAR_DEADLINE_SEC if compact else _tunable("CLEAR_DEADLINE", CLEAR_DEADLINE_SEC)
+        booking = {
             "schema": SCHEMA, "nonce": nonce, "status": "reserved", "created": now,
-            "deadline": now + _tunable("CLEAR_DEADLINE", CLEAR_DEADLINE_SEC),
+            "deadline": now + duration,
             "seat": seat.as_dict(),
             "harness": harness, "sid": sid, "cwd": cwd,
             "card_generation": int(card["generation"]) if card else 0, "prompt_seq": seq,
-            "continue_off": bool(no_continue)})
+            "continue_off": bool(no_continue or inherit_stop)}
+        if compact:
+            booking.update(origin="compact", compact=compact)
+        _write_reservation(booking)
     try:
         pid = _start_helper(seat.key, nonce)
     except (OSError, subprocess.SubprocessError):
@@ -240,12 +307,78 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
             if held and held.get("nonce") == nonce:
                 _remove_reservation(seat.key)
         return f"clear=manual reason=helper-not-started hint={hint}"
-    with st.seat_lock(seat.key):
-        held = read_reservation(seat.key)
-        if held and held.get("nonce") == nonce:
-            held["helper"] = {"pid": pid, "pid_start": _proc_start(pid)}
-            _write_reservation(held)
-    return "clear=scheduled continue=off" if no_continue else "clear=scheduled"
+    try:
+        with st.seat_lock(seat.key, wait=lock_wait):
+            held = read_reservation(seat.key)
+            if held and held.get("nonce") == nonce:
+                held["helper"] = {"pid": pid, "pid_start": _proc_start(pid)}
+                _write_reservation(held)
+    except BaseException:
+        if lock_wait is None:
+            raise
+        # The helper records its own PID as soon as it starts; a busy seat lock
+        # must not make the compact hook exceed its shared time budget.
+    return "clear=scheduled continue=off" if (no_continue or inherit_stop) else "clear=scheduled"
+
+
+def observe_runtime_status(sid: str, status: str, *, observed_at=None, cwd: str = "") -> bool:
+    """Attach OpenCode's native status to the exact pending compact booking for this main sid."""
+    status = str(status or "").lower()
+    if status not in ("idle", "busy", "working", "retry") or not sid:
+        return False
+    import session_tidy as st
+    observed = st.now_epoch() if observed_at is None else float(observed_at)
+    if observed > 10_000_000_000:   # JavaScript Date.now() is milliseconds.
+        observed /= 1000.0
+    try:
+        seat = st.resolve_seat("opencode", cwd or None, sid=sid)
+        with st.seat_lock(seat.key, wait=0.2):
+            req = read_reservation(seat.key)
+            if (not req or req.get("status") != "reserved" or req.get("origin") != "compact"
+                    or req.get("harness") != "opencode" or req.get("sid") != sid
+                    or observed < float(req.get("created", 0) or 0)):
+                return False
+            req["runtime_status"] = {"sid": sid, "status": status, "observed_at": observed}
+            _write_reservation(req)
+            return True
+    except (OSError, ValueError, st.StateError):
+        return False
+
+
+def compact_observation(req: dict) -> dict:
+    """Read the booking's exact compact transcript anchor; unknown evidence never permits clear."""
+    anchor = req.get("compact") if isinstance(req.get("compact"), dict) else {}
+    harness, sid = str(req.get("harness") or ""), str(req.get("sid") or "")
+    source = str(anchor.get("transcript") or "")
+    native_idle = False
+    if harness == "opencode":
+        status = req.get("runtime_status") if isinstance(req.get("runtime_status"), dict) else {}
+        native_idle = (status.get("sid") == sid and status.get("status") == "idle"
+                       and float(status.get("observed_at", 0) or 0) >= float(req.get("created", 0) or 0))
+    try:
+        import tidy_transcripts as transcripts
+        return transcripts.compact_observation(harness, sid, source, anchor, native_idle=native_idle)
+    except BaseException as exc:
+        return {"state": "unknown", "reason": f"compact-reader-{type(exc).__name__}", "source": source}
+
+
+def _refresh_compact_card(req: dict, observation: dict) -> None:
+    """Snapshot current owners and add the tail under the existing seat lock, preserving generation."""
+    import session_tidy as st
+    seat = st.seat_from_dict(req["seat"])
+    identity = str((req.get("compact") or {}).get("identity") or "")
+    try:
+        with st.seat_lock(seat.key):
+            import dispatch_seat_handover as handover
+            handover.write_snapshot_locked(seat, req["harness"], req["sid"])
+            st.update_compact_card_locked(seat, int(req.get("card_generation", 0) or 0), identity,
+                                          recent=str(observation.get("recent") or ""),
+                                          source=str(observation.get("source") or ""),
+                                          recent_partial=bool(observation.get("recent_partial")))
+    except BaseException:
+        # The original complete summary remains authoritative; best-effort enrichment
+        # and the extra snapshot do not turn missing transcript detail into a clear gate.
+        return
 
 
 def note_start_locked(seat: "st.Seat", harness: str, sid: str, now: float) -> None:
@@ -309,7 +442,8 @@ def _unchanged_since_card(req: dict, seat: "st.Seat") -> str:
     return ""
 
 
-def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] = None):
+def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] = None,
+                    require_ready: bool = True, _sending_claim: Optional[dict] = None):
     """``(booking, "")`` when the booking at ``path`` still allows a clear, else ``(None, reason)``.
 
     ``superseded`` (another nonce, no booking, already finished) is the only silent reason;
@@ -323,10 +457,37 @@ def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] 
         return None, reason
     if (nonce and req.get("nonce") != nonce) or req.get("status") != "reserved":
         return None, "superseded"
+    held_claim = req.get("clear_claim") if isinstance(req.get("clear_claim"), dict) else {}
+    claimed = (_sending_claim is not None and held_claim.get("state") == "sending"
+               and held_claim == _sending_claim and req.get("nonce") == _sending_claim.get("nonce"))
+    if held_claim and not claimed:
+        return None, "superseded"
     if now > float(req.get("deadline", 0) or 0):
         return None, "expired"
     reason = _unchanged_since_card(req, seat)
-    return (None, reason) if reason else (req, "")
+    if reason:
+        return None, reason
+    if req.get("origin") == "compact" and require_ready:
+        observation = compact_observation(req)
+        if observation.get("state") != "ready":
+            return None, "compact-unknown" if observation.get("state") == "unknown" else "compact-pending"
+    return req, ""
+
+
+def claim_clear(path, nonce: Optional[str] = None):
+    """Atomically consume the one clear send before the steward/native writer acts."""
+    req, seat, reason = _booking_at(Path(path))
+    if req is None:
+        return None, reason
+    with st.seat_lock(seat.key):
+        req, reason = validate_request(path, nonce)
+        if req is None:
+            return None, reason
+        claim = {"state": "sending", "nonce": req["nonce"], "token": secrets.token_hex(12),
+                 "at": st.now_epoch()}
+        req["clear_claim"] = claim
+        _write_reservation(req)
+        return {**req, "clear_claim": claim}, ""
 
 
 def validate_continue(path, nonce: Optional[str] = None, *, now: Optional[float] = None,
@@ -490,6 +651,10 @@ def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observ
             return False
         now = st.now_epoch()
         req.update(status=outcome, reason=reason, finished=now)
+        claim = req.get("clear_claim")
+        if isinstance(claim, dict) and claim.get("state") == "sending":
+            req["clear_claim"] = {**claim, "state": "sent" if outcome in ("cleared", "unverified") else "finished",
+                                  "outcome": outcome, "finished": now}
         if observed:
             req["new_session"] = observed
         if outcome == "cleared" and not req.get("continue_off"):
@@ -548,8 +713,12 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
                steward: Optional[Callable[[Path, str, str], dict]] = None,
                continuer: Optional[Callable[[Path, str, str], dict]] = None,
                sleep: Callable[[float], None] = time.sleep) -> str:
-    """Wait for idle, ask ``peer-steward.py clear`` once, record the end; after a confirmed clear ask
-    ``peer-steward.py continue`` once.  Returns the outcome word (``continued`` when both happened)."""
+    """Wait for safe readiness, consume one clear send, and continue after a confirmed clear.
+
+    Ordinary tidy keeps its single idle wait. Compact bookings poll in bounded intervals and
+    require transcript completion on final validation. Returns ``continued`` only when both
+    the clear and continue prompt were confirmed.
+    """
     wait = wait or _herdr_wait_idle
     steward = steward or _run_steward
     continuer = continuer or _run_continue
@@ -563,17 +732,53 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
             req["helper"] = helper
             _write_reservation(req)
     pane = str((req.get("seat") or {}).get("pane") or "")
-    remaining = float(req.get("deadline", 0)) - st.now_epoch()
-    if remaining <= 0:
-        return "skipped" if _finish(seat_key, nonce, "skipped", "expired") else "superseded"
-    if (req.get("seat") or {}).get("kind") == "native":
-        from session_tidy_native import wait_idle
-        state = wait_idle(req["seat"].get("native"), req["sid"], int(remaining * 1000))
+    if req.get("origin") == "compact":
+        while True:
+            req, reason = validate_request(path, nonce, require_ready=False)
+            if req is None:
+                if reason == "superseded":
+                    return "superseded"
+                held = read_reservation(seat_key) or {}
+                if reason == "expired" and held.get("origin") == "compact":
+                    reason = "compact-timeout"
+                return "skipped" if _finish(seat_key, nonce, "skipped", reason) else "superseded"
+            remaining = float(req.get("deadline", 0)) - st.now_epoch()
+            if remaining <= 0:
+                return "skipped" if _finish(seat_key, nonce, "skipped", "compact-timeout") else "superseded"
+            timeout_ms = max(1, int(min(COMPACT_POLL_SEC, remaining) * 1000))
+            if (req.get("seat") or {}).get("kind") == "native":
+                from session_tidy_native import wait_idle
+                state = wait_idle(req["seat"].get("native"), req["sid"], timeout_ms)
+            else:
+                state = wait(pane, timeout_ms)
+            if state in ("idle", "done"):
+                observation = compact_observation(req)
+                if observation.get("state") == "ready":
+                    _refresh_compact_card(req, observation)
+                    req, reason = validate_request(path, nonce)
+                    if req is not None:
+                        break
+                    if reason == "superseded":
+                        return "superseded"
+            else:
+                # A transient herdr read failure is retried inside the same absolute deadline.
+                state = "pending"
+            remaining = float((read_reservation(seat_key) or {}).get("deadline", 0)) - st.now_epoch()
+            if remaining <= 0:
+                return "skipped" if _finish(seat_key, nonce, "skipped", "compact-timeout") else "superseded"
+            sleep(min(COMPACT_POLL_SEC, remaining))
     else:
-        state = wait(pane, int(remaining * 1000))
-    if state not in ("idle", "done"):
-        reason = "timeout" if state.startswith(("timeout", "state-")) else state
-        return "skipped" if _finish(seat_key, nonce, "skipped", reason) else "superseded"
+        remaining = float(req.get("deadline", 0)) - st.now_epoch()
+        if remaining <= 0:
+            return "skipped" if _finish(seat_key, nonce, "skipped", "expired") else "superseded"
+        if (req.get("seat") or {}).get("kind") == "native":
+            from session_tidy_native import wait_idle
+            state = wait_idle(req["seat"].get("native"), req["sid"], int(remaining * 1000))
+        else:
+            state = wait(pane, int(remaining * 1000))
+        if state not in ("idle", "done"):
+            reason = "timeout" if state.startswith(("timeout", "state-")) else state
+            return "skipped" if _finish(seat_key, nonce, "skipped", reason) else "superseded"
     req, reason = validate_request(path, nonce)
     if req is None:
         if reason == "superseded":

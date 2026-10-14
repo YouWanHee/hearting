@@ -277,6 +277,9 @@ def command(req, request_path, nonce, *, continuing, screen_ready):
             if continuing:
                 claim, why = clear.claim_continue(request_path, nonce)
                 if claim is None: return result("skipped", why)
+            else:
+                claim, why = clear.claim_clear(request_path, nonce)
+                if claim is None: return result("skipped", why)
             # Re-read the same terminal after the booking/claim checks. A draft
             # arriving during those checks must not be cleared or submitted.
             lines = view.read(timeout=1)
@@ -290,7 +293,8 @@ def command(req, request_path, nonce, *, continuing, screen_ready):
             if continuing:
                 current, why = clear.validate_continue(request_path, nonce, _sending_claim=claim)
             else:
-                current, why = clear.validate_request(request_path, nonce)
+                current, why = clear.validate_request(request_path, nonce,
+                                                     _sending_claim=claim.get("clear_claim"))
             if current is None:
                 if continuing: clear.release_unsent_continue(claim)
                 return result("skipped", why)

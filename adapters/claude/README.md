@@ -199,4 +199,4 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Runtime compaction tidy
 
-`PreCompact` supplies shared six-field summary instructions. `PostCompact` queues main-session memory tidy and saves a nonempty `compact_summary` as the seat card at the session's own pane/native seat (a shared project seat queues the tidy only). Workers are skipped, and compaction is never held for tidy.
+`PreCompact` supplies shared six-field summary instructions. `PostCompact` queues main-session memory tidy and saves a nonempty `compact_summary` as the card at the session's own verified pane/native seat. Only an explicit automatic trigger with both card files successfully saved can book the existing handover snapshot → clear → `이어서해` flow. Its helper waits up to three hours for transcript evidence that the compacted turn ended; idle alone does not clear. Before clearing, it preserves the full summary, a bounded recent tail, and the transcript path on the card. Manual/unknown compaction, empty or failed cards, project/outside-herdr seats, and workers/sub-sessions stay queue-only; compaction is never held for tidy.

@@ -465,4 +465,4 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Runtime compaction tidy
 
-The existing `PostCompact` queues main-session memory tidy through the shared hook with no stdout. Codex exposes no plaintext completed summary or summary-instruction override, so automatic seat-card saving and six-field instructions are unavailable. Workers are skipped.
+The existing `PostCompact` remains queue-only for Codex's OpenAI remote-V2 compaction: hooks receive no plaintext summary or summary-instruction override, so automatic card saving and clear are unavailable. This does not change Codex's existing explicit manual tidy clear/continue flow. Workers are skipped.

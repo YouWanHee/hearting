@@ -3673,6 +3673,40 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(prompts, [["herdr", "agent", "prompt", "w1:pX", "/clear"]])   # no trailer, no wait
         self.assertEqual([c for c in world.calls if c[:3] == ["herdr", "agent", "send-keys"]], [])
 
+    def test_a_compact_booking_types_only_after_the_turn_ended_and_only_once(self):
+        st, clear = self.st, self.clear
+        transcript = self.tmp_root / "sid-A.jsonl"
+        transcript.write_text(json.dumps({"type": "user", "uuid": "u-tool", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}) + "\n", encoding="utf-8")
+        info = transcript.stat()
+        context = {"trigger": "auto", "identity": "steward-compact", "transcript": str(transcript),
+                   "boundary_offset": info.st_size, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        seat = st.Seat("pane", st._digest("pane", "w1:pX"), "w1:pX", "claude", "")
+        now = time.time()
+        with st.seat_lock(seat.key):
+            card = st.write_card(seat, "claude", "sid-A", "summary", prompt_seq=0, origin="runtime-compact",
+                                 compact_context=context)
+            clear._write_reservation({
+                "schema": 1, "nonce": "n0nce", "status": "reserved", "created": now, "deadline": now + 600,
+                "seat": {"kind": "pane", "key": seat.key, "pane": "w1:pX", "harness": "claude", "project_key": ""},
+                "harness": "claude", "sid": "sid-A", "cwd": str(self.tmp_root), "origin": "compact",
+                "compact": {**context}, "card_generation": card["generation"], "prompt_seq": 0})
+        self.path = clear.reservation_path(seat.key)
+        world = _ClearWorld(screens=[CLAUDE_EMPTY])
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 3, line)
+        self.assertIn("reason=compact-pending", line)
+        self.assertEqual(world.typed(), [])
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "assistant", "uuid": "a-end", "message": {
+                "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}}) + "\n")
+        rc, line = self.clear_cmd(world)
+        self.assertEqual(rc, 0, line)
+        self.assertEqual(len(world.typed()), 1)
+        rc, line = self.clear_cmd(world)            # the claim was consumed: nothing is typed again
+        self.assertEqual(rc, 3, line)
+        self.assertEqual(len(world.typed()), 1)
+
     def test_a_claude_suggestion_is_an_empty_box_but_typed_text_is_not(self):
         for screen, expect in ((CLAUDE_SUGGESTION, "cleared=true"), (CLAUDE_DRAFT, "reason=draft"),
                                (CLAUDE_DRAFT_SECOND_LINE, "reason=draft")):

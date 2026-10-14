@@ -45,6 +45,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 import time
 from typing import Iterator, Optional
@@ -63,6 +64,8 @@ import session_summary_trigger as _sst  # noqa: E402
 HARNESSES = session_tidy.HARNESSES
 DEFAULT_CHUNK_BYTES = 256 * 1024
 MAX_ROW_BYTES = 8 * 1024 * 1024
+COMPACT_SCAN_BYTES = 1024 * 1024
+COMPACT_RECENT_BYTES = 8 * 1024
 RECENT_DAYS = 3
 MAX_DISCOVER_FILES = 300
 HEAD_SCAN_BYTES = 64 * 1024
@@ -167,6 +170,251 @@ def locate_transcript(harness: str, sid: str, hint: Optional[str] = None) -> Opt
         db = opencode_db_path()
         return db if db.is_file() else None
     return None
+
+
+def _compact_text(row: dict, harness: str) -> str:
+    """Dialogue text only; tool payloads never become card context."""
+    if harness == "claude":
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [content]
+        values = [block.get("text", "") for block in blocks
+                  if isinstance(block, dict) and block.get("type") == "text"]
+        if isinstance(content, str):
+            values = [content]
+        return "\n".join(v for v in values if isinstance(v, str)).strip()
+    return ""
+
+
+def _claude_compact_observation(sid: str, source: Path, anchor: dict) -> dict:
+    """Read only a bounded tail of one exact Claude transcript; no watermark is consulted."""
+    if source.name != f"{sid}.jsonl":
+        return {"state": "unknown", "reason": "transcript-session-mismatch", "source": str(source)}
+    try:
+        info = source.lstat()
+        if not stat.S_ISREG(info.st_mode) or source.is_symlink():
+            return {"state": "unknown", "reason": "transcript-not-regular", "source": str(source)}
+        expected_identity = str(anchor.get("transcript_identity") or "")
+        if expected_identity and expected_identity != f"{info.st_dev}:{info.st_ino}":
+            return {"state": "unknown", "reason": "transcript-identity-changed", "source": str(source)}
+        size = info.st_size
+        boundary = anchor.get("boundary_offset")
+        if isinstance(boundary, bool) or not isinstance(boundary, int) or boundary < 0 or boundary > size:
+            return {"state": "unknown", "reason": "compact-boundary-unknown", "source": str(source)}
+        start = max(0, size - COMPACT_SCAN_BYTES)
+        with source.open("rb") as handle:
+            handle.seek(start)
+            if start:
+                handle.readline()       # the first row may start before the bounded window
+                start = handle.tell()
+            raw = handle.read()
+    except OSError as exc:
+        return {"state": "unknown", "reason": f"transcript-read-{type(exc).__name__}", "source": str(source)}
+    if raw and not raw.endswith(b"\n"):
+        tail = raw.rsplit(b"\n", 1)[-1]
+        try:
+            json.loads(tail)
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return {"state": "unknown", "reason": "partial-latest-row", "source": str(source)}
+    rows, offset = [], start
+    for line in raw.splitlines(keepends=True):
+        payload = line.rstrip(b"\r\n")
+        if not payload:
+            offset += len(line)
+            continue
+        try:
+            row = json.loads(payload)
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return {"state": "unknown", "reason": "malformed-transcript-row", "source": str(source)}
+        if not isinstance(row, dict):
+            return {"state": "unknown", "reason": "malformed-transcript-row", "source": str(source)}
+        rows.append((offset, row))
+        offset += len(line)
+    main_rows = [(pos, row) for pos, row in rows
+                 if row.get("type") in ("user", "assistant")
+                 and row.get("isSidechain") is not True and row.get("isMeta") is not True
+                 and row.get("isCompactSummary") is not True]
+    if not main_rows:
+        return {"state": "unknown", "reason": "no-main-transcript-row", "source": str(source)}
+    _last_pos, latest = main_rows[-1]
+    message = latest.get("message") if isinstance(latest.get("message"), dict) else {}
+    terminal = latest.get("type") == "assistant" and message.get("stop_reason") == "end_turn"
+    # If the exact boundary has fallen before this scan window, only the latest
+    # terminal row remains provable; the omitted earlier tail is reported as partial.
+    partial = start > boundary
+    recent_rows, seen_uuids = [], set()
+    def add_recent(pos, row):
+        uid = str(row.get("uuid") or f"offset:{pos}")
+        if uid in seen_uuids:
+            return
+        seen_uuids.add(uid)
+        text = _compact_text(row, "claude")
+        if text:
+            recent_rows.append(f"[{row['type']}] {text}")
+    preserved = None
+    for _pos, row in reversed(rows):
+        metadata = row.get("compactMetadata")
+        segment = metadata.get("preservedSegment") if isinstance(metadata, dict) else None
+        if row.get("isCompactSummary") is True and isinstance(segment, dict):
+            preserved = segment
+            break
+    if preserved is None:
+        partial = True
+    if isinstance(preserved, dict):
+        start_uuid = preserved.get("startUuid") or preserved.get("start_uuid")
+        end_uuid = preserved.get("endUuid") or preserved.get("end_uuid")
+        by_uuid = {str(row.get("uuid")): (pos, row) for pos, row in rows if row.get("uuid")}
+        if start_uuid and end_uuid and start_uuid in by_uuid and end_uuid in by_uuid:
+            lo = by_uuid[start_uuid][0]
+            hi = by_uuid[end_uuid][0]
+            def on_lineage(uid):
+                seen = set()
+                current = str(uid)
+                for _ in range(256):
+                    if current == str(start_uuid):
+                        return True
+                    if current in seen or current not in by_uuid:
+                        return False
+                    seen.add(current)
+                    current = str(by_uuid[current][1].get("parentUuid") or "")
+                    if not current:
+                        return False
+                return False
+
+            if lo <= hi and on_lineage(end_uuid):
+                for pos, row in main_rows:
+                    if lo <= pos <= hi and on_lineage(row.get("uuid") or ""):
+                        add_recent(pos, row)
+            else:
+                partial = True
+        else:
+            partial = True
+    for pos, row in main_rows:
+        if pos < boundary:
+            continue
+        add_recent(pos, row)
+    recent = "\n".join(recent_rows)
+    recent = recent.encode("utf-8")[-COMPACT_RECENT_BYTES:].decode("utf-8", "ignore")
+    return {"state": "ready" if terminal else "pending", "reason": "" if terminal else "turn-not-ended",
+            "source": str(source), "boundary": boundary, "recent": recent,
+            "recent_partial": bool(partial or not recent_rows), "latest_type": latest.get("type"),
+            "latest_stop_reason": message.get("stop_reason")}
+
+
+def _decode_json(value):
+    try:
+        return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+
+
+def _opencode_compact_observation(sid: str, source: Path, anchor: dict, *, native_idle: bool) -> dict:
+    """Validate summary/compaction lineage and the latest completed main turn in one RO view."""
+    summary_id = str(anchor.get("summary_id") or "")
+    parent_id = str(anchor.get("parent_id") or "")
+    tail_start_id = str(anchor.get("tail_start_id") or "")
+    if not summary_id or not parent_id:
+        return {"state": "unknown", "reason": "compact-anchor-missing", "source": str(source)}
+    try:
+        with _opencode_view(source) as con:
+            message_rows = con.execute(
+                "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT 64", (sid,)
+            ).fetchall()
+            messages = []
+            for message_id, raw in reversed(message_rows):
+                info = _decode_json(raw)
+                if not isinstance(info, dict):
+                    return {"state": "unknown", "reason": "malformed-opencode-message", "source": str(source)}
+                parts_raw = con.execute("SELECT id, data FROM part WHERE session_id = ? AND message_id = ? ORDER BY rowid",
+                                        (sid, message_id)).fetchall()
+                parts = []
+                for part_id, data in parts_raw:
+                    part = _decode_json(data)
+                    if not isinstance(part, dict):
+                        return {"state": "unknown", "reason": "malformed-opencode-part", "source": str(source)}
+                    part.setdefault("id", part_id)
+                    parts.append(part)
+                messages.append({"id": str(message_id), "info": info, "parts": parts})
+    except (OSError, sqlite3.Error) as exc:
+        return {"state": "unknown", "reason": f"opencode-read-{type(exc).__name__}", "source": str(source)}
+
+    by_id = {row["id"]: row for row in messages}
+    summary = by_id.get(summary_id)
+    parent = by_id.get(parent_id)
+    if not summary or not parent:
+        return {"state": "unknown", "reason": "compact-anchor-not-found", "source": str(source)}
+    info = summary["info"]
+    if info.get("role") != "assistant" or info.get("summary") is not True or str(info.get("parentID") or "") != parent_id:
+        return {"state": "unknown", "reason": "summary-parent-mismatch", "source": str(source)}
+    compact_parts = [part for part in parent["parts"] if part.get("type") == "compaction"]
+    part_anchor = str(anchor.get("compaction_part_id") or "")
+    matching = [part for part in compact_parts
+                if not part_anchor or str(part.get("id") or "") == part_anchor]
+    if not any(part.get("auto") is True or (isinstance(part.get("data"), dict)
+                                             and part["data"].get("auto") is True) for part in matching):
+        return {"state": "unknown", "reason": "automatic-compaction-part-not-found", "source": str(source)}
+
+    summary_index = messages.index(summary)
+    start_index = summary_index
+    tail_found = not tail_start_id
+    if tail_start_id:
+        for index, row in enumerate(messages):
+            if row["id"] == tail_start_id:
+                start_index, tail_found = index, True
+                break
+        if not tail_found and any(str(part.get("id") or "") == tail_start_id for part in matching):
+            start_index, tail_found = messages.index(parent), True
+        if not tail_found:
+            # Preserve only the provable post-summary tail if the runtime's retained
+            # boundary is absent from this bounded view.
+            start_index = summary_index
+    after = messages[summary_index + 1:]
+    ordinary = [row for row in after if row["info"].get("summary") is not True]
+    latest_user = next((row for row in reversed(ordinary) if row["info"].get("role") == "user"), None)
+    latest_assistant = next((row for row in reversed(ordinary) if row["info"].get("role") == "assistant"), None)
+    if (not native_idle or not latest_user or not latest_assistant
+            or latest_user["info"].get("synthetic") is True
+            or any(part.get("synthetic") is True for part in latest_user["parts"])
+            or latest_assistant["info"].get("synthetic") is True
+            or any(part.get("synthetic") is True for part in latest_assistant["parts"])
+            or str(latest_assistant["info"].get("parentID") or "") != latest_user["id"]):
+        ready = False
+    else:
+        finish = str(latest_assistant["info"].get("finish") or "")
+        pending_tools = any(part.get("type") == "tool" and
+                            (part.get("state") or {}).get("status") in ("pending", "running")
+                            for part in latest_assistant["parts"])
+        ready = bool(finish in ("stop", "end_turn", "complete")
+                     and not latest_assistant["info"].get("error")
+                     and not latest_assistant["info"].get("toolCalls") and not pending_tools)
+    recent_rows = []
+    for row in messages[start_index:]:
+        if row["id"] != summary_id and row["info"].get("summary") is not True \
+                and row["info"].get("synthetic") is not True:
+            role = row["info"].get("role")
+            if role in ("user", "assistant"):
+                for part in row["parts"]:
+                    if part.get("type") == "text" and not part.get("synthetic") and isinstance(part.get("text"), str):
+                        recent_rows.append(f"[{role}] {part['text']}")
+    recent = "\n".join(recent_rows)
+    recent = recent.encode("utf-8")[-COMPACT_RECENT_BYTES:].decode("utf-8", "ignore")
+    return {"state": "ready" if ready else "pending", "reason": "" if ready else "turn-or-idle-not-confirmed",
+            "source": str(source), "recent": recent, "recent_partial": not tail_found,
+            "latest_assistant": latest_assistant["id"] if latest_assistant else "",
+            "latest_finish": (latest_assistant or {}).get("info", {}).get("finish", "")}
+
+
+def compact_observation(harness: str, sid: str, source_hint: str, anchor: dict,
+                        *, native_idle: bool = False) -> dict:
+    """Read-only compact evidence and a bounded conversation tail; never changes tidy watermarks."""
+    source = locate_transcript(harness, sid, source_hint or None)
+    if source is None:
+        return {"state": "unknown", "reason": "transcript-not-found", "source": source_hint or ""}
+    if harness == "claude":
+        return _claude_compact_observation(sid, source, anchor)
+    if harness == "opencode":
+        return _opencode_compact_observation(sid, source, anchor, native_idle=native_idle)
+    return {"state": "unknown", "reason": "unsupported-harness", "source": str(source)}
 
 
 # ---------------------------------------------------------------------------

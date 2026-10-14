@@ -740,5 +740,5 @@ Session and prompt bridges retain `hookSpecificOutput.additionalContext` for opt
 ## Runtime compaction tidy
 
 - **Runtime support:** PreCompact/PostCompact run, but OpenAI remote V2 exposes no plaintext summary or compact-prompt override through them.
-- **Adapter realization:** main PostCompact queues memory tidying through the shared hook, with no stdout.
-- **Fallback:** six-field compaction summaries and automatic summary-card saving are unavailable; ordinary explicit session-tidy cards remain available, without switching providers or forcing local compaction.
+- **Adapter realization:** main PostCompact remains queue-only for automatic compaction, with no stdout and no automatic card/clear booking. Codex's existing explicit manual tidy keeps its current snapshot/clear/continue behavior.
+- **Fallback:** six-field automatic summaries and automatic summary-card saving are unavailable. No provider switch, local compaction, user setting, or manual approval is introduced.

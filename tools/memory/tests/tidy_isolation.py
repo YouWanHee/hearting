@@ -5,8 +5,11 @@ run started straight from a developer's shell (not only through
 ``tools/run-tests.py --isolation isolated``) can never reach the real memory
 store, the real runtime state, the real remote setting, or the real herdr pane.
 
-The isolated root lives under ``/var/tmp`` (``/tmp`` is refused: this server has a
-stray ``/tmp/.git`` that would turn a fixture repository into a nested one).
+Direct test runs default to ``/var/tmp`` (``/tmp`` is refused because it may
+contain a parent Git worktree). The repository runner can provide
+``HEARTING_TIDY_TEST_ISOLATION_BASE`` beneath its own already-validated suite
+temporary root; that root is removed with the suite and also works when
+``/var/tmp`` is mounted read-only.
 
 Two ways to use it:
 
@@ -35,7 +38,8 @@ import sys
 import tempfile
 from typing import Iterator, Mapping, Optional
 
-ISOLATION_BASE = Path("/var/tmp")
+ISOLATION_BASE = Path(os.environ.get("HEARTING_TIDY_TEST_ISOLATION_BASE") or "/var/tmp")
+RUNNER_ISOLATION_BASE = bool(os.environ.get("HEARTING_TIDY_TEST_ISOLATION_BASE"))
 
 # Captured before anything patches the environment, from the passwd database
 # (not from $HOME, which a runner may already have replaced).
@@ -218,7 +222,7 @@ class IsolatedEnv:
         """Static checks on the root itself: location and the remote-off marker."""
         if not _under(self.root, ISOLATION_BASE.resolve()):
             raise IsolationError(f"{self.root} is not under {ISOLATION_BASE}")
-        if _under(self.root, Path("/tmp")):
+        if not RUNNER_ISOLATION_BASE and _under(self.root, Path("/tmp")):
             raise IsolationError("/tmp is refused for isolation roots")
         setting = self.xdg_config / "hearting" / "memory-sync.json"
         if json.loads(setting.read_text(encoding="utf-8")) != {"enabled": False}:

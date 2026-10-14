@@ -19,11 +19,15 @@ Write the handoff card yourself, queue the memory tidy, and let the window clear
 when it is safe; the new session then picks the work up from the card by itself. Nothing
 here is required input and nothing waits for a confirmation.
 
-Runtime compaction already queues memory tidying for the main session and saves its
-completed summary as the seat card when that runtime provides it and the session has
-its own seat (pane or native; a shared project seat only queues the tidy). Do not enqueue a
-duplicate tidy for the same compaction; invoke this Skill when you need a separate
-handoff or tidy.
+Runtime compaction queues memory tidying for the main session. Only a nonempty automatic
+Claude/OpenCode summary successfully saved to its own verified herdr pane/native seat can
+use the existing handover snapshot → clear → `이어서해` flow. The helper waits up to three
+hours for transcript evidence that the compacted turn actually ended; idle alone is not
+enough. The card keeps the full summary, a bounded recent conversation tail and the source
+transcript path. Manual/unknown compaction, empty or failed cards, project/outside-herdr
+seats, workers/sub-sessions, and Codex remote-V2 compaction never auto-clear. Codex remains
+queue-only for automatic compaction; its existing manual tidy behavior is unchanged. Do not
+enqueue a duplicate tidy for the same compaction; invoke this Skill for separate work.
 
 Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 <받을 세션>` (same
 work, then pass the card to a peer session; only this calling window is cleared, never the

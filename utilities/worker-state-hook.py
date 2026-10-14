@@ -56,9 +56,11 @@ def _main_compact(action: str, harness: str, payload: dict) -> int:
             or env.get("MEM_DISTILL") == "1" or any(k.startswith("OPENCODE_DISPATCH") and v for k, v in env.items()):
         return 0
     root = Path(os.environ.get("AGENT_HOME") or Path(__file__).resolve().parents[1])
+    runtime_status = action == "runtime-status"
     command = [sys.executable, str(root / "utilities/session_tidy.py"), "hook",
-               "--harness", harness, "--event", "compact", "--phase",
-               "before" if action == "compact-before" else "after"]
+               "--harness", harness, "--event", "runtime-status" if runtime_status else "compact"]
+    if not runtime_status:
+        command.extend(("--phase", "before" if action == "compact-before" else "after"))
     sid = payload.get("session_id") or payload.get("sessionID") or payload.get("sessionId")
     cwd = payload.get("cwd")
     transcript = payload.get("transcript_path") or payload.get("transcriptPath")
@@ -69,24 +71,41 @@ def _main_compact(action: str, harness: str, payload: dict) -> int:
     if isinstance(transcript, str) and transcript:
         command.extend(("--transcript", transcript))
     compact_summary = payload.get("compact_summary") or payload.get("compactSummary") or payload.get("summary") or ""
+    compact_context = {}
+    for key in ("trigger", "summary_id", "parent_id", "tail_start_id", "compaction_part_id", "status", "observed_at"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            compact_context[key] = value
+    if isinstance(transcript, str) and transcript:
+        compact_context["transcript"] = transcript
     try:
-        result = subprocess.run(command, input=json.dumps({"summary": compact_summary}), text=True,
+        body = compact_context if runtime_status else {"summary": compact_summary, **compact_context}
+        result = subprocess.run(command, input=json.dumps(body), text=True,
                                 capture_output=True, check=False, timeout=4, env=env)
     except (OSError, subprocess.SubprocessError):
         return 0
     if result.returncode == 0 and action == "compact-before" and harness in ("claude", "opencode"):
         sys.stdout.write(result.stdout or "")
         sys.stdout.flush()
+    elif result.returncode == 0 and action == "compact-after" \
+            and (result.stdout or "").strip() == "booking=scheduled":
+        # Internal OpenCode plugin signal only; the Claude hook wrapper discards after output.
+        sys.stdout.write("booking=scheduled\n")
+    elif result.returncode == 0 and action == "runtime-status" \
+            and (result.stdout or "").strip() == "booking=pending":
+        sys.stdout.write("booking=pending\n")
     return 0
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("compact-before", "compact-after"))
+    p.add_argument("action", choices=("compact-before", "compact-after", "runtime-status"))
     p.add_argument("--harness", choices=("claude", "codex", "opencode"))
     args = p.parse_args()
     # Keep the declared sub-session ledger branch first and fail-closed exactly as before.
     if _active():
+        if args.action == "runtime-status":
+            return 0
         try:
             result = _run(args.action)
             if result.returncode:
