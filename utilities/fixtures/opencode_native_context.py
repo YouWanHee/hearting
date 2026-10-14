@@ -21,4 +21,13 @@ def launch_context(**values):
         "configured_limits": {"context": None, "input": None, "output": None},
         "native_limits": dict(native), "applied_limits": applied,
         "final_limits": dict(applied),
+        # The substitute has no installed OpenCode to verify, so its policy stays unknown.
+        "compaction_policy": {
+            "state": "unknown", "enabled": None, "trigger_tokens": None,
+            "context_tokens": applied.get("context"), "input_tokens": applied.get("input"),
+            "output_allowance_tokens": applied.get("output"),
+            "configured_reserve_tokens": None, "effective_reserve_tokens": None,
+            "source": "fixture", "reason": "native-consumer-version-unverified",
+        },
+        "runtime_version": None,
     }
