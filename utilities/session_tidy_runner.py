@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import dataclasses
 import datetime
 import fcntl
 import hashlib
@@ -222,7 +223,7 @@ def _card_seat(item: dict) -> "st.Seat":
     """Restore the project author's card identity, including for older queue rows."""
     seat = st.Seat(**item["seat"])
     if seat.kind == "project":
-        return st.dataclasses.replace(seat, harness=item.get("harness") or seat.harness,
+        return dataclasses.replace(seat, harness=item.get("harness") or seat.harness,
                                        sid=item.get("sid") or seat.sid)
     return seat
 
@@ -232,7 +233,7 @@ def _card_seat(item: dict) -> "st.Seat":
 # ---------------------------------------------------------------------------
 
 def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: str = "") -> dict:
-    queue_seat = st.dataclasses.replace(seat, harness=harness, sid=sid) if seat.kind == "project" else seat
+    queue_seat = dataclasses.replace(seat, harness=harness, sid=sid) if seat.kind == "project" else seat
     item = {"schema": SCHEMA, "id": new_id(), "created": _now(), "status": "queued", "updated": _now(),
             "seat": queue_seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd, "transcript": transcript,
             "attempts": 0}

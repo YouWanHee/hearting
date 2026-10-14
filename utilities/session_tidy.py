@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """session-tidy: seat state, session cards, session ledger, result notices, hook text.
 
-Project seats remain shared for ledger, notices, locks and prompt sequence. Their cards
-use author-specific card keys selected by ``project-latest/<seat>.json``; history and
-consumption receipts follow that card key. Pane and native cards keep their seat key.
-
 One entry point for the parts of ``session-tidy`` that a session touches directly:
 
     session_tidy.py card [--harness H] [--session-id S] [--cwd D] [--file F | --text T]
@@ -32,10 +28,11 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
 State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 (directories 0700, files 0600, temp file + rename, symlinks refused):
 
-    cards/<seat>.json|.md   latest card (canonical JSON + readable text)
-    card-history/<seat>/    bounded older cards
+    cards/<card>.json|.md latest card (canonical JSON + readable text)
+    card-history/<card>/   bounded older cards
+    consumed/<card>.json   receipts by card key: pane/native use the seat key; project seats use the author session
+    project-latest/<seat>.json  newest project-seat card's author
     sessions/<seat>.jsonl   seat ledger: one line per hook/card event
-    consumed/<seat>.json    who already received the latest card generation (+ the "참고할 기억" revision)
     reread/<harness>-<sid>  the injection a session just consumed (OpenCode re-emits)
     notices/<seat>.json     result lines waiting for the next start/prompt
     locks/<seat>.lock       flock for the read-modify-write above
@@ -918,7 +915,6 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
     if not items:
         return []
     sessions = summary if summary is not None else session_summary(seat)
-    me = sessions.get((harness, sid))
     out = []
     for item in items:
         author = item.get("author") or {}
@@ -927,14 +923,24 @@ def pending_notices(seat: Seat, harness: str, sid: str, *, now: Optional[float] 
             out.append(item)
             continue
         theirs = sessions.get(a_key)
+        replaced = _appeared_after(sessions, harness, sid, a_key)
         if theirs is None:
-            out.append(item)          # author unknown to the ledger: nobody else will show it
+            if replaced:
+                out.append(item)      # author unknown to the ledger: nobody else will show it
             continue
-        replaced = bool(me) and me["first_seen"] > theirs["last_seen"]
         stale = now - theirs["last_seen"] > AUTHOR_STALE_SEC
         if replaced and (seat.kind in ("pane", "native") or stale):
             out.append(item)
     return out
+
+
+def _appeared_after(sessions: dict, harness: str, sid: str, author_key: tuple[str, str]) -> bool:
+    """Whether this session began after the author's last recorded activity."""
+    author = sessions.get(author_key)
+    if author is None:
+        return True
+    me = sessions.get((harness, sid))
+    return bool(me and me["first_seen"] > author["last_seen"])
 
 
 def _ago(seconds: float) -> str:
@@ -1008,13 +1014,15 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             return text
         if event == "prompt":
             bump_prompt_seq(seat, harness, sid, now)
-        prior = session_summary(seat).get((harness, sid))
+        sessions = session_summary(seat)
+        prior = sessions.get((harness, sid))
         # SessionStart(source=compact) and a separate compact event describe the same
         # compaction; count it once.
         compacting = (event == "compact" or source == "compact") and not (
             prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
         row = record_event(seat, harness, sid, event, source=source, transcript=transcript,
                            cwd=cwd, now=now, bump_epoch=compacting)
+        sessions[(harness, sid)] = row
         if event == "compact":
             return ""
         if event == "start" and seat.kind in ("pane", "native"):
@@ -1030,14 +1038,22 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                 handed = handover.record_locked(seat, harness, sid, event, source, now)
         epoch = int(row.get("epoch", 0) or 0)
         parts: list[str] = []
-        notices = pending_notices(seat, harness, sid, now=now)
+        notices = pending_notices(seat, harness, sid, now=now, summary=sessions)
         notice_block = ""
         if notices:
             notice_block = "\n".join(f"[정리 결과] {n['text']}" for n in notices)
             notice_block = _cut_bytes(notice_block, NOTICE_MAX_BYTES)[0]
             parts.append(notice_block)
         card_seat = seat
-        if seat.kind == "project":
+        own_card = read_latest_card(seat) if seat.kind == "project" else None
+        own_author = (own_card or {}).get("author") or {}
+        own_card_due = bool(own_card
+                            and (own_author.get("harness"), own_author.get("sid")) == (harness, sid)
+                            and own_card.get("origin") != "runtime-compact"
+                            and epoch > int(own_author.get("epoch", 0) or 0))
+        if own_card_due:
+            card = own_card
+        elif seat.kind == "project":
             card, card_seat = read_latest_project_card(seat)
         else:
             card = read_latest_card(seat)
@@ -1048,10 +1064,14 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         if card:
             author = card.get("author") or {}
             same_session = (author.get("harness"), author.get("sid")) == (harness, sid)
-            if seat.kind == "project" and not same_session:
-                author_session = session_summary(seat).get((author.get("harness"), author.get("sid")))
-                me = session_summary(seat).get((harness, sid))
-                eligible = author_session is None or bool(me and me["first_seen"] > author_session["last_seen"])
+            if seat.kind == "project" and own_card_due:
+                eligible = True
+            elif seat.kind == "project" and not same_session:
+                eligible = _appeared_after(sessions, harness, sid,
+                                           (author.get("harness") or "", author.get("sid") or ""))
+            elif seat.kind == "project":
+                eligible = (card.get("origin") != "runtime-compact"
+                            and epoch > int(author.get("epoch", 0) or 0))
             else:
                 eligible = (not same_session) or (
                     card.get("origin") != "runtime-compact" and epoch > int(author.get("epoch", 0) or 0))

@@ -333,6 +333,17 @@ class ProjectFallbackTest(TidyCase):
             self.assertEqual(st.read_latest_card(b)["generation"], 2)
         self.assertEqual(len(list((self.state / "cards").glob("*.json"))), 2)
 
+    def test_project_compaction_prefers_the_callers_newer_card_over_the_seat_latest(self):
+        self.hook("claude", "start", "sid-A", pane=None)
+        self.hook("claude", "start", "sid-B", pane=None)
+        self.card("sid-A", "A1", pane=None)
+        self.card("sid-B", "B1", pane=None)
+        resumed = self.hook("claude", "start", "sid-A", "--source", "compact", pane=None)
+        self.assertIn("A1", resumed)
+        self.assertNotIn("B1", resumed)
+        self.assertEqual(self.hook("claude", "prompt", "sid-A", pane=None), "")
+        self.assertEqual(self.hook("claude", "prompt", "sid-B", pane=None), "")
+
     def test_project_card_clear_is_delivered_once_for_claude_and_codex(self):
         for harness, author, successor, following in (
                 ("claude", "claude-author", "claude-next", "claude-last"),
