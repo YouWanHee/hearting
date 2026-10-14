@@ -17,6 +17,7 @@ are imported lazily, inside the functions that need them.
 """
 import json
 import os
+from collections import OrderedDict
 from pathlib import Path
 import re
 import stat
@@ -41,8 +42,12 @@ MAX_NODES = 16
 SWEEP_MAX_AGE = 14 * 86400
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _LEDGER_EVENTS = frozenset(("compose", "compile", "continuation", "start"))
+_FULL_HISTORY_CACHE = OrderedDict()
+_FULL_HISTORY_CACHE_LIMIT = 256
 # The events that say "this session composed the route" (a `start` line only says it started one).
 COMPOSING_EVENTS = frozenset(("compose", "compile", "continuation"))
+# Every event that puts a session in charge of a route at its `ts` (a start hands it over).
+OWNING_EVENTS = COMPOSING_EVENTS | {"start"}
 
 
 def _session_identity(env):
@@ -345,7 +350,7 @@ def _is_number(value):
 
 
 def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
-    """Validated ledger lines from the tail `max_bytes` of one session's ledger file."""
+    """Validated ledger lines from one session ledger; ``None`` reads its full history."""
     try:
         path = ledger_path(harness, session_id)
     except ValueError:
@@ -356,12 +361,25 @@ def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
         return []
     if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid():
         return []
+    stamp = (meta.st_dev, meta.st_ino, meta.st_mtime_ns, meta.st_ctime_ns, meta.st_size)
+    cache_key = (path, stamp)
+    if max_bytes is None and cache_key in _FULL_HISTORY_CACHE:
+        _FULL_HISTORY_CACHE.move_to_end(cache_key)
+        return list(_FULL_HISTORY_CACHE[cache_key])
     try:
         with open(path, "rb") as handle:
-            offset = max(0, meta.st_size - max_bytes)
+            offset = max(0, meta.st_size - max_bytes) if max_bytes is not None else 0
             handle.seek(offset)
             data = handle.read()
     except OSError:
+        return []
+    try:
+        after = os.lstat(path)
+        after_stamp = (after.st_dev, after.st_ino, after.st_mtime_ns,
+                       after.st_ctime_ns, after.st_size)
+    except OSError:
+        return []
+    if stamp != after_stamp:
         return []
     raw_lines = data.decode("utf-8", errors="replace").split("\n")
     if offset > 0 and raw_lines:
@@ -382,15 +400,20 @@ def read_tail(harness, session_id, max_bytes=TAIL_BYTES):
                 or not isinstance(obj.get("route_file"), str) or not obj.get("route_file")):
             continue
         result.append(obj)
+    if max_bytes is None:
+        _FULL_HISTORY_CACHE[cache_key] = tuple(result)
+        _FULL_HISTORY_CACHE.move_to_end(cache_key)
+        while len(_FULL_HISTORY_CACHE) > _FULL_HISTORY_CACHE_LIMIT:
+            _FULL_HISTORY_CACHE.popitem(last=False)
     return result
 
 
-def session_lines(session):
+def session_lines(session, *, full_history=False):
     """Every ledger line reachable from `session`'s own id and its resume aliases, ts-merged."""
     from . import session_registry
     merged = []
     for harness, sid in session_registry.session_join_keys(session):
-        merged.extend(read_tail(harness, sid))
+        merged.extend(read_tail(harness, sid, max_bytes=None if full_history else TAIL_BYTES))
     merged.sort(key=lambda item: item.get("ts") or 0)
     return merged
 

@@ -57,6 +57,7 @@ class NativeContextTests(unittest.TestCase):
         self.assertIn(b"[profiles.x]\r\nmodel_context_window = 900000\r\n", updated)
         self.assertEqual(updated.replace(b"760000", b"800000"), original)
         self.assertEqual(updated.count(b"model_context_window = 760000"), 1)
+        self.assertNotIn(b"default_mode_request_user_input", updated)
         self.assertTrue(any("profile" in line for line in result["report_lines"]))
 
     def test_codex_absent_baseline_restoration_keeps_trailing_comment_and_crlf(self):

@@ -144,26 +144,48 @@ def _frame_decision_result(decision, question, question_path, answer_path):
     return result
 
 
-def record_native_answer(route, jobs, asked):
-    """Keep the person's native reply to this route's registered frame question.
-
-    When the frame-review gate waits on a registered question with no answer yet and `asked`
-    (`frame_interview.answers_from_native`) is a valid answer to it, the reply is written once
-    beside the question as `answers.native.json`, and the next `start` takes it as the person's
-    answer. Returns that file, or None (no question waiting, or the reply is not its answer)."""
+def native_answer_candidate(route, jobs, asked):
+    """Purely identify a valid reply to this route's currently registered interview."""
     import frame_interview as FI
     import workflow_state as WS
+    if not isinstance(route, dict) or not route.get("route_id") or not route.get("route_hash"):
+        return None
     resolution = WS.human_gate_resolution(
         WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs).journal(), "frame-review")
     question_path = Path(resolution.get("artifact") or "")
-    if resolution.get("status") != "blocked" or not question_path.is_file() \
-            or (question_path.parent / "answers.json").exists():
+    if resolution.get("status") != "blocked" or not question_path.is_file():
         return None
-    question = json.loads(question_path.read_text(encoding="utf-8"))
+    try:
+        if question_path.is_symlink():
+            return None
+        if resolution.get("artifact_sha256") and hashlib.sha256(question_path.read_bytes()).hexdigest() != resolution["artifact_sha256"]:
+            return None
+        question = json.loads(question_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not FI.is_interview(question) or question.get("route_id") != route["route_id"]:
+        return None
+    manual_answer = question_path.parent / "answers.json"
+    if manual_answer.exists():
+        try:
+            existing = json.loads(manual_answer.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict) and not FI.validate_answers(question, existing):
+            return None
     answers = FI.answers_from_native(question, asked)
     if answers is None or FI.validate_answers(question, answers):
         return None
     target = question_path.parent / FI.NATIVE_ANSWERS_NAME
+    return target, answers
+
+
+def record_native_answer(route, jobs, asked):
+    """Keep a valid native reply beside the one current registered interview."""
+    candidate = native_answer_candidate(route, jobs, asked)
+    if candidate is None:
+        return None
+    target, answers = candidate
     target.write_text(json.dumps(answers, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return target
 
@@ -318,8 +340,9 @@ def frame_interview_step(route, path, jobs, *, interview=None, answers=None,
                               "Keep waiting for the actual answer. If this question has not yet been presented, "
                               "present human_wait.question_block now; registration alone does not prove presentation. "
                               "Do not automatically open another native question. ") +
-                    "Ask the person to confirm or correct the understanding in their language, and present the "
-                    "registered question and choices without changing their words. "
+                    "Put the registered understanding sentence verbatim as the first question in the same native "
+                    "question batch; its first option confirms understanding and typed text corrects it. Then put "
+                    "every registered question and its choices in that batch without changing their words. "
                     "Leave human_wait.question_block in the final conversation reply if the native box closes. "
                     "When the native question tool returns the reply, the runtime keeps it beside the question "
                     "(answers.native.json, recorded by the harness hook): then just rerun resume_command. Otherwise "

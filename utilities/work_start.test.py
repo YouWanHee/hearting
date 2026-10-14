@@ -1837,8 +1837,8 @@ class FrameInterviewStepTest(WF.WorkflowFixture):
         self.assertEqual(asked["human_wait"], {"state": "pending", "fallback": "ordinary-conversation",
                                               "question_block": expected})
         self.assertNotIn("Confirm this understanding", asked["human_wait"]["question_block"])
-        self.assertIn("confirm or correct the understanding in their language", asked["next_step"])
-        self.assertIn("registered question and choices without changing their words", asked["next_step"])
+        self.assertIn("understanding sentence verbatim as the first question in the same native question batch", asked["next_step"])
+        self.assertIn("every registered question and its choices in that batch", asked["next_step"])
         registered = Path(asked["interview_file"])
         original = registered.read_bytes()
         answers_path = registered.parent / "answers.json"

@@ -924,6 +924,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self._assert_clears_inherited(config)
             self.assertTrue((root / "config.toml.pre-harness-identity").is_file())
             self.assertEqual((root / "config.toml.pre-harness-identity").read_text(encoding="utf-8"), original)
+            import tomllib
+            self.assertIs(tomllib.loads(text)["features"]["default_mode_request_user_input"], True)
 
     def test_a_second_merge_is_byte_identical(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -955,7 +957,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = root / "config.toml"
-            body = ('[shell_environment_policy]\ninherit = "core"\n'
+            body = ('[features]\ndefault_mode_request_user_input = true\n\n'
+                    '[shell_environment_policy]\ninherit = "core"\n'
                     '[shell_environment_policy.set]\nFOO = "1"\n'
                     '[shell_environment_policy.filters]\n'
                     + "".join('"%s" = "exclude"\n' % key for key in self.EXCLUDED))
@@ -1047,9 +1050,15 @@ class CodexIdentityConfigTest(unittest.TestCase):
             result = self._merge(config, self._release(root))
             edited = config.read_text(encoding="utf-8").replace('"CLAUDECODE"', '"MINE"')
             config.write_text(edited, encoding="utf-8")
+            # Each insertion is unmerged on its own: the edited block stays exactly as the
+            # user left it, while the untouched question feature line still goes.
+            expected = activation._codex_feature_remove(edited, result["managed_config"]["feature"])
+            self.assertNotEqual(expected, edited)
+            self.assertIn('"MINE"', expected)
             self.assertEqual(
-                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}}), [])
-            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}}),
+                [str(config)])
+            self.assertEqual(config.read_text(encoding="utf-8"), expected)
 
     def test_invalid_toml_takes_the_existing_activation_error_path(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1082,6 +1091,200 @@ class CodexIdentityConfigTest(unittest.TestCase):
             config.write_text('[shell_environment_policy]\nexclude = ["A"]\n', encoding="utf-8")
             missing, conflicts = self._call("_codex_identity_health", config, release, "global")
             self.assertTrue(conflicts)
+
+    def test_explicit_feature_true_is_respected_and_false_or_non_boolean_is_preserved(self):
+        for value, expected_conflict in (("true", False), ("false", True), ('"yes"', True)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                original = f'[features]\nother = "kept"\ndefault_mode_request_user_input = {value}\n'
+                config.write_text(original, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                self.assertEqual(bool(result["conflicts"]), expected_conflict)
+                if expected_conflict:
+                    self.assertEqual(result["conflicts"], ["features.default_mode_request_user_input"])
+                    content = config.read_bytes()
+                    self.assertTrue(content.startswith(original.encode("utf-8")))
+                    self.assertIn(self.BEGIN.encode("utf-8"), content)
+                    import tomllib
+                    parsed = tomllib.loads(content.decode("utf-8"))
+                    self.assertEqual(parsed["features"]["default_mode_request_user_input"],
+                                     tomllib.loads(original)["features"]["default_mode_request_user_input"])
+                    self.assertIsNone(result["managed_config"]["feature"])
+                else:
+                    self.assertIsNone(result["managed_config"]["feature"])
+                    import tomllib
+                    self.assertIs(tomllib.loads(config.read_text(encoding="utf-8"))
+                                  ["features"]["default_mode_request_user_input"], True)
+
+    def test_deactivate_removes_only_the_inserted_feature_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            original = '[features]\napps = false\n\n[model]\nname = "x"\n'
+            config.write_text(original, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self.assertEqual(result["conflicts"], [])
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_inline_or_dotted_feature_forms_are_respected_when_true_and_conflicts_when_unsafe(self):
+        for original, conflict in (
+                ('features = { default_mode_request_user_input = true }\n', False),
+                ('features.default_mode_request_user_input = true\n', False),
+                ('features = { apps = false }\n', True),
+                ('features.apps = false\n', True)):
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text(original, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                if conflict:
+                    self.assertEqual(result["conflicts"], ["features.default_mode_request_user_input"])
+                    content = config.read_bytes()
+                    self.assertTrue(content.startswith(original.encode("utf-8")))
+                    self.assertIn(self.BEGIN.encode("utf-8"), content)
+                    parsed = self._feature_parsed(config)
+                    self.assertIs(parsed["features"]["apps"], False)
+                    self.assertIsNone(result["managed_config"]["feature"])
+                else:
+                    self.assertEqual(result["conflicts"], [])
+                    self.assertTrue(config.read_text(encoding="utf-8").startswith(original))
+                    self.assertIsNone(result["managed_config"]["feature"])
+
+    def _feature_parsed(self, config):
+        import tomllib
+        return tomllib.loads(config.read_text(encoding="utf-8"))
+
+    def test_identity_satisfied_but_feature_missing_inserts_and_records_only_the_feature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            body = ('[shell_environment_policy]\ninherit = "core"\n'
+                    '[shell_environment_policy.set]\nFOO = "1"\n'
+                    '[shell_environment_policy.filters]\n'
+                    + "".join('"%s" = "exclude"\n' % key for key in self.EXCLUDED))
+            config.write_text(body, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self.assertEqual(result["conflicts"], [])
+            self.assertIsNone(result["managed_config"]["inserted"])
+            self.assertTrue(result["managed_config"]["feature"])
+            self.assertNotIn(self.BEGIN, config.read_text(encoding="utf-8"))
+            self.assertIs(self._feature_parsed(config)["features"]["default_mode_request_user_input"], True)
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(config.read_text(encoding="utf-8"), body)
+
+    def test_remerge_never_moves_or_deletes_a_user_key_added_under_the_feature_header(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            release = self._release(root)
+            config.write_text('model = "x"\n', encoding="utf-8")
+            first = self._merge(config, release)
+            self.assertTrue(first["managed_config"]["feature"]["header"])
+            edited = config.read_text(encoding="utf-8").replace(
+                "default_mode_request_user_input = true\n",
+                "default_mode_request_user_input = true\nmine = 1\n", 1)
+            config.write_text(edited, encoding="utf-8")
+            previous = {"managed_config": {"codex_identity": first["managed_config"]}}
+            second = self._merge(config, release, previous)
+            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+            parsed = self._feature_parsed(config)
+            self.assertEqual(parsed["features"], {"default_mode_request_user_input": True, "mine": 1})
+            self._unmerge(config, {"managed_config": {"codex_identity": second["managed_config"]}})
+            parsed = self._feature_parsed(config)
+            self.assertEqual(parsed["features"], {"mine": 1})
+            self.assertEqual(parsed["model"], "x")
+            self.assertNotIn(self.BEGIN, config.read_text(encoding="utf-8"))
+
+    def test_deactivate_removes_an_activation_created_header_once_it_is_empty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            original = 'model = "x"'
+            config.write_text(original, encoding="utf-8")
+            result = self._merge(config, self._release(root))
+            self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+
+    def test_feature_header_spellings_lookalikes_and_other_tables_stay_valid(self):
+        cases = {
+            "spaced header": '[ features ]\napps = false\n',
+            "lookalike in multiline string": 'note = """\n[features]\n"""\n',
+            "same key under another table": '[profiles.x]\ndefault_mode_request_user_input = false\n',
+            "lookalike string then real header": 'note = """\n[features]\n"""\n\n[features]\napps = false\n',
+            "quoted header": '["features"]\napps = false\n',
+            "subtable only": '[features.sub]\na = 1\n',
+        }
+        for label, original in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                import tomllib
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text(original, encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                self.assertEqual(result["conflicts"], [], label)
+                before = tomllib.loads(original)
+                after = self._feature_parsed(config)
+                self.assertIs(after["features"]["default_mode_request_user_input"], True)
+                for key, value in before.items():
+                    if key == "features":
+                        for sub, sub_value in value.items():
+                            self.assertEqual(after["features"][sub], sub_value)
+                    else:
+                        self.assertEqual(after[key], value, label)
+                self._unmerge(config, {"managed_config": {"codex_identity": result["managed_config"]}})
+                self.assertEqual(config.read_text(encoding="utf-8"), original, label)
+
+    def test_deactivate_leaves_a_feature_the_user_changed_to_false_or_removed(self):
+        for label, edit in (("false", lambda text: text.replace(
+                "default_mode_request_user_input = true", "default_mode_request_user_input = false")),
+                ("removed", lambda text: text.replace(
+                    "default_mode_request_user_input = true\n", ""))):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / "config.toml"
+                config.write_text('[features]\napps = false\n', encoding="utf-8")
+                result = self._merge(config, self._release(root))
+                edited = edit(config.read_text(encoding="utf-8"))
+                config.write_text(edited, encoding="utf-8")
+                record = {"managed_config": {"codex_identity": {**result["managed_config"], "inserted": None}}}
+                self.assertEqual(self._unmerge(config, record), [])
+                self.assertEqual(config.read_text(encoding="utf-8"), edited)
+
+    def test_a_feature_conflict_after_activation_drops_the_feature_receipt_and_keeps_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.toml"
+            release = self._release(root)
+            config.write_text('[features]\napps = false\n', encoding="utf-8")
+            first = self._merge(config, release)
+            edited = config.read_text(encoding="utf-8").replace(
+                "default_mode_request_user_input = true", "default_mode_request_user_input = false")
+            config.write_text(edited, encoding="utf-8")
+            second = self._merge(config, release, {"managed_config": {"codex_identity": first["managed_config"]}})
+            self.assertEqual(second["conflicts"], ["features.default_mode_request_user_input"])
+            self.assertEqual(config.read_text(encoding="utf-8"), edited)
+            self.assertEqual(second["managed_config"]["inserted"], first["managed_config"]["inserted"])
+            self.assertIsNone(second["managed_config"]["feature"])
+            self._unmerge(config, {"managed_config": {"codex_identity": second["managed_config"]}})
+            self.assertIn("default_mode_request_user_input = false", config.read_text(encoding="utf-8"))
+            self.assertNotIn(self.BEGIN, config.read_text(encoding="utf-8"))
+
+    def test_health_names_a_feature_conflict_and_reports_a_missing_feature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "config.toml"
+            config.write_text('model = "x"\n', encoding="utf-8")
+            self._merge(config, release)
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"), (False, []))
+            text = config.read_text(encoding="utf-8")
+            config.write_text(text.replace("default_mode_request_user_input = true\n", ""), encoding="utf-8")
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"), (True, []))
+            config.write_text(text.replace("= true", "= false"), encoding="utf-8")
+            self.assertEqual(self._call("_codex_identity_health", config, release, "global"),
+                             (False, ["features.default_mode_request_user_input"]))
 
 
 class OpencodeTuiSeedTest(unittest.TestCase):

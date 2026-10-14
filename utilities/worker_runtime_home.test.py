@@ -51,6 +51,7 @@ class WorkerHomes(unittest.TestCase):
             self.assertEqual((home / 'agent-config/models.conf').read_text(), 'user-model-policy')
             args = codex_worker_arguments(env)
             self.assertIn('features.multi_agent=false', args)
+            self.assertIn('features.default_mode_request_user_input=false', args)
             self.assertIn('mcp_servers={"external"={"command"="true","enabled"=false}}', args)
             self.assertTrue(any('test-skill' in arg for arg in args))
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.source.iterdir() if p.is_file()})
