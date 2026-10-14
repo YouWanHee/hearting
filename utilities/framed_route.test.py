@@ -361,13 +361,40 @@ class FramedRouteCompileTest(FramedBase):
                                    env=env, check=False)
         self.assertEqual(explained.returncode, 0, explained.stderr)
         self.assertEqual(json.loads(explained.stdout.strip().splitlines()[-1])["shape"], "framed")
-        # the ordinary shapes keep their default capability
-        ordinary = subprocess.run(
-            [sys.executable, str(HERE / "capability-route.py"), "compose", "--cwd", str(R.ROOT),
-             "--artifact-root", str(self.root), "--spec-read", "fixture", "--slug", "plain", "--unassigned",
-             "--explain"], text=True, capture_output=True, env=env, check=False)
-        self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
-        self.assertEqual(json.loads(ordinary.stdout.strip().splitlines()[-1])["capability"], "autopilot-code")
+        # Omission seals a frame; --graph alone remains only a routing hint.
+        omitted = [sys.executable, str(HERE / "capability-route.py"), "compose", "--cwd", str(R.ROOT),
+                   "--artifact-root", str(self.root), "--spec-read", "fixture", "--prompt-file", str(task),
+                   "--slug", "omitted-shape", "--unassigned"]
+        explained = subprocess.run(omitted + ["--explain"], text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(explained.returncode, 0, explained.stderr)
+        explanation = json.loads(explained.stdout.strip().splitlines()[-1])
+        self.assertEqual((explanation["shape"], explanation["capability"]), ("framed", "route-frame"))
+        sealed = subprocess.run(omitted, text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(sealed.returncode, 0, sealed.stderr)
+        receipt = json.loads(sealed.stdout.strip().splitlines()[-1])
+        route = json.loads(Path(receipt["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual((route["selection"]["shape"], route["capability"]), ("framed", "route-frame"))
+
+        direct = subprocess.run(omitted + ["--shape", "direct", "--slug", "direct-shape", "--explain"],
+                                text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        direct_result = json.loads(direct.stdout.strip().splitlines()[-1])
+        self.assertEqual((direct_result["shape"], direct_result["capability"]),
+                         ("direct", "autopilot-code"))
+        self.assertTrue(direct_result["nodes"])
+        self.assertTrue(all(node["dispatch_depth"] == 0 for node in direct_result["nodes"]))
+
+        graph_only = omitted + ["--graph", "execute,test,report", "--slug", "graph-hint"]
+        graph_explained = subprocess.run(graph_only + ["--explain"], text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(graph_explained.returncode, 0, graph_explained.stderr)
+        graph_result = json.loads(graph_explained.stdout.strip().splitlines()[-1])
+        self.assertEqual((graph_result["shape"], graph_result["capability"]), ("framed", "route-frame"))
+        graph_sealed = subprocess.run(graph_only, text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(graph_sealed.returncode, 0, graph_sealed.stderr)
+        graph_receipt = json.loads(graph_sealed.stdout.strip().splitlines()[-1])
+        graph_route = json.loads(Path(graph_receipt["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(graph_route["work_request"]["routing_hints"]["graph"], "execute,test,report")
+        self.assertEqual(graph_route["selection"]["shape"], "framed")
 
 
 class RegistryRegistrationTest(unittest.TestCase):
@@ -992,7 +1019,8 @@ class FramedStartTest(FramedBase):
                          ("needs-attention", "yaml-unavailable", "install-pyyaml"), result)
         self.assertEqual((self.calls, result["launches"]), ([], []))   # no frame leg, so nothing spent
         self.assertIn("-m pip install --user pyyaml", result["next_step"])
-        self.assertIn("non-framed shape", result["next_step"])
+        self.assertIn("atomic, reversible inline change", result["next_step"])
+        self.assertIn("--shape direct", result["next_step"])
         self.assertFalse(R.outcome_path(self.path).exists())           # open: resume_command continues it
         with mock.patch.object(RP, "yaml_available", return_value=True):
             self.assertEqual(self.start()["state"], "preparing")

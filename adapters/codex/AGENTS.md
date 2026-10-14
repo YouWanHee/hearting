@@ -96,21 +96,24 @@ tool to claim Codex parity.
 
 ## Dispatch
 
-Route by `core/WORKFLOW.md §0.2`; pick the shape first (§0.2.1; new non-direct work defaults to `framed`):
-`direct`/`solo`/`staged`/`framed` use `hearting run capability-route compose` (defaults fill the rest;
-`--graph` = stage subgraph); `preflight.sh route --capability …` only for the
-entry's full loop or a promotion signal. Apply §0.3. `direct`/`solo`: the
-§0.4 card on user-authored turns; received peer envelopes use one `[경로]`
-line unless destructive or external-facing (§0.4 SD-136); else the
-§0.4 card unless approved. Close with §0.5.
+Route by `core/WORKFLOW.md §0.2`. The main session decides only whether the work is
+direct (§0.2.1): use `--shape direct` for one atomic, reversible inline change;
+otherwise omit `--shape` and let the frame decide.
+
+`hearting run capability-route compose`; shape-free flags are hints.
+Person-named stages use `--shape staged --graph <stage,…>` (§0.2.1). Preset
+routes cover loops/promotions. Apply §§0.3–0.5.
 
 <!-- BEGIN generated from core/fragments/bootstrap-dispatch.md by tools/sync-bootstrap-dispatch.py; edit the source -->
-Ordinary execution is one command, the same in every harness:
-
 ```
 hearting run capability-route compose --start --prompt-file <task> \
-  [--shape direct|solo|staged|framed] [--graph <stage,…>] [--campaign-key <stream>]
+  [--shape direct] [--campaign-key <stream>]
 ```
+
+Use `--shape direct` only for one atomic, reversible inline change; otherwise
+omit it and let the frame decide. Other shape-free flags are hints. Follow
+decided routes under §0.2.1; person-named stages use
+`--shape staged --graph <stage,…>`.
 
 `hearting` is on PATH. `hearting run <utility>` runs that harness utility from
 `AGENT_HOME` when it is set (dev activation: that checkout), else from the
