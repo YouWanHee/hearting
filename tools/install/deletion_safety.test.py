@@ -798,6 +798,22 @@ class RouteStaleOpenMirrorTest(unittest.TestCase):
                     paused = distribution._route_registry_index(line)["paused"]
                     self.assertEqual(self.ROUTE_ID in paused,
                                      bool(route_authority.answerable_owner_end(status, meta)))
+        base = {"worker_type": "owner", "owner_route_id": self.ROUTE_ID,
+                "note": "dead-contract", "failure_class": "contract",
+                "classifier_source": "supervisor-terminal-v1", "process_exit": "0",
+                "reconcile_reason": "final-handoff-invalid", "terminal_event": "claude-result"}
+        variants = [(base, True),
+                    ({**base, "worker_type": "stage"}, False),
+                    ({**base, "process_exit": "1"}, False),
+                    ({**base, "reconcile_reason": "other"}, False),
+                    ({**base, "classifier_source": "other"}, False)]
+        for meta, expected in variants:
+            line = "\t".join(["date", "done", "repo", "worktree", "att-1",
+                              ",".join(f"{k}={v}" for k, v in meta.items())])
+            with self.subTest(format_meta=meta):
+                paused = distribution._route_registry_index(line)["paused"]
+                self.assertEqual(self.ROUTE_ID in paused, expected)
+                self.assertEqual(bool(route_authority.answerable_owner_end("done", meta)), expected)
 
     def test_the_status_vocabulary_is_an_allowlist(self):
         # Round 1 (blocking 2): written first as a denylist of live states, so a

@@ -322,6 +322,8 @@ def death_proof(fields, meta, *, jobs=None, lines=None):
             result['handoff'] = handoff
         if route_authority.runtime_owner_can_resume(fields[1], meta):
             result['source_result'] = 'EXITED'
+        elif route_authority.owner_result_format_only_end(fields[1], meta):
+            result['source_result'] = 'CONTRACT'
     return result
 
 
@@ -1787,8 +1789,10 @@ def recovery_instructions(args):
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == CORRECTED:
         ended = ('exited before settlement and received a correction'
-                 if record['proof'].get('source_result') == 'EXITED'
-                 else 'ended BLOCKED and a person has answered it')
+                 if record['proof'].get('source_result') == 'EXITED' else
+                 'ended with a handoff-format error and received an answer'
+                 if record['proof'].get('source_result') == 'CONTRACT' else
+                 'ended BLOCKED and a person has answered it')
         opening = (f'The previous owner {prior} {ended}; this continues '
                    f'the same work on the existing route {record["route_id"]}.\n')
     elif kind == 'capacity':
@@ -1837,7 +1841,10 @@ def recovery_instructions(args):
             text += _gate_context(jobs, claim)
         if proof.get('death_kind') == CORRECTED:
             if claim is carried:
-                text += (f'The owner {answered} ended BLOCKED and a person has answered it; '
+                ended = ('ended with a handoff-format error and received an answer'
+                         if proof.get('source_result') == 'CONTRACT' else
+                         'ended BLOCKED and a person has answered it')
+                text += (f'The owner {answered} {ended}; '
                          'that answer is for this work.\n')
             text += _correction_context(jobs, answered, proof)
     return text + CONTINUATION_WAIT_NOTE + retry_context
@@ -1892,6 +1899,10 @@ def _correction_context(jobs, prior, proof):
     if proof.get('source_result') == 'EXITED':
         return ('The previous owner exited before settlement. The correction below names the remaining work; '
                 'preserve completed checks and continue the existing route.' + OwnerInput.text(items) + '\n')
+    if proof.get('source_result') == 'CONTRACT':
+        return ('The previous owner\'s final result had a handoff-format error. The answer below gives the '
+                'direction for continuing the existing route; preserve completed work and checks.'
+                + OwnerInput.text(items) + '\n')
     answer = ('The answer below is the fix a person approved for the failure it reported. Treat it as '
               'given: do not ask for it again; apply it, then continue through the remaining declared stages.'
               if proof.get('source_result') == 'FAIL' else

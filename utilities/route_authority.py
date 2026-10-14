@@ -1711,13 +1711,31 @@ def answerable_owner_end(status, meta) -> str:
     envelope reported a FAIL a person may answer with an approved fix (`readable_result`).
     Either answer is kept (`dispatch_owner_input`) and a replacement owner continues the
     same route with it first (`dispatch_replacement` 'corrected'). A death, an unverifiable
-    end or an invalid envelope keeps its own classification, and a readable FAIL still gets
+    end keeps its own classification, and a readable FAIL still gets
     no automatic retry (`retry_predecessor`): only a person's kept answer continues it."""
     if status != "done":
         return ""
+    if owner_result_format_only_end(status, meta):
+        return "BLOCKED"
     if meta.get("note") == "dead-worker-blocked":
         return "BLOCKED"
     return "FAIL" if readable_result(meta) == "FAIL" else ""
+
+
+def owner_result_format_only_end(status, meta) -> bool:
+    """Whether a normally exited owner ended only with a supervisor handoff-format error.
+
+    This is deliberately metadata-only so standalone installers can preserve the same
+    answer-waiting route contract without importing runtime log readers.
+    """
+    return (status == "done" and meta.get("worker_type") == "owner"
+            and meta.get("note") == "dead-contract"
+            and meta.get("failure_class") == "contract"
+            and meta.get("classifier_source") == "supervisor-terminal-v1"
+            and meta.get("process_exit") == "0"
+            and meta.get("reconcile_reason") in {"final-handoff-invalid", "pass-blocker-not-none"}
+            and meta.get("terminal_event") in {
+                "claude-result", "opencode-result", "turn.completed", "step_finish.stop"})
 
 
 def fix_answers(route, lines, jobs=None):

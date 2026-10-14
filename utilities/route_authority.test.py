@@ -1125,5 +1125,30 @@ class InputContinuationBoundaryTest(unittest.TestCase):
                         self.assertTrue(choice.retry_when)
 
 
+class OwnerFormatOnlyEndTest(unittest.TestCase):
+    BASE = {"worker_type": "owner", "note": "dead-contract", "failure_class": "contract",
+            "classifier_source": "supervisor-terminal-v1", "process_exit": "0",
+            "reconcile_reason": "final-handoff-invalid", "terminal_event": "claude-result"}
+
+    def test_metadata_allowlist_and_answerable_classification(self):
+        self.assertTrue(RA.owner_result_format_only_end("done", self.BASE))
+        self.assertEqual(RA.answerable_owner_end("done", self.BASE), "BLOCKED")
+        for event in ("claude-result", "opencode-result", "turn.completed", "step_finish.stop"):
+            for reason in ("final-handoff-invalid", "pass-blocker-not-none"):
+                with self.subTest(event=event, reason=reason):
+                    self.assertTrue(RA.owner_result_format_only_end(
+                        "done", {**self.BASE, "terminal_event": event, "reconcile_reason": reason}))
+        for key, value in (("worker_type", "stage"), ("worker_type", "review"),
+                           ("worker_type", "frame"), ("worker_type", ""), ("note", "dead-worker-blocked"),
+                           ("failure_class", "runtime"), ("classifier_source", "other"),
+                           ("process_exit", "1"), ("reconcile_reason", "other"),
+                           ("terminal_event", "other")):
+            with self.subTest(key=key, value=value):
+                self.assertFalse(RA.owner_result_format_only_end("done", {**self.BASE, key: value}))
+        self.assertFalse(RA.owner_result_format_only_end("open", self.BASE))
+        self.assertFalse(RA.owner_result_format_only_end("done", {k: v for k, v in self.BASE.items()
+                                                                    if k != "worker_type"}))
+
+
 if __name__ == "__main__":
     unittest.main()
