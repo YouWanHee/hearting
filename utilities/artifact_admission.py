@@ -479,6 +479,7 @@ def _bundle_coverage(cycle_root: Path, document: Dict[str, Any]):
                  if isinstance(row, Mapping)}
     paths = set()
     violations = []
+    directories = []
     for row in document.get("artifact_revisions", []) or []:
         if not isinstance(row, Mapping):
             continue
@@ -492,7 +493,15 @@ def _bundle_coverage(cycle_root: Path, document: Dict[str, Any]):
             violations.append(Violation("bundle-type-media-mismatch", str(rel or "$"), "bundle declaration mismatch"))
             continue
         try:
-            paths.update(artifact_directory_bundle.verify_coverage(cycle_root, rel, row))
+            covered = artifact_directory_bundle.verify_coverage(cycle_root, rel, row)
+            body = artifact_directory_bundle.parse_descriptor((cycle_root / rel).read_bytes())
+            directory = body["directory"]["path"]
+            if any(directory == prior or directory.startswith(prior + "/")
+                   or prior.startswith(directory + "/") for prior in directories):
+                violations.append(Violation("bundle-directory-overlap", directory, "overlapping directory bundles"))
+                continue
+            directories.append(directory)
+            paths.update(covered)
         except artifact_directory_bundle.DirectoryBundleError as exc:
             violations.append(Violation(exc.code, exc.path or rel, exc.detail))
     return paths, violations

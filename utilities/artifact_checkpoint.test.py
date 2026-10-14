@@ -64,6 +64,21 @@ class CheckpointTestBase(F.ProducerTestBase):
 
 
 class InterimManifestTest(CheckpointTestBase):
+    def test_checkpoint_prunes_raw_results_before_walk_and_byte_limits(self):
+        cycle = Path(self.result["cycle_dir"])
+        raw = cycle / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        for index in range(25):
+            (raw / f"f{index:02d}.bin").write_bytes(b"x" * 8)
+        report = self.write_output(self.result, "reports/final_report.md", b"report")
+        scan = P._checkpoint_scan(cycle, {}, P.CheckpointLimits(
+            max_walk_entries=1, max_files=1, max_file_bytes=100, max_total_bytes=100,
+        ))
+        self.assertNotIn("skip", scan)
+        self.assertEqual([row[0] for row in scan["facts"]], ["artifacts/reports/final_report.md"])
+        self.assertEqual(report.read_bytes(), b"report")
+        self.assertEqual(sorted(p.name for p in raw.iterdir()), [f"f{index:02d}.bin" for index in range(25)])
+
     def legacy_move(self, rel, to):
         """What a release before the move's removal left: the file at `to` and its ledger row."""
         cycle = Path(self.result["cycle_dir"])

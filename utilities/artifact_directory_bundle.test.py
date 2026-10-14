@@ -23,6 +23,25 @@ class DirectoryBundleTests(unittest.TestCase):
         with self.assertRaises(B.DirectoryBundleError):
             B.parse_descriptor(b'{"schema":"x","schema":"y"}')
 
+    def test_descriptor_independent_wire_vector_and_closed_negative_cases(self):
+        body = {"schema": B.SCHEMA, "directory": {"kind": "cycle-relative", "path": "artifacts/raw-results"},
+                "file_count": 1, "total_bytes": 0, "tree_digest": "sha256:" + "0" * 64,
+                "digest_algorithm": B.ALGORITHM}
+        expected = (b'{"digest_algorithm":"sha256-canonical-leaf-list/v1","directory":{"kind":"cycle-relative",'
+                    b'"path":"artifacts/raw-results"},"file_count":1,"schema":"hearting-directory-bundle/v1",'
+                    b'"total_bytes":0,"tree_digest":"sha256:' + b'0' * 64 + b'"}')
+        self.assertEqual(B.canonical_descriptor_bytes(body), expected)
+        invalid = (
+            expected.replace(b'"file_count":1', b'"file_count":1.0'),
+            expected.replace(b'"file_count":1', b'"file_count":NaN'),
+            expected.replace(b'"file_count":1', b'"file_count":true'),
+            expected[:-1] + b',"unknown":0}',
+            expected.replace(b'raw-results', b'outside'),
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(B.DirectoryBundleError):
+                B.parse_descriptor(raw)
+
     def test_selector_outermost_hidden_empty_and_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             a = Path(tmp) / "artifacts"
@@ -68,6 +87,32 @@ class DirectoryBundleTests(unittest.TestCase):
                 B.scan_tree(alias, "artifacts/raw-results")
             with self.assertRaises(B.DirectoryBundleError):
                 B.copy_file_streaming(alias / "artifacts" / "raw-results" / "x", root / "copy")
+
+    def test_tree_rejects_fifo_and_detects_same_size_read_race(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "artifacts" / "raw-results"
+            raw.mkdir(parents=True)
+            fifo = raw / "pipe"
+            os.mkfifo(fifo)
+            with self.assertRaises(B.DirectoryBundleError) as caught:
+                B.scan_tree(root, "artifacts/raw-results")
+            self.assertEqual(caught.exception.code, "tree-non-regular")
+            fifo.unlink()
+            target = raw / "mutable"
+            target.write_bytes(b"first")
+            original = B._hash_fd
+            def mutate(fd, rel):
+                facts = original(fd, rel)
+                target.write_bytes(b"other")
+                return facts
+            B._hash_fd = mutate
+            try:
+                with self.assertRaises(B.DirectoryBundleError) as caught:
+                    B.scan_tree(root, "artifacts/raw-results")
+                self.assertIn(caught.exception.code, {"output-changed-while-reading"})
+            finally:
+                B._hash_fd = original
 
     def test_streaming_hash_and_copy_memory_bound(self):
         self.assertEqual(B.CHUNK_BYTES, 1024 * 1024)

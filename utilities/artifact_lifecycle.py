@@ -408,6 +408,7 @@ def verify_artifact_revisions(
     root = Path(content_root).resolve()
     artifacts_by_id = {row.get("artifact_id"): row for row in document.get("artifacts", [])
                        if isinstance(row, Mapping)}
+    bundle_directories = []
     for row in document.get("artifact_revisions", []) or []:
         locator = row.get("locator") if isinstance(row, Mapping) else None
         rel = locator.get("path") if isinstance(locator, Mapping) else None
@@ -467,7 +468,15 @@ def verify_artifact_revisions(
                 failures.append(f"bundle-type-media-mismatch:{rel}")
             else:
                 try:
-                    artifact_directory_bundle.verify_coverage(root, rel, row)
+                    covered = artifact_directory_bundle.verify_coverage(root, rel, row)
+                    body = artifact_directory_bundle.parse_descriptor((root / rel).read_bytes())
+                    directory_rel = body["directory"]["path"]
+                    if artifact.get("title") != directory_rel[len("artifacts/"):]:
+                        failures.append(f"bundle-title-directory-mismatch:{rel}")
+                    if any(directory_rel == prior or directory_rel.startswith(prior + "/")
+                           or prior.startswith(directory_rel + "/") for prior in bundle_directories):
+                        failures.append(f"bundle-directory-overlap:{directory_rel}")
+                    bundle_directories.append(directory_rel)
                 except artifact_directory_bundle.DirectoryBundleError as exc:
                     failures.append(f"{exc.code}:{exc.path or rel}")
     return tuple(sorted(failures))

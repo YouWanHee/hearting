@@ -19,6 +19,31 @@ spec.loader.exec_module(fixture)
 
 
 class WorkflowGroupsTest(fixture.ProducerTestBase):
+    def test_coverage_only_evidence_is_unsupported_before_candidate_bytes_are_read(self):
+        import artifact_directory_bundle as bundles
+
+        cycle = self.root / "campaigns" / "camp_fixture" / "cycles" / "cyc_fixture"
+        raw = cycle / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        (raw / "evidence.md").write_bytes(b"covered")
+        tree = bundles.scan_tree(cycle, "artifacts/raw-results")
+        descriptor_rel = "artifacts/_internal/directory-bundles/raw-results.json"
+        descriptor = cycle / descriptor_rel
+        descriptor.parent.mkdir(parents=True)
+        descriptor.write_bytes(tree.descriptor)
+        bundle_id = "art_" + "1" * 32
+        revision = {"artifact_id": bundle_id, "artifact_revision_id": "arev_" + "2" * 32,
+                    "media_type": bundles.MEDIA_TYPE, "locator": {"path": descriptor_rel}}
+        document = {"artifacts": [{"artifact_id": bundle_id, "type": "directory-bundle"}],
+                    "artifact_revisions": [revision]}
+        endpoints = (("cyc_fixture", cycle), ("cyc_other", cycle))
+        evidence_path = "campaigns/camp_fixture/cycles/cyc_fixture/artifacts/raw-results/evidence.md"
+        with mock.patch.object(W, "_manifest", return_value=document), \
+             mock.patch.object(W, "_evidence_bytes", side_effect=AssertionError("candidate bytes read")):
+            with self.assertRaises(W.WorkflowGroupError) as caught:
+                W._bind_evidence(self.root, {"campaign_id": "camp_fixture"}, {"path": evidence_path}, endpoints)
+        self.assertEqual(caught.exception.code, "evidence-coverage-leaf-unsupported")
+
     def _cycles(self, count=3):
         self.activate()
         rows = []

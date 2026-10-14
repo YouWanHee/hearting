@@ -15,6 +15,7 @@ SCHEMA = "hearting-directory-bundle/v1"
 ALGORITHM = "sha256-canonical-leaf-list/v1"
 MEDIA_TYPE = "application/vnd.hearting.directory-bundle+json"
 CHUNK_BYTES = 1024 * 1024
+MAX_DESCRIPTOR_BYTES = 64 * 1024
 
 
 class DirectoryBundleError(ValueError):
@@ -120,7 +121,9 @@ def validate_body(body: Any) -> None:
     if not isinstance(directory, dict) or set(directory) != {"kind", "path"} or directory["kind"] != "cycle-relative":
         raise DirectoryBundleError("descriptor-directory-invalid")
     path = directory["path"]
-    if not isinstance(path, str) or not artifact_manifest.validate_locator_path(path).ok:
+    if (not isinstance(path, str) or not path.startswith("artifacts/")
+            or path.rsplit("/", 1)[-1] != "raw-results"
+            or not artifact_manifest.validate_locator_path(path).ok):
         raise DirectoryBundleError("descriptor-directory-invalid", str(path))
     if isinstance(body["file_count"], bool) or not isinstance(body["file_count"], int) or body["file_count"] <= 0:
         raise DirectoryBundleError("descriptor-file-count-invalid")
@@ -338,10 +341,14 @@ def verify_coverage(cycle_root: Path, descriptor_path: str, row: Mapping[str, An
         st = os.stat(leaf_name, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(st.st_mode):
             raise DirectoryBundleError("bundle-descriptor-not-regular", descriptor_path)
+        if st.st_size > MAX_DESCRIPTOR_BYTES:
+            raise DirectoryBundleError("bundle-descriptor-size-limit", descriptor_path)
         fd = os.open(leaf_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
                      getattr(os, "O_NONBLOCK", 0), dir_fd=parent_fd)
         with os.fdopen(fd, "rb") as stream:
-            data = stream.read()
+            data = stream.read(MAX_DESCRIPTOR_BYTES + 1)
+        if len(data) > MAX_DESCRIPTOR_BYTES:
+            raise DirectoryBundleError("bundle-descriptor-size-limit", descriptor_path)
     except OSError as exc:
         raise DirectoryBundleError("bundle-descriptor-unreadable", descriptor_path, str(exc)) from exc
     finally:
@@ -351,6 +358,9 @@ def verify_coverage(cycle_root: Path, descriptor_path: str, row: Mapping[str, An
     if st.st_size != row.get("byte_size") or digest != row.get("content_digest"):
         raise DirectoryBundleError("bundle-descriptor-revision-mismatch", descriptor_path)
     body = parse_descriptor(data)
+    selected = select_outermost(Path(cycle_root) / "artifacts")
+    if body["directory"]["path"] not in selected:
+        raise DirectoryBundleError("descriptor-directory-not-selected", body["directory"]["path"])
     tree = scan_tree(cycle_root, body["directory"]["path"])
     if tree.body != body:
         raise DirectoryBundleError("bundle-tree-mismatch", body["directory"]["path"])

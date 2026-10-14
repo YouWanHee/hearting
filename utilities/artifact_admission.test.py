@@ -601,6 +601,12 @@ class TestStagingSafety(AdmissionContractBase):
         staged_cycle = adm._stage_tree(stage, published, published, doc, src)
         self.assertEqual((staged_cycle / "artifacts/raw-results/hidden.tmp").read_bytes(), b"covered")
         self.assertEqual(adm._verify_staged_files(staged_cycle, doc), [])
+        doc["artifact_revisions"][-1]["content_digest"] = "sha256:" + "0" * 64
+        coverage, violations = adm._bundle_coverage(src, doc)
+        self.assertEqual(coverage, set())
+        self.assertEqual(violations[0].code, "bundle-descriptor-revision-mismatch")
+        source_codes = {row.code for row in adm._verify_staging_source(src, doc)}
+        self.assertIn("staging-undeclared-extra-file", source_codes)
 
 # ---------------------------------------------------------------------------
 # F-1 defence (graft G-2) and the non-scope invariants
