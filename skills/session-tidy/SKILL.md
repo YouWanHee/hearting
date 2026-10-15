@@ -105,10 +105,13 @@ For a new successor at this seat, replace the clear sequence below with `peer-st
    Report its one line as printed (`prompted=true|failed|queued|unverified` and the exit
    code); do not retry or send the card any other way. A failed handoff does not change the
    clear of this window; they are separate results. Confirmed/retained delivery marks this card handed off; failure retains it.
-   After reading the card and its referenced documents, the successor runs
-   `python3 "$AGENT_HOME/utilities/session_tidy.py" handoff accept <ref>` using
-   the exact trailer ref. That one explicit acceptance schedules its reply and
-   normal predecessor retire reservation. Delivery/queue/ACK alone never accepts.
+   Ordinary peer messages and cards have no session-tidy accept command or
+   successor authority. A confirmed same-seat clear uses the existing seat
+   handover automatically. For a valid typed cross-seat handoff, read the card
+   and referenced documents, then run only the exact receiver command supplied
+   by shared guidance; do not reconstruct its ref or receiver identity.
+   Explicit acceptance schedules its reply and normal predecessor retire
+   reservation. Delivery/queue/ACK alone never accepts.
 
 4. **Report one line**, from the `clear=` word of step 2 (do not start more work after a
    `clear=scheduled`):

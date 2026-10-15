@@ -17,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -831,12 +832,89 @@ def _ack_registered_delivery(received):
         pass  # The retained courier retries the same receipt, never another send.
 
 
-def receiver_guidance():
+def _ordinary_receiver_guidance():
     return ("For a new actionable peer request, send acceptance before processing; informational/no-reply notices need no reply. "
             "Read exact completion results and perform approved review/follow-through this turn or its existing registered continuation. "
-            "Receipt, queue consumption and ACK are not execution; report actual chronology. "
-            "For a session-tidy handoff, after reading the card/docs explicitly accept with "
-            "utilities/session_tidy.py handoff accept <ref> using the exact trailer ref.")
+            "Receipt, queue consumption and ACK are not execution; report actual chronology.")
+
+
+def receiver_guidance(text="", recipient=None, *, cwd=None):
+    """Return ordinary peer guidance, plus an exact accept command only for a live handoff.
+
+    This is a read-only hint. ``accept_handoff`` repeats the same receiver check
+    while holding its existing pending lock before it records any acceptance.
+    """
+    ordinary = _ordinary_receiver_guidance()
+    if not isinstance(recipient, dict) or not _valid_transfer_endpoint(recipient):
+        return ordinary
+    try:
+        trailer = parse_peer_trailer(text, recipient, include_ref=True)
+        ref = trailer.get("transfer_ref") if isinstance(trailer, dict) else None
+        if not ref:
+            return ordinary
+        row = _read_pending(ref)
+        if not isinstance(row, dict):
+            return ordinary
+        acceptance = row.get("acceptance")
+        if isinstance(acceptance, dict) and acceptance.get("read_and_accepted") is True:
+            # Partial settlement already belongs to the retained obligation path.
+            return ordinary
+
+        # Ordinary sealed messages have no typed handoff context. Reject them
+        # before cwd validation or resolving the current runtime seat. These
+        # cheap record bindings only select possible handoffs; the shared
+        # validator below remains authoritative for context, seat, and lifetime.
+        context = row.get("handoff")
+        original_from, original_to = row.get("from"), row.get("to")
+        predecessor = context.get("predecessor") if isinstance(context, dict) else None
+        successor = context.get("successor") if isinstance(context, dict) else None
+        requester = context.get("requester") if isinstance(context, dict) else None
+        if (not isinstance(context, dict)
+                or not isinstance(original_from, dict)
+                or not isinstance(original_to, dict)
+                or not isinstance(predecessor, dict)
+                or not isinstance(successor, dict)
+                or not isinstance(requester, dict)
+                or not _valid_transfer_endpoint(original_from)
+                or not _valid_transfer_endpoint(original_to)
+                or (original_to.get("harness"), original_to.get("session_id"))
+                   != (recipient["harness"], recipient["session_id"])
+                or (predecessor.get("harness"), predecessor.get("session_id"))
+                   != (original_from.get("harness"), original_from.get("session_id"))
+                or (successor.get("harness"), successor.get("session_id"))
+                   != (recipient["harness"], recipient["session_id"])
+                or (requester.get("harness"), requester.get("session_id"))
+                   != (successor.get("harness"), successor.get("session_id"))):
+            return ordinary
+
+        if not isinstance(cwd, str) or not cwd.strip():
+            return ordinary
+        current_cwd = os.path.abspath(os.path.expanduser(cwd))
+        if not os.path.isdir(current_cwd):
+            return ordinary
+
+        # Resolve the exact runtime-supplied identity, never an inherited pane
+        # label or an id inferred from the message body.
+        import session_tidy
+        caller = session_tidy.resolve_caller(recipient["harness"], recipient["session_id"], current_cwd)
+        if (not caller or len(caller) != 3
+                or caller[1:] != (recipient["harness"], recipient["session_id"])):
+            return ordinary
+
+        import session_tidy_runner
+        session_tidy_runner.validate_handoff_receiver(row, caller)
+        command = " ".join((
+            'python3 "$AGENT_HOME/utilities/session_tidy.py" handoff accept',
+            shlex.quote(ref), "--harness", shlex.quote(recipient["harness"]),
+            "--session-id", shlex.quote(recipient["session_id"]),
+            "--cwd", shlex.quote(current_cwd),
+        ))
+        return (ordinary + "\n\nFor this verified cross-seat session-tidy handoff, read the card and referenced documents, "
+                "then run exactly:\n`" + command + "`")
+    except Exception:
+        # Guidance is advisory: unavailable or uncertain evidence must not
+        # interrupt ordinary receipt, ACK, or completion handling.
+        return ordinary
 
 
 def receive_peer_message(text, recipient, project="", *, summary_text=""):

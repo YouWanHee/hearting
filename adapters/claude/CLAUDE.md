@@ -123,7 +123,7 @@ and at launch.
 
 <!-- BEGIN generated from core/fragments/bootstrap-continuation.md by tools/sync-bootstrap-dispatch.py; edit the source -->
 Keep unfinished tracked work in this turn or its existing registered continuation; when automatic follow-up is unsupported, state the checked fallback. Report PID/start, exit/log and artifact evidence.
-On completion, read the exact result and perform approved parent review/follow-through now or through that continuation. Receipt/queue/ACK is not execution; report actual chronology. Reply before processing an actionable peer request; no-reply notices need no reply. After reading a handoff card/docs, accept with `utilities/session_tidy.py handoff accept <ref>`.
+On completion, read the exact result and perform approved parent review/follow-through now or through that continuation. Receipt/queue/ACK is not execution; report actual chronology. Reply before processing an actionable peer request; no-reply notices need no reply. Accept a handoff only via its supplied command; plain refs/cards and same-seat clear need none.
 <!-- END generated from core/fragments/bootstrap-continuation.md -->
 
 `OPERATIONS §5.12` owns the mechanics.

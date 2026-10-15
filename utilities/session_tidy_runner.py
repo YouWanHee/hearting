@@ -1076,6 +1076,74 @@ def _handoff_steward():
     return module
 
 
+def validate_handoff_receiver(row, caller, *, steward=None):
+    """Read-only check shared by receiver guidance and explicit acceptance."""
+    try:
+        seat, harness, sid = caller
+    except (TypeError, ValueError):
+        raise ValueError("handoff-successor-mismatch") from None
+    steward = steward or _handoff_steward()
+    peer = steward.peer_message
+    context = row.get("handoff") if isinstance(row, dict) else None
+    original_from = row.get("from") if isinstance(row, dict) else None
+    original_to = row.get("to") if isinstance(row, dict) else None
+    if (not isinstance(context, dict) or not isinstance(original_from, dict)
+            or not isinstance(original_to, dict)
+            or (original_to.get("harness"), original_to.get("session_id")) != (harness, sid)
+            or not peer._valid_transfer_endpoint(original_to)):
+        raise ValueError("handoff-successor-mismatch")
+
+    predecessor = context.get("predecessor")
+    successor = context.get("successor")
+    requester = context.get("requester")
+    target = context.get("target")
+    def valid_pane(value):
+        return (isinstance(value, str) and 0 < len(value) <= 512
+                and not any(ord(ch) < 32 for ch in value))
+    def valid_server(value):
+        return isinstance(value, str) and bool(value) and not any(ord(ch) < 32 for ch in value)
+
+    if (not isinstance(predecessor, dict) or not isinstance(successor, dict)
+            or not isinstance(requester, dict) or not valid_pane(target)
+            or not valid_pane(predecessor.get("pane"))
+            or not valid_server(predecessor.get("server"))
+            or predecessor.get("pane") != target
+            or (predecessor.get("harness"), predecessor.get("session_id"))
+               != (original_from.get("harness"), original_from.get("session_id"))
+            or not peer._valid_transfer_endpoint({"harness": predecessor.get("harness"),
+                                                  "session_id": predecessor.get("session_id")})
+            or not valid_pane(successor.get("pane"))
+            or not valid_server(successor.get("server"))
+            or (successor.get("harness"), successor.get("session_id")) != (harness, sid)
+            or successor.get("pane") == predecessor.get("pane")
+            or not peer._valid_transfer_endpoint({"harness": successor.get("harness"),
+                                                  "session_id": successor.get("session_id")})
+            or (requester.get("harness"), requester.get("session_id"),
+                requester.get("pane"), requester.get("server"))
+               != (successor.get("harness"), successor.get("session_id"),
+                   successor.get("pane"), successor.get("server"))):
+        raise ValueError("handoff-context-invalid")
+
+    if (getattr(seat, "kind", None) != "pane" or seat.pane != successor["pane"]
+            or (steward._HERDR_SESSION or "default") != successor["server"]):
+        raise ValueError("handoff-successor-seat-mismatch")
+    _, current, _, _ = steward._retire_target(successor["pane"])
+    try:
+        observed = steward._retire_request_identity(current,
+            steward._retire_foreground(successor["pane"], harness, strict=False))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("handoff-successor-lifetime-unverified") from None
+    for identity in (successor, observed):
+        foreground = identity.get("foreground")
+        if (not steward._handoff_lifetime_valid(foreground)
+                or not steward._pid_identity_ok(foreground["pid"], foreground["start"])):
+            raise ValueError("handoff-successor-lifetime-unverified")
+    if any(observed.get(k) != successor.get(k)
+           for k in ("server", "pane", "harness", "session_id", "foreground")):
+        raise ValueError("handoff-successor-lifetime-mismatch")
+    return context, successor
+
+
 def accept_handoff(ref, caller, *, steward=None):
     """The agent explicitly asserts it read the card/docs and accepts this transfer."""
     seat, harness, sid = caller
@@ -1083,23 +1151,7 @@ def accept_handoff(ref, caller, *, steward=None):
     peer = steward.peer_message
     with peer.pending_lock(ref):
         row = peer._read_pending(ref)
-        context = (row or {}).get("handoff")
-        if not isinstance(context, dict) or (row["to"].get("harness"), row["to"].get("session_id")) != (harness, sid):
-            raise ValueError("handoff-successor-mismatch")
-        successor = context["successor"]
-        if (seat.pane != successor["pane"] or (steward._HERDR_SESSION or "default") != successor["server"]):
-            raise ValueError("handoff-successor-seat-mismatch")
-        _, current, _, _ = steward._retire_target(successor["pane"])
-        observed = steward._retire_request_identity(current,
-            steward._retire_foreground(successor["pane"], harness, strict=False))
-        for identity in (successor, observed):
-            foreground = identity.get("foreground")
-            if (not steward._handoff_lifetime_valid(foreground)
-                    or not steward._pid_identity_ok(foreground["pid"], foreground["start"])):
-                raise ValueError("handoff-successor-lifetime-unverified")
-        if any(observed.get(k) != successor.get(k)
-               for k in ("server", "pane", "harness", "session_id", "foreground")):
-            raise ValueError("handoff-successor-lifetime-mismatch")
+        context, successor = validate_handoff_receiver(row, caller, steward=steward)
         # Receipt callbacks never set this. Keep progress in the existing row.
         # Register recovery before recording acceptance. Until that explicit
         # record exists the runner waits; it can never infer agent approval.

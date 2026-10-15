@@ -536,6 +536,7 @@ console.log(JSON.stringify(output));
         context = "\n".join(json.loads(run.stdout)["system"])
         self.assertIn("send acceptance before processing", context)
         self.assertIn("ACK are not execution", context)
+        self.assertNotIn("handoff accept", context)
         self.assertNotIn("acceptance", pm._read_pending(ref))
 
     def test_opencode_normal_registration_and_callback_observation_is_bounded_and_fail_soft(self):

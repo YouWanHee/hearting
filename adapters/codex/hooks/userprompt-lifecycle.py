@@ -460,12 +460,13 @@ def main() -> int:
         batches, parts = native_queue_prompt_receipts(sid)
     except Exception:
         parts = []
-    if "peer-from:" in current_prompt:
+    if "peer-from:" in current_prompt or "cross-session-message" in current_prompt:
         import importlib.util
         spec = importlib.util.spec_from_file_location("peer_receiver_guidance", ROOT / "utilities/peer-message.py")
         peer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(peer)
-        parts.append(peer.receiver_guidance())
+        parts.append(peer.receiver_guidance(current_prompt,
+            {"harness": "codex", "session_id": interaction_sid}, cwd=current_cwd))
     parts.append(card)
     parts.append(candidate_context(payload, current_cwd, sid))
     parts.append(run_preflight("briefing", current_cwd))

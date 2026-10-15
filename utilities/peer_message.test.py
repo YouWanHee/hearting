@@ -8,6 +8,7 @@ import io
 import importlib.util
 import json
 import os
+import shlex
 import stat
 import sys
 import tempfile
@@ -1210,6 +1211,144 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
             mock.patch.object(self.steward, "_HERDR_SESSION", None)]
         for p in patches:
             p.start(); self.addCleanup(p.stop)
+
+    def test_ordinary_sealed_message_skips_runtime_handoff_resolution(self):
+        import session_tidy
+        text, ref = peer_message.prepare_peer_message(
+            "Please review this ordinary request", self.sender, self.recipient, defer=True)
+        path = peer_message._pending_path(ref)
+        before_bytes = path.read_bytes()
+        before_obligations = self.store.list()
+        self.assertEqual(peer_message.parse_peer_trailer(
+            text, self.recipient, include_ref=True)["transfer_ref"], ref)
+        self.assertNotIn("handoff", peer_message._read_pending(ref))
+        self.assertNotIn("acceptance", peer_message._read_pending(ref))
+
+        with mock.patch.object(session_tidy, "resolve_caller") as resolve, \
+             mock.patch.object(self.steward, "_retire_target") as target:
+            guidance = peer_message.receiver_guidance(
+                text, self.recipient, cwd=str(self.tmp_root))
+
+        self.assertEqual(guidance, peer_message._ordinary_receiver_guidance())
+        self.assertNotIn("handoff accept", guidance)
+        resolve.assert_not_called()
+        target.assert_not_called()
+        self.assertEqual(path.read_bytes(), before_bytes)
+        self.assertNotIn("acceptance", peer_message._read_pending(ref))
+        self.assertEqual(self.store.list(), before_obligations)
+
+    def test_native_wrapper_without_exact_ref_skips_runtime_handoff_resolution(self):
+        import session_tidy
+        wrapped = ('<pasted_content id="native-42">\n'
+                   'ordinary native notification\n</pasted_content>')
+        parsed = peer_message.parse_peer_trailer(wrapped, self.recipient, include_ref=True)
+        self.assertFalse(parsed and parsed.get("transfer_ref"))
+        before_obligations = self.store.list()
+
+        with mock.patch.object(session_tidy, "resolve_caller") as resolve, \
+             mock.patch.object(self.steward, "_retire_target") as target:
+            guidance = peer_message.receiver_guidance(
+                wrapped, self.recipient, cwd=str(self.tmp_root))
+
+        self.assertEqual(guidance, peer_message._ordinary_receiver_guidance())
+        self.assertNotIn("handoff accept", guidance)
+        resolve.assert_not_called()
+        target.assert_not_called()
+        self.assertEqual(self.store.list(), before_obligations)
+
+    def test_receiver_guidance_command_binds_each_adapter_identity(self):
+        import session_tidy
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                recipient = {"harness": harness, "session_id": harness + "-receiver", "name": "new"}
+                text, ref = peer_message.prepare_peer_message("[handoff] card", self.sender, recipient, defer=True)
+                predecessor = {**self.predecessor}
+                successor = {**recipient, "pane": "p2", "server": "default",
+                             "foreground": {"pid": 22, "start": "202"}}
+                row = peer_message._read_pending(ref)
+                row["handoff"] = {"card_id": "card-exact", "target": "p1",
+                    "predecessor": predecessor, "successor": successor,
+                    "requester": {"harness": harness, "session_id": recipient["session_id"],
+                                  "pane": "p2", "server": "default"}}
+                peer_message._save_pending(row)
+                caller = (session_tidy.Seat("pane", "seat-" + harness, "p2"),
+                          harness, recipient["session_id"])
+                current = {key: value for key, value in successor.items()
+                           if key not in {"server", "foreground"}}
+                with mock.patch.object(session_tidy, "resolve_caller", return_value=caller), \
+                     mock.patch.object(self.steward, "_retire_target",
+                                       return_value=("idle", current, None, None)):
+                    guidance = peer_message.receiver_guidance(text, recipient, cwd=str(self.tmp_root))
+                self.assertEqual(guidance.count("handoff accept"), 1)
+                command = guidance.split("run exactly:\n`", 1)[1].split("`", 1)[0]
+                tokens = shlex.split(command)
+                self.assertEqual(tokens[:3], ["python3", "$AGENT_HOME/utilities/session_tidy.py", "handoff"])
+                args = session_tidy.build_parser().parse_args(tokens[2:])
+                self.assertEqual(args.command, "handoff")
+                self.assertEqual(args.target, "accept")
+                self.assertEqual(args.transfer_ref, ref)
+                self.assertEqual(args.harness, harness)
+                self.assertEqual(args.session_id, recipient["session_id"])
+                self.assertEqual(args.cwd, str(self.tmp_root.resolve()))
+                after = peer_message._read_pending(ref)
+                self.assertNotIn("acceptance", after)
+        self.assertEqual(self.store.list(), [])
+
+    def test_received_scrubbed_handoff_keeps_exact_guidance_without_accepting(self):
+        import session_tidy
+        peer_message.receive_peer_message(self.text, self.recipient)
+        received = peer_message._read_pending(self.ref)
+        self.assertEqual(received["state"], "received")
+        self.assertIsNone(received["text"])
+        caller = self.caller
+        with mock.patch.object(session_tidy, "resolve_caller", return_value=caller):
+            guidance = peer_message.receiver_guidance(self.text, self.recipient, cwd=str(self.tmp_root))
+        self.assertIn(self.ref, guidance)
+        self.assertIn("--harness codex --session-id successor", guidance)
+        self.assertNotIn("acceptance", peer_message._read_pending(self.ref))
+        self.assertEqual(self.store.list(), [])
+
+    def test_guidance_suppresses_project_wrong_and_unverified_receivers(self):
+        import session_tidy
+        project_caller = (session_tidy.Seat("project", "project-seat", ""), "codex", "successor")
+        with mock.patch.object(session_tidy, "resolve_caller", return_value=project_caller), \
+             mock.patch.object(self.steward, "_retire_target") as target:
+            guidance = peer_message.receiver_guidance(self.text, self.recipient, cwd=str(self.tmp_root))
+        self.assertNotIn("handoff accept", guidance)
+        target.assert_not_called()
+
+        wrong_caller = (self.caller[0], "codex", "other-session")
+        with mock.patch.object(session_tidy, "resolve_caller", return_value=wrong_caller):
+            guidance = peer_message.receiver_guidance(self.text, self.recipient, cwd=str(self.tmp_root))
+        self.assertNotIn("handoff accept", guidance)
+
+        with mock.patch.object(session_tidy, "resolve_caller", return_value=self.caller), \
+             mock.patch.object(self.steward, "_pid_identity_ok", return_value=False):
+            guidance = peer_message.receiver_guidance(self.text, self.recipient, cwd=str(self.tmp_root))
+        self.assertNotIn("handoff accept", guidance)
+        self.assertNotIn("acceptance", peer_message._read_pending(self.ref))
+        self.assertEqual(self.store.list(), [])
+
+    def test_guidance_needs_exact_sealed_ref_and_suppresses_partial_acceptance(self):
+        import session_tidy
+        ordinary = "Please continue from this card; [handoff] is only text."
+        for text, recipient in (
+            (ordinary + " (peer-from: codex [0a] tag ; ref=11111111111111111111111111111111)", self.recipient),
+            (self.text, {"harness": "codex", "session_id": "foreign"}),
+            (self.text, {"harness": "codex", "session_id": None}),
+        ):
+            guidance = peer_message.receiver_guidance(text, recipient, cwd=str(self.tmp_root))
+            self.assertNotIn("handoff accept", guidance)
+        self.assertNotIn("handoff accept", peer_message.receiver_guidance())
+
+        row = peer_message._read_pending(self.ref)
+        row["acceptance"] = {"read_and_accepted": True, "settled": False}
+        peer_message._save_pending(row)
+        with mock.patch.object(session_tidy, "resolve_caller", side_effect=AssertionError("already accepted")):
+            guidance = peer_message.receiver_guidance(self.text, self.recipient, cwd=str(self.tmp_root))
+        self.assertNotIn("handoff accept", guidance)
+        self.assertEqual(peer_message._read_pending(self.ref)["acceptance"],
+                         {"read_and_accepted": True, "settled": False})
 
     def test_receipt_never_accepts_and_explicit_acceptance_is_once_only(self):
         peer_message.receive_peer_message(self.text, self.recipient)
