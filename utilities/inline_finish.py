@@ -25,6 +25,8 @@ def _scope_matches(path: str, item: str) -> bool:
         return False
     if item.endswith("/**"):
         base = item[:-3].rstrip("/")
+        if any(char in base for char in "*?["):
+            return fnmatch.fnmatchcase(path, base + "/*")
         return path == base or path.startswith(base + "/")
     base = item.rstrip("/")
     if path == base or path.startswith(base + "/"):

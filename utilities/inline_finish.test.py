@@ -822,9 +822,19 @@ class PublicInlineFinishTest(unittest.TestCase):
 
     def test_mixed_synthetic_and_concrete_file_directory_or_glob_scope_still_refuses(self):
         (self.repo / "README.md").write_text("dirty source\n", encoding="utf-8")
+        nested = self.repo / "pkg" / "nested dir" / "tracked file.py"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("base\n", encoding="utf-8")
+        test_file = self.repo / "tests" / "unit" / "tracked file.py"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "pkg", "tests"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "add nested scope fixtures"], check=True)
+        nested.write_text("dirty nested source\n", encoding="utf-8")
+        test_file.write_text("dirty test source\n", encoding="utf-8")
         args = SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
         state_path = self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json"
-        for concrete in ("README.md", "README.md/**", "READ*"):
+        for concrete in ("README.md", "README.md/**", "READ*", "pkg/**", "p*/**", "tests/**"):
             with self.subTest(scope=concrete):
                 scope = ["source-scoped", concrete]
                 with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
@@ -864,6 +874,37 @@ class PublicInlineFinishTest(unittest.TestCase):
         (self.repo / "README.md").write_text("raced scoped dirt\n", encoding="utf-8")
         with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
             inline_finish._unscoped_tracked_dirt(str(self.repo), scope)
+        self.assertFalse((self.root / ".runtime/inline-finish/v1" /
+                          self.route["route_id"] / "finish.json").exists())
+
+    def test_locked_revalidation_rejects_recursive_glob_dirt_without_mutating_sealed_route(self):
+        nested = self.repo / "pkg" / "locked dir" / "tracked file.py"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "pkg"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "add locked glob fixture"], check=True)
+        route_bytes = self.route_file.read_bytes()
+        original = inline_finish._unscoped_tracked_dirt
+        calls = 0
+
+        def introduce_scoped_dirt(cwd, scope):
+            nonlocal calls
+            calls += 1
+            # Exercise the same shared judgement with a concrete recursive glob
+            # while leaving the compiler-sealed route and its hash untouched.
+            concrete_scope = [*scope, "p*/**"]
+            if calls == 2:
+                nested.write_text("raced scoped dirt\n", encoding="utf-8")
+            return original(cwd, concrete_scope)
+
+        args = SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
+        with unittest.mock.patch.object(inline_finish, "_unscoped_tracked_dirt",
+                                        side_effect=introduce_scoped_dirt):
+            with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+                inline_finish.finish(args, self.route, self.route_file, CAP)
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.route_file.read_bytes(), route_bytes)
+        self.assertEqual(CAP.route_hash(json.loads(route_bytes)), self.route["route_hash"])
         self.assertFalse((self.root / ".runtime/inline-finish/v1" /
                           self.route["route_id"] / "finish.json").exists())
 
