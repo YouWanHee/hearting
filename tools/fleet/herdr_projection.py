@@ -479,17 +479,22 @@ def _herdr_endpoint(socket_path):
             os.environ["HERDR_SOCKET_PATH"] = inherited
 
 
+def _codex_tui_endpoint(session_id: str):
+    """The unique pane/socket pair whose live foreground Codex TUI proves ``session_id``."""
+    try:
+        from pane_ownership import codex_tui_pane_endpoint
+        return codex_tui_pane_endpoint(session_id)
+    except Exception:
+        return None
+
+
 def _codex_tui_pane(session_id: str, *, transport=None):
     """The unique pane whose live foreground Codex TUI proves ``session_id``, or None.
 
     Two panes resolving to one session stay unknown: a badge on the wrong pane
     also misdirects peer messages.
     """
-    try:
-        from pane_ownership import codex_tui_pane_endpoint
-        pair = codex_tui_pane_endpoint(session_id)
-    except Exception:
-        pair = None
+    pair = _codex_tui_endpoint(session_id)
     if pair is None:
         return None
     pane, socket_path = pair
@@ -513,13 +518,13 @@ def _await_tui_and_project(session_id: str, report_session: bool, *,
     try:
         deadline = time.monotonic() + _PROOF_WAIT_S
         while time.monotonic() < deadline:
-            transport = {}
-            pane = _codex_tui_pane(session_id, transport=transport)
-            if pane:
-                with _herdr_endpoint(transport.get("socket_path")):
+            endpoint = _codex_tui_endpoint(session_id)
+            if endpoint:
+                pane, socket_path = endpoint
+                with _herdr_endpoint(socket_path):
                     _report("codex", session_id, pane, report_session,
                             session_seq=session_seq, session_start_source=session_start_source,
-                            _proof=lambda: _codex_tui_pane(session_id) == pane)
+                            _proof=lambda: _codex_tui_endpoint(session_id) == endpoint)
                 return
             time.sleep(2)
     finally:

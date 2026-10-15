@@ -193,6 +193,52 @@ class CodexFooterBindingTest(unittest.TestCase):
                                     and "HERDR_PANE_ID" not in read_env
                                     for _target, read_env in self.screen_reads if _target == pane))
 
+    def run_deferred_report_with_endpoints(self, endpoints):
+        sent = []
+
+        def record_report(command, _observation):
+            sent.append((command, os.environ.get("HERDR_SOCKET_PATH")))
+
+        with mock.patch.object(pane_ownership, "codex_tui_pane_endpoint",
+                               side_effect=endpoints), \
+                mock.patch.object(projection.shutil, "which", return_value="/fake/herdr"), \
+                mock.patch.object(projection, "_send_projection", side_effect=record_report), \
+                mock.patch("tempfile.gettempdir", return_value=str(self.root)):
+            projection._await_tui_and_project(THREAD_A, True)
+        return sent
+
+    def test_deferred_report_proof_rejects_socket_switch_before_session_report(self):
+        pane = "wC:p7"
+        sent = self.run_deferred_report_with_endpoints([
+            (pane, "/endpoint/A.sock"),
+            (pane, "/endpoint/B.sock"),
+        ])
+        self.assertEqual(sent, [])
+
+    def test_deferred_report_proof_rejects_socket_switch_before_metadata_report(self):
+        pane = "wC:p7"
+        sent = self.run_deferred_report_with_endpoints([
+            (pane, "/endpoint/A.sock"),
+            (pane, "/endpoint/A.sock"),
+            (pane, "/endpoint/B.sock"),
+        ])
+        self.assertEqual(len(sent), 1)
+        command, socket_path = sent[0]
+        self.assertEqual(command[1:4], ["pane", "report-agent-session", pane])
+        self.assertEqual(socket_path, "/endpoint/A.sock")
+
+    def test_deferred_report_proof_allows_a_stable_pane_socket_pair(self):
+        pane = "wC:p7"
+        sent = self.run_deferred_report_with_endpoints([
+            (pane, "/endpoint/A.sock"),
+            (pane, "/endpoint/A.sock"),
+            (pane, "/endpoint/A.sock"),
+        ])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual([item[0][2] for item in sent],
+                         ["report-agent-session", "report-metadata"])
+        self.assertTrue(all(socket_path == "/endpoint/A.sock" for _, socket_path in sent))
+
     def test_deferred_proof_helper_skips_only_known_incapable_frontend_config(self):
         for feasibility, should_spawn in (("incapable", False), ("capable", True), ("unknown", True)):
             with self.subTest(feasibility=feasibility), \
