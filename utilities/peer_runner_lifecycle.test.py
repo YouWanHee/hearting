@@ -262,6 +262,44 @@ console.log(JSON.stringify(calls[0]));
             self.assertEqual(Path(fixed_argv[1]), checkout / "utilities/peer-steward.py")
             self.assertNotIn("--service-current", fixed_argv)
 
+        mismatch_env = self._environment(self.b)
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, mismatch_env, clear=True), \
+             mock.patch.object(obligations.subprocess, "Popen") as mismatch:
+            self.assertTrue(obligations.ensure_normal_runner(self.state))
+            mismatch_argv = mismatch.call_args.args[0]
+            self.assertEqual(Path(mismatch_argv[1]), self.a / "utilities/peer-steward.py")
+            self.assertNotIn("--service-current", mismatch_argv)
+
+        foreign_data = self.base / "foreign-data"
+        foreign_releases = foreign_data / "releases"
+        foreign_releases.mkdir(parents=True)
+        foreign = foreign_releases / "Foreign"
+        shutil.copytree(self.b, foreign)
+        (foreign_data / "current").symlink_to(foreign, target_is_directory=True)
+        foreign_env = self._environment(foreign)
+        foreign_env["HARNESS_DATA_ROOT"] = str(foreign_data)
+        with mock.patch.object(obligations, "__file__",
+                               str(foreign / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, foreign_env, clear=True), \
+             mock.patch.object(obligations.subprocess, "Popen") as other_install:
+            self.assertTrue(obligations.ensure_normal_runner(self.state))
+            foreign_argv = other_install.call_args.args[0]
+            self.assertEqual(Path(foreign_argv[1]), foreign / "utilities/peer-steward.py")
+            self.assertNotIn("--service-current", foreign_argv)
+
+        lock_path.write_text("not-json", encoding="utf-8")
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, self.env, clear=True), \
+             mock.patch.object(obligations.subprocess, "Popen") as malformed:
+            self.assertTrue(obligations.ensure_normal_runner(self.state))
+            malformed_argv = malformed.call_args.args[0]
+            self.assertEqual(Path(malformed_argv[1]), self.a / "utilities/peer-steward.py")
+            self.assertNotIn("--service-current", malformed_argv)
+        self.assertEqual(lock_path.read_text(encoding="utf-8"), "not-json")
+
     def test_fixed_invocations_checkouts_foreign_installs_and_overrides_stay_fixed(self):
         self._point_current(self.b)
         cases = []
