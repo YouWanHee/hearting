@@ -155,7 +155,7 @@ class ObligationStoreTest(unittest.TestCase):
         ensure.assert_called_once_with(jobs.parent)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
-    def test_unsupported_observer_keeps_same_lock_without_losing_accepted_duties(self):
+    def test_unsupported_observer_releases_same_lock_without_losing_accepted_duties(self):
         self._check_observer_handoff(supported=False)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
@@ -163,7 +163,7 @@ class ObligationStoreTest(unittest.TestCase):
         self._check_observer_handoff(supported=True)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
-    def test_claude_only_observer_keeps_lock_for_shared_activation_delivery(self):
+    def test_claude_only_observer_is_replaced_for_shared_activation_delivery(self):
         self._check_observer_handoff(supported=False, native_only=True)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
@@ -203,8 +203,9 @@ class ObligationStoreTest(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     spawned.assert_not_called()
                 else:
-                    self.assertIsNone(process.poll())
-                    spawned.assert_not_called()
+                    self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+                    spawned.assert_called_once()
+                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
             self.assertEqual(self.store.get(duty["id"]), duty)
             self.assertEqual(self.store.get(prior["id"]), prior)
         finally:

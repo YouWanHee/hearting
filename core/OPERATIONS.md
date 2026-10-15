@@ -526,6 +526,8 @@ only after the common helper validates it against that same installation's
 current pointer. It records service code provenance only; it grants no session,
 route, recipient, or other operation authority. Changing service code preserves
 the accepted duty, transfer identity, recipient, and session authority.
+Release following uses self-exec and preserves the narrow legacy compatibility
+handoff.
 
 The completion duty belongs to the outer controller and durable pending record,
 not to the lifetime of one model turn, watcher process, or tab location. A

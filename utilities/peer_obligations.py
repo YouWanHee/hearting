@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -588,6 +589,45 @@ def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
     return kind + "-" + hashlib.sha256(raw).hexdigest()[:32]
 
 
+def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
+    """Replace only an exact observer whose old code cannot process this duty.
+
+    Accepted work stays in the existing store; the same flock fences its next
+    observer. A pidfd prevents a recycled PID from ever receiving the signal.
+    """
+    if not any(d.get("intent", {}).get("kind") == "registered-batch" for d in store.list()):
+        return False
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
+    state_root = str(store.root.parents[1])
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        pidfd = None
+        try:
+            pidfd = os.pidfd_open(int(proc.name))
+            argv = (proc / "cmdline").read_bytes().decode().rstrip("\0").split("\0")
+            if (len(argv) < 3 or Path(argv[1]).name != "peer-steward.py"
+                    or argv[2] != "__obligation-runner"
+                    or argv[argv.index("--state-root") + 1] != state_root):
+                continue
+            lock_fd = argv[argv.index("--lock-fd") + 1]
+            if (proc / "fd" / lock_fd).resolve() != lock_path.resolve():
+                continue
+            source = Path(argv[1]).read_text()
+            if ("def _resume_registered_obligation(" in source
+                    and "from dispatch_session_sweep import addressed_records" in source):
+                continue
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            return True
+        except (OSError, ValueError, IndexError, UnicodeError):
+            continue
+        finally:
+            if pidfd is not None:
+                os.close(pidfd)
+    return False
+
+
 def _ensure_runner(root, *, service_current=None, use_remembered=False,
                    remember_binding=False):
     store = ObligationStore(root)
@@ -604,9 +644,17 @@ def _ensure_runner(root, *, service_current=None, use_remembered=False,
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            # The lock holder owns the accepted duties. Never change its
-            # provenance payload, signal it, or replace it from a producer.
-            return True
+            if not _handoff_legacy_runner(store, lock_path):
+                return True
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(0.02)
         code_root = _code_root()
         binding = validate_service_binding(service_current, root=code_root)
         if use_remembered:

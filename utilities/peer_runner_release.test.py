@@ -64,9 +64,14 @@ class ReleaseTransitionTest(unittest.TestCase):
         self.sender = {"harness": "codex", "session_id": "sid-release-sender", "name": "sender"}
         self.recipient = {"harness": "codex", "session_id": "sid-release-recipient", "name": "recipient"}
         self.env = self._environment(self.a)
-        with mock.patch.dict(os.environ, self.env, clear=True):
-            self.ref, self.body_digest, self.duty_id = self._seed_acknowledged_duty()
+        # Every parent-side helper and cleanup starts in this private fixture.
+        # Nested contexts select deliberate release/transport variants only.
+        fixture_environment = mock.patch.dict(os.environ, self.env, clear=True)
+        fixture_environment.start()
+        self.addCleanup(fixture_environment.stop)
+        self.ref, self.body_digest, self.duty_id = self._seed_acknowledged_duty()
         self.env["RUNNER_FIXTURE_TARGET_REF"] = self.ref
+        os.environ["RUNNER_FIXTURE_TARGET_REF"] = self.ref
 
     def _release(self, version):
         root = self.releases / version
