@@ -301,9 +301,9 @@ that is not a cycle bucket (`_internal/`, `shards/`) while the cycle holds
 another file, then takes the first `PRIMARY_CANDIDATES` name (including nested
 `report.html`), then a Markdown or HTML document, then the first remaining file;
 an explicit `--primary` is kept as given. Exact cycle-root `_internal/**`
-rows are always support and are excluded from every automatic primary fallback.
-They do not widen explicit primary or terminal-evidence scope; when no other
-primary candidate exists, the outcome has no required primary role.
+rows have support role and no authority as an automatic or explicit primary or
+terminal evidence. Without another primary candidate, the outcome has no required
+primary role.
 When the registered owner supplies a valid primary in its exact PASS handoff,
 terminal settlement uses that same artifact for the producer manifest and the
 sealed owner envelope. Without a valid owner primary, existing selection
