@@ -13,6 +13,143 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runtime_activation as activation  # noqa: E402
 import installer  # noqa: E402
 import fixture_env  # noqa: E402
+import codex_hook_trust  # noqa: E402
+
+
+class CodexHookTrustTest(unittest.TestCase):
+    def test_activation_publishes_the_receipt_and_deactivation_restores_its_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            calls = []
+
+            def record(home, hooks_file, previous, **_kwargs):
+                calls.append((home, hooks_file, previous))
+                self.assertTrue((home / "hooks.json").is_symlink())
+                config = home / "config.toml"
+                with config.open("a", encoding="utf-8") as handle:
+                    handle.write('\n[hooks.state."fixture-key"]\ntrusted_hash = "sha256:fixture"\n')
+                return {"record": {"schema": 1, "hooks": {"fixture-key": {
+                    "source": str(hooks_file), "written_hash": "sha256:fixture",
+                    "baseline_present": False, "baseline_value": None}}},
+                    "status": "recorded", "report_lines": []}
+
+            with fixture_env.patched_environment(root / "fixture", source), \
+                    mock.patch.object(codex_hook_trust, "record_managed_trust", side_effect=record):
+                activation.activate("codex", "linked", str(source))
+                state = activation._load_json(activation._state_path("codex"))
+                self.assertEqual(state["managed_config"]["codex_hook_trust"]["hooks"]["fixture-key"][
+                    "written_hash"], "sha256:fixture")
+                self.assertEqual(len(calls), 1)
+                activation.deactivate("codex")
+                config = activation.paths.runtime_home("codex") / "config.toml"
+                self.assertFalse(config.exists())
+
+    def test_state_publication_failure_rolls_back_the_native_trust_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            original_atomic_json = activation._atomic_json
+
+            def record(home, hooks_file, previous, **_kwargs):
+                with (home / "config.toml").open("a", encoding="utf-8") as handle:
+                    handle.write('\n[hooks.state."fixture-key"]\ntrusted_hash = "sha256:fixture"\n')
+                return {"record": {"schema": 1, "hooks": {"fixture-key": {
+                    "source": str(hooks_file), "written_hash": "sha256:fixture",
+                    "baseline_present": False, "baseline_value": None}}},
+                    "status": "recorded", "report_lines": []}
+
+            def fail_state(path, payload):
+                if Path(path) == activation._state_path("codex"):
+                    raise OSError("fixture-state-publication-failed")
+                return original_atomic_json(path, payload)
+
+            with fixture_env.patched_environment(root / "fixture", source), \
+                    mock.patch.object(codex_hook_trust, "record_managed_trust", side_effect=record), \
+                    mock.patch.object(activation, "_atomic_json", side_effect=fail_state):
+                with self.assertRaisesRegex(OSError, "fixture-state-publication-failed"):
+                    activation.activate("codex", "linked", str(source))
+                home = activation.paths.runtime_home("codex")
+                self.assertFalse((home / "config.toml").exists())
+                self.assertFalse((home / "hooks.json").exists())
+                self.assertFalse(activation._state_path("codex").exists())
+
+    def test_native_hash_upsert_uses_resolved_config_and_preserves_disabled_sibling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "codex-home"
+            home.mkdir()
+            active = root / "active"
+            active.mkdir()
+            hooks = active / "hooks.json"
+            hooks.write_text('{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}')
+            (home / "hooks.json").symlink_to(hooks)
+            target = root / "external-config.toml"
+            target.write_text('[hooks.state."stable-key"]\nenabled = false\n')
+            target.chmod(0o640)
+            config = home / "config.toml"
+            config.symlink_to(os.path.relpath(target, home))
+            observed = {}
+
+            class Server:
+                def __init__(self, command, cwd, *, env=None):
+                    observed.update(command=command, cwd=cwd, env=env)
+                def request(self, method, params, *, timeout=5):
+                    observed.setdefault("calls", []).append((method, params, timeout))
+                    if method == "hooks/list":
+                        return {"data": [{"cwd": str(Path(os.environ.get("TMPDIR") or "/tmp").resolve()),
+                                          "hooks": [{"sourcePath": str(hooks), "key": "stable-key",
+                                                     "currentHash": "sha256:new", "trustStatus": "untrusted",
+                                                     "enabled": False}]}]}
+                    if method == "config/batchWrite":
+                        self.params = params
+                        target.write_text('[hooks.state."stable-key"]\nenabled = false\ntrusted_hash = "sha256:new"\n')
+                        return {}
+                    return {}
+                def notify(self, method):
+                    observed.setdefault("notifications", []).append(method)
+                def close(self):
+                    observed["closed"] = True
+
+            fake_client = type("Client", (), {
+                "AppServer": Server,
+                "same_source": staticmethod(lambda raw, expected: Path(raw).samefile(expected)),
+            })
+            with mock.patch.object(codex_hook_trust, "_status_client", return_value=fake_client):
+                result = codex_hook_trust.record_managed_trust(home, hooks, None, command=["fixture"])
+            self.assertEqual(result["status"], "recorded")
+            self.assertEqual(result["record"]["hooks"]["stable-key"]["written_hash"], "sha256:new")
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+            self.assertIn("enabled = false", target.read_text())
+            write = next(params for method, params, _ in observed["calls"] if method == "config/batchWrite")
+            self.assertEqual(write["filePath"], str(target))
+            self.assertTrue(write["reloadUserConfig"])
+            self.assertNotIn("enabled", json.dumps(write))
+            self.assertEqual(write["edits"][0]["keyPath"], "hooks.state")
+            self.assertEqual(observed["env"]["CODEX_HOME"], str(home))
+
+    def test_restorer_only_changes_its_owned_trusted_hash_leaf(self):
+        original = ('[hooks.state."key"]\nenabled = false\ntrusted_hash = "sha256:owned"\n'
+                    '\n[other]\nvalue = 1\n')
+        record = {"hooks": {"key": {"written_hash": "sha256:owned", "baseline_present": False}}}
+        restored, reports = codex_hook_trust.restore_trust_text(original, record)
+        self.assertEqual(reports, [])
+        self.assertIn("enabled = false", restored)
+        self.assertNotIn("trusted_hash", restored)
+        self.assertIn("[other]", restored)
+        import tomllib
+        self.assertEqual(tomllib.loads(restored)["hooks"]["state"]["key"]["enabled"], False)
+
+    def test_restorer_removes_an_empty_owned_table_before_an_unrelated_table(self):
+        original = ('[hooks.state."key"]\ntrusted_hash = "sha256:owned"\n'
+                    '\n[projects."/mine"]\ntrust_level = "trusted"\n')
+        record = {"hooks": {"key": {"written_hash": "sha256:owned", "baseline_present": False}}}
+        restored, reports = codex_hook_trust.restore_trust_text(original, record)
+        self.assertEqual(reports, [])
+        self.assertNotIn("[hooks.state.", restored)
+        import tomllib
+        self.assertEqual(tomllib.loads(restored)["projects"]["/mine"]["trust_level"], "trusted")
 
 
 class RuntimeSnapshotTest(unittest.TestCase):

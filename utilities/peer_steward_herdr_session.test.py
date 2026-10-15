@@ -85,7 +85,7 @@ class HerdrSessionTargeting(unittest.TestCase):
             self.assertEqual(argv[:2], ["--session", "fourth"], argv)
         self.assertEqual({tuple(argv[2:4]) for argv in lines},
                          {("pane", "get"), ("pane", "close"), ("agent", "prompt"),
-                          ("agent", "read"), ("agent", "explain")})
+                          ("agent", "read"), ("agent", "explain"), ("agent", "get")})
 
     def test_no_herdr_invocation_bypasses_the_session_helper(self):
         # A bare `["herdr", ...]` argv literal can only reach the default server.

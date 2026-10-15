@@ -677,6 +677,9 @@ def _ensure_pane_ingress(pane, kind, cwd=None):
         commands.append('export PATH="%s:$PATH"' % directory)
     line = " && ".join(commands)
     try:
+        block = _blocking_screen(kind, _read_screen(pane))
+        if block:
+            return block
         text = subprocess.run(_herdr_argv("pane", "send-text", pane, line),
                               capture_output=True, text=True, timeout=5)
         if text.returncode != 0:
@@ -1099,6 +1102,9 @@ def _export_opencode_tui_scoped(pane):
     line = ("export OPENCODE_TUI_CONFIG=${OPENCODE_TUI_CONFIG:-%s}"
             % shlex.quote(scoped))
     try:
+        block = _blocking_screen("opencode", _read_screen(pane))
+        if block:
+            return block
         text = subprocess.run(_herdr_argv("pane", "send-text", pane, line),
                               capture_output=True, text=True, timeout=5)
         if text.returncode != 0:
@@ -2435,11 +2441,22 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
     stopped = " stopped-background=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
     if _retire_foreground(pane, harness) != identity:
         return finish("foreground-changed", pending=True)
-    if _retire_background_dialog_lines(_read_screen(target)) is None:
-        return finish("agent-still-running", pending=True)
+    def observed_dialog():
+        current = _read_screen(target)
+        current_tasks = _retire_background_dialog_lines(current)
+        if current_tasks is not None:
+            return current_tasks, None
+        return None, _blocking_screen(harness, current)
+
+    current_tasks, screen_block = observed_dialog()
+    if current_tasks is None:
+        return finish(screen_block or "agent-still-running", pending=True)
     try:
         subprocess.run(_herdr_argv("pane", "send-text", pane, "1"),
                        capture_output=True, text=True, timeout=5)
+        current_tasks, screen_block = observed_dialog()
+        if current_tasks is None:
+            return finish(screen_block or "agent-still-running", pending=True)
         subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -2458,9 +2475,15 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
             return finish("normal-exit", True, handover=handover,
                           detail=(f"background-stopped:{stopped.strip()}") if stopped else None)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    current_tasks, screen_block = observed_dialog()
+    if current_tasks is None:
+        return finish(screen_block or "agent-still-running", pending=True)
     try:
         subprocess.run(_herdr_argv("pane", "send-text", pane, "3"),
                        capture_output=True, text=True, timeout=5)
+        current_tasks, screen_block = observed_dialog()
+        if current_tasks is None:
+            return finish(screen_block or "agent-still-running", pending=True)
         subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -3597,6 +3620,67 @@ _CODEX_LOCATION_TOKENS = (
     "whereshouldthenewconversationrun", "whereshouldtheforkedconversationrun",
     "usecurrentgitworktree", "keepusingthecurrentworkingdirectory", "createnewgitworktree",
 )
+_NATIVE_TRUST_TOKENS = {
+    "codex": ("trustthisfolder", "trustthisworkspace", "doyoutrustthisproject"),
+    "claude": ("trustthisfolder", "trustthisproject", "doyoutrustthecontentsofthisfolder"),
+    "opencode": ("trustthisfolder", "trustthisproject", "doyoutrustthisproject"),
+}
+
+
+def _blocking_screen(harness, lines, *, window=15):
+    """Return the existing wait reason for a visibly active native form.
+
+    Unknown/unreadable content is deliberately non-blocking. Codex's hook
+    review is recognized only as the standalone top-origin TUI view; quoted
+    transcript text and a composer following the quote are not a form.
+    """
+    if isinstance(lines, str):
+        lines = _screen_lines(lines)
+    if not isinstance(lines, (list, tuple)):
+        return None
+    rendered = []
+    for line in lines:
+        value = _plain(line) if isinstance(line, list) else str(line)
+        rendered.append(value.rstrip())
+    while rendered and not rendered[-1].strip():
+        rendered.pop()
+    meaningful = [line for line in rendered if line.strip()]
+    if not meaningful:
+        return None
+    flat_bottom = "".join("".join(meaningful[-window:]).split()).lower()
+    harness = str(harness or "").lower()
+    if harness == "codex":
+        normalized = ["".join(line.split()).lower() for line in meaningful]
+        if normalized[0].strip("─━│╭╮╰╯┌┐└┘ ") == "hooksneedreview":
+            body = normalized[1:]
+            title_count = any(re.fullmatch(r"\d+hooks?(?:isnew|arenew)orchanged", row) for row in body)
+            labels = ("reviewhooks", "trustallandcontinue", "continuewithouttrusting")
+            joined = "".join(body)
+            positions = [joined.find(label) for label in labels]
+            ordered = all(pos >= 0 for pos in positions) and positions == sorted(positions)
+            if title_count and ordered:
+                tail = joined[positions[-1] + len(labels[-1]):]
+                tail = tail.replace("(hookswon'trun)", "")
+                if (not tail or tail.startswith("(hooks") or "key" in tail
+                        or ("enter" in tail and "esc" in tail)):
+                    return "native-trust-wait"
+        active_rows = [row for row in normalized
+                       if not row.startswith(("+", "assistant:", "user:", "```", "❯letme"))]
+        location_title = next((i for i, row in enumerate(active_rows)
+                               if "whereshouldthenewconversation" in row
+                               or "whereshouldtheforkedconversation" in row), None)
+        if location_title == 0:
+            area = "".join(active_rows[location_title:])
+            options = ("usecurrentgitworktree", "keepusingthecurrentworkingdirectory",
+                       "createnewgitworktree")
+            if ("run?" in area or "run" in area) and sum(token in area for token in options) >= 1 and not any(
+                    row.startswith(("❯letme", "?for")) for row in normalized):
+                return "form-open"
+    if any(token in flat_bottom for token in _FORM_TOKENS):
+        return "form-open"
+    if any(token in flat_bottom for token in _NATIVE_TRUST_TOKENS.get(harness, ())):
+        return "native-trust-wait"
+    return None
 
 
 def _codex_location_menu(lines):
@@ -3611,42 +3695,24 @@ def _codex_location_menu(lines):
 
 
 def _form_open(target):
-    """True when the target's visible pane shows an open selection/permission
-    form (AskUserQuestion, permission prompt). Measured 2026-09-06: text
-    injected into such a form is lost and its `Enter` picks the form's
-    default answer -- the one injection path that silently destroys state.
-    herdr reports `blocked` for a normal-width pane; a narrow pane wraps the
-    footer words so the state stays `idle` (or `working` for a mid-turn
-    permission prompt), hence this whitespace-free scan of the whole visible
-    buffer, run for every state (review round 1, M3/minor 5)."""
+    """Compatibility wrapper for the shared observed-harness screen classifier."""
+    harness, _sid, _name = _resolve_target(target)
+    return _blocking_screen_for_target(target, harness) is not None
+
+
+def _blocking_screen_for_target(target, harness, *, window=15):
     try:
         proc = subprocess.run(_herdr_argv("agent", "read", target, "--source", "visible"),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
-        return False
-    lines = _screen_lines(proc.stdout or "")
-    flat = "".join("".join(_plain(line) for line in lines).split()).lower()
-    return any(token in flat for token in _FORM_TOKENS) or _codex_location_menu(lines)
+        return None
+    return _blocking_screen(harness, _screen_lines(proc.stdout or ""), window=window)
 
 
 def _bottom_form_tokens(target, window=15):
-    """Whether form tokens show in the bottom `window` screen lines.
-
-    A real form always renders at the bottom: even on a narrow pane its
-    wrapped footer words land in the trailing lines, and joining them
-    reassembles the tokens. Transcript quotes higher up never count. A quote
-    sitting in the bottom lines can still misfire, but that only delays the
-    send now (the flush redelivers later) instead of stranding it with no
-    redelivery (2026-10-07).
-    """
-    try:
-        proc = subprocess.run(_herdr_argv("agent", "read", target, "--source", "visible"),
-                              capture_output=True, text=True, timeout=_herdr_get_timeout())
-    except (OSError, subprocess.SubprocessError):
-        return False
-    lines = _screen_lines(proc.stdout or "")[-window:]
-    flat = "".join("".join(_plain(line) for line in lines).split()).lower()
-    return any(token in flat for token in _FORM_TOKENS) or _codex_location_menu(lines)
+    """Compatibility wrapper for the shared classifier's trailing-row window."""
+    harness, _sid, _name = _resolve_target(target)
+    return _blocking_screen_for_target(target, harness, window=window) is not None
 
 
 def _prompt_form_open(target, state_before):
@@ -3658,11 +3724,10 @@ def _prompt_form_open(target, state_before):
     Any other state needs the tokens at the very bottom of the screen;
     transcript mentions of forms must not strand messages (2026-10-07).
     """
-    if state_before == "blocked":
+    harness, _sid, _name = _resolve_target(target)
+    if state_before == "blocked" and harness != "codex":
         return True
-    if state_before == "working":
-        return _form_open(target)
-    return _bottom_form_tokens(target)
+    return _blocking_screen_for_target(target, harness) is not None
 
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
@@ -3727,12 +3792,14 @@ def _prompt_input_reason(target, harness, state, *, expected_sid=None):
         return readiness.reason
     if readiness.reason.startswith("bound-registered-work") and readiness.state != "ready":
         return readiness.reason
+    if state == "blocked" and harness != "codex":
+        return "target-form-open"
+    if _blocking_screen_for_target(target, harness):
+        return "target-form-open"
     if harness == "codex":
         # Codex's exact native queue does not type into the pane. Read only to
         # recognize a live choice/permission form; a blocked label alone must
         # not turn the queue into the frontend draft path.
-        if _bottom_form_tokens(target):
-            return "target-form-open"
         return "codex-native-queue" if state == "blocked" else None
     if _prompt_form_open(target, state):
         return "target-form-open"
@@ -4721,9 +4788,7 @@ def _opencode_left_text(body):
 def _screen_ready(harness, lines):
     """None when the visible screen shows no selection/permission form and an empty input box,
     else the reason (`form-open`, `draft`, `draft-unknown`)."""
-    flat = "".join("".join(_plain(c) for c in lines).split()).lower()
-    if any(token in flat for token in _FORM_TOKENS) \
-            or (harness == "codex" and _codex_location_menu(lines)):
+    if _blocking_screen(harness, lines):
         return "form-open"
     draft = _draft_state(harness, lines)
     if draft == "nonempty":
@@ -4762,15 +4827,7 @@ def _read_screen(target):
 
 def _native_trust_reason(harness, lines):
     """Name an observed native folder trust screen without interacting with it."""
-    if not lines:
-        return None
-    flat = "".join("".join(_plain(line) for line in lines).split()).lower()
-    patterns = {
-        "codex": ("trustthisfolder", "trustthisworkspace", "doyoutrustthisproject"),
-        "claude": ("trustthisfolder", "trustthisproject", "doyoutrustthecontentsofthisfolder"),
-        "opencode": ("trustthisfolder", "trustthisproject", "doyoutrustthisproject"),
-    }
-    return "native-trust-wait" if any(token in flat for token in patterns.get(harness, ())) else None
+    return "native-trust-wait" if _blocking_screen(harness, lines) == "native-trust-wait" else None
 
 
 def _process_session(pane, harness):
@@ -4938,7 +4995,7 @@ def _clear_observe(target, req, request_path, before_threads=()):
     for round_no in range(_CLEAR_OBSERVE_ROUNDS):
         if req.get("harness") == "codex":
             menu_lines = _read_screen(target)
-            if menu_lines is not None and _codex_location_menu(menu_lines):
+            if menu_lines is not None and _blocking_screen(req.get("harness"), menu_lines):
                 if round_no + 1 < _CLEAR_OBSERVE_ROUNDS:
                     _run_herdr_wait(target, ["working", "blocked"], _CLEAR_OBSERVE_SETTLE_MS)
                 continue
@@ -5158,8 +5215,7 @@ def _continue_look(target, req):
     if lines is None:
         return "screen-unknown"
     if harness == "opencode":
-        flat = "".join("".join(_plain(c) for c in lines).split()).lower()
-        if any(token in flat for token in _FORM_TOKENS):
+        if _blocking_screen(harness, lines):
             return "form-open"
         draft = _draft_state(harness, lines)
         if draft == "nonempty":

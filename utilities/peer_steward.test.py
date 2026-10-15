@@ -820,6 +820,32 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertIn("ready=false reason=native-trust-wait", out.getvalue())
         self.assertFalse(any(argv[:3] == ["herdr", "pane", "send-text"] for argv in calls))
 
+    def test_codex_hook_review_start_reports_not_ready_without_answering_the_form(self):
+        import contextlib
+        import io
+        calls = []
+        screen = ("Hooks need review\n1 hook is new or changed\nReview hooks\n"
+                  "Trust all and continue\nContinue without trusting")
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:3] == ["herdr", "agent", "start"]:
+                return _herdr_json(_agent_json("codex", "thread-review", "peer-c"))
+            if argv[:3] == ["herdr", "agent", "read"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=screen, stderr="")
+            if argv[:3] == ["herdr", "pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {"foreground_processes": []}}})
+            return _herdr_json({"result": {"pane": {}}})
+        out = io.StringIO()
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(out):
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        self.assertIn("ready=false reason=native-trust-wait", out.getvalue())
+        self.assertFalse(any(argv[:3] in (["herdr", "pane", "send-text"],
+                                         ["herdr", "pane", "send-keys"])
+                             for argv in calls))
+
     def test_a_cwd_that_is_not_a_directory_never_reaches_herdr(self):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run") as run_mock:
@@ -2462,6 +2488,34 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertTrue(row["no_trailer"])
         self.assertEqual(row["state"], "pending")
 
+    def test_codex_hook_review_prompt_is_queued_without_transport_for_sidless_and_bound_targets(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        screens = (
+            "Hooks need review\n1 hook is new or changed\nReview hooks\n"
+            "Trust all and continue\nContinue without trusting\nEnter to confirm · Esc to skip",
+            "Hooks need review\n2 hooks are new or changed\nChecking hooks…\n"
+            "1. Review hooks\n2. Trust all and continue\n"
+            "3. Continue without trusting (hooks\n   won't run)",
+        )
+        for sid, screen in ((None, screens[0]), ("thread-present", screens[1])):
+            with self.subTest(sid=sid):
+                calls = []
+                with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(
+                         _agent_json("codex", sid, "fresh"), calls=calls, pane_text=screen)), \
+                     mock.patch.object(peer_steward, "_proven_session", return_value=None), \
+                     mock.patch.object(peer_steward.peer_message, "deliver_pending_codex") as queue, \
+                     mock.patch("builtins.print") as print_mock:
+                    self.assertEqual(peer_steward.main(["prompt", "fresh", "queued body", "--no-trailer"]), 3)
+                self.assertIn("prompted=queued", print_mock.call_args[0][0])
+                self.assertIn("reason=target-form-open", print_mock.call_args[0][0])
+                self.assertFalse([call for call in calls if call[:3] in (
+                    ["herdr", "agent", "prompt"], ["herdr", "agent", "send-keys"]
+                )])
+                queue.assert_not_called()
+                row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
+                self.assertEqual(row["state"], "pending")
+
     def test_sidless_codex_pending_waits_for_same_pane_session_then_delivers_once(self):
         sender = {"harness": "claude", "session_id": "sid-steward", "name": "sender"}
         recipient = {"harness": "codex", "session_id": None, "name": "fresh",
@@ -3526,7 +3580,8 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
 
     def test_codex_native_queue_is_not_subject_to_draft_reads(self):
         self.harness, self.status, self.screen = "codex", "blocked", CLAUDE_DRAFT
-        with mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("native queue needs no box")), \
+        with mock.patch.object(peer_steward, "_read_screen", return_value=[[("unknown screen", False)]]), \
+             mock.patch.object(peer_steward, "_draft_state", side_effect=AssertionError("Codex does not gate on draft")), \
              mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
                                return_value={"status": "queued", "reason": "native-queue-accepted"}) as queue:
             self.assertEqual(self.prompt(), 3)
@@ -6809,6 +6864,67 @@ class RetireBackgroundDialogTest(unittest.TestCase):
                  self._cells("  Enter to confirm · Esc to cancel is only in the real window."),
                  self._cells("❯ let me check the logs")]
         self.assertIsNone(peer_steward._retire_background_dialog_lines(lines))
+
+    def test_retire_rechecks_before_confirmation_enter_if_another_form_appears(self):
+        dialog = peer_steward._screen_lines(
+            "Background work is running\n❯ 1. Exit and stop tasks\n"
+            "2. Move to background and exit\n3. Stay\nEnter to confirm · Esc to cancel\n")
+        unrelated_form = peer_steward._screen_lines("Do you want to proceed?\nEnter to confirm\n")
+        for switch_at in (3, 5):
+            with self.subTest(switch_at=switch_at):
+                reads = [dialog] * (switch_at - 1) + [unrelated_form]
+                calls = []
+                def run(argv, **kwargs):
+                    calls.append(argv)
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                with mock.patch.object(peer_steward, "_read_screen", side_effect=reads), \
+                     mock.patch.object(peer_steward, "_retire_foreground", return_value="same-process"), \
+                     mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+                     mock.patch.object(peer_steward, "_RETIRE_SECONDS", 0):
+                    result = peer_steward._retire_claude_background_confirm(
+                        "peer", "w1:pX", "claude", {}, "same-process",
+                        lambda reason, **kwargs: reason, None, None,
+                    )
+                self.assertEqual(result, "form-open")
+                keys = [argv[4:] for argv in calls if argv[:3] == ["herdr", "pane", "send-keys"]]
+                self.assertEqual(len(keys), 1 if switch_at == 5 else 0)
+                texts = [argv[-1] for argv in calls if argv[:3] == ["herdr", "pane", "send-text"]]
+                self.assertEqual(texts, ["1"] if switch_at == 3 else ["1", "3"])
+
+
+class BlockingScreenClassifierTest(unittest.TestCase):
+    @staticmethod
+    def cells(text):
+        return [(char, False) for char in text]
+
+    def test_codex_hook_review_is_recognized_at_top_for_normal_and_wrapped_views(self):
+        for screen in (
+            "Hooks need review\n1 hook is new or changed\nReview hooks\n"
+            "Trust all and continue\nContinue without trusting\nEnter to confirm · Esc to skip",
+            "Hooks need review\n2 hooks are new or changed\nChecking hooks…\n"
+            "1. Review hooks\n2. Trust all and continue\n"
+            "3. Continue without trusting (hooks\n   won't run)",
+        ):
+            with self.subTest(screen=screen):
+                self.assertEqual("native-trust-wait", peer_steward._blocking_screen(
+                    "codex", [self.cells(line) for line in screen.splitlines()]))
+
+    def test_codex_hook_review_quote_and_unknown_screen_do_not_block(self):
+        quote = [self.cells("● Reviewing documentation"),
+                 self.cells("+ Hooks need review 1 hook is new or changed"),
+                 self.cells("+ Review hooks / Trust all and continue / Continue without trusting"),
+                 self.cells("❯ let me inspect the implementation")]
+        self.assertIsNone(peer_steward._blocking_screen("codex", quote))
+        self.assertIsNone(peer_steward._blocking_screen("codex", None))
+        self.assertIsNone(peer_steward._blocking_screen("codex", []))
+
+    def test_hook_review_signature_is_codex_scoped(self):
+        lines = [self.cells(row) for row in (
+            "Hooks need review", "1 hook is new or changed", "Review hooks",
+            "Trust all and continue", "Continue without trusting")]
+        self.assertEqual("native-trust-wait", peer_steward._blocking_screen("codex", lines))
+        self.assertIsNone(peer_steward._blocking_screen("claude", lines))
+        self.assertIsNone(peer_steward._blocking_screen("opencode", lines))
 
 
 class ObservedStartTest(_TmpRootMixin, unittest.TestCase):

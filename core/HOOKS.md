@@ -88,6 +88,14 @@ writer that cannot persist the field must not claim.
 
 ## Current Session and Context Evidence
 
+Codex runtime activation (install, update, or refresh) may record the current native
+hash for Hearting's own projected hook definitions through App Server. It preserves
+disabled decisions, leaves foreign definitions to the user's `/hooks` review, and
+conditionally restores only trust leaves it still owns during deactivation. If Codex
+or App Server is unavailable, activation reports one skipped-trust line and `/hooks`
+remains the fallback. Claude and OpenCode have no corresponding trust-record step.
+peer-steward observes forms only and never writes trust or selects an option.
+
 A process lifetime or launch session is not necessarily the conversation selected
 now. A pane report names the current full native conversation only after the
 live foreground process, PID/start, tty, and foreground process group agree with
