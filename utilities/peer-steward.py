@@ -3678,24 +3678,26 @@ def _blocking_screen(harness, lines, *, window=15):
                         or "enterselect" in tail or "escskip" in tail):
                     return "native-trust-wait"
 
-        # The /new and /fork picker is a bottom-pane popup in the live chat.
-        # Require its own trailing title/options/footer group, so a transcript
-        # quote above an ordinary composer cannot be mistaken for the popup.
+        # The /new and /fork picker is a bottom-pane popup that replaces the
+        # composer while open. A composer row (Codex `›`, or `❯`) below the
+        # title means the title is a transcript quote, not the live popup.
         active_rows = normalized[-window:]
-        last_row = active_rows[-1]
         menu_choices = ("usecurrentgitworktree", "keepusingthecurrentworkingdirectory",
                         "createnewgitworktree")
-        live_composer = (last_row.startswith("❯") and len(last_row) > len("❯")
-                         and not any(choice in last_row for choice in menu_choices))
+
+        def composer_row(row):
+            return (row[:1] in ("›", "❯") and len(row) > 1
+                    and not any(choice in row for choice in menu_choices))
+
+        live_composer = composer_row(active_rows[-1])
         location_title = next((i for i, row in enumerate(active_rows)
                                if "whereshouldthenewconversation" in row
                                or "whereshouldtheforkedconversation" in row), None)
-        if location_title is not None and not live_composer:
+        if location_title is not None:
             area_rows = active_rows[location_title:]
             area = "".join(area_rows)
-            options = ("usecurrentgitworktree", "keepusingthecurrentworkingdirectory",
-                       "createnewgitworktree")
-            if ("run?" in area or "run" in area) and any(token in area for token in options):
+            if (not any(composer_row(row) for row in area_rows[1:])
+                    and any(token in area for token in menu_choices)):
                 return "form-open"
     else:
         live_composer = False

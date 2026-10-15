@@ -6948,6 +6948,14 @@ class BlockingScreenClassifierTest(unittest.TestCase):
         for harness in ("codex", "claude", "opencode"):
             with self.subTest(harness=harness):
                 self.assertIsNone(peer_steward._blocking_screen(harness, quoted))
+        # Codex 0.162.1's own composer glyph is `›`, usually followed by its
+        # status footer, so the composer is not necessarily the last row.
+        popup_rows = popup.strip("\n").splitlines()
+        for tail in (["› ordinary draft"],
+                     ["› ordinary draft", "", "  ? for shortcuts            100% context left"]):
+            with self.subTest(tail=tail):
+                quoted_popup = "\n".join(["• Earlier answer quoting the picker:"] + popup_rows + tail)
+                self.assertIsNone(peer_steward._blocking_screen("codex", quoted_popup))
 
     def test_singular_count_with_period_matches_real_dialog_shape(self):
         screen = ("Hooks need review\n1 hook is new or changed.\nReview hooks\n"
