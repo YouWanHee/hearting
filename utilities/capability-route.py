@@ -4104,11 +4104,10 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                                        owner_harnesses=_compose_default_owners(selection_pins))
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
     if shape == "staged" and not owner_only and owner_pin and not any(
-            row.get("parent_harness") == owner_pin and row.get("status") == "supported"
-            and row.get("launch_authority") == "conductor"
+            row.get("parent_harness") == owner_pin
             for row in (dispatch_evidence or {}).get("tuples", [])):
         # A frame's evidence describes its conductor. Check the selected owner
-        # with its workers rather than relabelling that evidence.
+        # only when absent; a checked refusal is already its probe result.
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), owner_pin,
                                        children or _compose_default_children(selection_pins),
                                        gpu_route=gpu_route)

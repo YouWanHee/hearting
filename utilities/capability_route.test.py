@@ -7365,6 +7365,50 @@ class ComposeRouteTest(TestRoute):
   with mock.patch.object(R, "_compose_default_children", return_value=("claude", "codex")):
    self.assertEqual(R._compose_default_owners(pins), ("claude", "codex"))
 
+ def test_automatic_pool_does_not_reprobe_a_checked_but_ineligible_owner_pin(self):
+  for pinned in ("claude", "codex", "opencode"):
+   other = "claude" if pinned != "claude" else "codex"
+   checked = self.nested(parent=pinned, child="claude", status="unsupported", failure="fixture-unavailable")
+   readiness = self.dispatch(self.nested(parent=other, child="claude"), checked)
+   with self.subTest(pinned=pinned), \
+        mock.patch.object(R, "_compose_default_children", return_value=("claude", "codex", "opencode")), \
+        mock.patch.object(R, "_compose_readiness", return_value=readiness) as probe:
+    route = self.compose(dispatch_evidence=None, selection_pins=R._parse_selection_pins([], pinned),
+                         children=["claude"])
+    probe.assert_called_once()
+    self.assertEqual(route["dispatch_evidence"]["tuples"], readiness["tuples"])
+    R.verify_route(route, R.ROOT)
+
+ def test_checked_owner_without_conductor_authority_is_not_reprobed_or_accepted(self):
+  readiness = self.dispatch(self.nested(parent="claude", child="claude"),
+                            self.nested(parent="codex", child="claude", authority="ancestor-broker"))
+  with mock.patch.object(R, "_compose_readiness", return_value=readiness) as probe:
+   with self.assertRaisesRegex(ValueError, "v3 dispatch evidence requires conductor launch authority"):
+    self.compose(dispatch_evidence=None, selection_pins=R._parse_selection_pins([], "codex"))
+  probe.assert_called_once()
+
+ def test_supplied_checked_owner_refusal_is_preserved_without_another_probe(self):
+  checked = self.nested(parent="codex", child="claude", status="unsupported", failure="fixture-unavailable")
+  evidence = self.dispatch(self.nested(parent="claude", child="claude"), checked)
+  with mock.patch.object(R, "_compose_readiness") as probe:
+   route = self.compose(dispatch_evidence=evidence, selection_pins=R._parse_selection_pins([], "codex"))
+  probe.assert_not_called()
+  self.assertEqual(route["dispatch_evidence"]["tuples"], evidence["tuples"])
+  R.verify_route(route, R.ROOT)
+
+ def test_out_of_pool_owner_pin_still_gets_its_exact_probe(self):
+  pool = self.dispatch(self.nested(parent="claude", child="claude"))
+  exact = self.dispatch(self.nested(parent="codex", child="claude"))
+  with mock.patch.object(R, "_compose_default_children", return_value=("claude",)), \
+       mock.patch.object(R, "_compose_readiness", side_effect=[pool, exact]) as probe:
+   route = self.compose(dispatch_evidence=None, selection_pins=R._parse_selection_pins([], "codex"),
+                        children=["claude"])
+  self.assertEqual(probe.call_count, 2)
+  self.assertEqual(probe.call_args_list[0].kwargs["owner_harnesses"], ("claude",))
+  self.assertEqual(probe.call_args_list[1].args[2], "codex")
+  self.assertEqual(route["dispatch_evidence"]["tuples"], pool["tuples"] + exact["tuples"])
+  R.verify_route(route, R.ROOT)
+
  def test_auto_owner_close_retains_verification_and_every_leg_input(self):
   for intensity in ("strong","thorough","adversarial"):
    route=self.compose(capability="autopilot-lab",capability_mode="eval",intensity=intensity,
