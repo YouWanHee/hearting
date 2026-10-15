@@ -13,6 +13,7 @@ import concurrent.futures
 import unittest
 import unittest.mock
 import uuid
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
@@ -749,18 +750,141 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("finish-registered-caller-ineligible", refused.stderr)
 
-    def test_closed_route_and_scoped_tracked_dirt_are_refused_before_intent(self):
+    def test_closed_route_still_refuses_before_finish_intent(self):
         outcome = self.route_file.with_name(self.route_file.stem + ".outcome.json")
         outcome.write_text("{}\n", encoding="utf-8")
         closed = self.finish()
         self.assertNotEqual(closed.returncode, 0)
         self.assertIn("finish-route-already-closed", closed.stderr)
-        outcome.unlink()
-        (self.repo / "README.md").write_text("dirty source\n", encoding="utf-8")
-        dirty = self.finish()
-        self.assertNotEqual(dirty.returncode, 0)
-        self.assertIn("finish-scoped-tracked-dirt", dirty.stderr)
         self.assertFalse((self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").exists())
+
+    def test_synthetic_scope_finishes_with_unrelated_tracked_state_and_replays_without_git_changes(self):
+        def git(*args, check=True):
+            return subprocess.run(["git", "-C", str(self.repo), *args], check=check,
+                                  capture_output=True)
+
+        branch = git("branch", "--show-current").stdout.decode().strip()
+        for name in ("staged file.txt", "unstaged file.txt", "rename source.txt"):
+            (self.repo / name).write_bytes((name + " base\n").encode())
+        git("add", "staged file.txt", "unstaged file.txt", "rename source.txt")
+        git("commit", "-qm", "add tracked finish fixtures")
+
+        git("checkout", "-qb", "finish-side")
+        (self.repo / "side-only.txt").write_bytes(b"side\n")
+        git("add", "side-only.txt")
+        git("commit", "-qm", "side change")
+        git("checkout", "-q", branch)
+        (self.repo / "ours-only.txt").write_bytes(b"ours\n")
+        git("add", "ours-only.txt")
+        git("commit", "-qm", "ours change")
+        merged = git("merge", "--no-commit", "--no-ff", "finish-side", check=False)
+        self.assertEqual(merged.returncode, 0, merged.stderr.decode(errors="replace"))
+        self.assertTrue((self.repo / ".git/MERGE_HEAD").is_file())
+
+        (self.repo / "staged file.txt").write_bytes(b"staged edit\n")
+        git("add", "staged file.txt")
+        (self.repo / "unstaged file.txt").write_bytes(b"unstaged edit\n")
+        git("mv", "rename source.txt", "renamed target.txt")
+
+        def git_snapshot():
+            names = ("README.md", "staged file.txt", "unstaged file.txt",
+                     "renamed target.txt", "side-only.txt")
+            operation = {name: (self.repo / ".git" / name).read_bytes()
+                         for name in ("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE")
+                         if (self.repo / ".git" / name).is_file()}
+            return {
+                "files": {name: (self.repo / name).read_bytes() for name in names if (self.repo / name).is_file()},
+                "entries": git("ls-files", "--stage", "-z").stdout,
+                "tree": git("write-tree").stdout,
+                "status": git("status", "--porcelain=v1", "-z", "--untracked-files=no").stdout,
+                "operation": operation,
+            }
+
+        before = git_snapshot()
+        first = self.finish()
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        receipt = json.loads(first.stdout)
+        observed = set(receipt["unscoped_tracked_dirt"])
+        self.assertTrue({"staged file.txt", "unstaged file.txt",
+                         "rename source.txt", "renamed target.txt", "side-only.txt"} <= observed)
+        self.assertEqual(git_snapshot(), before)
+        stored_before = json.loads(
+            (self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").read_text())
+        replay = self.finish()
+        self.assertEqual(replay.returncode, 0, replay.stderr + replay.stdout)
+        replay_receipt = json.loads(replay.stdout)
+        self.assertTrue(replay_receipt["replay"])
+        self.assertEqual(replay_receipt["unscoped_tracked_dirt"], receipt["unscoped_tracked_dirt"])
+        self.assertEqual(git_snapshot(), before)
+        stored_after = json.loads(
+            (self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json").read_text())
+        self.assertEqual(stored_after, stored_before)
+
+    def test_mixed_synthetic_and_concrete_file_directory_or_glob_scope_still_refuses(self):
+        (self.repo / "README.md").write_text("dirty source\n", encoding="utf-8")
+        args = SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
+        state_path = self.root / ".runtime/inline-finish/v1" / self.route["route_id"] / "finish.json"
+        for concrete in ("README.md", "README.md/**", "READ*"):
+            with self.subTest(scope=concrete):
+                scope = ["source-scoped", concrete]
+                with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+                    inline_finish._unscoped_tracked_dirt(str(self.repo), scope)
+                self.assertFalse(state_path.exists())
+
+    def test_synthetic_scope_vocabulary_does_not_match_tracked_paths(self):
+        (self.repo / "source").mkdir()
+        (self.repo / "source/source.py").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "source/source.py"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "add source fixture"], check=True)
+        (self.repo / "source/source.py").write_text("dirty\n", encoding="utf-8")
+        for token in ("source-scoped", "source/**", "source-alternative/**", "target-artifact"):
+            with self.subTest(token=token):
+                self.assertEqual(inline_finish._unscoped_tracked_dirt(str(self.repo), [token]),
+                                 ["source/source.py"])
+
+    def test_porcelain_status_keeps_both_rename_paths_and_spaces_for_scope_checks(self):
+        def git(*args, check=True):
+            return subprocess.run(["git", "-C", str(self.repo), *args], check=check,
+                                  capture_output=True)
+
+        (self.repo / "old name.txt").write_bytes(b"rename bytes\n")
+        git("add", "old name.txt")
+        git("commit", "-qm", "add rename fixture")
+        git("mv", "old name.txt", "new name.txt")
+        observed = set(inline_finish._unscoped_tracked_dirt(str(self.repo), []))
+        self.assertEqual(observed, {"old name.txt", "new name.txt"})
+        for scope in ("old name.txt", "new name.txt"):
+            with self.subTest(scope=scope):
+                with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+                    inline_finish._unscoped_tracked_dirt(str(self.repo), ["source-scoped", scope])
+
+    def test_fresh_scope_judgment_rejects_concrete_dirt_added_after_the_first_scan(self):
+        scope = ["source-scoped", "README.md"]
+        self.assertEqual(inline_finish._unscoped_tracked_dirt(str(self.repo), scope), [])
+        (self.repo / "README.md").write_text("raced scoped dirt\n", encoding="utf-8")
+        with self.assertRaisesRegex(inline_finish.InlineFinishError, "finish-scoped-tracked-dirt"):
+            inline_finish._unscoped_tracked_dirt(str(self.repo), scope)
+        self.assertFalse((self.root / ".runtime/inline-finish/v1" /
+                          self.route["route_id"] / "finish.json").exists())
+
+    def test_locked_revalidation_reports_unrelated_dirt_that_arrives_after_first_scan(self):
+        args = SimpleNamespace(evidence=str(self.evidence), summary_file=str(self.summary), commit=None)
+        original = inline_finish._unscoped_tracked_dirt
+        calls = 0
+
+        def introduce_unrelated_dirt(cwd, scope):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (self.repo / "README.md").write_text("raced unrelated dirt\n", encoding="utf-8")
+            return original(cwd, scope)
+
+        with unittest.mock.patch.object(inline_finish, "_unscoped_tracked_dirt",
+                                        side_effect=introduce_unrelated_dirt):
+            result = inline_finish.finish(args, self.route, self.route_file, CAP)
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["unscoped_tracked_dirt"], ["README.md"])
+        self.assertTrue(result["inline_finish_id"])
 
     def test_changed_result_commit_conflicts_with_existing_claim(self):
         self.assertNotEqual(self.finish("after-claim").returncode, 0)
