@@ -1207,7 +1207,7 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
             mock.patch.object(self.steward, "_retire_foreground", return_value=self.successor["foreground"]),
             mock.patch.object(self.steward, "_pid_identity_ok", return_value=True),
             mock.patch.object(self.steward.peer_obligations, "ObligationStore", return_value=self.store),
-            mock.patch.object(self.steward.peer_obligations, "ensure_runner"),
+            mock.patch.object(self.steward.peer_obligations, "ensure_normal_runner"),
             mock.patch.object(self.steward, "_HERDR_SESSION", None)]
         for p in patches:
             p.start(); self.addCleanup(p.stop)

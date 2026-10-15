@@ -209,6 +209,59 @@ console.log(JSON.stringify(calls[0]));
             with self.subTest(callback=command[1]):
                 self._run_captured_cli(command, options, expected_root=self.b)
 
+    def test_normal_producer_reuses_locked_binding_but_direct_and_checkout_stay_fixed(self):
+        self._point_current(self.b)
+        lock_path = obligations.ObligationStore(self.state).root / obligations.RUNNER_LOCK_NAME
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertFalse(obligations.ensure_normal_runner(
+                self.state, lifecycle_root=str(self.a)))
+        original_inode = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload, {"schema": 1, "install_data_root": str(self.data),
+                                   "service_current": str(self.current)})
+
+        store = obligations.ObligationStore(self.state)
+        store.create("ordinary-producer", "message", {"fixture": "normal"},
+                     {"ref": "a" * 32, "body_digest": "b" * 64})
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, self.env, clear=True), \
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
+            self.assertTrue(obligations.ensure_normal_runner(self.state))
+            argv = launch.call_args.args[0]
+            self.assertEqual(Path(argv[1]), self.b / "utilities/peer-steward.py")
+            self.assertEqual(argv[-2:], ["--service-current", str(self.current)])
+            child_env = launch.call_args.kwargs["env"]
+            self.assertEqual(child_env["AGENT_HOME"], str(self.b))
+            self.assertEqual(child_env["AGENT_DISPATCH_JOBS"], str(self.jobs))
+        self.assertEqual((lock_path.stat().st_dev, lock_path.stat().st_ino), original_inode)
+        self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8")), payload)
+
+        with mock.patch.object(obligations, "__file__",
+                               str(self.a / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, self.env, clear=True), \
+             mock.patch.object(obligations.subprocess, "Popen") as direct:
+            self.assertTrue(obligations.ensure_runner(self.state))
+            direct_argv = direct.call_args.args[0]
+            self.assertEqual(Path(direct_argv[1]), self.a / "utilities/peer-steward.py")
+            self.assertNotIn("--service-current", direct_argv)
+
+        checkout = self.base / "checkout"
+        (checkout / "utilities").mkdir(parents=True)
+        (checkout / "utilities/peer-steward.py").touch()
+        checkout_env = self._environment(checkout)
+        with mock.patch.object(obligations, "__file__",
+                               str(checkout / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, checkout_env, clear=True), \
+             mock.patch.object(obligations.subprocess, "Popen") as fixed:
+            self.assertTrue(obligations.ensure_normal_runner(
+                self.state, lifecycle_root=str(checkout)))
+            fixed_argv = fixed.call_args.args[0]
+            self.assertEqual(Path(fixed_argv[1]), checkout / "utilities/peer-steward.py")
+            self.assertNotIn("--service-current", fixed_argv)
+
     def test_fixed_invocations_checkouts_foreign_installs_and_overrides_stay_fixed(self):
         self._point_current(self.b)
         cases = []

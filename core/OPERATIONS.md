@@ -520,8 +520,12 @@ queries neither cancel work nor acquire these responsibilities.
 An interactive session keeps its startup-pinned runtime root. A shared
 obligation service follows `current` only when its lifecycle binding proves the
 same managed installation; development checkouts and fixed invocations stay on
-their code root. Changing service code preserves the accepted duty, transfer
-identity, recipient, and session authority.
+their code root. The verified service-code binding is retained in the existing
+`runner-current.lock` control payload and reused by normal obligation producers
+only after the common helper validates it against that same installation's
+current pointer. It records service code provenance only; it grants no session,
+route, recipient, or other operation authority. Changing service code preserves
+the accepted duty, transfer identity, recipient, and session authority.
 
 The completion duty belongs to the outer controller and durable pending record,
 not to the lifetime of one model turn, watcher process, or tab location. A

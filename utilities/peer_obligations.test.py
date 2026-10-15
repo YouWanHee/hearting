@@ -137,8 +137,25 @@ class ObligationStoreTest(unittest.TestCase):
             obligations.acknowledge_registered_delivery(final, roots=[self.root])
             self.assertEqual(self.store.get(duty["id"])["state"], "complete")
 
+    def test_registered_completion_producer_uses_shared_normal_runner_helper(self):
+        from types import SimpleNamespace
+        carrier = "fixture-parent-runtime"
+        jobs = self.root / "dispatch" / "jobs.log"
+        row = SimpleNamespace(status="running", metadata={
+            "parent_completion_delivery": carrier})
+        with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
+             mock.patch("dispatch_seat_handover.effective_parent", return_value="sid-parent"), \
+             mock.patch("harness_capabilities.parent_completion",
+                        return_value={"carrier": carrier}), \
+             mock.patch.object(obligations, "ensure_normal_runner") as ensure:
+            obligations.retain_registered_completion(
+                jobs, "att-fixture", "sid-parent", carrier)
+        duty = obligations.ObligationStore(jobs.parent).list()[0]
+        self.assertEqual(duty["intent"]["identity"]["attempt_id"], "att-fixture")
+        ensure.assert_called_once_with(jobs.parent)
+
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
-    def test_unsupported_observer_releases_same_lock_without_losing_accepted_duties(self):
+    def test_unsupported_observer_keeps_same_lock_without_losing_accepted_duties(self):
         self._check_observer_handoff(supported=False)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
@@ -146,7 +163,7 @@ class ObligationStoreTest(unittest.TestCase):
         self._check_observer_handoff(supported=True)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
-    def test_claude_only_observer_is_replaced_for_shared_activation_delivery(self):
+    def test_claude_only_observer_keeps_lock_for_shared_activation_delivery(self):
         self._check_observer_handoff(supported=False, native_only=True)
 
     @unittest.skipUnless(hasattr(os, "pidfd_open"), "Linux pidfd handoff")
@@ -186,9 +203,8 @@ class ObligationStoreTest(unittest.TestCase):
                     self.assertIsNone(process.poll())
                     spawned.assert_not_called()
                 else:
-                    self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
-                    spawned.assert_called_once()
-                    self.assertEqual(len(spawned.call_args.kwargs["pass_fds"]), 1)
+                    self.assertIsNone(process.poll())
+                    spawned.assert_not_called()
             self.assertEqual(self.store.get(duty["id"]), duty)
             self.assertEqual(self.store.get(prior["id"]), prior)
         finally:

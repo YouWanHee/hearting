@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import signal
 import subprocess
 import sys
 import tempfile
@@ -28,6 +27,7 @@ from dispatch_attempt_policy import (
 
 SCHEMA_VERSION = 1
 RUNNER_LOCK_NAME = "runner-current.lock"
+_RUNNER_CONTROL_SCHEMA = 1
 _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
@@ -210,30 +210,89 @@ def _service_exec_environment(source_root: Path, target_root: Path, environ=None
 def exec_service_runner(lock_fd: int, state_root: str | Path, service_current: str | Path,
                         *, herdr_session: str | None = None) -> bool:
     """Replace this process with the same-install runner while retaining its flock."""
-    source_root = _code_root()
-    target_root = active_service_root(service_current, root=source_root)
-    if target_root is None or target_root == source_root:
-        return False
-    runner = target_root / "utilities" / "peer-steward.py"
-    argv = [sys.executable, str(runner)]
-    if herdr_session:
-        argv.extend(("--herdr-session", herdr_session))
-    argv.extend(("__obligation-runner", "--lock-fd", str(lock_fd),
-                 "--state-root", str(Path(state_root).resolve()),
-                 "--service-current", str(validate_service_binding(service_current,
-                                                                      root=source_root))))
-    child_env = _service_exec_environment(source_root, target_root)
+    was_inheritable = None
     try:
+        source_root = _code_root().resolve(strict=True)
+        binding = validate_service_binding(service_current, root=source_root)
+        if binding is None:
+            return False
+        target_root = active_service_root(binding, root=source_root)
+        if target_root is None or target_root == source_root:
+            return False
+        runner = target_root / "utilities" / "peer-steward.py"
+        argv = [sys.executable, str(runner)]
+        if herdr_session:
+            argv.extend(("--herdr-session", herdr_session))
+        argv.extend(("__obligation-runner", "--lock-fd", str(lock_fd),
+                     "--state-root", str(Path(state_root).resolve(strict=True)),
+                     "--service-current", binding))
+        # Selection, strict root resolution and environment preparation are all
+        # pre-exec work. Any OSError here is the same unsuccessful handoff as an
+        # execve error: this process keeps its lock and retries on its next pass.
+        child_env = _service_exec_environment(source_root, target_root)
         was_inheritable = os.get_inheritable(lock_fd)
         os.set_inheritable(lock_fd, True)
         os.execve(sys.executable, argv, child_env)
     except OSError:
-        try:
-            os.set_inheritable(lock_fd, was_inheritable)
-        except (OSError, UnboundLocalError):
-            pass
+        if was_inheritable is not None:
+            try:
+                os.set_inheritable(lock_fd, was_inheritable)
+            except OSError:
+                pass
         return False
     return True
+
+
+def _runner_control_payload(service_current: str | Path, *, root=None) -> bytes | None:
+    """Serialize only provenance freshly verified for this installed code root."""
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+        binding = validate_service_binding(service_current, root=code_root)
+        layout = _service_layout(code_root)
+        if binding is None or layout is None or binding != str(layout[3]):
+            return None
+        return json.dumps({"schema": _RUNNER_CONTROL_SCHEMA,
+                           "install_data_root": str(layout[1]),
+                           "service_current": binding},
+                          sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _remembered_service_binding(lock_fd: int, *, root=None) -> str | None:
+    """Read a lock payload only while holding its lock; malformed data is fixed."""
+    try:
+        code_root = Path(root).resolve(strict=True) if root is not None else _code_root().resolve(strict=True)
+        raw = os.pread(lock_fd, 4097, 0)
+        if not raw or len(raw) > 4096:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+        if (not isinstance(value, dict) or set(value) !=
+                {"schema", "install_data_root", "service_current"}
+                or type(value.get("schema")) is not int
+                or value["schema"] != _RUNNER_CONTROL_SCHEMA
+                or not isinstance(value.get("install_data_root"), str)
+                or not isinstance(value.get("service_current"), str)):
+            return None
+        layout = _service_layout(code_root)
+        binding = validate_service_binding(value["service_current"], root=code_root)
+        if (layout is None or binding is None
+                or value["install_data_root"] != str(layout[1])
+                or binding != str(layout[3])):
+            return None
+        return binding
+    except (OSError, RuntimeError, ValueError, TypeError, UnicodeError):
+        return None
+
+
+def _write_runner_control(lock_fd: int, payload: bytes) -> None:
+    """Update the existing locked inode; never replace the runner lock file."""
+    os.ftruncate(lock_fd, 0)
+    view = memoryview(payload)
+    offset = 0
+    while offset < len(view):
+        offset += os.pwrite(lock_fd, view[offset:], offset)
+    os.fsync(lock_fd)
 
 
 def peer_state_root() -> Path:
@@ -332,7 +391,7 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
     if duty.get("state") not in {"complete", "cancelled"}:
         if holder:
             store.update(duty["id"], observation={"holder": list(holder)})
-        ensure_runner(Path(jobs).parent)
+        ensure_normal_runner(Path(jobs).parent)
 
 
 def _registered_delivery_bindings(message, roots=None):
@@ -529,54 +588,14 @@ def stable_duty_id(kind: str, identity: dict, discriminator: str = "") -> str:
     return kind + "-" + hashlib.sha256(raw).hexdigest()[:32]
 
 
-def _handoff_legacy_runner(store: ObligationStore, lock_path: Path) -> bool:
-    """Replace only an exact observer whose old code cannot process this duty.
-
-    Accepted work stays in the existing store; the same flock fences its next
-    observer. A pidfd prevents a recycled PID from ever receiving the signal.
-    """
-    if not any(d.get("intent", {}).get("kind") == "registered-batch" for d in store.list()):
-        return False
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        return False
-    state_root = str(store.root.parents[1])
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        pidfd = None
-        try:
-            pidfd = os.pidfd_open(int(proc.name))
-            argv = (proc / "cmdline").read_bytes().decode().rstrip("\0").split("\0")
-            if (len(argv) < 3 or Path(argv[1]).name != "peer-steward.py"
-                    or argv[2] != "__obligation-runner"
-                    or argv[argv.index("--state-root") + 1] != state_root):
-                continue
-            lock_fd = argv[argv.index("--lock-fd") + 1]
-            if (proc / "fd" / lock_fd).resolve() != lock_path.resolve():
-                continue
-            source = Path(argv[1]).read_text()
-            if ("def _resume_registered_obligation(" in source
-                    and "from dispatch_session_sweep import addressed_records" in source):
-                continue
-            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-            return True
-        except (OSError, ValueError, IndexError, UnicodeError):
-            continue
-        finally:
-            if pidfd is not None:
-                os.close(pidfd)
-    return False
-
-
-def ensure_runner(root: str | Path | None = None, *,
-                  service_current: str | Path | None = None) -> bool:
-    """Start the existing peer-steward task runner once for actual open duties."""
+def _ensure_runner(root, *, service_current=None, use_remembered=False,
+                   remember_binding=False):
     store = ObligationStore(root)
-    if not store.list():
-        return False
-    # Legacy runners can remain alive through a long registered child. Their
-    # message claims still serialize transport; do not interrupt an in-flight send.
+    duties = store.list()
     lock_path = store.root / RUNNER_LOCK_NAME
+    if not duties and not remember_binding:
+        if not use_remembered or not lock_path.exists():
+            return False
     store.root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if lock_path.is_symlink():
         raise ObligationError("peer-obligation-runner-lock-symlink")
@@ -585,20 +604,22 @@ def ensure_runner(root: str | Path | None = None, *,
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            if not _handoff_legacy_runner(store, lock_path):
-                return True
-            deadline = time.monotonic() + 2
-            while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        return False
-                    time.sleep(0.02)
-        os.set_inheritable(fd, True)
+            # The lock holder owns the accepted duties. Never change its
+            # provenance payload, signal it, or replace it from a producer.
+            return True
         code_root = _code_root()
         binding = validate_service_binding(service_current, root=code_root)
+        if use_remembered:
+            binding = _remembered_service_binding(fd, root=code_root)
+        elif remember_binding and binding:
+            payload = _runner_control_payload(binding, root=code_root)
+            if payload is None:
+                binding = None
+            else:
+                _write_runner_control(fd, payload)
+        if not duties:
+            return False
+        os.set_inheritable(fd, True)
         active_root = active_service_root(binding, root=code_root) if binding else None
         runner_root = active_root or code_root
         runner = runner_root / "utilities" / "peer-steward.py"
@@ -620,6 +641,26 @@ def ensure_runner(root: str | Path | None = None, *,
         return False
     finally:
         os.close(fd)
+
+
+def ensure_runner(root: str | Path | None = None, *,
+                  service_current: str | Path | None = None) -> bool:
+    """Start a fixed-root runner unless an explicit internal binding is supplied."""
+    return _ensure_runner(root, service_current=service_current)
+
+
+def ensure_normal_runner(root: str | Path | None = None, *, lifecycle_root=None) -> bool:
+    """Ensure a producer runner using only verified lifecycle provenance.
+
+    Lifecycle callbacks may establish the binding while holding the existing
+    runner lock, including when no duty currently needs a process. Ordinary
+    producers reuse only a validated binding already in that lock's payload.
+    """
+    if lifecycle_root is not None:
+        binding = managed_service_binding(lifecycle_root)
+        return _ensure_runner(root, service_current=binding,
+                              remember_binding=binding is not None)
+    return _ensure_runner(root, use_remembered=True)
 
 
 @contextmanager
