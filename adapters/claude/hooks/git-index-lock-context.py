@@ -1,0 +1,1 @@
+../../../hooks/git-index-lock-context.py

@@ -2,7 +2,7 @@
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
 
-import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
+import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, subprocess, sys, tempfile, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -16,6 +16,7 @@ VALID_AFFINITY = DEFAULTS.AFFINITY_VALUES | {"unspecified"}
 sys.path.insert(0, str(ROOT/"utilities"))
 from hearting_gates import gates_on, same_work_or_refuse
 import artifact_locator as ARTIFACT_LOCATOR
+import git_index_lock
 import route_identity as ROUTE_IDENTITY
 import route_lineage as ROUTE_LINEAGE
 import dispatch_runtime_support as RUNTIME_SUPPORT
@@ -10194,8 +10195,21 @@ def _git(cwd, *args):
 def _worktree_git(cwd, *args):
     """Run one preparation command, retaining stderr for a fail-closed receipt."""
     try:
-        return subprocess.run(["git", "-C", str(cwd), *args], text=True, capture_output=True,
-                              timeout=120, check=False)
+        argv = ["git", "-C", str(cwd), *args]
+        raw = subprocess.run(argv, text=False, capture_output=True, timeout=120, check=False)
+        encoding = locale.getpreferredencoding(False) or "utf-8"
+        result = subprocess.CompletedProcess(
+            raw.args, raw.returncode,
+            git_index_lock.compatibility_text(raw.stdout, encoding, failed=raw.returncode != 0),
+            git_index_lock.compatibility_text(raw.stderr, encoding, failed=raw.returncode != 0))
+        result.raw_stdout, result.raw_stderr = raw.stdout, raw.stderr
+        if raw.returncode:
+            result.git_failure = git_index_lock.failure_record(
+                raw.returncode, raw.stdout, raw.stderr, encoding)
+            diagnosis = git_index_lock.diagnose_failure(
+                argv, str(cwd), raw.returncode, raw.stdout, raw.stderr)
+            result.git_diagnosis = diagnosis if diagnosis and diagnosis.get("state") != "unbound" else None
+        return result
     except (OSError, subprocess.SubprocessError) as exc:
         return subprocess.CompletedProcess(["git", *args], 127, "", str(exc))
 
@@ -10460,8 +10474,14 @@ def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=
             if added.returncode != 0:
                 if _worktree_collision(added):
                     continue
-                return {"state": "failed", "reason": "worktree-add-failed", "path": str(path),
-                        "branch": branch, "base": base_sha, "detail": (added.stderr or added.stdout).strip()}
+                failed = {"state": "failed", "reason": "worktree-add-failed", "path": str(path),
+                          "branch": branch, "base": base_sha,
+                          "detail": (added.stderr or added.stdout).strip()}
+                if hasattr(added, "git_failure"):
+                    failed["git_failure"] = added.git_failure
+                if getattr(added, "git_diagnosis", None):
+                    failed["git_diagnosis"] = added.git_diagnosis
+                return failed
             record["state"] = "ready"
             try:
                 atomic_write(record_path, record)

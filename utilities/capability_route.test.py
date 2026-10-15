@@ -10224,4 +10224,42 @@ class EntryExecutionScopeTest(unittest.TestCase):
   self.assertNotEqual(R.TOPO.registry_digest(reconstructed), R.TOPO.registry_digest(old))
 
 
+class GitIndexLockPreparationReceipt(unittest.TestCase):
+ def test_actual_worktree_add_failure_keeps_reason_and_raw_git_failure(self):
+  with tempfile.TemporaryDirectory(prefix="route-index-lock-") as td:
+   root=Path(td); repo=root/"repo"; repo.mkdir(); reports=root/"reports"; reports.mkdir()
+   def git(*args):
+    return subprocess.run(["git","-C",str(repo),*args],capture_output=True,check=True)
+   git("init","-q","-b","main"); git("config","user.name","Fixture")
+   git("config","user.email","fixture@example.invalid")
+   (repo/"tracked").write_text("base\n"); git("add","tracked"); git("commit","-qm","base")
+   head=git("rev-parse","HEAD").stdout.decode().strip()
+   custom_index=root/"custom-index"; custom_index.write_bytes((repo/".git/index").read_bytes())
+   lock=Path(str(custom_index)+".lock"); lock.write_bytes(b"")
+   lock_fd=os.open(lock,os.O_RDONLY); lock.chmod(0)
+   original=R._worktree_git
+   def fail_add(cwd,*args):
+    if args[:2]==("worktree","add"):
+     with mock.patch.dict(os.environ,{"GIT_INDEX_FILE":str(custom_index)}):
+      return original(cwd,*args)
+    return original(cwd,*args)
+   with mock.patch.object(R,"_remote_default_base",
+                          return_value=({"branch":"main","sha":head},None,None)), \
+        mock.patch.object(R,"_worktree_git",side_effect=fail_add):
+    receipt=R.prepare_isolated_worktree(
+     repo,"fixture-lock-failure",artifact_root=reports,
+     preparation_key={"task":"isolated lock receipt"})
+   self.assertEqual((receipt["state"],receipt["reason"]),("failed","worktree-add-failed"))
+   self.assertEqual(receipt["git_failure"]["returncode"],128)
+   self.assertEqual(base64.b64decode(receipt["git_failure"]["stderr_b64"]),
+                    receipt["detail"].encode("utf-8")+b"\n")
+   self.assertEqual(receipt["git_diagnosis"]["lock_path"],str(lock))
+   self.assertEqual(receipt["git_diagnosis"]["state"],"present")
+   self.assertEqual(lock.stat().st_mode & 0o777,0)
+   self.assertEqual(lock.stat().st_size,0)
+   self.assertEqual((os.fstat(lock_fd).st_dev,os.fstat(lock_fd).st_ino),
+                    (os.lstat(lock).st_dev,os.lstat(lock).st_ino))
+   os.close(lock_fd)
+
+
 if __name__=="__main__": unittest.main()
