@@ -1142,11 +1142,17 @@ def _first_leg(route, path, jobs, result, root, record, output, record_path, dec
                 work_request={"text": Path(context["prompt_file"]).read_text(encoding="utf-8"),
                               "owner_harness": context.get("owner")}, readiness=probe)
         except ValueError as exc:
-            return None, {**result, "state": "needs-attention", "reason": "first-leg-compose-refused",
-                          "detail": str(exc), "required_action": "inspect-preparation",
-                          "record_file": str(record_path),
-                          "next_step": "The decision record is kept. Correct what the compose error names, then run "
-                              "resume_command again, or compose the route yourself from the record's proposal."}
+            preparation_failed = str(exc).startswith("source-worktree-preparation-failed:")
+            attention = {**result, "state": "needs-attention",
+                         "reason": "first-leg-preparation-failed" if preparation_failed else "first-leg-compose-refused",
+                         "detail": str(exc), "record_file": str(record_path),
+                         "next_step": ("The decision and approval are retained. Retry this same start; "
+                                       "preparation will continue automatically." if preparation_failed else
+                                       "The decision record is kept. Correct what the compose error names, then run "
+                                       "resume_command again.")}
+            if not preparation_failed:
+                attention["required_action"] = "inspect-preparation"
+            return None, attention
         # Key order is part of the route's bytes (the validators read some tables in declared order),
         # so the snapshot keeps it; `route_hash` is order-independent.
         raw = (json.dumps(leg_route, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -2037,6 +2043,13 @@ def _advance_plan(route, jobs, result, *, run, sleep, clock):
             return result
         leg_route, leg_path = _plan_leg(route, jobs, following["index"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
+        preparation_failed = str(exc).startswith("source-worktree-preparation-failed:")
+        if preparation_failed:
+            return {**result, "state": "needs-attention", "reason": "source-worktree-preparation-failed",
+                    "plan_advance": {"state": "retryable", "leg": following.get("index"),
+                                     "reason": str(exc)[:240]},
+                    "next_step": ("The route plan, approval, and cursor are retained. Retry this same start; "
+                                  "worktree preparation will continue automatically.")}
         return {**result, "plan_advance": {"state": "not-started", "leg": following.get("index"),
                                            "reason": str(exc)[:240]},
                 "next_step": "This leg finished. The plan's next leg did not start: " + str(exc)[:160]
@@ -2110,8 +2123,10 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
         result = _advance(route, path, jobs, result, wait=wait, interview=interview,
                           answers=answers, decision=decision, run=run, sleep=sleep, clock=clock)
     except (OSError, ValueError) as exc:
+        preparation_failed = str(exc).startswith("source-worktree-preparation-failed:")
         result = {**result, "state": "needs-attention",
-                  "reason": getattr(exc, "reason", type(exc).__name__), "detail": str(exc)}
+                  "reason": "source-worktree-preparation-failed" if preparation_failed else
+                            getattr(exc, "reason", type(exc).__name__), "detail": str(exc)}
         # A caller can lose the launch reply after the adapter claimed a row.
         # Preserve those durable obligations in this receipt too; do not spawn
         # a replacement or infer completion from the caller's exception.
@@ -2127,13 +2142,18 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
         except (OSError, ValueError) as observation_error:
             result["observation_error"] = str(observation_error)
     if result["state"] == "needs-attention":
-        result.setdefault("required_action", "inspect-preparation")
         result["resume_command"] = resume_command(path, jobs, agent_home=ROOT)
-        result.setdefault("next_step", "Inspect the exact diagnostic or result recovery_command. Existing workers retain "
-            "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
-            "failure, then use resume_command; a usage-limit stop resumes after the limit resets, and a silent death "
-            "is replaced once per logical node. "
-            "If the correction changes the requested work, ask the user before changing that work.")
+        if result.get("reason") == "source-worktree-preparation-failed":
+            result.pop("required_action", None)
+            result["next_step"] = ("The existing route plan, approval, and cursor are retained. Retry this same start; "
+                                   "worktree preparation will continue automatically.")
+        else:
+            result.setdefault("required_action", "inspect-preparation")
+            result.setdefault("next_step", "Inspect the exact diagnostic or result recovery_command. Existing workers retain "
+                "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
+                "failure, then use resume_command; a usage-limit stop resumes after the limit resets, and a silent death "
+                "is replaced once per logical node. "
+                "If the correction changes the requested work, ask the user before changing that work.")
     for launch in result.get("launches", []):
         for advisory in OWNER_WRITE_ADVISORY.receipt_advisories(launch.get("receipt", "")):
             if advisory not in result["advisories"]:
