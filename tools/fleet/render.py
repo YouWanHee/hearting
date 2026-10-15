@@ -761,6 +761,27 @@ def _half_up(value):
     return int(math.floor(float(value) + 0.5))
 
 
+def _native_context_gauge(entity):
+    """Without an applied compaction trigger, draw the native gauge: raw window and percent.
+
+    An unknown or disabled policy still has a measured window and usage; showing nothing would
+    hide what every session showed before applied triggers existed."""
+    policy = getattr(entity, "context_policy", None)
+    if isinstance(policy, dict) and policy.get("state") == "applied":
+        return None, None
+    window = getattr(entity, "context_window_tokens", None)
+    raw = policy.get("raw_percentage") if isinstance(policy, dict) else None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+        return min(99, round(raw)), window
+    active = getattr(entity, "active_context_tokens", None)
+    if getattr(entity, "harness", None) == "codex":
+        from .token_budget import codex_context_used_pct
+        return codex_context_used_pct(active, window), window
+    if (type(active) is int and active >= 0 and type(window) is int and window > 0):
+        return min(99, round(100 * active / window)), window
+    return None, window
+
+
 def _context_gauge_track(window):
     """F-52b context-gauge track length: `clamp(half_up(16 * window / 1M), 1, 16)`.
 
@@ -5284,7 +5305,10 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     indent = " " * max(0, int(indent_width))
     available = max(0, (term_width or _SUMMARY_FALLBACK_W) - _dw(indent))
     gauge_width = _compact_context_gauge_width(available, depth=depth)
-    track = _context_gauge_track(getattr(entity, "context_display_window_tokens", None))
+    window = getattr(entity, "context_display_window_tokens", None)
+    if pct is None and window is None:
+        pct, window = _native_context_gauge(entity)
+    track = _context_gauge_track(window)
     if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
             and 0 <= pct <= 100):
         shown_pct = int(round(pct))
