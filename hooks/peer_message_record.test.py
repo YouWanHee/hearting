@@ -2,6 +2,7 @@
 """Unit tests for hooks/peer-message-record.py (SD-122)."""
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -208,6 +210,28 @@ class PromptTest(_BaseTest):
         proc = self._run("prompt", payload)
         context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("ACK are not execution", context)
+
+    def test_prompt_guidance_receives_exact_claude_payload_identity(self):
+        from types import SimpleNamespace
+        spec = importlib.util.spec_from_file_location("peer_message_record_hook_test", _HOOK)
+        hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hook)
+        prompt = "actual Claude prompt (peer-from: codex [0a] peer ; ref=abc)"
+        payload = {"session_id": "claude-payload-session", "cwd": "/tmp/project", "prompt": prompt}
+        calls = []
+        mod = SimpleNamespace(
+            receiver_guidance=lambda *args, **kwargs: calls.append((args, kwargs)) or "ordinary guidance",
+            emit_peer_context=lambda *args, **kwargs: None,
+        )
+        with mock.patch.object(hook, "_is_helper_process", return_value=False), \
+             mock.patch.object(hook, "_read_stdin_json", return_value=payload), \
+             mock.patch.object(hook, "handle_prompt"), \
+             mock.patch.object(hook, "sweep_undelivered", return_value=[]), \
+             mock.patch.object(hook, "_peer_message_module", return_value=mod), \
+             mock.patch.object(hook.sys, "argv", [str(_HOOK), "prompt"]):
+            hook.main()
+        self.assertEqual(calls, [((prompt, {"harness": "claude", "session_id": "claude-payload-session"}),
+                                  {"cwd": "/tmp/project"})])
 
     def test_notice_record_has_no_body_text(self):
         payload = {

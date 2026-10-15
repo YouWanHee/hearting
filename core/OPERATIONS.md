@@ -2152,10 +2152,14 @@ actually recover a detached-watch receipt on its next turn, with no wake carrier
 receipts at `spec/stage-dispatch/_internal/research/peer-session-probe/P-<n>.md`; no
 adapter claims a working Codex-steward or OpenCode realization until its receipt exists.
 
-Explicit peer handoff acceptance uses `session_tidy.py handoff accept <ref>`
-after the successor reads the card and its referenced documents. That one
-agent operation schedules the acceptance reply and normal predecessor retire
-reservation using the original exact identities. Delivery is receipt, not acceptance.
+Only shared receiver guidance for a valid current typed cross-seat session-tidy
+handoff supplies the existing `session_tidy.py handoff accept <ref>` command.
+After reading the card and referenced documents, the receiver uses that exact
+command; it binds the current receiver and transfer ref. Ordinary messages and
+cards have no accept command or successor authority. A confirmed same-seat clear
+uses the existing seat handover automatically. Explicit acceptance schedules the
+retained reply and normal predecessor retire reservation using the original exact
+identities. Delivery is receipt, not acceptance.
 For a new actionable peer request, send an acceptance reply before processing;
 an informational/no-reply notice needs no reply. Completion reception requires
 actual approved result review/follow-through this turn or its registered

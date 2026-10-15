@@ -78,7 +78,7 @@ Example fields (use the user's language):
 사용자 지시: "…" — 끝남 / 남음 / 보류
 ```
 
-Continue with the existing enqueue and handoff flow.
+Continue with the existing enqueue and handoff flow. An ordinary peer message or card grants no successor authority and has no session-tidy accept command. A confirmed same-seat clear continues through the existing seat snapshot and handover ledger without peer acceptance. For a typed cross-seat session-tidy handoff, read the card and referenced documents, then use only the exact receiver command supplied by shared guidance. Delivery, queue consumption and ACK are receipt facts, not acceptance; the existing explicit acceptance still revalidates the current receiver and preserves the original requester, predecessor and successor lifetimes and completion delivery.
 
 ## Artifact Ownership
 
@@ -108,8 +108,6 @@ Adapters must preserve the portable invariants relevant to this capability:
 
 `skills/session-tidy/SKILL.md` and `adapters/claude/skills/session-tidy/SKILL.md` are byte-identical (enforced by `check-adaptation-boundary.sh`'s `diff -qr`); the only difference is the runtime discovery path — Claude Code discovers `adapters/claude/skills/session-tidy/SKILL.md`, while `skills/session-tidy/SKILL.md` remains the compatibility reference kept for parity/drift checks.
 
-The successor reads the handoff card and referenced documents, then invokes
-`utilities/session_tidy.py handoff accept <ref>`. This is its explicit read-and-accept,
-not user approval. One existing transfer processing schedules a retained acceptance
-reply and the normal retire reservation, preserving exact original requester,
-predecessor and successor lifetimes. Mere delivery never accepts the handoff.
+Only a valid current typed cross-seat handoff receives the existing explicit
+read-and-accept command. It is not user approval and does not change registered
+completion identity; mere delivery never accepts the handoff.

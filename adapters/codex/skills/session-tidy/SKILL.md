@@ -78,7 +78,7 @@ Example fields (use the user's language):
 사용자 지시: "…" — 끝남 / 남음 / 보류
 ```
 
-Continue with the existing enqueue and handoff flow.
+Continue with the existing enqueue and handoff flow. An ordinary peer message or card grants no successor authority and has no session-tidy accept command. A confirmed same-seat clear continues through the existing seat snapshot and handover ledger without peer acceptance. For a typed cross-seat session-tidy handoff, read the card and referenced documents, then use only the exact receiver command supplied by shared guidance. Delivery, queue consumption and ACK are receipt facts, not acceptance; the existing explicit acceptance still revalidates the current receiver and preserves the original requester, predecessor and successor lifetimes and completion delivery.
 
 
 ## Workflow Evidence

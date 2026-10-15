@@ -2,6 +2,7 @@
 """A native prompt renders pending transport receipts before acknowledging them."""
 import contextlib
 import importlib.util
+import importlib.machinery
 import io
 from pathlib import Path
 import sys
@@ -50,6 +51,47 @@ class PromptReceiptTest(unittest.TestCase):
             self.assertIn('additionalContext', output.getvalue())
             sweep.ack_delivered(root, 'native-parent', batches[0][1], acked_by='codex-native-prompt:native-parent')
             self.assertEqual(pending.read(root, 'native-parent', did)['state'], 'acked')
+
+    def test_prompt_guidance_receives_exact_codex_payload_identity(self):
+        import types
+        prompt = "actual Codex prompt (peer-from: claude [0a] peer ; ref=abc)"
+        sid = "codex-payload-session"
+        calls = []
+
+        class GuidanceLoader:
+            def create_module(self, spec):
+                return None
+            def exec_module(self, module):
+                module.receiver_guidance = lambda *args, **kwargs: calls.append((args, kwargs)) or "ordinary guidance"
+
+        guidance_spec = importlib.machinery.ModuleSpec("peer_receiver_guidance_test", GuidanceLoader())
+        projection = types.ModuleType("herdr_session_projection")
+        projection.project = lambda *args, **kwargs: None
+        context_alert = types.ModuleType("context_alert")
+        context_alert.codex_notice = lambda payload: ""
+        fleet = types.ModuleType("fleet")
+        fleet.interaction = types.SimpleNamespace(clear_wait=lambda *args, **kwargs: None)
+        payload = {"session_id": sid, "cwd": "/tmp/codex-project", "prompt": prompt}
+        no_context = lambda *args, **kwargs: ""
+        with mock.patch.dict(sys.modules, {"herdr_session_projection": projection,
+                                           "context_alert": context_alert, "fleet": fleet}), \
+             mock.patch.object(hook, "is_worker_session", return_value=False), \
+             mock.patch.object(hook, "load_payload", return_value=payload), \
+             mock.patch.object(hook, "interaction_session_id", return_value=sid), \
+             mock.patch.object(hook, "peer_notice"), \
+             mock.patch.object(hook, "retry_pending_peer"), \
+             mock.patch.object(hook, "launch_trigger"), \
+             mock.patch.object(hook, "sd111_first_prompt_sweep"), \
+             mock.patch.object(hook, "card_context", return_value=""), \
+             mock.patch.object(hook, "native_queue_prompt_receipts", return_value=([], [])), \
+             mock.patch.object(hook, "candidate_context", return_value=""), \
+             mock.patch.object(hook, "run_preflight", side_effect=no_context), \
+             mock.patch.object(hook, "token_budget_context", return_value=""), \
+             mock.patch.object(hook, "emit_context"), \
+             mock.patch.object(importlib.util, "spec_from_file_location", return_value=guidance_spec):
+            self.assertEqual(hook.main(), 0)
+        self.assertEqual(calls, [((prompt, {"harness": "codex", "session_id": sid}),
+                                  {"cwd": "/tmp/codex-project"})])
 
 if __name__ == '__main__':
     unittest.main()
