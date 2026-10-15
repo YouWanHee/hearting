@@ -860,6 +860,33 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
             # Partial settlement already belongs to the retained obligation path.
             return ordinary
 
+        # Ordinary sealed messages have no typed handoff context. Reject them
+        # before cwd validation or resolving the current runtime seat. These
+        # cheap record bindings only select possible handoffs; the shared
+        # validator below remains authoritative for context, seat, and lifetime.
+        context = row.get("handoff")
+        original_from, original_to = row.get("from"), row.get("to")
+        predecessor = context.get("predecessor") if isinstance(context, dict) else None
+        successor = context.get("successor") if isinstance(context, dict) else None
+        requester = context.get("requester") if isinstance(context, dict) else None
+        if (not isinstance(context, dict)
+                or not isinstance(original_from, dict)
+                or not isinstance(original_to, dict)
+                or not isinstance(predecessor, dict)
+                or not isinstance(successor, dict)
+                or not isinstance(requester, dict)
+                or not _valid_transfer_endpoint(original_from)
+                or not _valid_transfer_endpoint(original_to)
+                or (original_to.get("harness"), original_to.get("session_id"))
+                   != (recipient["harness"], recipient["session_id"])
+                or (predecessor.get("harness"), predecessor.get("session_id"))
+                   != (original_from.get("harness"), original_from.get("session_id"))
+                or (successor.get("harness"), successor.get("session_id"))
+                   != (recipient["harness"], recipient["session_id"])
+                or (requester.get("harness"), requester.get("session_id"))
+                   != (successor.get("harness"), successor.get("session_id"))):
+            return ordinary
+
         if not isinstance(cwd, str) or not cwd.strip():
             return ordinary
         current_cwd = os.path.abspath(os.path.expanduser(cwd))

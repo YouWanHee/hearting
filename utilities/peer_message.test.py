@@ -1212,6 +1212,50 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
         for p in patches:
             p.start(); self.addCleanup(p.stop)
 
+    def test_ordinary_sealed_message_skips_runtime_handoff_resolution(self):
+        import session_tidy
+        text, ref = peer_message.prepare_peer_message(
+            "Please review this ordinary request", self.sender, self.recipient, defer=True)
+        path = peer_message._pending_path(ref)
+        before_bytes = path.read_bytes()
+        before_obligations = self.store.list()
+        self.assertEqual(peer_message.parse_peer_trailer(
+            text, self.recipient, include_ref=True)["transfer_ref"], ref)
+        self.assertNotIn("handoff", peer_message._read_pending(ref))
+        self.assertNotIn("acceptance", peer_message._read_pending(ref))
+
+        with mock.patch.object(session_tidy, "resolve_caller") as resolve, \
+             mock.patch.object(self.steward, "_retire_target") as target:
+            guidance = peer_message.receiver_guidance(
+                text, self.recipient, cwd=str(self.tmp_root))
+
+        self.assertEqual(guidance, peer_message._ordinary_receiver_guidance())
+        self.assertNotIn("handoff accept", guidance)
+        resolve.assert_not_called()
+        target.assert_not_called()
+        self.assertEqual(path.read_bytes(), before_bytes)
+        self.assertNotIn("acceptance", peer_message._read_pending(ref))
+        self.assertEqual(self.store.list(), before_obligations)
+
+    def test_native_wrapper_without_exact_ref_skips_runtime_handoff_resolution(self):
+        import session_tidy
+        wrapped = ('<pasted_content id="native-42">\n'
+                   'ordinary native notification\n</pasted_content>')
+        parsed = peer_message.parse_peer_trailer(wrapped, self.recipient, include_ref=True)
+        self.assertFalse(parsed and parsed.get("transfer_ref"))
+        before_obligations = self.store.list()
+
+        with mock.patch.object(session_tidy, "resolve_caller") as resolve, \
+             mock.patch.object(self.steward, "_retire_target") as target:
+            guidance = peer_message.receiver_guidance(
+                wrapped, self.recipient, cwd=str(self.tmp_root))
+
+        self.assertEqual(guidance, peer_message._ordinary_receiver_guidance())
+        self.assertNotIn("handoff accept", guidance)
+        resolve.assert_not_called()
+        target.assert_not_called()
+        self.assertEqual(self.store.list(), before_obligations)
+
     def test_receiver_guidance_command_binds_each_adapter_identity(self):
         import session_tidy
         for harness in ("claude", "codex", "opencode"):
