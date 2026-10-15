@@ -281,5 +281,42 @@ class CodexDaemonIdentityTest(unittest.TestCase):
         apply.assert_not_called()
 
 
+class TcpListenerSnapshotTest(unittest.TestCase):
+    """The /proc scan behind the daemon join, on a host with closed fd tables."""
+
+    TCP = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+           "retrnsmt   uid  timeout inode\n"
+           "   0: 0100007F:A155 00000000:0000 0A 00000000:00000000 00:00000000 "
+           "00000000  1002        0 881122 1 0 100 0 0 10 0\n")
+
+    def _scan(self, locked_error):
+        def listdir(path):
+            if path == "/proc":
+                return ["100", "200", "300", "self"]
+            if path == "/proc/100/fd":
+                return ["3"]
+            if path == "/proc/200/fd":
+                raise locked_error
+            raise AssertionError(f"unexpected listdir: {path}")
+
+        def stat(path):
+            uid = os.geteuid() + 1 if path == "/proc/300" else os.geteuid()
+            return SimpleNamespace(st_uid=uid)
+
+        with mock.patch.object(codex, "open", mock.mock_open(read_data=self.TCP), create=True), \
+                mock.patch.object(codex.os, "listdir", side_effect=listdir), \
+                mock.patch.object(codex.os, "stat", side_effect=stat), \
+                mock.patch.object(codex.os, "readlink", return_value="socket:[881122]"):
+            return codex._tcp_listener_snapshot(41301)
+
+    def test_unreadable_same_uid_fd_table_is_skipped(self):
+        # User systemd and privsep sshd always refuse /proc/<pid>/fd here.
+        self.assertEqual(self._scan(PermissionError(13, "denied")),
+                         (frozenset({"881122"}), frozenset({100})))
+
+    def test_other_proc_failures_still_make_the_owner_set_unknown(self):
+        self.assertIsNone(self._scan(OSError(5, "I/O error")))
+
+
 if __name__ == "__main__":
     unittest.main()

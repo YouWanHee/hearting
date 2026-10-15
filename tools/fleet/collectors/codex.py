@@ -1392,7 +1392,10 @@ def _tcp_listener_snapshot(port):
                 if link.startswith("socket:[") and link[8:-1] in inodes:
                     owners.add(int(raw_pid))
                     break
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError):
+            # Gone, or a same-UID process whose fd table is closed to us (user
+            # systemd, privsep sshd, sandboxed children). It cannot be proven an
+            # owner, so it is skipped instead of voiding every listener snapshot.
             continue
         except OSError:
             return None
