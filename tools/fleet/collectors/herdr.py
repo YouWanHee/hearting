@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from concurrent.futures import wait
 
@@ -164,11 +165,10 @@ def pane_pids(panes, runner=subprocess.run, bindings=None):
 
 
 def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_current=False):
-    """Exact thread IDs for Codex TUIs, bounded by cwd and cached by PID.
+    """Process identities for Codex TUIs currently foreground in herdr panes.
 
-    Herdr pane metadata can be stale (a closed pane may retain a thread ID), so a
-    matching live foreground Codex PID and its original process start are required.
-    Current-session transitions bypass the short-lived identity cache.
+    Pane metadata is not thread proof. The live foreground PID's
+    ``process_identity`` is authoritative; pane process info confirms ownership.
     """
     from . import procscan
 
@@ -192,7 +192,26 @@ def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_cu
         selected = [p for p in panes or []
                     if p.get("agent") == "codex"
                     and os.path.realpath(p.get("cwd") or "") in cwds]
-        _shells, _fg, found = pane_evidence(selected, runner=runner)
+        _shells, foreground, _metadata = pane_evidence(selected, runner=runner)
+        utilities = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "utilities"))
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        try:
+            from pane_ownership import current_codex_thread
+            found = {}
+            for pid, session in targets.items():
+                if pid not in foreground or procscan.read_proc_start(pid) != session.proc_start:
+                    continue
+                for pane in selected:
+                    pane_id = pane.get("pane_id")
+                    if not pane_id:
+                        continue
+                    sid = current_codex_thread(str(pane_id), pid)
+                    if sid:
+                        found[pid] = sid
+                        break
+        except Exception:
+            found = {}
         if runner is subprocess.run:
             _CODEX_PANE_CACHE.update(key=key, until=now + _CODEX_PANE_TTL_S,
                                      identities=found)

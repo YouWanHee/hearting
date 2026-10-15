@@ -42,12 +42,9 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 
 The seat is the herdr pane only when ``pane_ownership`` verifies its live connection,
 else harness + project. ``HERDR_PANE_ID`` is only a lookup hint.
-A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
-pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
-caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
-a ``/clear``), else the one whose confirmed auto-clear named exactly this thread as its new session,
-else -- for the first hook after an auto-clear -- the one window waiting for its successor.  No
-match or several -> the project seat, quietly.
+A Codex caller's ``CODEX_THREAD_ID`` supplies its exact thread; pane_ownership maps that
+thread to the foreground TUI PID and confirms herdr's pane process info. If no unique pane
+can be proved, the project seat is used quietly.
 A worker marker is checked before the pane: a worker that inherited its
 supervisor's pane id gets no card, ledger line or notice.
 """
@@ -377,7 +374,12 @@ def _herdr_codex_agents() -> Optional[list[dict]]:
     if not exe:
         return None
     try:
-        done = subprocess.run([exe, "agent", "list"], capture_output=True, text=True,
+        server = os.environ.get("AGENT_HERDR_SESSION")
+        command = [exe]
+        if server:
+            command += ["--session", server]
+        command += ["agent", "list"]
+        done = subprocess.run(command, capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=HERDR_LOOKUP_TIMEOUT_SEC)
         agents = (json.loads(done.stdout or "").get("result") or {}).get("agents")
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
@@ -485,11 +487,20 @@ def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
 def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] = None,
                  source: str = "") -> Seat:
     env = os.environ if env is None else env
-    pane = (env.get("HERDR_PANE_ID") or "").strip()
-    if not pane and harness == "codex" and sid:
+    live_caller = env is os.environ
+    pane = ((env.get("HERDR_PANE_ID") or "").strip()
+            if live_caller or harness != "codex" else "")
+    server = env.get("AGENT_HERDR_SESSION") if live_caller else None
+    socket_value = env.get("HERDR_SOCKET_PATH", "") if live_caller else ""
+    endpoint_unproven = bool(harness == "codex" and server and not socket_value)
+    if live_caller and not endpoint_unproven and not pane and harness == "codex" and sid:
         pane = codex_pane_for_session(sid, str(cwd or ""), source)
     from pane_ownership import verified_pane
-    pane = verified_pane(pane, harness, sid, executable=_herdr_executable())
+    socket_path = (env.get("HERDR_SOCKET_PATH", "")
+                   if live_caller and harness == "codex" else None)
+    if (live_caller or harness != "codex") and not endpoint_unproven:
+        pane = verified_pane(pane, harness, sid, executable=_herdr_executable(),
+                             server=server, socket_path=socket_path)
     if pane:
         return Seat("pane", _digest("pane", pane), pane, harness or "", "")
     from session_tidy_native import caller_target

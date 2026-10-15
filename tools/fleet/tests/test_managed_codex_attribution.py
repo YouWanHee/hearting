@@ -96,14 +96,13 @@ class ManagedCodexAttributionTest(unittest.TestCase):
             tick = self._prepare([server, tui], {100: [rollout], 200: []}, home)
 
             self.assertEqual(tick.proc_paths, {200: rollout})
-            self.assertIn(100, tick.no_fallback_pids)
 
             with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
                 for sess in (server, tui):
                     codex.enrich(sess, tick=tick)
             self.assertEqual(tui.session_id, _SID)
             self.assertIsNotNone(tui.mtime)
-            # F-24: one sid, one row — the donor must not re-claim it via the fallback.
+            # One directly owned rollout stays on the visible managed TUI row.
             self.assertIsNone(server.session_id)
             sids = [s.session_id for s in (server, tui) if s.session_id]
             self.assertEqual(len(sids), len(set(sids)))
@@ -118,7 +117,6 @@ class ManagedCodexAttributionTest(unittest.TestCase):
             tui = _session(200, cwd, os.path.join(base, "session-bbb"))
             tick = self._prepare([server, tui], {100: [rollout], 200: []}, home)
             self.assertEqual(tick.proc_paths, {100: rollout})
-            self.assertEqual(tick.no_fallback_pids, frozenset())
 
     def test_two_clients_in_one_managed_dir_stay_unattributed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,7 +137,6 @@ class ManagedCodexAttributionTest(unittest.TestCase):
             rollout = _make_rollout(home, cwd)
             tick = self._prepare([_session(100, cwd, None)], {100: [rollout]}, home)
             self.assertEqual(tick.proc_paths, {100: rollout})
-            self.assertEqual(tick.no_fallback_pids, frozenset())
 
     def test_shared_daemon_with_two_same_cwd_rollouts_has_no_owner(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,7 +204,6 @@ class ManagedCodexAttributionTest(unittest.TestCase):
                     mock.patch.object(procscan, "read_environ", return_value={}):
                 tick = self._prepare([tui], {200: [old]}, home)
             self.assertNotIn(200, tick.proc_paths)
-            self.assertIn(200, tick.no_fallback_pids)
             with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
                 codex.enrich(tui, tick=tick)
             self.assertEqual(tui.session_id, new_sid)
@@ -226,7 +222,6 @@ class ManagedCodexAttributionTest(unittest.TestCase):
                  mock.patch.object(procscan, "read_environ", return_value={}):
                 tick = self._prepare([tui], {200: []}, home)
             self.assertIsNone(tick.proc_paths.get(200))
-            self.assertIn(200, tick.no_fallback_pids)
             with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
                 codex.enrich(tui, tick=tick)
             self.assertEqual(tui.session_id, other_sid)

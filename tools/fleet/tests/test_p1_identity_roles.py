@@ -304,6 +304,9 @@ class ProcessRolesTest(unittest.TestCase):
             process_identity.finalize_process_roles(rows, jobs)
         self.assertEqual({s.pid for s in rows}, {20, 21, 22, 30, 40})
         self.assertEqual({s.process_role for s in rows}, {"conversation", "session-backend", "registered-worker"})
+        generic_app_server = next(session for session in rows if session.pid == 30)
+        self.assertTrue(generic_app_server.app_server)
+        self.assertEqual(generic_app_server._invocation_mode, "command")
 
     def test_unbound_session_cannot_infer_stage_from_cwd_basename(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,9 +347,7 @@ class ProcessRolesTest(unittest.TestCase):
                     session_id="0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47", app_server=True)
         s._tty, s._invocation_mode = "?", "command"
         path = "/tmp/rollout-0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47.jsonl"
-        with mock.patch.object(codex, "_proc_rollout", return_value=path), \
-                mock.patch.object(codex, "_reserve_start_matched_rollouts"), \
-                mock.patch("fleet.session_registry.read", return_value=None):
+        with mock.patch.object(codex, "_proc_rollout", return_value=path):
             codex.process_rollouts([s], "/tmp/codex")
             rows = [s]
             process_identity.finalize_process_roles(rows, [])

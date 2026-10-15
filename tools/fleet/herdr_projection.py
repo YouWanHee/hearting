@@ -23,11 +23,11 @@ pane belongs to the interactive session that owns it.
 Every herdr report from a hook — this projection and `hooks/herdr-agent-state.sh` — asks
 `may_report()` first. A process may report a session only when it IS that session's
 runtime, proven from the process itself, never from the payload or the environment
-(OpenCode proves the harness only — see `may_report`). For Codex, a direct frontend's
-two fresh native footer reads prove the current thread and must agree with the exact
-foreground PID and pane. An open rollout can be historical after a session switch.
-Shared services still need an exact native session match, and ambiguous process
-ownership proves nothing. Test suites run the real
+(OpenCode proves the harness only — see `may_report`). For Codex, process_identity
+proves the thread through the daemon loader's exact foreground PID. A visible footer
+confirms the thread and refuses a disagreement; an absent footer does not erase the
+process proof. Shared services use the caller's CODEX_THREAD_ID to locate that TUI.
+Ambiguous process ownership proves nothing. Test suites run the real
 hooks with fake session ids while inheriting the interactive pane's `HERDR_PANE_ID` and
 often strip the worker markers, so the worker check alone let `directpromptsid` repaint a
 live pane as `[0d] codex` and take over its `agent_session_id` (2026-09-24). When the
@@ -100,13 +100,9 @@ def runtime_identity():
       the statusline tap matched by pid + start time, for the hours a live process's
       registry file goes missing — F-25 tier 2);
     - Codex: a process named ``codex``/``codex-*`` is the runtime only once
-      `collectors.codex.session_id_of_process` proves its thread — the rollout it holds
-      open, else (a direct TUI holding none) the board's own `process_rollouts`
-      start-time match and then its same-cwd fallback over the live Codex processes,
-      scanned at most once per walk. A
-      Codex process proven neither way (the `--remote` TUI, `codex-code-mode-host`, an
-      ambiguous match) is passed over for the ancestor that is, and no proof anywhere
-      means ``("codex", None)``;
+      `collectors.codex.session_id_of_process` proves its thread through a held rollout
+      or the daemon loader's unique TUI PID. A process without either proof is passed
+      over for the ancestor that is, and no proof anywhere means ``("codex", None)``;
     - OpenCode: a process named ``opencode`` — its session id is the one its own TUI
       selection record proves, else ``("opencode", None)`` (a start-time ``--session``
       is not proof: the TUI may have switched since).
@@ -116,14 +112,8 @@ def runtime_identity():
     ``(None, None)`` when no runtime is found — CI, a detached helper, a test with a fake
     config dir.
     """
-    from fleet.collectors import procscan
     from fleet.process_identity import PROVEN, process_identity
-    pid, codex_seen, live = os.getpid(), False, []
-
-    def live_codex():
-        if not live:
-            live.append(procscan.scan(harness_filter={"codex"}))
-        return live[0]
+    pid, codex_seen = os.getpid(), False
 
     for _ in range(_MAX_ANCESTORS):
         if not pid or pid <= 1:
@@ -134,7 +124,7 @@ def runtime_identity():
         comm = _comm(pid)
         if comm == "codex" or comm.startswith("codex-"):
             codex_seen = True
-            found = process_identity(pid, "codex", live_codex=live_codex)
+            found = process_identity(pid, "codex")
             if found.confidence == PROVEN:
                 return "codex", found.session_id
         elif comm == "opencode":
@@ -171,8 +161,8 @@ def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> b
     - never for a registered/background worker (D-42);
     - Claude: the nearest runtime above this process must be proven to be on
       ``session_id`` (see `runtime_identity`); the payload and environment are never proof;
-    - Codex: the current footer must prove ``session_id`` for the exact foreground PID and
-      pane; rollout identity may be historical after /new, resume, or fork;
+    - Codex: process_identity must prove ``session_id`` for the foreground TUI in its
+      pane; a visible footer confirms it and rejects a different selection;
     - OpenCode: the nearest runtime must be OpenCode, and when that process proves its
       session (its TUI selection record) the id must match it. A process
       that proves none — an older TUI without the selection record — keeps the
@@ -189,9 +179,8 @@ def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> b
         return False
     pane = pane_id or os.environ.get("HERDR_PANE_ID")
     if harness == "codex":
-        # An open rollout can continue to name A after the foreground TUI has
-        # selected B. The current footer must authorize both B and reject a late
-        # callback for A, even while the process still holds A's rollout open.
+        # The callback's exact thread id is checked against the TUI process identity;
+        # if a footer is visible, pane_ownership also rejects a conflicting selection.
         pid = _nearest_codex_pid()
         return bool(pid and verified_pane(pane, harness, session_id, pid=pid))
     if not (runtime == "opencode" and own is None) and own != session_id:
@@ -490,32 +479,25 @@ def _herdr_endpoint(socket_path):
             os.environ["HERDR_SOCKET_PATH"] = inherited
 
 
+def _codex_tui_endpoint(session_id: str):
+    """The unique pane/socket pair whose live foreground Codex TUI proves ``session_id``."""
+    try:
+        from pane_ownership import codex_tui_pane_endpoint
+        return codex_tui_pane_endpoint(session_id)
+    except Exception:
+        return None
+
+
 def _codex_tui_pane(session_id: str, *, transport=None):
     """The unique pane whose live foreground Codex TUI proves ``session_id``, or None.
 
-    Two panes resolving to one session (same-cwd TUIs sharing the fallback candidate)
-    stay None: a badge on the wrong pane also misdirects peer messages.
+    Two panes resolving to one session stay unknown: a badge on the wrong pane
+    also misdirects peer messages.
     """
-    from fleet.collectors import procscan
-    endpoints = set()
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit() or _comm(int(entry)) != "codex":
-            continue
-        frontend_env = procscan.read_environ(int(entry))
-        pane = frontend_env.get("HERDR_PANE_ID")
-        socket_path = frontend_env.get("HERDR_SOCKET_PATH")
-        try:
-            if pane:
-                with _herdr_endpoint(socket_path):
-                    proven = verified_pane(pane, "codex", session_id, pid=int(entry),
-                                           socket_path=socket_path)
-                if proven:
-                    endpoints.add((proven, socket_path))
-        except Exception:
-            continue
-    if len(endpoints) != 1:
+    pair = _codex_tui_endpoint(session_id)
+    if pair is None:
         return None
-    pane, socket_path = endpoints.pop()
+    pane, socket_path = pair
     if transport is not None:
         transport.update(socket_path=socket_path)
     return pane
@@ -536,13 +518,13 @@ def _await_tui_and_project(session_id: str, report_session: bool, *,
     try:
         deadline = time.monotonic() + _PROOF_WAIT_S
         while time.monotonic() < deadline:
-            transport = {}
-            pane = _codex_tui_pane(session_id, transport=transport)
-            if pane:
-                with _herdr_endpoint(transport.get("socket_path")):
+            endpoint = _codex_tui_endpoint(session_id)
+            if endpoint:
+                pane, socket_path = endpoint
+                with _herdr_endpoint(socket_path):
                     _report("codex", session_id, pane, report_session,
                             session_seq=session_seq, session_start_source=session_start_source,
-                            _proof=lambda: _codex_tui_pane(session_id) == pane)
+                            _proof=lambda: _codex_tui_endpoint(session_id) == endpoint)
                 return
             time.sleep(2)
     finally:

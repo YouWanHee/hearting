@@ -1750,11 +1750,13 @@ shell; past screen prompts are not readiness. Unknown, busy, occupied, form, and
 trust screens receive no typed input; visible folder-trust and Codex hook-review forms
 report not-ready, retaining pending delivery for redelivery after closure. Unknown Codex
 prompt screens keep immediate typing. peer-steward observes forms without writing trust
-or selecting options; global runtime activation records hashes for Hearting's hooks. A fresh
-Codex start the steward launches runs Embedded (`--no-daemon`) unless the caller
-stated otherwise, so the new TUI owns its rollout fd and same-cwd simultaneous
-starts stay exactly attributable; time-candidate threads stay out of Embedded
-attribution (unknown until its own fd proves it), and resume/fork keep theirs.
+or selecting options; global runtime activation records hashes for Hearting's hooks.
+Fresh Codex starts use Codex's normal shared-daemon behavior. The steward preserves
+caller-supplied `--no-daemon` and `--remote` arguments. A start receipt includes a
+session ID only when the existing shared process-identity resolver already proves
+it; unknown identity does not make a successful launch fail, and the start path
+does not infer identity from newly appearing rollouts or elapsed time. Resume and
+fork keep their explicit thread targets.
 
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
 which with no `--pane` or `--beside` uses the calling pane (`HERDR_PANE_ID`)
