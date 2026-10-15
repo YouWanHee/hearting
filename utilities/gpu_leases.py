@@ -66,11 +66,18 @@ def _registered_parent(environ, jobs=None):
     own canonical identity, from a registered attempt whose lineage could not be proved.
     """
     attempt = environ.get("AGENT_DISPATCH_ATTEMPT_ID")
-    try:
-        depth = int(environ.get("AGENT_DISPATCH_DEPTH") or 0)
-    except (TypeError, ValueError):
-        depth = -1
-    if not attempt or depth == 0:
+    if not attempt:
+        return False, None
+    raw_depth = environ.get("AGENT_DISPATCH_DEPTH")
+    if isinstance(raw_depth, int) and not isinstance(raw_depth, bool):
+        depth = raw_depth
+    elif isinstance(raw_depth, str) and raw_depth in {"0", "1", "2"}:
+        depth = int(raw_depth)
+    else:
+        # An attempt id is evidence that this may be registered. Missing or
+        # malformed depth cannot turn it into an interactive launcher.
+        return True, None
+    if depth == 0:
         return False, None
     if depth not in (1, 2):
         return True, None

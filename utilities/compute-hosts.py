@@ -1096,7 +1096,7 @@ def host_uptime_s():
 
 ENV_KEYS = {
     "AGENT_DISPATCH_ATTEMPT_ID", "AGENT_DISPATCH_SELF_SLUG",
-    "HEARTING_COMPUTE_RUN_ID", "HEARTING_COMPUTE_HOST",
+    "HEARTING_COMPUTE_RUN_ID", "HEARTING_RESOURCE_RUN_ID", "HEARTING_COMPUTE_HOST",
     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
     "OPENCODE_SESSION_ID", "SSH_CONNECTION",
     "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER",
@@ -1172,7 +1172,8 @@ def process_owner(pid, expected_start):
                 "evidence_start": stat["start"], "ancestry_depth": depth,
                 "source": "environment+ancestry",
             })
-        run_id = env.get("HEARTING_COMPUTE_RUN_ID")
+        run_id = (env.get("HEARTING_COMPUTE_RUN_ID")
+                  or env.get("HEARTING_RESOURCE_RUN_ID"))
         if run_id:
             candidates["run"].append({
                 "kind": "run", "id": run_id,
@@ -1436,7 +1437,9 @@ def gpu_proc_fallback():
                     or after.get("state") in {"Z", "X"} or not same_euid(pid)
                     or identity_env(pid) != env):
                 continue
-            processes[pid] = (process, indexes, env.get("HEARTING_COMPUTE_RUN_ID"), before["ppid"])
+            run_id = (env.get("HEARTING_COMPUTE_RUN_ID")
+                      or env.get("HEARTING_RESOURCE_RUN_ID"))
+            processes[pid] = (process, indexes, run_id, before["ppid"])
     except OSError as exc:
         detail = str(exc)[:120]
     count = 0

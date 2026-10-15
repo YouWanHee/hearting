@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from unittest import mock
@@ -82,6 +83,189 @@ class PayloadSessionEnvironmentTest(unittest.TestCase):
 
 
 class TestRunner(unittest.TestCase):
+    def test_resource_run_probe_attributes_both_gpu_spawn_paths_to_route_parent(self):
+        harness = textwrap.dedent(r"""
+            import contextlib, hashlib, importlib.util, io, json, os, signal, subprocess, sys, time
+            from pathlib import Path
+            from types import SimpleNamespace
+            from unittest import mock
+
+            mode, base_arg, root_arg = sys.argv[1:]
+            base, root = Path(base_arg), Path(root_arg)
+            utilities = root / "utilities"
+            sys.path.insert(0, str(utilities))
+            import gpu_leases as G
+
+            def load(path, name):
+                spec = importlib.util.spec_from_file_location(name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                return module
+
+            runner = load(utilities / "resource-runner.py", "resource_probe_runner")
+            compute = load(utilities / "compute-hosts.py", "resource_probe_compute_hosts")
+            jobs = base / "dispatch" / "jobs.log"
+            route_file = base / "route.json"
+            registry = base / "resource-runs.json"
+            log = base / "run.log"
+            pid_file = base / "gpu-process.pid"
+            run_id = "probe-" + mode
+            route = json.loads(route_file.read_text())
+            command = [sys.executable, "-c",
+                "import pathlib,subprocess,sys; "
+                "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+                "pathlib.Path(%r).write_text(str(p.pid)); p.wait()" % str(pid_file)]
+            observation = {"reachable": True, "gpus": [
+                {"index": 0, "uuid": "GPU-A", "free_mib": 24000,
+                 "utilization_gpu_pct": 0, "processes": []}]}
+            real_run = subprocess.run
+            output = io.StringIO()
+            process_group = None
+            try:
+                with mock.patch.object(G, "local_observation", return_value=observation), \
+                     contextlib.redirect_stdout(output):
+                    if mode == "main":
+                        with mock.patch.object(runner, "verify_launch_input"), \
+                             mock.patch.object(runner, "register_registry"):
+                            runner.main(["--registry", str(registry), "start", "--run-id", run_id,
+                                "--cwd", str(base), "--log", str(log), "--route", str(route_file),
+                                "--node", "full-run", "--smoke-attestation", str(base / "unused-attestation"),
+                                "--", *command])
+                    else:
+                        import artifact_producer
+                        args = SimpleNamespace(jobs=str(jobs), run_id=run_id, node="full-run", share=False)
+                        placeholder = {"run_id": run_id, "cwd": str(base), "log": str(log),
+                            "command": command, "route": str(route_file), "node": "full-run",
+                            "status": "launching", "workflow_state": "READY",
+                            "sentinel": str(log) + ".exit", "progress_file": str(log) + ".progress.json",
+                            "started_at": time.time()}
+                        fake_watch = SimpleNamespace(pid=os.getpid(), poll=lambda: None,
+                                                     terminate=lambda: None)
+                        supervision = runner.proc_identity(os.getpid())
+                        with mock.patch.object(runner, "register_registry"), \
+                             mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                                return_value={"AGENT_ARTIFACT_OUTPUT_DIR": str(base)}), \
+                             mock.patch.object(runner, "start_watch",
+                                return_value=(fake_watch, supervision)), \
+                             mock.patch.object(runner.subprocess, "run"):
+                            runner.start_verified(registry, args, route, route_file, placeholder)
+                row = json.loads(output.getvalue())
+                process_group = int(row["process_group"])
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not pid_file.is_file():
+                    time.sleep(.01)
+                if not pid_file.is_file():
+                    raise RuntimeError("resource payload did not publish its GPU process pid")
+                gpu_pid = int(pid_file.read_text())
+                proc_stat = Path("/proc") / str(os.getpid()) / "stat"
+                stat_fields = proc_stat.read_text().rsplit(")", 1)[1].split()
+                cmdline = (Path("/proc") / str(os.getpid()) / "cmdline").read_bytes()
+                claim = {"root_pid": os.getpid(), "root_start": int(stat_fields[19]),
+                    "root_cmdline_sha256": hashlib.sha256(cmdline).hexdigest(),
+                    "owner": {"kind": "session", "harness": "opencode",
+                              "id": "outer-pgid-claim"}}
+                claims = [claim]
+                if os.environ.get("AGENT_DISPATCH_DEPTH") == "1":
+                    run_root = int(row["pid"])
+                    root_stat = (Path("/proc") / str(run_root) / "stat").read_text()
+                    root_fields = root_stat.rsplit(")", 1)[1].split()
+                    root_cmdline = (Path("/proc") / str(run_root) / "cmdline").read_bytes()
+                    claims.append({"root_pid": run_root, "root_start": int(root_fields[19]),
+                        "root_cmdline_sha256": hashlib.sha256(root_cmdline).hexdigest(),
+                        "owner": {"kind": "session", "harness": "codex", "id": "route-parent"}})
+                fakebin = base / "fake-bin"
+                fakebin.mkdir()
+                fake_smi = fakebin / "nvidia-smi"
+                fake_smi.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import os,sys\n"
+                    "if any(a.startswith('--query-gpu=') for a in sys.argv):\n"
+                    " print('0, GPU-A, NVIDIA Test GPU, 10, 24000, 512')\n"
+                    "else:\n"
+                    " print('GPU-A, %s, python, 512' % os.environ['FAKE_GPU_PID'])\n",
+                    encoding="utf-8")
+                fake_smi.chmod(0o755)
+                probe_env = {**os.environ, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
+                    "FAKE_GPU_PID": str(gpu_pid),
+                    "HEARTING_OWNER_CLAIMS_JSON": json.dumps(claims)}
+                probed = real_run(["bash", "-c", compute.PROBE_SCRIPT], text=True,
+                    capture_output=True, env=probe_env, timeout=8)
+                if probed.returncode:
+                    raise RuntimeError("probe failed: " + probed.stderr)
+                payload = json.loads(probed.stdout)
+                process = next(proc for gpu in payload["gpus"] for proc in gpu["processes"]
+                               if proc["pid"] == gpu_pid)
+                print(json.dumps({"row": row, "process": process, "lease_state":
+                    str(jobs.parent / "gpu-leases.json"), "outer_claim": claim,
+                    "outer_session": os.environ.get("CLAUDE_CODE_SESSION_ID")}, sort_keys=True))
+            finally:
+                if process_group:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process_group, signal.SIGTERM)
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        try:
+                            os.killpg(process_group, 0)
+                        except ProcessLookupError:
+                            break
+                        time.sleep(.02)
+        """)
+        session_keys = {"CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
+                        "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "SSH_CONNECTION"}
+        base_env = {key: value for key, value in CLEAN_ENV.items() if key not in session_keys}
+
+        for launch_path, dispatch_depth in (("main", "1"), ("verified", "1"), ("main", None)):
+            with self.subTest(launch_path=launch_path, dispatch_depth=dispatch_depth):
+                depth_label = dispatch_depth or "missing-depth"
+                base = self.base / ("resource-probe-" + launch_path + "-" + depth_label)
+                dispatch = base / "dispatch"
+                route_state = base / "route-chains"
+                dispatch.mkdir(parents=True)
+                jobs = dispatch / "jobs.log"
+                metadata = ",".join(("attempt_id=att-route-owner", "worker_type=owner",
+                    "dispatch_depth=1", "owner_route_id=rt-resource-probe",
+                    "owner_route_hash=sha256:resource-probe", "parent_sid=route-parent"))
+                jobs.write_text("\t".join(("2099-01-01T00:00:00Z", "done", "/work", "/work",
+                    "owner", metadata)) + "\n", encoding="utf-8")
+                parent_ledger = route_state / "codex" / "route-parent.jsonl"
+                parent_ledger.parent.mkdir(parents=True)
+                parent_ledger.write_text('{"event":"compose","sid":"route-parent"}\n',
+                                         encoding="utf-8")
+                route_file = base / "route.json"
+                route_file.write_text(json.dumps({"capability": "autopilot-lab",
+                    "artifact_root": str(base), "route_id": "rt-resource-probe",
+                    "route_hash": "sha256:resource-probe", "nodes": [{"id": "full-run",
+                    "kind": "resource-runner", "resource_class": "gpu",
+                    "resource_transport": "detached-process"}]}), encoding="utf-8")
+                env = {**base_env, "AGENT_HOME": str(ROOT),
+                    "AGENT_DISPATCH_ATTEMPT_ID": "att-route-owner",
+                    "AGENT_DISPATCH_JOBS": str(jobs), "AGENT_DISPATCH_CALLER_HARNESS": "claude",
+                    "CLAUDE_CODE_SESSION_ID": "worker-self-session",
+                    "XDG_STATE_HOME": str(base / "state-home"),
+                    "FLEET_ROUTE_CHAIN_DIR": str(route_state), "CUDA_VISIBLE_DEVICES": "0"}
+                if dispatch_depth is not None:
+                    env["AGENT_DISPATCH_DEPTH"] = dispatch_depth
+                outcome = subprocess.run([sys.executable, "-c", harness, launch_path,
+                    str(base), str(ROOT)], text=True, capture_output=True, env=env, timeout=20)
+                self.assertEqual(outcome.returncode, 0, outcome.stderr)
+                result = json.loads(outcome.stdout)
+                lease_owner = result["row"]["gpu_lease"]["owner"]
+                expected_owner = (("codex", "route-parent") if dispatch_depth is not None else None)
+                self.assertEqual((lease_owner["harness"], lease_owner["id"])
+                                 if lease_owner else None, expected_owner)
+                self.assertEqual(result["row"]["gpus"], "0")
+                self.assertTrue(Path(result["lease_state"]).is_relative_to(base))
+                self.assertEqual(result["outer_session"], "worker-self-session")
+                session_owner = result["process"].get("session_owner")
+                self.assertEqual((session_owner["harness"], session_owner["id"])
+                                 if session_owner else None, expected_owner)
+                if session_owner:
+                    self.assertEqual(session_owner["source"], "persistent-claim+ancestry")
+                    self.assertEqual(session_owner["evidence_pid"], result["row"]["pid"])
+                    self.assertNotEqual(session_owner["id"], result["outer_claim"]["owner"]["id"])
+                self.assertEqual(result["process"]["owner"]["kind"], "job")
+                self.assertEqual(result["process"]["owner"]["id"], "att-route-owner")
+
     def test_verified_publication_cas_preserves_changed_or_missing_reservation(self):
         expected = {"run_id":"resume", "status":"launching", "command":["approved"], "token":"one"}
         for current in ({**expected,"command":["foreign"]}, {**expected,"token":"two"}, None):

@@ -274,9 +274,43 @@ class LeasesTest(unittest.TestCase):
             malformed = {**environ, "AGENT_DISPATCH_DEPTH": "7"}
             self.assertIsNone(G.launcher_owner(malformed))
 
+    def test_registered_attempt_without_valid_depth_stays_unknown_and_gpu_admission_is_fail_soft(self):
+        jobs = self.root / "dispatch-depth" / "jobs.log"
+        jobs.parent.mkdir(parents=True)
+        jobs.write_text("", encoding="utf-8")
+        for index, depth in enumerate((None, "", "not-a-depth", "3", " 1", "01")):
+            environ = {
+                "AGENT_DISPATCH_ATTEMPT_ID": "att-missing-depth",
+                "AGENT_DISPATCH_JOBS": str(jobs),
+                "CLAUDE_CODE_SESSION_ID": "worker-session",
+                "CODEX_THREAD_ID": "other-session",
+                "CUDA_VISIBLE_DEVICES": "0",
+            }
+            if depth is not None:
+                environ["AGENT_DISPATCH_DEPTH"] = depth
+            with self.subTest(depth=depth), \
+                 mock.patch.dict(os.environ, environ, clear=True), \
+                 mock.patch.object(G, "local_observation", return_value=OBS):
+                self.assertIsNone(G.launcher_owner(os.environ, jobs=jobs))
+                path, lease, _gpu_env = G.resource_admission(
+                    {"resource_class": "gpu"}, ["python", "train.py"],
+                    jobs=jobs, run_id="unknown-depth-%s" % index)
+                self.assertEqual(path, jobs.parent / "gpu-leases.json")
+                self.assertIsNotNone(lease)  # identity uncertainty does not block launch
+                self.assertIsNone(lease["owner"])
+                payload_env = G.launcher_session_environment({
+                    "CLAUDE_CODE_SESSION_ID": "worker-session",
+                    "CODEX_THREAD_ID": "other-session",
+                }, owner=lease["owner"])
+                self.assertFalse(set(G.session_environment_keys()) & payload_env.keys())
+                G.release(path, lease)
+
     def test_unregistered_identity_fallback_and_session_environment_alias_cleanup(self):
         direct = {"AGENT_DISPATCH_CALLER_HARNESS": "codex", "CODEX_THREAD_ID": "direct-session"}
         self.assertEqual(G.launcher_owner(direct)["id"], "direct-session")
+        explicit_zero = {**direct, "AGENT_DISPATCH_ATTEMPT_ID": "att-explicit-zero",
+                         "AGENT_DISPATCH_DEPTH": "0"}
+        self.assertEqual(G.launcher_owner(explicit_zero)["id"], "direct-session")
         source = {"CLAUDE_CODE_SESSION_ID": "worker-session", "CLAUDE_SESSION_ID": "old-alias",
                   "CODEX_THREAD_ID": "foreign-codex", "OPENCODE_SESSION_ID": "foreign-opencode",
                   "KEEP_ME": "preserved"}
