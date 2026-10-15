@@ -13,6 +13,7 @@ import json
 import hashlib
 import os
 import subprocess
+import stat
 import sys
 import tempfile
 import time
@@ -1299,6 +1300,41 @@ class FinalizeTest(ProducerTestBase):
         self.assertEqual(outside.read_bytes(), b"outside bytes remain untouched\n")
         record = P.read_cycle_record(self.root, result["cycle_id"])
         self.assertIn("_internal/review.bin", record.get("excluded_symlinks", []))
+
+    def test_cycle_root_support_ancestor_symlink_is_never_followed(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        outside = Path(self._tmp.name) / "outside-support-tree"
+        outside.mkdir()
+        outside_file = outside / "review.md"
+        outside_file.write_bytes(b"outside tree remains untouched\n")
+        internal = cycle / "_internal"
+        internal.symlink_to(outside, target_is_directory=True)
+        self.write_output(result, "documents/final_report.md", b"result\n")
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        document = json.loads((cycle / "manifest.json").read_text(encoding="utf-8"))
+        paths = {row["locator"]["path"] for row in document["artifact_revisions"]}
+        self.assertNotIn("_internal/review.md", paths)
+        self.assertTrue(internal.is_symlink())
+        self.assertEqual(outside_file.read_bytes(), b"outside tree remains untouched\n")
+        self.assertIn("_internal", P.read_cycle_record(self.root, result["cycle_id"]).get("excluded_symlinks", []))
+
+    def test_cycle_root_support_special_node_refuses_before_manifest_publication(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        pipe = cycle / "_internal/reviews/pipe"
+        pipe.parent.mkdir(parents=True)
+        os.mkfifo(pipe)
+        self.write_output(result, "documents/final_report.md", b"result\n")
+        self.close(route, route_file)
+        with self.assertRaisesRegex(P.ProducerError, "output-invalid"):
+            P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(stat.S_ISFIFO(pipe.lstat().st_mode))
+        self.assertFalse((cycle / "manifest.json").exists())
+        self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "open")
 
     def test_root_support_modern_locator_survives_legacy_exclusion_mode(self):
         cycle = Path(self._tmp.name) / "cycle"
