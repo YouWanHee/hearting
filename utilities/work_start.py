@@ -2045,6 +2045,8 @@ def _advance_plan(route, jobs, result, *, run, sleep, clock):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         preparation_failed = str(exc).startswith("source-worktree-preparation-failed:")
         if preparation_failed:
+            # The finished leg's `advance-completed` would read as "nothing left": the retry is the action.
+            result = {key: value for key, value in result.items() if key != "required_action"}
             return {**result, "state": "needs-attention", "reason": "source-worktree-preparation-failed",
                     "plan_advance": {"state": "retryable", "leg": following.get("index"),
                                      "reason": str(exc)[:240]},

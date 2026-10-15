@@ -1755,6 +1755,50 @@ BOUNDARIES = ("after-intent-save", "after-decision-write", "after-compiled-snaps
               "after-finalize")
 
 
+def fixture_git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def checkout_with_origin(base):
+    """A primary checkout with its own bare origin, whose default branch is one commit ahead.
+
+    A source-changing leg prepares its worktree from this origin in whichever process runs it,
+    never from the checkout running the tests. Returns `(primary, remote tip SHA)`."""
+    primary, origin, writer = base / "repo", base / "origin.git", base / "writer"
+    identity = ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test")
+    fixture_git(base, "init", "-q", "--bare", "-b", "main", str(origin))
+    fixture_git(base, "init", "-q", "-b", "main", str(primary))
+    (primary / "base.txt").write_text("base\n", encoding="utf-8")
+    fixture_git(primary, "add", "base.txt")
+    fixture_git(primary, *identity, "commit", "-qm", "base")
+    fixture_git(primary, "remote", "add", "origin", str(origin))
+    fixture_git(primary, "push", "-q", "origin", "main")
+    fixture_git(base, "clone", "-q", str(origin), str(writer))
+    (writer / "remote-tip.txt").write_text("remote tip\n", encoding="utf-8")
+    fixture_git(writer, "add", "remote-tip.txt")
+    fixture_git(writer, *identity, "commit", "-qm", "remote tip")
+    fixture_git(writer, "push", "-q", "origin", "main")
+    return primary, fixture_git(writer, "rev-parse", "HEAD")
+
+
+class OwnCheckout:
+    """Mixin: the frame sits in its own checkout with its own origin, so real worktree preparation,
+    in this process or a child one, happens there and never in the checkout running the tests."""
+
+    def setUp(self):
+        source = tempfile.TemporaryDirectory()
+        self.addCleanup(source.cleanup)
+        self.primary, self.remote_sha = checkout_with_origin(Path(source.name))
+        self.primary_head = fixture_git(self.primary, "rev-parse", "HEAD")
+        super().setUp()
+
+    def compose(self, **kwargs):
+        kwargs["cwd"] = self.primary
+        kwargs["dispatch_evidence"] = {"tuples": [
+            {**T.nested("claude", "codex"), "checked_worktree": str(self.primary.resolve())}]}
+        return super().compose(**kwargs)
+
+
 def driver(context_path, crash_at):
     """One `_framed_settle` in this process with the fixture's controls; `crash_at` kills it there."""
     context = json.loads(Path(context_path).read_text(encoding="utf-8"))
@@ -1797,12 +1841,26 @@ def driver(context_path, crash_at):
             os._exit(CRASH_EXIT)
         return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
 
+    def readiness(probed_route, _jobs):
+        # Fixed evidence, bound to the exact cwd probed: the prepared worktree the leg seals.
+        checked = str(Path(probed_route["cwd"]).resolve())
+        return {"tuples": [{**T.nested("claude", "codex"), "checked_worktree": checked}],
+                "candidates": T.registered_headless()["candidates"]}
+
+    real_prepare = R.prepare_isolated_worktree
+
+    def prepare(cwd, slug, **kwargs):
+        target, repository = str(Path(cwd).resolve()), str(R.ROOT.resolve())
+        if os.path.commonpath([target, repository]) == repository:
+            raise AssertionError("the driver reached the checkout running the tests: " + target)
+        return real_prepare(cwd, slug, **kwargs)
+
     interview = json.loads(Path(context["interview"]).read_text(encoding="utf-8"))
     answers = json.loads(Path(context["answers"]).read_text(encoding="utf-8"))
-    evidence = {"tuples": [T.nested("claude", "codex")], "candidates": T.registered_headless()["candidates"]}
     with mock.patch("dispatch_contract.completion_marker_gate"), \
             mock.patch.object(W, "_route_cli", side_effect=in_process_cli), \
-            mock.patch.object(R, "proposal_readiness", return_value=evidence), \
+            mock.patch.object(R, "proposal_readiness", side_effect=readiness), \
+            mock.patch.object(R, "prepare_isolated_worktree", side_effect=prepare), \
             mock.patch.object(W, "_recorded_interview", return_value=(interview, answers)), \
             mock.patch.object(W, "default_parent_session_id", return_value="parent"), \
             mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}), \
@@ -1813,9 +1871,10 @@ def driver(context_path, crash_at):
     return 0
 
 
-class InterruptionTest(StartBase):
+class InterruptionTest(OwnCheckout, StartBase):
     """A164-6: stop at each boundary of the transaction, run the same start again in a fresh process,
-    and read the registry, route files, record and manifest back from disk."""
+    and read the registry, route files, record and manifest back from disk. The fresh process
+    prepares the source leg's worktree for real, in the frame's own checkout."""
 
     def setUp(self):
         super().setUp()
@@ -1852,6 +1911,16 @@ class InterruptionTest(StartBase):
         directory = self.jobs.parent / "completion" / self.route["route_id"]
         self.assertEqual([p.name for p in sorted(directory.glob("route-decision.[0-9]*.json"))],
                          ["route-decision.1.json"])             # the one marker of the terminal, never a second
+        # One allocation from origin's tip, sealed with evidence probed there; the primary is untouched.
+        leg = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertEqual(leg["cwd"], str((self.primary.parent / "repo-wt" / self.route["slug"]).resolve()))
+        self.assertEqual({row["checked_worktree"] for row in leg["dispatch_evidence"]["tuples"]}, {leg["cwd"]})
+        self.assertEqual(fixture_git(leg["cwd"], "rev-parse", "HEAD"), self.remote_sha)
+        records = [json.loads(p.read_text(encoding="utf-8"))
+                   for p in (self.root / ".runtime" / "worktree-preparation").glob("*.json")]
+        self.assertEqual([(r["state"], str(Path(r["path"]).resolve())) for r in records], [("ready", leg["cwd"])])
+        self.assertEqual((fixture_git(self.primary, "rev-parse", "HEAD"),
+                          fixture_git(self.primary, "status", "--porcelain")), (self.primary_head, ""))
 
     def test_an_uninterrupted_run_in_a_fresh_process_settles_once_and_a_repeat_changes_nothing(self):
         first = self.result_of(self.run_driver())

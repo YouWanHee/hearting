@@ -7662,7 +7662,9 @@ class ComposeRouteTest(TestRoute):
       self.assertIn("nodes=1 worker_dispatches=0 owner_dispatches=0 resource(측정)=없음",err.getvalue())
       self.assertIn("tiers: inline=current-session(등급 미기록)",err.getvalue())
       return dict(receipt)
+     # Display-only fixture: the preparation boundary is observed, never run on the checkout under test.
      with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+          mock.patch.object(R,"prepare_isolated_worktree",return_value={"state":"reused","cwd":str(R.ROOT)}), \
           mock.patch.object(work_start,"start_work",side_effect=start), \
           mock.patch.object(R,"_record_route_chain"),mock.patch.object(R,"_route_autoclose"), \
           contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
@@ -7845,6 +7847,7 @@ class ComposeRouteTest(TestRoute):
    for _ in range(2):
     out,err=io.StringIO(),io.StringIO()
     with mock.patch.object(sys,"argv",argv), mock.patch.object(R,"compose_route",return_value=route), \
+         mock.patch.object(R,"prepare_isolated_worktree",return_value={"state":"reused","cwd":str(R.ROOT)}), \
          mock.patch.object(R,"_record_route_chain"), mock.patch.object(R,"_route_autoclose"), \
          mock.patch.object(work_start,"start_work",side_effect=start), \
          contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
