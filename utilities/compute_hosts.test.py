@@ -1476,8 +1476,8 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertIn(str(home.resolve()), result.stdout)
         self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=att-9f2c4b1ad34e",
                       result.stdout)
-        # Session identity keeps its existing independent path.
-        self.assertIn("export CODEX_THREAD_ID=launch-thread", result.stdout)
+        # Without dispatch depth, this attempt's session identity is unresolved.
+        self.assertNotIn("export CODEX_THREAD_ID=launch-thread", result.stdout)
         for canary in ("canary-secret", "canary-agent.sock", "canary-jobs.log",
                        "canary-arbitrary", "AWS_SECRET_ACCESS_KEY",
                        "SSH_AUTH_SOCK", "AGENT_DISPATCH_JOBS", "MY_ARBITRARY"):
