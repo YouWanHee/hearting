@@ -320,12 +320,17 @@ class InterimManifestTest(CheckpointTestBase):
         root_support = cycle / "_internal/reviews/manifest.json"
         artifact_support = cycle / "artifacts/_internal/reviews/manifest.json"
         support_raw = cycle / "_internal/raw-results/summary.json"
+        binary_support = cycle / "_internal/reviews/weights.bin"
+        oversized_support = cycle / "_internal/reviews/large.md"
         for path, data in (
                 (root_support, b'{"version":1}\n'),
                 (artifact_support, b'{"artifact-side":true}\n'),
-                (support_raw, b'{"files":2}\n')):
+                (support_raw, b'{"files":2}\n'),
+                (binary_support, b"binary support")):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
+        with oversized_support.open("wb") as stream:
+            stream.truncate(P.CheckpointLimits().max_file_bytes + 1)
         self.write_output(self.result, "raw-results/inside.txt", b"bundle bytes\n")
         primary = self.write_output(self.result, "documents/final_report.md", b"report\n")
 
@@ -336,6 +341,8 @@ class InterimManifestTest(CheckpointTestBase):
         self.assertIn("_internal/reviews/manifest.json", interim_rows)
         self.assertIn("artifacts/_internal/reviews/manifest.json", interim_rows)
         self.assertIn("_internal/raw-results/summary.json", interim_rows)
+        self.assertNotIn("_internal/reviews/weights.bin", interim_rows)
+        self.assertNotIn("_internal/reviews/large.md", interim_rows)
         self.assertNotIn("artifacts/raw-results/inside.txt", interim_rows)
         self.assertNotEqual(interim_rows["_internal/reviews/manifest.json"][0],
                             interim_rows["artifacts/_internal/reviews/manifest.json"][0])
@@ -357,6 +364,10 @@ class InterimManifestTest(CheckpointTestBase):
         self.assertEqual(sealed_rows["artifacts/_internal/reviews/manifest.json"][0],
                          before["artifacts/_internal/reviews/manifest.json"][0])
         self.assertEqual(sealed_rows["_internal/raw-results/summary.json"][3], "support")
+        self.assertEqual(sealed_rows["_internal/reviews/weights.bin"][3], "support")
+        self.assertEqual(sealed_rows["_internal/reviews/large.md"][3], "support")
+        self.assertEqual(sealed_rows["_internal/reviews/large.md"][2],
+                         "sha256:" + hashlib.sha256(oversized_support.read_bytes()).hexdigest())
         artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
         bundles = [row for row in document["artifact_revisions"]
                    if artifacts[row["artifact_id"]]["type"] == "directory-bundle"]
