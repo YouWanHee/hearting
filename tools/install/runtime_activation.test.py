@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -525,23 +526,68 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
             root = Path(temporary)
             source = Path(__file__).resolve().parents[2]
             with fixture_env.patched_environment(root / "fixture", source):
+                runtime_home = activation.paths.runtime_home("codex")
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared" / "config.toml"
+                target.parent.mkdir()
+                original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                            'status_line_use_colors = false\n').encode()
+                target.write_bytes(original)
+                config = runtime_home / "config.toml"
+                link_target = os.path.relpath(target, runtime_home)
+                config.symlink_to(link_target)
                 original_prepare = activation._prepare_runtime_config
 
                 def project_then_fail(*args, **kwargs):
                     original_prepare(*args, **kwargs)
+                    self.assertTrue(config.is_symlink())
+                    self.assertEqual(os.readlink(config), link_target)
+                    projected = target.read_text(encoding="utf-8")
+                    self.assertIn('status_line = ["project-name", "custom", "thread-id"]', projected)
+                    self.assertIn(activation.CODEX_IDENTITY_BEGIN, projected)
+                    self.assertIn('status_line_use_colors = false', projected)
+                    self.assertEqual(backup.read_bytes(), original)
                     raise activation.ActivationError("injected after native projection")
 
+                backup = config.with_name(activation.CODEX_IDENTITY_BACKUP)
                 activation._prepare_runtime_config = project_then_fail
                 try:
                     with self.assertRaisesRegex(activation.ActivationError, "injected"):
                         activation.activate("codex", "linked", str(source))
                 finally:
                     activation._prepare_runtime_config = original_prepare
-                config = activation.paths.runtime_home("codex") / "config.toml"
-                backup = config.with_name(activation.CODEX_IDENTITY_BACKUP)
-                self.assertFalse(config.exists())
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.read_bytes(), original)
                 self.assertFalse(backup.exists())
                 self.assertFalse(activation._state_path("codex").exists())
+
+    def test_runtime_snapshot_restores_codex_symlink_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                runtime_home = activation.paths.runtime_home("codex")
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared" / "config.toml"
+                target.parent.mkdir()
+                original = b'[tui]\nstatus_line = ["custom"]\n'
+                target.write_bytes(original)
+                config = runtime_home / "config.toml"
+                link_target = os.path.relpath(target, runtime_home)
+                config.symlink_to(link_target)
+
+                snapshot = activation.capture_runtime_state("codex", str(source))
+                self.addCleanup(activation.discard_runtime_state, snapshot)
+                destinations = {Path(record["dest"]) for record in snapshot["records"]}
+                self.assertIn(target.resolve(), destinations)
+                target.write_bytes(b'[tui]\nstatus_line = ["activation-postimage"]\n')
+                activation.seal_runtime_state(snapshot)
+
+                activation.restore_runtime_state(snapshot)
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.read_bytes(), original)
 
 
 class NativeContextLifecycleTest(unittest.TestCase):
@@ -566,12 +612,18 @@ class NativeContextLifecycleTest(unittest.TestCase):
                         backup.read_bytes() if backup.exists() else None)
 
     def test_codex_clean_home_leaves_no_config_or_backup(self):
-        self.assertEqual(self._lifecycle("codex"), (None, None))
+        import tomllib
+        config, backup = self._lifecycle("codex")
+        self.assertIsNotNone(config)
+        self.assertEqual(tomllib.loads(config.decode("utf-8"))["tui"]["status_line"][-1], "thread-id")
+        self.assertIsNone(backup)
 
     def test_codex_manual_window_survives_with_its_bytes(self):
         seed = b"# mine\nmodel_context_window = 800000\nmodel = \"x\"\n"
+        import tomllib
         config, backup = self._lifecycle("codex", seed)
-        self.assertEqual(config, seed)
+        self.assertTrue(config.startswith(seed))
+        self.assertEqual(tomllib.loads(config.decode("utf-8"))["tui"]["status_line"][-1], "thread-id")
         self.assertEqual(backup, seed)
 
     def test_claude_clean_home_drops_the_added_window(self):
@@ -818,6 +870,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
         fragment.mkdir(parents=True)
         (fragment / "harness-identity.toml").write_bytes(
             (REPO_ROOT / "adapters/codex/config/harness-identity.toml").read_bytes())
+        (fragment / "tui-statusline.toml").write_bytes(
+            (REPO_ROOT / "adapters/codex/config/tui-statusline.toml").read_bytes())
         return release
 
     def _call(self, name, config: Path, *args):
@@ -855,6 +909,79 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertEqual(result["conflicts"], [])
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
             self._assert_clears_inherited(config)
+
+    def test_runtime_config_preparation_moves_thread_id_last_and_deactivation_keeps_it(self):
+        import tomllib
+        import native_context
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "home" / "config.toml"
+            original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                        'status_line_use_colors = false\n')
+            config.parent.mkdir(parents=True)
+            config.write_text(original, encoding="utf-8")
+            projection = {"native_context": {"codex": {}}, "report_lines": [],
+                          "pre_projection_exists": True,
+                          "pre_projection_bytes": original.encode("utf-8")}
+            with mock.patch.object(activation, "_config_path", return_value=config), \
+                 mock.patch.object(native_context, "project_context_window", return_value=projection):
+                changes = activation._prepare_runtime_config("codex", release, None)
+            self.assertTrue(changes[0]["tui_status_line_changed"])
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
+
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"]}}
+            with mock.patch.object(activation, "_config_path", return_value=config):
+                activation._unmerge_codex_identity_config(state, "global")
+            remaining = config.read_text(encoding="utf-8")
+            parsed = tomllib.loads(remaining)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertNotIn(self.BEGIN, remaining)
+
+    def test_runtime_config_preparation_and_deactivation_preserve_symlink(self):
+        import native_context
+        import tomllib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            target = root / "shared" / "codex.toml"
+            target.parent.mkdir()
+            original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                        'status_line_use_colors = false\n').encode()
+            target.write_bytes(original)
+            config = root / "home" / "config.toml"
+            config.parent.mkdir()
+            link_target = os.path.relpath(target, config.parent)
+            config.symlink_to(link_target)
+            projection = {"native_context": {"codex": {}}, "report_lines": [],
+                          "pre_projection_exists": True,
+                          "pre_projection_bytes": original}
+            with mock.patch.object(activation, "_config_path", return_value=config), \
+                 mock.patch.object(native_context, "project_context_window", return_value=projection):
+                changes = activation._prepare_runtime_config("codex", release, None)
+            self.assertTrue(changes[0]["tui_status_line_changed"])
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(os.readlink(config), link_target)
+            applied = target.read_text(encoding="utf-8")
+            parsed = tomllib.loads(applied)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertIn(self.BEGIN, applied)
+
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"]}}
+            with mock.patch.object(activation, "_config_path", return_value=config):
+                activation._unmerge_codex_identity_config(state, "global")
+            remaining = target.read_text(encoding="utf-8")
+            parsed = tomllib.loads(remaining)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertNotIn(self.BEGIN, remaining)
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(os.readlink(config), link_target)
 
     def test_native_window_restores_without_identity_record_and_deletes_created_file(self):
         with tempfile.TemporaryDirectory() as temporary:

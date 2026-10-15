@@ -3925,7 +3925,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                   transport_evidence="compose-default", jobs=None, profile_demands=None, explicit_profiles=None,
                   campaign_key=None, parent_cycle_id=None, profile=None, work_request=None, unassigned=False,
                   selection_pins=None, route_plan=None, frameless=False, execution_scope=None,
-                  extra_stages=None):
+                  extra_stages=None, selection_only=False):
     """Resolve every default, then compile through the ordinary sealer.
 
     `route_plan` (a binding read by `route_plan.read_route_plan`) seals `{decision, digest, index}`
@@ -4002,7 +4002,7 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
         raise ValueError("compose-campaign-key-required:" + compose_campaign_hint(artifact_root, cwd))
     if tracking is None:
         tracking = "tracked" if shape in ("staged", "framed") or resume_graph else "untracked"
-    gate = {
+    gate = None if selection_only else {
         "spec_read": compose_spec_read(cwd, artifact_root, spec_read),
         "drift_verdict": drift_verdict or DEFAULT_DRIFT_VERDICT,
         "workflow_mode": tracking,
@@ -4050,6 +4050,24 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                                                 extra_stages=extra_stages, group_intensity=requested,
                                                 complete_group_consumers=True)
                        if graph_spec is not None else base)
+    if selection_only:
+        if shape == "direct":
+            nodes = [{"id": "inline", "write_scope": list(base["quick"]["write_scope"])}]
+        elif shape == "solo" and not signals:
+            if resume_graph and RESOURCE_RESUME.recipe_selected(base):
+                nodes = RESOURCE_RESUME.nodes(base, registry["owner_profile_by_intensity"]["quick"])
+            else:
+                nodes = [{"id": "one-shot", "write_scope": list(base["quick"]["write_scope"])}]
+        else:
+            nodes = json.loads(json.dumps(selected_recipe["standard_plus"]["nodes"]))
+            selected_intensity = "standard" if requested == "auto" else requested
+            inferred_intensity = "standard" if signals else "quick"
+            effective_intensity = max((selected_intensity, inferred_intensity), key=ORDER.get)
+            nodes = _expand_parallel_groups(
+                nodes, selected_recipe["standard_plus"].get("parallel_groups"), effective_intensity,
+                capability, auxiliary_check_units=registry.get("auxiliary_check_units"))
+        return {"capability": capability, "shape": shape, "cwd": cwd,
+                "artifact_root": artifact_root, "slug": slug, "nodes": nodes}
     if execution_scope == "report" and shape == "staged" and graph_spec is not None and profile is None:
         # The narrowed graph is made only from existing recipe/catalog parts. Keep each
         # stage's declared profile so a report boundary adds no new profile-demand input.
@@ -4086,11 +4104,10 @@ def compose_route(*, capability, capability_mode, shape, graph, slug, cwd, artif
                                        owner_harnesses=_compose_default_owners(selection_pins))
         dispatch_evidence = {"tuples": readiness["tuples"], "native_subagent": []}
     if shape == "staged" and not owner_only and owner_pin and not any(
-            row.get("parent_harness") == owner_pin and row.get("status") == "supported"
-            and row.get("launch_authority") == "conductor"
+            row.get("parent_harness") == owner_pin
             for row in (dispatch_evidence or {}).get("tuples", [])):
         # A frame's evidence describes its conductor. Check the selected owner
-        # with its workers rather than relabelling that evidence.
+        # only when absent; a checked refusal is already its probe result.
         readiness = _compose_readiness(cwd, jobs or _compose_default_jobs(), owner_pin,
                                        children or _compose_default_children(selection_pins),
                                        gpu_route=gpu_route)
@@ -4241,6 +4258,55 @@ def _leg_evidence(leg, readiness):
             "registered_headless_evidence": {"candidates": probe["candidates"]}}
 
 
+def _route_plan_preparation_key(binding):
+    decision = ((binding.get("record") or {}).get("decision") or {}) if isinstance(binding, dict) else {}
+    frame_route = decision.get("frame_route") or {}
+    return {"kind": "approved-route-plan", "digest": binding.get("digest"),
+            "frame_route_id": frame_route.get("route_id")}
+
+
+def _compose_preparation_key(compose_args, route_plan_binding, prompt_file=None):
+    if route_plan_binding is not None:
+        return _route_plan_preparation_key(route_plan_binding)
+    request = compose_args.get("work_request") or {}
+    text = request.get("text") if isinstance(request, dict) else ""
+    graph = compose_args.get("graph")
+    graph = ([part.strip() for part in graph.split(",") if part.strip()]
+             if isinstance(graph, str) else list(graph or []))
+    caller = _route_chain_identity("compose", None)
+    evidence = json.dumps({"dispatch": compose_args.get("dispatch_evidence"),
+                           "registered_headless": compose_args.get("registered_headless_evidence")},
+                          sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return {"kind": "compose-start", "caller": caller,
+            "request_path": str(Path(prompt_file).resolve()) if prompt_file else None,
+            "request_sha256": hashlib.sha256(str(text or "").encode("utf-8")).hexdigest(),
+            "evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+            "capability": compose_args.get("capability"),
+            "mode": compose_args.get("capability_mode"), "shape": compose_args.get("shape"),
+            "graph": graph, "slug": compose_args.get("slug"),
+            "campaign_key": compose_args.get("campaign_key"),
+            "parent_cycle_id": compose_args.get("parent_cycle_id"),
+            "intensity": compose_args.get("intensity"), "signals": sorted(compose_args.get("signals") or []),
+            "parent_harness": compose_args.get("parent_harness"),
+            "children": list(compose_args.get("children") or []),
+            "selection_pins": compose_args.get("selection_pins"),
+            "execution_scope": compose_args.get("execution_scope"), "profile": compose_args.get("profile"),
+            "profile_demands": compose_args.get("profile_demands"),
+            "explicit_profiles": compose_args.get("explicit_profiles"),
+            "tracking": compose_args.get("tracking"), "artifact_guard": compose_args.get("artifact_guard"),
+            "transport_evidence": compose_args.get("transport_evidence"),
+            "cwd": str(Path(compose_args["cwd"]).resolve())}
+
+
+def _dispatch_evidence_matches_cwd(evidence, cwd):
+    rows = evidence.get("tuples") if isinstance(evidence, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return False
+    expected = os.path.realpath(cwd)
+    return all(isinstance(row, dict) and isinstance(row.get("checked_worktree"), str)
+               and os.path.realpath(row["checked_worktree"]) == expected for row in rows)
+
+
 def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, work_request, readiness, index=0):
     """An approved leg, compiled in memory with its route-plan reference sealed.
 
@@ -4255,16 +4321,20 @@ def compile_first_leg(leg, *, frame_route, frame_cycle_id, context, binding, wor
     owner = ((kwargs["selection_pins"] or {}).get("owner") or {}).get("harness") or context.get("owner")
     if work_request is not None:
         work_request = {**work_request, "owner_harness": owner or work_request.get("owner_harness")}
-    probe = (lambda: readiness(kwargs["cwd"])) if leg.get("cwd") else readiness
-    route = compose_route(**kwargs, **_leg_evidence(leg, probe), work_request=work_request, route_plan=binding,
-                            parent_harness=owner or "claude")
-    if not leg.get("cwd") and leg["shape"] != "direct" and _isolates_worktree(route):
-        # Every leg of one decision shares the frame's worktree, prepared by the first leg that changes source.
-        worktree = prepare_isolated_worktree(frame_route["cwd"], frame_route.get("slug"))
+    selection = compose_route(**kwargs, work_request=work_request, route_plan=binding,
+                              parent_harness=owner or "claude", selection_only=True)
+    if _isolates_worktree(selection):
+        worktree = prepare_isolated_worktree(
+            kwargs["cwd"], frame_route.get("slug"), artifact_root=frame_route["artifact_root"],
+            preparation_key=_route_plan_preparation_key(binding), explicitly_approved=bool(leg.get("cwd")))
+        if worktree.get("state") == "failed":
+            raise ValueError("source-worktree-preparation-failed:" + worktree.get("reason", "unknown")
+                             + (":" + worktree["detail"] if worktree.get("detail") else ""))
         if worktree.get("cwd"):
-            route = compose_route(**{**kwargs, "cwd": worktree["cwd"]},
-                                  **_leg_evidence(leg, lambda: readiness(worktree["cwd"])),
-                                  work_request=work_request, route_plan=binding, parent_harness=owner or "claude")
+            kwargs["cwd"] = worktree["cwd"]
+    # The probe is collected only after preparation, against the exact cwd that will be sealed.
+    route = compose_route(**kwargs, **_leg_evidence(leg, lambda: readiness(kwargs["cwd"])),
+                          work_request=work_request, route_plan=binding, parent_harness=owner or "claude")
     scope = route_plan_execution_scope(binding)
     if scope in ("complete", "report"):
         route = _bind_entry_execution_scope(route, scope)
@@ -10109,13 +10179,8 @@ def stages_block(registry, recipe):
 
 
 def _isolates_worktree(route):
-    """Whether this route gets its own worktree: it changes source, and its artifact root is a real
-    one (a temporary root is a fixture's, as for the route-chain ledger, which never touches the
-    checkout around it)."""
-    real_root = os.path.realpath(str(route.get("artifact_root") or ""))
-    real_tmp = os.path.realpath(tempfile.gettempdir())
-    return (real_root != real_tmp and not real_root.startswith(real_tmp + os.sep)
-            and any(_node_mutates_worktree(node) for node in route.get("nodes") or []))
+    """Whether the selected route changes source, independent of artifact-root location."""
+    return any(_node_mutates_worktree(node) for node in route.get("nodes") or [])
 
 
 def _git(cwd, *args):
@@ -10126,47 +10191,288 @@ def _git(cwd, *args):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def prepare_isolated_worktree(cwd, slug):
-    """The isolated worktree a source-changing route runs in, when `cwd` is a primary checkout.
+def _worktree_git(cwd, *args):
+    """Run one preparation command, retaining stderr for a fail-closed receipt."""
+    try:
+        return subprocess.run(["git", "-C", str(cwd), *args], text=True, capture_output=True,
+                              timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["git", *args], 127, "", str(exc))
 
-    `<repo>-wt/<slug>` (OPERATIONS §5.9 naming) on a new branch `<slug>` from the latest
-    `origin/<default>` (the primary's current HEAD when it has local work), or
-    the existing worktree at that path, reused as it is. Returns
-    `{state: created|reused, path, cwd, branch, base}`, or `{state: skipped, reason}` when the
-    caller's cwd stays the route cwd (not a primary checkout, or the path
-    or branch is taken).
-    Nothing here refuses: a skipped preparation leaves the work where it was asked to run."""
-    if OWNER_WRITE_ADVISORY.git_topology(cwd) != "primary":
-        return {"state": "skipped", "reason": "not-primary-checkout"}
-    top = _git(cwd, "rev-parse", "--show-toplevel")
-    if not top or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(slug or "")):
-        return {"state": "skipped", "reason": "no-checkout-or-slug"}
-    relative = os.path.relpath(os.path.realpath(cwd), os.path.realpath(top))
-    path = Path(top).parent / f"{Path(top).name}-wt" / slug
-    inside = lambda root: str(Path(root) / relative) if relative != "." and (Path(root) / relative).is_dir() else str(root)
-    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if path.exists():
-        branch = _git(path, "symbolic-ref", "-q", "--short", "HEAD")
-        if branch and common and _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir") == common:
-            return {"state": "reused", "path": str(path), "cwd": inside(path), "branch": branch, "base": None}
-        return {"state": "skipped", "reason": "path-occupied", "path": str(path)}
-    default = (_git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "origin/main").split("/", 1)[-1]
-    _git(top, "fetch", "-q", "origin", default)
-    base = f"origin/{default}" if _git(top, "rev-parse", "--verify", "-q", f"origin/{default}") else "HEAD"
-    # Local work must not pin a source-changing owner to the shared primary.
-    # Keep its committed baseline, without copying or changing uncommitted files.
-    # The prepared cwd is sealed before launch, so every stage shares it naturally.
-    if (_git(top, "status", "--porcelain") != ""
-            or _git(top, "merge-base", "--is-ancestor", "HEAD", base) is None):
-        base = _git(top, "rev-parse", "HEAD") or "HEAD"
-    if _git(top, "rev-parse", "--verify", "-q", f"refs/heads/{slug}"):
-        made = _git(top, "worktree", "add", str(path), slug)
+
+def _primary_worktree(cwd, common):
+    """Find the primary worktree belonging to this common Git directory."""
+    current = _git(cwd, "rev-parse", "--show-toplevel")
+    if not current:
+        return None
+    if OWNER_WRITE_ADVISORY.git_topology(cwd) == "primary":
+        return os.path.realpath(current)
+    result = _worktree_git(cwd, "worktree", "list", "--porcelain")
+    if result.returncode != 0:
+        return None
+    candidates = [line.partition(" ")[2] for line in result.stdout.splitlines()
+                  if line.startswith("worktree ")]
+    for candidate in candidates:
+        root = _git(candidate, "rev-parse", "--show-toplevel")
+        candidate_common = _git(candidate, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if root and candidate_common and os.path.realpath(candidate_common) == os.path.realpath(common):
+            if OWNER_WRITE_ADVISORY.git_topology(root) == "primary":
+                return os.path.realpath(root)
+    return None
+
+
+def _preparation_record_path(artifact_root, key):
+    return Path(artifact_root).resolve() / ".runtime" / "worktree-preparation" / f"{key}.json"
+
+
+def _recorded_preparation_roots(artifact_root, common_dir):
+    directory = Path(artifact_root).resolve() / ".runtime" / "worktree-preparation"
+    roots = []
+    try:
+        records = directory.glob("*.json")
+        for path in records:
+            record = _read_preparation_record(path)
+            if (record and record.get("common_dir") == os.path.realpath(common_dir)
+                    and record.get("path")):
+                roots.append(os.path.realpath(record["path"]))
+    except OSError:
+        return []
+    return roots
+
+
+def _read_preparation_record(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) and value.get("schema_version") == 1 else None
+
+
+def _worktree_cwd(path, relative):
+    target = Path(path) if relative in ("", ".") else Path(path) / relative
+    target.mkdir(parents=True, exist_ok=True)
+    return str(target.resolve())
+
+
+def _prepared_record_worktree(record, common, relative):
+    """Return a recorded allocation only when path, common dir, and branch prove its identity."""
+    if not isinstance(record, dict) or record.get("common_dir") != os.path.realpath(common):
+        return None
+    path = Path(record.get("path") or "")
+    if not path.is_dir():
+        return None
+    actual_common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    branch = _git(path, "symbolic-ref", "-q", "--short", "HEAD")
+    head = _git(path, "rev-parse", "HEAD")
+    if (not actual_common or os.path.realpath(actual_common) != os.path.realpath(common)
+            or branch != record.get("branch")):
+        return None
+    if record.get("state") == "reserved" and head != record.get("base_sha"):
+        return None
+    return {"path": str(path.resolve()), "cwd": _worktree_cwd(path, relative),
+            "branch": branch, "base": record.get("base_sha"), "base_sha": record.get("base_sha")}
+
+
+def _remote_default_base(top):
+    """Fetch origin's current default (origin/HEAD, then main fallback) and pin the fetched SHA."""
+    advertised = _worktree_git(top, "ls-remote", "--symref", "origin", "HEAD")
+    if advertised.returncode != 0:
+        return None, "remote-default-fetch-failed", (advertised.stderr or "git ls-remote failed").strip()
+    match = re.search(r"^ref: refs/heads/(.+)\s+HEAD$", advertised.stdout, re.MULTILINE)
+    if match:
+        default = match.group(1).strip()
     else:
-        made = _git(top, "worktree", "add", "-b", slug, str(path), base)
-    if made is None:
-        return {"state": "skipped", "reason": "worktree-add-failed", "path": str(path)}
-    return {"state": "created", "path": str(path), "cwd": inside(path), "branch": slug, "base": base}
+        symbolic = _git(top, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")
+        default = symbolic[len("origin/"):] if symbolic and symbolic.startswith("origin/") else "main"
+    valid = _worktree_git(top, "check-ref-format", "--branch", default)
+    if valid.returncode != 0:
+        return None, "remote-default-ref-invalid", (valid.stderr or default).strip()
+    fetched = _worktree_git(top, "fetch", "-q", "origin",
+                            f"+refs/heads/{default}:refs/remotes/origin/{default}")
+    if fetched.returncode != 0:
+        return None, "remote-default-fetch-failed", (fetched.stderr or "git fetch failed").strip()
+    base = _git(top, "rev-parse", "--verify", f"refs/remotes/origin/{default}^{{commit}}")
+    if not base or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base):
+        return None, "remote-default-ref-unresolved", f"refs/remotes/origin/{default} did not resolve to a commit"
+    return {"branch": default, "sha": base}, None, None
 
+
+def _existing_local_branch(top, branch):
+    result = _worktree_git(top, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    return result.returncode == 0
+
+
+def _worktree_collision(result):
+    detail = ((result.stderr or "") + "\n" + (result.stdout or "")).lower()
+    return any(token in detail for token in ("already exists", "already checked out", "already in use",
+                                               "not an empty directory", "is locked"))
+
+
+def prepare_isolated_worktree(cwd, slug, *, artifact_root=None, preparation_key=None,
+                              explicitly_approved=False):
+    """Prepare or resume a source-start allocation without changing the primary checkout.
+
+    New work starts from a fetched remote-default SHA. Explicit approved linked tasks and a
+    recorded allocation keep their existing contents. A failure is returned to the caller so it
+    can stop before publishing a route or starting an owner.
+    """
+    original = str(Path(cwd).resolve())
+    topology = OWNER_WRITE_ADVISORY.git_topology(original)
+    source_top = _git(original, "rev-parse", "--show-toplevel")
+    if not source_top:
+        return {"state": "skipped", "reason": "non-git-cwd"}
+    if topology not in ("primary", "linked"):
+        return {"state": "failed", "reason": "git-topology-unresolved", "cwd": original}
+    common = _git(source_top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        return {"state": "failed", "reason": "git-common-dir-unresolved", "cwd": original}
+    common = os.path.realpath(common)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(slug or "")):
+        return {"state": "failed", "reason": "worktree-slug-invalid", "slug": str(slug or "")}
+    try:
+        root = artifact_root or os.environ.get("AGENT_ARTIFACT_ROOT") or _compose_artifact_root(original)
+        root = str(Path(root).resolve())
+    except (OSError, ValueError) as exc:
+        return {"state": "failed", "reason": "canonical-artifact-root-unresolved", "detail": str(exc)}
+    if preparation_key is None:
+        preparation_key = {"kind": "compat", "common_dir": common, "cwd": original, "slug": slug}
+    key_payload = json.dumps({"common_dir": common, "key": preparation_key}, sort_keys=True,
+                             separators=(",", ":"), ensure_ascii=False)
+    key = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+    record_path = _preparation_record_path(root, key)
+    try:
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(record_path.with_suffix(".lock")), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        return {"state": "failed", "reason": "preparation-state-unavailable", "detail": str(exc)}
+    with os.fdopen(fd, "a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        record = _read_preparation_record(record_path)
+        relative = os.path.relpath(original, os.path.realpath(source_top))
+        if topology == "linked" and explicitly_approved:
+            branch = _git(original, "symbolic-ref", "-q", "--short", "HEAD")
+            if not branch:
+                return {"state": "failed", "reason": "approved-linked-branch-unresolved", "cwd": original}
+            approved_path = str(Path(source_top).resolve())
+            if record:
+                reused = _prepared_record_worktree(record, common, relative)
+                if reused:
+                    if reused["path"] != approved_path:
+                        return {"state": "failed", "reason": "preparation-identity-conflict",
+                                "path": reused["path"], "requested_path": approved_path}
+                    return {"state": "reused", **reused, "preparation_key": key,
+                            "reason": "approved-linked-task"}
+            primary = _primary_worktree(original, common)
+            primary = os.path.realpath(primary) if primary else None
+            record = {"schema_version": 1, "state": "ready", "key": key,
+                      "common_dir": common, "primary_top": primary, "origin_cwd": original,
+                      "relative_cwd": relative, "path": approved_path, "branch": branch,
+                      "base_sha": _git(source_top, "rev-parse", "HEAD"),
+                      "remote_default": "approved-linked-task"}
+            try:
+                atomic_write(record_path, record)
+            except OSError as exc:
+                return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
+            return {"state": "reused", "path": approved_path, "cwd": original,
+                    "branch": branch, "base": None, "preparation_key": key,
+                    "reason": "approved-linked-task"}
+        if topology == "linked" and record:
+            reused = _prepared_record_worktree(record, common, os.path.relpath(original, source_top))
+            if reused and os.path.commonpath([original, reused["path"]]) == reused["path"]:
+                return {"state": "reused", **reused, "preparation_key": key}
+        primary = _primary_worktree(original, common)
+        if not primary:
+            return {"state": "failed", "reason": "primary-worktree-unresolved", "cwd": original}
+        primary = os.path.realpath(primary)
+        if record and record.get("primary_top") == primary:
+            reused = _prepared_record_worktree(record, common, relative)
+            if reused and record.get("state") == "ready":
+                return {"state": "reused", **reused, "preparation_key": key}
+            if reused and record.get("state") == "reserved":
+                record["state"] = "ready"
+                try:
+                    atomic_write(record_path, record)
+                except OSError as exc:
+                    return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
+                return {"state": "reused", **reused, "preparation_key": key}
+
+        # A branch created before interruption is a retry anchor only when it still points at
+        # the recorded fetched SHA. This avoids both another fetch and accidental branch adoption.
+        reserved = None
+        if record and record.get("primary_top") == primary and record.get("state") == "reserved":
+            branch, path, base_sha = record.get("branch"), Path(record.get("path") or ""), record.get("base_sha")
+            if (branch and not os.path.lexists(path) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(base_sha or ""))
+                    and _git(primary, "rev-parse", "--verify", f"refs/heads/{branch}") == base_sha):
+                reserved = (branch, path, base_sha)
+        base = {"branch": None, "sha": None}
+        if reserved is None:
+            base, reason, detail = _remote_default_base(primary)
+            if reason:
+                return {"state": "failed", "reason": reason, "detail": detail, "cwd": original}
+
+        worktree_root = Path(primary).parent / f"{Path(primary).name}-wt"
+        try:
+            worktree_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"state": "failed", "reason": "worktree-parent-create-failed", "detail": str(exc)}
+        candidates = []
+        if reserved:
+            candidates.append((reserved[0], reserved[1], reserved[2], True))
+        if record and record.get("primary_top") == primary and not reserved:
+            recorded_branch = record.get("branch")
+            recorded_path = Path(record.get("path") or "")
+            if (recorded_branch and recorded_path.parent.resolve() == worktree_root.resolve()
+                    and recorded_branch == recorded_path.name):
+                candidates.append((recorded_branch, recorded_path, base["sha"],
+                                   _existing_local_branch(primary, recorded_branch)))
+        for suffix in range(1, 65):
+            candidate = slug if suffix == 1 else f"{slug}-{suffix}"
+            if not any(row[0] == candidate for row in candidates):
+                candidates.append((candidate, worktree_root / candidate, base["sha"], False))
+        for branch, path, base_sha, resume_branch in candidates:
+            if os.path.lexists(path):
+                if (record and str(path.resolve()) == str(Path(record.get("path") or "").resolve())
+                        and record.get("state") == "reserved"):
+                    reused = _prepared_record_worktree(record, common, relative)
+                    if reused:
+                        record["state"] = "ready"
+                        try:
+                            atomic_write(record_path, record)
+                        except OSError as exc:
+                            return {"state": "failed", "reason": "preparation-state-write-failed",
+                                    "detail": str(exc)}
+                        return {"state": "reused", **reused, "preparation_key": key}
+                continue
+            if not resume_branch and _existing_local_branch(primary, branch):
+                continue
+            record = {"schema_version": 1, "state": "reserved", "key": key,
+                      "common_dir": common, "primary_top": primary, "origin_cwd": original,
+                      "relative_cwd": relative, "path": str(path), "branch": branch,
+                      "base_sha": base_sha,
+                      "remote_default": base.get("branch") or (record or {}).get("remote_default")}
+            try:
+                atomic_write(record_path, record)
+            except OSError as exc:
+                return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
+            command = (("worktree", "add", str(path), branch) if resume_branch else
+                       ("worktree", "add", "-b", branch, str(path), base_sha))
+            added = _worktree_git(primary, *command)
+            if added.returncode != 0:
+                if _worktree_collision(added):
+                    continue
+                return {"state": "failed", "reason": "worktree-add-failed", "path": str(path),
+                        "branch": branch, "base": base_sha, "detail": (added.stderr or added.stdout).strip()}
+            record["state"] = "ready"
+            try:
+                atomic_write(record_path, record)
+                final_cwd = _worktree_cwd(path, relative)
+            except OSError as exc:
+                return {"state": "failed", "reason": "preparation-state-write-failed", "detail": str(exc)}
+            return {"state": "created", "path": str(path.resolve()), "cwd": final_cwd,
+                    "branch": branch, "base": base_sha, "base_sha": base_sha,
+                    "preparation_key": key}
+        return {"state": "failed", "reason": "worktree-collision-budget-exhausted",
+                "cwd": original, "slug": slug}
 
 ROUTE_ID_FORM = re.compile(r"rt-[0-9a-f]{16}")
 
@@ -10257,15 +10563,25 @@ def caller_open_route(cwd):
         else:
             same_repository.append(found)
     if not rows and same_repository:
-        # A route compose moved into this repository's worktree for it (`prepare_isolated_worktree`:
-        # `<repo>-wt/<route slug>`), not any route sealed elsewhere in the repository.
+        # Prefer the exact persisted allocation, including an automatically selected collision
+        # suffix. Retain the old slug path only as a read-only compatibility lookup for legacy routes.
         top = _git(here, "rev-parse", "--show-toplevel")
+        common = _git(here, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        allocated = _recorded_preparation_roots(artifact_root, common) if common else []
         def moved(row):
-            if not top or not row.get("slug"):
+            if not top:
                 return False
-            home = os.path.realpath(Path(top).parent / f"{Path(top).name}-wt" / row["slug"])
             sealed = os.path.realpath(row["cwd"])
-            return sealed == home or sealed.startswith(home + os.sep)
+            for home in allocated:
+                try:
+                    if os.path.commonpath([sealed, home]) == home:
+                        return True
+                except ValueError:
+                    continue
+            if not row.get("slug"):
+                return False
+            legacy = os.path.realpath(Path(top).parent / f"{Path(top).name}-wt" / row["slug"])
+            return sealed == legacy or sealed.startswith(legacy + os.sep)
         rows = [row for row in same_repository if moved(row)]
     if len(rows) == 1:
         return rows[0]["route_file"], "cwd", rows
@@ -10893,6 +11209,7 @@ def main():
         shape=a.shape or "framed"
         if a.start and (a.explain or a.prompt_file is None):
             raise ValueError("compose-start-requires-task: use --start --prompt-file <task>, without --explain")
+        cwd_was_explicit = a.cwd is not None
         cwd=a.cwd or os.getcwd()
         artifact_root=a.artifact_root or _compose_artifact_root(cwd)
         if a.campaign_key is None and a.parent_cycle is None and not a.unassigned:
@@ -10953,18 +11270,32 @@ def main():
             selection_pins=pins or None,route_plan=route_plan_binding,
             execution_scope=a.execution_scope,
         )
-        route=compose_route(**compose_args)
         worktree=None
-        if (a.start and a.cwd is None and a.dispatch_evidence is None and shape!="direct"
-                and not (route_plan_binding or {}).get("leg",{}).get("cwd")
-                and _isolates_worktree(route)):
-            # Work that changes source runs in its own worktree, not in the shared primary checkout.
-            worktree=prepare_isolated_worktree(cwd,a.slug)
-            print("worktree_prepared="+worktree["state"]+"".join(
-                f" {key}={worktree[key]}" for key in ("path","branch","base","reason") if worktree.get(key)),file=sys.stderr)
-            if worktree.get("cwd"):
-                DISPATCH_DEFAULTS_WARNINGS.clear()
-                route=compose_route(**{**compose_args,"cwd":worktree["cwd"]})
+        if a.start and not a.explain:
+            selection = compose_route(**compose_args, selection_only=True)
+            if _isolates_worktree(selection):
+                approved_leg_cwd = bool((route_plan_binding or {}).get("leg", {}).get("cwd"))
+                prep_key = _compose_preparation_key(compose_args, route_plan_binding, a.prompt_file)
+                worktree = prepare_isolated_worktree(
+                    cwd, a.slug, artifact_root=artifact_root, preparation_key=prep_key,
+                    explicitly_approved=cwd_was_explicit or approved_leg_cwd)
+                print("worktree_prepared=" + worktree["state"] + "".join(
+                    f" {key}={worktree[key]}" for key in ("path", "branch", "base", "reason") if worktree.get(key)),
+                    file=sys.stderr)
+                if worktree.get("state") == "failed":
+                    raise ValueError("source-worktree-preparation-failed:" + worktree.get("reason", "unknown")
+                                     + (":" + worktree["detail"] if worktree.get("detail") else "")
+                                     + "; retry the same compose --start request; its identity is retained")
+                if worktree.get("cwd") and os.path.realpath(worktree["cwd"]) != os.path.realpath(cwd):
+                    final_cwd = worktree["cwd"]
+                    compose_args["cwd"] = final_cwd
+                    if (compose_args.get("dispatch_evidence") is not None
+                            and not _dispatch_evidence_matches_cwd(compose_args["dispatch_evidence"], final_cwd)):
+                        compose_args["dispatch_evidence"] = None
+                    # Candidate evidence has no checked-worktree binding. Recollect it after a move.
+                    compose_args["registered_headless_evidence"] = None
+                    DISPATCH_DEFAULTS_WARNINGS.clear()
+        route=compose_route(**compose_args)
         for line in (*DISPATCH_DEFAULTS_WARNINGS,*pin_warnings):
             print(line,file=sys.stderr)
         _plan_for_card, _plan_source_for_card = a._route_chain_plan

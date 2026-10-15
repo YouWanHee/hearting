@@ -57,12 +57,26 @@ replacing a tracked directory with a symlink.
 The §5.8 lock protects only artifact writes. It does not detect an active merge or rebase, dirty files, detached HEAD, or the same branch in another worktree. A code-mutating capability, canonically `autopilot-code`, checks once before editing and again before every commit or write-back.
 
 Dispatch requires a branch in every route worktree, including spec-only
-routes whose artifacts live outside the checkout. `compose --start` creates it
-for source-changing work started from a primary checkout (`<repo>-wt/<slug>`,
-WORKFLOW compose defaults); elsewhere create it with
-`git worktree add -b <new-branch> <path> <base>`. For an existing detached task
-worktree, `git switch -c <new-branch>` inside that worktree preserves its current
-HEAD and uncommitted work. Dispatch refuses a detached HEAD as `unsafe-git-state`
+routes whose artifacts live outside the checkout. Every approved start whose
+selected route changes source prepares its execution cwd before eligibility
+evidence, sealing, publication, or launch. This applies to `compose --start`,
+framed first legs, successors, printed next-leg commands, and `direct` routes;
+an explicit primary cwd or supplied dispatch evidence is not an exemption.
+From a primary checkout, preparation fetches the remote default branch and
+creates the worktree from the commit SHA observed after that successful fetch.
+An explicitly approved task linked worktree is kept with its existing changes
+and HEAD. Exact saved snapshots, cursors, receipts, and official continuations
+are resumed before new preparation, so resuming an existing task does not
+require another network fetch. Occupied worktree names are skipped with an
+automatically chosen suffix; preparation failure prevents route publication
+and launch and can be retried through the same start with its existing
+decision and approval.
+
+Preparation does not run for preview, explain, a non-start compose, or the
+low-level `compile` interface. These paths remain read-only, and a sealed route
+is never rewritten or moved. For an existing detached task worktree,
+`git switch -c <new-branch>` inside that worktree preserves its current HEAD
+and uncommitted work. Dispatch refuses a detached HEAD as `unsafe-git-state`
 and names that command.
 
 ```bash
@@ -218,12 +232,16 @@ Each SD item below keeps the rule an agent acts on; its full decision record is 
 Adapter and projection changes follow the same core-first order as other portable work: establish and read the governing `core/` contract before adapter edits. A generated projection's determinism covers its file mode, not only its bytes: a generator that writes plugin JSON (`hooks.json`, `plugin.json`, marketplace manifests) fixes the mode to `0644` on every write regardless of process umask, and its `--check` counterpart fails a foreign mode as a stale projection alongside a content mismatch (S-5d, owner-supervisor-liveness — a reproducible regenerate cycle flips `hooks.json` away from `0644`; the first mutating syscall was not isolated, so the fix enforces the invariant rather than only diagnosing it).
 
 Actual edits, tests, and QA run in isolated worktrees while the main session
-handles triage, dispatch, harvest, and reporting. Source-changing non-direct compose starts
-prepare that worktree even when the primary checkout has local work: use its
-current HEAD in that case, preserve its uncommitted files in place, and bind the
-owner and every stage to the prepared cwd before launch. Clean primary checkouts
-continue to use the latest default-branch base; an explicitly chosen linked
-worktree is reused. Exact file inventories treat an existing file path literally,
+handles triage, dispatch, harvest, and reporting. A new independent source
+start from a primary checkout prepares `<repo>-wt/<slug>` (or an available
+collision-free suffix) from the successfully fetched remote default commit,
+even when the primary is dirty, stale, or diverged. The primary's files,
+index, branch, and HEAD stay untouched. An explicitly approved task linked
+worktree is reused with its changes; a linked worktree is not adopted merely
+because its slug or repository matches. Preparation failure leaves the start
+unpublished and retryable with its existing approval and identity. Frame and
+successor routes bind the owner and every stage to the final prepared cwd
+before readiness is collected. Exact file inventories treat an existing file path literally,
 including `[id]`, `[...slug]`, and `(group)` components. Only a path that does not
 name an existing file is tested for glob syntax, by the shared stage-session
 contract used for subdivision and adapter binding. Containment and disjointness
@@ -287,10 +305,13 @@ lifecycle predicate term.
 
 | Scale | Handling |
 |---|---|
-| One-off typo, one line, or `direct` work | Work directly in the main working tree |
+| One-off typo, one line, or `direct` work whose selected route does not change source | Work directly in the main working tree |
 | Small work routed to `quick` because atomic-direct predicates are incomplete and no promotion signal is present | Registered-headless dispatch-depth-1 one-shot conductor in an isolated worktree |
-| Work promoted to `standard+` by durable scope, shared-contract, resource, resume, verifier, or separability signals | Use a worktree and task branch from the latest base. Features, new modules, and multi-file edits always use a branch; ambiguity resolves toward a branch. Separable multi-file or feature work at `standard+` must use headless dispatch. Team delegation and inline micro-stages are limited to `quick` and genuinely microscopic stages. |
+| Work promoted to `standard+` by durable scope, shared-contract, resource, resume, verifier, or separability signals | Use a worktree and task branch from the latest base. Separable multi-file or feature work at `standard+` must use headless dispatch. Team delegation and inline micro-stages are limited to `quick` and genuinely microscopic stages. |
 | A new independent request while work is active | Dispatch it to a new worktree alongside the first job |
+
+`direct` remains inline. When its selected route changes source, the approved
+start uses the shared source-worktree preparation contract above.
 
 **Token-pressure non-interference:** token or context pressure cannot downshift this table, remove a required stage or depth, skip liveness and registry handling, or weaken worktree, write, spec, sandbox, approval, safety, validation, security, or accessibility guards. Unknown or exceeded budgets preserve the pipeline and surface degraded availability. Only unrequested optional exploration and user-facing verbosity may shrink.
 
@@ -419,14 +440,17 @@ a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
 
-For native Codex callbacks in a shared service, the foreground TUI's first
-full `thread-id` footer field provides the current `Thread.id`; `sessionId`
-remains its tree root. Two fresh samples share stable foreground PID/start/TTY
-and one unique endpoint/pane, also used for reporting, number lookup and title.
-Managed apply preserves other custom footer items. UUIDs elsewhere, callback
-or environment SID, cwd, title, inherited pane and shared ancestry alone remain
-hints. Missing, clipped, conflicting or stale observations stay unknown;
-registered workers have no foreground pane ownership.
+For native Codex callbacks in a shared service, exactly one `thread-id` is the
+last `[tui].status_line` item, and the complete UUID in the last visible native
+footer field provides the current `Thread.id`; `sessionId` remains its tree
+root. A UUID in an earlier field, title, transcript, or arbitrary screen text
+is not current identity. A missing, clipped, wrapped, partial, ambiguous, or
+hidden last field stays unknown. Two fresh samples share stable foreground
+PID/start/TTY and one unique endpoint/pane, also used for reporting, number
+lookup and title. Managed apply preserves every other custom footer item and
+its order. Callback or environment SID, cwd, title, inherited pane and shared
+ancestry alone remain hints; registered workers have no foreground pane
+ownership.
 
 For an unproven background caller, default `peer-steward start` locates the
 inherited pane's workspace by its live foreground directory in the caller's

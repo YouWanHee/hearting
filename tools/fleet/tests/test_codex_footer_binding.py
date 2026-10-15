@@ -26,10 +26,10 @@ TREE_ROOT = "01a12d62-4ef3-7363-8d6a-9e12a26d250f"
 def screen(thread_ids, *, prompt=True, clipped=False):
     if isinstance(thread_ids, str):
         thread_ids = [thread_ids]
-    lines = ["Codex", "›" if prompt else "composer unavailable"]
-    for thread_id in thread_ids:
-        shown = thread_id[:-4] + "…" if clipped else thread_id
-        lines.append("\x1b[2m" + shown + "\x1b[0m")
+    shown_ids = [thread_id[:-4] + "…" if clipped else thread_id for thread_id in thread_ids]
+    lines = ["Codex", "›" if prompt else "composer unavailable", "",
+             "fixture-project · " + " · ".join("\x1b[2m" + sid + "\x1b[0m" for sid in shown_ids),
+             "  ? for shortcuts"]
     return "\x1b[?25l" + "\r\n".join(lines) + "\r\n\x1b[?25h"
 
 
@@ -126,10 +126,24 @@ class CodexFooterBindingTest(unittest.TestCase):
                                   side_effect=lambda pid: self.frontend_env.get(int(pid), {})))
 
     def test_parser_requires_prompt_and_complete_bounded_uuid(self):
+        hint = "  ? for shortcuts"
         self.assertEqual(pane_ownership.codex_footer_threads(
-            ["activity contains " + THREAD_A, "›", "thread-id " + THREAD_A]), {THREAD_A})
-        self.assertEqual(pane_ownership.codex_footer_threads(["›", "thread-id " + THREAD_A[:-3] + "…"]), set())
-        self.assertEqual(pane_ownership.codex_footer_threads(["activity " + THREAD_A]), set())
+            ["activity contains " + THREAD_A, "› Ask Codex", "", "project · telemetry · " + THREAD_A, hint],
+            current_id_only=True), {THREAD_A})
+        self.assertEqual(pane_ownership.codex_footer_threads(
+            ["› Ask Codex", "", THREAD_A[:-3] + "…", hint], current_id_only=True), set())
+        self.assertEqual(pane_ownership.codex_footer_threads(
+            ["› Ask Codex", "", THREAD_A + " suffix", hint], current_id_only=True), set())
+        self.assertEqual(pane_ownership.codex_footer_threads(
+            ["› Ask Codex", "", THREAD_A + " | " + THREAD_B, hint], current_id_only=True), set())
+        self.assertEqual(pane_ownership.codex_footer_threads(
+            ["› Ask Codex", "", THREAD_A + " · telemetry", hint], current_id_only=True), set())
+        self.assertEqual(pane_ownership.codex_footer_threads(
+            ["› Ask Codex", "", THREAD_A + " · " + THREAD_B, hint], current_id_only=True), {THREAD_B})
+        self.assertEqual(pane_ownership.codex_footer_threads(
+            ["› Ask Codex", "", "Where should the new conversation run?", "❯ Use current Git worktree", hint],
+            current_id_only=True), set())
+        self.assertEqual(pane_ownership.codex_footer_threads(["activity " + THREAD_A], current_id_only=True), set())
 
     def test_current_thread_from_normal_callback_drives_the_deferred_report(self):
         for index, (source, thread_id) in enumerate((("startup", THREAD_A),
@@ -168,6 +182,39 @@ class CodexFooterBindingTest(unittest.TestCase):
                                     and "HERDR_PANE_ID" not in read_env
                                     for _target, read_env in self.screen_reads if _target == pane))
 
+    def test_deferred_proof_helper_skips_only_known_incapable_frontend_config(self):
+        for feasibility, should_spawn in (("incapable", False), ("capable", True), ("unknown", True)):
+            with self.subTest(feasibility=feasibility), \
+                 mock.patch.object(projection, "_nearest_codex_pid", return_value=44001), \
+                 mock.patch.object(procscan, "is_shared_codex_daemon", return_value=False), \
+                 mock.patch.object(procscan, "_read_argv", return_value=["codex"]), \
+                 mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": str(self.root)}), \
+                 mock.patch.object(projection, "_codex_status_line_feasibility", return_value=feasibility), \
+                 mock.patch.object(projection.subprocess, "Popen") as spawn:
+                projection._defer_until_proven(THREAD_A, True)
+                self.assertEqual(spawn.called, should_spawn)
+                if should_spawn:
+                    args, kwargs = spawn.call_args
+                    self.assertEqual(args[0][args[0].index("--session-id") + 1], THREAD_A)
+                    self.assertTrue(kwargs["start_new_session"])
+
+    def test_deferred_proof_feasibility_reads_the_frontend_home_and_retained_overrides(self):
+        home = self.root / "frontend-codex-home"
+        home.mkdir()
+        config = home / "config.toml"
+        config.write_text('[tui]\nstatus_line = ["custom"]\n', encoding="utf-8")
+        with mock.patch.object(projection, "_nearest_codex_pid", return_value=44002), \
+             mock.patch.object(procscan, "is_shared_codex_daemon", return_value=False), \
+             mock.patch.object(procscan, "_read_argv", return_value=["codex"]), \
+             mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": str(home)}), \
+             mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "masked-home")}):
+            self.assertEqual(projection._codex_status_line_feasibility(), "incapable")
+            config.write_text('[tui]\nstatus_line = ["custom", "thread-id"]\n', encoding="utf-8")
+            self.assertEqual(projection._codex_status_line_feasibility(), "capable")
+            with mock.patch.object(procscan, "_read_argv",
+                                   return_value=["codex", "--profile", "custom"]):
+                self.assertEqual(projection._codex_status_line_feasibility(), "unknown")
+
     def test_two_same_cwd_frontends_are_selected_by_their_current_footer(self):
         self.add_frontend(42001, "wA:p1", THREAD_A)
         self.add_frontend(42002, "wA:p2", THREAD_B)
@@ -197,12 +244,16 @@ class CodexFooterBindingTest(unittest.TestCase):
     def test_uuid_in_title_is_not_the_current_native_identity_field(self):
         pid, pane = 42121, "wA:ptitle"
         self.add_frontend(pid, pane, THREAD_A)
-        self.screens[pane] = ["Codex\n›\nfixture-project · " + THREAD_A] * 2
+        self.screens[pane] = ["Codex\n› Ask Codex\n\nfixture-project · " + THREAD_A + " · Fix it"
+                              + "\n  ? for shortcuts"] * 2
         self.assertEqual(pane_ownership.verified_pane(
             pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
-        self.screens[pane] = ["Codex\n›\n" + THREAD_A + " · " + THREAD_B] * 2
+        self.screens[pane] = ["Codex\n› Ask Codex\n\nfixture-project · " + THREAD_A + " · " + THREAD_B
+                              + "\n  ? for shortcuts"] * 2
         self.assertEqual(pane_ownership.verified_pane(
-            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), pane)
+            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
+        self.assertEqual(pane_ownership.verified_pane(
+            pane, "codex", THREAD_B, pid=pid, executable="/fake/herdr"), pane)
 
     def test_frontend_default_socket_does_not_inherit_service_socket(self):
         pid, pane = 42131, "wA:pdefault"

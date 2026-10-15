@@ -299,7 +299,9 @@ class _CodexFixture:
                 self.assertIsNone(payload["context_policy"]["effective_window_tokens"])
                 self.assertIsNone(payload["context_display_window_tokens"])
                 self.assertIsNone(payload["ctx_pct"])
-                self.assertNotIn("%", row)
+                # No trigger is invented; the row keeps the native gauge of the raw window.
+                from fleet.token_budget import codex_context_used_pct
+                self.assertIn(f"{codex_context_used_pct(10000, usable)}%", row)
 
     def test_limit_clamp_can_resolve_the_ambiguous_native_window(self):
         self.catalogue(percent=33)
