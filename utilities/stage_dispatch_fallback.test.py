@@ -80,26 +80,49 @@ class FallbackTest(unittest.TestCase):
           "AGENT_DISPATCH_JOBS":str(self.jobs)}
  def test_dirty_primary_prepares_the_cwd_that_every_stage_adapter_uses(self):
   primary=self.repo
-  head=subprocess.run(["git","-C",str(primary),"rev-parse","HEAD"],check=True,capture_output=True,text=True).stdout.strip()
+  origin=Path(self.tmp.name)/"origin.git"; writer=Path(self.tmp.name)/"writer"
+  subprocess.run(["git","init","-q","--bare","-b","main",str(origin)],check=True)
+  subprocess.run(["git","-C",str(primary),"branch","-M","main"],check=True)
+  subprocess.run(["git","-C",str(primary),"remote","add","origin",str(origin)],check=True)
+  subprocess.run(["git","-C",str(primary),"push","-q","-u","origin","main"],check=True)
+  subprocess.run(["git","clone","-q",str(origin),str(writer)],check=True)
+  subprocess.run(["git","-C",str(writer),"config","user.name","Fixture"],check=True)
+  subprocess.run(["git","-C",str(writer),"config","user.email","fixture@example.test"],check=True)
+  (writer/"remote-only.txt").write_text("remote tip\n")
+  subprocess.run(["git","-C",str(writer),"add","remote-only.txt"],check=True)
+  subprocess.run(["git","-C",str(writer),"commit","-qm","remote tip"],check=True)
+  subprocess.run(["git","-C",str(writer),"push","-q","origin","main"],check=True)
+  remote_sha=subprocess.run(["git","-C",str(writer),"rev-parse","HEAD"],check=True,capture_output=True,text=True).stdout.strip()
   (primary/"x").write_text("uncommitted\n")
-  prepared=R.prepare_isolated_worktree(primary,"owner-task")
+  prepared=R.prepare_isolated_worktree(primary,"owner-task",artifact_root=self.art,
+                                       preparation_key={"test":"stage-adapter-cwd"})
   self.assertEqual(prepared["state"],"created")
   self.repo=Path(prepared["cwd"])
   self.assertNotEqual(self.repo,primary)
-  self.assertEqual(prepared["base"],head)
+  self.assertEqual(prepared["base"],remote_sha)
   self.assertEqual((primary/"x").read_text(),"uncommitted\n")
   self.assertEqual((self.repo/"x").read_text(),"x")
+  self.assertTrue((self.repo/"remote-only.txt").is_file())
   route_path=self.route(same_status="supported")
   with mock.patch.dict(os.environ,self.launch_roots_env()):
    route,node=F.load_node(route_path,"execute","dry-run")
   self.assertEqual(route["cwd"],str(self.repo))
+  self.assertEqual(route["artifact_root"],str(self.art.resolve()))
   args=SimpleNamespace(action="dry-run",slug="owner-execute",parent="owner",route=route_path,
                        jobs=self.jobs,qa=None,worker_role=None,prompt_file=None)
+  consumers=[]
   for harness in ("claude","codex","opencode"):
    with self.subTest(harness=harness):
     row={**self.tuple(harness,"supported"),"child_harness":harness}
     command=F.wrapper_command(args,route,node,row,1,"att-stage-fixture")
     self.assertEqual(command[command.index("--worktree")+1],str(self.repo))
+    self.assertEqual(command[command.index("--route-file")+1],str(route_path))
+    self.assertEqual(command[command.index("--parent-harness")+1],row["parent_harness"])
+    self.assertEqual(command[command.index("--parent-sandbox")+1],row["parent_sandbox"])
+    consumers.append((command[command.index("--worktree")+1],command[command.index("--route-file")+1],
+                      command[command.index("--route-id")+1],command[command.index("--route-hash")+1],
+                      command[command.index("--parent-harness")+1],command[command.index("--parent-sandbox")+1]))
+  self.assertEqual(len(set(consumers)),1)
   self.assertEqual((primary/"x").read_text(),"uncommitted\n")
  def route(self,native="unsupported",same_status="unsupported",intensity="strong"):
   """Compile the fixture route under the SAME runtime root the launch uses.

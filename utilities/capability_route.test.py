@@ -7662,14 +7662,18 @@ class ComposeRouteTest(TestRoute):
       self.assertIn("nodes=1 worker_dispatches=0 owner_dispatches=0 resource(측정)=없음",err.getvalue())
       self.assertIn("tiers: inline=current-session(등급 미기록)",err.getvalue())
       return dict(receipt)
+     # Display-only fixture: the preparation boundary is observed, never run on the checkout under test.
      with mock.patch.object(sys,"argv",argv),mock.patch.object(R,"compose_route",return_value=route), \
+          mock.patch.object(R,"prepare_isolated_worktree",return_value={"state":"reused","cwd":str(R.ROOT)}), \
           mock.patch.object(work_start,"start_work",side_effect=start), \
           mock.patch.object(R,"_record_route_chain"),mock.patch.object(R,"_route_autoclose"), \
           contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
       self.assertEqual(R.main(),0)
      actual=json.loads(out.getvalue())
      self.assertEqual({k:actual[k] for k in receipt},receipt)
-     self.assertEqual(set(actual),set(receipt)|{"confirmation","pre_execution_answers"})
+     expected_keys=set(receipt)|{"confirmation","pre_execution_answers"}
+     if command=="compose": expected_keys.add("worktree")
+     self.assertEqual(set(actual),expected_keys)
      self.assertEqual(err.getvalue().count("강도 안내"),1)
      self.assertEqual(err.getvalue().count("규모:"),1)
  def test_verified_resume_graph_keeps_payload_inline_and_verifies_after_exit(self):
@@ -7843,6 +7847,7 @@ class ComposeRouteTest(TestRoute):
    for _ in range(2):
     out,err=io.StringIO(),io.StringIO()
     with mock.patch.object(sys,"argv",argv), mock.patch.object(R,"compose_route",return_value=route), \
+         mock.patch.object(R,"prepare_isolated_worktree",return_value={"state":"reused","cwd":str(R.ROOT)}), \
          mock.patch.object(R,"_record_route_chain"), mock.patch.object(R,"_route_autoclose"), \
          mock.patch.object(work_start,"start_work",side_effect=start), \
          contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
@@ -8507,56 +8512,93 @@ class ComposeRouteTest(TestRoute):
  def test_source_changing_work_gets_its_own_worktree_from_the_latest_base(self):
   with tempfile.TemporaryDirectory() as tmp:
    git=lambda cwd,*args: subprocess.run(["git","-C",str(cwd),*args],check=True,capture_output=True,text=True).stdout.strip()
-   origin=Path(tmp)/"origin.git"; primary=Path(tmp)/"repo"
+   origin=Path(tmp)/"origin.git"; primary=Path(tmp)/"repo"; writer=Path(tmp)/"writer"
    git(tmp,"init","-q","--bare","-b","main",str(origin)); git(tmp,"clone","-q",str(origin),str(primary))
-   commit=lambda *args: git(primary,"-c","user.name=t","-c","user.email=t@t","commit","-q",*args)
-   (primary/"a.txt").write_text("a\n"); git(primary,"add","a.txt"); commit("-m","base"); git(primary,"push","-q","origin","main")
-   (primary/"pkg").mkdir()
-   made=R.prepare_isolated_worktree(primary/"pkg","fix-x")
+   git(primary,"config","user.name","Fixture"); git(primary,"config","user.email","fixture@example.test")
+   (primary/"a.txt").write_text("base\n"); git(primary,"add","a.txt")
+   git(primary,"commit","-qm","base"); git(primary,"push","-q","-u","origin","main")
+   git(primary,"-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-qm","local-only")
+   git(tmp,"clone","-q",str(origin),str(writer)); git(writer,"config","user.name","Fixture"); git(writer,"config","user.email","fixture@example.test")
+   (writer/"remote.txt").write_text("remote tip\n"); git(writer,"add","remote.txt"); git(writer,"commit","-qm","remote tip"); git(writer,"push","-q","origin","main")
+   remote_sha=git(writer,"rev-parse","HEAD")
+   (primary/"a.txt").write_text("staged primary edit\n"); git(primary,"add","a.txt")
+   (primary/"a.txt").write_text("dirty primary edit\n"); (primary/"untracked.txt").write_text("keep\n")
+   def fingerprint():
+    return (git(primary,"rev-parse","HEAD"),git(primary,"branch","--show-current"),
+            git(primary,"diff","--binary"),git(primary,"diff","--cached","--binary"),
+            git(primary,"status","--porcelain"),git(primary,"ls-files","--stage"),
+            (primary/"a.txt").read_bytes(),(primary/"untracked.txt").read_bytes())
+   before=fingerprint(); reports=Path(tmp)/"reports"; reports.mkdir(); (primary/"pkg").mkdir()
+   key={"request":"source work one","campaign":"main"}
+   made=R.prepare_isolated_worktree(primary/"pkg","fix-x",artifact_root=reports,preparation_key=key)
    wt=Path(tmp)/"repo-wt"/"fix-x"
-   self.assertEqual((made["state"],made["path"],made["branch"],made["base"]),("created",str(wt),"fix-x","origin/main"))
-   self.assertEqual(made["cwd"],str(wt))                   # an untracked subdirectory is not in the new tree
-   self.assertEqual(git(wt,"rev-parse","HEAD"),git(primary,"rev-parse","origin/main"))
-   again=R.prepare_isolated_worktree(primary,"fix-x")         # the same work reuses its worktree
+   self.assertEqual((made["state"],Path(made["path"]),made["branch"],made["base"]),
+                    ("created",wt,"fix-x",remote_sha))
+   self.assertEqual(made["cwd"],str(wt/"pkg"))
+   self.assertEqual(git(wt,"rev-parse","HEAD"),remote_sha)
+   self.assertTrue((wt/"remote.txt").is_file()); self.assertFalse((wt/"untracked.txt").exists())
+   self.assertEqual(fingerprint(),before)
+   (wt/"pending.py").write_text("keep this linked task\n")
+   with mock.patch.object(R,"_worktree_git",side_effect=AssertionError("ready allocation must not fetch")):
+    again=R.prepare_isolated_worktree(primary,"fix-x",artifact_root=reports,preparation_key=key)
    self.assertEqual((again["state"],again["path"],again["branch"]),("reused",str(wt),"fix-x"))
-   self.assertEqual(R.prepare_isolated_worktree(wt,"other")["reason"],"not-primary-checkout")
-   (Path(tmp)/"repo-wt"/"taken").mkdir()
-   self.assertEqual(R.prepare_isolated_worktree(primary,"taken")["reason"],"path-occupied")
-   self.assertEqual(R.prepare_isolated_worktree(Path(tmp),"x")["reason"],"not-primary-checkout")
-   (primary/"new.txt").write_text("new\n")                     # a new file not yet added is work in progress too
-   made=R.prepare_isolated_worktree(primary,"z")
-   self.assertEqual(made["state"],"created")
-   self.assertEqual(made["base"],git(primary,"rev-parse","HEAD"))
-   self.assertEqual((primary/"new.txt").read_text(),"new\n")
-   self.assertFalse((Path(made["path"])/"new.txt").exists())
-   (primary/"new.txt").unlink()
-   # Dirty files stay in primary; the owner gets a clean tree at the current committed baseline.
-   (primary/"a.txt").write_text("changed\n")
-   made=R.prepare_isolated_worktree(primary,"y")
-   self.assertEqual(made["state"],"created")
-   self.assertEqual((primary/"a.txt").read_text(),"changed\n")
-   self.assertEqual((Path(made["path"])/"a.txt").read_text(),"a\n")
-   git(primary,"switch","-q","-c","feature-x"); (primary/"b.txt").write_text("b\n"); git(primary,"add","b.txt","a.txt"); commit("-m","wip")
-   made=R.prepare_isolated_worktree(primary,"local-commit")
-   self.assertEqual(made["state"],"created")
-   self.assertEqual(made["base"],git(primary,"rev-parse","HEAD"))
-   self.assertEqual(git(Path(made["path"]),"rev-parse","HEAD"),git(primary,"rev-parse","HEAD"))
-   self.assertEqual((Path(made["path"])/"b.txt").read_text(),"b\n")
-   # the route compose moved into that worktree is found from the primary checkout after /clear
-   routes=Path(tmp)/"reports"; R.canonical_routes_dir(routes).mkdir(parents=True)
-   path=R.canonical_routes_dir(routes)/("rt-"+"f"*16+".json")
-   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(wt),"slug":"fix-x","artifact_root":str(routes)}),encoding="utf-8")
-   other=R.canonical_routes_dir(routes)/("rt-"+"e"*16+".json")     # another route in a worktree it was not made for
-   other.write_text(json.dumps({"route_id":"rt-"+"e"*16,"nodes":[],"cwd":str(wt),"slug":"elsewhere","artifact_root":str(routes)}),encoding="utf-8")
+   explicit_key={"request":"approved linked task"}
+   explicit=R.prepare_isolated_worktree(wt,"other",artifact_root=reports,preparation_key=explicit_key,
+                                       explicitly_approved=True)
+   self.assertEqual((explicit["state"],explicit["cwd"]),("reused",str(wt)))
+   self.assertEqual((wt/"pending.py").read_text(),"keep this linked task\n")
+   real_worktree_git=R._worktree_git
+   def no_network(cwd,*args):
+    self.assertNotIn(args[:1],(("ls-remote",),("fetch",),("worktree","add")))
+    return real_worktree_git(cwd,*args)
+   with mock.patch.object(R,"_worktree_git",side_effect=no_network):
+    explicit_again=R.prepare_isolated_worktree(wt,"other",artifact_root=reports,
+                                               preparation_key=explicit_key)
+   self.assertEqual((explicit_again["state"],explicit_again["path"]),("reused",str(wt)))
+   collided=R.prepare_isolated_worktree(primary,"fix-x",artifact_root=reports,
+                                        preparation_key={"request":"independent source work"})
+   self.assertEqual((Path(collided["path"]).name,collided["branch"]),("fix-x-2","fix-x-2"))
+   git(primary,"branch","branch-only")
+   branch_collision=R.prepare_isolated_worktree(primary,"branch-only",artifact_root=reports,
+                                                preparation_key={"request":"branch collision"})
+   self.assertEqual((Path(branch_collision["path"]).name,branch_collision["branch"]),
+                    ("branch-only-2","branch-only-2"))
+   foreign=Path(tmp)/"foreign"
+   git(tmp,"init","-q","-b","main",str(foreign)); git(foreign,"config","user.name","Fixture")
+   git(foreign,"config","user.email","fixture@example.test")
+   (foreign/"foreign.txt").write_text("foreign repository\n"); git(foreign,"add","foreign.txt")
+   git(foreign,"commit","-qm","foreign base")
+   foreign_wt=Path(tmp)/"repo-wt"/"path-only"
+   git(foreign,"worktree","add","-q","-b","foreign-branch",str(foreign_wt),"HEAD")
+   path_collision=R.prepare_isolated_worktree(primary,"path-only",artifact_root=reports,
+                                              preparation_key={"request":"path collision"})
+   self.assertEqual((Path(path_collision["path"]).name,path_collision["branch"]),
+                    ("path-only-2","path-only-2"))
+   from concurrent.futures import ThreadPoolExecutor
+   parallel_key={"request":"one concurrent start"}
+   with ThreadPoolExecutor(max_workers=2) as pool:
+    parallel=list(pool.map(lambda _:R.prepare_isolated_worktree(primary,"parallel",artifact_root=reports,
+                                                                 preparation_key=parallel_key),range(2)))
+   self.assertEqual({row["state"] for row in parallel},{"created","reused"})
+   self.assertEqual({row["path"] for row in parallel},{str(Path(tmp)/"repo-wt"/"parallel")})
+   routes=R.canonical_routes_dir(reports); routes.mkdir(parents=True)
+   path=routes/("rt-"+"f"*16+".json")
+   path.write_text(json.dumps({"route_id":"rt-"+"f"*16,"nodes":[],"cwd":str(collided["cwd"]),
+                               "slug":"fix-x","artifact_root":str(reports)}),encoding="utf-8")
    with mock.patch.object(R,"_route_chain_module",return_value=None), \
-        mock.patch.object(R,"_compose_artifact_root",return_value=str(routes)):
+        mock.patch.object(R,"_compose_artifact_root",return_value=str(reports)):
     self.assertEqual(R.caller_open_route(primary)[:2],(str(path),"cwd"))
+    other=routes/("rt-"+"e"*16+".json")
+    other.write_text(json.dumps({"route_id":"rt-"+"e"*16,"nodes":[],"cwd":str(collided["cwd"]),
+                                 "slug":"different-task","artifact_root":str(reports)}),encoding="utf-8")
+    self.assertEqual(R.caller_open_route(primary)[1],"ambiguous")
  def test_only_source_changing_routes_with_a_real_artifact_root_are_isolated(self):
   source={"id":"execute","write_scope":["source/**"]}; plan={"id":"plan","write_scope":["artifacts/plans/**"]}
   real=str(Path.home()/"project"/".agent_reports")
   self.assertTrue(R._isolates_worktree({"artifact_root":real,"nodes":[plan,source]}))
   self.assertFalse(R._isolates_worktree({"artifact_root":real,"nodes":[plan]}))
-  self.assertFalse(R._isolates_worktree({"artifact_root":tempfile.gettempdir()+"/x","nodes":[source]}))
+  self.assertTrue(R._isolates_worktree({"artifact_root":tempfile.gettempdir()+"/x","nodes":[source]}))
+  self.assertFalse(R._isolates_worktree({"artifact_root":tempfile.gettempdir()+"/x","nodes":[plan]}))
  def test_a_route_id_finds_its_record_from_the_checkout_the_registry_or_a_ledger(self):
   with tempfile.TemporaryDirectory() as tmp:
    def record(root,name):

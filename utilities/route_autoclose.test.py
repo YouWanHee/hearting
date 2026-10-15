@@ -67,6 +67,10 @@ class RouteAutocloseTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
                         "commit", "-qm", "base"], check=True)
+        # A source `compose --start` prepares its worktree from origin's default branch; this
+        # fixture's own bare origin keeps that real preparation inside the temporary directory.
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(base / "origin.git")], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "remote", "add", "origin", str(base / "origin.git")], check=True)
         self.jobs = base / "state" / "dispatch" / "jobs.log"
         self.jobs.parent.mkdir(parents=True)
         self.jobs.write_text("", encoding="utf-8")
@@ -348,9 +352,15 @@ class RouteAutocloseTest(unittest.TestCase):
         import work_start
         api = self._api()
         order, seen = [], {}
+        real_prepare = api.prepare_isolated_worktree
+
+        def prepare(*args, **kwargs):
+            order.append("prepare")
+            return real_prepare(*args, **kwargs)
 
         def start(route, path, jobs, **_kw):
             order.append("start")
+            seen["cwd"] = route["cwd"]
             return {"state": "started", "route_id": route["route_id"]}
 
         def autoclose(root, trigger, route=None):
@@ -367,13 +377,15 @@ class RouteAutocloseTest(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, {**self.env, "CODEX_THREAD_ID": "order-session"}))
             stack.enter_context(mock.patch.object(sys, "argv", argv))
+            stack.enter_context(mock.patch.object(api, "prepare_isolated_worktree", prepare))
             stack.enter_context(mock.patch.object(work_start, "start_work", start))
             stack.enter_context(mock.patch.object(api, "_route_autoclose", autoclose))
             stack.enter_context(contextlib.redirect_stdout(out))
             stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
             self.assertEqual(api.main(), 0)
-        self.assertEqual(order, ["start", "autoclose"])
+        self.assertEqual(order, ["prepare", "start", "autoclose"])
         self.assertIn('"state": "started"', seen["stdout"])   # the receipt was already printed
+        self.assertEqual(seen["cwd"], str((self.base / "repo-wt" / "order").resolve()))
 
     def test_r7_interrupted_autoclose_is_finished_by_the_next_sweep(self):
         route_file, route = self.compose("interrupted", "codex", "session-1")
@@ -777,7 +789,11 @@ class RouteAutocloseTest(unittest.TestCase):
         again = subprocess.run(receipt["parent_next_command"], shell=True, cwd=self.repo, capture_output=True,
                                text=True, env={**self.env, "CODEX_THREAD_ID": "session-b"})
         self.assertEqual(again.returncode, 0, again.stderr)
-        self.assertNotEqual(json.loads(again.stdout.strip().splitlines()[-1])["route_id"], route["route_id"])
+        receipt = json.loads(again.stdout.strip().splitlines()[-1])
+        self.assertNotEqual(receipt["route_id"], route["route_id"])
+        # The handed-back compose is a new source start: it runs in its own prepared worktree.
+        restarted = json.loads(Path(receipt["route_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(restarted["cwd"], str((self.base / "repo-wt" / route["slug"]).resolve()))
 
     def test_review3_worker_environment_cannot_move_a_test_into_a_real_root(self):
         decoy = self.base / "decoy-artifact-root"
@@ -796,6 +812,7 @@ class RouteAutocloseTest(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         receipt = json.loads(again.stdout.strip().splitlines()[-1])
         self.assertTrue(receipt["route_file"].startswith(str(self.root)), receipt["route_file"])
+        self.assertEqual(len(list((self.root / ".runtime/worktree-preparation").glob("*.json"))), 1)
         self.assertEqual(sorted(decoy.rglob("*")), [])
 
     def test_review3_write_into_an_automatically_closed_cycle_is_allowed(self):

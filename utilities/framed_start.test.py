@@ -96,6 +96,17 @@ class StartBase(F.EndingBase):
         patch = mock.patch.object(R, "proposal_readiness", create=False, side_effect=self.readiness)
         patch.start()
         self.addCleanup(patch.stop)
+        real_prepare = R.prepare_isolated_worktree
+
+        def prepare_fixture(cwd, slug, **kwargs):
+            target, repository = str(Path(cwd).resolve()), str(R.ROOT.resolve())
+            if os.path.commonpath([target, repository]) == repository:
+                return {"state": "skipped", "reason": "fixture-cwd-is-not-a-git-allocation-target"}
+            return real_prepare(cwd, slug, **kwargs)
+
+        patch = mock.patch.object(R, "prepare_isolated_worktree", side_effect=prepare_fixture)
+        patch.start()
+        self.addCleanup(patch.stop)
         patch = mock.patch.object(W, "_recorded_interview", side_effect=lambda route, jobs: (self.interview, self.answers))
         patch.start()
         self.addCleanup(patch.stop)
@@ -663,12 +674,10 @@ class LegWorktreeTest(StartBase):
                                for child in ("claude", "codex", "opencode")],
                     "candidates": T.registered_headless()["candidates"]}
 
-        with mock.patch.object(R, "proposal_readiness", side_effect=readiness), \
-                mock.patch.object(R, "prepare_isolated_worktree") as prepare:
+        with mock.patch.object(R, "proposal_readiness", side_effect=readiness):
             result = self.settle()
             replay = self.settle()
         self.assertTrue(result["owner_started"], result)
-        prepare.assert_not_called()
         self.assertTrue(probed)
         self.assertEqual(set(probed), {str(worktree)})
         (leg_path,) = self.leg_routes()
@@ -725,8 +734,201 @@ class LegWorktreeTest(StartBase):
             (leg_path,) = self.leg_routes()
             leg = json.loads(leg_path.read_text(encoding="utf-8"))
             self.assertEqual(leg["cwd"], str(worktree))
-            prepare.assert_called_once_with(self.route["cwd"], self.route["slug"])
+            prepare.assert_called_once_with(
+                self.route["cwd"], self.route["slug"], artifact_root=self.route["artifact_root"],
+                preparation_key=R._route_plan_preparation_key(
+                    RP.read_route_plan(f"{self.record_path()}#0", self.root)), explicitly_approved=False)
             self.assertIn(str(worktree), probed)                 # the worktree was probed, not the frame's checkout
+
+
+class FirstLegPreparationFailureRetryTest(StartBase):
+    """Preparation failures cross the real framed decision/first-leg boundary and retry in place."""
+
+    def setUp(self):
+        self.source_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.source_tmp.cleanup)
+        base = Path(self.source_tmp.name)
+        self.primary = base / "repo"
+        self.origin = base / "origin.git"
+        self.writer = base / "writer"
+        git = lambda cwd, *args: subprocess.run(
+            ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+        git(base, "init", "-q", "--bare", "-b", "main", str(self.origin))
+        git(base, "init", "-q", "-b", "main", str(self.primary))
+        git(self.primary, "config", "user.name", "Fixture")
+        git(self.primary, "config", "user.email", "fixture@example.test")
+        (self.primary / "base.txt").write_text("base\n", encoding="utf-8")
+        git(self.primary, "add", "base.txt")
+        git(self.primary, "commit", "-qm", "base")
+        git(self.primary, "remote", "add", "origin", str(self.origin))
+        git(self.primary, "push", "-q", "-u", "origin", "main")
+        git(self.primary, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+            "commit", "--allow-empty", "-qm", "primary-only")
+        git(base, "clone", "-q", str(self.origin), str(self.writer))
+        git(self.writer, "config", "user.name", "Fixture")
+        git(self.writer, "config", "user.email", "fixture@example.test")
+        (self.writer / "remote-tip.txt").write_text("remote tip\n", encoding="utf-8")
+        git(self.writer, "add", "remote-tip.txt")
+        git(self.writer, "commit", "-qm", "remote tip")
+        git(self.writer, "push", "-q", "origin", "main")
+        self.remote_sha = git(self.writer, "rev-parse", "HEAD")
+        (self.primary / "base.txt").write_text("staged\n", encoding="utf-8")
+        git(self.primary, "add", "base.txt")
+        (self.primary / "base.txt").write_text("unstaged\n", encoding="utf-8")
+        (self.primary / "untracked.txt").write_text("preserve\n", encoding="utf-8")
+        self.probe_cwds = []
+        super().setUp()
+        self.set_briefs(CODE_STAGED, CODE_STAGED)
+        self.set_interview({"legs": [CODE_STAGED]})
+
+    def compose(self, **kwargs):
+        kwargs["cwd"] = self.primary
+        kwargs["dispatch_evidence"] = {"tuples": [
+            {**T.nested("claude", "codex"), "checked_worktree": str(self.primary.resolve())}]}
+        return super().compose(**kwargs)
+
+    def readiness(self, frame_route, jobs):
+        cwd = str(Path(frame_route["cwd"]).resolve())
+        self.probe_cwds.append(cwd)
+        row = {**T.nested("claude", "codex"), "checked_worktree": cwd}
+        return {"tuples": [row], "candidates": T.registered_headless()["candidates"]}
+
+    def primary_fingerprint(self):
+        git = lambda *args: subprocess.run(
+            ["git", "-C", str(self.primary), *args], check=True, capture_output=True, text=True).stdout.strip()
+        return (git("rev-parse", "HEAD"), git("branch", "--show-current"), git("write-tree"),
+                git("diff", "--binary"), git("diff", "--cached", "--binary"), git("status", "--porcelain"),
+                (self.primary / "base.txt").read_bytes(), (self.primary / "untracked.txt").read_bytes())
+
+    def fail_then_retry(self, failure):
+        before = self.primary_fingerprint()
+        initial_attempts, initial_routes = len(self.registry_rows()), len(self.leg_routes())
+        real = R._worktree_git
+        injected = {"done": False}
+
+        def fail_once(cwd, *args):
+            is_target = (failure == "fetch" and args[:1] == ("fetch",)
+                         or failure == "add" and args[:2] == ("worktree", "add"))
+            if is_target and not injected["done"]:
+                injected["done"] = True
+                return subprocess.CompletedProcess(["git", *args], 128, "", f"injected {failure} failure")
+            return real(cwd, *args)
+
+        with mock.patch.object(R, "_worktree_git", side_effect=fail_once):
+            failed = self.settle()
+        self.assertTrue(injected["done"])
+        self.assertEqual(failed["reason"], "first-leg-preparation-failed", failed)
+        self.assertEqual(self.primary_fingerprint(), before)
+        self.assertEqual((len(self.leg_routes()), len(self.registry_rows()), len(self.leg_calls)),
+                         (initial_routes, initial_attempts, 0))
+        # The frame's own earlier probe remains in the primary; the failed source start adds no
+        # first-leg probe there and no execution route can consume that evidence.
+        self.assertEqual(self.probe_cwds, [str(self.primary.resolve())])
+        decision = copy.deepcopy(self.record()["decision"])
+        self.assertNotIn("snapshot", self.record().get("first_leg", {}))
+
+        with mock.patch.object(W, "_recorded_interview", side_effect=AssertionError("same start re-interviewed")):
+            retried = self.settle()
+        self.assertTrue(retried["owner_started"], retried)
+        self.assertEqual(self.record()["decision"], decision)
+        self.assertEqual(self.primary_fingerprint(), before)
+        self.assertEqual((len(self.leg_routes()), len(self.registry_rows()), len(self.leg_calls)),
+                         (initial_routes + 1, initial_attempts + 1, 1))
+        route_path, = self.leg_routes()
+        route = json.loads(route_path.read_text(encoding="utf-8"))
+        expected = self.primary.parent / "repo-wt" / self.route["slug"]
+        self.assertEqual(route["cwd"], str(expected.resolve()))
+        self.assertEqual(self.probe_cwds, [str(self.primary.resolve()), route["cwd"]])
+        self.assertEqual({row["checked_worktree"] for row in route["dispatch_evidence"]["tuples"]},
+                         {route["cwd"]})
+        git = lambda *args: subprocess.run(
+            ["git", "-C", route["cwd"], *args], check=True, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(git("rev-parse", "HEAD"), self.remote_sha)
+        records = list((self.root / ".runtime" / "worktree-preparation").glob("*.json"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0].read_text(encoding="utf-8"))["state"], "ready")
+
+    def test_first_leg_fetch_failure_keeps_decision_and_same_start_retries_once(self):
+        self.fail_then_retry("fetch")
+
+    def test_first_leg_worktree_add_failure_keeps_decision_and_same_start_retries_once(self):
+        self.fail_then_retry("add")
+
+    def first_source_leg_and_projection(self):
+        self.set_briefs([DIRECT, CODE_STAGED], [DIRECT, CODE_STAGED])
+        self.set_interview({"legs": [DIRECT, CODE_STAGED]})
+        first_start = self.settle()
+        self.assertEqual(first_start["state"], "inline", first_start)
+        first_path, = self.leg_routes()
+        first = json.loads(first_path.read_text(encoding="utf-8"))
+        cycle = self.finish_leg(first, first_path)
+        projection = RP.project_next_leg(first, cycle)
+        self.assertIsNotNone(projection)
+        return first, first_path, projection
+
+    def test_automatic_source_successor_reuses_first_leg_allocation(self):
+        first, _, projection = self.first_source_leg_and_projection()
+        linked = first["cwd"]
+        argv = shlex.split(projection["compose_command"])
+        self.assertEqual(argv[argv.index("--cwd") + 1], linked)
+        real = R._worktree_git
+
+        def no_new_fetch(cwd, *args):
+            self.assertNotIn(args[:1], (("ls-remote",), ("fetch",)))
+            return real(cwd, *args)
+
+        from dispatch_notice_state import closed_outcome
+        with mock.patch.object(R, "_worktree_git", side_effect=no_new_fetch), \
+                mock.patch.object(W, "_recorded_interview", side_effect=AssertionError("successor re-interviewed")):
+            advanced = self.settle(closed=closed_outcome(Path(self.path), self.route))
+        self.assertEqual(advanced["plan_advanced"]["leg"], 1)
+        routes = [json.loads(path.read_text(encoding="utf-8")) for path in self.leg_routes()]
+        second, = [route for route in routes if route["route_plan"]["index"] == 1]
+        self.assertEqual(second["cwd"], linked)
+        self.assertEqual({row["checked_worktree"] for row in second["dispatch_evidence"]["tuples"]}, {linked})
+        records = list((self.root / ".runtime" / "worktree-preparation").glob("*.json"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0].read_text(encoding="utf-8"))["path"], linked)
+
+    def test_printed_source_next_leg_command_keeps_preparation_and_canonical_root(self):
+        first, _, projection = self.first_source_leg_and_projection()
+        argv = shlex.split(projection["compose_command"])
+        self.assertIn("--start", argv)
+        self.assertEqual(argv[argv.index("--cwd") + 1], first["cwd"])
+        cli_argv = ["capability-route.py", *argv[2:]]
+        probed = []
+
+        def readiness(cwd, jobs, parent_harness, children, **kwargs):
+            final = str(Path(cwd).resolve())
+            probed.append(final)
+            row = {**T.nested(parent_harness, "codex"), "checked_worktree": final}
+            return {"tuples": [row], "candidates": T.registered_headless()["candidates"]}
+
+        starts = []
+
+        def start(route, path, jobs):
+            starts.append((route, Path(path)))
+            return {"state": "running", "owner_attempt_id": "printed-next-leg", "owner_started": True,
+                    "launches": [{"receipt": "registered=1 started=1 child_spawned=1"}]}
+
+        real = R._worktree_git
+
+        def no_new_fetch(cwd, *args):
+            self.assertNotIn(args[:1], (("ls-remote",), ("fetch",)))
+            return real(cwd, *args)
+
+        with mock.patch.object(R, "_compose_readiness", side_effect=readiness), \
+                mock.patch.object(R, "_worktree_git", side_effect=no_new_fetch), \
+                mock.patch.object(W, "start_work", side_effect=start), mock.patch.object(sys, "argv", cli_argv):
+            self.assertEqual(R.main(), 0)
+        self.assertEqual(len(starts), 1)
+        route, _ = starts[0]
+        self.assertEqual(route["cwd"], first["cwd"])
+        self.assertEqual(route["artifact_root"], str(self.root.resolve()))
+        self.assertEqual(probed, [first["cwd"]])
+        records = list((self.root / ".runtime" / "worktree-preparation").glob("*.json"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0].read_text(encoding="utf-8"))["path"], first["cwd"])
 
 
 class OneLegFramedTest(StartBase):
@@ -1553,6 +1755,50 @@ BOUNDARIES = ("after-intent-save", "after-decision-write", "after-compiled-snaps
               "after-finalize")
 
 
+def fixture_git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def checkout_with_origin(base):
+    """A primary checkout with its own bare origin, whose default branch is one commit ahead.
+
+    A source-changing leg prepares its worktree from this origin in whichever process runs it,
+    never from the checkout running the tests. Returns `(primary, remote tip SHA)`."""
+    primary, origin, writer = base / "repo", base / "origin.git", base / "writer"
+    identity = ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test")
+    fixture_git(base, "init", "-q", "--bare", "-b", "main", str(origin))
+    fixture_git(base, "init", "-q", "-b", "main", str(primary))
+    (primary / "base.txt").write_text("base\n", encoding="utf-8")
+    fixture_git(primary, "add", "base.txt")
+    fixture_git(primary, *identity, "commit", "-qm", "base")
+    fixture_git(primary, "remote", "add", "origin", str(origin))
+    fixture_git(primary, "push", "-q", "origin", "main")
+    fixture_git(base, "clone", "-q", str(origin), str(writer))
+    (writer / "remote-tip.txt").write_text("remote tip\n", encoding="utf-8")
+    fixture_git(writer, "add", "remote-tip.txt")
+    fixture_git(writer, *identity, "commit", "-qm", "remote tip")
+    fixture_git(writer, "push", "-q", "origin", "main")
+    return primary, fixture_git(writer, "rev-parse", "HEAD")
+
+
+class OwnCheckout:
+    """Mixin: the frame sits in its own checkout with its own origin, so real worktree preparation,
+    in this process or a child one, happens there and never in the checkout running the tests."""
+
+    def setUp(self):
+        source = tempfile.TemporaryDirectory()
+        self.addCleanup(source.cleanup)
+        self.primary, self.remote_sha = checkout_with_origin(Path(source.name))
+        self.primary_head = fixture_git(self.primary, "rev-parse", "HEAD")
+        super().setUp()
+
+    def compose(self, **kwargs):
+        kwargs["cwd"] = self.primary
+        kwargs["dispatch_evidence"] = {"tuples": [
+            {**T.nested("claude", "codex"), "checked_worktree": str(self.primary.resolve())}]}
+        return super().compose(**kwargs)
+
+
 def driver(context_path, crash_at):
     """One `_framed_settle` in this process with the fixture's controls; `crash_at` kills it there."""
     context = json.loads(Path(context_path).read_text(encoding="utf-8"))
@@ -1595,12 +1841,26 @@ def driver(context_path, crash_at):
             os._exit(CRASH_EXIT)
         return subprocess.CompletedProcess(command, 0, "registered=1 started=1 child_spawned=1\n", "")
 
+    def readiness(probed_route, _jobs):
+        # Fixed evidence, bound to the exact cwd probed: the prepared worktree the leg seals.
+        checked = str(Path(probed_route["cwd"]).resolve())
+        return {"tuples": [{**T.nested("claude", "codex"), "checked_worktree": checked}],
+                "candidates": T.registered_headless()["candidates"]}
+
+    real_prepare = R.prepare_isolated_worktree
+
+    def prepare(cwd, slug, **kwargs):
+        target, repository = str(Path(cwd).resolve()), str(R.ROOT.resolve())
+        if os.path.commonpath([target, repository]) == repository:
+            raise AssertionError("the driver reached the checkout running the tests: " + target)
+        return real_prepare(cwd, slug, **kwargs)
+
     interview = json.loads(Path(context["interview"]).read_text(encoding="utf-8"))
     answers = json.loads(Path(context["answers"]).read_text(encoding="utf-8"))
-    evidence = {"tuples": [T.nested("claude", "codex")], "candidates": T.registered_headless()["candidates"]}
     with mock.patch("dispatch_contract.completion_marker_gate"), \
             mock.patch.object(W, "_route_cli", side_effect=in_process_cli), \
-            mock.patch.object(R, "proposal_readiness", return_value=evidence), \
+            mock.patch.object(R, "proposal_readiness", side_effect=readiness), \
+            mock.patch.object(R, "prepare_isolated_worktree", side_effect=prepare), \
             mock.patch.object(W, "_recorded_interview", return_value=(interview, answers)), \
             mock.patch.object(W, "default_parent_session_id", return_value="parent"), \
             mock.patch.object(W, "join_selected_attempts", return_value={"state": "timeout", "children": []}), \
@@ -1611,9 +1871,10 @@ def driver(context_path, crash_at):
     return 0
 
 
-class InterruptionTest(StartBase):
+class InterruptionTest(OwnCheckout, StartBase):
     """A164-6: stop at each boundary of the transaction, run the same start again in a fresh process,
-    and read the registry, route files, record and manifest back from disk."""
+    and read the registry, route files, record and manifest back from disk. The fresh process
+    prepares the source leg's worktree for real, in the frame's own checkout."""
 
     def setUp(self):
         super().setUp()
@@ -1650,6 +1911,16 @@ class InterruptionTest(StartBase):
         directory = self.jobs.parent / "completion" / self.route["route_id"]
         self.assertEqual([p.name for p in sorted(directory.glob("route-decision.[0-9]*.json"))],
                          ["route-decision.1.json"])             # the one marker of the terminal, never a second
+        # One allocation from origin's tip, sealed with evidence probed there; the primary is untouched.
+        leg = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertEqual(leg["cwd"], str((self.primary.parent / "repo-wt" / self.route["slug"]).resolve()))
+        self.assertEqual({row["checked_worktree"] for row in leg["dispatch_evidence"]["tuples"]}, {leg["cwd"]})
+        self.assertEqual(fixture_git(leg["cwd"], "rev-parse", "HEAD"), self.remote_sha)
+        records = [json.loads(p.read_text(encoding="utf-8"))
+                   for p in (self.root / ".runtime" / "worktree-preparation").glob("*.json")]
+        self.assertEqual([(r["state"], str(Path(r["path"]).resolve())) for r in records], [("ready", leg["cwd"])])
+        self.assertEqual((fixture_git(self.primary, "rev-parse", "HEAD"),
+                          fixture_git(self.primary, "status", "--porcelain")), (self.primary_head, ""))
 
     def test_an_uninterrupted_run_in_a_fresh_process_settles_once_and_a_repeat_changes_nothing(self):
         first = self.result_of(self.run_driver())
