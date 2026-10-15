@@ -22,6 +22,7 @@ import dispatch_contract as D
 import dispatch_replacement as R
 import work_start as W
 from dispatch_completion_join import CurrentDeliveryState
+os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 
 LIMITED = "resets 2099-01-01 00:00 (UTC)"
 FREE = "resets 2020-01-01 00:00 (UTC)"

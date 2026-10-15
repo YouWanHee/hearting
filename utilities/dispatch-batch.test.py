@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import tempfile
 import time
 import unittest
+os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 from unittest import mock
 
 

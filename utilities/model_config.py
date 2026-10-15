@@ -102,6 +102,7 @@ OPTIONAL_SCALAR_KEYS = frozenset({CONTEXT_WINDOW_KEY})
 # Claude copy without it is replaced by the shipped file, which keeps the
 # shipped restriction rather than lifting it (combined review m1).
 OPTIONAL_POLICY_KEYS: dict[str, frozenset[str]] = {
+    "claude": frozenset({"CFG_CAPACITY_PROBE_MODELS"}),
     "codex": frozenset({"CFG_MAIN_SESSION_ONLY_MODELS"}),
 }
 # Tiers a user copy may reference without declaring: the exception tier's

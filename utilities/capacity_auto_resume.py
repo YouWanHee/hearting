@@ -18,6 +18,12 @@ paused the same way: only the route's parent launches its continuation, so the
 parent's own carrier arms a record when it hands that notice over, and the
 record runs `start` at once.
 
+A Claude usage-limit pause does not always last until its reset: another account
+may be signed in, or the quota may come back earlier. Every `RECHECK_SECONDS` of
+the wait asks the usage gate as a launch decision would (`usage_states(...,
+recheck=True)`), and resumes at once when the gate reports Claude `ok`. An early
+resume frees the record's name, so a `start` that pauses again arms a new one.
+
 Bounded on purpose: one resume per record, a sleep of at most `MAX_SLEEP_SECONDS`,
 and at most `MAX_CHAIN` automatic resumes in a row for one route (a resume that
 pauses again arms the next one). A pause without a known reset time arms
@@ -41,6 +47,8 @@ MAX_CHAIN = 3
 SLACK_SECONDS = 60
 POLL_SECONDS = 60
 LATER_SECONDS = 60
+# The usage gate's own probe interval (dispatch_capacity_evidence.PROBE_INTERVAL).
+RECHECK_SECONDS = 600
 LATER_REASONS = ("owner-launch-not-admitted", "owner-launch-not-started")
 ANSWER_REASON = "answer-awaiting-parent"
 CHAIN_ENV = "AGENT_CAPACITY_RESUME_CHAIN"
@@ -88,6 +96,8 @@ def arm(result: dict, route_file, jobs, *, environ=None, spawn=subprocess.Popen,
     record = {"schema": "capacity-resume-v1", "route_id": result.get("route_id"),
               "route_file": str(Path(route_file).resolve()), "jobs": str(Path(jobs).resolve()),
               "retry_at": retry_at, "chain": chain + 1, "state": "armed", "cause": cause,
+              "harness": result.get("harness") or "", "source_attempt_id": result.get("source_attempt_id") or "",
+              "usage_state": result.get("usage_state") or "",
               "armed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,21 +121,57 @@ def _write(path: Path, record: dict) -> None:
     os.replace(tmp, path)
 
 
-def run(path: Path, *, sleep=time.sleep, now=time.time, call=subprocess.run) -> int:
+def _cleared(record: dict) -> bool:
+    """True once the usage gate, asked as a launch decision, reports Claude `ok` for a paused
+    Claude usage limit. Other harnesses, and the allocation usage gate (not a usage limit),
+    keep waiting for their reset."""
+    if (record.get("cause") != "capacity" or record.get("harness") != "claude"
+            or record.get("usage_state") == "allocation-usage-gate"):
+        return False
+    try:
+        from dispatch_capacity_evidence import attempt_model, usage_states
+        model = attempt_model(record["jobs"], record.get("source_attempt_id") or "")
+        if not model:
+            # A model-free reader omits family/exact-model holds. Older or
+            # incomplete records keep their reset deadline instead of treating
+            # that incomplete view as proof the paused worker can run.
+            return False
+        states = usage_states(record["jobs"], models={"claude": model}, recheck=True)
+        return states.get("claude") == "ok"
+    except Exception:  # noqa: BLE001 -- a failed check keeps the wait for retry_at
+        return False
+
+
+def run(path: Path, *, sleep=time.sleep, now=time.time, call=subprocess.run, cleared=_cleared) -> int:
     record = json.loads(path.read_text(encoding="utf-8"))
     epoch = _epoch(record.get("retry_at"))
     if record.get("state") != "armed" or epoch is None:
         return 0
     slack = 0 if record.get("cause") == "answer" else SLACK_SECONDS
     deadline = now() + min(MAX_SLEEP_SECONDS, max(0.0, epoch + slack - now()))
+    recheck_at = now() + RECHECK_SECONDS
+    early = False
     while now() < deadline:
         # Short steps: a record removed (or disarmed) meanwhile ends the wait.
         sleep(min(POLL_SECONDS, max(0.0, deadline - now())))
         if not path.is_file():
             return 0
+        if deadline > now() >= recheck_at:
+            recheck_at = now() + RECHECK_SECONDS
+            if cleared(record):
+                early = True
+                break
     record = json.loads(path.read_text(encoding="utf-8"))
     if record.get("state") != "armed":
         return 0
+    if early:
+        # A start that pauses again before retry_at would name this same record; free the name.
+        moved = path.with_name(f"{path.stem}.early-{int(now())}.json")
+        try:
+            os.replace(path, moved)
+            path = moved
+        except OSError:
+            pass
     # The installed release at resume time, not the one that armed this wait hours
     # earlier (the printed-command rule, `parent_next_directive.entrypoint`).
     from parent_next_directive import entrypoint
@@ -139,7 +185,7 @@ def run(path: Path, *, sleep=time.sleep, now=time.time, call=subprocess.run) -> 
         receipt = {}
     record.update(state="resumed", resumed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   exit_code=done.returncode, result_state=receipt.get("state"),
-                  owner_attempt_id=receipt.get("owner_attempt_id"))
+                  owner_attempt_id=receipt.get("owner_attempt_id"), **({"early": True} if early else {}))
     _write(path, record)
     _notify(record, receipt)
     return 0
@@ -160,7 +206,8 @@ def _notify(record: dict, receipt: dict) -> None:
         failed = not again and (record.get("exit_code") not in (None, 0) or not receipt.get("state"))
         why = {"launch-not-started": "started again after a launch that did not start",
                "answer": "continued with the answer another session sent"}.get(
-                   record.get("cause"), "resumed after the usage limit reset")
+                   record.get("cause"), "resumed before its recorded reset because the usage gate cleared it"
+                   if record.get("early") else "resumed after the usage limit reset")
         text = (f"route {record['route_id']} {why}: state {state}"
                 + (f", owner {receipt['owner_attempt_id']}" if receipt.get("owner_attempt_id") else "")
                 + (f"; paused again until {receipt.get('retry_at', 'an unknown time')}" if again else "")

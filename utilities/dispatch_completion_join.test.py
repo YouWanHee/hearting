@@ -10,6 +10,7 @@ import io
 import inspect
 import json
 import os
+os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 import shlex
 from pathlib import Path
 import subprocess

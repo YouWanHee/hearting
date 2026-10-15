@@ -41,6 +41,13 @@ class ArmTest(unittest.TestCase):
         record = json.loads(Path(armed["record"]).read_text())
         self.assertEqual((record["state"], record["route_file"]), ("armed", str(self.route.resolve())))
 
+    def test_the_record_names_the_paused_harness_attempt_and_usage_state(self):
+        armed = self.arm({**PAUSE, "harness": "claude", "source_attempt_id": "att-dead",
+                          "usage_state": "allocation-usage-gate"})
+        record = json.loads(Path(armed["record"]).read_text())
+        self.assertEqual((record["harness"], record["source_attempt_id"], record["usage_state"]),
+                         ("claude", "att-dead", "allocation-usage-gate"))
+
     def test_what_arms_nothing(self):
         for result in ({**PAUSE, "retry_at": None}, {**PAUSE, "reason": "launch-capacity-wait"},
                        {**PAUSE, "state": "running"}):
@@ -124,6 +131,86 @@ class RunTest(unittest.TestCase):
         self.assertEqual(calls[0][2:5], ["start", "--route", "/r/route.json"])
         self.assertEqual(json.loads(self.path.read_text())["owner_attempt_id"], "att-2")
         notify.assert_called_once()
+
+    def claude_pause(self, **extra):
+        record = json.loads(self.path.read_text())
+        self.path.write_text(json.dumps({**record, "cause": "capacity", "harness": "claude",
+                                         "source_attempt_id": "att-dead", "usage_state": "2026-10-07T12:00:00Z",
+                                         **extra}))
+
+    def test_a_claude_pause_resumes_once_the_recheck_clears_it_and_can_pause_again(self):
+        self.claude_pause()
+        self.clock[0] = RETRY_EPOCH - 7200
+        checks, calls, nested = [], [], []
+        def cleared(rec):
+            checks.append(self.clock[0])
+            return len(checks) == 2
+        def call(argv, **kw):
+            calls.append(argv)
+            # The resumed start pauses again with the same reset: it must arm a fresh record.
+            nested.append(C.arm({**PAUSE, "harness": "claude"}, "/r/route.json", Path(self._tmp.name) / "jobs.log",
+                                environ={}, now=lambda: self.clock[0], spawn=lambda argv, **kw: None))
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"state": "waiting-capacity",
+                                                                     "retry_at": PAUSE["retry_at"]}) + "\n")
+        record_path = C.record_path(Path(self._tmp.name) / "jobs.log", PAUSE["route_id"], PAUSE["retry_at"])
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.replace(record_path)
+        self.path = record_path
+        with mock.patch.object(C, "_notify") as notify:
+            C.run(self.path, sleep=self.sleep, now=lambda: self.clock[0], call=call, cleared=cleared)
+        self.assertEqual(checks[1] - checks[0], C.RECHECK_SECONDS)
+        self.assertLess(self.clock[0], RETRY_EPOCH)
+        self.assertEqual(calls[0][2:5], ["start", "--route", "/r/route.json"])
+        self.assertEqual(nested[0]["state"], "armed")
+        [moved] = self.path.parent.glob(self.path.stem + ".early-*.json")
+        early = json.loads(moved.read_text())
+        self.assertEqual((early["state"], early["early"]), ("resumed", True))
+        self.assertEqual(json.loads(self.path.read_text())["state"], "armed")  # the new pause's own record
+        notify.assert_called_once()
+
+    def test_a_pause_the_recheck_never_clears_waits_for_its_reset(self):
+        self.claude_pause()
+        self.clock[0] = RETRY_EPOCH - 3000
+        checks = []
+        done = SimpleNamespace(returncode=0, stdout="{}\n")
+        with mock.patch.object(C, "_notify"):
+            C.run(self.path, sleep=self.sleep, now=lambda: self.clock[0], call=lambda argv, **kw: done,
+                  cleared=lambda rec: checks.append(self.clock[0]) and False)
+        self.assertEqual(len(checks), 3000 // C.RECHECK_SECONDS)
+        self.assertGreaterEqual(self.clock[0], RETRY_EPOCH + C.SLACK_SECONDS)
+        self.assertNotIn("early", json.loads(self.path.read_text()))
+
+    def test_only_a_claude_usage_limit_is_rechecked_and_only_ok_clears_it(self):
+        import dispatch_capacity_evidence as Q
+        record = {"cause": "capacity", "harness": "claude", "jobs": "/j/jobs.log", "source_attempt_id": "att-dead",
+                  "usage_state": "2026-10-07T12:00:00Z"}
+        with mock.patch.object(Q, "attempt_model", return_value="claude-opus-4-6") as model, \
+             mock.patch.object(Q, "usage_states", return_value={"claude": "ok"}) as states:
+            self.assertTrue(C._cleared(record))
+        model.assert_called_once_with("/j/jobs.log", "att-dead")
+        states.assert_called_once_with("/j/jobs.log", models={"claude": "claude-opus-4-6"}, recheck=True)
+        for state in ("limited(2026-10-07T12:00:00Z)", "unknown"):
+            with mock.patch.object(Q, "attempt_model", return_value="claude-opus-4-6"), \
+                 mock.patch.object(Q, "usage_states", return_value={"claude": state}):
+                self.assertFalse(C._cleared(record))
+        with mock.patch.object(Q, "usage_states", side_effect=AssertionError("asked")):
+            for other in ({**record, "cause": "answer"}, {**record, "harness": "codex"},
+                          {**record, "usage_state": "allocation-usage-gate"}):
+                self.assertFalse(C._cleared(other))
+
+    def test_an_unresolved_source_model_waits_for_the_original_reset(self):
+        import dispatch_capacity_evidence as Q
+        self.claude_pause(source_attempt_id="")
+        self.clock[0] = RETRY_EPOCH - 1800
+        starts = []
+        with mock.patch.object(Q, "attempt_model", return_value=None), \
+             mock.patch.object(Q, "usage_states", return_value={"claude": "ok"}) as states, \
+             mock.patch.object(C, "_notify"):
+            C.run(self.path, sleep=self.sleep, now=lambda: self.clock[0], cleared=C._cleared,
+                  call=lambda *a, **k: starts.append(self.clock[0]) or SimpleNamespace(returncode=0, stdout="{}"))
+        states.assert_not_called()
+        self.assertEqual(starts, [RETRY_EPOCH + C.SLACK_SECONDS])
+        self.assertNotIn("early", json.loads(self.path.read_text()))
 
     def test_a_removed_record_ends_the_wait(self):
         def sleep(seconds):

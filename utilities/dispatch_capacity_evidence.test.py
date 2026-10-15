@@ -670,5 +670,480 @@ class EvidenceCacheTests(unittest.TestCase):
         reads.assert_not_called()
 
 
+FAKE_CLAUDE = r"""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["FAKE_PROBE_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\n")
+mode, reset = os.environ.get("FAKE_PROBE_MODE", "allowed"), int(os.environ.get("FAKE_PROBE_RESET", "0"))
+window = os.environ.get("FAKE_PROBE_WINDOW", "five_hour")
+emit = lambda row: print(json.dumps(row))
+emit({"type": "system", "subtype": "init"})
+if mode == "hang":
+    import time
+    time.sleep(5)
+if mode.startswith("event-"):
+    emit({"type": "rate_limit_event", "rate_limit_info": {
+        "status": mode.removeprefix("event-"), "rateLimitType": window,
+        "isUsingOverage": mode == "event-overage"}})
+if mode in ("allowed", "rejected", "overloaded"):
+    emit({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "allowed" if mode == "overloaded" else mode, "rateLimitType": window, "resetsAt": reset,
+        "isUsingOverage": False}})
+if mode == "overloaded":
+    emit({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429, "result": "Overloaded"})
+if mode == "allowed":
+    emit({"type": "result", "subtype": "success", "is_error": False, "api_error_status": None, "result": "OK"})
+elif mode == "rejected":
+    emit({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429, "result": "limit"})
+elif mode == "auth":
+    emit({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 401, "result": "Invalid"})
+"""
+
+
+class ClaudeLimitRecheckTests(unittest.TestCase):
+    """A recorded Claude limit stops holding once the login a worker would use can run."""
+
+    OBSERVED = int(datetime(2026, 9, 29, 17, 0, tzinfo=timezone.utc).timestamp())  # 02:00 in Asia/Seoul
+    LIMIT_RESET = OBSERVED + 3600  # "resets 3am (Asia/Seoul)"
+    PROBE_RESET = OBSERVED + 7200
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        (self.home / ".claude").mkdir()
+        self.credentials = self.home / ".claude" / ".credentials.json"
+        self.credentials.write_text("{}")
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": "account-b", "organizationUuid": "org-a"}}))
+        self.fake = self.home / "fake-claude"
+        self.fake.write_text(FAKE_CLAUDE)
+        self.fake.chmod(0o755)
+        self.probe_log = self.home / "probe.log"
+        self.env = {"HOME": str(self.home), "PATH": os.environ["PATH"], "FAKE_PROBE_LOG": str(self.probe_log),
+                    "FAKE_PROBE_MODE": "allowed", "FAKE_PROBE_RESET": str(self.PROBE_RESET),
+                    "HEARTING_CAPACITY_PROBE_CLI": str(self.fake)}
+        self.jobs = self.home / "jobs.log"
+        self.jobs.write_text("")
+        # The 2026-10-13 shape: an unscoped legacy marker, recorded before another account signed in.
+        self.marker(self.OBSERVED, "att-dead")
+
+    def marker(self, observed, attempt, reset_text="resets 3am (Asia/Seoul)"):
+        log = self.home / f"job.{attempt}.claude.jsonl"
+        log.write_text(json.dumps({"type": "result", "is_error": True, "api_error_status": 429, "session_id": "s",
+                                   "result": f"You've hit your limit · {reset_text}"}) + "\n")
+        self.row(observed, {"attempt_id": attempt, "harness": "claude", "note": "dead-capacity",
+                            "failure_class": "capacity", "log_file": str(log), "model": "claude-opus-4-6",
+                            "worker_type": "owner"})
+
+    def native(self, observed, attempt, window, reset, model="claude-opus-4-6"):
+        log = self.home / f"job.{attempt}.claude.jsonl"
+        info = {"status": "rejected", "rateLimitType": window, "resetsAt": reset, "isUsingOverage": False}
+        if window == "seven_day_overage_included":
+            info.update(overageStatus="rejected", unifiedWindows={window: {"utilization": 1}})
+        log.write_text("".join(json.dumps(row) + "\n" for row in (
+            {"type": "rate_limit_event", "session_id": attempt, "rate_limit_info": info},
+            {"type": "result", "session_id": attempt, "is_error": True, "subtype": "success",
+             "api_error_status": 429})))
+        self.row(observed, {"attempt_id": attempt, "harness": "claude", "note": "dead-launch-exit-1",
+                            "log_file": str(log), "model": model, **Q.launch_scope("claude", self.env)})
+
+    def row(self, observed, metadata):
+        stamp = datetime.fromtimestamp(observed, timezone.utc).isoformat().replace("+00:00", "Z")
+        with self.jobs.open("a") as handle:
+            handle.write(f"{stamp}\tdone\t/repo\t/work\tjob\t"
+                         + ",".join(f"{k}={v}" for k, v in metadata.items()) + "\n")
+
+    def probes(self):
+        return [json.loads(line) for line in self.probe_log.read_text().splitlines()] if self.probe_log.exists() else []
+
+    def state(self, now, **kwargs):
+        return Q.usage_states(self.jobs, now=now, env=self.env, **kwargs)["claude"]
+
+    def test_a_launch_decision_lifts_a_limit_the_current_login_no_longer_has(self):
+        now = self.OBSERVED + 600
+        self.assertTrue(self.state(now).startswith("limited("))
+        self.assertEqual(self.probes(), [])  # a reader that is not a launch decision never probes
+        self.assertEqual(self.state(now, recheck=True), "ok")
+        self.assertEqual(len(self.probes()), 1)
+        self.assertEqual(self.probes()[0][:len(Q.PROBE_ARGS)], list(Q.PROBE_ARGS))
+        # An all-model window is answered by Haiku, regardless of the worker profile.
+        self.assertEqual(self.probes()[0][-2:], ["--model", "haiku"])
+        self.assertEqual(self.state(now + 60), "ok")  # every reader honors the stored answer
+        self.assertIsNone(Q.harness_hold(self.jobs, "claude", now=now + 60, env=self.env, recheck=True))
+        self.assertEqual(len(self.probes()), 1)  # an answer that lifts the limit needs no new probe
+
+    def test_an_answer_for_any_model_lifts_all_model_evidence_for_every_reader(self):
+        now = self.OBSERVED + 600
+        opus = {"claude": "claude-opus-4-6"}
+        self.assertEqual(Q.usage_states(self.jobs, models=opus, now=now, env=self.env, recheck=True)["claude"], "ok")
+        self.assertEqual(self.probes()[0][-2:], ["--model", "haiku"])  # not the Opus the launch asked for
+        # A reader that asks about no model (gauges, Fleet, usage-check without a profile) sees the lift too.
+        self.assertEqual(self.state(now + 60), "ok")
+        self.native(now + 30, "att-five-hour", "five_hour", self.OBSERVED + 4 * 3600)
+        self.assertIn("claude", Q.active_limits(self.jobs, now=now + 60, env=self.env))
+        self.jobs.write_text("")
+        self.native(self.OBSERVED, "att-five-hour", "five_hour", self.OBSERVED + 4 * 3600)
+        self.assertEqual(Q.active_limits(self.jobs, now=now + 60, env=self.env), {})
+
+    def test_a_limit_observed_after_a_passing_probe_is_not_hidden_behind_an_older_window(self):
+        self.jobs.write_text("")
+        self.native(self.OBSERVED, "att-week", "seven_day", self.OBSERVED + 5 * 86400)
+        now = self.OBSERVED + 600
+        self.assertEqual(Q.active_limits(self.jobs, now=now, env=self.env, recheck=True), {})
+        # A five-hour death after the probe; the older weekly entry still has the later reset.
+        self.native(self.OBSERVED + 2400, "att-five-hour", "five_hour", self.OBSERVED + 5 * 3600)
+        for later in (self.OBSERVED + 2460, self.OBSERVED + 2 * 3600):
+            self.assertIn("claude", Q.active_limits(self.jobs, now=later, env=self.env))
+            self.assertTrue(self.state(later).startswith("limited("))
+
+    def test_a_rejected_probe_holds_claude_until_its_own_reset_and_no_longer(self):
+        self.env["FAKE_PROBE_MODE"] = "rejected"
+        now = self.OBSERVED + 600
+        self.assertEqual(self.state(now, recheck=True), f"limited({Q._iso(self.PROBE_RESET)})")
+        self.assertEqual(len(self.probes()), 1)
+        # Past the recorded reset the probe's later reset still holds Claude ...
+        hold = Q.harness_hold(self.jobs, "claude", now=self.LIMIT_RESET + 60, env=self.env)
+        self.assertEqual(hold["until_epoch"], self.PROBE_RESET)
+        self.assertIn("claude", Q.active_limits(self.jobs, now=self.LIMIT_RESET + 60, env=self.env))
+        # ... and once that passes it holds nothing, with no reset in the past.
+        self.assertEqual(self.state(self.PROBE_RESET + 1), "ok")
+        self.assertEqual(Q.active_limits(self.jobs, now=self.PROBE_RESET + 1, env=self.env), {})
+
+    def test_a_rejection_on_a_shorter_window_does_not_end_a_longer_one(self):
+        self.jobs.write_text("")
+        week_reset = self.OBSERVED + 5 * 86400
+        self.native(self.OBSERVED, "att-week", "seven_day", week_reset)
+        self.env.update(FAKE_PROBE_MODE="rejected", FAKE_PROBE_WINDOW="five_hour",
+                        FAKE_PROBE_RESET=str(self.OBSERVED + 3600))
+        now = self.OBSERVED + 600
+        self.assertEqual(Q.active_limits(self.jobs, now=now, env=self.env, recheck=True)["claude"]["reset_epoch"],
+                         week_reset)
+        self.assertIn("claude", Q.active_limits(self.jobs, now=self.OBSERVED + 3700, env=self.env))
+
+    def test_a_rejection_whose_reset_passed_lifts_an_older_limit(self):
+        self.env.update(FAKE_PROBE_MODE="rejected", FAKE_PROBE_RESET=str(self.OBSERVED + 900))
+        now = self.OBSERVED + 600
+        self.assertEqual(self.state(now, recheck=True), f"limited({Q._iso(self.OBSERVED + 900)})")
+        self.assertEqual(self.state(self.OBSERVED + 960), "ok")  # recorded reset (3am) not reached yet
+
+    def test_one_probe_per_interval_while_claude_is_held(self):
+        self.env["FAKE_PROBE_MODE"] = "rejected"
+        now = self.OBSERVED + 600
+        self.state(now, recheck=True)
+        self.state(now + Q.PROBE_INTERVAL - 1, recheck=True)
+        self.assertEqual(len(self.probes()), 1)
+        self.env["FAKE_PROBE_MODE"] = "allowed"
+        self.assertEqual(self.state(now + Q.PROBE_INTERVAL, recheck=True), "ok")
+        self.assertEqual(len(self.probes()), 2)
+
+    def test_a_probe_that_says_nothing_about_quota_changes_nothing_and_waits_the_interval(self):
+        now = self.OBSERVED + 600
+        before = self.state(now)
+        later = now + Q.PROBE_INTERVAL
+        for step, mode in enumerate(("auth", "silent", "missing")):
+            self.env["FAKE_PROBE_MODE"] = mode
+            self.env["HEARTING_CAPACITY_PROBE_CLI"] = (
+                str(self.home / "missing-cli") if mode == "missing" else str(self.fake))
+            at = now + step * Q.PROBE_INTERVAL
+            self.assertEqual(self.state(at, recheck=True), before)
+            self.assertEqual(self.state(at + 60, recheck=True), before)  # not one minute later
+            self.assertEqual(self.state(at + Q.PROBE_INTERVAL - 1, recheck=True), before)
+            self.assertEqual(len(self.probes()), min(step + 1, 2))  # the missing CLI never starts
+        self.assertEqual(len(self.probes()), 2)
+        self.env.update(HEARTING_CAPACITY_PROBE_CLI=str(self.fake), FAKE_PROBE_MODE="allowed")
+        self.assertEqual(self.state(later + 2 * Q.PROBE_INTERVAL, recheck=True), "ok")
+        self.assertEqual(len(self.probes()), 3)
+
+    def test_a_damaged_stored_answer_is_ignored(self):
+        now = self.OBSERVED + 600
+        before = self.state(now)
+        scope = Q._login_scope(self.env)
+        model = "haiku"
+        for damaged in ({"at": now, "ok": False, "reset_epoch": "soon"}, {"at": now, "ok": False, "reset_epoch": 1e300},
+                        {"at": now, "ok": False, "reset_epoch": now + 99999, "ok_at": "then"},
+                        {"at": "now", "ok": True}, {"at": now, "ok": "yes"}, "not a dict"):
+            with self.subTest(damaged=damaged):
+                Q._probe_path(self.jobs).write_text(json.dumps(
+                    {"schema": Q.PROBE_SCHEMA, "probes": {f"{scope}:{model}": damaged}}))
+                self.assertEqual(self.state(now), before)
+                self.assertTrue(Q.harness_hold(self.jobs, "claude", now=now, env=self.env)["label"])
+        Q._probe_path(self.jobs).write_text("{not json")
+        self.assertEqual(self.state(now), before)
+
+    def test_the_cli_authenticates_so_a_missing_credential_file_does_not_stop_the_recheck(self):
+        self.credentials.unlink()
+        self.assertEqual(self.state(self.OBSERVED + 600, recheck=True), "ok")
+        self.assertEqual(len(self.probes()), 1)
+
+    def test_an_unresolved_login_is_rechecked_as_unscoped_and_never_borrows_an_account(self):
+        now = self.OBSERVED + 600
+        (self.home / ".claude.json").write_text("{}")  # no account to name
+        self.assertIsNone(Q.launch_scope("claude", self.env).get("quota_scope"))
+        self.assertTrue(self.state(now).startswith("limited("))
+        self.assertEqual(self.state(now, recheck=True), "ok")  # the unscoped legacy marker is lifted
+        self.assertEqual(len(self.probes()), 1)
+        self.assertEqual(self.state(now + 60), "ok")
+        # The answer belongs to "unscoped": once an account resolves it is not that account's.
+        scoped = json.loads(Q._probe_path(self.jobs).read_text())["probes"]
+        self.assertEqual(list(scoped), [f"{Q.UNSCOPED}:haiku"])
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": "account-b", "organizationUuid": "org-a"}}))
+        self.assertTrue(self.state(now + 120).startswith("limited("))
+        # A limit bound to an account is neither read away nor borrowed once that account is not resolved.
+        self.jobs.write_text("")
+        self.native(now - 60, "att-scoped", "five_hour", self.OBSERVED + 4 * 3600)
+        self.env["FAKE_PROBE_MODE"] = "rejected"
+        self.assertIn("claude", Q.active_limits(self.jobs, now=now + 120, env=self.env, recheck=True))
+        probed = len(self.probes())
+        (self.home / ".claude.json").write_text("{}")
+        self.assertEqual(Q.active_limits(self.jobs, now=now + 700, env=self.env, recheck=True), {})
+        self.assertEqual(len(self.probes()), probed)  # nothing unscoped holds: no probe either
+
+    def test_no_probe_for_api_or_provider_configuration(self):
+        self.env["ANTHROPIC_API_KEY"] = "key-value"
+        now = self.OBSERVED + 600
+        self.assertTrue(self.state(now, recheck=True).startswith("limited("))
+        self.assertEqual(self.probes(), [])
+
+    def test_a_weekly_hold_lifted_by_a_probe_is_not_revived_by_a_later_five_hour_rejection(self):
+        self.jobs.write_text("")
+        week_reset, five_reset = self.OBSERVED + 5 * 86400, self.OBSERVED + 3 * 3600
+        self.native(self.OBSERVED, "att-week", "seven_day", week_reset)
+        now = self.OBSERVED + 600
+        self.assertEqual(Q.active_limits(self.jobs, now=now, env=self.env, recheck=True), {})  # success lifts the week
+        self.native(now + 300, "att-five-hour", "five_hour", five_reset)
+        later = now + Q.PROBE_INTERVAL
+        self.env.update(FAKE_PROBE_MODE="rejected", FAKE_PROBE_WINDOW="five_hour", FAKE_PROBE_RESET=str(five_reset))
+        for reader in (lambda: Q.active_limits(self.jobs, now=later, env=self.env, recheck=True)["claude"]["reset_epoch"],
+                       lambda: Q.active_limits(self.jobs, now=later + 1, env=self.env)["claude"]["reset_epoch"],
+                       lambda: Q.harness_hold(self.jobs, "claude", now=later + 1, env=self.env)["until_epoch"]):
+            self.assertEqual(reader(), five_reset)  # never the week the first probe lifted
+        stored = json.loads(Q._probe_path(self.jobs).read_text())["probes"]
+        self.assertIn(now, [a["at"] for a in stored[f"{Q._login_scope(self.env)}:haiku"]["answers"] if a["ok"]])  # the answer kept beside the rejection
+        self.assertEqual([argv[-1] for argv in self.probes()], ["haiku", "haiku"])
+        # The rejection's reset passes: nothing holds, and the old week does not come back.
+        self.assertEqual(self.state(five_reset + 1), "ok")
+        self.assertEqual(Q.active_limits(self.jobs, now=five_reset + 1, env=self.env), {})
+
+    def test_every_window_that_holds_is_answered_in_turn(self):
+        self.jobs.write_text("")
+        self.native(self.OBSERVED, "att-week", "seven_day", self.OBSERVED + 5 * 86400)
+        self.native(self.OBSERVED, "att-opus-week", "seven_day_opus", self.OBSERVED + 86400)
+        opus, now = {"claude": "claude-opus-4-6"}, self.OBSERVED + 600
+        self.assertIn("claude", Q.active_limits(self.jobs, models=opus, now=now, env=self.env, recheck=True))
+        self.assertEqual(self.probes()[-1][-2:], ["--model", "haiku"])  # the all-model window first
+        self.assertEqual(Q.active_limits(self.jobs, models=opus, now=now + 1, env=self.env, recheck=True), {})
+        self.assertEqual([argv[-1] for argv in self.probes()], ["haiku", "opus"])
+
+    def test_a_limit_observed_after_a_passing_probe_holds_again(self):
+        now = self.OBSERVED + 600
+        self.assertEqual(self.state(now, recheck=True), "ok")
+        self.marker(now + 60, "att-dead-2")
+        self.assertTrue(self.state(now + 120, recheck=True).startswith("limited("))
+        self.assertEqual(len(self.probes()), 1)  # still inside the interval
+        self.assertEqual(self.state(now + Q.PROBE_INTERVAL, recheck=True), "ok")
+        self.assertEqual(len(self.probes()), 2)
+
+    def test_answers_belong_to_the_login_that_got_them(self):
+        now = self.OBSERVED + 600
+        self.assertEqual(self.state(now, recheck=True), "ok")
+        (self.home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": "account-c", "organizationUuid": "org-a"}}))
+        self.assertTrue(self.state(now + 60).startswith("limited("))
+        self.env["FAKE_PROBE_MODE"] = "rejected"
+        self.assertEqual(self.state(now + 60, recheck=True), f"limited({Q._iso(self.PROBE_RESET)})")
+        self.assertEqual(len(self.probes()), 2)
+
+    def test_another_harness_decision_never_waits_on_a_claude_probe(self):
+        now = self.OBSERVED + 600
+        self.assertIsNone(Q.harness_hold(self.jobs, "codex", now=now, env=self.env, recheck=True))
+        self.assertEqual(self.probes(), [])
+
+    def test_a_probe_already_running_elsewhere_is_not_repeated(self):
+        import fcntl
+        lock = os.open(f"{Q._probe_path(self.jobs)}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.assertTrue(self.state(self.OBSERVED + 600, recheck=True).startswith("limited("))
+        self.assertEqual(self.probes(), [])
+
+    def test_a_model_scoped_limit_is_lifted_only_by_that_model(self):
+        self.jobs.write_text("")
+        self.native(self.OBSERVED, "att-opus-week", "seven_day_opus", self.OBSERVED + 86400)
+        now, opus, sonnet = self.OBSERVED + 600, {"claude": "claude-opus-4-6"}, {"claude": "claude-sonnet-4-6"}
+        self.assertEqual(Q.active_limits(self.jobs, models=sonnet, now=now, env=self.env, recheck=True), {})
+        self.assertEqual(self.probes(), [])  # the Sonnet family was never limited
+        self.assertIn("claude", Q.active_limits(self.jobs, models=opus, now=now, env=self.env))
+        self.assertNotIn("claude", Q.active_limits(self.jobs, models=opus, now=now, env=self.env, recheck=True))
+        self.assertEqual(self.probes()[0][-2:], ["--model", "opus"])
+
+    def test_a_rejection_on_one_family_does_not_hold_another(self):
+        self.env.update(FAKE_PROBE_MODE="rejected", FAKE_PROBE_WINDOW="seven_day_opus")
+        now, opus = self.OBSERVED + 600, {"claude": "claude-opus-4-6"}
+        self.assertTrue(Q.usage_states(self.jobs, models=opus, now=now, env=self.env,
+                                       recheck=True)["claude"].startswith("limited("))
+        sonnet = {"claude": "claude-sonnet-4-6"}
+        later = self.LIMIT_RESET + 60  # the legacy marker no longer holds anyone
+        self.assertEqual(Q.usage_states(self.jobs, models=sonnet, now=later, env=self.env)["claude"], "ok")
+        self.assertTrue(Q.usage_states(self.jobs, models=opus, now=later, env=self.env)["claude"].startswith("limited("))
+
+    def test_an_answer_on_one_family_does_not_open_another_familys_window(self):
+        self.jobs.write_text("")
+        opus_reset = self.OBSERVED + 4 * 86400
+        self.native(self.OBSERVED, "att-opus-week", "seven_day_opus", opus_reset)
+        now, opus, sonnet = self.OBSERVED + 600, {"claude": "claude-opus-4-6"}, {"claude": "claude-sonnet-4-6"}
+        # Sonnet is not held by the Opus week: nothing to probe, nothing held.
+        self.assertEqual(Q.usage_states(self.jobs, models=sonnet, now=now, env=self.env, recheck=True)["claude"], "ok")
+        self.assertEqual(self.probes(), [])
+        # An answer through another family's key leaves the Opus week held.
+        Q._write_probe(self.jobs, f"{Q._login_scope(self.env)}:sonnet",
+                       {"at": now, "ok": True, "reset_epoch": None, "model": "claude-sonnet-4-6",
+                        "model_scope": "all", "tried": now}, now)
+        self.assertEqual(Q.usage_states(self.jobs, models=opus, now=now + 60, env=self.env)["claude"],
+                         f"limited({Q._iso(opus_reset)})")
+        self.assertEqual(Q.active_limits(self.jobs, models=opus, now=now + 60, env=self.env)["claude"]["reset_epoch"],
+                         opus_reset)
+        self.assertEqual(self.state(now + 60), "ok")  # a reader with no model is held by neither
+
+    def test_a_429_that_is_not_a_quota_rejection_is_no_answer(self):
+        self.env["FAKE_PROBE_MODE"] = "overloaded"
+        now = self.OBSERVED + 600
+        before = self.state(now)
+        self.assertEqual(self.state(now, recheck=True), before)
+        self.assertEqual(len(self.probes()), 1)
+        self.assertEqual(self.state(self.LIMIT_RESET + 60), "ok")  # it never holds Claude past the marker
+
+    def test_a_probe_that_times_out_waits_the_full_interval(self):
+        self.env["FAKE_PROBE_MODE"] = "hang"
+        now = self.OBSERVED + 600
+        before = self.state(now)
+        with mock.patch.object(Q, "PROBE_TIMEOUT", 0.5):
+            self.assertEqual(self.state(now, recheck=True), before)
+            self.env["FAKE_PROBE_MODE"] = "allowed"
+            self.assertEqual(self.state(now + Q.PROBE_INTERVAL - 1, recheck=True), before)
+            self.assertEqual(self.state(now + Q.PROBE_INTERVAL, recheck=True), "ok")
+        self.assertEqual(len(self.probes()), 2)
+
+    def test_all_model_probe_ignores_the_configured_mini_model(self):
+        with mock.patch.object(Q, "_limit_models", return_value={"claude": "claude-opus-4-6"}):
+            self.assertEqual(self.state(self.OBSERVED + 600, recheck=True), "ok")
+        self.assertEqual(self.probes()[0][-2:], ["--model", "haiku"])
+
+    def test_family_windows_select_the_limited_family_alias(self):
+        for family in ("opus", "sonnet"):
+            with self.subTest(family=family):
+                self.jobs.write_text("")
+                Q._probe_path(self.jobs).unlink(missing_ok=True)
+                model = f"claude-{family}-4-6"
+                self.native(self.OBSERVED, f"att-{family}", f"seven_day_{family}", self.PROBE_RESET, model=model)
+                self.assertEqual(Q.active_limits(self.jobs, models={"claude": model},
+                                                now=self.OBSERVED + 600, env=self.env, recheck=True), {})
+                self.assertEqual(self.probes()[-1][-2:], ["--model", family])
+
+    def test_auto_resume_needs_the_source_model_to_clear_a_family_hold(self):
+        import capacity_auto_resume as resume
+        self.jobs.write_text("")
+        now = self.OBSERVED + 600
+        self.native(self.OBSERVED, "att-held-opus", "seven_day_opus", self.PROBE_RESET)
+        record = {"cause": "capacity", "harness": "claude", "jobs": str(self.jobs), "source_attempt_id": ""}
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(Q.time, "time", return_value=now):
+            self.assertEqual(Q.usage_states(self.jobs)["claude"], "ok")  # incomplete view for a paused model
+            self.assertFalse(resume._cleared(record))
+            self.assertFalse(resume._cleared({**record, "source_attempt_id": "att-missing"}))
+            self.assertEqual(self.probes(), [])
+            self.assertTrue(resume._cleared({**record, "source_attempt_id": "att-held-opus"}))
+        self.assertEqual([a[-1] for a in self.probes()], ["opus"])
+
+    def test_later_rejection_does_not_discard_another_windows_rejection(self):
+        now = self.OBSERVED + 600
+        week_reset, five_reset = now + 5 * 86400, now + 4000
+        self.env.update(FAKE_PROBE_MODE="rejected", FAKE_PROBE_WINDOW="seven_day",
+                        FAKE_PROBE_RESET=str(week_reset))
+        self.assertEqual(self.state(now, recheck=True), f"limited({Q._iso(week_reset)})")
+        self.env.update(FAKE_PROBE_WINDOW="five_hour", FAKE_PROBE_RESET=str(five_reset))
+        self.assertEqual(self.state(now + 600, recheck=True), f"limited({Q._iso(week_reset)})")
+        self.assertEqual(self.state(five_reset + 1), f"limited({Q._iso(week_reset)})")
+
+    def test_positive_event_only_responses_clear_the_limit(self):
+        for mode in ("event-allowed", "event-allowed_warning", "event-overage"):
+            with self.subTest(mode=mode):
+                Q._probe_path(self.jobs).unlink(missing_ok=True)
+                self.env["FAKE_PROBE_MODE"] = mode
+                self.assertEqual(self.state(self.OBSERVED + 600, recheck=True), "ok")
+
+    def test_failed_attempt_reservation_does_not_launch(self):
+        with mock.patch.object(Q, "_write_probe", return_value=False):
+            self.assertTrue(self.state(self.OBSERVED + 600, recheck=True).startswith("limited("))
+        self.assertEqual(self.probes(), [])
+
+    def test_interrupted_attempt_still_spends_the_interval(self):
+        now = self.OBSERVED + 600
+        with mock.patch.object(Q, "_probe_once", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.state(now, recheck=True)
+        self.assertTrue(self.state(now + 599, recheck=True).startswith("limited("))
+        self.assertEqual(self.probes(), [])
+        self.assertEqual(self.state(now + 600, recheck=True), "ok")
+        self.assertEqual(len(self.probes()), 1)
+
+    def test_no_probe_without_serialization(self):
+        with mock.patch.object(Q, "fcntl", None):
+            self.assertTrue(self.state(self.OBSERVED + 600, recheck=True).startswith("limited("))
+        self.assertEqual(self.probes(), [])
+
+    def test_family_aliases_share_the_interval_and_exact_models_stay_exact(self):
+        self.jobs.write_text("")
+        now = self.OBSERVED + 600
+        old, new = "claude-opus-4-5", "claude-opus-4-6"
+        self.native(self.OBSERVED, "att-old-model", "seven_day_overage_included", now + 5000, model=old)
+        self.env["FAKE_PROBE_MODE"] = "auth"
+        self.assertIn("claude", Q.active_limits(self.jobs, models={"claude": old}, now=now, env=self.env, recheck=True))
+        self.native(now + 1, "att-new-model", "seven_day_overage_included", now + 5000, model=new)
+        self.assertIn("claude", Q.active_limits(self.jobs, models={"claude": new}, now=now + 599, env=self.env, recheck=True))
+        self.assertEqual([a[-1] for a in self.probes()], [old])
+        self.env["FAKE_PROBE_MODE"] = "allowed"
+        self.assertEqual(Q.active_limits(self.jobs, models={"claude": new}, now=now + 600, env=self.env, recheck=True), {})
+        self.assertEqual([a[-1] for a in self.probes()], [old, new])
+        self.assertIn("claude", Q.active_limits(self.jobs, models={"claude": old}, now=now + 601, env=self.env))
+
+    def test_later_same_family_success_preserves_the_earlier_exact_model_success(self):
+        self.jobs.write_text("")
+        now = self.OBSERVED + 600
+        old, new = "claude-opus-4-5", "claude-opus-4-6"
+        for model, attempt in ((old, "att-old-model"), (new, "att-new-model")):
+            self.native(self.OBSERVED, attempt, "seven_day_overage_included", now + 5000, model=model)
+        self.assertIn("claude", Q.active_limits(self.jobs, models={"claude": old}, now=now, env=self.env))
+        self.assertEqual(Q.active_limits(self.jobs, models={"claude": old}, now=now, env=self.env, recheck=True), {})
+        self.assertEqual(Q.active_limits(self.jobs, models={"claude": new}, now=now + 600, env=self.env, recheck=True), {})
+        self.assertEqual(Q.active_limits(self.jobs, models={"claude": old}, now=now + 601, env=self.env), {})
+        self.assertEqual([a[-1] for a in self.probes()], [old, new])
+
+    def test_success_for_a_long_legacy_marker_survives_another_accounts_later_check(self):
+        self.jobs.write_text("")
+        self.marker(self.OBSERVED, "att-long", "resets 2099-01-01 00:00 (UTC)")
+        now = self.OBSERVED + 600
+        self.assertEqual(self.state(now, recheck=True), "ok")
+        identity = self.home / ".claude.json"
+        original = identity.read_text()
+        identity.write_text(json.dumps({"oauthAccount": {"accountUuid": "account-c", "organizationUuid": "org-a"}}))
+        self.assertEqual(self.state(now + 9 * 86400, recheck=True), "ok")
+        identity.write_text(original)
+        self.assertEqual(self.state(now + 9 * 86400 + 1), "ok")
+
+    def test_usage_check_recheck_flag_is_the_launch_decision(self):
+        def states(*flags):
+            done = subprocess.run([str(ROOT / "utilities/usage-check.sh"), "--jobs", str(self.jobs), *flags],
+                                  env=self.env, text=True, capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return dict(line.split() for line in done.stdout.splitlines())
+        self.jobs.write_text("")
+        self.marker(time.time() - 60, "att-recent", reset_text="resets 2099-01-01 00:00 (UTC)")
+        self.assertTrue(states()["claude"].startswith("limited("))
+        self.assertEqual(self.probes(), [])
+        self.assertEqual(states("--recheck")["claude"], "ok")
+        self.assertEqual(len(self.probes()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
