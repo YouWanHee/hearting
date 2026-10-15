@@ -2358,12 +2358,28 @@ def main(argv: list[str]) -> int:
         args.child_pid = proc.pid
         args.child_pid_start = start_ticks
         args.launch_heartbeat = seed_launch_heartbeat(args, jobs, proc.pid, start_ticks)
+        activity_context = None
+        if args.launch_lifecycle == FOREGROUND_SCOPED:
+            from foreground_activity import resolve_activity_policy, make_activity_context
+            activity_policy = resolve_activity_policy(args.worker_type)
+            for warning in activity_policy.warnings:
+                print(f"warning={warning}", file=sys.stderr)
+            activity_context = make_activity_context(
+                activity_policy, worker_type=args.worker_type, harness="codex",
+                log_path=log_path, jobs=Path(jobs),
+                metadata={**{str(k): str(v) for k, v in launch_metadata.items()},
+                          "attempt_id": args.attempt_id, "route_id": args.route_id or "",
+                          "route_node": args.route_node or ""},
+                runtime_executable="codex",
+                transcript_roots=(Path(dispatch_env["CODEX_HOME"]) / "sessions",),
+            )
         if args.launch_lifecycle == FOREGROUND_SCOPED and foreground_review_handoff:
             binding = args.parent_binding
             try:
                 outcome = wait_foreground(
                     proc, args.foreground_timeout,
                     watchdog_budget=args.watchdog_budget,
+                    activity_context=activity_context,
                     parent_pid=binding.observed_pid if binding else None,
                     parent_pid_start=binding.observed_pid_start if binding else None,
                     parent_is_live=(
@@ -2410,6 +2426,7 @@ def main(argv: list[str]) -> int:
                     else None
                 ),
                 watchdog_budget=args.watchdog_budget,
+                activity_context=activity_context,
             )
             annotate_attempt_row(
                 jobs,

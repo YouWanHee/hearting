@@ -10,6 +10,7 @@ schema v4 adds `confirmation.mode` and `steward.child_permission_mode`.
 """
 import copy
 import json
+import math
 import os
 import sys
 
@@ -49,9 +50,11 @@ DEFAULT_TERMINAL_COMMIT_SUPPORT = "auto"
 # `allowlist` keeps the runtime's starting mode and pre-approves only the
 # harness utilities. The shipped default is `bypass`; omitting the section
 # selects it.
-HEADLESS_KEYS = {"claude_permission_mode"}
+HEADLESS_KEYS = {"claude_permission_mode", "no_progress_minutes"}
 HEADLESS_PERMISSION_MODES = ("bypass", "allowlist")
 DEFAULT_HEADLESS_PERMISSION_MODE = "bypass"
+DEFAULT_NO_PROGRESS_MINUTES = 30.0
+MAX_NO_PROGRESS_MINUTES = 1440.0
 CONFIRMATION_MODES = ("hybrid", "both", "post-frame-only")
 DEFAULT_CONFIRMATION_MODE = "hybrid"
 # SD-136: how a `direct`/`solo`(quick) route is confirmed before material work.
@@ -535,6 +538,11 @@ def policy_warnings(config):
     recommendation left to break.
     """
     warnings = []
+    headless = config.get("headless")
+    if isinstance(headless, dict) and "no_progress_minutes" in headless:
+        _minutes, warning = normalize_no_progress_minutes(headless["no_progress_minutes"])
+        if warning:
+            warnings.append(warning)
     version = config.get("schema_version")
     enabled = _enabled_harnesses(config)
     profiles = config.get("profiles")
@@ -625,6 +633,11 @@ def normalize_policy(config):
     W1/W2/W5/W6). W3/W4 change nothing here. The input is not mutated.
     """
     result = copy.deepcopy(config)
+    headless = result.get("headless")
+    if isinstance(headless, dict) and "no_progress_minutes" in headless:
+        headless["no_progress_minutes"] = normalize_no_progress_minutes(
+            headless["no_progress_minutes"]
+        )[0]
     version = result.get("schema_version")
     enabled = _enabled_harnesses(result)
     profiles = result.get("profiles")
@@ -817,6 +830,30 @@ def query_headless_policy(config):
         "claude_permission_mode": DEFAULT_HEADLESS_PERMISSION_MODE,
         "source": "shipped-default",
     }
+
+
+def normalize_no_progress_minutes(raw):
+    """Normalize the optional launcher activity window and explain corrections."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        return DEFAULT_NO_PROGRESS_MINUTES, (
+            f"headless.no_progress_minutes is invalid ({raw!r}); using "
+            f"{DEFAULT_NO_PROGRESS_MINUTES:g}"
+        )
+    value = float(raw)
+    bounded = min(MAX_NO_PROGRESS_MINUTES, max(0.0, value))
+    if bounded != value:
+        return bounded, (
+            f"headless.no_progress_minutes {value:g} is outside 0–"
+            f"{MAX_NO_PROGRESS_MINUTES:g}; clamped to {bounded:g}"
+        )
+    return bounded, None
+
+
+def query_no_progress_minutes(config):
+    """Return the optional launcher activity window in minutes."""
+    headless = config.get("headless")
+    raw = headless.get("no_progress_minutes", DEFAULT_NO_PROGRESS_MINUTES) if isinstance(headless, dict) else DEFAULT_NO_PROGRESS_MINUTES
+    return normalize_no_progress_minutes(raw)[0]
 
 
 def query_opencode_policy(config):

@@ -21,6 +21,86 @@ SPEC.loader.exec_module(L)
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_quiet_foreground_child_stops_with_no_progress(self):
+        from foreground_activity import ForegroundActivityContext
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "attempt.log"
+            child = subprocess.Popen(
+                ["/bin/sh", "-c", "sleep 10"], start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            start = L.process_start_ticks(child.pid)
+            context = ForegroundActivityContext(
+                window_seconds=0.4, harness="test", log_path=log,
+                metadata={}, runtime_executable="/bin/true",
+            )
+            try:
+                outcome = L.wait_foreground(child, 5, poll_interval=0.02,
+                                            activity_context=context)
+                self.assertEqual(outcome.failure, "no-progress")
+                self.assertTrue(outcome.group_empty)
+            finally:
+                if child.poll() is None:
+                    L._bounded_group_stop(child, start or "", poll_interval=0.01)
+
+    def test_log_and_tool_cpu_activity_survive_multiple_windows(self):
+        from foreground_activity import ForegroundActivityContext
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "attempt.log"
+            commands = [
+                ["/bin/sh", "-c", f"i=0; while [ $i -lt 12 ]; do echo x >> {log}; i=$((i+1)); sleep 0.05; done"],
+                [sys.executable, "-c", "import time; e=time.monotonic()+0.8\nwhile time.monotonic()<e: pass"],
+            ]
+            for command in commands:
+                child = subprocess.Popen(command, start_new_session=True,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                start = L.process_start_ticks(child.pid)
+                context = ForegroundActivityContext(
+                    window_seconds=0.25, harness="test", log_path=log,
+                    metadata={}, runtime_executable="/bin/true",
+                )
+                try:
+                    outcome = L.wait_foreground(child, 4, poll_interval=0.02,
+                                                activity_context=context)
+                    self.assertNotEqual(outcome.failure, "no-progress")
+                    self.assertEqual(outcome.failure, "")
+                finally:
+                    if child.poll() is None:
+                        L._bounded_group_stop(child, start or "", poll_interval=0.01)
+
+    def test_runtime_cpu_noise_is_ignored_but_child_tool_cpu_counts(self):
+        from foreground_activity import ForegroundActivityContext
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "attempt.log"
+            runtime = subprocess.Popen(
+                [sys.executable, "-c", "import time; e=time.monotonic()+1.0\nwhile time.monotonic()<e: pass"],
+                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            start = L.process_start_ticks(runtime.pid)
+            context = ForegroundActivityContext(
+                window_seconds=0.3, harness="test", log_path=log,
+                metadata={}, runtime_executable=sys.executable,
+            )
+            try:
+                outcome = L.wait_foreground(runtime, 4, poll_interval=0.02,
+                                            activity_context=context)
+                self.assertEqual(outcome.failure, "no-progress")
+            finally:
+                if runtime.poll() is None:
+                    L._bounded_group_stop(runtime, start or "", poll_interval=0.01)
+
+            tool_parent = subprocess.Popen(
+                [sys.executable, "-c", "import subprocess; p=subprocess.Popen(['/bin/sh','-c','i=0; while [ $i -lt 2000000 ]; do i=$((i+1)); done']); p.wait()"],
+                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            start = L.process_start_ticks(tool_parent.pid)
+            try:
+                outcome = L.wait_foreground(tool_parent, 5, poll_interval=0.02,
+                                            activity_context=context)
+                self.assertEqual(outcome.failure, "")
+            finally:
+                if tool_parent.poll() is None:
+                    L._bounded_group_stop(tool_parent, start or "", poll_interval=0.01)
     def test_namespace_detection_supports_host_and_remounted_proc(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

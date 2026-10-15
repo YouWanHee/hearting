@@ -125,6 +125,28 @@ class NamespaceLocalForegroundCellTest(unittest.TestCase):
         outcome = L.wait_foreground(child, 5)
         self.assertEqual(outcome, L.ForegroundResult(0, ""))
 
+    def test_quiet_child_is_closed_as_no_progress_inside_liveness_matrix(self):
+        from foreground_activity import ForegroundActivityContext
+        with tempfile.TemporaryDirectory() as td:
+            child = subprocess.Popen(["sleep", "10"], start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            start = L.process_start_ticks(child.pid)
+            context = ForegroundActivityContext(
+                0.35, "matrix", Path(td) / "attempt.log", {},
+                runtime_executable="/bin/false",
+            )
+            began = time.monotonic()
+            try:
+                outcome = L.wait_foreground(child, 8, poll_interval=0.02,
+                                            activity_context=context)
+                self.assertEqual(outcome.failure, "no-progress")
+                self.assertTrue(outcome.group_empty)
+                self.assertGreaterEqual(time.monotonic() - began, 0.3)
+                self.assertLess(time.monotonic() - began, 3.0)
+            finally:
+                if child.poll() is None:
+                    L._bounded_group_stop(child, start or "", poll_interval=0.01)
+
 
 class WrapperInternalWaitBoundTest(unittest.TestCase):
     """The wrapper's own foreground wait must also refuse to wait indefinitely.
