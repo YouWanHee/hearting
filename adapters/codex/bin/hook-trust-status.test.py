@@ -128,6 +128,14 @@ class HookTrustStatusTest(unittest.TestCase):
         self.assertEqual(reason, "definition-set-mismatch")
         self.assertEqual(events, ["pre_tool_use", "stop"])
 
+    def test_app_server_request_timeout_terminates_unresponsive_child(self):
+        server = TRUST.AppServer(
+            [sys.executable, "-c", "import time; time.sleep(10)"], self.root
+        )
+        with self.assertRaisesRegex(TRUST.HookTrustError, "app-server-timeout"):
+            server.request("initialize", {}, timeout=0.05)
+        self.assertIsNotNone(server.process.poll())
+
     def test_parent_definition_proof_is_reported_with_typed_paths(self):
         ledger = self.root / "ledger.json"
         lock = self.root / "ledger.lock"

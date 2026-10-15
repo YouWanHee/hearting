@@ -33,12 +33,15 @@ and enabled plugins, and disable discovered system skills by documented path.
 The assigned contract remains in the prompt. Native or managed input outside
 these controls must be reported from actual runtime evidence.
 
-Hook trust is path-keyed in Codex. The invocation maps existing user decisions
-to the relocated copies of the same source definitions, including disabled
-states; it reads those decisions again when a resumed command is built. Native
-current-hash validation still rejects changed or unapproved definitions. No
-user trust record is written and no hook-trust bypass is used. Validate this
-with App Server `hooks/list`, rather than assuming a linked file is active.
+Hook trust is path-keyed in Codex. Worker projection maps existing user decisions
+to relocated copies of the same source definitions, including disabled states;
+it reads those decisions again when a resumed command is built. Global runtime
+activation attempts to record Codex's current hash only for Hearting's projected
+hook definitions. Disabled states and foreign hooks are preserved. If Codex or
+App Server is unavailable, or for hooks Hearting did not install, `/hooks` stays
+the user-facing fallback. Worker launch itself never writes trust. Validate
+active definitions with App Server `hooks/list`, rather than assuming a linked
+file is active.
 
 Official surfaces: [instruction discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md),
 [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

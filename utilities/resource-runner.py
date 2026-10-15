@@ -40,6 +40,15 @@ def fail(message):
     error = SystemExit(65)
     error.resource_message = message
     raise error
+
+
+def gpu_payload_environment(environment, lease):
+    """Use the lease's exact session for GPU payloads; leave CPU paths untouched."""
+    if not lease:
+        return environment
+    return gpu_leases.launcher_session_environment(environment, owner=lease.get("owner"))
+
+
 def locked_update(path, fn):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
     with open(str(path)+".lock","a+") as lock:
@@ -297,6 +306,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         environment.update(gpu_env)
         environment.update(HEARTING_RESOURCE_RUN_ID=args.run_id, HEARTING_RESOURCE_REGISTRY=str(registry.resolve()))
         environment.update(AGENT_RESOURCE_SENTINEL=str(sentinel), AGENT_RESOURCE_LAUNCH_FD=str(wait_read))
+        environment = gpu_payload_environment(environment, gpu_lease)
         try:
             with open(log, "ab", buffering=0) as output:
                 proc = subprocess.Popen(launch_argv, cwd=placeholder["cwd"], env=environment,
@@ -594,6 +604,7 @@ def _main(argv=None, *, controller=None):
         environment={**os.environ,**progress_environment(placeholder),"AGENT_RESOURCE_SENTINEL":str(sentinel),
                      "HEARTING_RESOURCE_RUN_ID": args.run_id, "HEARTING_RESOURCE_REGISTRY": str(registry.resolve()),
                      "HEARTING_GPU_LEASE_RELEASE": "", **gpu_env, "AGENT_RESOURCE_LAUNCH_FD": str(wait_read)}
+        environment = gpu_payload_environment(environment, gpu_lease)
         out=open(log,"ab",buffering=0)
         try:
             proc=subprocess.Popen(launch_argv,cwd=cwd,env=environment,pass_fds=(wait_read,),stdout=out,stderr=subprocess.STDOUT,start_new_session=True)

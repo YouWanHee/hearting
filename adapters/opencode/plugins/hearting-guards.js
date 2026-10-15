@@ -1681,12 +1681,38 @@ export const AgentHarnessGuards = async (ctx) => {
   },
   "tool.execute.after": async (input, output) => {
     observePaneCallback(ctx, "tool.execute.after", input.sessionID || "")
+    const args = input.args || output.args || {}
+    const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
+    const nativeExit = output?.metadata?.exit
+    const instanceDir = typeof ctx.directory === "string" && path.isAbsolute(ctx.directory)
+      ? ctx.directory : ""
+    if (toolName === "bash" && typeof args.command === "string" && instanceDir &&
+        Number.isInteger(nativeExit) && nativeExit > 0 && nativeExit <= 128 &&
+        typeof output?.output === "string") {
+      const cwd = typeof args.workdir === "string"
+        ? path.resolve(instanceDir, args.workdir) : instanceDir
+      const payload = {
+        tool_name: toolName,
+        tool_input: { command: args.command },
+        cwd,
+        tool_response: { exit: nativeExit, output: output.output },
+      }
+      const diagnosis = spawnSync("python3", [path.join(root, "utilities", "git_index_lock.py"),
+        "--harness", "opencode"], {
+        cwd: root, env: { ...process.env, AGENT_HOME: root },
+        input: JSON.stringify(payload), encoding: "utf8", timeout: 2200,
+      })
+      try {
+        const context = JSON.parse(diagnosis.stdout || "{}").diagnosis?.message
+        if (diagnosis.status === 0 && typeof context === "string" && context &&
+            typeof output.output === "string") output.output += "\n" + context
+      } catch { /* Preserve the completed shell result if diagnosis is unavailable. */ }
+    }
     if (input.sessionID && typeof output?.output === "string") {
       const receipt = spawnSync("python3", [startReceipt, "--harness", "opencode", "--session-id", input.sessionID],
         { encoding: "utf8", timeout: 1000 })
       if (receipt.status === 0 && receipt.stdout?.trim()) output.output += "\n" + receipt.stdout.trim()
     }
-    const args = input.args || output.args || {}
     const files = targetFiles(ctx, input.tool || {}, args)
     for (const file of files) {
       if (isDesignHtml(file)) runPreflight("design", [file])
@@ -1708,7 +1734,6 @@ export const AgentHarnessGuards = async (ctx) => {
     }
     // Record actual spec reads for workflow and display evidence.
     // Non-blocking: a marker failure must never abort a successful read.
-    const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
     if (toolName === "read") {
       const readFile = normalizeFile(ctx, args.filePath || args.path || args.file)
       if (readFile) collectPreflight("read", [readFile, input.sessionID || "opencode-plugin"])
