@@ -837,31 +837,35 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         self.assertNotIn("--cd", _agent_start_cmd(run_mock))
 
     def test_the_receipt_says_when_the_launch_produced_no_identity(self):
-        """A session herdr cannot name has no ledger endpoint and no board badge. That
-        used to surface hours later as a nameless row; it belongs in the launch receipt."""
+        """A successful launch stays successful when shared identity is unknown."""
         import io
         import contextlib
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json(_agent_json("codex", None, "peer-c"))), \
-             mock.patch.object(peer_steward, "_BIND_PROCESS_SECONDS", 0.1), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.02):
+                                return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
+             mock.patch.object(peer_steward, "_process_session", return_value=None) as resolve:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+                rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        resolve.assert_called_once_with("w1:pM", "codex")
+        self.assertIn("started=true", out.getvalue())
         self.assertIn("session_id=-", out.getvalue())
-        self.assertIn("session_bind=no-process", out.getvalue())
+        self.assertNotIn("session_bind=", out.getvalue())
 
-    def test_the_receipt_names_the_identity_when_there_is_one(self):
+    def test_the_receipt_uses_only_the_shared_resolver_identity(self):
         import io
         import contextlib
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=_herdr_json(_agent_json("codex", "thread-9", "peer-c"))):
+                                return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
+             mock.patch.object(peer_steward, "_process_session", return_value="proven-thread") as resolve:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
-        self.assertIn("session_id=thread-9", out.getvalue())
+                rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
+        self.assertEqual(rc, 0)
+        resolve.assert_called_once_with("w1:pM", "codex")
+        self.assertIn("session_id=proven-thread", out.getvalue())
 
     def test_name_is_the_positional_right_after_start(self):
         """herdr `agent start <NAME> --kind --pane`: the name is a required positional.
@@ -933,7 +937,8 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch("builtins.print"), \
              mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
-                                return_value=subprocess.CompletedProcess([], 0, stdout=started, stderr="")):
+                                return_value=subprocess.CompletedProcess([], 0, stdout=started, stderr="")), \
+             mock.patch.object(peer_steward, "_process_session", return_value="child-sid"):
             self.assertEqual(self._start(name="peer-e", kind="codex"), 0)
         markers = peer_steward.peer_message.read_steward_markers()
         self.assertEqual(set(markers), {("claude", "sid-steward")})
@@ -1084,430 +1089,72 @@ print(json.dumps(info)); sys.exit(0)
 '''
 
 
-class StartSessionBindTest(_TmpRootMixin, unittest.TestCase):
-    """`start --kind codex` binds the launched thread when the launcher can prove it.
 
-    A TUI attached to the shared Codex daemon holds no rollout file and the daemon creates
-    the thread's rollout about a second after the TUI starts, so Fleet sees an anonymous
-    row (several same-cwd starts overlap its start-time window). The launcher is the one
-    party that saw the launch: it notes the rollouts that exist before `herdr agent start`
-    and, afterwards, takes exactly one new root rollout for the target cwd as the session.
-    Zero or several new rollouts is no proof: no guess, `session_id=-`, and the start is
-    never failed or blocked beyond the bound.
-    """
 
-    def setUp(self):
-        super().setUp()
-        self.home = self.tmp_root / "codex-home"
-        (self.home / "sessions" / "2026" / "10" / "02").mkdir(parents=True)
-        self.project = self.tmp_root / "project"
-        self.project.mkdir()
-        self.registry = self.tmp_root / "registry"
-        os.environ["CODEX_HOME"] = str(self.home)
-        os.environ["FLEET_SESSION_REGISTRY_DIR"] = str(self.registry)
-        # the "TUI": a real process, so /proc has a start time and a cwd for it
-        self.tui = subprocess.Popen(["sleep", "60"], cwd=str(self.project))
-        self.addCleanup(self.tui.wait)
-        self.addCleanup(self.tui.kill)
-        self.late = []        # rollouts the "daemon" writes after the TUI is up
-        self.calls = []
 
-    def _rollout(self, sid, cwd=None, created=None, originator="codex-tui", source="vscode"):
-        created = created if created is not None else time.time()
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(created)) + ".%03dZ" % (int(created * 1000) % 1000)
-        meta = {"id": sid, "timestamp": stamp, "cwd": str(cwd or self.project),
-                "originator": originator, "source": source}
-        path = self.home / "sessions" / "2026" / "10" / "02" / (
-            "rollout-%s-%s.jsonl" % (stamp[:19].replace(":", "-"), sid))
-        path.write_text(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
-        return path
 
-    def _fake_herdr(self, argv, **_kwargs):
-        self.calls.append(list(argv))
-        if argv[:3] == ["herdr", "agent", "start"]:
-            return _herdr_json({"result": {"agent": {"name": argv[3], "agent": "codex",
-                                                     "pane_id": "w1:pM"}}})
-        if argv[:3] == ["herdr", "pane", "process-info"]:
-            for write in self.late:
-                write()
-            self.late = []
-            return _herdr_json({"result": {"process_info": {"foreground_processes": [
-                {"pid": self.tui.pid, "argv": ["codex", "--cd", str(self.project)]}]}}})
-        return _herdr_json({"result": {"pane": {}}})
 
-    def _start(self, *extra, kind="codex", name="bl-c1"):
-        import io
+
+class SharedDaemonCodexStartTest(_TmpRootMixin, unittest.TestCase):
+    """Exercise the real steward start path with Codex's shared defaults."""
+
+    def _start(self, agent_args, *, proof=None, herdr_sid="herdr-claim"):
         import contextlib
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            rc = peer_steward.main(["start", name, "--kind", kind, "--pane", "w1:pM",
-                                    *(["--cwd", str(self.project)] if kind == "codex" else []), *extra])
-        self.assertEqual(rc, 0)
-        return out.getvalue()
-
-    def _registry_record(self):
-        path = self.registry / "codex" / ("%d.json" % self.tui.pid)
-        return json.loads(path.read_text()) if path.is_file() else None
-
-    def _proc_start(self):
-        raw = Path("/proc/%d/stat" % self.tui.pid).read_text()
-        return raw[raw.rindex(")") + 1:].split()[19]
-
-    def test_one_new_root_rollout_is_the_launched_session(self):
-        sid = "01a0fa57-7f0e-7eb0-bffe-1d56df94e90c"
-        self.late.append(lambda: self._rollout(sid))
-        out = self._start()
-        self.assertIn("session_id=" + sid, out)
-        self.assertIn("session_bind=bound", out)
-        record = self._registry_record()
-        self.assertEqual(record["sessionId"], sid)
-        self.assertEqual(record["procStart"], self._proc_start())
-        self.assertEqual(record["cwd"], os.path.realpath(str(self.project)))
-        self.assertEqual(record["name"], "bl-c1")
-        self.assertNotEqual(record.get("nameSource"), "derived")
-        self.assertEqual(record["harness"], "codex")
-        self.assertEqual(record["pid"], self.tui.pid)
-        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
-        self.assertEqual(sent[0]["to"]["session_id"], sid)
-
-    def test_two_new_root_rollouts_are_never_guessed(self):
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000001"))
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-000000000002"))
-        out = self._start()
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=ambiguous", out)
-        self.assertIsNone(self._registry_record())
-
-    def test_an_embedded_start_never_binds_a_time_candidate(self):
-        """F2: an Embedded TUI owns its rollout fd, but the fd appears only after
-        its first thread exists. While it does not, another same-cwd execution's
-        lone new root rollout would satisfy the before/after binder — and the
-        resulting tier-1 record would outrank the later own fd forever. So an
-        Embedded start skips the binder entirely: unknown until the fd proves it,
-        zero registry writes from time candidates."""
         import io
-        import contextlib
-        foreign = "01a0fa57-0000-7000-8000-0000000000f1"
-        self.late.append(lambda: self._rollout(foreign))
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_managed_ingress_dir", return_value=None), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
-             mock.patch.object(peer_steward, "_bind_codex_session") as bind_mock, \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            rc = peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM",
-                                    "--cwd", str(self.project)])
-        self.assertEqual(rc, 0)
-        text = out.getvalue()
-        self.assertIn("started=true", text)
-        self.assertIn("session_id=-", text)
-        self.assertNotIn("session_bind=", text)
-        self.assertEqual(bind_mock.call_count, 0)
-        self.assertIsNone(self._registry_record())
-        starts = [c for c in self.calls if c[:3] == ["herdr", "agent", "start"]]
-        self.assertEqual(len(starts), 1)
-        self.assertIn("--no-daemon", starts[0])
 
-    def test_a_caller_stated_no_daemon_start_never_binds_a_time_candidate(self):
-        """F2 residual: a caller-stated `--no-daemon` really is Embedded execution
-        (the helper returns ``[]`` only to avoid injecting a duplicate flag), so it
-        must skip the binder like an injected one. Reproduced against 4543a6ec with
-        `_start(--, --no-daemon)`: the foreign root bound and would have been
-        written tier-1. No duplicate flag is injected on top of the caller's own."""
-        import io
-        import contextlib
-        foreign = "01a0fa57-0000-7000-8000-0000000000f2"
-        self.late.append(lambda: self._rollout(foreign))
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_bind_codex_session") as bind_mock, \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            rc = peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM",
-                                    "--cwd", str(self.project), "--", "--no-daemon"])
-        self.assertEqual(rc, 0)
-        text = out.getvalue()
-        self.assertIn("started=true", text)
-        self.assertIn("session_id=-", text)
-        self.assertNotIn("session_bind=", text)
-        self.assertEqual(bind_mock.call_count, 0)
-        self.assertIsNone(self._registry_record())
-        starts = [c for c in self.calls if c[:3] == ["herdr", "agent", "start"]]
-        self.assertEqual(len(starts), 1)
-        typed = starts[0][starts[0].index("--") + 1:]
-        self.assertEqual(typed.count("--no-daemon"), 1)
-
-    def test_stated_no_daemon_ignores_option_values_and_native_literal_boundary(self):
-        self.assertTrue(peer_steward._codex_stated_no_daemon(["--no-daemon"]))
-        self.assertTrue(peer_steward._codex_stated_no_daemon(["resume", "--no-daemon"]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon([]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon(["--remote", "unix:///x.sock"]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon(["-m", "--no-daemon"]))
-        self.assertFalse(peer_steward._codex_stated_no_daemon(["--", "--no-daemon"]))
-
-    def test_no_new_rollout_within_the_bound_times_out_without_failing(self):
-        started = time.time()
-        out = self._start()
-        self.assertLess(time.time() - started, 5)
-        self.assertIn("started=true", out)
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=timeout", out)
-        self.assertIsNone(self._registry_record())
-
-    def test_a_rollout_that_existed_before_the_start_is_never_taken(self):
-        self._rollout("01a0fa57-0000-7000-8000-0000000000aa")
-        out = self._start()
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=timeout", out)
-        sid = "01a0fa57-0000-7000-8000-0000000000bb"
-        self.late.append(lambda: self._rollout(sid))
-        self.assertIn("session_id=" + sid, self._start(name="bl-c2"))
-
-    def test_other_cwd_subagent_and_stale_rollouts_are_ignored(self):
-        other = self.tmp_root / "elsewhere"
-        other.mkdir()
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c1", cwd=other))
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c2",
-                                               source={"subagent": {"parent": "x"}}))
-        self.late.append(lambda: self._rollout("01a0fa57-0000-7000-8000-0000000000c3",
-                                               created=time.time() - 3600))
-        out = self._start()
-        self.assertIn("session_id=-", out)
-        self.assertIn("session_bind=timeout", out)
-        self.assertIsNone(self._registry_record())
-
-    def test_a_session_id_herdr_already_gave_is_kept_and_not_searched_for(self):
-        def with_session(argv, **kwargs):
+        def fake_run(argv, **kwargs):
             if argv[:3] == ["herdr", "agent", "start"]:
-                self.calls.append(list(argv))
-                return _herdr_json({"result": {"agent": {
-                    "name": argv[3], "agent": "codex",
-                    "agent_session": {"value": "herdr-given-sid"}}}})
-            return self._fake_herdr(argv, **kwargs)
-        import io
-        import contextlib
-        out = io.StringIO()
+                return _herdr_json(_agent_json("codex", herdr_sid, argv[3]))
+            return _idle_shell_run(argv, **kwargs)
+
+        output = io.StringIO()
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=with_session), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=fake_run) as run_mock, \
+             mock.patch.object(peer_steward, "_managed_ingress_dir", return_value=None), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             contextlib.redirect_stdout(out):
-            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
-        self.assertIn("session_id=herdr-given-sid", out.getvalue())
-        self.assertNotIn("session_bind=", out.getvalue())
-        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
-
-    def test_other_harnesses_are_not_searched_for_a_rollout(self):
-        out = self._start(kind="claude")
-        self.assertNotIn("session_bind=", out)
-        self.assertEqual([c for c in self.calls if c[:3] == ["herdr", "pane", "process-info"]], [])
-
-    def test_the_cwd_defaults_to_the_launched_process_cwd(self):
-        sid = "01a0fa57-0000-7000-8000-0000000000d1"
-        self.late.append(lambda: self._rollout(sid))
-        import io
-        import contextlib
-        out = io.StringIO()
-        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_herdr), \
-             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.05), \
-             contextlib.redirect_stdout(out):
-            peer_steward.main(["start", "bl-c1", "--kind", "codex", "--pane", "w1:pM"])
-        self.assertIn("session_id=" + sid, out.getvalue())
-
-    def test_a_missing_proc_start_keeps_the_thread_id_but_writes_no_registry_record(self):
-        # Fleet rejects a record without a matching procStart, so none is written and the
-        # receipt says the binding is unregistered; the start itself is neither failed nor blocked.
-        sid = "01a0fa57-0000-7000-8000-0000000000e1"
-        self.late.append(lambda: self._rollout(sid))
-        with mock.patch.object(peer_steward, "_proc_start_ticks", return_value=None):
-            out = self._start()
-        self.assertIn("started=true", out)
-        self.assertIn("session_id=" + sid, out)
-        self.assertIn("session_bind=bound-unregistered", out)
-        self.assertNotIn("session_bind=bound ", out + " ")
-        self.assertIsNone(self._registry_record())
-        sent = [r for r in self._all_records() if r.get("kind") == "steer"]
-        self.assertEqual(sent[0]["to"]["session_id"], sid)
-
-    def test_a_registry_write_that_fails_is_reported_unregistered_not_bound(self):
-        sid = "01a0fa57-0000-7000-8000-0000000000e2"
-        self.late.append(lambda: self._rollout(sid))
-        registry = peer_steward._session_registry()
-        with mock.patch.object(registry, "write", side_effect=OSError("read-only registry")):
-            out = self._start()
-        self.assertIn("session_id=" + sid, out)
-        self.assertIn("session_bind=bound-unregistered", out)
-
-
-class BindDeadlineConfirmationTest(unittest.TestCase):
-    """A single candidate counts only after a second observation, also at the deadline.
-
-    A rollout first seen on the final poll cannot be told apart from a concurrent same-cwd
-    start, so the bind ends as `timeout` instead of taking it.
-    """
-
-    def _bind(self, sightings):
-        """Run `_bind_codex_session` on a fake clock; `sightings[i]` is the poll-i rollout list."""
-        clock = {"now": 0.0}
-        polls = iter(sightings)
-        fake_time = mock.Mock()
-        fake_time.monotonic = lambda: clock["now"]
-        fake_time.sleep = lambda seconds: clock.__setitem__("now", clock["now"] + seconds)
-        fake_time.time = time.time
-        with mock.patch.object(peer_steward, "time", fake_time), \
-             mock.patch.object(peer_steward, "_fleet_codex_collector", return_value=object()), \
-             mock.patch.object(peer_steward, "_pane_codex_pid", return_value=4242), \
-             mock.patch.object(peer_steward, "_new_root_rollouts",
-                               side_effect=lambda *a, **k: next(polls, sightings[-1])), \
-             mock.patch.object(peer_steward, "_BIND_SECONDS", 1.0), \
-             mock.patch.object(peer_steward, "_BIND_POLL_SECONDS", 0.25):
-            return peer_steward._bind_codex_session("w1:pM", "/work", "/home", set(), 0.0)
-
-    def test_a_candidate_first_seen_on_the_final_poll_is_not_bound(self):
-        # polls at t=0, .25, .5, .75 -- the candidate appears only on the last one
-        state, sid, pid, cwd = self._bind([[], [], [], ["sid-late"]])
-        self.assertEqual((state, sid), ("timeout", None))
-        self.assertEqual((pid, cwd), (4242, "/work"))
-
-    def test_a_candidate_seen_on_the_last_two_polls_is_bound(self):
-        state, sid, _pid, _cwd = self._bind([[], [], ["sid-ok"], ["sid-ok"]])
-        self.assertEqual((state, sid), ("bound", "sid-ok"))
-
-    def test_a_candidate_that_changes_on_the_final_poll_is_not_bound(self):
-        state, sid, _pid, _cwd = self._bind([[], [], ["sid-a"], ["sid-b"]])
-        self.assertEqual((state, sid), ("timeout", None))
-
-    def test_a_candidate_that_vanishes_before_confirmation_is_not_bound(self):
-        state, sid, _pid, _cwd = self._bind([["sid-a"], [], [], []])
-        self.assertEqual((state, sid), ("timeout", None))
-
-
-class EmbeddedCodexStartTest(_TmpRootMixin, unittest.TestCase):
-    """Fresh steward-started Codex TUIs run Embedded (`--no-daemon`).
-
-    A shared-daemon TUI holds no rollout fd, so two same-cwd TUIs started moments
-    apart (2026-10-04: PID 3023216/3023356, 0.03 s apart) leave Fleet with no
-    per-process proof and both rows stay anonymous. An Embedded TUI owns its
-    transcript fd, and the existing fd resolver attributes each one exactly."""
-
-    def _start_cmd(self, *argv, kind="codex", support=True, ingress=None):
-        with mock.patch.object(peer_steward.shutil, "which",
-                               return_value="/usr/bin/herdr"), \
-             mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=_idle_shell_run) as run_mock, \
-             mock.patch.object(peer_steward, "_managed_ingress_dir",
-                               return_value=ingress), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon",
-                               return_value=support):
-            rc = peer_steward.main(["start", "peer-c", "--kind", kind,
-                                    "--pane", "w1:pM", *argv])
+             mock.patch.object(peer_steward, "_process_session", return_value=proof) as resolver, \
+             contextlib.redirect_stdout(output):
+            rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM",
+                                    "--", *agent_args])
         self.assertEqual(rc, 0)
-        return _agent_start_cmd(run_mock)
+        resolver.assert_called_once_with("w1:pM", "codex")
+        return output.getvalue(), _agent_start_cmd(run_mock)
 
-    def _typed(self, cmd):
-        return cmd[cmd.index("--") + 1:]
+    @staticmethod
+    def _typed(command):
+        return command[command.index("--") + 1:]
 
-    def test_a_fresh_codex_start_runs_embedded_first(self):
-        cmd = self._start_cmd("--cwd", str(self.tmp_root))
-        typed = self._typed(cmd)
-        self.assertEqual(typed[0], "--no-daemon")
-        self.assertEqual(typed[1], "--dangerously-bypass-approvals-and-sandbox")
-        self.assertEqual(typed.count("--no-daemon"), 1)
+    def test_fresh_start_keeps_shared_default_and_does_not_inject_no_daemon(self):
+        out, command = self._start([], proof=None, herdr_sid="untrusted-start-response")
+        self.assertNotIn("--no-daemon", self._typed(command))
+        self.assertIn("started=true", out)
+        self.assertIn("session_id=-", out)
+        self.assertNotIn("session_bind=", out)
 
-    def test_resume_and_fork_keep_their_existing_thread(self):
-        # An Embedded resume of a thread open in another app is refused natively;
-        # continuing a thread must keep reaching it, never reshape the launch.
-        for args in (["resume", "01a1055e-bd7b-7481-a5f9-7b2cc1bee230"],
-                     ["fork", "01a1055e-bd7b-7481-a5f9-7b2cc1bee230"]):
+    def test_explicit_no_daemon_and_remote_arguments_are_preserved_once(self):
+        for args, expected in (
+            (["--no-daemon"], ["--no-daemon"]),
+            (["--remote", "unix:///tmp/explicit-codex.sock"],
+             ["--remote", "unix:///tmp/explicit-codex.sock"]),
+            (["--no-daemon", "--remote=unix:///tmp/explicit-codex.sock"],
+             ["--no-daemon", "--remote=unix:///tmp/explicit-codex.sock"]),
+        ):
             with self.subTest(args=args):
-                cmd = self._start_cmd("--", *args)
-                self.assertNotIn("--no-daemon", self._typed(cmd))
+                _out, command = self._start(args)
+                typed = self._typed(command)
+                self.assertIn(expected, [typed[i:i + len(expected)]
+                                         for i in range(len(typed) - len(expected) + 1)])
+                self.assertEqual(typed.count("--no-daemon"), args.count("--no-daemon"))
 
-    def test_a_managed_ingress_is_never_given_a_conflicting_flag(self):
-        # The wrapper forwards trailing args to its `--remote` client; the managed
-        # path already attributes via registry + rollout transfer.
-        cmd = self._start_cmd(ingress=str(self.tmp_root / "bin"))
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-
-    def test_a_caller_stated_daemon_stance_is_never_second_guessed(self):
-        for args in (["--no-daemon"], ["--remote", "unix:///tmp/x.sock"],
-                     ["--remote=unix:///tmp/x.sock"]):
+    def test_resume_and_fork_targets_are_forwarded_without_reshaping(self):
+        thread = "01a0fa57-7f0e-7eb0-bffe-1d56df94e90c"
+        for args in (["resume", thread], ["fork", thread]):
             with self.subTest(args=args):
-                cmd = self._start_cmd("--", *args)
-                self.assertLessEqual(self._typed(cmd).count("--no-daemon"),
-                                     1 if args == ["--no-daemon"] else 0)
-
-    def test_an_unrecognized_invocation_keeps_its_previous_shape(self):
-        cmd = self._start_cmd("--", "--future-flag")
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-
-    def test_an_initial_prompt_is_still_a_fresh_start(self):
-        # A quoted prompt phrase is one argv token with a space: no native
-        # subcommand name contains a space, so this cannot be a subcommand.
-        cmd = self._start_cmd("--", "do stuff")
-        self.assertEqual(self._typed(cmd)[0], "--no-daemon")
-
-    def test_a_subcommand_after_a_prompt_word_is_never_reshaped(self):
-        # F1: official 0.160 parses `codex hello resume` with `resume` as the
-        # subcommand (`hello` sits in the PROMPT slot), so the scan must not stop
-        # at the first positional. `hello` alone really is a prompt per
-        # `codex --help` (`codex [OPTIONS] [PROMPT]`), pinned here so no future
-        # "fix" re-breaks it; native aliases (`e`, `a`) fail closed too.
-        for args, fresh in ((["hello", "resume", "--help"], False),
-                            (["hello", "fork", "--help"], False),
-                            (["hello"], True),
-                            (["e", "dated"], False),
-                            (["a"], False),
-                            (["--help"], False),
-                            (["-h"], False),
-                            (["--version"], False),
-                            (["--", "resume"], True),
-                            (["-m", "resume"], True),
-                            (["do", "stuff"], True)):
-            with self.subTest(args=args):
-                self.assertEqual(peer_steward._codex_fresh_tui_args(args), fresh)
-                cmd = self._start_cmd("--", *args)
-                self.assertEqual("--no-daemon" in self._typed(cmd), fresh)
-
-    def test_other_harnesses_and_unprobed_support_add_nothing(self):
-        cmd = self._start_cmd("--cwd", str(self.tmp_root), kind="claude")
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-        cmd = self._start_cmd("--cwd", str(self.tmp_root), support=False)
-        self.assertNotIn("--no-daemon", self._typed(cmd))
-
-    def test_the_support_probe_is_fail_closed(self):
-        with mock.patch.object(peer_steward.shutil, "which", return_value=None):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-        with mock.patch.object(peer_steward.subprocess, "run",
-                               side_effect=OSError("no codex")):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-        bad = subprocess.CompletedProcess([], 1, stdout="--no-daemon", stderr="")
-        with mock.patch.object(peer_steward.subprocess, "run", return_value=bad):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-        plain = subprocess.CompletedProcess([], 0, stdout="usage: codex", stderr="")
-        with mock.patch.object(peer_steward.subprocess, "run", return_value=plain):
-            self.assertFalse(peer_steward._codex_supports_no_daemon())
-
-    def test_freshness_scan_skips_known_root_options(self):
-        self.assertTrue(peer_steward._codex_fresh_tui_args(
-            ["--cd", "/work", "-m", "gpt-x", "--config", "k=v"]))
-        self.assertTrue(peer_steward._codex_fresh_tui_args([]))
-        self.assertFalse(peer_steward._codex_fresh_tui_args(["exec", "ls"]))
-        self.assertFalse(peer_steward._codex_fresh_tui_args(["--cd"]))
+                _out, command = self._start(args)
+                typed = self._typed(command)
+                self.assertIn(args, [typed[i:i + len(args)]
+                                     for i in range(len(typed) - len(args) + 1)])
+                self.assertNotIn("--no-daemon", typed)
 
 
 class _WatchMixin(_TmpRootMixin):
@@ -1926,7 +1573,6 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
             "while time.monotonic() < deadline:\n    def later():\n        time.sleep(1)\n",
             "while time.monotonic() < deadline:\n    for event in events():\n        time.sleep(1)\n",
             "while time.monotonic() < deadline:\n    while ready():\n        time.sleep(1)\n",
-            "def _bind_codex_session():\n    time.sleep(1)\n",
         ):
             with self.subTest(source=forbidden):
                 self.assertTrue(violations(forbidden, bounded_ui=True))
@@ -4633,16 +4279,16 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                          mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
                          mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
                          mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
-                         mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
+                         mock.patch.object(peer_steward, "_process_session", return_value=None), \
                          mock.patch.object(peer_steward, "_read_screen", return_value=None), \
                          mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), mock.patch("builtins.print"):
                         self.assertEqual(peer_steward.main(["start", "grid", "--kind", kind,
                                                            "--beside", "w1:p0", "--cwd", str(self.tmp_root)]), 0)
-                    launch = calls[-1]
+                    launch = next(a for a in calls if a[1:3] == ["agent", "start"])
                     self.assertEqual(launch[1:3], ["agent", "start"])
                     self.assertEqual(launch[launch.index("--pane") + 1], target if action == "reuse" else "w1:pNew")
                     if action == "reuse":
-                        self.assertEqual(len(calls), 2)  # layout and start, no creation/move
+                        self.assertEqual(sum(a[1:3] == ["agent", "start"] for a in calls), 1)
                     else:
                         create = next(a for a in calls if a[1:3] in (["pane", "split"], ["tab", "create"]))
                         self.assertIn("--no-focus", create)
@@ -4693,7 +4339,6 @@ class ProjectStartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
              mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
              mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
              mock.patch.object(peer_steward, "_read_screen", return_value=None), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
              mock.patch.object(peer_steward, "_mark_seat_successor") as successor, \
@@ -4803,7 +4448,6 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
              mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
              mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
-             mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
              mock.patch.object(peer_steward, "_read_screen", return_value=None), \
              mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
              mock.patch("builtins.print") as printed:
@@ -5004,7 +4648,6 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
                      mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
                      mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value="missing"), \
                      mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="stable prompt"), \
-                     mock.patch.object(peer_steward, "_codex_supports_no_daemon", return_value=True), \
                      mock.patch.object(peer_steward, "_read_screen", return_value=None), \
                      mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
                      mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: clock["now"]), \
@@ -6818,7 +6461,7 @@ class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
             for name, value in (("_herdr_missing", False), ("_ensure_pane_ingress", None),
                                 ("_export_opencode_tui_scoped", "missing"),
                                 ("_read_screen", None), ("_pane_is_managed", False),
-                                ("_codex_embedded_args", []),
+                                ("_process_session", "observed-sid" if kind == "codex" else None),
                                 ("_current_session_identity", ("parent-sid", "claude"))):
                 stack.enter_context(mock.patch.object(peer_steward, name, return_value=value))
             stack.enter_context(mock.patch.object(peer_steward.subprocess, "run", side_effect=world))
@@ -6877,7 +6520,9 @@ class ObservedStartTest(_TmpRootMixin, unittest.TestCase):
                     self.assertIn("start_verify=observed-pane", line)
                     self.assertEqual(sum(a[:3] == ["herdr", "agent", "start"] for a in world.calls), 1)
                     self.assertEqual(sum(a[:3] == ["herdr", "agent", "rename"] for a in world.calls), 1)
-                    self.assertFalse(any(a[1] == "pane" for a in world.calls))
+                    pane_info_reads = [a for a in world.calls
+                                       if a[:3] == ["herdr", "pane", "process-info"]]
+                    self.assertEqual(pane_info_reads, [])  # this case stubs the shared resolver
                     marker = peer_steward.peer_message.read_steward_markers()[("claude", "parent-sid")]
                     entry = marker["targets"]["observed-sid"]
                     self.assertEqual((entry["harness"], entry["pane"], entry["source"]), (kind, "w1:pM", "start"))

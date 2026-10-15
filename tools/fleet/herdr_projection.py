@@ -485,26 +485,14 @@ def _codex_tui_pane(session_id: str, *, transport=None):
     Two panes resolving to one session stay unknown: a badge on the wrong pane
     also misdirects peer messages.
     """
-    from fleet.collectors import procscan
-    endpoints = set()
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit() or _comm(int(entry)) != "codex":
-            continue
-        frontend_env = procscan.read_environ(int(entry))
-        pane = frontend_env.get("HERDR_PANE_ID")
-        socket_path = frontend_env.get("HERDR_SOCKET_PATH")
-        try:
-            if pane:
-                with _herdr_endpoint(socket_path):
-                    proven = verified_pane(pane, "codex", session_id, pid=int(entry),
-                                           socket_path=socket_path)
-                if proven:
-                    endpoints.add((proven, socket_path))
-        except Exception:
-            continue
-    if len(endpoints) != 1:
+    try:
+        from pane_ownership import codex_tui_pane_endpoint
+        pair = codex_tui_pane_endpoint(session_id)
+    except Exception:
+        pair = None
+    if pair is None:
         return None
-    pane, socket_path = endpoints.pop()
+    pane, socket_path = pair
     if transport is not None:
         transport.update(socket_path=socket_path)
     return pane

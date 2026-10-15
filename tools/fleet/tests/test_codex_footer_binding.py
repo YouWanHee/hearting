@@ -55,14 +55,13 @@ class CodexFooterBindingTest(unittest.TestCase):
             mock.patch.object(pane_ownership, "_native_session", side_effect=self.native_session),
             mock.patch.object(pane_ownership, "_registered_worker", side_effect=self.is_worker),
             mock.patch.object(procscan, "read_proc_start", side_effect=self.proc_start),
-            mock.patch("fleet.collectors.codex.process_for_thread", return_value=None),
             mock.patch.object(pane_ownership.subprocess, "run", side_effect=self.herdr),
             mock.patch.object(pane_ownership.shutil, "which", return_value="/fake/herdr"),
         ]
         for patcher in self.patches:
             patcher.start()
             self.addCleanup(patcher.stop)
-        env_patch = mock.patch.dict(os.environ, {"CODEX_THREAD_ID": ""})
+        env_patch = mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "HERDR_SOCKET_PATH": ""})
         env_patch.start()
         self.addCleanup(env_patch.stop)
 
@@ -111,16 +110,18 @@ class CodexFooterBindingTest(unittest.TestCase):
         return int(pid) in self.workers
 
     def herdr(self, command, **kwargs):
+        env = kwargs.get("env")
+        env = os.environ if env is None else env
         if "process-info" in command:
             pane = command[command.index("--pane") + 1]
-            self.info_reads.append((pane, dict(kwargs.get("env") or os.environ)))
-            socket_path = (kwargs.get("env") or os.environ).get("HERDR_SOCKET_PATH")
+            self.info_reads.append((pane, dict(env)))
+            socket_path = env.get("HERDR_SOCKET_PATH")
             info = self.process_info.get((socket_path, pane), self.process_info.get(pane, {}))
             result = {"result": {"process_info": info}}
             return subprocess.CompletedProcess(command, 0, json.dumps(result), "")
         if len(command) > 3 and command[1:3] == ["agent", "read"]:
             pane = command[3]
-            self.screen_reads.append((pane, kwargs.get("env")))
+            self.screen_reads.append((pane, None if kwargs.get("env") is None else dict(env)))
             queue = self.screens.get(pane, [""])
             output = queue.pop(0) if len(queue) > 1 else queue[0]
             return subprocess.CompletedProcess(command, 0, output, "")
@@ -256,14 +257,16 @@ class CodexFooterBindingTest(unittest.TestCase):
         self.add_frontend(pid, pane, THREAD_A)
         self.screens[pane] = ["Codex\n› Ask Codex\n\nfixture-project · " + THREAD_A + " · Fix it"
                               + "\n  ? for shortcuts"] * 2
-        self.assertEqual(pane_ownership.verified_pane(
-            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), pane)
-        self.screens[pane] = ["Codex\n› Ask Codex\n\nfixture-project · " + THREAD_A + " · " + THREAD_B
-                              + "\n  ? for shortcuts"] * 2
-        self.assertEqual(pane_ownership.verified_pane(
-            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
-        self.assertEqual(pane_ownership.verified_pane(
-            pane, "codex", THREAD_B, pid=pid, executable="/fake/herdr"), "")
+        scan = self.scan_panes([pid])
+        with scan[0], scan[1], scan[2]:
+            self.assertEqual(pane_ownership.verified_pane(
+                pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), pane)
+            self.screens[pane] = ["Codex\n› Ask Codex\n\nfixture-project · " + THREAD_A + " · " + THREAD_B
+                                  + "\n  ? for shortcuts"] * 2
+            self.assertEqual(pane_ownership.verified_pane(
+                pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
+            self.assertEqual(pane_ownership.verified_pane(
+                pane, "codex", THREAD_B, pid=pid, executable="/fake/herdr"), "")
 
     def test_frontend_default_socket_does_not_inherit_service_socket(self):
         pid, pane = 42131, "wA:pdefault"
@@ -307,22 +310,25 @@ class CodexFooterBindingTest(unittest.TestCase):
         with scan[0], scan[1], scan[2]:
             self.assertEqual(projection._codex_tui_pane(THREAD_A), "wB:p9")
 
-    def test_shared_caller_thread_maps_to_foreground_pid_without_footer(self):
+    def test_shared_caller_keeps_sender_thread_but_dual_root_has_no_pane(self):
         owner, pane, service = 42211, "wB:p-loader", 42212
-        record = self.add_frontend(owner, pane, THREAD_B)
+        self.add_frontend(owner, pane, THREAD_B)
         self.add_service(service, "stale:pane")
         self.native[owner] = ""  # process_identity is ambiguous across loaded root threads
         self.screens[pane] = ["Codex\n› Ask Codex\n\nproject · Context 80% used\n  ? for shortcuts"] * 2
         env = {"CODEX_THREAD_ID": THREAD_B}
         with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(pane_ownership.os, "listdir",
+                                  return_value=[str(owner), str(service)]), \
                 mock.patch.object(procscan, "read_environ",
                                   side_effect=lambda pid: self.frontend_env.get(int(pid), {})), \
-                mock.patch("fleet.collectors.codex.process_for_thread",
-                           return_value=(owner, record[5])):
+                mock.patch.object(pane_ownership, "_caller_runtime",
+                                  return_value=(self.records[service], True)):
+            self.assertEqual(pane_ownership.current_codex_thread_for_caller("stale:pane"), THREAD_B)
             self.assertEqual(pane_ownership.verified_pane(
-                "stale:pane", "codex", THREAD_B, pid=service, executable="/fake/herdr"), pane)
+                "stale:pane", "codex", THREAD_B, pid=service, executable="/fake/herdr"), "")
             self.assertEqual(pane_ownership.verified_pane(
-                "", "codex", THREAD_B, pid=service, executable="/fake/herdr"), pane)
+                "", "codex", THREAD_B, pid=service, executable="/fake/herdr"), "")
             self.screens[pane] = [screen(THREAD_A), screen(THREAD_A)]
             self.assertEqual(pane_ownership.verified_pane(
                 "stale:pane", "codex", THREAD_B, pid=service, executable="/fake/herdr"), "")
@@ -339,7 +345,9 @@ class CodexFooterBindingTest(unittest.TestCase):
                 pid, pane = 42300 + index, f"wB:p{index}"
                 self.add_frontend(pid, pane, THREAD_A)
                 self.screens[pane] = [content, content]
-                with mock.patch.object(pane_ownership, "_registered_worker", return_value=False):
+                scan = self.scan_panes([pid])
+                with scan[0], scan[1], scan[2], \
+                        mock.patch.object(pane_ownership, "_registered_worker", return_value=False):
                     expected = "" if index == 3 else pane
                     self.assertEqual(pane_ownership.verified_pane(
                         pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), expected)

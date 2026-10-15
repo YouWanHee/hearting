@@ -63,15 +63,25 @@ def codex_footer_threads(lines, *, current_id_only=False):
             for match in _THREAD_ID_RE.finditer(line)}
 
 
+def _herdr_env(socket_path):
+    """Bind a Herdr read to a supplied endpoint; ``""`` explicitly means default."""
+    if socket_path is None:
+        return None
+    env = dict(os.environ)
+    env.pop("HERDR_PANE_ID", None)
+    if socket_path:
+        env["HERDR_SOCKET_PATH"] = str(socket_path)
+    else:
+        env.pop("HERDR_SOCKET_PATH", None)
+    return env
+
+
 def _read_codex_footer_threads(pane, *, executable=None, socket_path=None):
     """Read one pane's visible screen and parse only its native Codex footer."""
     executable = executable or shutil.which("herdr")
     if not executable:
         return None
-    env = None
-    if socket_path:
-        env = {**os.environ, "HERDR_SOCKET_PATH": str(socket_path)}
-        env.pop("HERDR_PANE_ID", None)
+    env = _herdr_env(socket_path)
     try:
         result = subprocess.run(
             [executable, "agent", "read", str(pane), "--source", "visible", "--format", "ansi"],
@@ -175,10 +185,7 @@ def _native_session(pid, harness):
 
 
 def _pane_process_info(pane, *, executable, server=None, socket_path=None):
-    env = None
-    if socket_path:
-        env = {**os.environ, "HERDR_SOCKET_PATH": str(socket_path)}
-        env.pop("HERDR_PANE_ID", None)
+    env = _herdr_env(socket_path)
     command = [executable, *(["--session", server] if server else []),
                "pane", "process-info", "--pane", str(pane)]
     done = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL,
@@ -262,14 +269,18 @@ def current_codex_thread(pane, pid=None, *, executable=None, server=None, socket
                     pane, native_sid, candidate, record, group,
                     executable=executable, server=server, socket_path=socket_path):
                 continue
-        if _process(candidate) == record:
+        if (_process(candidate) == record
+                and _native_session(candidate, "codex") == native_sid):
             current_ids.add(native_sid)
     return next(iter(current_ids)) if len(current_ids) == 1 else ""
 
 
 def current_codex_thread_for_caller(pane, *, executable=None, server=None, socket_path=None):
     """Return the caller's exact CODEX_THREAD_ID or its process_identity thread."""
-    own, service = _caller_runtime(os.getpid(), "codex")
+    caller_pid = os.getpid()
+    if _registered_worker(caller_pid):
+        return None
+    own, service = _caller_runtime(caller_pid, "codex")
     if own is None:
         return None
     caller_sid = os.environ.get("CODEX_THREAD_ID", "")
@@ -284,6 +295,8 @@ def _loader_verified_pane(pane, session_id, owner_pid, owner_start, *,
                           executable, server=None, socket_path=None):
     """Confirm a caller-selected thread's exact loader PID in a herdr pane."""
     if _registered_worker(owner_pid):
+        return ""
+    if _native_session(owner_pid, "codex") != session_id:
         return ""
     record = _process(owner_pid)
     kind, service = _runtime(owner_pid)
@@ -317,61 +330,60 @@ def _loader_verified_pane(pane, session_id, owner_pid, owner_start, *,
     except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
         return ""
     return pane if (_process(owner_pid) == record and latest_group == group
-                    and owner_pid in latest_pids) else ""
+                    and owner_pid in latest_pids
+                    and _native_session(owner_pid, "codex") == session_id) else ""
 
 
-def _verified_codex_pane(pane, sid, caller_pid, *, executable, server=None, socket_path=None):
-    """Find the pane owned by this exact thread and confirm its foreground PID."""
-    from fleet.collectors import codex, procscan
+def codex_tui_pane_endpoint(session_id, *, pane_hint=None, executable=None):
+    """Return the unique proven ``(pane, socket_path)`` for a current Codex thread."""
+    if not _THREAD_ID_RE.fullmatch(session_id or ""):
+        return None
+    from fleet.collectors import procscan
 
-    caller_sid = os.environ.get("CODEX_THREAD_ID", "")
-    caller_sid = caller_sid if _THREAD_ID_RE.fullmatch(caller_sid) else ""
-    own, service = _caller_runtime(caller_pid, "codex")
-    if not own or caller_sid and caller_sid != sid:
-        return ""
-    if caller_sid:
-        session_id = caller_sid
-    elif not service:
-        session_id = _native_session(own[0], "codex")
-        if session_id != sid:
-            return ""
-    else:
-        return ""
-
-    runtime_env = procscan.read_environ(own[0])
-    owner = codex.process_for_thread(session_id, environ=runtime_env)
-    if owner:
-        owner_pid, owner_start = owner
-        if not service and owner_pid != own[0]:
-            return ""
-        owner_env = procscan.read_environ(owner_pid)
-        candidates = [pane, owner_env.get("HERDR_PANE_ID", "")]
-        seen = set()
-        for candidate in candidates:
-            candidate = str(candidate or "").strip()
-            if not candidate or candidate in seen:
+    executable = executable or shutil.which("herdr")
+    if not executable:
+        return None
+    try:
+        process_ids = [int(item) for item in os.listdir("/proc") if item.isdigit()]
+    except OSError:
+        return None
+    candidates = set()
+    for owner_pid in process_ids:
+        try:
+            kind, service = _runtime(owner_pid)
+            record = _process(owner_pid)
+            if kind != "codex" or service or not record or _registered_worker(owner_pid):
                 continue
-            seen.add(candidate)
-            if _loader_verified_pane(candidate, session_id, owner_pid, owner_start,
-                                     executable=executable, server=server,
-                                     socket_path=socket_path):
-                return candidate
-        return ""
-
-    if service or _native_session(own[0], "codex") != session_id:
-        return ""
-    own_env = procscan.read_environ(own[0])
-    candidates = [pane, own_env.get("HERDR_PANE_ID", "")]
-    seen = set()
-    for candidate in candidates:
-        candidate = str(candidate or "").strip()
-        if not candidate or candidate in seen:
+            if _native_session(owner_pid, "codex") != session_id:
+                continue
+            owner_env = procscan.read_environ(owner_pid)
+            pane = str(owner_env.get("HERDR_PANE_ID") or "").strip()
+            if not pane or pane_hint and pane != pane_hint:
+                continue
+            # The endpoint travels with the pane. An empty value is an explicit
+            # default-endpoint binding, never permission to inherit another socket.
+            socket_path = str(owner_env.get("HERDR_SOCKET_PATH") or "")
+            if owner_env.get("AGENT_HERDR_SESSION") and not socket_path:
+                continue  # a named server without its socket path cannot be carried safely
+            if _loader_verified_pane(
+                    pane, session_id, owner_pid, record[5], executable=executable,
+                    socket_path=socket_path):
+                candidates.add((pane, socket_path))
+        except Exception:
             continue
-        seen.add(candidate)
-        if current_codex_thread(candidate, own[0], executable=executable,
-                                server=server, socket_path=socket_path) == session_id:
-            return candidate
-    return ""
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _same_socket_endpoint(owner_socket, requested_socket, server):
+    requested = (os.environ.get("HERDR_SOCKET_PATH", "")
+                 if requested_socket is None else str(requested_socket or ""))
+    if server and not requested:
+        return False
+    if bool(owner_socket) != bool(requested):
+        return False
+    if not owner_socket:
+        return True
+    return os.path.realpath(owner_socket) == os.path.realpath(requested)
 
 
 def verified_pane(pane, harness, sid=None, *, pid=None, executable=None, server=None, socket_path=None):
@@ -393,6 +405,8 @@ def verified_pane(pane, harness, sid=None, *, pid=None, executable=None, server=
     if harness == "codex":
         try:
             caller_pid = os.getpid() if pid is None else int(pid)
+            if _registered_worker(caller_pid):
+                return ""
             own, service = _caller_runtime(caller_pid, "codex")
             if not own:
                 return ""
@@ -404,9 +418,12 @@ def verified_pane(pane, harness, sid=None, *, pid=None, executable=None, server=
                 target_sid = _native_session(own[0], "codex")
             if not target_sid or not _THREAD_ID_RE.fullmatch(target_sid):
                 return ""
-            return _verified_codex_pane(pane, target_sid, caller_pid,
-                                        executable=executable, server=server,
-                                        socket_path=socket_path)
+            pair = codex_tui_pane_endpoint(
+                target_sid, pane_hint=str(pane or "").strip() or None,
+                executable=executable)
+            if not pair or not _same_socket_endpoint(pair[1], socket_path, server):
+                return ""
+            return pair[0]
         except Exception:
             return ""
     try:

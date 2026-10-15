@@ -374,7 +374,12 @@ def _herdr_codex_agents() -> Optional[list[dict]]:
     if not exe:
         return None
     try:
-        done = subprocess.run([exe, "agent", "list"], capture_output=True, text=True,
+        server = os.environ.get("AGENT_HERDR_SESSION")
+        command = [exe]
+        if server:
+            command += ["--session", server]
+        command += ["agent", "list"]
+        done = subprocess.run(command, capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=HERDR_LOOKUP_TIMEOUT_SEC)
         agents = (json.loads(done.stdout or "").get("result") or {}).get("agents")
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
@@ -482,11 +487,20 @@ def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
 def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] = None,
                  source: str = "") -> Seat:
     env = os.environ if env is None else env
-    pane = (env.get("HERDR_PANE_ID") or "").strip()
-    if not pane and harness == "codex" and sid:
+    live_caller = env is os.environ
+    pane = ((env.get("HERDR_PANE_ID") or "").strip()
+            if live_caller or harness != "codex" else "")
+    server = env.get("AGENT_HERDR_SESSION") if live_caller else None
+    socket_value = env.get("HERDR_SOCKET_PATH", "") if live_caller else ""
+    endpoint_unproven = bool(harness == "codex" and server and not socket_value)
+    if live_caller and not endpoint_unproven and not pane and harness == "codex" and sid:
         pane = codex_pane_for_session(sid, str(cwd or ""), source)
     from pane_ownership import verified_pane
-    pane = verified_pane(pane, harness, sid, executable=_herdr_executable())
+    socket_path = (env.get("HERDR_SOCKET_PATH", "")
+                   if live_caller and harness == "codex" else None)
+    if (live_caller or harness != "codex") and not endpoint_unproven:
+        pane = verified_pane(pane, harness, sid, executable=_herdr_executable(),
+                             server=server, socket_path=socket_path)
     if pane:
         return Seat("pane", _digest("pane", pane), pane, harness or "", "")
     from session_tidy_native import caller_target

@@ -459,6 +459,20 @@ class DaemonCodexSeatTest(TidyCase):
         self.fake_herdr.chmod(0o755)
         self.agents([])
         self.env = {"HEARTING_TIDY_TEST_ROOT": str(self.iso.root), "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        self.proven = {}
+        proof = mock.patch.object(pane_ownership, "verified_pane", side_effect=self._verified_pane)
+        proof.start()
+        self.addCleanup(proof.stop)
+
+    def _verified_pane(self, pane, harness, sid=None, **kwargs):
+        if harness != "codex":
+            return pane or ""
+        expected = self.proven.get(sid)
+        endpoint = str(kwargs.get("socket_path") or "")
+        return pane if expected == (pane, endpoint) else ""
+
+    def prove(self, sid, pane, socket_path=""):
+        self.proven[sid] = (pane, socket_path)
 
     def agents(self, rows):
         self.agents_file.write_text(json.dumps({"id": "cli:agent:list", "result": {"agents": rows}}), encoding="utf-8")
@@ -470,7 +484,7 @@ class DaemonCodexSeatTest(TidyCase):
 
     def seat(self, harness="codex", sid="t-A", source="", cwd=None):
         with self.iso.patched_environ(self.env):
-            return st.resolve_seat(harness, str(cwd or self.cwd), {}, sid, source)
+            return st.resolve_seat(harness, str(cwd or self.cwd), None, sid, source)
 
     @staticmethod
     def pane_key(pane):
@@ -494,6 +508,7 @@ class DaemonCodexSeatTest(TidyCase):
 
     def test_the_one_codex_pane_with_the_thread_id_is_the_seat(self):
         self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-other")])
+        self.prove("t-A", "w:p1")
         seat = self.seat()
         self.assertEqual((seat.kind, seat.pane, seat.key), ("pane", "w:p1", self.pane_key("w:p1")))
 
@@ -521,13 +536,26 @@ class DaemonCodexSeatTest(TidyCase):
         with self.iso.patched_environ(self.env):
             own = st.resolve_seat("codex", str(self.cwd), {"HERDR_PANE_ID": "w:p5"}, "t-A")
             claude = st.resolve_seat("claude", str(self.cwd), {"HERDR_PANE_ID": "w:p5"}, "sid-A")
-        self.assertEqual((own.pane, claude.pane), ("w:p5", "w:p5"))
+        self.assertEqual((own.kind, own.pane, own.sid), ("project", "", "t-A"))
+        self.assertEqual(claude.pane, "w:p5")
         self.assertFalse(self.calls.exists(), self.calls.read_text() if self.calls.exists() else "")
+
+    def test_named_herdr_server_without_its_socket_keeps_codex_pane_unknown(self):
+        self.agents([self.agent("w:p1", "t-A")])
+        self.prove("t-A", "w:p1")
+        env = {**self.env, "AGENT_HERDR_SESSION": "secondary"}
+        with self.iso.patched_environ(env):
+            seat = st.resolve_seat("codex", str(self.cwd), None, "t-A")
+        self.assertEqual((seat.kind, seat.pane, seat.sid), ("project", "", "t-A"))
+        self.assertFalse(self.calls.exists())
 
     def test_a_pane_whose_ledger_knows_the_thread_keeps_it_while_herdr_shows_the_old_session(self):
         self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X")])
         self.assertEqual(self.seat(sid="t-B").kind, "project")      # nobody knows t-B
         self.know("w:p1", "t-B")
+        self.assertEqual(self.seat(sid="t-B").kind, "project")      # ledger is only a hint
+        self.prove("t-A", "w:p1")
+        self.prove("t-B", "w:p1")
         self.assertEqual(self.seat(sid="t-B").pane, "w:p1")
         self.assertEqual(self.seat(sid="t-C").kind, "project")
         self.know("w:p2", "t-B")                                     # two panes claim it: no decision
@@ -535,11 +563,13 @@ class DaemonCodexSeatTest(TidyCase):
         self.agents([self.agent("w:p1", "t-B"), self.agent("w:p2", "t-X")])
         self.assertEqual(self.seat(sid="t-B").pane, "w:p1")         # herdr's own value is decisive
         self.agents([self.agent("w:p3", "t-Y")])                     # the pane is gone: its ledger is not consulted
+        self.proven.pop("t-B", None)
         self.assertEqual(self.seat(sid="t-B").kind, "project")
 
     def test_the_first_hook_after_a_clear_belongs_to_the_one_window_waiting_for_its_successor(self):
         self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X", cwd=self.iso.root / "else")])
         self.book("w:p1", "t-A")
+        self.prove("t-B", "w:p1")
         self.assertEqual(self.seat(sid="t-B", source="clear").pane, "w:p1")
         self.book("w:p1", "t-A", status="unverified")
         self.assertEqual(self.seat(sid="t-B", source="clear").pane, "w:p1")
@@ -560,6 +590,7 @@ class DaemonCodexSeatTest(TidyCase):
         # Two Codex windows in one directory: the "one window waiting" rule gives up, the thread id
         # the clear read off w:p1's own screen does not.
         self.agents([self.agent("w:p1", "t-A"), self.agent("w:p2", "t-X")])
+        self.prove("t-B", "w:p1")
         key = self.pane_key("w:p1")
         with self.iso.patched_environ(self.env):
             seat = st.Seat("pane", key, "w:p1", "codex", "")
@@ -584,7 +615,7 @@ class DaemonCodexSeatTest(TidyCase):
         self.assertEqual(self.seat(sid="t-B").pane, "w:p1")
         out = []
         with self.iso.patched_environ(self.env):
-            st.run_hook("codex", "start", "t-B", source="clear", cwd=str(self.cwd), env={}, emit=out.append)
+            st.run_hook("codex", "start", "t-B", source="clear", cwd=str(self.cwd), emit=out.append)
         self.assertIn("표식-정확일치", "".join(out))
 
     def test_a_second_codex_window_in_the_directory_or_no_booking_is_no_decision(self):
@@ -597,17 +628,18 @@ class DaemonCodexSeatTest(TidyCase):
 
     def test_the_hook_card_and_successor_work_through_the_pane_found_in_herdr(self):
         self.agents([self.agent("w:p1", "t-A")])
+        self.prove("t-A", "w:p1")
+        self.prove("t-B", "w:p1")
         with self.iso.patched_environ(self.env):
-            st.run_hook("codex", "start", "t-A", cwd=str(self.cwd), env={}, emit=lambda _t: None)
-            card = self.cli("card", "--harness", "codex", "--session-id", "t-A",
-                            "--text", "표식-데몬", pane=None, extra=self.env, cwd=self.cwd)
-        self.assertEqual(card.returncode, 0, card.stderr)
-        self.assertIn(f"seat={self.pane_key('w:p1')}", card.stdout)
+            seat = self.seat(sid="t-A")
+            self.assertEqual(seat.pane, "w:p1")
+            st.write_card(seat, "codex", "t-A", "표식-데몬", cwd=str(self.cwd))
+            st.run_hook("codex", "start", "t-A", cwd=str(self.cwd), emit=lambda _t: None)
         # /clear: herdr keeps showing t-A, the auto-clear booking waits; t-B's start hook is the first sign of it.
         self.book("w:p1", "t-A")
         out = []
         with self.iso.patched_environ(self.env):
-            st.run_hook("codex", "start", "t-B", source="clear", cwd=str(self.cwd), env={}, emit=out.append)
+            st.run_hook("codex", "start", "t-B", source="clear", cwd=str(self.cwd), emit=out.append)
         self.assertIn("표식-데몬", "".join(out))
         with clear_booking_seen(self, "w:p1") as booking:
             self.assertEqual(booking["observed"]["sid"], "t-B")      # the clear helper sees its successor
@@ -617,11 +649,12 @@ class DaemonCodexSeatTest(TidyCase):
         # a project-seat session of the same project does not get the pane's card
         out = []
         with self.iso.patched_environ(self.env):
-            st.run_hook("codex", "start", "t-Z", cwd=str(self.cwd), env={}, emit=out.append)
+            st.run_hook("codex", "start", "t-Z", cwd=str(self.cwd), emit=out.append)
         self.assertEqual("".join(out), "")
 
     def test_enqueue_books_the_auto_clear_for_the_pane_found_in_herdr(self):
         self.agents([self.agent("w:p1", "t-A")])
+        self.prove("t-A", "w:p1")
         started = []
         with self.iso.patched_environ(self.env), \
                 mock.patch.object(clear, "_start_helper", side_effect=lambda key, nonce: started.append(key) or 4242):
@@ -638,8 +671,10 @@ class DaemonCodexSeatTest(TidyCase):
     def test_the_handover_storage_lookup_finds_the_pane_of_a_daemon_codex_session(self):
         import dispatch_seat_handover as handover
         self.agents([self.agent("w:p1", "t-A")])
+        self.prove("t-A", "w:p1")
         with self.iso.patched_environ(self.env):
-            self.assertEqual(handover.pane_seat({}, "codex", "t-A").pane, "w:p1")
+            self.assertIsNone(handover.pane_seat({}, "codex", "t-A"))
+            self.assertEqual(handover.pane_seat(os.environ, "codex", "t-A").pane, "w:p1")
             self.assertIsNone(handover.pane_seat({}, None, "t-A"))
             self.assertIsNone(handover.pane_seat({}, "claude", "t-A"))
             self.assertEqual(handover.storage_recipients("t-A", {}, "codex"), [("t-A", None)])
@@ -2686,7 +2721,7 @@ class SeatHandoverTest(TidyCase):
     def retire(self, old, old_harness, new, new_harness, pane=PANE_BESIDE):
         with self.iso.patched_environ({"HERDR_PANE_ID": pane}):
             return self.handover.record_retire_handover(old, old_harness, new, new_harness,
-                                                        env={"HERDR_PANE_ID": pane}, jobs=self.jobs)
+                                                        env=os.environ, jobs=self.jobs)
 
     def test_a_retire_from_the_pane_beside_hands_a_codex_route_to_a_claude_successor(self):
         # RA-2 (decision 5f0f10): BC [62] codex -> Claude successor; the registry row stays as it is.

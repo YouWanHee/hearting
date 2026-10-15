@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 import socket
@@ -48,10 +49,12 @@ _SID_RE = re.compile(r"-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 _INDEX = {"ts": 0.0, "map": None, "home": None}   # cwd → rollout paths (newest first)
 _INDEX_TTL = 1.5
-_START_MATCH_BEFORE_SEC = 5.0
-_START_MATCH_AFTER_SEC = 30.0
-_FALLBACK_CLAIMS = {"ts": 0.0, "sids": set()}  # session ids assigned without a proc fd
-_DAEMON_ORIGINS = {}  # control socket -> loaded thread id -> (origin port, thread source)
+_DAEMON_ORIGINS = {}  # live control-socket identity -> complete loaded thread observations
+_DAEMON_RPC_SECONDS = 6.0
+_DAEMON_RPC_TIMEOUT = 1.5
+_DAEMON_MAX_PAGES = 16
+_DAEMON_PAGE_SIZE = 100
+_DAEMON_MAX_THREADS = 512
 _PROC_PATHS = {}                                  # pid -> rollout reserved at collect tick start
 _CFG = {"ts": 0.0, "model": None, "effort": None}
 _TITLE_INDEX = {"stamp": None, "map": {}, "runtime_map": {}}   # native state stamps -> sid: title
@@ -1122,28 +1125,6 @@ def _proc_rollout(pid, cwd, home):
     return None
 
 
-def _registered_thread(pid):
-    """The thread a launcher bound to this exact process, or None.
-
-    `peer-steward start --kind codex` proves the thread of a daemon-attached TUI (which holds
-    no rollout) from the one new root rollout and writes the tier-1 record for the TUI pid. The
-    record counts only while its `procStart` still equals the live process's start time, so a
-    recycled pid, or a record with no start time, is not proof.
-    """
-    try:
-        record = session_registry.read("codex", pid)
-    except Exception:
-        return None
-    if not record:
-        return None
-    from . import procscan
-    claimed = record.get("procStart")
-    thread = record.get("sessionId")
-    if claimed is None or str(claimed) != str(procscan.read_proc_start(pid) or ""):
-        return None
-    if not isinstance(thread, str) or _sid("rollout-x-%s.jsonl" % thread) != thread:
-        return None
-    return thread
 
 
 def _control_socket(environ):
@@ -1163,7 +1144,9 @@ def _origin_port(value):
         return None
     try:
         origin = urlsplit(value)
-        if origin.scheme != "http" or origin.hostname != "127.0.0.1":
+        if (origin.scheme != "http" or origin.hostname != "127.0.0.1"
+                or origin.username is not None or origin.password is not None
+                or origin.path or origin.query or origin.fragment):
             return None
         port = origin.port
     except (TypeError, ValueError):
@@ -1175,129 +1158,262 @@ def _thread_source(thread):
     if not isinstance(thread, dict):
         return None
     value = thread.get("threadSource") or thread.get("thread_source")
-    if isinstance(value, str) and value:
-        return value.lower()
-    source = thread.get("source")
-    if source == "subagent" or isinstance(source, dict) and "subagent" in source:
+    source = value.lower() if isinstance(value, str) and value else None
+    legacy_source = thread.get("source")
+    parent = thread.get("parentThreadId")
+    if (source == "subagent" or isinstance(parent, str) and parent
+            or isinstance(legacy_source, dict) and "subagent" in legacy_source):
         return "subagent"
+    if source in {"user", "root"} or "parentThreadId" in thread and parent is None:
+        return "user"
     return None
 
 
+class _DaemonOrigins(dict):
+    """One complete loaded-thread snapshot tied to a live control socket inode."""
+
+    def __init__(self, values, *, endpoint, cache_key):
+        super().__init__(values)
+        self.endpoint = endpoint
+        self.cache_key = cache_key
+
+
+def _invalidate_daemon_cache(endpoint=None):
+    if endpoint is None:
+        _DAEMON_ORIGINS.clear()
+        return
+    endpoint = str(endpoint)
+    for key in tuple(_DAEMON_ORIGINS):
+        if isinstance(key, tuple) and key and key[0] == endpoint:
+            _DAEMON_ORIGINS.pop(key, None)
+
+
+def _control_socket_identity(endpoint):
+    """Return the safe, live Unix-socket identity used to bind daemon observations."""
+    from pathlib import Path
+    from codex_queue_delivery import resolve_endpoint
+
+    resolved = resolve_endpoint(Path(endpoint))
+    info = resolved.lstat()
+    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077):
+        return None
+    return (str(resolved), info.st_dev, info.st_ino, info.st_uid,
+            stat.S_IMODE(info.st_mode))
+
+
+def _daemon_request(client, method, params, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Codex daemon observation deadline expired")
+    connection = getattr(client, "socket", None)
+    if connection is not None:
+        connection.settimeout(min(_DAEMON_RPC_TIMEOUT, remaining))
+    return client.request(method, params)
+
+
+def _daemon_read_pages(client, method, params, deadline, *, max_items):
+    """Read one schema-paged list completely, rejecting loops and exhausted budgets."""
+    values = []
+    cursor = None
+    seen = set()
+    for _page in range(_DAEMON_MAX_PAGES):
+        request = dict(params)
+        request["limit"] = _DAEMON_PAGE_SIZE
+        if cursor is not None:
+            request["cursor"] = cursor
+        response = _daemon_request(client, method, request, deadline)
+        data = response.get("data")
+        if not isinstance(data, list):
+            raise ValueError("Codex daemon list response omitted data")
+        values.extend(data)
+        if len(values) > max_items:
+            raise ValueError("Codex daemon list exceeded its observation limit")
+        next_cursor = response.get("nextCursor")
+        if next_cursor is None:
+            return values
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen:
+            raise ValueError("Codex daemon returned an invalid or looping cursor")
+        seen.add(next_cursor)
+        cursor = next_cursor
+    raise ValueError("Codex daemon page budget exhausted")
+
+
 def _daemon_thread_origins(environ):
-    """Read loaded Codex TUI MCP origins; cache each thread until it unloads.
+    """Read a complete loaded/source/status snapshot, caching only loaded threads.
 
     The only daemon calls are initialize, thread/loaded/list,
     mcpServerStatus/list, and a turns-free thread/read for its root/subagent marker.
-    All are observations; no thread is resumed, subscribed, or modified.
+    All are observations; no thread is resumed, subscribed, or modified. Any failed
+    page or per-thread read invalidates the whole cache so an old unique result cannot
+    survive an incomplete observation.
     """
+    endpoint_path = None
+    cache_key = None
+    client = None
     try:
         endpoint = _control_socket(environ)
-        key = os.path.realpath(endpoint)
+        identity = _control_socket_identity(endpoint)
+        if identity is None:
+            raise OSError("Codex control socket identity is unavailable")
+        endpoint_path = identity[0]
+        cache_key = identity
+        # A replacement at the same pathname starts a fresh cache lifetime.
+        for old_key in tuple(_DAEMON_ORIGINS):
+            if (isinstance(old_key, tuple) and old_key and old_key[0] == endpoint_path
+                    and old_key != cache_key):
+                _DAEMON_ORIGINS.pop(old_key, None)
+        cache = _DAEMON_ORIGINS.get(cache_key)
+        if cache is None:
+            cache = {}
         utilities = os.path.abspath(os.path.join(
             os.path.dirname(__file__), "..", "..", "..", "utilities"))
         if utilities not in sys.path:
             sys.path.insert(0, utilities)
         from codex_queue_delivery import _connect
-        client = _connect(endpoint, 1.5)
+        deadline = time.monotonic() + _DAEMON_RPC_SECONDS
+        client = _connect(endpoint, min(_DAEMON_RPC_TIMEOUT, _DAEMON_RPC_SECONDS))
     except Exception:
+        _invalidate_daemon_cache(endpoint_path)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
         return None
     try:
-        loaded = client.request("thread/loaded/list", {})
-        rows = loaded.get("data")
-        if not isinstance(rows, list):
-            return None
+        connection = getattr(client, "socket", None)
+        if connection is not None:
+            connection.settimeout(min(_DAEMON_RPC_TIMEOUT, deadline - time.monotonic()))
+        client.initialize()
+        rows = _daemon_read_pages(client, "thread/loaded/list", {}, deadline,
+                                  max_items=_DAEMON_MAX_THREADS)
         thread_ids = []
-        for row in rows:
-            if isinstance(row, str):
-                thread_id = row
-            elif isinstance(row, dict):
-                thread_id = row.get("id") or row.get("threadId")
-            else:
-                thread_id = None
-            if (isinstance(thread_id, str)
-                    and _sid("rollout-x-%s.jsonl" % thread_id) == thread_id):
-                thread_ids.append(thread_id)
-        thread_ids = list(dict.fromkeys(thread_ids))
-        cache = _DAEMON_ORIGINS.setdefault(key, {})
+        for thread_id in rows:
+            if (not isinstance(thread_id, str)
+                    or _sid("rollout-x-%s.jsonl" % thread_id) != thread_id
+                    or thread_id in thread_ids):
+                raise ValueError("Codex daemon returned an invalid or duplicate loaded thread")
+            thread_ids.append(thread_id)
         loaded_ids = set(thread_ids)
         for thread_id in tuple(cache):
             if thread_id not in loaded_ids:
                 del cache[thread_id]
         missing = [thread_id for thread_id in thread_ids if thread_id not in cache]
         for thread_id in missing:
+            thread_result = _daemon_request(client, "thread/read", {
+                "threadId": thread_id, "includeTurns": False,
+            }, deadline)
+            thread = thread_result.get("thread")
+            if not isinstance(thread, dict) or thread.get("id") != thread_id:
+                raise ValueError("Codex daemon omitted loaded-thread source metadata")
+            source = _thread_source(thread)
+            if source not in {"user", "subagent"}:
+                raise ValueError("Codex daemon thread root/source is unknown")
+
+            statuses = _daemon_read_pages(client, "mcpServerStatus/list", {
+                "threadId": thread_id, "serverName": "codex_tui",
+                "detail": "toolsAndAuthOnly",
+            }, deadline, max_items=128)
+            if any(not isinstance(item, dict) or not isinstance(item.get("name"), str)
+                   for item in statuses):
+                raise ValueError("Codex daemon returned malformed MCP status data")
+            entries = [item for item in statuses
+                       if item.get("name") == "codex_tui"]
+            if len(entries) > 1:
+                raise ValueError("Codex daemon returned duplicate codex_tui status entries")
             origin_port = None
-            source = None
-            try:
-                status = client.request("mcpServerStatus/list", {
-                    "threadId": thread_id, "serverName": "codex_tui",
-                    "detail": "toolsAndAuthOnly",
-                })
-                data = status.get("data")
-                entries = data if isinstance(data, list) else []
-                entry = next((item for item in entries
-                              if isinstance(item, dict) and item.get("name") == "codex_tui"), None)
-                if entry:
+            if entries:
+                entry = entries[0]
+                runtime_status = entry.get("runtimeStatus")
+                if runtime_status is None:
+                    raise ValueError("Codex daemon MCP status is incomplete")
+                if runtime_status == "connected":
                     origin_port = _origin_port(entry.get("httpOrigin"))
-                    source = _thread_source(entry)
-                thread = client.request("thread/read", {
-                    "threadId": thread_id, "includeTurns": False,
-                }).get("thread")
-                source = _thread_source(thread) or source
-                if source == "subagent" or source and origin_port:
-                    cache[thread_id] = (origin_port, source)
-            except Exception:
-                # A transient daemon/read failure is retried on the next snapshot.
-                continue
-        return dict(cache)
+                    if origin_port is None:
+                        raise ValueError("Codex daemon returned an unusable codex_tui origin")
+                elif runtime_status not in {
+                        "notStarted", "starting", "authenticationRequired", "failed",
+                        "cancelled", "disabled"}:
+                    raise ValueError("Codex daemon returned an unknown MCP runtime status")
+            cache[thread_id] = (origin_port, source)
+
+        if _control_socket_identity(endpoint) != cache_key:
+            raise OSError("Codex control socket changed during observation")
+        _DAEMON_ORIGINS[cache_key] = cache
+        return _DaemonOrigins(cache, endpoint=endpoint, cache_key=cache_key)
     except Exception:
+        _invalidate_daemon_cache(endpoint_path)
         return None
     finally:
-        client.close()
-
-
-def _tcp_listener_inodes(port):
-    inodes = set()
-    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
-            with open(table, encoding="ascii", errors="replace") as handle:
-                rows = handle.read().splitlines()[1:]
-        except OSError:
-            continue
-        for row in rows:
-            fields = row.split()
-            try:
-                if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
-                    inodes.add(fields[9])
-            except (IndexError, ValueError):
-                continue
-    return inodes
+            client.close()
+        except Exception:
+            pass
 
 
-def _tcp_listener_owners(port):
-    inodes = _tcp_listener_inodes(port)
+def _tcp_listener_snapshot(port):
+    """Return the exact IPv4 LISTEN inode and same-UID owner sets, or unknown."""
+    inodes = set()
+    try:
+        with open("/proc/net/tcp", encoding="ascii", errors="strict") as handle:
+            rows = handle.read().splitlines()[1:]
+    except (OSError, UnicodeError):
+        return None
+    for row in rows:
+        fields = row.split()
+        try:
+            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add(fields[9])
+        except (IndexError, ValueError):
+            return None
     if not inodes:
-        return set()
+        return frozenset(), frozenset()
     owners = set()
     try:
-        pids = (name for name in os.listdir("/proc") if name.isdigit())
+        pids = [name for name in os.listdir("/proc") if name.isdigit()]
     except OSError:
-        return owners
+        return None
     for raw_pid in pids:
-        pid = int(raw_pid)
         try:
-            if os.stat("/proc/%s" % raw_pid).st_uid != os.geteuid():
+            process_stat = os.stat("/proc/%s" % raw_pid)
+            if process_stat.st_uid != os.geteuid():
                 continue
-            for fd in os.listdir("/proc/%s/fd" % raw_pid):
+            fd_dir = "/proc/%s/fd" % raw_pid
+            try:
+                fds = os.listdir(fd_dir)
+            except FileNotFoundError:
+                continue
+            for fd in fds:
                 try:
-                    link = os.readlink("/proc/%s/fd/%s" % (raw_pid, fd))
-                except OSError:
+                    link = os.readlink("%s/%s" % (fd_dir, fd))
+                except FileNotFoundError:
                     continue
                 if link.startswith("socket:[") and link[8:-1] in inodes:
-                    owners.add(pid)
+                    owners.add(int(raw_pid))
                     break
-        except OSError:
+        except FileNotFoundError:
             continue
-    return owners
+        except OSError:
+            return None
+    return frozenset(inodes), frozenset(owners)
+
+
+def _daemon_endpoint_current(origins):
+    try:
+        return _control_socket_identity(origins.endpoint) == origins.cache_key
+    except Exception:
+        return False
+
+
+def _listener_unchanged(port, observed):
+    current = _tcp_listener_snapshot(port)
+    return current is not None and current == observed
+
+
+def _invalidate_origins(origins):
+    key = getattr(origins, "cache_key", None)
+    _invalidate_daemon_cache(key[0] if isinstance(key, tuple) and key else None)
 
 
 def _live_tui_start(pid):
@@ -1327,13 +1443,23 @@ def _daemon_session_for_process(pid, environ=None):
     for thread_id, (port, source) in origins.items():
         if not port or not source or source == "subagent":
             continue
-        owners = listeners.get(port)
-        if owners is None:
-            owners = _tcp_listener_owners(port)
-            listeners[port] = owners
-        if owners == {int(pid)}:
+        observed = listeners.get(port)
+        if observed is None:
+            observed = _tcp_listener_snapshot(port)
+            if observed is None:
+                _invalidate_origins(origins)
+                return None
+            listeners[port] = observed
+        inodes, owners = observed
+        if inodes and owners == {int(pid)}:
             candidates.add(thread_id)
-    if len(candidates) != 1 or procscan.read_proc_start(pid) != start:
+    if len(candidates) != 1:
+        return None
+    if (not _daemon_endpoint_current(origins)
+            or any(not _listener_unchanged(port, observed)
+                   for port, observed in listeners.items())
+            or procscan.read_proc_start(pid) != start):
+        _invalidate_origins(origins)
         return None
     return next(iter(candidates))
 
@@ -1351,12 +1477,23 @@ def process_for_thread(thread_id, environ=None):
     port, source = row
     if not port or not source or source == "subagent":
         return None
-    owners = _tcp_listener_owners(port)
-    candidates = [(pid, _live_tui_start(pid)) for pid in owners]
-    candidates = [(pid, start) for pid, start in candidates if start]
-    if len(candidates) != 1 or procscan.read_proc_start(candidates[0][0]) != candidates[0][1]:
+    observed = _tcp_listener_snapshot(port)
+    if observed is None:
+        _invalidate_origins(origins)
         return None
-    return candidates[0]
+    inodes, owners = observed
+    if not inodes or len(owners) != 1:
+        return None
+    pid = next(iter(owners))
+    start = _live_tui_start(pid)
+    if not start:
+        return None
+    if (not _daemon_endpoint_current(origins)
+            or not _listener_unchanged(port, observed)
+            or procscan.read_proc_start(pid) != start):
+        _invalidate_origins(origins)
+        return None
+    return pid, start
 
 
 def session_id_of_process(pid, live_codex=None):
@@ -1391,26 +1528,13 @@ def session_id_of_process(pid, live_codex=None):
     return _daemon_session_for_process(pid, initial_env)
 
 
-def _mutual_fallback_rollout(pid, sessions, home, paths, claimed):
-    """The board's same-cwd fallback, accepted only when no rival process shares it."""
-    sess = next((s for s in sessions if getattr(s, "pid", None) == pid), None)
-    if sess is None or not getattr(sess, "cwd", None):
-        return None
-    now = time.time()
-    candidates = _fallback_candidates(sess, home, claimed, now)
-    if len(candidates) != 1:
-        return None
-    for rival in sessions:
-        if (rival is sess or getattr(rival, "harness", None) != "codex"
-                or getattr(rival, "cwd", None) != sess.cwd or rival.pid in paths):
-            continue
-        if candidates[0] in _fallback_candidates(rival, home, claimed, now, rival=True):
-            return None
-    return candidates[0]
+
+
 
 
 def _session_created(meta):
-    value = meta.get("timestamp")
+    """Parse a rollout's persisted creation time for context-policy telemetry."""
+    value = meta.get("timestamp") if isinstance(meta, dict) else None
     if not isinstance(value, str):
         return None
     try:
@@ -1442,80 +1566,8 @@ def _process_started_at(sess):
     return boot + ticks / clock_ticks
 
 
-_START_MATCH_MAX_VERTICES = 256
-_START_MATCH_MAX_EDGES = 16384
 
 
-def _unique_full_matching(edges):
-    """Return a unique process→root matching, or None for unknown/ambiguous graphs.
-
-    The iterative augmenting-path search is O(P·E). After one perfect matching
-    is found, an alternating cycle in the directed unmatched-edge graph is exactly
-    the condition for a second perfect matching; Kahn's cycle check is O(P+E).
-    """
-    process_ids = list(edges)
-    roots = set().union(*(edges[pid] for pid in process_ids)) if process_ids else set()
-    edge_count = sum(len(edges[pid]) for pid in process_ids)
-    if (not process_ids or len(process_ids) != len(roots)
-            or len(process_ids) + len(roots) > _START_MATCH_MAX_VERTICES
-            or edge_count > _START_MATCH_MAX_EDGES):
-        return None
-
-    root_owner, process_root = {}, {}
-    for start_pid in process_ids:
-        queue = [start_pid]
-        parent_process = {start_pid: None}
-        parent_root = {}
-        free_root = None
-        cursor = 0
-        while cursor < len(queue) and free_root is None:
-            pid = queue[cursor]
-            cursor += 1
-            for root in edges[pid]:
-                if root in parent_root:
-                    continue
-                parent_root[root] = pid
-                owner = root_owner.get(root)
-                if owner is None:
-                    free_root = root
-                    break
-                if owner not in parent_process:
-                    parent_process[owner] = root
-                    queue.append(owner)
-        if free_root is None:
-            return None
-        root = free_root
-        while root is not None:
-            pid = parent_root[root]
-            previous_root = parent_process[pid]
-            root_owner[root] = pid
-            process_root[pid] = root
-            root = previous_root
-
-    outgoing = {pid: set() for pid in process_ids}
-    indegree = {pid: 0 for pid in process_ids}
-    for pid in process_ids:
-        for root in edges[pid]:
-            if root == process_root[pid]:
-                continue
-            owner = root_owner.get(root)
-            if owner is None:
-                return None
-            if owner not in outgoing[pid]:
-                outgoing[pid].add(owner)
-                indegree[owner] += 1
-    ready = [pid for pid, degree in indegree.items() if degree == 0]
-    removed = 0
-    while ready:
-        pid = ready.pop()
-        removed += 1
-        for neighbor in outgoing[pid]:
-            indegree[neighbor] -= 1
-            if indegree[neighbor] == 0:
-                ready.append(neighbor)
-    if removed != len(process_ids):
-        return None
-    return process_root
 
 
 def process_rollouts(sessions, home):
@@ -1542,234 +1594,10 @@ def process_rollouts(sessions, home):
     return paths, claimed
 
 
-def _reserve_start_matched_rollouts(sessions, home, paths, claimed):
-    """Consume a component only when its exact-start full matching is unique.
-
-    The observed candidate graph need not be the world's complete cohort. Thus
-    ambiguity, malformed observations, and bounded-work refusals remain unknown.
-    """
-    from . import procscan
-
-    by_cwd = {}
-    registry_claims = {}
-    registry_owners = {}
-    eligible = []
-    for sess in sessions:
-        if (getattr(sess, "harness", None) != "codex"
-                or not getattr(sess, "cwd", None)
-                or getattr(sess, "app_server", False)
-                or getattr(sess, "managed_dir", None)
-                or getattr(sess, "is_child", False)):
-            continue
-        eligible.append(sess)
-        sid = _registered_thread(sess.pid)
-        if sid:
-            registry_claims[sess.pid] = sid
-            registry_owners.setdefault(sid, set()).add(sess.pid)
-
-    # A registry row reserves its full SID even when multiple validated PIDs
-    # claim it. Only a sole owner may recover a missing path, and never by
-    # duplicating a path already held independently through an open FD.
-    initially_claimed = set(claimed)
-    fd_owned_sids = {_sid(path) for path in paths.values() if _sid(path)}
-    for sid in registry_owners:
-        claimed.add(sid)
-    for sess in eligible:
-        sid = registry_claims.get(sess.pid)
-        if sid:
-            if (len(registry_owners[sid]) == 1 and sess.pid not in paths
-                    and sid not in initially_claimed and sid not in fd_owned_sids):
-                registered_path = exact_rollout_for_session_id(sid, homes=[home])
-                if registered_path:
-                    registered_meta = _rollout_meta(registered_path)
-                    if (isinstance(registered_meta, dict)
-                            and _sid(registered_path) == sid
-                            and os.path.realpath(registered_meta.get("cwd") or "")
-                            == os.path.realpath(sess.cwd)):
-                        paths[sess.pid] = registered_path
-            continue
-        if sess.pid in paths:
-            continue
-        cwd = os.path.realpath(sess.cwd)
-        by_cwd.setdefault(cwd, []).append((sess, _process_started_at(sess)))
-
-    index = {}
-    for indexed_cwd, indexed_paths in _index(home).items():
-        index.setdefault(os.path.realpath(indexed_cwd), []).extend(indexed_paths)
-    for cwd, started_sessions in by_cwd.items():
-        # A missing process start can affect membership of any observed edge in
-        # this bucket. Keep the old single-process control when it has no peer.
-        if any(started is None for _sess, started in started_sessions):
-            if len(started_sessions) > 1:
-                continue
-            started_sessions = [(sess, started) for sess, started in started_sessions
-                                if started is not None]
-        if not started_sessions:
-            continue
-
-        roots_by_sid = {}
-        invalid_paths = set()
-        invalid_observation = False
-        for indexed_path in index.get(cwd, []):
-            path = os.path.realpath(indexed_path)
-            meta = _rollout_meta(path)
-            if not isinstance(meta, dict) or not meta:
-                invalid_observation = True
-                continue
-            meta_cwd = meta.get("cwd")
-            if not isinstance(meta_cwd, str) or not meta_cwd:
-                invalid_observation = True
-                continue
-            if os.path.realpath(meta_cwd) != cwd or _is_subagent(meta):
-                continue
-            sid = _sid(path)
-            if not sid:
-                invalid_observation = True
-                continue
-            declared = []
-            malformed_declared = False
-            for field in ("id", "session_id"):
-                if field not in meta:
-                    continue
-                value = meta[field]
-                if (not isinstance(value, str)
-                        or _sid("rollout-declared-%s.jsonl" % value) != value):
-                    malformed_declared = True
-                    continue
-                declared.append(value)
-            created = _session_created(meta)
-            if created is None:
-                invalid_observation = True
-                continue
-            if (malformed_declared or any(value != sid for value in declared)
-                    or len(set(declared)) > 1):
-                invalid_paths.add(path)
-            roots_by_sid.setdefault(sid, set()).add(path)
-        if invalid_observation:
-            continue
-
-        duplicate_sids = {sid for sid, candidates in roots_by_sid.items()
-                          if len(candidates) > 1}
-        duplicate_paths = {path for sid in duplicate_sids
-                           for path in roots_by_sid[sid]}
-        roots = {path: sid for sid, candidates in roots_by_sid.items()
-                 if sid not in claimed for path in candidates}
-        edges = {}
-        process_homes = {}
-        for sess, _started in started_sessions:
-            env = procscan.read_environ(sess.pid)
-            raw_home = env.get("CODEX_HOME") or (
-                os.path.join(env["HOME"], ".codex") if env.get("HOME") else None)
-            process_homes[sess.pid] = (
-                os.path.realpath(os.path.abspath(raw_home)) if raw_home else None)
-        for sess, started in started_sessions:
-            if registry_claims.get(sess.pid):
-                continue
-            if process_homes[sess.pid] and process_homes[sess.pid] != os.path.realpath(os.path.abspath(home)):
-                continue
-            candidates = set()
-            for path, sid in roots.items():
-                meta = _rollout_meta(path)
-                created = _session_created(meta)
-                if created is not None:
-                    delay = created - started
-                    if -_START_MATCH_BEFORE_SEC <= delay <= _START_MATCH_AFTER_SEC:
-                        candidates.add(path)
-            if candidates:
-                edges[sess.pid] = candidates
-
-        roots_to_pids = {}
-        for pid, candidates in edges.items():
-            for path in candidates:
-                roots_to_pids.setdefault(path, set()).add(pid)
-        unseen = set(edges)
-        while unseen:
-            first = unseen.pop()
-            component_pids, component_roots = {first}, set()
-            queue = [first]
-            while queue:
-                pid = queue.pop()
-                for path in edges[pid]:
-                    if path in component_roots:
-                        continue
-                    component_roots.add(path)
-                    for owner in roots_to_pids[path]:
-                        if owner not in component_pids:
-                            component_pids.add(owner)
-                            unseen.discard(owner)
-                            queue.append(owner)
-            component = {pid: edges[pid] & component_roots for pid in component_pids}
-            if component_roots & (invalid_paths | duplicate_paths):
-                continue
-            matching = _unique_full_matching(component)
-            if matching is None:
-                continue
-
-            if len(component_pids) > 1:
-                sessions_by_pid = {sess.pid: sess for sess, _started in started_sessions}
-                safe = True
-                for pid in component_pids:
-                    sess = sessions_by_pid[pid]
-                    if str(procscan.read_proc_start(pid) or "") != str(sess.proc_start or ""):
-                        safe = False
-                        break
-                    if (not process_homes[pid]
-                            or process_homes[pid] != os.path.realpath(os.path.abspath(home))):
-                        safe = False
-                        break
-                if not safe:
-                    continue
-
-            assigned_sids = [_sid(path) for path in matching.values()]
-            if (None in assigned_sids or len(set(assigned_sids)) != len(assigned_sids)
-                    or any(sid in claimed for sid in assigned_sids)):
-                continue
-            paths.update(matching)
-            claimed.update(assigned_sids)
 
 
-def _fallback_candidates(sess, home, claimed, now, *, rival=False):
-    """Unclaimed same-cwd root rollouts created since this process started.
-
-    A rollout older than the process is not its own: a closed window's thread
-    in the same cwd is unclaimed, and a 300 s slack once handed it to the fresh
-    Codex started 61 s later (2026-10-10). The exact /proc start keeps the start
-    match's tolerance; without it, whole-minute `etime` widens by its rounding only.
-    A `rival` keeps the former slack: a resumed Codex holds no rollout fd and may
-    own an older thread, so it still makes a match ambiguous.
-    """
-    started = _process_started_at(sess)
-    if rival:
-        earliest = now - max(0, sess.elapsed_min) * 60 - 300
-    elif started is not None:
-        earliest = started - _START_MATCH_BEFORE_SEC
-    else:
-        earliest = now - (max(0, sess.elapsed_min) + 1) * 60
-    candidates = []
-    for path in _index(home).get(sess.cwd, []):
-        sid = _sid(path)
-        if not sid or sid in claimed:
-            continue
-        meta = _rollout_meta(path)
-        if _is_subagent(meta):
-            continue
-        created = _session_created(meta)
-        if created is not None and earliest <= created <= now + 300:
-            candidates.append(path)
-    return candidates
 
 
-def _fallback_rollout(sess, home):
-    """Match an idle TUI only when exactly one unclaimed rollout fits its start time."""
-    now = time.time()
-    if now - _FALLBACK_CLAIMS["ts"] >= _INDEX_TTL:
-        _FALLBACK_CLAIMS.update(ts=now, sids=set())
-    candidates = _fallback_candidates(sess, home, _FALLBACK_CLAIMS["sids"], now)
-    if len(candidates) != 1:
-        return None
-    path = candidates[0]
-    _FALLBACK_CLAIMS["sids"].add(_sid(path))
-    return path
 
 
 def _transfer_managed_rollouts(sessions, paths):
@@ -2399,11 +2227,15 @@ def account_usage():
 
 def enrich(sess, tick=None):
     home = tick.default_home if tick is not None else _home()
-    # B-3: retain the exact gateway-owned records. The old codex-tui launcher
-    # registration was based on a newly appearing rollout and is not thread proof.
+    # Keep exact managed/headless registry evidence. A direct shared-daemon TUI
+    # can only get its thread from the current loader resolver, never a stale
+    # launcher record left by an earlier selection.
     try:
         rec = session_registry.read("codex", sess.pid)
-        if rec and rec.get("kind") != "codex-tui":
+        direct_tui = (not getattr(sess, "app_server", False)
+                      and not getattr(sess, "managed_dir", None)
+                      and getattr(sess, "_invocation_mode", "unknown") in {"session", "unknown"})
+        if rec and rec.get("kind") != "codex-tui" and not direct_tui:
             session_registry.apply_to_session(sess, rec, "codex")
     except Exception:
         pass
