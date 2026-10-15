@@ -526,23 +526,68 @@ class RuntimeActivationOwnershipTest(unittest.TestCase):
             root = Path(temporary)
             source = Path(__file__).resolve().parents[2]
             with fixture_env.patched_environment(root / "fixture", source):
+                runtime_home = activation.paths.runtime_home("codex")
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared" / "config.toml"
+                target.parent.mkdir()
+                original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                            'status_line_use_colors = false\n').encode()
+                target.write_bytes(original)
+                config = runtime_home / "config.toml"
+                link_target = os.path.relpath(target, runtime_home)
+                config.symlink_to(link_target)
                 original_prepare = activation._prepare_runtime_config
 
                 def project_then_fail(*args, **kwargs):
                     original_prepare(*args, **kwargs)
+                    self.assertTrue(config.is_symlink())
+                    self.assertEqual(os.readlink(config), link_target)
+                    projected = target.read_text(encoding="utf-8")
+                    self.assertIn('status_line = ["project-name", "custom", "thread-id"]', projected)
+                    self.assertIn(activation.CODEX_IDENTITY_BEGIN, projected)
+                    self.assertIn('status_line_use_colors = false', projected)
+                    self.assertEqual(backup.read_bytes(), original)
                     raise activation.ActivationError("injected after native projection")
 
+                backup = config.with_name(activation.CODEX_IDENTITY_BACKUP)
                 activation._prepare_runtime_config = project_then_fail
                 try:
                     with self.assertRaisesRegex(activation.ActivationError, "injected"):
                         activation.activate("codex", "linked", str(source))
                 finally:
                     activation._prepare_runtime_config = original_prepare
-                config = activation.paths.runtime_home("codex") / "config.toml"
-                backup = config.with_name(activation.CODEX_IDENTITY_BACKUP)
-                self.assertFalse(config.exists())
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.read_bytes(), original)
                 self.assertFalse(backup.exists())
                 self.assertFalse(activation._state_path("codex").exists())
+
+    def test_runtime_snapshot_restores_codex_symlink_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                runtime_home = activation.paths.runtime_home("codex")
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared" / "config.toml"
+                target.parent.mkdir()
+                original = b'[tui]\nstatus_line = ["custom"]\n'
+                target.write_bytes(original)
+                config = runtime_home / "config.toml"
+                link_target = os.path.relpath(target, runtime_home)
+                config.symlink_to(link_target)
+
+                snapshot = activation.capture_runtime_state("codex", str(source))
+                self.addCleanup(activation.discard_runtime_state, snapshot)
+                destinations = {Path(record["dest"]) for record in snapshot["records"]}
+                self.assertIn(target.resolve(), destinations)
+                target.write_bytes(b'[tui]\nstatus_line = ["activation-postimage"]\n')
+                activation.seal_runtime_state(snapshot)
+
+                activation.restore_runtime_state(snapshot)
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.read_bytes(), original)
 
 
 class NativeContextLifecycleTest(unittest.TestCase):
@@ -896,6 +941,47 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertNotIn(self.BEGIN, remaining)
+
+    def test_runtime_config_preparation_and_deactivation_preserve_symlink(self):
+        import native_context
+        import tomllib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            target = root / "shared" / "codex.toml"
+            target.parent.mkdir()
+            original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                        'status_line_use_colors = false\n').encode()
+            target.write_bytes(original)
+            config = root / "home" / "config.toml"
+            config.parent.mkdir()
+            link_target = os.path.relpath(target, config.parent)
+            config.symlink_to(link_target)
+            projection = {"native_context": {"codex": {}}, "report_lines": [],
+                          "pre_projection_exists": True,
+                          "pre_projection_bytes": original}
+            with mock.patch.object(activation, "_config_path", return_value=config), \
+                 mock.patch.object(native_context, "project_context_window", return_value=projection):
+                changes = activation._prepare_runtime_config("codex", release, None)
+            self.assertTrue(changes[0]["tui_status_line_changed"])
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(os.readlink(config), link_target)
+            applied = target.read_text(encoding="utf-8")
+            parsed = tomllib.loads(applied)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertIn(self.BEGIN, applied)
+
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"]}}
+            with mock.patch.object(activation, "_config_path", return_value=config):
+                activation._unmerge_codex_identity_config(state, "global")
+            remaining = target.read_text(encoding="utf-8")
+            parsed = tomllib.loads(remaining)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertNotIn(self.BEGIN, remaining)
+            self.assertTrue(config.is_symlink())
+            self.assertEqual(os.readlink(config), link_target)
 
     def test_native_window_restores_without_identity_record_and_deletes_created_file(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -58,6 +58,35 @@ class ApplyTuiConfigTest(unittest.TestCase):
         self.assertIs(parsed["daemon_auto_start"], False)
         self.assertEqual(parsed["mcp_servers"]["fixture"][0]["command"], "keep-this")
 
+    def test_symlinked_config_keeps_link_and_updates_target(self):
+        target = self.root / "shared" / "config.toml"
+        target.parent.mkdir()
+        original = ('model = "preserve"\n[tui]\n'
+                    'status_line = ["project-name", "thread-id", "custom"]\n'
+                    'status_line_use_colors = false\n').encode()
+        target.write_bytes(original)
+        link_target = os.path.relpath(target, self.codex_home)
+        self.config.symlink_to(link_target)
+
+        first = self.apply_config()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(self.config.is_symlink())
+        self.assertEqual(os.readlink(self.config), link_target)
+        self.assertEqual((self.codex_home / "config.toml.pre-harness-tui").read_bytes(), original)
+        parsed = tomllib.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(parsed["model"], "preserve")
+        self.assertEqual(parsed["tui"]["status_line"],
+                         ["project-name", "custom", "thread-id"])
+        self.assertIs(parsed["tui"]["status_line_use_colors"], False)
+        once = target.read_bytes()
+
+        second = self.apply_config()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("changed=no", second.stdout)
+        self.assertEqual(target.read_bytes(), once)
+        self.assertTrue(self.config.is_symlink())
+        self.assertEqual(os.readlink(self.config), link_target)
+
     def test_existing_thread_id_is_not_duplicated_and_second_apply_is_noop(self):
         self.config.write_text(
             'daemon_auto_start = false\n[tui]\n'

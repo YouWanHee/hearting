@@ -69,6 +69,27 @@ class CodexDriverLauncherRetirementTest(unittest.TestCase):
         action = next(item for item in applied["actions"] if item["action"] == "codex-tui-statusline")
         self.assertEqual(action["status"], "updated")
 
+    def test_install_updates_symlink_target_and_keeps_link_target_text(self):
+        import os
+        import tomllib
+        target = Path(self.temp.name) / "shared" / "config.toml"
+        target.parent.mkdir()
+        original = ('[tui]\nstatus_line = ["thread-id", "custom"]\n'
+                    'status_line_use_colors = false\n').encode()
+        target.write_bytes(original)
+        config = self.runtime_home / "config.toml"
+        link_target = os.path.relpath(target, self.runtime_home)
+        config.symlink_to(link_target)
+
+        result = codex_driver.install(dry_run=False)
+        self.assertFalse(result["blocked"])
+        self.assertTrue(config.is_symlink())
+        self.assertEqual(os.readlink(config), link_target)
+        self.assertEqual((self.runtime_home / "config.toml.pre-harness-tui").read_bytes(), original)
+        parsed = tomllib.loads(target.read_text(encoding="utf-8"))["tui"]
+        self.assertEqual(parsed["status_line"], ["custom", "thread-id"])
+        self.assertIs(parsed["status_line_use_colors"], False)
+
     def test_invalid_statusline_is_skipped_without_blocking_install(self):
         config = self.runtime_home / "config.toml"
         original = '[tui]\nstatus_line = 7\n'

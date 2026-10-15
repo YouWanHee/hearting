@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Behavioral regressions for Codex status-line merge and feasibility."""
 from pathlib import Path
+import os
+import stat
 import tempfile
 import tomllib
 import unittest
@@ -67,6 +69,57 @@ class CodexTuiConfigTest(unittest.TestCase):
             second = config.apply_status_line(path, fragment)
             self.assertFalse(second["changed"])
             self.assertEqual(path.read_bytes(), after)
+
+    def test_symlink_target_is_updated_with_one_time_backup_and_idempotently(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fragment = Path(__file__).resolve().parents[1] / "adapters/codex/config/tui-statusline.toml"
+            target = root / "shared" / "codex.toml"
+            target.parent.mkdir()
+            original = (b'model = "keep"\n[tui]\n'
+                        b'status_line = ["project-name", "thread-id", "custom-item"]\n'
+                        b'status_line_use_colors = false\n')
+            target.write_bytes(original)
+            target.chmod(0o640)
+            path = root / "config.toml"
+            link_target = os.path.relpath(target, path.parent)
+            path.symlink_to(link_target)
+
+            first = config.apply_status_line(path, fragment)
+            self.assertTrue(first["changed"])
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(os.readlink(path), link_target)
+            self.assertEqual(path.with_name(config.BACKUP_NAME).read_bytes(), original)
+            merged_bytes = target.read_bytes()
+            merged = tomllib.loads(merged_bytes.decode("utf-8"))
+            self.assertEqual(merged["model"], "keep")
+            self.assertEqual(merged["tui"]["status_line"],
+                             ["project-name", "custom-item", "thread-id"])
+            self.assertIs(merged["tui"]["status_line_use_colors"], False)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+
+            second = config.apply_status_line(path, fragment)
+            self.assertFalse(second["changed"])
+            self.assertEqual(target.read_bytes(), merged_bytes)
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(os.readlink(path), link_target)
+
+    def test_invalid_symlink_target_is_unchanged_and_not_backed_up(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fragment = Path(__file__).resolve().parents[1] / "adapters/codex/config/tui-statusline.toml"
+            target = root / "shared.toml"
+            original = b'[tui]\nstatus_line = 7\n'
+            target.write_bytes(original)
+            path = root / "config.toml"
+            path.symlink_to(target)
+
+            with self.assertRaises(config.CodexTuiConfigError):
+                config.apply_status_line(path, fragment)
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(os.readlink(path), str(target))
+            self.assertEqual(target.read_bytes(), original)
+            self.assertFalse(path.with_name(config.BACKUP_NAME).exists())
 
     def test_feasibility_is_exact_and_overrides_stay_unknown(self):
         self.assertEqual(config.status_line_capability(''), "incapable")

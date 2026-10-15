@@ -215,6 +215,7 @@ def apply_status_line(config_path, fragment_path, *, dry_run=False) -> dict:
     changed = updated != original
     if changed and not dry_run:
         config_path.parent.mkdir(parents=True, exist_ok=True)
+        write_path = config_path.resolve(strict=False) if config_path.is_symlink() else config_path
         if config_path.exists():
             backup = config_path.with_name(BACKUP_NAME)
             if not backup.exists():
@@ -222,15 +223,15 @@ def apply_status_line(config_path, fragment_path, *, dry_run=False) -> dict:
             mode = config_path.stat().st_mode & 0o777
         else:
             mode = 0o600
-        descriptor, temporary = tempfile.mkstemp(dir=str(config_path.parent),
-                                                   prefix=f".{config_path.name}.", suffix=".tmp")
+        descriptor, temporary = tempfile.mkstemp(dir=str(write_path.parent),
+                                                   prefix=f".{write_path.name}.", suffix=".tmp")
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
                 handle.write(updated)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temporary, mode)
-            os.replace(temporary, config_path)
+            os.replace(temporary, write_path)
         finally:
             try:
                 os.unlink(temporary)
