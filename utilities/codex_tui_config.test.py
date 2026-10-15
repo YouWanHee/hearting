@@ -11,6 +11,58 @@ import codex_tui_config as config
 
 
 class CodexTuiConfigTest(unittest.TestCase):
+    def _tracked_merge(self, text, previous=None):
+        merged = config.merge_status_line_text(text)
+        return merged, config.status_line_record(text, merged, previous)
+
+    def test_restore_clean_and_existing_config_after_refresh(self):
+        for source in ('', 'model = "mine"\n',
+                       '# mine\n[tui]\nstatus_line = ["x"] # footer\nstatus_line_use_colors = false\n',
+                       '[tui]\nstatus_line = ["thread-id", "x"]\n',
+                       '[tui]\nstatus_line = []\n',
+                       '[tui]\nnotification_method = "osc9"\n'):
+            with self.subTest(source=source):
+                merged, record = self._tracked_merge(source)
+                refreshed, record = self._tracked_merge(merged, record)
+                self.assertEqual(config.restore_status_line_text(refreshed, record), source)
+
+    def test_restore_keeps_later_items_colors_and_other_tables(self):
+        merged, record = self._tracked_merge('[tui]\nstatus_line = ["x"]\n')
+        edited = merged.replace('["x", "thread-id"]', '["x", "new", "thread-id"]')
+        edited = edited.replace('status_line_use_colors = true', 'status_line_use_colors = false')
+        edited += '\n[projects."/work"]\ntrust_level = "trusted"\n'
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh):
+                current, receipt = self._tracked_merge(edited, record) if refresh else (edited, record)
+                restored = config.restore_status_line_text(current, receipt)
+                tui = tomllib.loads(restored)["tui"]
+                self.assertEqual(tui["status_line"], ["x", "new"])
+                self.assertIs(tui["status_line_use_colors"], False)
+                self.assertIn('[projects."/work"]\ntrust_level = "trusted"\n', restored)
+
+    def test_restore_keeps_user_owned_thread_id_and_new_table_settings(self):
+        merged, record = self._tracked_merge('[tui]\nstatus_line = ["thread-id", "x"]\n')
+        edited = merged.replace('["x", "thread-id"]', '["new", "thread-id"]')
+        self.assertEqual(tomllib.loads(config.restore_status_line_text(edited, record))["tui"]["status_line"],
+                         ["new", "thread-id"])
+        merged, record = self._tracked_merge('')
+        edited = merged + 'notification_method = "osc9"\n'
+        self.assertEqual(tomllib.loads(config.restore_status_line_text(edited, record)),
+                         {"tui": {"notification_method": "osc9"}})
+
+    def test_missing_receipt_does_not_claim_legacy_settings(self):
+        source = config.merge_status_line_text('')
+        self.assertEqual(config.restore_status_line_text(source, None), source)
+        for invalid in ({"keys": {}}, {"keys": {"status_line": {"baseline": {"present": False}}}}):
+            self.assertEqual(config.restore_status_line_text(source, invalid), source)
+
+    def test_new_keys_stay_outside_the_next_tables_managed_comment(self):
+        for settings in ('', 'status_line = ["custom"]\n', 'status_line_use_colors = false\n'):
+            source = '[tui]\n' + settings + '\n# >>> managed block\n[other]\nvalue = true\n'
+            merged, record = self._tracked_merge(source)
+            self.assertIn('\n# >>> managed block\n[other]\nvalue = true\n', merged)
+            self.assertEqual(config.restore_status_line_text(merged, record), source)
+
     def test_existing_items_and_comments_survive_with_thread_id_last(self):
         source = ('# keep this comment\n[tui] # preserve header\n'
                   'status_line = [\n  "project-name", # item comment\n'

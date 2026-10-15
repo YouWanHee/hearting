@@ -84,6 +84,13 @@ def _array_end(lines, start, limit):
     raise CodexTuiConfigError("could not locate the end of tui.status_line")
 
 
+def _table_insert_index(lines, start, end):
+    # Trailing comments may introduce the next managed table. Keep its block intact.
+    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
+        end -= 1
+    return end
+
+
 def merge_status_line_text(text: str, defaults=DEFAULT_STATUS_LINE,
                            default_colors=DEFAULT_STATUS_LINE_USE_COLORS) -> str:
     """Return valid TOML with one thread-id item last; leave all other values intact."""
@@ -120,7 +127,8 @@ def merge_status_line_text(text: str, defaults=DEFAULT_STATUS_LINE,
         if raw_items is not _MISSING and status_index is None:
             raise CodexTuiConfigError("could not locate the parsed tui.status_line assignment")
         if status_index is None:
-            lines.insert(table_end, "status_line = " + json.dumps(items, ensure_ascii=False))
+            lines.insert(_table_insert_index(lines, tui_start, table_end),
+                         "status_line = " + json.dumps(items, ensure_ascii=False))
             table_end += 1
         elif raw_items != items:
             end_index, suffix = _array_end(lines, status_index, table_end)
@@ -132,7 +140,8 @@ def merge_status_line_text(text: str, defaults=DEFAULT_STATUS_LINE,
         has_colors = any(re.match(r"^\s*(?:status_line_use_colors|\"status_line_use_colors\"|'status_line_use_colors')\s*=",
                                   lines[i]) for i in range(tui_start + 1, table_end))
         if not has_colors:
-            lines.insert(table_end, "status_line_use_colors = " + str(colors).lower())
+            lines.insert(_table_insert_index(lines, tui_start, table_end),
+                         "status_line_use_colors = " + str(colors).lower())
 
     result = newline.join(lines) + (newline if lines else "")
     _parse(result, "merged Codex config")
@@ -205,6 +214,126 @@ def merge_status_line_from_fragment(text: str, fragment_path) -> str:
     if colors is _MISSING:
         colors = DEFAULT_STATUS_LINE_USE_COLORS
     return merge_status_line_text(text, defaults, colors)
+
+
+def _tui_bounds(lines):
+    start = next((i for i, line in enumerate(lines) if _TUI_TABLE_RE.match(line)), None)
+    if start is None:
+        return None, None
+    end = next((i for i in range(start + 1, len(lines)) if _TABLE_RE.match(lines[i])), len(lines))
+    return start, end
+
+
+def _setting_span(lines, key):
+    start, end = _tui_bounds(lines)
+    if start is None:
+        return None
+    pattern = re.compile(r"^\s*(?:" + key + r"|\"" + key + r"\"|'" + key + r"')\s*=")
+    index = next((i for i in range(start + 1, end) if pattern.match(lines[i])), None)
+    if index is None:
+        return None
+    last = _array_end(lines, index, end)[0] if key == "status_line" else index
+    return index, last + 1
+
+
+def _valid_setting_record(item, key):
+    if not isinstance(item, dict) or not isinstance(item.get("baseline"), dict):
+        return False
+    baseline = item["baseline"]
+    if type(baseline.get("present")) is not bool or not isinstance(baseline.get("source"), str):
+        return False
+    values = [item.get("projected")]
+    if baseline["present"]:
+        values.append(baseline.get("value"))
+    if key == "status_line":
+        if any(not isinstance(value, list) or any(not isinstance(entry, str) for entry in value)
+               for value in values):
+            return False
+    elif any(type(value) is not bool for value in values):
+        return False
+    try:
+        expected = {"tui": {key: baseline["value"]}} if baseline["present"] else {"tui": {}}
+        return _parse("[tui]\n" + baseline["source"]) == expected
+    except CodexTuiConfigError:
+        return False
+
+
+def status_line_record(before: str, after: str, previous=None) -> dict:
+    """Remember only the two managed keys, retaining their baseline through refresh."""
+    old_tui = _parse(before).get("tui", {})
+    new_tui = _parse(after).get("tui", {})
+    previous = previous if isinstance(previous, dict) else {}
+    prior_keys = previous.get("keys", {})
+    prior_keys = prior_keys if isinstance(prior_keys, dict) else {}
+    lines = before.splitlines(keepends=True)
+    record = {"table_created": previous.get("table_created") is True or "tui" not in _parse(before),
+              "keys": {}}
+    for key in ("status_line", "status_line_use_colors"):
+        prior = prior_keys.get(key)
+        span = _setting_span(lines, key)
+        baseline = {"present": key in old_tui,
+                    "source": "".join(lines[slice(*span)]) if span else ""}
+        if key in old_tui:
+            baseline["value"] = old_tui[key]
+        if _valid_setting_record(prior, key):
+            if old_tui.get(key, _MISSING) == prior.get("projected", _MISSING):
+                baseline = dict(prior["baseline"])
+            elif (key == "status_line" and isinstance(old_tui.get(key), list)
+                  and "thread-id" not in prior["baseline"].get("value", [])
+                  and "thread-id" in prior.get("projected", [])):
+                # An edited list owns its new items, but not our added identity item.
+                baseline["value"] = [item for item in old_tui[key] if item != "thread-id"]
+                baseline["source"] = "status_line = " + json.dumps(baseline["value"]) + "\n"
+        record["keys"][key] = {"baseline": baseline, "projected": new_tui[key]}
+    return record
+
+
+def restore_status_line_text(text: str, record) -> str:
+    """Remove recorded additions without restoring over subsequent user settings."""
+    if not isinstance(record, dict) or not isinstance(record.get("keys"), dict):
+        return text
+    parsed = _parse(text)
+    tui = parsed.get("tui", {})
+    if not isinstance(tui, dict):
+        return text
+    lines = text.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    for key in ("status_line", "status_line_use_colors"):
+        item = record["keys"].get(key)
+        if not _valid_setting_record(item, key):
+            continue
+        baseline = item["baseline"]
+        span = _setting_span(lines, key)
+        if span is None:
+            continue
+        current = tui.get(key, _MISSING)
+        if current == item.get("projected", _MISSING):
+            replacement = baseline.get("source") if baseline["present"] else ""
+            if not isinstance(replacement, str):
+                continue
+        elif (key == "status_line" and isinstance(current, list)
+              and "thread-id" not in baseline.get("value", [])
+              and "thread-id" in item.get("projected", [])):
+            remaining = [entry for entry in current if entry != "thread-id"]
+            if remaining == current:
+                continue
+            suffix = _array_end(lines, span[0], span[1])[1].rstrip("\r\n")
+            replacement = "status_line = " + json.dumps(remaining, ensure_ascii=False) + suffix + newline
+        else:
+            continue
+        lines[span[0]:span[1]] = [replacement] if replacement else []
+    start, end = _tui_bounds(lines)
+    if (record.get("table_created") is True and start is not None
+            and all(_valid_setting_record(record["keys"].get(key), key)
+                    for key in ("status_line", "status_line_use_colors"))
+            and not "".join(lines[start + 1:end]).strip()):
+        # merge_status_line_text added one separator before its new table.
+        if start and not lines[start - 1].strip():
+            start -= 1
+        del lines[start:end]
+    result = "".join(lines)
+    _parse(result, "restored Codex config")
+    return result
 
 
 def apply_status_line(config_path, fragment_path, *, dry_run=False) -> dict:

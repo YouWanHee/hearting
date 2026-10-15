@@ -612,24 +612,55 @@ class NativeContextLifecycleTest(unittest.TestCase):
                         backup.read_bytes() if backup.exists() else None)
 
     def test_codex_clean_home_leaves_no_config_or_backup(self):
-        import tomllib
         config, backup = self._lifecycle("codex")
-        self.assertIsNotNone(config)
-        self.assertEqual(tomllib.loads(config.decode("utf-8"))["tui"]["status_line"][-1], "thread-id")
+        self.assertIsNone(config)
         self.assertIsNone(backup)
 
     def test_codex_manual_window_survives_with_its_bytes(self):
         seed = b"# mine\nmodel_context_window = 800000\nmodel = \"x\"\n"
-        import tomllib
         config, backup = self._lifecycle("codex", seed)
-        self.assertTrue(config.startswith(seed))
-        self.assertEqual(tomllib.loads(config.decode("utf-8"))["tui"]["status_line"][-1], "thread-id")
+        self.assertEqual(config, seed)
         self.assertEqual(backup, seed)
 
     def test_claude_clean_home_drops_the_added_window(self):
         config, _ = self._lifecycle("claude")
         env = json.loads(config).get("env", {})
         self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
+
+    def test_codex_refresh_and_uninstall_keep_user_edits_and_symlink(self):
+        import tomllib
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Path(__file__).resolve().parents[2]
+            with fixture_env.patched_environment(root / "fixture", source):
+                home = activation.paths.runtime_home("codex")
+                home.mkdir(parents=True, exist_ok=True)
+                target = root / "fixture" / "shared.toml"
+                target.write_text('model = "mine"\n[tui]\nstatus_line = ["custom"]\n', encoding="utf-8")
+                target.chmod(0o640)
+                config = home / "config.toml"
+                link_target = os.path.relpath(target, home)
+                config.symlink_to(link_target)
+                activation.activate("codex", "linked", str(source))
+                edited = target.read_text(encoding="utf-8").replace(
+                    '["custom", "thread-id"]', '["custom", "later", "thread-id"]')
+                edited = edited.replace('status_line_use_colors = true', 'status_line_use_colors = false')
+                target.write_text(edited + '\n[projects."/mine"]\ntrust_level = "trusted"\n', encoding="utf-8")
+                activation.activate("codex", "linked", str(source))
+                before = target.read_bytes()
+                args = installer.build_parser().parse_args(["uninstall", "codex", "--dry-run"])
+                self.assertEqual(installer.cmd_uninstall(args)["exit"], 0)
+                self.assertEqual(target.read_bytes(), before)
+                args.dry_run = False
+                self.assertEqual(installer.cmd_uninstall(args)["exit"], 0)
+                self.assertTrue(config.is_symlink())
+                self.assertEqual(os.readlink(config), link_target)
+                self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(tomllib.loads(target.read_text(encoding="utf-8")), {
+                    "model": "mine", "tui": {"status_line": ["custom", "later"],
+                                               "status_line_use_colors": False},
+                    "projects": {"/mine": {"trust_level": "trusted"}},
+                })
 
     def test_claude_manual_window_survives(self):
         seed = json.dumps({"env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "800000",
@@ -910,7 +941,7 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
             self._assert_clears_inherited(config)
 
-    def test_runtime_config_preparation_moves_thread_id_last_and_deactivation_keeps_it(self):
+    def test_runtime_config_preparation_moves_thread_id_last_and_deactivation_restores_it(self):
         import tomllib
         import native_context
         with tempfile.TemporaryDirectory() as temporary:
@@ -933,12 +964,13 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
 
-            state = {"managed_config": {"codex_identity": changes[0]["managed_config"]}}
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"],
+                                        "codex_tui": changes[0]["tui_record"]}}
             with mock.patch.object(activation, "_config_path", return_value=config):
                 activation._unmerge_codex_identity_config(state, "global")
             remaining = config.read_text(encoding="utf-8")
             parsed = tomllib.loads(remaining)["tui"]
-            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertEqual(parsed["status_line"], ["project-name", "thread-id", "custom"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertNotIn(self.BEGIN, remaining)
 
@@ -972,12 +1004,13 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertIn(self.BEGIN, applied)
 
-            state = {"managed_config": {"codex_identity": changes[0]["managed_config"]}}
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"],
+                                        "codex_tui": changes[0]["tui_record"]}}
             with mock.patch.object(activation, "_config_path", return_value=config):
                 activation._unmerge_codex_identity_config(state, "global")
             remaining = target.read_text(encoding="utf-8")
             parsed = tomllib.loads(remaining)["tui"]
-            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertEqual(parsed["status_line"], ["project-name", "thread-id", "custom"])
             self.assertIs(parsed["status_line_use_colors"], False)
             self.assertNotIn(self.BEGIN, remaining)
             self.assertTrue(config.is_symlink())

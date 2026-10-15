@@ -95,6 +95,8 @@ jobs:
 
       - name: Run activation and lifecycle suites
         run: |
+          python3 utilities/codex_tui_config.test.py
+          python3 tools/install/runtime_activation.test.py
           ./tools/install/runtime-activation.test.sh
           ./tools/install/projection-completeness.test.sh
           ./tools/install/release-lifecycle.test.sh

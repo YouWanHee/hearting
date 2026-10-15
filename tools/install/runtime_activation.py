@@ -2081,6 +2081,10 @@ def _unmerge_codex_identity_config(
     except (OSError, UnicodeDecodeError):
         return []
     remaining = _codex_feature_remove(text, feature)
+    try:
+        remaining = codex_tui_config.restore_status_line_text(remaining, managed.get("codex_tui"))
+    except codex_tui_config.CodexTuiConfigError:
+        pass
     block_removed = isinstance(inserted, str) and bool(inserted) and remaining.count(inserted) == 1
     if block_removed:
         remaining = remaining.replace(inserted, "", 1)
@@ -2345,6 +2349,8 @@ def _prepare_runtime_config(
         try:
             original = config.read_text(encoding="utf-8") if config.exists() else ""
             updated = codex_tui_config.merge_status_line_from_fragment(original, fragment)
+            prior_tui = (previous.get("managed_config") or {}).get("codex_tui") if previous else None
+            result["tui_record"] = codex_tui_config.status_line_record(original, updated, prior_tui)
             if updated != original:
                 _atomic_codex_config_text(config, updated)
             result["tui_status_line_changed"] = updated != original
@@ -3369,6 +3375,10 @@ def activate(
                         and change.get("managed_config")
                     ),
                     None,
+                ),
+                "codex_tui": next(
+                    (change["tui_record"] for change in config_changes if "tui_record" in change),
+                    (previous.get("managed_config") or {}).get("codex_tui") if previous else None,
                 ),
                 "opencode_tui": next(
                     (
