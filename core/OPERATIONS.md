@@ -1714,8 +1714,10 @@ idle pane shell's cwd before the agent starts. Any cwd or PATH bootstrap waits f
 observed final visible shell prompt, including Powerline, within the existing bound
 (seconds converted to native milliseconds). Readiness includes the native foreground
 shell; past screen prompts are not readiness. Unknown, busy, occupied, form, and native
-trust screens receive no typed input; native trust remains a human decision and is
-reported as a wait reason, separate from whether the process was started. A fresh
+trust screens receive no typed input; visible folder-trust and Codex hook-review forms
+report not-ready, retaining pending delivery for redelivery after closure. Unknown Codex
+prompt screens keep immediate typing. peer-steward observes forms without writing trust
+or selecting options; global runtime activation records hashes for Hearting's hooks. A fresh
 Codex start the steward launches runs Embedded (`--no-daemon`) unless the caller
 stated otherwise, so the new TUI owns its rollout fd and same-cwd simultaneous
 starts stay exactly attributable; time-candidate threads stay out of Embedded

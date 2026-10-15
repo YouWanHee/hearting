@@ -2093,6 +2093,15 @@ def _unmerge_codex_identity_config(
         remaining = restored.decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         remaining = remaining
+    trust_record = managed.get("codex_hook_trust") if isinstance(managed, dict) else None
+    if trust_record:
+        try:
+            import codex_hook_trust
+            remaining, trust_reports = codex_hook_trust.restore_trust_text(remaining, trust_record)
+            for line in trust_reports:
+                print(line, file=sys.stderr)
+        except (ImportError, ValueError) as exc:
+            print(f"Codex hook trust restore skipped: {str(exc).splitlines()[0][:180]}", file=sys.stderr)
     backup = config.with_name(CODEX_IDENTITY_BACKUP)
     if valid_native and isinstance(codex_native.get("file_created"), bool):
         created_by_activation = codex_native["file_created"]
@@ -3304,11 +3313,26 @@ def activate(
     context_report_lines: List[str] = []
 
     def commit_state(owned):
+        local_hook_trust_record = None
         config_changes = _prepare_runtime_config(runtime, active_root, previous, scope,
                                                  native_locked=True)
         for change in config_changes:
             context_report_lines.extend(change.get("report_lines", []))
         previous_managed = (previous or {}).get("managed_config", {})
+        if runtime == "codex" and scope == "global":
+            try:
+                import codex_hook_trust
+                prior_trust = previous_managed.get("codex_hook_trust") if isinstance(previous_managed, dict) else None
+                hooks_file = active_root / "adapters/codex/hooks/hooks.json"
+                trust_result = codex_hook_trust.record_managed_trust(
+                    paths.runtime_home("codex", scope), hooks_file, prior_trust
+                )
+                local_hook_trust_record = trust_result.get("record")
+                context_report_lines.extend(trust_result.get("report_lines", []))
+            except Exception as exc:
+                context_report_lines.append(
+                    f"Codex hook trust skipped: {str(exc).splitlines()[0][:180]}"
+                )
         previous_native = previous_managed.get("native_context", {}) if isinstance(previous_managed, dict) else {}
         native_context = dict(previous_native) if isinstance(previous_native, dict) else {}
         projected_native = next((change.get("native_context") for change in config_changes
@@ -3398,6 +3422,9 @@ def activate(
                     [],
                 ),
                 "model_config": model_config_action,
+                "codex_hook_trust": local_hook_trust_record or (
+                    previous_managed.get("codex_hook_trust") if isinstance(previous_managed, dict) else None
+                ),
             },
             "replaced_installer_symlink_targets": replaced_installer_symlink_targets,
             "activated_at": _utc_now(),
