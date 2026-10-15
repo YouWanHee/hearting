@@ -3651,32 +3651,55 @@ def _blocking_screen(harness, lines, *, window=15):
     harness = str(harness or "").lower()
     if harness == "codex":
         normalized = ["".join(line.split()).lower() for line in meaningful]
-        if normalized[0].strip("─━│╭╮╰╯┌┐└┘ ") == "hooksneedreview":
-            body = normalized[1:]
-            title_count = any(re.fullmatch(r"\d+hooks?(?:isnew|arenew)orchanged", row) for row in body)
+        title = normalized[0].strip("─━│╭╮╰╯┌┐└┘")
+        if title == "hooksneedreview" and len(normalized) > 1:
+            # This dialog owns the top of the cleared TUI. Its rows may wrap
+            # and may include progress/error text before the three options.
+            count = re.fullmatch(r"\d+hooks?(?:isnew|arenew)orchanged\.?", normalized[1])
+            option_rows = []
+            for index, row in enumerate(normalized[2:], start=2):
+                option_rows.append((index, re.sub(r"^(?:[❯›>])?(?:[123][.)])?", "", row)))
             labels = ("reviewhooks", "trustallandcontinue", "continuewithouttrusting")
-            joined = "".join(body)
-            positions = [joined.find(label) for label in labels]
-            ordered = all(pos >= 0 for pos in positions) and positions == sorted(positions)
-            if title_count and ordered:
-                tail = joined[positions[-1] + len(labels[-1]):]
+            positions = []
+            cursor = 0
+            for label in labels:
+                found = next((i for i in range(cursor, len(option_rows))
+                              if option_rows[i][1].startswith(label)), None)
+                positions.append(found)
+                if found is not None:
+                    cursor = found + 1
+            if count and all(pos is not None for pos in positions):
+                third = positions[-1]
+                tail = "".join(row for _index, row in option_rows[third + 1:])
+                # Only the wrapped parenthetical and the native keymap footer
+                # may follow the final choice in the standalone view.
                 tail = tail.replace("(hookswon'trun)", "")
-                if (not tail or tail.startswith("(hooks") or "key" in tail
-                        or ("enter" in tail and "esc" in tail)):
+                if (not tail or tail.startswith("won'trun)") or "entertoconfirm" in tail
+                        or "enterselect" in tail or "escskip" in tail):
                     return "native-trust-wait"
-        active_rows = [row for row in normalized
-                       if not row.startswith(("+", "assistant:", "user:", "```", "❯letme"))]
+
+        # The /new and /fork picker is a bottom-pane popup in the live chat.
+        # Require its own trailing title/options/footer group, so a transcript
+        # quote above an ordinary composer cannot be mistaken for the popup.
+        active_rows = normalized[-window:]
+        last_row = active_rows[-1]
+        menu_choices = ("usecurrentgitworktree", "keepusingthecurrentworkingdirectory",
+                        "createnewgitworktree")
+        live_composer = (last_row.startswith("❯") and len(last_row) > len("❯")
+                         and not any(choice in last_row for choice in menu_choices))
         location_title = next((i for i, row in enumerate(active_rows)
                                if "whereshouldthenewconversation" in row
                                or "whereshouldtheforkedconversation" in row), None)
-        if location_title == 0:
-            area = "".join(active_rows[location_title:])
+        if location_title is not None and not live_composer:
+            area_rows = active_rows[location_title:]
+            area = "".join(area_rows)
             options = ("usecurrentgitworktree", "keepusingthecurrentworkingdirectory",
                        "createnewgitworktree")
-            if ("run?" in area or "run" in area) and sum(token in area for token in options) >= 1 and not any(
-                    row.startswith(("❯letme", "?for")) for row in normalized):
+            if ("run?" in area or "run" in area) and any(token in area for token in options):
                 return "form-open"
-    if any(token in flat_bottom for token in _FORM_TOKENS):
+    else:
+        live_composer = False
+    if not live_composer and any(token in flat_bottom for token in _FORM_TOKENS):
         return "form-open"
     if any(token in flat_bottom for token in _NATIVE_TRUST_TOKENS.get(harness, ())):
         return "native-trust-wait"

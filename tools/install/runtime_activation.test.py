@@ -151,6 +151,16 @@ class CodexHookTrustTest(unittest.TestCase):
         import tomllib
         self.assertEqual(tomllib.loads(restored)["projects"]["/mine"]["trust_level"], "trusted")
 
+    def test_restorer_removes_one_separator_with_an_empty_owned_table(self):
+        original = ('[hooks.state."key"]\ntrusted_hash = "sha256:owned"\n'
+                    '\n[projects."/mine"]\ntrust_level = "trusted"\n')
+        record = {"hooks": {"key": {"written_hash": "sha256:owned", "baseline_present": False}}}
+        restored, reports = codex_hook_trust.restore_trust_text(original, record)
+        self.assertEqual(reports, [])
+        self.assertEqual(restored, '[projects."/mine"]\ntrust_level = "trusted"\n')
+        import tomllib
+        self.assertEqual(tomllib.loads(restored)["projects"]["/mine"]["trust_level"], "trusted")
+
 
 class RuntimeSnapshotTest(unittest.TestCase):
     # destructive-ok: reason=exercise added and deleted source fingerprints; boundary=entry.py and new_entry.py under this test TemporaryDirectory

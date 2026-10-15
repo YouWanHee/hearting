@@ -19,6 +19,25 @@ from types import SimpleNamespace
 from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
+# Real capture fixtures: codex-cli 0.162.1 via tmux capture-pane, 80x40 and
+# 40x30, alt-screen and inline launches; README records each file's provenance.
+_CODEX_REVIEW_FIXTURES = _HERE / "fixtures" / "codex-0.162.1-hook-review"
+
+
+def _codex_snapshot(name):
+    text = (_CODEX_REVIEW_FIXTURES / name).read_text()
+    separators = [index for index, row in enumerate(text.splitlines()) if row == "---"]
+    return "\n".join(text.splitlines()[separators[1] + 1:]) if len(separators) >= 2 else text
+
+
+def _codex_capture(name):
+    text = (_CODEX_REVIEW_FIXTURES / name).read_text()
+    body, delimiter, _tail = text.rpartition("# capture fixture delimiter\n")
+    if not delimiter:
+        raise AssertionError(f"capture fixture delimiter missing: {name}")
+    return body
+
+
 _SPEC = importlib.util.spec_from_file_location("peer_steward", str(_HERE / "peer-steward.py"))
 peer_steward = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(peer_steward)
@@ -824,8 +843,7 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         import contextlib
         import io
         calls = []
-        screen = ("Hooks need review\n1 hook is new or changed\nReview hooks\n"
-                  "Trust all and continue\nContinue without trusting")
+        screen = _codex_capture("cap-inline80.txt")
         def fake_run(argv, **kwargs):
             calls.append(list(argv))
             if argv[:3] == ["herdr", "agent", "start"]:
@@ -2434,12 +2452,10 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def test_codex_new_and_fork_location_forms_defer_without_any_key_transport(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        menus = (
-            "\x1b[2mWhere should the new conversation\x1b[0m\nrun?\n"
-            "❯ Use current Git worktree\nKeep using the current working directory\nCreate new Git worktree\n",
-            "Where should the forked conversation run?\n"
-            "❯ Use current Git worktree\nKeep using the current working directory\nCreate new Git worktree\n",
-        )
+        menus = tuple(_codex_snapshot(name)
+                      for name in ("worktrees_new_choices.snap", "worktrees_fork_choices.snap"))
+        menus = tuple("banner: project · main\nEarlier transcript line\n" + menu
+                      for menu in menus)
         cases = ((None, menus[0], False), (None, menus[1], True),
                  ("thread-present", menus[0], False), ("thread-present", menus[1], True))
         for index, (sid, menu, no_trailer) in enumerate(cases):
@@ -2490,13 +2506,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def test_codex_hook_review_prompt_is_queued_without_transport_for_sidless_and_bound_targets(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        screens = (
-            "Hooks need review\n1 hook is new or changed\nReview hooks\n"
-            "Trust all and continue\nContinue without trusting\nEnter to confirm · Esc to skip",
-            "Hooks need review\n2 hooks are new or changed\nChecking hooks…\n"
-            "1. Review hooks\n2. Trust all and continue\n"
-            "3. Continue without trusting (hooks\n   won't run)",
-        )
+        screens = tuple(_codex_capture(name)
+                        for name in ("cap-alt80.txt", "cap-inline40.ansi"))
         for sid, screen in ((None, screens[0]), ("thread-present", screens[1])):
             with self.subTest(sid=sid):
                 calls = []
@@ -2510,7 +2521,9 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                 self.assertIn("prompted=queued", print_mock.call_args[0][0])
                 self.assertIn("reason=target-form-open", print_mock.call_args[0][0])
                 self.assertFalse([call for call in calls if call[:3] in (
-                    ["herdr", "agent", "prompt"], ["herdr", "agent", "send-keys"]
+                    ["herdr", "agent", "prompt"], ["herdr", "agent", "send-text"],
+                    ["herdr", "agent", "send-keys"], ["herdr", "pane", "send-text"],
+                    ["herdr", "pane", "send-keys"]
                 )])
                 queue.assert_not_called()
                 row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
@@ -6908,6 +6921,38 @@ class BlockingScreenClassifierTest(unittest.TestCase):
             with self.subTest(screen=screen):
                 self.assertEqual("native-trust-wait", peer_steward._blocking_screen(
                     "codex", [self.cells(line) for line in screen.splitlines()]))
+
+    def test_real_codex_01621_captures_and_upstream_snapshots_are_recognized(self):
+        capture_names = (
+            "cap-alt80.txt", "cap-alt80.ansi", "cap-inline80.txt", "cap-inline80.ansi",
+            "cap-alt40.txt", "cap-alt40.ansi", "cap-inline40.txt", "cap-inline40.ansi",
+            "cap-80x40-noalt.txt",
+        )
+        for name in capture_names:
+            with self.subTest(capture=name):
+                self.assertEqual("native-trust-wait", peer_steward._blocking_screen(
+                    "codex", _codex_capture(name)))
+        for name in ("startup_hooks_review_prompt.snap", "startup_hooks_picker_progress_40.snap",
+                     "startup_hooks_review_prompt_with_trust_error.snap"):
+            with self.subTest(snapshot=name):
+                self.assertEqual("native-trust-wait", peer_steward._blocking_screen(
+                    "codex", _codex_snapshot(name)))
+
+    def test_codex_location_popup_under_transcript_blocks_but_quotes_do_not(self):
+        popup = _codex_snapshot("worktrees_new_choices.snap")
+        chat_popup = "banner: project · main\nPrior chat text\n" + popup
+        self.assertEqual("form-open", peer_steward._blocking_screen("codex", chat_popup))
+        quoted = [self.cells("● Working"), self.cells("Quoted: Where should the new conversation run?"),
+                  self.cells("› Use current Git worktree; Enter select · Esc back"),
+                  self.cells("❯ Continue with the requested change")]
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness):
+                self.assertIsNone(peer_steward._blocking_screen(harness, quoted))
+
+    def test_singular_count_with_period_matches_real_dialog_shape(self):
+        screen = ("Hooks need review\n1 hook is new or changed.\nReview hooks\n"
+                  "Trust all and continue\nContinue without trusting\n")
+        self.assertEqual("native-trust-wait", peer_steward._blocking_screen("codex", screen))
 
     def test_codex_hook_review_quote_and_unknown_screen_do_not_block(self):
         quote = [self.cells("● Reviewing documentation"),

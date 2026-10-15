@@ -174,6 +174,11 @@ def restore_trust_text(text: str, record: dict | None) -> tuple[str, list[str]]:
             del lines[matches[0]]
             if not siblings:
                 del lines[start]
+                # Remove exactly the blank separator owned by this deleted
+                # table. Additional blank lines and all nonblank user content
+                # remain untouched.
+                if start < len(lines) and not lines[start].strip():
+                    del lines[start]
         changed = True
     if changed and not any(line.strip().startswith("[hooks.state.") for line in lines):
         parent = [i for i, line in enumerate(lines) if line.strip() == "[hooks.state]"]
