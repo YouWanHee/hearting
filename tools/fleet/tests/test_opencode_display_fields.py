@@ -9,16 +9,16 @@ were populated. Each class below pins one of them against the real on-disk shape
      characters and the refresher wrote an empty title and no summary at all.
   2. The SQLite refresh cursor anchored on the ``message`` table, which holds only
      per-message metadata. Conversational text lives in ``part``.
-  3. ``collectors/dispatch.py`` parsed context telemetry for claude and codex only, so an
-     opencode job row had no ctx% even though every ``step_finish`` carries its tokens.
-  4. The models.dev window lookup ignored ``providerID`` and took the maximum across every
-     provider publishing that model id.
+  3. ``collectors/dispatch.py`` associates native attempt context by exact session/attempt.
+  4. A catalogue window is not an applied trigger; exact chat-parameter evidence now feeds
+     the registered row.
 """
 import json
 import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,6 +29,7 @@ from fleet import refresh_title as rt                       # noqa: E402
 from fleet.collectors import dispatch                       # noqa: E402
 from fleet.collectors import opencode                       # noqa: E402
 from fleet.model import DispatchJob                         # noqa: E402
+from fleet.context_policy import SCHEMA, policy_path       # noqa: E402
 
 
 def _envelope(event_type, part):
@@ -171,7 +172,12 @@ class DispatchTelemetryTest(unittest.TestCase):
         self.logs = os.path.join(self.tmp.name, ".dispatch", "logs")
         os.makedirs(self.logs)
         self.saved_home = os.environ.get("AGENT_HOME")
+        self.saved_state = os.environ.get("XDG_STATE_HOME")
+        self.saved_registry = os.environ.get("FLEET_SESSION_REGISTRY_DIR")
         os.environ["AGENT_HOME"] = self.tmp.name
+        os.environ["XDG_STATE_HOME"] = os.path.join(self.tmp.name, "state")
+        os.environ["FLEET_SESSION_REGISTRY_DIR"] = os.path.join(
+            self.tmp.name, "state", "agent-fleet", "sessions")
         dispatch._OPENCODE_ATTEMPT_CACHE.clear()
 
     def tearDown(self):
@@ -179,6 +185,14 @@ class DispatchTelemetryTest(unittest.TestCase):
             os.environ.pop("AGENT_HOME", None)
         else:
             os.environ["AGENT_HOME"] = self.saved_home
+        if self.saved_state is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = self.saved_state
+        if self.saved_registry is None:
+            os.environ.pop("FLEET_SESSION_REGISTRY_DIR", None)
+        else:
+            os.environ["FLEET_SESSION_REGISTRY_DIR"] = self.saved_registry
         dispatch._OPENCODE_ATTEMPT_CACHE.clear()
         self.tmp.cleanup()
 
@@ -194,23 +208,58 @@ class DispatchTelemetryTest(unittest.TestCase):
         job._log_file = path
         return job
 
-    def test_last_step_finish_sets_ctx_pct(self):
+    def test_last_step_finish_without_native_policy_stays_unknown(self):
         early = json.loads(json.dumps(_STEP_LINE))
         early["part"]["tokens"] = {"input": 100, "cache": {"read": 0, "write": 0}}
         job = self._job([early, _TEXT_LINE, _STEP_LINE])
         with _Registry():
             dispatch._enrich_opencode_attempt_session(job)
-        # last step wins: 1611 input + 17920 cache.read + 300 cache.write
-        self.assertEqual(job.active_context_tokens, 19831)
-        self.assertEqual(job.context_window_tokens, 1000000)
-        self.assertEqual(job.ctx_pct, 2)
+        # OpenCode 1.19.0 compaction uses tokens.total when present.
+        self.assertEqual(job.active_context_tokens, 19691)
+        self.assertIsNone(job.context_window_tokens)
+        self.assertIsNone(job.context_display_window_tokens)
+        self.assertIsNone(job.ctx_pct)
+        self.assertEqual(job.context_policy["state"], "unknown")
         self.assertEqual(job._runtime_session_id, "ses_test")
 
-    def test_output_and_reasoning_are_excluded_from_context(self):
+    def test_attempt_uses_exact_chat_params_policy_not_catalogue_window(self):
+        job = self._job([_STEP_LINE])
+        now = time.time()
+        path = policy_path("opencode", attempt_id=job.attempt_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schema": SCHEMA, "harness": "opencode", "session_id": "ses_test",
+            "pid": 123, "proc_start": "456", "attempt_id": job.attempt_id,
+            "model": "opencode-go/glm-5.2", "observed_at": now,
+            "policy": {"state": "applied", "source": "opencode-native-chat-params",
+                       "runtime_version": "1.19.0", "configured_request_tokens": 800000,
+                       "configured_request": "800000", "effective_window_tokens": 1000000,
+                       "applied_trigger_tokens": 40000, "output_allowance_tokens": 8192,
+                       "compaction_reserve_tokens": 20000, "enabled": True,
+                       "enforced": True, "disabled": False},
+        }), encoding="utf-8")
+        os.chmod(path, 0o600)
+        os.utime(job._log_file, (now + 2, now + 2))
+        dispatch._enrich_opencode_attempt_session(job)
+        self.assertEqual(job.active_context_tokens, 19691)
+        self.assertEqual(job.context_window_tokens, 1000000)
+        self.assertEqual(job.context_display_window_tokens, 40000)
+        self.assertEqual(job.ctx_pct, 49)
+        self.assertEqual(job.context_policy["configured_request_tokens"], 800000)
+
+    def test_native_total_is_the_trigger_count_when_present(self):
         job = self._job([_STEP_LINE])
         with _Registry():
             dispatch._enrich_opencode_attempt_session(job)
-        self.assertNotIn(job.active_context_tokens, (19691, 19991))
+        self.assertEqual(job.active_context_tokens, 19691)
+
+    def test_native_fallback_sum_includes_output_and_cache(self):
+        step = json.loads(json.dumps(_STEP_LINE))
+        del step["part"]["tokens"]["total"]
+        job = self._job([step])
+        with _Registry():
+            dispatch._enrich_opencode_attempt_session(job)
+        self.assertEqual(job.active_context_tokens, 19991)
 
     def test_transcript_without_tokens_reports_no_context(self):
         job = self._job([_TEXT_LINE, _TOOL_LINE])

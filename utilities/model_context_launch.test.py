@@ -152,6 +152,34 @@ class ModelContextLaunchTest(unittest.TestCase):
                     cwd="/tmp", environ={"OPENCODE_CONFIG_CONTENT": "{}"}, command="opencode",
                 )
 
+    def test_native_compaction_policy_uses_final_input_and_reserve_once(self):
+        configured = {
+            "model": MODEL, "compaction": {"auto": True, "reserved": 5000},
+            "provider": {"opencode-go": {"models": {"deepseek-v4.1-flash": {
+                "limit": {"context": 500000, "input": 400000, "output": 8192},
+            }}}},
+        }
+        final = json.loads(json.dumps(configured))
+        final["provider"]["opencode-go"]["models"]["deepseek-v4.1-flash"]["limit"]["input"] = 350000
+        native = {"context": 700000, "input": 350000, "output": 8192}
+        with mock.patch.object(context, "_installed_version", return_value="1.19.0"), \
+                mock.patch.object(context, "_native_limits", return_value=native), \
+                mock.patch.object(context, "_resolved_config", side_effect=[configured, final]):
+            launch = context.prepare_launch_context(
+                model=MODEL, context_window="800000", config_content=json.dumps(configured),
+                cwd="/tmp", environ={"OPENCODE_CONFIG_CONTENT": json.dumps(configured)},
+                command="opencode")
+        self.assertEqual(launch["runtime_version"], "1.19.0")
+        self.assertEqual(launch["final_limits"], {"context": 500000, "input": 350000,
+                                                  "output": 8192})
+        self.assertEqual(launch["compaction_policy"], {
+            "state": "applied", "enabled": True, "trigger_tokens": 345000,
+            "context_tokens": 500000, "input_tokens": 350000,
+            "output_allowance_tokens": 8192, "configured_reserve_tokens": 5000,
+            "effective_reserve_tokens": 5000,
+            "source": "opencode-v1.19.0-session-overflow", "reason": None,
+        })
+
     def test_configured_custom_model_needs_no_standard_catalog_entry(self):
         configured = {
             "model": "local/custom",

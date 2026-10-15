@@ -220,12 +220,16 @@ class StatuslineTapInjectionTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _run(self, stdin_json):
+    def _run(self, stdin_json, extra_env=None):
         env = dict(os.environ)
+        for name in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+                     "DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"):
+            env.pop(name, None)
         env["AGENT_HOME"] = self.agent_home
         env["CLAUDE_CONFIG_DIR"] = self.config_home
         env["FLEET_TITLE_DISABLE"] = "1"           # keep the refresher out of the test
         env["HARNESS_CAPACITY_REFRESH_DISABLE"] = "1"   # and the capacity gauge probe (network + live cache)
+        env.update(extra_env or {})
         proc = subprocess.Popen([self.stub, _STATUSLINE], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         out, err = proc.communicate(stdin_json.encode("utf-8"), timeout=30)
@@ -261,7 +265,32 @@ class StatuslineTapInjectionTest(unittest.TestCase):
     def test_non_brace_quote_input_stays_verbatim(self):
         stdin_json = '{ "session_id": "sidY", "cwd": "/tmp" }'
         self._run(stdin_json)
-        self.assertEqual(self._tap("sidY"), stdin_json)
+        record = json.loads(self._tap("sidY"))
+        # Native fields are untouched; the tap only gains Hearting's additive request record.
+        self.assertEqual({k: record[k] for k in ("session_id", "cwd")},
+                         {"session_id": "sidY", "cwd": "/tmp"})
+        self.assertIn("hearting_context_request", record)
+
+    def test_tap_keeps_allowlisted_compaction_request_separate_from_raw_window(self):
+        payload = json.dumps({"session_id": "sid-policy", "cwd": "/tmp",
+                              "context_window": {"context_window_size": 1000000,
+                                                  "used_percentage": 25}})
+        self._run(payload, {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "750000",
+                            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80"})
+        record = json.loads(self._tap("sid-policy"))
+        self.assertEqual(record["context_window"]["context_window_size"], 1000000)
+        self.assertEqual(record["hearting_context_request"]["window"], "750000")
+        self.assertEqual(record["hearting_context_request"]["pct_override"], "80")
+
+    def test_statusline_does_not_guess_model_window_from_model_id(self):
+        payload = json.dumps({"session_id": "sid-no-window", "cwd": "/tmp",
+                              "model": {"id": "claude-sonnet-5-5-1m"},
+                              "context_window": {"current_usage": {
+                                  "input_tokens": 500000,
+                                  "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": 0}}})
+        _proc, output, _err = self._run(payload)
+        self.assertNotIn("context", output.decode("utf-8", "replace"))
 
 
 if __name__ == "__main__":

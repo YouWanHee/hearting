@@ -167,6 +167,54 @@ class ManagedCodexAttributionTest(unittest.TestCase):
             self.assertEqual(tui.session_id, _SID)
             self.assertEqual(tui.session_tag, minted_tag(_SID))
 
+    def test_current_pane_thread_replaces_an_already_selected_old_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cwd = os.path.join(tmp, "dot-codex"), os.path.join(tmp, "project")
+            os.makedirs(cwd)
+            old_sid = "019facc9-fe83-7480-89f6-9e64fbebf0cb"
+            new_sid = "019facc9-fe83-7480-89f6-9e64fbebf0cc"
+            old = _make_rollout(home, cwd, old_sid)
+            new = _make_rollout(home, cwd, new_sid)
+            for path, active, window in ((old, 80, 100), (new, 30, 200)):
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"payload": {"type": "token_count", "info": {
+                        "last_token_usage": {"total_tokens": active},
+                        "model_context_window": window}}}) + "\n")
+            tui = _session(200, cwd, None)
+            with mock.patch.object(herdr, "codex_pane_sessions", return_value={200: new_sid}), \
+                    mock.patch.object(procscan, "read_environ", return_value={}):
+                tick = self._prepare([tui], {200: [old]}, home)
+            self.assertEqual(tick.proc_paths[200], new)
+            self.assertEqual(tui._herdr_session_id, new_sid)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+                codex.enrich(tui, tick=tick)
+            self.assertEqual((tui.session_id, tui.active_context_tokens,
+                              tui.context_window_tokens), (new_sid, 30, 200))
+
+    def test_current_pane_thread_without_rollout_drops_old_session_telemetry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cwd = os.path.join(tmp, "dot-codex"), os.path.join(tmp, "project")
+            os.makedirs(cwd)
+            old_sid = "019facc9-fe83-7480-89f6-9e64fbebf0cb"
+            new_sid = "019facc9-fe83-7480-89f6-9e64fbebf0cc"
+            old = _make_rollout(home, cwd, old_sid)
+            with open(old, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"total_tokens": 80},
+                    "model_context_window": 100}}}) + "\n")
+            tui = _session(200, cwd, None)
+            with mock.patch.object(herdr, "codex_pane_sessions", return_value={200: new_sid}), \
+                    mock.patch.object(procscan, "read_environ", return_value={}):
+                tick = self._prepare([tui], {200: [old]}, home)
+            self.assertNotIn(200, tick.proc_paths)
+            self.assertIn(200, tick.no_fallback_pids)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+                codex.enrich(tui, tick=tick)
+            self.assertEqual(tui.session_id, new_sid)
+            self.assertIsNone(tui.active_context_tokens)
+            self.assertIsNone(tui.context_window_tokens)
+            self.assertIsNone(tui.session_input_tokens)
+
     def test_herdr_thread_without_rollout_never_claims_other_cwd_rollout(self):
         with tempfile.TemporaryDirectory() as tmp:
             home, cwd = os.path.join(tmp, "dot-codex"), os.path.join(tmp, "project")

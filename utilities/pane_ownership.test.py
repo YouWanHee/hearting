@@ -69,7 +69,13 @@ class PaneOwnershipTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 foreground = self.runtime(harness)
                 self.foreground(foreground)
-                self.assertEqual(self.verify(foreground.pid, harness), "wB:p3N")
+                sid = "019facc9-fe83-7480-89f6-9e64fbebf0ca" if harness == "codex" else None
+                if harness == "codex":
+                    with mock.patch.object(po, "_read_codex_footer_threads", return_value={sid}), \
+                            mock.patch.object(po, "_registered_worker", return_value=False):
+                        self.assertEqual(self.verify(foreground.pid, harness, sid), "wB:p3N")
+                else:
+                    self.assertEqual(self.verify(foreground.pid, harness, sid), "wB:p3N")
 
     def test_inherited_label_different_pty_cannot_overwrite_or_consume_foreground_card(self):
         foreground, unrelated = self.runtime(), self.runtime()
@@ -131,16 +137,59 @@ class PaneOwnershipTest(unittest.TestCase):
         with mock.patch.object(po, "_process", return_value=None):
             self.assertEqual(self.verify(foreground.pid), "")
 
+    def test_fresh_codex_footer_replaces_stale_open_rollout_identity(self):
+        foreground = self.runtime("codex")
+        self.foreground(foreground)
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        with mock.patch.object(po, "_native_session", return_value="old-thread"), \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value={current}), \
+                mock.patch.object(po, "_registered_worker", return_value=False):
+            self.assertEqual(self.verify(foreground.pid, "codex", current), "wB:p3N")
+            self.assertEqual(self.verify(foreground.pid, "codex", "old-thread"), "")
+
+    def test_codex_hook_can_report_new_thread_only_after_current_footer_proof(self):
+        from fleet import herdr_projection as hp
+        foreground = self.runtime("codex")
+        self.foreground(foreground)
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        env = {"HERDR_PANE_ID": "wB:p3N"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(hp, "runtime_identity", return_value=("codex", "old-thread")), \
+                mock.patch.object(hp, "_nearest_codex_pid", return_value=foreground.pid), \
+                mock.patch.object(po.shutil, "which", return_value=str(self.herdr)), \
+                mock.patch.object(po, "_native_session", return_value="old-thread"), \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value={current}), \
+                mock.patch.object(po, "_registered_worker", return_value=False):
+            self.assertTrue(hp.may_report("codex", current, worker=False))
+            self.assertFalse(hp.may_report("codex", "old-thread", worker=False))
+
+    def test_session_tidy_uses_current_codex_footer_instead_of_inherited_thread(self):
+        foreground = self.runtime("codex")
+        self.foreground(foreground)
+        current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+        process = po._process(foreground.pid)
+        env = {"CODEX_THREAD_ID": "old-thread", "HERDR_PANE_ID": "wB:p3N"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(po, "_caller_runtime", return_value=(process, False)), \
+                mock.patch.object(po.shutil, "which", return_value=str(self.herdr)), \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value={current}), \
+                mock.patch.object(po, "_registered_worker", return_value=False):
+            self.assertEqual(st.session_from_env(), ("codex", current))
+            with mock.patch.object(po, "_read_codex_footer_threads", return_value=set()):
+                self.assertEqual(st.session_from_env(), ("codex", None))
+
     def test_shared_server_needs_exact_current_thread_not_fork_tree_root(self):
         foreground = self.runtime("codex")
         self.foreground(foreground)
         caller = (123, 1, 123, 0, -1, "server-start")
-        current_thread = "fork-current-thread"
+        current_thread = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
         tree_root = "original-tree-root"
         original = po._process
         with mock.patch.object(po, "_caller_runtime", return_value=(caller, True)), \
                 mock.patch.object(po, "_process", side_effect=lambda pid: caller if pid == 123 else original(pid)), \
-                mock.patch.object(po, "_native_session", return_value=current_thread):
+                mock.patch.object(po, "_native_session", return_value="old-rollout-thread"), \
+                mock.patch.object(po, "_read_codex_footer_threads", return_value={current_thread}), \
+                mock.patch.object(po, "_registered_worker", return_value=False):
             self.assertEqual(self.verify(123, "codex", tree_root), "")
             self.assertEqual(self.verify(123, "codex", current_thread), "wB:p3N")
 
@@ -161,7 +210,10 @@ class PaneOwnershipTest(unittest.TestCase):
         env = {"CODEX_THREAD_ID": "inherited-fake-thread", "HERDR_PANE_ID": "wB:p3N"}
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(hp, "runtime_identity", return_value=("codex", "selected-thread")), \
-                mock.patch.object(hp, "verified_pane", return_value="wB:p3N"):
+                mock.patch.object(hp, "_nearest_codex_pid", return_value=os.getpid()), \
+                mock.patch.object(hp, "verified_pane",
+                                  side_effect=lambda pane, harness, sid, **kw:
+                                  "wB:p3N" if sid == "selected-thread" else ""):
             self.assertFalse(hp.may_report("codex", "inherited-fake-thread"))
             self.assertTrue(hp.may_report("codex", "selected-thread"))
             with mock.patch.dict(os.environ, {"AGENT_SESSION_ROLE": "worker"}):
@@ -194,9 +246,12 @@ class PaneOwnershipTest(unittest.TestCase):
                 mock.patch.object(procscan, "read_environ", return_value={"HERDR_PANE_ID": "wB:p3N"}), \
                 mock.patch.object(po, "_native_session", return_value=""):
             self.assertIsNone(hp._codex_tui_pane("guessed-session"))
-            with mock.patch.object(po, "_native_session", return_value="actual-session"):
+            actual = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+            with mock.patch.object(po, "_native_session", return_value=actual):
                 self.assertIsNone(hp._codex_tui_pane("guessed-session"))
-                self.assertEqual(hp._codex_tui_pane("actual-session"), "wB:p3N")
+                with mock.patch.object(po, "_read_codex_footer_threads",
+                                       return_value={actual}):
+                    self.assertEqual(hp._codex_tui_pane(actual), "wB:p3N")
 
     def test_recovery_default_does_not_use_an_inherited_pane(self):
         foreground, unrelated = self.runtime(), self.runtime()

@@ -259,6 +259,12 @@ def _current_session_identity():
     try:
         from dispatch_parent_completion import interactive_parent_identity
         harness, sid = interactive_parent_identity()
+        if harness == "codex":
+            from pane_ownership import current_codex_thread_for_caller
+            current = current_codex_thread_for_caller(
+                os.environ.get("HERDR_PANE_ID", ""), server=_HERDR_SESSION)
+            if current is not None:
+                return current, "codex"
         if sid:
             return sid, harness
     except Exception:   # caller-harness-ambiguous/invalid -> sender unknown, never guessed
@@ -4657,18 +4663,32 @@ def _native_trust_reason(harness, lines):
 def _process_session(pane, harness):
     """The session the pane's foreground runtime process is on now, or None.
 
-    Read from the process the way the Fleet board does (`fleet.process_identity`:
-    Claude's `sessions/<pid>.json`, rewritten on `/clear`; Codex's open rollout;
-    OpenCode's TUI selection record). herdr's own `agent_session`
+    Claude uses `sessions/<pid>.json`, rewritten on `/clear`; Codex uses the
+    current full footer bound to the pane's foreground PID/start/group; OpenCode
+    uses its TUI selection record. Herdr's own `agent_session`
     follows a `/clear` only when its integration reports it, and has been seen to keep
     the previous session for good (live panes 2026-10-01), so a second tidy in the same
-    window would otherwise never clear it."""
+    window would otherwise never clear it. Codex's open rollout can also be historical
+    after `/new` or resume; the current footer owns the visible conversation."""
     try:
         proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
         payload = json.loads(proc.stdout or "")
         processes = ((payload.get("result") or {}).get("process_info") or {}).get("foreground_processes") or []
     except Exception:
+        return None
+    if harness == "codex":
+        from pane_ownership import current_codex_thread
+        executable = shutil.which("herdr")
+        for process in processes:
+            try:
+                current = current_codex_thread(
+                    pane, int(process.get("pid")), executable=executable,
+                    server=_HERDR_SESSION)
+            except Exception:
+                current = ""
+            if current:
+                return current
         return None
     return _proven_session(processes, harness)
 

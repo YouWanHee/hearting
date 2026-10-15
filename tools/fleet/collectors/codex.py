@@ -1733,25 +1733,33 @@ def prepare_tick(sessions):
     # Running it after the start match changes nothing: that match skips every row with
     # a managed dir, which is every row this transfer touches.
     donated = _transfer_managed_rollouts(sessions, paths)
-    # Newer native Codex TUIs may have no rollout fd while the user-wide daemon
-    # holds many. Only herdr's live foreground PID → thread ID can disambiguate
-    # those same-cwd sessions. Probe unresolved direct TUIs, then open the exact
-    # thread's rollout; a missing rollout still reserves the identity against a
-    # same-cwd fallback.
-    unresolved = [s for s in sessions
-                  if getattr(s, "harness", None) == "codex"
-                  and not getattr(s, "app_server", False)
-                  and not getattr(s, "managed_dir", None)
-                  and not getattr(s, "is_child", False)
-                  and s.pid not in paths and getattr(s, "cwd", None)]
+    # Herdr's current pane session can move while the process keeps an older
+    # rollout open (for example, after /new or resume). Re-read direct TUI pane
+    # identities even when process_rollouts already selected a path, then replace
+    # that path only when the exact current pane identity is unambiguous.
+    direct_tuis = [s for s in sessions
+                   if getattr(s, "harness", None) == "codex"
+                   and not getattr(s, "app_server", False)
+                   and not getattr(s, "managed_dir", None)
+                   and not getattr(s, "is_child", False)
+                   and getattr(s, "cwd", None)]
     pane_ids = {}
-    if unresolved:
+    if direct_tuis:
         from . import herdr, procscan
-        pane_ids = herdr.codex_pane_sessions(unresolved)
-        for sess in unresolved:
+        pane_ids = herdr.codex_pane_sessions(direct_tuis, force_current=True)
+        for sess in direct_tuis:
             sid = pane_ids.get(sess.pid)
-            if (not sid or _sid("rollout-x-%s.jsonl" % sid) != sid
-                    or sid in claimed):
+            if not sid or _sid("rollout-x-%s.jsonl" % sid) != sid:
+                continue
+            old_path = paths.get(sess.pid)
+            old_sid = _sid(old_path) if old_path else None
+            if old_sid != sid and old_path:
+                paths.pop(sess.pid, None)
+                if old_sid and not any(_sid(path) == old_sid for path in paths.values()):
+                    claimed.discard(old_sid)
+            if sid in claimed and old_sid != sid:
+                # A different live row already owns this thread. Drop the old
+                # path and leave this PID unresolved instead of showing either.
                 continue
             sess._herdr_session_id = sid
             claimed.add(sid)
@@ -1949,7 +1957,36 @@ def _tail_pending_request_user_input(path, chunk=65536):
     return {"call_id": call_id, "waiting_since": since if since is not None else cursor.mtime_ns / 1e9}
 
 
-def _apply_token_count(sess, line):
+_ROLLOUT_VERSION_CACHE = {}              # path -> session_meta cli_version (immutable per rollout)
+
+
+def _rollout_cli_version(path):
+    """Codex runtime version recorded by the rollout's own session_meta, or None."""
+    key = os.path.realpath(path)
+    if key in _ROLLOUT_VERSION_CACHE:
+        return _ROLLOUT_VERSION_CACHE[key]
+    version = _rollout_meta(path).get("cli_version")
+    version = version[:32] if isinstance(version, str) else None
+    if version is not None:
+        if len(_ROLLOUT_VERSION_CACHE) > 512:
+            _ROLLOUT_VERSION_CACHE.pop(next(iter(_ROLLOUT_VERSION_CACHE)))
+        _ROLLOUT_VERSION_CACHE[key] = version
+    return version
+
+
+def _cmdline_overrides_compaction(pid):
+    """True when this process was launched with a compaction-affecting `-c` override."""
+    if not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as stream:
+            raw = stream.read(65536)
+    except OSError:
+        return None
+    return b"auto_compact" in raw or b"token_budget" in raw
+
+
+def _apply_token_count(sess, line, path=None):
     # Shared parser keeps active context separate from cumulative session counters.
     telemetry = parse_codex_token_count(line, session_id=sess.session_id)
     sess.active_context_tokens = telemetry.active_context_tokens
@@ -1962,8 +1999,24 @@ def _apply_token_count(sess, line):
     if telemetry.active_context_tokens is not None:
         # Legacy render compatibility: Codex ``tokens`` remains active context.
         sess.tokens = telemetry.active_context_tokens
-    if telemetry.context_used_pct is not None:
-        sess.ctx_pct = telemetry.context_used_pct
+    # token_count reports the thread's usable window (window * effective percent). The
+    # applied auto-compaction trigger comes from the verified native consumer for this
+    # rollout's own runtime version and model; anything unproven stays unknown.
+    from ..context_policy import codex_applied_policy
+    from ..token_budget import context_policy_used_pct
+    policy = codex_applied_policy(
+        runtime_version=_rollout_cli_version(path) if path else None,
+        model=getattr(sess, "model", None),
+        usable_window_tokens=telemetry.context_window_tokens,
+        session_id=sess.session_id, home=(_rollout_home(path) if path else None),
+        execution_started_at=_process_started_at(sess),
+        execution_key=(sess.pid, sess.proc_start, sess.session_id),
+        session_created_at=_session_created(_rollout_meta(path)) if path else None,
+        cli_override_present=_cmdline_overrides_compaction(getattr(sess, "pid", None)))
+    sess.context_policy = policy
+    sess.context_display_window_tokens = (
+        policy["applied_trigger_tokens"] if policy["state"] == "applied" else None)
+    sess.ctx_pct = context_policy_used_pct(telemetry.active_context_tokens, policy)
     try:
         p = json.loads(line).get("payload") or {}
     except Exception:
@@ -2191,6 +2244,9 @@ def enrich(sess, tick=None):
         path = tick.proc_paths.get(sess.pid)
         if not path and sess.pid not in tick.no_fallback_pids:
             path = _fallback_rollout(sess, home)
+    herdr_sid = getattr(sess, "_herdr_session_id", None)
+    if path and herdr_sid and _sid(path) != herdr_sid:
+        path = None                      # the pane selected another thread; never borrow this one's
     if not path:
         if sess.session_id:
             from fleet.session_handle import resolve_tag
@@ -2289,4 +2345,4 @@ def enrich(sess, tick=None):
         sess.exec_tool = _tail_open_tool_call(path)
     tc = _tail_token_count(path)
     if tc:
-        _apply_token_count(sess, tc)
+        _apply_token_count(sess, tc, path)
