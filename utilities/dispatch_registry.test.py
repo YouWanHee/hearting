@@ -3394,4 +3394,44 @@ class ClosedUnclaimedOwnerTest(RegistryFixtureTestCase):
   self.assertTrue(all(d["proposed_note"]!="cancelled-receipt-unavailable" for d in result["decisions"]))
 
 
+class WorkerHomeRetentionCarrierTest(unittest.TestCase):
+ """A non-exact `reconcile --apply` retires expired homes; scoped runs do not."""
+
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+  self.base=Path(self.tmp.name).resolve();self.jobs=self.base/"jobs.log"
+  from worker_runtime_home import _builder
+  self.attempt="att-carrier-expired"
+  key=_builder.worker_home_key(str(ROOT),"claude","stage",self.attempt)
+  self.home=self.base/"homes/workers"/key;self.home.mkdir(parents=True)
+  (self.home/"worker-home.json").write_text(json.dumps({"harness":"claude","worker_type":"stage",
+   "source":str(ROOT),"profile":None,"schema":2,"identity":self.attempt,"key":key,"destination":False}))
+  old=time.time()-30*86400
+  os.utime(self.home/"worker-home.json",(old,old));os.utime(self.home,(old,old))
+  state=self.base/"homes/worker-retention";state.mkdir()
+  (state/"state.json").write_text(json.dumps({"schema":1,"last_pass_ns":0,"cursor":"",
+   "eligible_since":{key:time.time_ns()-20*86400*10**9}}))
+  self.jobs.write_text(f"2026-09-01T00:00:00Z\tdone\t/repo\t/wt\told\t{CURRENT_ATTEMPT_CONTRACT},"
+   f"worker_type=stage,attempt_id={self.attempt},harness=claude,runtime_home={self.home},launch_outcome=never-launched\n")
+
+ def run_registry(self,*flags):
+  return subprocess.run([sys.executable,str(SCRIPT),"reconcile","--jobs",str(self.jobs),
+   "--agent-home",str(self.base),*flags],capture_output=True,text=True)
+
+ def test_dry_run_and_exact_scope_keep_the_home(self):
+  dry=self.run_registry("--route","rt-none");self.assertEqual(dry.returncode,0,dry.stdout+dry.stderr)
+  self.assertNotIn("worker_homes",json.loads(dry.stdout))
+  exact=self.run_registry("--attempt",self.attempt,"--apply")
+  self.assertEqual(exact.returncode,0,exact.stdout+exact.stderr)
+  self.assertNotIn("worker_homes",json.loads(exact.stdout))
+  self.assertTrue(self.home.is_dir())
+
+ def test_non_exact_apply_retires_the_expired_home(self):
+  applied=self.run_registry("--route","rt-none","--apply");self.assertEqual(applied.returncode,0,applied.stdout+applied.stderr)
+  record=json.loads(applied.stdout)
+  self.assertEqual(record["worker_homes"]["removed"],1,record)
+  self.assertFalse(self.home.exists())
+
+
+
 if __name__=="__main__":unittest.main()

@@ -539,7 +539,10 @@ def publish_owner_route_advance(jobs: str | Path, *, owner_attempt_id: str,
     return _advance_from_payload(payload, path)
 
 
-def _verified_binding(binding: OwnerRouteBinding, *, expected_cwd: str | None = None) -> tuple[dict, dict]:
+def _verified_binding(binding: OwnerRouteBinding, *, expected_cwd: str | None = None,
+                      observer=None) -> tuple[dict, dict]:
+    if observer is not None:
+        observer("file", Path(binding.route_file))
     try:
         raw = json.loads(Path(binding.route_file).read_text(encoding="utf-8"))
         verified = ROUTE.verify_route(raw, expected_cwd=expected_cwd)
@@ -555,8 +558,11 @@ def _verified_binding(binding: OwnerRouteBinding, *, expected_cwd: str | None = 
 
 
 def _resolve_attachment_locked(jobs: Path, owner_attempt_id: str,
-                               fields: list[str], meta: dict[str, str]) -> OwnerRouteBinding | None:
+                               fields: list[str], meta: dict[str, str],
+                               observer=None) -> OwnerRouteBinding | None:
     path = _attachment_root(jobs) / _attachment_key(owner_attempt_id)
+    if observer is not None:
+        observer("file", path)
     if not path.exists():
         return None
     try:
@@ -572,7 +578,8 @@ def _resolve_attachment_locked(jobs: Path, owner_attempt_id: str,
         attachment.route_id,
         attachment.route_hash,
     )
-    _, route = _verified_binding(binding, expected_cwd=attachment.worktree)
+    _, route = _verified_binding(binding, expected_cwd=attachment.worktree,
+                                 observer=observer)
     route_checks = (
         (int(route.get("advance_generation") or 0) == 0,
          "owner-route-attachment-generation-invalid"),
@@ -625,7 +632,8 @@ def _resolve_attachment_locked(jobs: Path, owner_attempt_id: str,
 
 def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
                                   sealed_binding: OwnerRouteBinding | None = None,
-                                  sealed_generation: int | None = None
+                                  sealed_generation: int | None = None,
+                                  observer=None
                                   ) -> tuple[OwnerRouteBinding | None, str]:
     """Resolve launch binding or post-launch attachment, then verified advances."""
     canonical_jobs = Path(jobs).expanduser()
@@ -638,6 +646,8 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
     # attachment/advance files themselves are atomic write-once records, so a
     # before/after snapshot is safe and the next Fleet tick observes the other
     # side of a concurrent transition.
+    if observer is not None:
+        observer("file", canonical_jobs)
     rows = _registry_snapshot(canonical_jobs)
     fields, meta = _owner_snapshot(
         canonical_jobs, owner_attempt_id, rows=rows
@@ -648,19 +658,22 @@ def resolve_owner_route_lifecycle(jobs: str | Path, *, owner_attempt_id: str,
             raise OwnerRouteBindingError("owner-route-owner-binding-mismatch")
         same_work_or_refuse("owner-route-owner-binding-mismatch")
     attachment_path = _attachment_root(canonical_jobs) / _attachment_key(owner_attempt_id)
+    if observer is not None:
+        observer("file", attachment_path)
     if row_binding is not None:
         if attachment_path.exists():
             raise OwnerRouteBindingError("owner-route-attachment-conflicts-sealed-binding")
         anchor = row_binding
         anchor_status = "owner-route-launch-binding"
     else:
-        anchor = _resolve_attachment_locked(canonical_jobs, owner_attempt_id, fields, meta)
+        anchor = _resolve_attachment_locked(canonical_jobs, owner_attempt_id, fields, meta,
+                                            observer=observer)
         anchor_status = "owner-route-post-launch-attachment"
     if anchor is None:
         return None, "owner-route-binding-absent"
     current, advance_status = resolve_owner_route_advance(
         jobs, owner_attempt_id=owner_attempt_id, anchor=anchor,
-        anchor_generation=sealed_generation, registry_rows=rows,
+        anchor_generation=sealed_generation, registry_rows=rows, observer=observer,
     )
     if advance_status in {"owner-route-advance-current"}:
         return current, advance_status
@@ -747,6 +760,7 @@ def resolve_owner_route_advance(
     jobs: str | Path, *, owner_attempt_id: str, anchor: OwnerRouteBinding,
     anchor_generation: int | None = None,
     registry_rows: list[tuple[list[str], dict[str, str]]] | None = None,
+    observer=None,
 ) -> tuple[OwnerRouteBinding, str]:
     """Follow only verified, child-adopted predecessor candidates.
 
@@ -762,10 +776,14 @@ def resolve_owner_route_advance(
     )
     if registry_rows is None:
         jobs_path = Path(jobs).expanduser()
+        if observer is not None:
+            observer("file", jobs_path)
         registry_rows = _registry_snapshot(jobs_path) if jobs_path.is_file() else []
+    if observer is not None:
+        observer("members", first_path)
     first_candidates = list(first_path.glob("*.json")) if first_path.is_dir() else []
     try:
-        _current_raw, current_route = _verified_binding(anchor)
+        _current_raw, current_route = _verified_binding(anchor, observer=observer)
         route_generation = int(current_route.get("advance_generation") or 0)
     except (OwnerRouteBindingError, ValueError, TypeError) as exc:
         if not first_candidates:
@@ -784,6 +802,8 @@ def resolve_owner_route_advance(
         predecessor = root / _advance_key(
             owner_attempt_id, current.route_id, current.route_hash
         )
+        if observer is not None:
+            observer("members", predecessor)
         paths = sorted(predecessor.glob("*.json")) if predecessor.is_dir() else []
         if not paths:
             return current, (
@@ -793,6 +813,8 @@ def resolve_owner_route_advance(
             )
         adopted = []
         for path in paths:
+            if observer is not None:
+                observer("file", path)
             try:
                 candidate = _advance_from_payload(
                     json.loads(path.read_text(encoding="utf-8")), path
@@ -852,6 +874,8 @@ def resolve_owner_route_advance(
         if not target_path.is_absolute():
             raise OwnerRouteBindingError("owner-route-advance-target-invalid")
         try:
+            if observer is not None:
+                observer("file", target_path)
             raw_target = json.loads(target_path.read_text(encoding="utf-8"))
             verified_target = ROUTE.verify_route(raw_target)
             if (

@@ -373,6 +373,23 @@ class WorkerHomes(unittest.TestCase):
         self.assertFalse((empty_destination / '.credentials.json').exists())
         self.assertEqual(main_candidate.read_bytes(), main_before)
 
+    def test_manifest_records_the_identity_retention_needs_to_bind_a_home(self):
+        (self.source / 'settings.json').write_text('{}')
+        env = {**self.env, 'CLAUDE_CONFIG_DIR': str(self.source)}
+        built = prepare_worker_home(ROOT, 'claude', 'stage', 'att-manifest', env=env)
+        home = Path(built['CLAUDE_CONFIG_DIR'])
+        manifest = json.loads((home / 'worker-home.json').read_text())
+        key = worker_runtime_home._builder.worker_home_key(str(ROOT.resolve()), 'claude', 'stage', 'att-manifest')
+        self.assertEqual(home.name, key)
+        self.assertEqual((manifest['schema'], manifest['identity'], manifest['key'], manifest['destination']),
+                         (2, 'att-manifest', key, False))
+        self.assertEqual({'harness', 'worker_type', 'source', 'profile'} - set(manifest), set())
+        shared = self.base / 'shared-home'
+        built = prepare_worker_home(ROOT, 'claude', 'stage', 'att-shared', env=env, destination=shared)
+        manifest = json.loads((shared / 'worker-home.json').read_text())
+        self.assertTrue(manifest['destination'])
+        self.assertEqual(manifest['identity'], 'att-shared')
+
     def test_codex_hook_alias_preserves_user_decisions_and_rereads_them_on_resume(self):
         hooks = self.source / 'hooks.json'
         hooks.write_text('{"hooks":{}}')

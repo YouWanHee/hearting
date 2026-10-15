@@ -2517,6 +2517,18 @@ def namespace_gone(metadata: dict[str, str]) -> str:
     return "extinct"
 
 
+def recorded_pid_namespace_state(recorded: str) -> str:
+    """present | extinct | unverifiable for one recorded ``pid:[inode]`` value.
+
+    The per-value rule `namespace_gone` applies to a row's own namespaces, for a
+    caller that holds a different recorded namespace (a summary owner's).
+    """
+
+    if _PID_NAMESPACE_LINK.fullmatch(recorded or "") is None:
+        return "unverifiable"
+    return _recorded_pid_namespace_state(recorded)
+
+
 def authoritative_process_identities(
     metadata: dict[str, str],
 ) -> tuple[AuthoritativeProcessIdentity, ...]:

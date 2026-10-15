@@ -442,6 +442,11 @@ def worker_hook_state_override(home, origins):
     return 'hooks.state=' + inline
 
 
+def worker_home_key(agent_home, harness, worker_type, identity):
+    """The per-attempt home directory name; ``agent_home`` is its resolved string."""
+    return hashlib.sha256((str(agent_home) + '\0' + harness + '\0' + worker_type + '\0' + identity).encode()).hexdigest()[:32]
+
+
 def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, destination=None, profile=None):
     """Default typed profile for every launch; never changes the caller's home.
 
@@ -456,7 +461,7 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
     if harness not in VALID_HARNESSES or worker_type not in VALID_WORKER_TYPES:
         raise ValueError('invalid worker home type')
     jobs = Path(env.get('AGENT_DISPATCH_JOBS') or resolve_dispatch_state_root(agent_home) / 'jobs.log')
-    key = hashlib.sha256((str(agent_home) + '\0' + harness + '\0' + worker_type + '\0' + identity).encode()).hexdigest()[:32]
+    key = worker_home_key(agent_home, harness, worker_type, identity)
     home = Path(destination) if destination is not None else jobs.parent / 'homes/workers' / key
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     home.chmod(0o700)
@@ -661,8 +666,11 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         symlink(home, runtime / 'config/opencode')
         values.update(OPENCODE_CONFIG_DIR=str(home), OPENCODE_DISABLE_CLAUDE_CODE_PROMPT='1',
                       OPENCODE_DISABLE_CLAUDE_CODE_SKILLS='1')
+    # schema 2 adds the identity retention needs to bind a home to its attempt.
     metadata = {'harness': harness, 'worker_type': worker_type,
-                'source': str(agent_home), 'profile': profile}
+                'source': str(agent_home), 'profile': profile,
+                'schema': 2, 'identity': identity, 'key': key,
+                'destination': destination is not None}
     if harness == 'claude':
         metadata['claude_secure_storage_dir'] = secure_storage
     write_json(home / 'worker-home.json', metadata)

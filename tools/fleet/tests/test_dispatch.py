@@ -1633,7 +1633,8 @@ class JobLivenessPathAssemblyTest(unittest.TestCase):
         def no_store(path):
             calls.append(path)
             raise OSError
-        with mock.patch('fleet.collectors.dispatch.os.listdir', side_effect=no_store):
+        with mock.patch('fleet.collectors.dispatch.os.listdir', side_effect=no_store), \
+             mock.patch('fleet.collectors.dispatch._native_home_admitted', return_value=True):
             dispatch._job_liveness('/cwd', 0, profile='legacy', slug='job', job=job)
         self.assertEqual(calls, [os.path.join('/WORKER', 'projects', dispatch._enc('/cwd'))])
 

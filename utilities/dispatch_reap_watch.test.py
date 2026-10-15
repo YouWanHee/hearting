@@ -1032,5 +1032,90 @@ class DrainScanRetryTest(unittest.TestCase):
             self.assertEqual(self.watch(None, grace=0.0, metadata=metadata), (69, []))   # could be the attempt's own
 
 
+class WorkerHomeRetentionCarrierTest(unittest.TestCase):
+    """The post-exit reaper retires expired homes; no user step is involved."""
+
+    def seed_expired_home(self, base, attempt):
+        from worker_runtime_home import _builder
+        key = _builder.worker_home_key(str(ROOT), "claude", "stage", attempt)
+        home = base / "homes" / "workers" / key
+        home.mkdir(parents=True)
+        (home / "worker-home.json").write_text(json.dumps({
+            "harness": "claude", "worker_type": "stage", "source": str(ROOT), "profile": None,
+            "schema": 2, "identity": attempt, "key": key, "destination": False}))
+        (home / "projects").mkdir()
+        (home / "projects" / "t.jsonl").write_text("x")
+        old = time.time() - 30 * 86400
+        for path in (home / "projects" / "t.jsonl", home / "projects", home / "worker-home.json", home):
+            os.utime(path, (old, old))
+        # An earlier pass proved it eligible long ago.
+        state = base / "homes" / "worker-retention"
+        state.mkdir(parents=True)
+        (state / "state.json").write_text(json.dumps({
+            "schema": 1, "last_pass_ns": 0, "cursor": "",
+            "eligible_since": {key: time.time_ns() - 20 * 86400 * 10**9}}))
+        return home, key
+
+    def test_a_reaper_exit_retires_an_expired_home_and_keeps_the_rest(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            jobs = base / "jobs.log"
+            attempt = "att-reaper-carrier"
+            worker = subprocess.Popen(
+                ["sleep", "0.05"], env={**os.environ, D.ATTEMPT_DESCENDANT_ENV: attempt},
+                start_new_session=True)
+            identity = D.process_launch_identity(worker.pid)
+            metadata = ",".join(f"{k}={v}" for k, v in {
+                **identity, "attempt_id": attempt, "launch_lifecycle": "detached",
+                "log_file": str(base / "missing.jsonl")}.items())
+            expired, key = self.seed_expired_home(base, "att-long-gone")
+            from worker_runtime_home import _builder
+            live_key = _builder.worker_home_key(str(ROOT), "claude", "stage", attempt)
+            live_home = base / "homes" / "workers" / live_key
+            live_home.mkdir(parents=True)
+            (live_home / "worker-home.json").write_text(json.dumps({
+                "harness": "claude", "worker_type": "stage", "source": str(ROOT), "profile": None,
+                "schema": 2, "identity": attempt, "key": live_key, "destination": False}))
+            jobs.write_text(
+                "2026-10-01T00:00:00Z\topen\t/repo\t/wt\tworker\t"
+                f"{CURRENT},{metadata},runtime_home={live_home}\n"
+                "2026-09-01T00:00:00Z\tdone\t/repo\t/wt\told\t"
+                f"{CURRENT},attempt_id=att-long-gone,harness=claude,runtime_home={expired},"
+                "launch_outcome=never-launched\n", encoding="utf-8")
+            watcher = subprocess.Popen([
+                sys.executable, str(WATCH), "--jobs", str(jobs), "--attempt-id", attempt,
+                "--pid", str(worker.pid), "--pid-start", identity["pid_start"],
+                "--pgid", identity["pgid"], "--interval", "0.02"])
+            worker.wait(timeout=5)
+            self.assertEqual(watcher.wait(timeout=30), 0)
+            self.assertFalse(expired.exists())
+            self.assertTrue(live_home.is_dir())
+            self.assertIn("\tdone\t", jobs.read_text(encoding="utf-8").splitlines()[0])
+            record = json.loads((base / "homes/worker-retention/state.json").read_text())
+            self.assertEqual(record["last_result"]["removed"], 1)
+            # The attempt this reaper just closed carries a real post-exit receipt, so
+            # its own home is proven quiet and starts its window instead of being
+            # held as unverifiable for ever.
+            self.assertEqual(record["last_result"]["kept"], {"within-window": 1})
+            self.assertEqual(record["last_result"]["unknown"], {})
+
+    def test_a_failing_sweep_does_not_change_the_watcher_result(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dispatch_reap_watch_main", WATCH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        import worker_home_retention
+        with mock.patch.object(module, "watch", return_value=65), \
+                mock.patch.object(worker_home_retention, "sweep", side_effect=RuntimeError("boom")):
+            code = module.main(["--jobs", "/nonexistent/jobs.log", "--attempt-id", "att-x",
+                                "--pid", "1", "--pid-start", "1", "--pgid", "1"])
+        self.assertEqual(code, 65)
+        with mock.patch.object(module, "watch", return_value=0), \
+                mock.patch.object(worker_home_retention, "sweep") as sweep:
+            self.assertEqual(module.main(["--jobs", "/nonexistent/jobs.log", "--attempt-id", "att-x",
+                                          "--pid", "1", "--pid-start", "1", "--pgid", "1"]), 0)
+        sweep.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

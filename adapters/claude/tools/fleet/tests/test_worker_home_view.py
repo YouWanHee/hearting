@@ -1,0 +1,1 @@
+../../../../../tools/fleet/tests/test_worker_home_view.py

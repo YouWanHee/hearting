@@ -49,6 +49,10 @@ from dispatch_contract import (  # noqa: E402
     tagged_residue_receipt,
 )
 from claude_project_dir import resolve_session_transcript
+try:
+    from worker_home_retention import note_view as _note_worker_home_view
+except Exception:  # a monitor must never fail to import over a bookkeeping helper
+    _note_worker_home_view = None
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
 from dispatch_attempt_policy import terminal_conflict_pending  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
@@ -677,6 +681,9 @@ def _codex_job_liveness(cwd, now, stale_min=15, profile=None, slug=None,
             if mtime is not None and (newest is None or mtime > newest):
                 newest = mtime
     else:
+        actual_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home") if job is not None else None
+        if actual_home and not _native_home_admitted(job):
+            return "unknown"
         for sessions in _codex_sessions_dirs(cwd, profile, slug, job=job):
             try:
                 for root, _dirs, names in os.walk(sessions):
@@ -726,6 +733,8 @@ def _opencode_heartbeat_age(slug, now, job=None):
 
 def _opencode_job_liveness(cwd, now, stale_min=15, slug=None, job=None):
     if not cwd:
+        return "unknown"
+    if job is not None and not _native_home_admitted(job):
         return "unknown"
     db = _opencode_db()
     runtime_dir = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir") if job is not None else None
@@ -1232,6 +1241,30 @@ def _attempt_summary_sid(job):
     return "dispatch-" + attempt_id
 
 
+def _note_home_view(job, jobs_path=None):
+    """Admit a displayed native home; mark an actual retention candidate.
+
+    A candidate's marker (at most one write per home per hour) keeps retention
+    from detaching it during a read. Excluded homes need no retention writes.
+    Only displayed rows call this, so dropped historical rows never pin a home.
+    """
+    home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home")
+    registry = getattr(job, "_registry_path", None) or jobs_path
+    if not home:
+        return True
+    if not registry or _note_worker_home_view is None:
+        return False
+    try:
+        return bool(_note_worker_home_view(registry, home))
+    except Exception:
+        return False
+
+
+def _native_home_admitted(job):
+    """Revalidate at the read site, including direct detail/enricher calls."""
+    return _note_home_view(job)
+
+
 def _enrich_attempt_summary(job, fast_first=False):
     """Attach an attempt-owned summary sidecar produced by dispatch.
 
@@ -1540,7 +1573,8 @@ def _enrich_claude_stream_session(job, fast_first=False):
         job.association_ambiguity = parsed["ambiguity"]
         return
     telemetry_path = path
-    transcript, ambiguity = _supervised_claude_transcript(job, path)
+    admitted = _native_home_admitted(job)
+    transcript, ambiguity = _supervised_claude_transcript(job, path) if admitted else (None, None)
     if ambiguity:
         job.association_ambiguity = ambiguity
         return
@@ -1612,7 +1646,7 @@ def _enrich_claude_stream_session(job, fast_first=False):
     # launch/completion state machine. Keep the scan bounded for the 2s Fleet tick.
     # First publication skips it: child detail, not classification evidence.
     subagents = None
-    if not fast_first:
+    if not fast_first and (admitted or telemetry_path == path):
         try:
             from . import claude as claude_collector
             subagents = claude_collector._tail_subagents(
@@ -1846,7 +1880,8 @@ def _enrich_codex_attempt_session(job, fast_first=False):
     evidence_path = path
     evidence_source = "codex-attempt-app-server"
     attempt_rollout, rollout_resolved = None, False   # at most one lookup; none on the fast pass
-    if telemetry.context_used_pct is None and thread_id and not fast_first:
+    admitted = _native_home_admitted(job)
+    if telemetry.context_used_pct is None and thread_id and not fast_first and admitted:
         rollout = attempt_rollout = _codex_attempt_rollout(job, thread_id)
         rollout_resolved = True
         if rollout:
@@ -1867,7 +1902,7 @@ def _enrich_codex_attempt_session(job, fast_first=False):
             "session_reasoning_output_tokens", "session_total_tokens"):
         setattr(job, field_name, getattr(telemetry, field_name))
     policy_rollout = None
-    if thread_id and not fast_first:
+    if thread_id and not fast_first and admitted:
         if evidence_source == "codex-attempt-rollout":
             policy_rollout = evidence_path
         elif rollout_resolved:
@@ -1899,10 +1934,11 @@ def _enrich_codex_attempt_session(job, fast_first=False):
     policy = codex_applied_policy(
         runtime_version=runtime_version, model=model,
         usable_window_tokens=telemetry.context_window_tokens,
-        session_id=thread_id, attempt_id=job.attempt_id, home=runtime_home,
+        session_id=thread_id, attempt_id=job.attempt_id,
+        home=runtime_home if admitted else None,
         execution_started_at=execution_start, execution_key=job.attempt_id,
         session_created_at=session_created_at,
-        private_runtime_home=bool(metadata.get("runtime_home")))
+        private_runtime_home=bool(metadata.get("runtime_home")) and admitted)
     if not policy_rollout and policy["state"] == "unknown":
         policy["reason"] = "rollout-runtime-facts-not-resolved"
     policy["source"] = evidence_source + ":" + policy["source"]
@@ -2042,7 +2078,7 @@ _OPENCODE_ACTIVITY_BYTES = 32 * 1024 * 1024
 
 def _enrich_opencode_native_activity(job, session_id, fast_first=False):
     """Observe only the attempt-private DB; first publication remains log-only."""
-    if fast_first or not session_id:
+    if fast_first or not session_id or not _native_home_admitted(job):
         return
     runtime = (getattr(job, "_registry_metadata", None) or {}).get("opencode_runtime_dir")
     if not isinstance(runtime, str) or not os.path.isabs(runtime):
@@ -2111,7 +2147,7 @@ def _enrich_opencode_attempt_session(job, fast_first=False):
     metadata = getattr(job, "_registry_metadata", None) or {}
     raw_window = _opencode_job_context_window(job)
     record = None
-    if parsed.get("session_id") and job.attempt_id:
+    if parsed.get("session_id") and job.attempt_id and _native_home_admitted(job):
         try:
             from ..context_policy import read_policy
             record = read_policy(
@@ -2245,6 +2281,8 @@ def _job_liveness(path, now, stale_min=15, profile=None, slug=None, job=None):
     if not path:
         return "unknown"
     actual_home = (getattr(job, "_registry_metadata", None) or {}).get("runtime_home") if job is not None else None
+    if actual_home and not _native_home_admitted(job):
+        return "unknown"
     if actual_home:
         candidates = [os.path.join(actual_home, "projects", _enc(path))]
     elif profile and slug:
@@ -3948,6 +3986,10 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
     # F-83 retention uses registry/route evidence, never stream telemetry. Apply
     # that existing rule before any location/title/log reads for discarded owners.
     jobs = _retain_dead_terminal_owners(jobs, time.time(), jobs_path=jobs_path)
+    # The first display can perform native reads too. Admission is nonblocking;
+    # a failed mark leaves the row on its already collected observations.
+    for j in jobs:
+        j._worker_home_admitted = _note_home_view(j, jobs_path)
     if not fast_first:
         _fill_locations(jobs)      # explanatory metadata, filled by live details
         _campaign_labels(jobs)
@@ -4046,7 +4088,8 @@ def _collect(jobs_path=None, harness_filter=None, session_rows=(), fast_first=Fa
                 "parent_attempt_id": proof.parent_attempt_id,
             }
     try:
-        codex_index = _build_codex_rollout_index(jobs)
+        codex_index = _build_codex_rollout_index(
+            [j for j in jobs if getattr(j, "_worker_home_admitted", True)])
     except Exception:
         codex_index = None
     # F-18a correlation merges proc evidence onto canonical registry rows BEFORE

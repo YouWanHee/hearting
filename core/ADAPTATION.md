@@ -47,6 +47,17 @@ dispatch state root for that state, within the owner's normal writable scope.
 It preserves the project location and foreign directory, links existing auth/config read-only,
 and does not ask the caller to change ownership, permissions, or launch flags.
 
+Per-attempt worker-home retention is shared runtime-state maintenance. The
+`worker_home_retention.py` entry in `tools/adaptation-census.tsv` records the
+shared utility; Claude, Codex and OpenCode reach it through their existing
+post-exit reaper and dispatch-registry reconciliation paths. Adapters supply
+the attempt identity and runtime-home location rather than independent deletion
+policies. Retention records remain in the canonical dispatch state root and are
+never projected into a release. The generated adapter-side Fleet retention test
+link points to the canonical test and adds no adapter-specific behavior. The
+eligibility, reader protection and shared-home exclusions are defined in
+`core/OPERATIONS.md` under per-attempt home retention.
+
 ## 2. Adapter Rule
 
 An adapter must not claim support for a surface unless it provides one of:

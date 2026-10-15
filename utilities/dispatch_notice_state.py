@@ -34,17 +34,20 @@ def closed_outcome(path: Path, route: dict) -> dict | None:
     return outcome
 
 
-def bound_route(metadata: dict, jobs: Path, expected_id: str = ""):
+def bound_route(metadata: dict, jobs: Path, expected_id: str = "", *, observer=None):
     """Use the row's exact binding, including a verified owner advance."""
     prefix = "" if metadata.get("route_file") else "owner_"
     path, rid, digest = (metadata.get(prefix + key) for key in ("route_file", "route_id", "route_hash"))
     if prefix == "owner_" and all((path, rid, digest, metadata.get("attempt_id"))):
         from owner_route_binding import resolve_owner_route_lifecycle
-        binding, _ = resolve_owner_route_lifecycle(jobs, owner_attempt_id=metadata["attempt_id"])
+        binding, _ = resolve_owner_route_lifecycle(
+            jobs, owner_attempt_id=metadata["attempt_id"], observer=observer)
         if binding:
             path, rid, digest = binding.route_file, binding.route_id, binding.route_hash
     if not path:
         return None  # Historical route-free rows have no closure authority.
+    if observer is not None:
+        observer("file", Path(path))
     route = json.loads(Path(path).read_text())
     if (not isinstance(route, dict) or route.get("route_id") != rid
             or route.get("route_hash") != digest or route_hash(route) != digest

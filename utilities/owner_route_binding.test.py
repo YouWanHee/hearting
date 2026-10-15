@@ -528,6 +528,58 @@ class OwnerRouteAdvanceTest(unittest.TestCase):
 class OwnerRouteLifecycleTest(unittest.TestCase):
     ATTEMPT = "att-owner-post-launch"
 
+    def test_optional_observer_covers_absent_attachment_and_adopted_chain(self):
+        import worker_home_retention as retention
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            jobs.write_text(self._row(td), encoding="utf-8")
+            r0_path, r0 = self._route(td, "rt-observed-zero", 0)
+            r1_path, r1 = self._route(td, "rt-observed-one", 1, source=r0)
+            seen = []
+            observe = lambda kind, path: seen.append((kind, Path(path)))
+            attachment = M._attachment_root(jobs) / M._attachment_key(self.ATTEMPT)
+            with mock.patch.object(M.ROUTE, "verify_route", side_effect=lambda raw, *a, **k: raw):
+                absent, status = M.resolve_owner_route_lifecycle(
+                    jobs, owner_attempt_id=self.ATTEMPT, observer=observe)
+                self.assertIsNone(absent)
+                self.assertEqual(status, "owner-route-binding-absent")
+                self.assertIn(("file", attachment), seen)
+                seen.clear()
+                watched = {}
+                token = retention._DEPENDENCIES.set(watched)
+                try:
+                    M.resolve_owner_route_lifecycle(
+                        jobs, owner_attempt_id=self.ATTEMPT,
+                        observer=retention._route_observer)
+                finally:
+                    retention._DEPENDENCIES.reset(token)
+                self._attach(td, jobs, r0_path, r0)
+                self.assertFalse(retention._fresh(watched))
+                watched = {}
+                token = retention._DEPENDENCIES.set(watched)
+                try:
+                    M.resolve_owner_route_lifecycle(
+                        jobs, owner_attempt_id=self.ATTEMPT,
+                        observer=retention._route_observer)
+                finally:
+                    retention._DEPENDENCIES.reset(token)
+                M.publish_owner_route_advance_from_environment(
+                    jobs, source_route=self._payload(r0_path, r0),
+                    target_route=self._payload(r1_path, r1), environ=self._env(jobs))
+                self.assertFalse(retention._fresh(watched))
+                with jobs.open("a", encoding="utf-8") as stream:
+                    stream.write(self._child_row(td, r1_path, r1, "observed"))
+                current, status = M.resolve_owner_route_lifecycle(
+                    jobs, owner_attempt_id=self.ATTEMPT, observer=observe)
+            predecessor = M._advance_root(jobs) / M._advance_key(
+                self.ATTEMPT, r0["route_id"], r0["route_hash"])
+            self.assertEqual((current.route_id, status), (r1["route_id"], "owner-route-advance-current"))
+            for item in (("file", jobs), ("file", attachment), ("file", r0_path),
+                         ("members", predecessor), ("file", r1_path)):
+                self.assertIn(item, seen)
+            self.assertTrue(any(kind == "file" and path.parent == predecessor
+                                for kind, path in seen))
+
     def _row(self, td: str, *, status: str = "open", session: str = "parent-session") -> str:
         meta = ",".join((
             f"attempt_id={self.ATTEMPT}",

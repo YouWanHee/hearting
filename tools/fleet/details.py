@@ -109,6 +109,7 @@ def _enrich(snapshot):
     for job in jobs:
         job._details_error = False
         try:
+            dispatch._note_home_view(job)
             dispatch._enrich_claude_stream_session(job)
             dispatch._enrich_codex_attempt_session(job)
             dispatch._enrich_opencode_attempt_session(job)
