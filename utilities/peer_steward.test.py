@@ -5176,7 +5176,10 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                             self.retire(world, clear_existing=False, resume_request_id=duty_id)
                     return stale
                 with mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness):
-                    self._run_retire_runner(world, crash_phase="checkpoint")
+                    if exits:
+                        self._run_retire_runner(world)
+                    else:
+                        self._run_retire_runner(world, crash_phase="checkpoint")
                 duty = store.get(duty_id)
                 if exits:
                     self.assertEqual((duty["state"], duty["observation"]["phase"]), ("complete", "complete"))

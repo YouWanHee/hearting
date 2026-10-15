@@ -517,6 +517,12 @@ Duplicate observations converge on the existing obligation; successful results
 and already accepted notifications are not replayed as retries. Read-only
 queries neither cancel work nor acquire these responsibilities.
 
+An interactive session keeps its startup-pinned runtime root. A shared
+obligation service follows `current` only when its lifecycle binding proves the
+same managed installation; development checkouts and fixed invocations stay on
+their code root. Changing service code preserves the accepted duty, transfer
+identity, recipient, and session authority.
+
 The completion duty belongs to the outer controller and durable pending record,
 not to the lifetime of one model turn, watcher process, or tab location. A
 timeout or unavailable observation leaves the same exact duty pending for the

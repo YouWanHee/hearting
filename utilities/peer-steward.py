@@ -4043,12 +4043,22 @@ def cmd_obligation_runner(args):
                     store.update(duty["id"], observer_error="observer-unavailable")
                 except Exception:
                     pass
+        if not store.list():
+            return 0
+        service_current = getattr(args, "service_current", None)
+        if service_current:
+            peer_obligations.exec_service_runner(
+                args.lock_fd, store.root.parents[1], service_current,
+                herdr_session=_HERDR_SESSION,
+            )
         time.sleep(delay)
         delay = min(15.0, delay * 1.7)
 
 
 def cmd_ensure_obligations(_args):
     """Reconnect accepted peer duties from an existing harness lifecycle callback."""
+    service_current = peer_obligations.managed_service_binding(
+        getattr(_args, "lifecycle_root", None))
     try:
         _ensure_watch_observers()
         # Reconnect with the activated code, even if an older runner is still
@@ -4068,7 +4078,10 @@ def cmd_ensure_obligations(_args):
                 pane = (duty["intent"].get("requester") or {}).get("pane")
                 if pane and _seat_successor_path(pane).is_file():
                     _resume_retire_obligation(duty, store)
-        peer_obligations.ensure_runner()
+        if service_current:
+            peer_obligations.ensure_runner(service_current=service_current)
+        else:
+            peer_obligations.ensure_runner()
         dispatch_batch_obligations.ensure_observers()
     except Exception:
         pass
@@ -5102,9 +5115,11 @@ def build_parser():
     p_obligation = sub.add_parser("__obligation-runner", help=argparse.SUPPRESS)
     p_obligation.add_argument("--lock-fd", type=int, required=True)
     p_obligation.add_argument("--state-root", required=True)
+    p_obligation.add_argument("--service-current", default=None, help=argparse.SUPPRESS)
     p_obligation.set_defaults(func=cmd_obligation_runner)
 
     p_recover = sub.add_parser("__ensure-obligations", help=argparse.SUPPRESS)
+    p_recover.add_argument("--lifecycle-root", default=None, help=argparse.SUPPRESS)
     p_recover.set_defaults(func=cmd_ensure_obligations)
 
     p_wait = sub.add_parser("wait")

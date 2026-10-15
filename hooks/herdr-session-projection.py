@@ -48,7 +48,8 @@ def main() -> int:
                 import subprocess
                 subprocess.Popen(
                     [sys.executable, str(tools.parent / "utilities" / "peer-steward.py"),
-                     "__ensure-obligations"],
+                     "__ensure-obligations", "--lifecycle-root",
+                     str(Path(__file__).resolve().parents[1])],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     close_fds=True, start_new_session=True,
                 )

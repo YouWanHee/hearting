@@ -1221,8 +1221,10 @@ function pendingPeerCommand(sid, options = []) {
 }
 
 function reconnectPeerObligations() {
+  let lifecycleRoot = pluginRoot
+  try { lifecycleRoot = realpathSync(pluginRoot) } catch {}
   const child = spawn("python3", [path.join(root, "utilities", "peer-steward.py"),
-    "__ensure-obligations"], {
+    "__ensure-obligations", "--lifecycle-root", lifecycleRoot], {
     cwd: root, env: { ...process.env, AGENT_HOME: root },
     stdio: "ignore", detached: true,
   })
