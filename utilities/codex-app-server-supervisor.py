@@ -234,6 +234,7 @@ class CodexGitFailureFeedback:
         self.active: tuple[str, str] | None = None
         self.turn_order: list[tuple[str, str]] = []
         self.seen: dict[tuple[str, str], set[str]] = {}
+        self.limit_reported: set[tuple[str, str]] = set()
         self.pending: dict[int, dict[str, str]] = {}
 
     @staticmethod
@@ -255,6 +256,7 @@ class CodexGitFailureFeedback:
         while len(self.turn_order) > self.MAX_TURNS:
             old = self.turn_order.pop(0)
             self.seen.pop(old, None)
+            self.limit_reported.discard(old)
 
     def finish_turn(self, turn_id: str) -> None:
         if self.active is None or self.active[1] != turn_id:
@@ -276,24 +278,26 @@ class CodexGitFailureFeedback:
         seen = self.seen.get(key)
         if seen is None:
             return
+        status = item.get("status")
+        exit_code = item.get("exitCode")
+        command, cwd, output = item.get("command"), item.get("cwd"), item.get("aggregatedOutput")
+        if (not isinstance(status, str) or status not in ("completed", "failed")
+                or not git_index_lock.codex_command_candidate(command, cwd, exit_code, output)):
+            return
         if item_id in seen:
             self._event("duplicate-ignored", {
                 "thread_id": thread_id, "turn_id": turn_id, "command_item_id": item_id,
             })
             return
         if len(seen) >= self.MAX_COMMANDS_PER_TURN:
-            self._event("observation-limit", {
-                "thread_id": thread_id, "turn_id": turn_id, "command_item_id": item_id,
-            }, reason="per-turn-command-result-limit")
+            if key not in self.limit_reported:
+                self.limit_reported.add(key)
+                self._event("observation-limit", {
+                    "thread_id": thread_id, "turn_id": turn_id, "command_item_id": item_id,
+                }, reason="per-turn-command-result-limit")
             return
         seen.add(item_id)
 
-        status = item.get("status")
-        exit_code = item.get("exitCode")
-        if (status != "completed" or not isinstance(exit_code, int)
-                or isinstance(exit_code, bool) or exit_code <= 0):
-            return
-        command, cwd, output = item.get("command"), item.get("cwd"), item.get("aggregatedOutput")
         try:
             diagnosis = git_index_lock.diagnose_codex_command(
                 command, cwd, exit_code, output,

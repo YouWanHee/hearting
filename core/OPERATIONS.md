@@ -122,11 +122,21 @@ observations; neither authorizes removal. The helper does not delete, rename,
 chmod, choose another index, or retry Git. Git context lookup and file
 observation run inside one newly created diagnostic process group under a shared
 two-second wall-clock deadline. On expiry, the caller signals only that group
-and returns without an unbounded wait; it never signals the failed Git writer.
+and returns without an unbounded wait; the failed Git writer receives no
+signal.
 A process held in an uninterruptible kernel wait may outlive that signal, so a
 timeout preserves the original failure without promising kernel cancellation.
 See utilities/git_index_lock.py for the single implementation used by source
 consumers and runtime adapters.
+
+Native coverage is envelope-specific: Claude's supported post-tool events use
+the shared bridge; Codex's text-only Bash PostToolUse lacks terminal status and
+effective cwd, so it remains raw and has no Bash registration. The structured
+Codex App Server path uses exact active-thread/turn command results with known
+terminal status, valid nonzero exit, supported command, absolute cwd, and
+matching lock-error output. OpenCode 1.19 uses `metadata.exit`, combined
+`output`, and `args.workdir` resolved from plugin `ctx.directory` (or that
+directory when omitted); separate streams and raw bytes are unavailable.
 
 ### §5.9a. Immutable Runtime Activation and Session Pinning
 

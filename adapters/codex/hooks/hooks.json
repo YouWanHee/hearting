@@ -103,16 +103,6 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^Bash$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh -c 'for root in \"$AGENT_HOME\" \"$HOME/.codex/hearting\"; do if [ -f \"$root/hooks/git-index-lock-context.py\" ]; then exec python3 \"$root/hooks/git-index-lock-context.py\" --harness codex; fi; done; exit 0'",
-            "timeout": 3
-          }
-        ]
-      },
-      {
         "matcher": "*",
         "hooks": [
           {

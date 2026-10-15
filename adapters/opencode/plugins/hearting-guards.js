@@ -1683,19 +1683,19 @@ export const AgentHarnessGuards = async (ctx) => {
     observePaneCallback(ctx, "tool.execute.after", input.sessionID || "")
     const args = input.args || output.args || {}
     const toolName = typeof input.tool === "string" ? input.tool : input.tool?.name || ""
-    if (toolName === "bash" && typeof args.command === "string" &&
-        typeof output?.metadata?.exitCode === "number" && output.metadata.exitCode !== 0) {
-      const cwd = typeof args.workdir === "string" ? args.workdir
-        : typeof args.cwd === "string" ? args.cwd : ""
+    const nativeExit = output?.metadata?.exit
+    const instanceDir = typeof ctx.directory === "string" && path.isAbsolute(ctx.directory)
+      ? ctx.directory : ""
+    if (toolName === "bash" && typeof args.command === "string" && instanceDir &&
+        Number.isInteger(nativeExit) && nativeExit > 0 && nativeExit <= 128 &&
+        typeof output?.output === "string") {
+      const cwd = typeof args.workdir === "string"
+        ? path.resolve(instanceDir, args.workdir) : instanceDir
       const payload = {
         tool_name: toolName,
         tool_input: { command: args.command },
         cwd,
-        tool_response: {
-          exit_code: output.metadata.exitCode,
-          stdout: typeof output.metadata.stdout === "string" ? output.metadata.stdout : "",
-          stderr: typeof output.metadata.stderr === "string" ? output.metadata.stderr : "",
-        },
+        tool_response: { exit: nativeExit, output: output.output },
       }
       const diagnosis = spawnSync("python3", [path.join(root, "utilities", "git_index_lock.py"),
         "--harness", "opencode"], {

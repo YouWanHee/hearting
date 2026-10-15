@@ -499,30 +499,66 @@ def _codex_command_argv(command: str, cwd: str):
     return parse_shell_command(command, cwd)
 
 
-def diagnose_codex_command(command: str, cwd: str, exit_code: int,
-                           aggregated_output: str, *, env: dict[str, str] | None = None) -> dict | None:
-    """Consume a structured App Server result without inventing output streams."""
+def _shell_failure_candidate(command: str, cwd: str, exit_code: int,
+                             output: str, parse_command):
+    """Cheaply recognize a structured, supported index-lock failure candidate."""
     if (not isinstance(command, str) or len(command) > 64 * 1024
             or not isinstance(cwd, str) or len(cwd) > 16 * 1024 or not os.path.isabs(cwd)
             or not isinstance(exit_code, int) or isinstance(exit_code, bool)
             or exit_code <= 0 or exit_code > 128
-            or not isinstance(aggregated_output, str) or len(aggregated_output) > 1_000_000):
+            or not isinstance(output, str) or len(output) > 1_000_000):
         return None
-    match = _LOCK_ERROR_TEXT.search(aggregated_output)
-    parsed = _codex_command_argv(command, cwd)
+    match = _LOCK_ERROR_TEXT.search(output)
+    parsed = parse_command(command, cwd)
     if not match or parsed is None:
         return None
-    argv, effective_cwd, command_env = parsed
+    return parsed, match.group("path")
+
+
+def codex_command_candidate(command: str, cwd: str, exit_code: int,
+                            aggregated_output: str) -> bool:
+    """Return whether a native App Server item merits bounded path diagnosis."""
+    return _shell_failure_candidate(
+        command, cwd, exit_code, aggregated_output, _codex_command_argv,
+    ) is not None
+
+
+def _diagnose_shell_failure(command: str, cwd: str, exit_code: int, output: str,
+                            *, output_source: str, parse_command,
+                            env: dict[str, str] | None = None):
+    candidate = _shell_failure_candidate(command, cwd, exit_code, output, parse_command)
+    if candidate is None:
+        return None
+    (argv, effective_cwd, command_env), reported_path = candidate
     merged_env = dict(env or {})
     merged_env.update(command_env)
     deadline = time.monotonic() + DIAGNOSIS_BUDGET_SECONDS
     payload = {
         "argv": argv, "cwd": effective_cwd, "returncode": exit_code,
-        "reported_path": match.group("path"), "env": merged_env,
-        "deadline": deadline,
-        "output_source": "Codex App Server aggregatedOutput",
+        "reported_path": reported_path, "env": merged_env,
+        "deadline": deadline, "output_source": output_source,
     }
     return _bounded_worker(payload, deadline)
+
+
+def diagnose_codex_command(command: str, cwd: str, exit_code: int,
+                           aggregated_output: str, *, env: dict[str, str] | None = None) -> dict | None:
+    """Consume a structured App Server result without inventing output streams."""
+    return _diagnose_shell_failure(
+        command, cwd, exit_code, aggregated_output,
+        output_source="Codex App Server aggregatedOutput",
+        parse_command=_codex_command_argv, env=env,
+    )
+
+
+def diagnose_opencode_command(command: str, cwd: str, exit_code: int,
+                              combined_output: str) -> dict | None:
+    """Consume OpenCode's native exit plus combined model-facing shell output."""
+    return _diagnose_shell_failure(
+        command, cwd, exit_code, combined_output,
+        output_source="OpenCode combined output",
+        parse_command=parse_shell_command,
+    )
 
 
 def _text_bytes(value, encoding: str) -> tuple[bytes, bool]:
@@ -582,11 +618,6 @@ def _hook_fields(payload: dict, harness: str):
                 inputs.get("command") if isinstance(inputs, dict) else None,
                 cwd, code, b"", error.encode(locale.getpreferredencoding(False) or "utf-8",
                                               errors="replace"), False)
-    elif harness == "opencode":
-        name, inputs, response, cwd = (
-            payload.get("tool_name"), payload.get("tool_input"),
-            payload.get("tool_response"), payload.get("cwd"))
-        command = inputs.get("command") if isinstance(inputs, dict) else None
     else:
         return None
     if not isinstance(name, str) or name.lower() not in {
@@ -610,6 +641,17 @@ def _hook_fields(payload: dict, harness: str):
 
 
 def diagnose_hook_payload(payload: dict, harness: str) -> dict | None:
+    if harness == "opencode":
+        name = payload.get("tool_name")
+        inputs = payload.get("tool_input")
+        response = payload.get("tool_response")
+        cwd = payload.get("cwd")
+        if (not isinstance(name, str) or name.lower() != "bash"
+                or not isinstance(inputs, dict) or not isinstance(response, dict)):
+            return None
+        return diagnose_opencode_command(
+            inputs.get("command"), cwd, response.get("exit"), response.get("output"),
+        )
     fields = _hook_fields(payload, harness)
     if fields is None:
         return None

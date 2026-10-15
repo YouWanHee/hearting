@@ -208,15 +208,15 @@ class GitIndexLockConsumerTest(unittest.TestCase):
                      st.st_size, os.pread(lock_fd, 256, 0)))
 
         def invoke_adapter(repo, command, result):
+            combined = self.response_text(result.stdout) + self.response_text(result.stderr)
             script = f'''import {{ AgentHarnessGuards }} from {json.dumps((ROOT / "adapters/opencode/plugins/hearting-guards.js").as_uri())};
 const hooks = await AgentHarnessGuards({{ directory: {json.dumps(str(repo))},
   worktree: {json.dumps(str(repo))}, client: {{}} }});
 const input = {{ tool: "bash", sessionID: "ses_rebase_fixture", args: {{
   command: {json.dumps(command)}, workdir: {json.dumps(str(repo))}
 }} }};
-const output = {{ args: input.args, output: {json.dumps(self.response_text(result.stderr))},
-  metadata: {{ exitCode: {result.returncode}, stdout: {json.dumps(self.response_text(result.stdout))},
-    stderr: {json.dumps(self.response_text(result.stderr))} }} }};
+const output = {{ args: input.args, output: {json.dumps(combined)},
+  metadata: {{ exit: {result.returncode}, output: {json.dumps(combined[:160])}, truncated: false }} }};
 await hooks["tool.execute.after"](input, output);
 console.log(JSON.stringify({{ output: output.output, metadata: output.metadata }}));
 '''
@@ -263,11 +263,16 @@ console.log(JSON.stringify({{ output: output.output, metadata: output.metadata }
                 callback = invoke_adapter(repo, shlex.join(command), result)
                 self.assertEqual(callback.returncode, 0, callback.stderr + callback.stdout)
                 delivered = json.loads(callback.stdout.strip().splitlines()[-1])
-                self.assertEqual(delivered["metadata"]["exitCode"], result.returncode)
-                self.assertEqual(delivered["metadata"]["stdout"], self.response_text(result.stdout))
-                self.assertEqual(delivered["metadata"]["stderr"], self.response_text(result.stderr))
+                self.assertEqual(delivered["metadata"], {
+                    "exit": result.returncode,
+                    "output": (self.response_text(result.stdout) + self.response_text(result.stderr))[:160],
+                    "truncated": False,
+                })
+                self.assertTrue(delivered["output"].startswith(
+                    self.response_text(result.stdout) + self.response_text(result.stderr)))
                 self.assertIn(self.response_text(result.stderr), delivered["output"])
                 self.assertIn(str(lock), delivered["output"])
+                self.assertIn("OpenCode combined output", delivered["output"])
                 self.assertIn("Ownership: unknown", delivered["output"])
                 self.assertEqual(snapshot(repo, tracked, lock_fd, lock), before)
                 self.assertEqual(counter.read_text(encoding="utf-8").splitlines().count(label), 1)
@@ -293,12 +298,15 @@ console.log(JSON.stringify({{ output: output.output, metadata: output.metadata }
 
     def test_native_configurations_wire_only_the_original_shell_result_events(self):
         codex = json.loads((ROOT / "adapters/codex/hooks/hooks.json").read_text(encoding="utf-8"))
-        codex_hooks = codex["hooks"]["PostToolUse"]
+        codex_hooks = codex["hooks"]
+        self.assertFalse(any(
+            "git-index-lock-context.py" in json.dumps(group)
+            for event_groups in codex_hooks.values() for group in event_groups))
         self.assertTrue(any(
-            group.get("matcher") == "^Bash$"
-            and any("git-index-lock-context.py" in hook.get("command", "")
+            group.get("matcher") == "*"
+            and any("posttooluse-interaction-clear.py" in hook.get("command", "")
                     for hook in group.get("hooks", []))
-            for group in codex_hooks))
+            for group in codex_hooks["PostToolUse"]))
         claude = json.loads((ROOT / "adapters/claude/settings.json").read_text(encoding="utf-8"))
         for event_name in ("PostToolUse", "PostToolUseFailure"):
             self.assertTrue(any(
@@ -307,19 +315,24 @@ console.log(JSON.stringify({{ output: output.output, metadata: output.metadata }
                         for hook in group.get("hooks", []))
                 for group in claude["hooks"][event_name]))
 
-    def test_actual_opencode_plugin_callback_appends_context_and_preserves_exit_metadata(self):
+    def invoke_opencode_callback(self, *, instance_directory, workdir, metadata, combined_output):
+        context = {"client": {}}
+        if instance_directory is not None:
+            context["directory"] = str(instance_directory)
+            context["worktree"] = str(instance_directory)
+        args = {"command": "git commit -m 'expected failure'"}
+        if workdir is not None:
+            args["workdir"] = workdir
         script = f'''import {{ AgentHarnessGuards }} from {json.dumps((ROOT / "adapters/opencode/plugins/hearting-guards.js").as_uri())};
-const hooks = await AgentHarnessGuards({{ directory: {json.dumps(str(self.repo))},
-  worktree: {json.dumps(str(self.repo))}, client: {{}} }});
-const input = {{ tool: "bash", sessionID: "ses_lock_fixture", args: {{
-  command: "git commit -m 'expected failure'", workdir: {json.dumps(str(self.repo))}
-}} }};
-const output = {{ args: input.args, output: {json.dumps(self.response_text(self.result.stderr))},
-  metadata: {{ exitCode: {self.result.returncode},
-    stdout: {json.dumps(self.response_text(self.result.stdout))},
-    stderr: {json.dumps(self.response_text(self.result.stderr))} }} }};
+const hooks = await AgentHarnessGuards({json.dumps(context)});
+const input = {{ tool: "bash", args: {json.dumps(args)} }};
+const output = {{ args: input.args, output: {json.dumps(combined_output)},
+  metadata: {json.dumps(metadata)} }};
+const originalMetadata = structuredClone(output.metadata);
+const originalOutput = output.output;
 await hooks["tool.execute.after"](input, output);
-console.log(JSON.stringify({{ output: output.output, metadata: output.metadata }}));
+console.log(JSON.stringify({{ output: output.output, metadata: output.metadata,
+  originalMetadata, originalOutput }}));
 '''
         env = {
             **os.environ,
@@ -333,14 +346,60 @@ console.log(JSON.stringify({{ output: output.output, metadata: output.metadata }
             "AGENT_SESSION_ROLE": "worker",
             "OPENCODE_VERSION": "1.19.0",
         }
-        run = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
-                             env=env, text=True, capture_output=True, timeout=15)
-        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
-        result = json.loads(run.stdout.strip().splitlines()[-1])
-        self.assertEqual(result["metadata"]["exitCode"], self.result.returncode)
-        self.assertIn(self.response_text(self.result.stderr), result["output"])
-        self.assertIn(str(self.lock), result["output"])
-        self.assertIn("Ownership: unknown", result["output"])
+        return subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
+                              env=env, text=True, capture_output=True, timeout=15)
+
+    def test_actual_opencode_callback_uses_native_result_and_effective_workdir(self):
+        combined = self.response_text(self.result.stdout) + self.response_text(self.result.stderr)
+        native_metadata = {
+            "exit": self.result.returncode,
+            "output": combined[:160],
+            "truncated": False,
+        }
+        scenarios = (
+            ("omitted", self.repo, None),
+            ("relative", self.root, str(self.repo.relative_to(self.root))),
+            ("explicit", self.root, str(self.repo)),
+        )
+        for label, instance_directory, workdir in scenarios:
+            with self.subTest(workdir=label):
+                run = self.invoke_opencode_callback(
+                    instance_directory=instance_directory, workdir=workdir,
+                    metadata=native_metadata, combined_output=combined,
+                )
+                self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+                result = json.loads(run.stdout.strip().splitlines()[-1])
+                self.assertEqual(result["metadata"], native_metadata)
+                self.assertEqual(result["originalMetadata"], native_metadata)
+                self.assertEqual(result["originalOutput"], combined)
+                self.assertTrue(result["output"].startswith(combined))
+                self.assertIn(str(self.lock), result["output"])
+                self.assertIn("OpenCode combined output", result["output"])
+                self.assertIn("Ownership: unknown", result["output"])
+
+        untouched = (
+            ("success-conflicting-fields", self.root, str(self.repo),
+             {**native_metadata, "exit": 0, "exitCode": 128, "stdout": combined, "stderr": combined}, combined),
+            ("null-conflicting-fields", self.root, str(self.repo),
+             {**native_metadata, "exit": None, "exitCode": 128, "stdout": combined, "stderr": combined}, combined),
+            ("signal", self.root, str(self.repo), {**native_metadata, "exit": 130}, combined),
+            ("malformed-exit", self.root, str(self.repo), {**native_metadata, "exit": "128"}, combined),
+            ("unrelated", self.root, str(self.repo), native_metadata,
+             "fatal: unrelated command failure\n"),
+            ("context-unavailable", None, str(self.repo), native_metadata, combined),
+        )
+        for label, instance_directory, workdir, metadata, output in untouched:
+            with self.subTest(untouched=label):
+                run = self.invoke_opencode_callback(
+                    instance_directory=instance_directory, workdir=workdir,
+                    metadata=metadata, combined_output=output,
+                )
+                self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+                result = json.loads(run.stdout.strip().splitlines()[-1])
+                self.assertEqual(result["metadata"], metadata)
+                self.assertEqual(result["originalMetadata"], metadata)
+                self.assertEqual(result["output"], output)
+                self.assertEqual(result["originalOutput"], output)
 
 
 if __name__ == "__main__":
