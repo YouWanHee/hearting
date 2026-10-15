@@ -7669,7 +7669,9 @@ class ComposeRouteTest(TestRoute):
       self.assertEqual(R.main(),0)
      actual=json.loads(out.getvalue())
      self.assertEqual({k:actual[k] for k in receipt},receipt)
-     self.assertEqual(set(actual),set(receipt)|{"confirmation","pre_execution_answers"})
+     expected_keys=set(receipt)|{"confirmation","pre_execution_answers"}
+     if command=="compose": expected_keys.add("worktree")
+     self.assertEqual(set(actual),expected_keys)
      self.assertEqual(err.getvalue().count("강도 안내"),1)
      self.assertEqual(err.getvalue().count("규모:"),1)
  def test_verified_resume_graph_keeps_payload_inline_and_verifies_after_exit(self):

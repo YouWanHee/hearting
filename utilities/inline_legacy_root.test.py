@@ -32,6 +32,9 @@ class LegacyRootDirectRouteTest(unittest.TestCase):
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
         subprocess.run(git + ["add", "README.md"], check=True)
         subprocess.run(git + ["commit", "-qm", "base"], check=True)
+        origin = base / "origin.git"
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(origin)], check=True)
+        subprocess.run(git + ["remote", "add", "origin", str(origin)], check=True)
         legacy = self.root / "analysis_project/summary.md"
         legacy.parent.mkdir(parents=True)
         legacy.write_text("legacy\n", encoding="utf-8")
@@ -61,6 +64,9 @@ class LegacyRootDirectRouteTest(unittest.TestCase):
         receipt = json.loads(started.stdout.strip().splitlines()[-1])
         self.assertEqual(receipt["state"], "inline", receipt)
         self.assertEqual(receipt["artifact_env"], {"AGENT_ARTIFACT_ROOT": str(self.root.resolve())})
+        route = json.loads(Path(receipt["route_file"]).read_text(encoding="utf-8"))
+        self.assertNotEqual(Path(route["cwd"]).resolve(), self.repo.resolve())
+        self.assertEqual(route["artifact_root"], str(self.root.resolve()))
         self.assertFalse((self.root / "campaigns").exists())   # nothing activated or issued
 
     def finish_command(self):
