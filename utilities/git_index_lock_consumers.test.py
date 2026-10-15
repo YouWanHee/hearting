@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE = shutil.which("node") or "node"
@@ -111,6 +112,165 @@ class GitIndexLockConsumerTest(unittest.TestCase):
         self.assertEqual(output.stdout, "")
         payload["tool_response"] = "command completed without an index-lock failure"
         self.assertEqual(self.run_bridge("codex", payload).stdout, "")
+
+    def test_codex_app_server_command_result_uses_aggregated_output_without_forging_streams(self):
+        command = "zsh -lc " + shlex.quote(self.command)
+        output = self.response_text(self.result.stderr)
+        diagnosis = git_index_lock.diagnose_codex_command(
+            command, str(self.root), self.result.returncode, output)
+        self.assertEqual(diagnosis["state"], "present")
+        self.assertEqual(diagnosis["lock_path"], str(self.lock))
+        self.assertIn("Codex App Server aggregatedOutput", diagnosis["message"])
+        self.assertIn("stdout/stderr separation and raw bytes are unavailable", diagnosis["message"])
+
+        self.assertIsNone(git_index_lock.diagnose_codex_command(
+            command, str(self.root), 0, output))
+        self.assertIsNone(git_index_lock.diagnose_codex_command(
+            command, str(self.root), 130, output))
+        self.assertIsNone(git_index_lock.diagnose_codex_command(
+            "zsh -lc 'git commit && echo unsafe'", str(self.root),
+            self.result.returncode, output))
+        unrelated = output.replace(str(self.lock), "/tmp/unrelated/index.lock")
+        unbound = git_index_lock.diagnose_codex_command(
+            command, str(self.root), self.result.returncode, unrelated)
+        self.assertEqual(unbound["state"], "unbound")
+
+    def test_codex_app_server_unknown_git_path_stays_unbound(self):
+        command = "zsh -lc " + shlex.quote(self.command)
+        output = self.response_text(self.result.stderr)
+        with mock.patch.dict(os.environ, {"PATH": str(self.root / "empty-bin")}):
+            diagnosis = git_index_lock.diagnose_codex_command(
+                command, str(self.root), self.result.returncode, output)
+        self.assertEqual(diagnosis["state"], "unbound")
+        self.assertTrue(self.lock.exists())
+
+    def test_real_rebase_start_and_continue_failures_reach_opencode_callback_once(self):
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        fake_bin = self.root / "counted-git-bin"
+        fake_bin.mkdir()
+        counter = self.root / "git-operation-counts"
+        wrapper = fake_bin / "git"
+        wrapper.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, sys\n"
+            "args = sys.argv[1:]\n"
+            "label = 'continue' if '--continue' in args else 'start' if 'rebase' in args else None\n"
+            f"if label: open({str(counter)!r}, 'a', encoding='utf-8').write(label + '\\n')\n"
+            f"os.execv({real_git!r}, ['git', *args])\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+               "HEARTING_GIT_CALL_COUNT_FILE": str(counter), "AGENT_HOME": str(ROOT),
+               "AGENT_SESSION_ROLE": "worker"}
+
+        def git(repo, *args, check=True):
+            return subprocess.run([real_git, "-C", str(repo), *args], cwd=repo,
+                                  capture_output=True, check=check)
+
+        def conflicted_repo(name):
+            repo = self.root / name
+            repo.mkdir()
+            subprocess.run([real_git, "init", "-q", str(repo)], check=True)
+            git(repo, "config", "user.name", "Fixture")
+            git(repo, "config", "user.email", "fixture@example.invalid")
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            git(repo, "add", "tracked.txt")
+            git(repo, "commit", "-qm", "base")
+            git(repo, "branch", "-m", "main")
+            git(repo, "checkout", "-qb", "feature")
+            tracked.write_text("feature\n", encoding="utf-8")
+            git(repo, "add", "tracked.txt")
+            git(repo, "commit", "-qm", "feature")
+            git(repo, "checkout", "-q", "main")
+            tracked.write_text("main\n", encoding="utf-8")
+            git(repo, "add", "tracked.txt")
+            git(repo, "commit", "-qm", "main")
+            git(repo, "checkout", "-q", "feature")
+            return repo, tracked
+
+        def snapshot(repo, tracked, lock_fd, lock):
+            index = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip()
+            gitdir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-dir").stdout.decode().strip())
+            rebase_state = []
+            for dirname in ("rebase-merge", "rebase-apply"):
+                directory = gitdir / dirname
+                if directory.is_dir():
+                    rebase_state.append((dirname, sorted(
+                        (str(path.relative_to(directory)), path.read_bytes())
+                        for path in directory.rglob("*") if path.is_file())))
+            st = os.fstat(lock_fd)
+            return (git(repo, "rev-parse", "HEAD").stdout, Path(index).read_bytes(),
+                    tracked.read_bytes(), rebase_state,
+                    (os.lstat(lock).st_dev, os.lstat(lock).st_ino, os.lstat(lock).st_mode,
+                     st.st_size, os.pread(lock_fd, 256, 0)))
+
+        def invoke_adapter(repo, command, result):
+            script = f'''import {{ AgentHarnessGuards }} from {json.dumps((ROOT / "adapters/opencode/plugins/hearting-guards.js").as_uri())};
+const hooks = await AgentHarnessGuards({{ directory: {json.dumps(str(repo))},
+  worktree: {json.dumps(str(repo))}, client: {{}} }});
+const input = {{ tool: "bash", sessionID: "ses_rebase_fixture", args: {{
+  command: {json.dumps(command)}, workdir: {json.dumps(str(repo))}
+}} }};
+const output = {{ args: input.args, output: {json.dumps(self.response_text(result.stderr))},
+  metadata: {{ exitCode: {result.returncode}, stdout: {json.dumps(self.response_text(result.stdout))},
+    stderr: {json.dumps(self.response_text(result.stderr))} }} }};
+await hooks["tool.execute.after"](input, output);
+console.log(JSON.stringify({{ output: output.output, metadata: output.metadata }}));
+'''
+            return subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
+                                  env=env, text=True, capture_output=True, timeout=15)
+
+        scenarios = []
+        start_repo, start_file = conflicted_repo("rebase-start-repo")
+        start_lock = Path(git(start_repo, "rev-parse", "--path-format=absolute",
+                               "--git-path", "index").stdout.decode().strip() + ".lock")
+        start_lock.write_bytes(b"rebase-start lock")
+        start_fd = os.open(start_lock, os.O_RDONLY)
+        self.addCleanup(os.close, start_fd)
+        start_lock.chmod(0)
+        start_command = ["git", "rebase", "main"]
+        start_result = subprocess.run(["git", *start_command[1:]], cwd=start_repo, env=env,
+                                      capture_output=True, check=False)
+        self.assertNotEqual(start_result.returncode, 0)
+        scenarios.append(("start", start_repo, start_file, start_lock, start_fd,
+                          start_command, start_result))
+
+        continue_repo, continue_file = conflicted_repo("rebase-continue-repo")
+        conflict = git(continue_repo, "rebase", "main", check=False)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertTrue((continue_repo / ".git/rebase-merge").is_dir())
+        continue_file.write_text("resolved\n", encoding="utf-8")
+        git(continue_repo, "add", "tracked.txt")
+        continue_lock = Path(git(continue_repo, "rev-parse", "--path-format=absolute",
+                                 "--git-path", "index").stdout.decode().strip() + ".lock")
+        continue_lock.write_bytes(b"rebase-continue lock")
+        continue_fd = os.open(continue_lock, os.O_RDONLY)
+        self.addCleanup(os.close, continue_fd)
+        continue_lock.chmod(0)
+        continue_command = ["git", "-c", "core.editor=true", "rebase", "--continue"]
+        continue_result = subprocess.run(["git", *continue_command[1:]], cwd=continue_repo,
+                                         env=env, capture_output=True, check=False)
+        self.assertNotEqual(continue_result.returncode, 0)
+        scenarios.append(("continue", continue_repo, continue_file, continue_lock,
+                          continue_fd, continue_command, continue_result))
+
+        for label, repo, tracked, lock, lock_fd, command, result in scenarios:
+            with self.subTest(rebase=label):
+                before = snapshot(repo, tracked, lock_fd, lock)
+                callback = invoke_adapter(repo, shlex.join(command), result)
+                self.assertEqual(callback.returncode, 0, callback.stderr + callback.stdout)
+                delivered = json.loads(callback.stdout.strip().splitlines()[-1])
+                self.assertEqual(delivered["metadata"]["exitCode"], result.returncode)
+                self.assertEqual(delivered["metadata"]["stdout"], self.response_text(result.stdout))
+                self.assertEqual(delivered["metadata"]["stderr"], self.response_text(result.stderr))
+                self.assertIn(self.response_text(result.stderr), delivered["output"])
+                self.assertIn(str(lock), delivered["output"])
+                self.assertIn("Ownership: unknown", delivered["output"])
+                self.assertEqual(snapshot(repo, tracked, lock_fd, lock), before)
+                self.assertEqual(counter.read_text(encoding="utf-8").splitlines().count(label), 1)
 
     def test_claude_post_tool_use_failure_uses_native_error_fields(self):
         payload = {

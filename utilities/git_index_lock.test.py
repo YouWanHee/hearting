@@ -232,6 +232,44 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         self.assertEqual(self.fd_bytes(lock_fd), b"")
         self.assertTrue(custom.exists())
 
+    def test_relative_index_after_git_c_binds_actual_path_and_rejects_prec_c_decoy(self):
+        custom = self.repo / "alt" / "index"
+        custom.parent.mkdir()
+        env = {**os.environ, "GIT_INDEX_FILE": "alt/index"}
+        command = ["git", "-C", str(self.repo), "commit", "-m", "relative after -C"]
+        self.git(self.repo, "read-tree", "HEAD", env=env)
+        self.stage_change(env=env)
+        lock = self.repo / "alt" / "index.lock"
+        lock_fd = self.make_lock(lock, b"selected index lock")
+        custom_before = custom.read_bytes()
+        result = subprocess.run(command, cwd=self.root, env=env,
+                                capture_output=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(os.fsencode(str(lock)), result.stderr)
+        state_after_failure = (custom.read_bytes(), self.git(self.repo, "rev-parse", "HEAD").stdout,
+                               self.fd_bytes(lock_fd))
+
+        diagnosis = git_index_lock.diagnose_failure(
+            command, str(self.root), result.returncode, result.stdout, result.stderr,
+            env={"GIT_INDEX_FILE": "alt/index"})
+        self.assertEqual(diagnosis["lock_path"], str(lock))
+        self.assertEqual((custom.read_bytes(), self.git(self.repo, "rev-parse", "HEAD").stdout,
+                          self.fd_bytes(lock_fd)), state_after_failure)
+        self.assertEqual(custom.read_bytes(), custom_before)
+
+        decoy = self.root / "alt" / "index.lock"
+        decoy.parent.mkdir()
+        decoy.write_bytes(b"must not be inspected")
+        forged_stderr = result.stderr.replace(os.fsencode(str(lock)), os.fsencode(str(decoy)))
+        observer = mock.Mock(side_effect=AssertionError("pre--C decoy reached lstat"))
+        unbound = git_index_lock.diagnose_failure(
+            command, str(self.root), result.returncode, result.stdout, forged_stderr,
+            env={"GIT_INDEX_FILE": "alt/index"}, observer=observer)
+        self.assertEqual(unbound["state"], "unbound")
+        observer.assert_not_called()
+        self.assertEqual(decoy.read_bytes(), b"must not be inspected")
+        self.assertEqual(self.fd_bytes(lock_fd), b"selected index lock")
+
     def test_index_symlink_and_lock_symlink_are_observed_without_following_lock(self):
         real_index = self.root / "real-index"
         real_index.write_bytes((self.repo / ".git/index").read_bytes())
@@ -261,9 +299,15 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         observer.assert_not_called()
 
     def test_missing_unavailable_replaced_and_permission_states_stay_distinct(self):
-        result, lock, *_ = self.fail_commit()
+        result, lock, _, _, lock_fd = self.fail_commit()
+        lock.unlink()
+        after_failure_before_diagnosis = self.git_state()
+        diagnosis = self.diagnose(result)
+        self.assertEqual(diagnosis["state"], "not_found")
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.git_state(), after_failure_before_diagnosis)
+        self.assertEqual(self.fd_bytes(lock_fd), b"")
         for observation, state in (
-            ({"state": "not_found"}, "not_found"),
             ({"state": "unavailable", "reason": "permission-denied"}, "unavailable"),
             ({"state": "replaced"}, "replaced"),
         ):
@@ -272,6 +316,9 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
                 self.assertEqual(diagnosis["state"], state)
                 self.assertEqual(diagnosis["lock_path"], str(lock))
                 self.assertIn("Ownership: unknown", diagnosis["message"])
+                self.assertFalse(lock.exists())
+                self.assertEqual(self.git_state(), after_failure_before_diagnosis)
+                self.assertEqual(self.fd_bytes(lock_fd), b"")
 
     def test_success_signal_permission_other_lock_and_unrecognized_locale_are_not_reclassified(self):
         result, lock, *_ = self.fail_commit()
@@ -315,6 +362,33 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         self.assertAlmostEqual(observer.call_args.args[1], 0.4)
         self.assertEqual(diagnosis["state"], "unavailable")
         self.assertIn("observer-timeout", diagnosis["message"])
+
+    def test_real_consumer_returns_within_budget_when_git_resolution_stalls(self):
+        result, lock, _, _, lock_fd = self.fail_commit()
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        pid_file = self.root / "slow-git.pid"
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, time\n"
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}):
+            diagnosis = git_index_lock.diagnose_failure(
+                ["git", "-C", str(self.repo), "commit", "-m", "fixture"],
+                str(self.root), result.returncode, result.stdout, result.stderr,
+            )
+        elapsed = time.monotonic() - started
+        self.assertEqual(diagnosis["state"], "unavailable")
+        self.assertEqual(diagnosis["observation"]["reason"], "diagnostic-timeout")
+        self.assertLess(elapsed, git_index_lock.DIAGNOSIS_BUDGET_SECONDS + 0.75)
+        self.assertEqual(self.fd_bytes(lock_fd), b"")
+        self.assertEqual(lock.stat().st_mode & 0o777, 0)
 
     def test_crlf_and_undecodable_bytes_have_compatible_text_and_lossless_side_channel(self):
         stdout, stderr = b"out\r\n\xff", b"err\r\n\xfe"

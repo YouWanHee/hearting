@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import select
+import signal
 import stat
 import subprocess
 import sys
@@ -19,6 +21,10 @@ import time
 DIAGNOSIS_BUDGET_SECONDS = 2.0
 _LOCK_ERROR = re.compile(
     rb"unable to create ['\"](?P<path>[^\r\n]*?index\.lock)['\"]:\s*file exists\b",
+    re.IGNORECASE,
+)
+_LOCK_ERROR_TEXT = re.compile(
+    r"unable to create ['\"](?P<path>[^\r\n]*?index\.lock)['\"]:\s*file exists\b",
     re.IGNORECASE,
 )
 _SHELL_META = set(";&|<>$()\n\r") | {chr(96)}
@@ -131,28 +137,58 @@ def _run_git_path(global_args: list[str], cwd: str, env: dict[str, str],
     if timeout <= 0:
         return None
     try:
-        result = subprocess.run(
+        child = subprocess.Popen(
             [*global_args, "rev-parse", "--path-format=absolute", "--git-path", path],
             cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=timeout, check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+        output, _ = child.communicate()
+    except OSError:
         return None
-    if result.returncode:
+    if child.returncode:
         return None
-    value = os.fsdecode(result.stdout).rstrip("\r\n")
+    value = os.fsdecode(output).rstrip("\r\n")
     return value if value and "\n" not in value and "\r" not in value else None
+
+
+def _effective_git_cwd(argv: list[str], cwd: str) -> str | None:
+    """Apply Git's ordered -C changes before resolving relative index paths."""
+    global_args = _global_args(argv)
+    if global_args is None:
+        return None
+    current = os.path.realpath(os.path.abspath(cwd or os.getcwd()))
+    index = 1
+    while index < len(global_args):
+        token = global_args[index]
+        if token == "-C":
+            value = global_args[index + 1]
+            current = os.path.realpath(
+                value if os.path.isabs(value) else os.path.join(current, value)
+            )
+            if not os.path.isdir(current):
+                return None
+            index += 2
+        else:
+            index += 1
+    return current
 
 
 def _run_git_index(argv: list[str], cwd: str, env: dict[str, str], timeout: float):
     global_args = _global_args(argv)
     if global_args is None or timeout <= 0:
         return None
+    effective_cwd = _effective_git_cwd(argv, cwd)
+    if effective_cwd is None:
+        return None
     deadline = time.monotonic() + timeout
-    index_path = _run_git_path(global_args, cwd, env, "index", max(0.0, deadline - time.monotonic()))
-    lock_path = _run_git_path(global_args, cwd, env, "index.lock",
-                               max(0.0, deadline - time.monotonic()))
-    return {"index": index_path, "lock": lock_path}
+    index_path = _run_git_path(
+        global_args, cwd, env, "index", max(0.0, deadline - time.monotonic())
+    )
+    logical_lock = _run_git_path(
+        global_args, cwd, env, "index.lock", max(0.0, deadline - time.monotonic())
+    )
+    if not index_path or not logical_lock:
+        return None
+    return {"index": index_path, "logical_lock": logical_lock, "cwd": effective_cwd}
 
 
 def errno_name(exc: OSError) -> str:
@@ -160,57 +196,28 @@ def errno_name(exc: OSError) -> str:
         exc.errno, "observation-error")
 
 
-def _observer_main(path: str) -> int:
+def _observe(path: str, timeout: float) -> dict:
+    """Observe directly; production calls run inside the bounded worker group."""
+    if timeout <= 0:
+        return {"state": "unavailable", "reason": "deadline-exhausted"}
     try:
         before = os.lstat(path)
         after = os.lstat(path)
     except FileNotFoundError:
-        print(json.dumps({"state": "not_found"}))
-        return 0
+        return {"state": "not_found"}
     except OSError as exc:
-        print(json.dumps({"state": "unavailable", "reason": errno_name(exc)}))
-        return 0
+        return {"state": "unavailable", "reason": errno_name(exc)}
     before_id = (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode))
     after_id = (after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode))
     if before_id != after_id:
-        print(json.dumps({"state": "replaced"}))
-        return 0
+        return {"state": "replaced"}
     mode = after.st_mode
     kind = "symlink" if stat.S_ISLNK(mode) else "regular-file" if stat.S_ISREG(mode) else (
         "directory" if stat.S_ISDIR(mode) else "other")
-    print(json.dumps({
+    return {
         "state": "present", "kind": kind, "mode": oct(stat.S_IMODE(mode)),
         "size": after.st_size, "mtime_ns": after.st_mtime_ns,
-    }))
-    return 0
-
-
-def _observe(path: str, timeout: float) -> dict:
-    if timeout <= 0:
-        return {"state": "unavailable", "reason": "deadline-exhausted"}
-    try:
-        child = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--observe", path],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError:
-        return {"state": "unavailable", "reason": "observer-start-failed"}
-    try:
-        output, _ = child.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        child.kill()
-        if child.stdout:
-            child.stdout.close()
-        return {"state": "unavailable", "reason": "observer-timeout"}
-    if child.returncode:
-        return {"state": "unavailable", "reason": "observer-failed"}
-    try:
-        data = json.loads(output)
-        return data if isinstance(data, dict) and isinstance(data.get("state"), str) else {
-            "state": "unavailable", "reason": "observer-invalid-result"}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return {"state": "unavailable", "reason": "observer-invalid-result"}
+    }
 
 
 def _lock_path_from_error(stderr: bytes) -> str | None:
@@ -225,22 +232,6 @@ def _context_env(extra: dict[str, str] | None) -> dict[str, str]:
             if key in _GIT_ENV_PATHS or key.startswith("GIT_CONFIG_"):
                 env[key] = value
     return env
-
-
-def _git_c_directories(argv: list[str], cwd: str) -> list[str]:
-    global_args = _global_args(argv)
-    if global_args is None:
-        return [os.path.abspath(cwd)]
-    directories = [os.path.abspath(cwd)]
-    index = 1
-    while index < len(global_args):
-        token = global_args[index]
-        if token == "-C" and index + 1 < len(global_args):
-            directories.append(os.path.abspath(os.path.join(directories[-1], global_args[index + 1])))
-            index += 2
-        else:
-            index += 1
-    return directories
 
 
 def _read_only_commands(argv: list[str], cwd: str, env: dict[str, str], lock_path: str) -> list[str]:
@@ -259,47 +250,68 @@ def _read_only_commands(argv: list[str], cwd: str, env: dict[str, str], lock_pat
     return commands
 
 
-def diagnose_failure(argv: list[str], cwd: str, returncode: int, stdout: bytes, stderr: bytes,
-                     *, env: dict[str, str] | None = None,
-                     budget_seconds: float = DIAGNOSIS_BUDGET_SECONDS,
-                     observer=None, git_runner=None) -> dict | None:
-    """Return an advisory only for a context-bound index.lock EEXIST failure."""
-    if returncode <= 0 or not _LOCK_ERROR.search(stderr):
-        return None
-    deadline = time.monotonic() + max(0.0, min(float(budget_seconds), DIAGNOSIS_BUDGET_SECONDS))
+def _diagnose_bound_path(argv: list[str], cwd: str, returncode: int, reported_path: str,
+                         *, env: dict[str, str] | None, deadline: float,
+                         observer=None, git_runner=None,
+                         output_source: str = "Git stderr") -> dict:
     process_env = _context_env(env)
     runner = git_runner or _run_git_index
     resolved = runner(argv, cwd, process_env, max(0.0, deadline - time.monotonic()))
-    error_path = _lock_path_from_error(stderr)
-    if not resolved or not error_path:
+    if not resolved:
         return {"state": "unbound", "message": (
             "Could not bind the reported index.lock failure to this Git context; no path was inspected.")}
-    reported = error_path if os.path.isabs(error_path) else os.path.abspath(os.path.join(cwd, error_path))
-    default_lock = resolved.get("lock") if isinstance(resolved, dict) else None
     index_path = resolved.get("index") if isinstance(resolved, dict) else str(resolved)
-    index_lock = os.path.abspath(index_path + ".lock") if index_path else None
-    explicit_locks = []
+    if not isinstance(index_path, str) or not index_path:
+        return {"state": "unbound", "message": (
+            "Could not bind the reported index.lock failure to this Git context; no path was inspected.")}
+    index_path = os.path.abspath(index_path)
+    selected_lock = index_path + ".lock"
+    effective_cwd = (resolved.get("cwd") if isinstance(resolved, dict) else None)
+    effective_cwd = effective_cwd or _effective_git_cwd(argv, cwd) or os.path.abspath(cwd)
     explicit_index = process_env.get("GIT_INDEX_FILE")
+    if explicit_index is not None and not explicit_index:
+        return {"state": "unbound", "message": (
+            "The selected Git index path is ambiguous; no path was inspected.")}
+
+    allowed_reports = {selected_lock}
     if explicit_index:
-        for directory in _git_c_directories(argv, cwd):
-            path = explicit_index if os.path.isabs(explicit_index) else os.path.join(directory, explicit_index)
-            explicit_locks.append(os.path.abspath(path + ".lock"))
-    allowed = [path for path in (default_lock, index_lock, *explicit_locks)
-               if isinstance(path, str) and path]
-    matched = next((path for path in allowed
-                    if os.path.normcase(os.path.abspath(path)) == os.path.normcase(reported)), None)
-    if matched is None:
+        logical_index = (explicit_index if os.path.isabs(explicit_index) else
+                         os.path.join(effective_cwd, explicit_index))
+        logical_index = os.path.abspath(logical_index)
+        try:
+            same_index = os.path.realpath(logical_index) == os.path.realpath(index_path)
+        except OSError:
+            same_index = False
+        if not same_index:
+            return {"state": "unbound", "message": (
+                "The selected Git index path is ambiguous; no path was inspected.")}
+        allowed_reports.add(logical_index + ".lock")
+    elif isinstance(resolved, dict):
+        logical_lock = resolved.get("logical_lock")
+        if isinstance(logical_lock, str) and logical_lock.endswith(".lock"):
+            logical_index = os.path.abspath(logical_lock[:-5])
+            try:
+                same_index = os.path.realpath(logical_index) == os.path.realpath(index_path)
+            except OSError:
+                same_index = False
+            if same_index:
+                allowed_reports.add(os.path.abspath(logical_lock))
+
+    reported = (reported_path if os.path.isabs(reported_path) else
+                os.path.abspath(os.path.join(effective_cwd, reported_path)))
+    allowed_normalized = {os.path.normcase(os.path.abspath(path)) for path in allowed_reports}
+    if os.path.normcase(os.path.abspath(reported)) not in allowed_normalized:
         return {"state": "unbound", "message": (
             "The reported lock path differs from this Git context; no path was inspected.")}
-    # Git may report the repository's index.lock label for a resolved index
-    # symlink. Inspect the actual selected index path; never follow the lock
-    # path quoted by stderr.
-    if explicit_locks and matched in explicit_locks:
-        expected = matched
-    else:
-        expected = index_lock or matched
+
+    # Git may report a logical index.lock label for a symlinked index. Both
+    # accepted labels are bound to this one selected index; observe beside the
+    # path Git resolved, and never follow a lock symlink.
+    expected = selected_lock
     observe = observer or _observe
     observation = observe(expected, max(0.0, deadline - time.monotonic()))
+    if not isinstance(observation, dict):
+        observation = {"state": "unavailable", "reason": "observer-invalid-result"}
     state = observation.get("state", "unavailable")
     if state == "present" and observation.get("kind") == "symlink":
         observed = "present (symlink; target not followed)"
@@ -314,11 +326,14 @@ def diagnose_failure(argv: list[str], cwd: str, returncode: int, stdout: bytes, 
         observed = f"unavailable ({observation.get('reason', 'unknown reason')})"
     checks = _read_only_commands(argv, cwd, process_env, expected)
     check_lines = "\n".join(f"  {command}" for command in checks)
+    source_note = (f"Output source: {output_source}; stdout/stderr separation and raw bytes are unavailable.\n"
+                   if output_source != "Git stderr" else "")
     return {
         "state": state, "lock_path": expected, "observation": observation,
         "message": (
             "Hearting Git index-lock diagnosis\n"
             f"Index lock: {expected}\n"
+            f"{source_note}"
             f"Observation: {observed}\n"
             "Ownership: unknown. Local process visibility and file age/attributes do not prove "
             "ownership or staleness across NFS hosts and namespaces.\n"
@@ -327,6 +342,187 @@ def diagnose_failure(argv: list[str], cwd: str, returncode: int, stdout: bytes, 
             f"{check_lines}"
         ),
     }
+
+
+def _worker_unavailable(reason: str, description: str) -> dict:
+    return {
+        "state": "unavailable",
+        "observation": {"state": "unavailable", "reason": reason},
+        "message": ("Hearting Git index-lock diagnosis\n"
+                    f"Observation: unavailable ({description})\n"
+                    "Ownership: unknown. The original Git failure is unchanged; "
+                    "no file was changed and Git was not retried."),
+    }
+
+
+def _bounded_worker(payload: dict, deadline: float) -> dict | None:
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > 256 * 1024:
+        return _worker_unavailable("diagnostic-input-too-large", "diagnostic input exceeded its bound")
+    try:
+        child = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--diagnose-worker"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True, bufsize=0,
+        )
+    except OSError:
+        return _worker_unavailable("diagnostic-start-failed", "diagnostic worker did not start")
+
+    def stop_group() -> None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        # Reap promptly after the signal, with a strict short bound. A worker
+        # in an uninterruptible kernel wait never holds the caller indefinitely.
+        child.poll()
+        if child.returncode is None:
+            try:
+                child.wait(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                pass
+
+    try:
+        if child.stdin is None or child.stdout is None:
+            stop_group()
+            return _worker_unavailable("diagnostic-pipe-unavailable", "diagnostic worker pipe unavailable")
+        input_fd = child.stdin.fileno()
+        os.set_blocking(input_fd, False)
+        pending_input = memoryview(encoded)
+        while pending_input:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_group()
+                return _worker_unavailable("diagnostic-timeout", "two-second diagnostic budget expired")
+            _, writable, _ = select.select([], [child.stdin], [], remaining)
+            if not writable:
+                stop_group()
+                return _worker_unavailable("diagnostic-timeout", "two-second diagnostic budget expired")
+            try:
+                written = os.write(input_fd, pending_input)
+            except BlockingIOError:
+                continue
+            pending_input = pending_input[written:]
+        child.stdin.close()
+        output = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_group()
+                return _worker_unavailable("diagnostic-timeout", "two-second diagnostic budget expired")
+            ready, _, _ = select.select([child.stdout], [], [], remaining)
+            if not ready:
+                stop_group()
+                return _worker_unavailable("diagnostic-timeout", "two-second diagnostic budget expired")
+            chunk = os.read(child.stdout.fileno(), 65537)
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > 65536:
+                stop_group()
+                return _worker_unavailable("diagnostic-result-too-large", "worker result exceeded its bound")
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            child.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            stop_group()
+            return _worker_unavailable("diagnostic-timeout", "two-second diagnostic budget expired")
+        if child.returncode != 0:
+            return _worker_unavailable("diagnostic-worker-failed", "diagnostic worker exited without a result")
+        result = json.loads(output)
+        return result if isinstance(result, dict) else _worker_unavailable(
+            "diagnostic-worker-invalid-result", "diagnostic worker returned an invalid result")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        stop_group()
+        return _worker_unavailable("diagnostic-worker-failed", "diagnostic worker could not finish")
+    finally:
+        if child.stdin is not None:
+            try:
+                child.stdin.close()
+            except OSError:
+                pass
+        if child.stdout is not None:
+            try:
+                child.stdout.close()
+            except OSError:
+                pass
+
+
+def _diagnose_payload(payload: dict) -> dict | None:
+    try:
+        return _diagnose_bound_path(
+            payload["argv"], payload["cwd"], payload["returncode"], payload["reported_path"],
+            env=payload.get("env"), deadline=payload["deadline"],
+            output_source=payload.get("output_source", "Git stderr"),
+        )
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
+def diagnose_failure(argv: list[str], cwd: str, returncode: int, stdout: bytes, stderr: bytes,
+                     *, env: dict[str, str] | None = None,
+                     budget_seconds: float = DIAGNOSIS_BUDGET_SECONDS,
+                     observer=None, git_runner=None) -> dict | None:
+    """Return an advisory only for a context-bound index.lock EEXIST failure."""
+    if returncode <= 0 or not isinstance(stderr, bytes):
+        return None
+    reported_path = _lock_path_from_error(stderr)
+    if not reported_path:
+        return None
+    try:
+        budget = max(0.0, min(float(budget_seconds), DIAGNOSIS_BUDGET_SECONDS))
+    except (TypeError, ValueError):
+        budget = 0.0
+    deadline = time.monotonic() + budget
+    payload = {"argv": argv, "cwd": cwd, "returncode": int(returncode),
+               "reported_path": reported_path, "env": env, "deadline": deadline}
+    # Injected callbacks are deterministic unit seams, not production timeout evidence.
+    if observer is not None or git_runner is not None:
+        try:
+            return _diagnose_bound_path(
+                argv, cwd, int(returncode), reported_path, env=env, deadline=deadline,
+                observer=observer, git_runner=git_runner,
+            )
+        except (TypeError, ValueError, OSError):
+            return None
+    return _bounded_worker(payload, deadline)
+
+
+def _codex_command_argv(command: str, cwd: str):
+    words = _shell_words(command)
+    if not words:
+        return None
+    if Path(words[0]).name in {"zsh", "bash", "sh"}:
+        if len(words) != 3 or words[1] != "-lc":
+            return None
+        command = words[2]
+    return parse_shell_command(command, cwd)
+
+
+def diagnose_codex_command(command: str, cwd: str, exit_code: int,
+                           aggregated_output: str, *, env: dict[str, str] | None = None) -> dict | None:
+    """Consume a structured App Server result without inventing output streams."""
+    if (not isinstance(command, str) or len(command) > 64 * 1024
+            or not isinstance(cwd, str) or len(cwd) > 16 * 1024 or not os.path.isabs(cwd)
+            or not isinstance(exit_code, int) or isinstance(exit_code, bool)
+            or exit_code <= 0 or exit_code > 128
+            or not isinstance(aggregated_output, str) or len(aggregated_output) > 1_000_000):
+        return None
+    match = _LOCK_ERROR_TEXT.search(aggregated_output)
+    parsed = _codex_command_argv(command, cwd)
+    if not match or parsed is None:
+        return None
+    argv, effective_cwd, command_env = parsed
+    merged_env = dict(env or {})
+    merged_env.update(command_env)
+    deadline = time.monotonic() + DIAGNOSIS_BUDGET_SECONDS
+    payload = {
+        "argv": argv, "cwd": effective_cwd, "returncode": exit_code,
+        "reported_path": match.group("path"), "env": merged_env,
+        "deadline": deadline,
+        "output_source": "Codex App Server aggregatedOutput",
+    }
+    return _bounded_worker(payload, deadline)
 
 
 def _text_bytes(value, encoding: str) -> tuple[bytes, bool]:
@@ -431,12 +627,14 @@ def diagnose_hook_payload(payload: dict, harness: str) -> dict | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--harness", choices=("codex", "claude", "opencode"))
-    parser.add_argument("--observe", metavar="PATH")
+    parser.add_argument("--diagnose-worker", action="store_true")
     args = parser.parse_args()
-    if args.observe is not None:
-        return _observer_main(args.observe)
     try:
         payload = json.load(sys.stdin)
+        if args.diagnose_worker:
+            result = _diagnose_payload(payload) if isinstance(payload, dict) else None
+            sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
+            return 0
         result = diagnose_hook_payload(payload, args.harness or "") if isinstance(payload, dict) else None
         print(json.dumps({"diagnosis": result}, ensure_ascii=False) if result and result["state"] != "unbound" else "{}")
     except (OSError, ValueError, TypeError, UnicodeError):

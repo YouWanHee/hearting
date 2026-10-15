@@ -745,7 +745,7 @@ class RealIntegration(unittest.TestCase):
                              (os.fstat(lock_fd).st_dev, os.fstat(lock_fd).st_ino))
             os.close(lock_fd)
 
-    def test_consumer_shares_one_two_second_deadline_across_git_lookups_and_observer(self):
+    def test_injected_git_lookups_and_observer_share_one_two_second_deadline(self):
         with tempfile.TemporaryDirectory(prefix="merge-line-deadline-") as td:
             repo = Path(td) / "repo"
             repo.mkdir()
@@ -768,6 +768,7 @@ class RealIntegration(unittest.TestCase):
             integration = M.Integration.__new__(M.Integration)
             integration.temp = type("Temp", (), {"name": str(repo)})()
             original_path = M.git_index_lock._run_git_path
+            original_diagnose = M.git_index_lock.diagnose_failure
             calls = []
             def delayed_path(global_args, cwd, env, path, timeout):
                 calls.append(path)
@@ -777,9 +778,14 @@ class RealIntegration(unittest.TestCase):
             def delayed_observer(_path, remaining):
                 time.sleep(max(0.0, remaining))
                 return {"state": "unavailable", "reason": "fixture-deadline"}
+            def injected_diagnose(*args, **kwargs):
+                return original_diagnose(*args, observer=delayed_observer, **kwargs)
             started = time.monotonic()
+            # Injected callbacks exercise deadline accounting only. The
+            # production process-group cancellation bound is tested separately
+            # through diagnose_failure with a slow Git executable.
             with mock.patch.object(M.git_index_lock, "_run_git_path", side_effect=delayed_path), \
-                    mock.patch.object(M.git_index_lock, "_observe", side_effect=delayed_observer):
+                    mock.patch.object(M.git_index_lock, "diagnose_failure", side_effect=injected_diagnose):
                 result = integration.git("commit", "-m", "must fail", check=False)
             elapsed = time.monotonic() - started
             self.assertEqual(result.returncode, 128)

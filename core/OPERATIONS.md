@@ -119,10 +119,14 @@ The diagnosis is advisory. A present lock, its age, size, mode, timestamps, or a
 process not found in local observations cannot establish stale ownership across
 NFS hosts or process namespaces. Missing and unobservable locks remain distinct
 observations; neither authorizes removal. The helper does not delete, rename,
-chmod, kill, choose another index, or retry Git. Diagnosis shares one two-second
-monotonic deadline across Git context lookup and bounded file observation; it
-does not signal the failed Git process. See utilities/git_index_lock.py for the
-single implementation used by source consumers and runtime adapters.
+chmod, choose another index, or retry Git. Git context lookup and file
+observation run inside one newly created diagnostic process group under a shared
+two-second wall-clock deadline. On expiry, the caller signals only that group
+and returns without an unbounded wait; it never signals the failed Git writer.
+A process held in an uninterruptible kernel wait may outlive that signal, so a
+timeout preserves the original failure without promising kernel cancellation.
+See utilities/git_index_lock.py for the single implementation used by source
+consumers and runtime adapters.
 
 ### §5.9a. Immutable Runtime Activation and Session Pinning
 
