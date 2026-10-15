@@ -1676,14 +1676,14 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         spec.loader.exec_module(steward)
         from dispatch_session_sweep import activate, sweep_deliver
         self.enterContext(mock.patch.dict(os.environ, {"AGENT_PEER_LEDGER_ROOT": str(self.root)}))
-        self.enterContext(mock.patch.object(steward.peer_obligations, "ensure_runner"))
+        self.enterContext(mock.patch.object(steward.peer_obligations, "ensure_normal_runner"))
         for harness, carrier in (("claude", "claude-parent-runtime"),
                                  ("codex", "codex-native-queue"), ("opencode", "opencode-turn")):
             with self.subTest(harness=harness):
                 self._open_row()
                 self.jobs.write_text(self.jobs.read_text().replace("claude-parent-runtime", carrier))
                 path = self._close_and_materialize()
-                with mock.patch.object(rewake.peer_obligations, "ensure_runner"):
+                with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"):
                     activate(self.root, carrier, "session-1")
                 store = rewake.peer_obligations.ObligationStore(self.root)
                 duty = next(d for d in store.list() if d["intent"]["identity"]["harness"] == harness)
@@ -1788,7 +1788,7 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         launch = rewake.Launch("att-owner-1", self.jobs, crash_sid)
         claim = rewake.ArmClaim(rewake.arm_path(self.jobs, launch.attempt_id), launch.attempt_id,
                                 launch.session_id, 1, tuple(DEAD_HOLDER))
-        with mock.patch.object(rewake.peer_obligations, "ensure_runner"), \
+        with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"), \
                 mock.patch.object(rewake.seat_handover, "effective_parent", return_value=crash_sid), \
                 mock.patch.object(rewake, "_run_carrier", side_effect=RuntimeError("carrier crashed")):
             with self.assertRaisesRegex(RuntimeError, "carrier crashed"):
@@ -3523,5 +3523,5 @@ def replace_session(launch, session):
 if __name__ == "__main__":
     # Unit fixtures exercise records without observers racing their cleanup;
     # runner startup is exercised by peer_obligations.test.py.
-    with mock.patch.object(rewake.peer_obligations, "ensure_runner", return_value=True):
+    with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner", return_value=True):
         unittest.main()

@@ -33,7 +33,7 @@ def project(payload: dict[str, Any] | None, session_id: str, *, worker: bool = F
         try:
             subprocess.Popen(
                 [sys.executable, str(ROOT / "utilities" / "peer-steward.py"),
-                 "__ensure-obligations"],
+                 "__ensure-obligations", "--lifecycle-root", str(ROOT)],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
             )

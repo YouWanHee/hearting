@@ -1719,7 +1719,7 @@ def reserve_handoff_retire(target, exact, requester):
         if not _handoff_lifetime_valid(exact.get("foreground")):
             raise ValueError("handoff-predecessor-lifetime-unverified")
         store, duty = _retire_request(target, exact, requester=requester)
-    peer_obligations.ensure_runner()
+    peer_obligations.ensure_normal_runner()
     return duty["id"]
 
 
@@ -1743,7 +1743,7 @@ def _retire_request(target, exact, *, requester=None):
         if retry_of:
             intent["retry_of"] = retry_of
         duty = store.create(duty_id, "retire", exact, intent)
-    peer_obligations.ensure_runner()
+    peer_obligations.ensure_normal_runner()
     return store, duty
 
 
@@ -3554,7 +3554,7 @@ def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=Non
     try:
         duty = peer_obligations.ObligationStore().create(
             _message_obligation_id(row["ref"] + ("-accept" if handoff_acceptance else "")), "message", identity, intent)
-        peer_obligations.ensure_runner()
+        peer_obligations.ensure_normal_runner()
         return duty
     except (OSError, ValueError, peer_obligations.ObligationError):
         return None
@@ -3576,7 +3576,7 @@ def _ensure_sender_delay_notice(row):
     try:
         existing = peer_obligations.ObligationStore().get(notice_id)
         if existing:
-            peer_obligations.ensure_runner()
+            peer_obligations.ensure_normal_runner()
             return existing
         created = float(row.get("created") or time.time())
         sent_at = datetime.datetime.fromtimestamp(
@@ -3599,7 +3599,7 @@ def _ensure_sender_delay_notice(row):
             _schedule_message_obligation(
                 pending, sender.get("name") or sender.get("session_id"),
                 delay_notice_for=original_ref)
-        peer_obligations.ensure_runner()
+        peer_obligations.ensure_normal_runner()
         return duty
     except (OSError, ValueError, OverflowError, peer_obligations.ObligationError):
         return None
@@ -4043,6 +4043,14 @@ def cmd_obligation_runner(args):
                     store.update(duty["id"], observer_error="observer-unavailable")
                 except Exception:
                     pass
+        if not store.list():
+            return 0
+        service_current = getattr(args, "service_current", None)
+        if service_current:
+            peer_obligations.exec_service_runner(
+                args.lock_fd, store.root.parents[1], service_current,
+                herdr_session=_HERDR_SESSION,
+            )
         time.sleep(delay)
         delay = min(15.0, delay * 1.7)
 
@@ -4068,7 +4076,11 @@ def cmd_ensure_obligations(_args):
                 pane = (duty["intent"].get("requester") or {}).get("pane")
                 if pane and _seat_successor_path(pane).is_file():
                     _resume_retire_obligation(duty, store)
-        peer_obligations.ensure_runner()
+        lifecycle_root = getattr(_args, "lifecycle_root", None)
+        if lifecycle_root is None:
+            peer_obligations.ensure_runner()
+        else:
+            peer_obligations.ensure_normal_runner(lifecycle_root=lifecycle_root)
         dispatch_batch_obligations.ensure_observers()
     except Exception:
         pass
@@ -5102,9 +5114,11 @@ def build_parser():
     p_obligation = sub.add_parser("__obligation-runner", help=argparse.SUPPRESS)
     p_obligation.add_argument("--lock-fd", type=int, required=True)
     p_obligation.add_argument("--state-root", required=True)
+    p_obligation.add_argument("--service-current", default=None, help=argparse.SUPPRESS)
     p_obligation.set_defaults(func=cmd_obligation_runner)
 
     p_recover = sub.add_parser("__ensure-obligations", help=argparse.SUPPRESS)
+    p_recover.add_argument("--lifecycle-root", default=None, help=argparse.SUPPRESS)
     p_recover.set_defaults(func=cmd_ensure_obligations)
 
     p_wait = sub.add_parser("wait")

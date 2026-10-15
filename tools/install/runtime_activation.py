@@ -3619,7 +3619,8 @@ def reconnect_peer_obligations(active_root: str | Path) -> bool:
     env["AGENT_HOME"] = str(root)
     try:
         subprocess.Popen(
-            [sys.executable, str(utility), "__ensure-obligations"], env=env,
+            [sys.executable, str(utility), "__ensure-obligations",
+             "--lifecycle-root", str(root)], env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, start_new_session=True,
         )

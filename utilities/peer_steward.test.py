@@ -81,7 +81,7 @@ class _TmpRootMixin:
         os.environ.pop("AGENT_HERDR_SESSION", None)
         self._old_herdr_session = peer_steward._HERDR_SESSION
         peer_steward._HERDR_SESSION = None
-        runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False)
         runner_patch.start()
         self.addCleanup(runner_patch.stop)
         # Existing peer tests use already admitted fixture panes. The shared
@@ -2068,7 +2068,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         patch = mock.patch.object(peer_steward, "_read_screen", return_value=empty)
         patch.start()
         self.addCleanup(patch.stop)
-        runner = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner = mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False)
         runner.start()
         self.addCleanup(runner.stop)
 
@@ -2957,6 +2957,71 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         watches.assert_called_once_with()
         peers.assert_called_once_with()
         batches.assert_called_once_with()
+
+
+class NormalProducerRunnerBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        self.jobs = self.base / "dispatch" / "jobs.log"
+        self.env = {"AGENT_PEER_LEDGER_ROOT": str(self.state),
+                    "AGENT_DISPATCH_JOBS": str(self.jobs),
+                    "HOME": str(self.base / "home")}
+        Path(self.env["HOME"]).mkdir()
+        patch = mock.patch.dict(os.environ, self.env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _exact_retire(self):
+        return {"server": "default", "pane": "fixture-pane", "harness": "codex",
+                "session_id": "sid-retire", "name": "retire-target",
+                "foreground": {"pid": 123, "start": "456"}}
+
+    def test_message_and_delay_producers_use_the_shared_binding_helper(self):
+        sender = {"harness": "claude", "session_id": "sid-sender", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "sid-recipient", "name": "recipient"}
+        message = {"ref": "a" * 32, "body_sha256": "b" * 64,
+                   "from": sender, "to": recipient, "refs": []}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            duty = peer_steward._schedule_message_obligation(message, "recipient", "fixture-pane")
+            self.assertIsNotNone(duty)
+            ensure.assert_called_once_with()
+
+        delay_row = {"ref": "c" * 32, "created": time.time(), "refs": [],
+                     "from": sender, "to": recipient}
+        prepared = {"ref": "d" * 32, "body_sha256": "e" * 64,
+                    "from": recipient, "to": sender, "refs": ["delay-notice:" + delay_row["ref"]]}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure, \
+             mock.patch.object(peer_steward.peer_message, "prepare_peer_message",
+                               return_value=("fixture text", prepared["ref"])), \
+             mock.patch.object(peer_steward.peer_message, "_read_pending",
+                               return_value=prepared):
+            duty = peer_steward._ensure_sender_delay_notice(delay_row)
+            self.assertIsNotNone(duty)
+            self.assertEqual(ensure.call_count, 2)
+
+    def test_retire_and_handoff_retire_producers_use_the_shared_binding_helper(self):
+        exact = self._exact_retire()
+        requester = {"session_id": "sid-requester", "harness": "codex",
+                     "pane": "requester-pane", "server": "default"}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            _store, duty = peer_steward._retire_request(
+                "retire-target", exact, requester=requester)
+            self.assertEqual(duty["intent"]["identity"], exact)
+            ensure.assert_called_once_with()
+
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            handoff_exact = {**exact, "pane": "handoff-pane"}
+            duty_id = peer_steward.reserve_handoff_retire(
+                "handoff-target", handoff_exact, requester)
+            self.assertTrue(duty_id.startswith("retire-"))
+            self.assertEqual(ensure.call_count, 2)
 
 
 class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
@@ -5176,7 +5241,10 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                             self.retire(world, clear_existing=False, resume_request_id=duty_id)
                     return stale
                 with mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness):
-                    self._run_retire_runner(world, crash_phase="checkpoint")
+                    if exits:
+                        self._run_retire_runner(world)
+                    else:
+                        self._run_retire_runner(world, crash_phase="checkpoint")
                 duty = store.get(duty_id)
                 if exits:
                     self.assertEqual((duty["state"], duty["observation"]["phase"]), ("complete", "complete"))
@@ -5254,7 +5322,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_retire_process_record", return_value=(record if record is not None else
                               {"start": "800", "group": 4242, "argv": [world.harness]})), \
              mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=lambda pid: "700" if pid == 101 else "800"), \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False), \
              mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
              mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
              mock.patch.object(peer_steward.time, "sleep"), \
