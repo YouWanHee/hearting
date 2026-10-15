@@ -1325,6 +1325,7 @@ class HandoffTest(RunnerCase):
             self.assertEqual(row["argv"][2], "--body-file")
             self.assertEqual(len(row["argv"]), 4)
             self.assertEqual(row["body"].strip(), text.strip())
+            self.assertNotIn("[첫 답]", row["body"])
         self.assertEqual(list((self.state / "handoff").glob("*")), [])      # the body file does not linger
 
     def test_large_compact_card_reaches_peer_body_file_without_truncation(self):

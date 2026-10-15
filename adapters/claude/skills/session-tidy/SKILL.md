@@ -19,6 +19,14 @@ Write the handoff card yourself, queue the memory tidy, and let the window clear
 when it is safe; the new session then picks the work up from the card by itself. Nothing
 here is required input and nothing waits for a confirmation.
 
+When receiving a seat card, start the first reply before any tool call with one summary
+in the user's language, about five lines using the three headings
+`하던 일 · 남은 일 · 다음 할 일`, then continue. If the user first gives a different
+instruction instead of continuing, skip the summary and follow only that instruction.
+The card's fixed injection header carries this guidance even when its body is clipped
+or memory references accompany it; late memory-only injections and peer handoff
+messages do not carry it.
+
 Runtime compaction queues memory tidying for the main session. Only a nonempty automatic
 Claude/OpenCode summary successfully saved to its own verified herdr pane/native seat can
 use the existing handover snapshot → clear → `이어서해` flow. The helper waits up to three

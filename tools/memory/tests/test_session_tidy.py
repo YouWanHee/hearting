@@ -1443,6 +1443,44 @@ class OpenCodeCompactObservationTest(TidyCase):
 class MemoryLayerTest(TidyCase):
     """Card layer B ("참고할 기억"): its own revision and receipt, beside the unchanged layer A."""
 
+    def test_first_reply_guidance_survives_all_harnesses_budgets_and_late_memory(self):
+        guidance = st.CARD_FIRST_REPLY_GUIDANCE
+        for requirement in ("첫 답 맨 앞", "도구 호출 전에", "사용자의 언어", "하던 일 · 남은 일 · 다음 할 일",
+                            "5줄 안팎", "한 번", "다른 지시를 먼저 주면 요약을 생략", "그 지시만"):
+            self.assertIn(requirement, guidance)
+        for harness in st.HARNESSES:
+            for bundled in (False, True):
+                for long_body in (False, True):
+                    with self.subTest(harness=harness, bundled=bundled, long_body=long_body):
+                        pane = f"{PANE}-{harness}-{bundled}-{long_body}"
+                        receiver = f"receiver-{harness}-{bundled}-{long_body}"
+                        body = "진행 중: 카드 시험\n다음 할 일: 검증\n" + ("세부 내용 " * 900 if long_body else "")
+                        self.card("author-A", body, harness=harness, pane=pane)
+                        with self.library({"HERDR_PANE_ID": pane}):
+                            seat = st.resolve_seat(harness, str(self.cwd))
+                            if bundled:
+                                st.update_memory_refs(seat, **self.refs(n=8))
+                                st.write_notice(seat, "정리 결과: 새 기록 3건. 되돌리기: mem tidy-undo b1",
+                                                author_harness=harness, author_sid="author-A")
+                            got = st.run_hook(harness, "start", receiver, cwd=str(self.cwd))
+                            self.assertEqual(got.count(guidance), 1)
+                            self.assertIn(guidance, got.splitlines())
+                            self.assertLess(got.index(guidance), got.index("진행 중: 카드 시험"))
+                            self.assertIn("카드 전문:", got)
+                            self.assertLessEqual(len(got.encode("utf-8")), 2400)
+                            replay = self.hook(harness, "prompt", receiver, "--reread", pane=pane)
+                            self.assertEqual(replay, got + "\n")
+                            self.assertLessEqual(len(replay.encode("utf-8")), 2400)
+                            self.assertEqual("이하 생략" in got, long_body)
+                            self.assertEqual("[참고할 기억]" in got, bundled)
+                            self.assertEqual(st.run_hook(harness, "prompt", receiver, cwd=str(self.cwd)), "")
+                            st.update_memory_refs(seat, **self.refs(batch="late-B"))
+                            late = st.run_hook(harness, "prompt", receiver, cwd=str(self.cwd))
+                            self.assertIn("[참고할 기억]", late)
+                            self.assertNotIn("[세션 카드]", late)
+                            self.assertNotIn(guidance, late)
+                            self.assertNotIn("[첫 답]", late)
+
     def refs(self, n=3, batch="b1", status="applied", **more):
         rows = [{"id": f"mem-{i}", "kind": "새", "headline": f"기억 {i} 제목"} for i in range(n)]
         return dict(batch=batch, status=status, refs=rows, **more)
@@ -1466,7 +1504,8 @@ class MemoryLayerTest(TidyCase):
         again = self.update(**self.refs(result_path="/r/result.json"))
         self.assertEqual(again["revision"], 1)                                  # the same batch: same revision
         self.assertEqual(self.update(**self.refs(batch="b2"))["revision"], 2)
-        self.assertIsNone(st.update_memory_refs(st.Seat("pane", "nocard", "x", "claude", ""), batch="b", status="applied", refs=[]))
+        with self.library():
+            self.assertIsNone(st.update_memory_refs(st.Seat("pane", "nocard", "x", "claude", ""), batch="b", status="applied", refs=[]))
 
     def test_a_new_card_keeps_the_finished_list_and_the_late_batch_names_the_card_it_was_queued_under(self):
         self.card("sid-A", "첫 카드")
