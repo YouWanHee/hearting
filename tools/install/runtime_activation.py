@@ -40,6 +40,7 @@ import projector
 import retired_memory_state
 import safe_fs
 import user_model_config
+import codex_tui_config
 
 
 RUNTIMES = ("claude", "codex", "opencode")
@@ -2308,6 +2309,17 @@ def _prepare_runtime_config(
             pre_projection_bytes=projected.get("pre_projection_bytes"),
             file_created=codex_record.get("file_created") if isinstance(codex_record, dict) else None,
         )
+        config = _config_path("codex", scope, "config.toml")
+        fragment = active_root / "adapters" / "codex" / "config" / "tui-statusline.toml"
+        try:
+            original = config.read_text(encoding="utf-8") if config.exists() else ""
+            updated = codex_tui_config.merge_status_line_from_fragment(original, fragment)
+            if updated != original:
+                _atomic_text(config, updated)
+            result["tui_status_line_changed"] = updated != original
+        except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
+            result.setdefault("conflicts", []).append("tui.status_line")
+            result["tui_status_line_detail"] = str(exc)
         result.setdefault("report_lines", []).extend(projected["report_lines"])
         result["context_projection"] = projected
         result["native_context"] = native

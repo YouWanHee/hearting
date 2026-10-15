@@ -3593,6 +3593,21 @@ def _settle(target, bound_ms=_PROMPT_SETTLE_MS):
 
 _FORM_TOKENS = ("esctocancel", "entertoselect", "entertoconfirm", "doyouwanttoproceed",
                 "tab/arrowkeys", "arrowkeystonavigate")
+_CODEX_LOCATION_TOKENS = (
+    "whereshouldthenewconversationrun", "whereshouldtheforkedconversationrun",
+    "usecurrentgitworktree", "keepusingthecurrentworkingdirectory", "createnewgitworktree",
+)
+
+
+def _codex_location_menu(lines):
+    """Recognize Codex new/fork location forms after ANSI and line-wrap removal."""
+    if isinstance(lines, str):
+        lines = _screen_lines(lines)
+    if not isinstance(lines, (list, tuple)):
+        return False
+    flat = "".join("".join(_plain(line) if isinstance(line, list) else str(line)
+                          for line in lines).split()).lower()
+    return any(token in flat for token in _CODEX_LOCATION_TOKENS)
 
 
 def _form_open(target):
@@ -3609,8 +3624,9 @@ def _form_open(target):
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
-    flat = "".join((proc.stdout or "").split()).lower()
-    return any(token in flat for token in _FORM_TOKENS)
+    lines = _screen_lines(proc.stdout or "")
+    flat = "".join("".join(_plain(line) for line in lines).split()).lower()
+    return any(token in flat for token in _FORM_TOKENS) or _codex_location_menu(lines)
 
 
 def _bottom_form_tokens(target, window=15):
@@ -3628,9 +3644,9 @@ def _bottom_form_tokens(target, window=15):
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
-    lines = (proc.stdout or "").splitlines()[-window:]
-    flat = "".join("".join(lines).split()).lower()
-    return any(token in flat for token in _FORM_TOKENS)
+    lines = _screen_lines(proc.stdout or "")[-window:]
+    flat = "".join("".join(_plain(line) for line in lines).split()).lower()
+    return any(token in flat for token in _FORM_TOKENS) or _codex_location_menu(lines)
 
 
 def _prompt_form_open(target, state_before):
@@ -3711,10 +3727,17 @@ def _prompt_input_reason(target, harness, state, *, expected_sid=None):
         return readiness.reason
     if readiness.reason.startswith("bound-registered-work") and readiness.state != "ready":
         return readiness.reason
+    if harness == "codex":
+        # Codex's exact native queue does not type into the pane. Read only to
+        # recognize a live choice/permission form; a blocked label alone must
+        # not turn the queue into the frontend draft path.
+        if _bottom_form_tokens(target):
+            return "target-form-open"
+        return "codex-native-queue" if state == "blocked" else None
     if _prompt_form_open(target, state):
         return "target-form-open"
     if harness not in {"claude", "opencode"}:
-        return None                 # Codex's existing queue path is unchanged.
+        return None
     lines = _read_screen(target)
     if lines is None:
         return "target-draft-unknown"
@@ -3825,11 +3848,16 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
     Never raises; failures print to stderr and leave rows for a later prompt.
     """
     stuck = []
+    if t_sid in (None, "", "-"):
+        return 0, stuck
     try:
         rows = [row for row in peer_message._pending_rows()
                 if row.get("state") == "pending"
                 and (row.get("to") or {}).get("harness") == t_harness
-                and (row.get("to") or {}).get("session_id") == t_sid]
+                and ((row.get("to") or {}).get("session_id") == t_sid
+                     or ((row.get("to") or {}).get("session_id") is None
+                         and expected_pane
+                         and (row.get("to") or {}).get("pane_id") == expected_pane))]
     except (OSError, ValueError):
         print("pending-flush-failed target=%s reason=pending-unreadable" % target, file=sys.stderr)
         return 0, stuck
@@ -3853,7 +3881,7 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
     flushed = 0
     if t_harness == "codex":
         return flushed, stuck
-    recipient = {"harness": t_harness, "session_id": t_sid}
+    recipient = {"harness": t_harness, "session_id": t_sid, "pane_id": expected_pane}
     rows.sort(key=lambda row: row.get("created") or 0)
     for row in rows[:_FLUSH_MAX_ROWS]:
         ref = row.get("ref")
@@ -3876,6 +3904,10 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
                 _current_state, current_ident, _code, _reason = _retire_target(target)
                 if current_ident.get("pane") != expected_pane:
                     break
+            if peer_message._valid_pane_bound_endpoint(row.get("to")):
+                row = peer_message.bind_pending_recipient(ref, recipient)
+                if row is None:
+                    continue
             row = peer_message.claim_pending_herdr(ref, recipient)
             if row is None:
                 continue
@@ -3898,6 +3930,12 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
             else:
                 continue
             if outcome == "true":
+                if row.get("no_trailer"):
+                    ack = peer_message.mark_pending_queued(
+                        ref, receipt="herdr-redelivery-observed:" + observed)
+                    if ack:
+                        flushed += 1
+                    continue
                 ack = peer_message.receive_peer_message(
                     text, recipient, summary_text="herdr redelivery observed: " + observed)
                 current = peer_message._read_pending(ref)
@@ -4002,13 +4040,30 @@ def _resume_message_obligation(duty, store):
     try:
         state, ident, _code, reason = _retire_target(target or recipient.get("name") or "")
         expected_pane = identity.get("pane") or ""
+        pane_bound = peer_message._valid_pane_bound_endpoint(recipient)
         if (reason or ident.get("harness") != recipient.get("harness")
-                or ident.get("session_id") != recipient.get("session_id")
-                or (expected_pane and ident.get("pane") != expected_pane)):
+                or (expected_pane and ident.get("pane") != expected_pane)
+                or (not pane_bound and ident.get("session_id") != recipient.get("session_id"))):
             store.update(duty["id"], state="unknown",
                          observation={"ref": ref, "reason": reason or "target-identity-changed",
                                       "observed_pane": ident.get("pane", "")})
             return
+        if pane_bound:
+            observed_sid = ident.get("session_id")
+            if observed_sid in (None, "", "-"):
+                store.update(duty["id"], state="pending",
+                             observation={"ref": ref, "reason": "target-session-unresolved",
+                                          "observed_pane": ident.get("pane", "")})
+                return
+            bound = peer_message.bind_pending_recipient(
+                ref, {"harness": recipient["harness"], "session_id": observed_sid,
+                      "pane_id": expected_pane or recipient.get("pane_id")})
+            if bound is None:
+                store.update(duty["id"], state="unknown",
+                             observation={"ref": ref, "reason": "target-identity-changed",
+                                          "observed_pane": ident.get("pane", "")})
+                return
+            recipient = peer_message.pending_delivery_recipient(bound)
         readiness = _pane_readiness(target, state,
                                     expected_harness=recipient.get("harness"),
                                     expected_sid=recipient.get("session_id"), purpose="input")
@@ -4018,6 +4073,11 @@ def _resume_message_obligation(duty, store):
                              observation={"ref": ref, "reason": readiness.reason,
                                           "state": readiness.state})
                 return
+        if _prompt_form_open(target, state):
+            store.update(duty["id"], state="pending",
+                         observation={"ref": ref, "reason": "target-form-open",
+                                      "state": state, "pane": expected_pane})
+            return
         if recipient.get("harness") == "codex":
             peer_message.deliver_pending_codex(ref, timeout=0.25)
         elif state in {"idle", "done", "working"}:
@@ -4347,18 +4407,35 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
         flushed, _stuck = _flush_pending_for_target(
             args.target, t_harness, t_sid, state_before,
             skip=(hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest(),
-                  from_harness, from_sid))
-    if not args.no_trailer:
+                  from_harness, from_sid), expected_pane=target_pane)
+    recipient = {"harness": t_harness, "session_id": peer_message.usable_session_id(t_sid),
+                 "name": _t_name}
+    pane_bound_defer = input_reason in {"target-form-open", "target-draft", "target-draft-unknown"}
+    if target_pane and (not input_reason or pane_bound_defer):
+        recipient["pane_id"] = target_pane
+    can_persist_sidless = t_harness in {"claude", "codex", "opencode"} and bool(target_pane)
+    if not args.no_trailer or (input_reason and can_persist_sidless) or on_prepared is not None:
         try:
             text, transfer_ref = peer_message.prepare_peer_message(
                 body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
-                {"harness": t_harness, "session_id": t_sid, "name": _t_name},
+                recipient,
                 defer=bool(input_reason) or on_prepared is not None,
-                refs=args.ref, receipt=input_reason or "target-form-open")
+                refs=args.ref, receipt=input_reason or "target-form-open",
+                with_trailer=not args.no_trailer)
             if on_prepared is not None:
                 on_prepared(transfer_ref)
         except (OSError, ValueError):
             print("prompted=unverified reason=peer-pending-or-transfer-unavailable")
+            return 5
+    elif not input_reason:
+        try:
+            pending_retry = peer_message.find_pending_peer_message(
+                body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
+                recipient, with_trailer=False)
+            if pending_retry:
+                text, transfer_ref = pending_retry["text"], pending_retry["ref"]
+        except (OSError, ValueError):
+            print("prompted=unverified reason=peer-pending-unavailable")
             return 5
     first = body.strip().splitlines()[0] if body.strip() else ""
     kind = "steer"
@@ -4377,41 +4454,72 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     except (OSError, ValueError):
         print("prompted=unverified reason=peer-pending-unavailable")
         return 5
-    if pending and not t_sid and not input_reason:
-        # Private delivery is SID-bound: a receivable target with no session
-        # yet (a fresh Codex before its first input) takes the typed send, even
-        # when a retry reused a row an earlier deferral left unaddressable.
-        pending = None
+    if pending and t_sid in (None, "", "-") and not input_reason:
+        if peer_message._valid_pane_bound_endpoint(pending.get("to")):
+            input_reason = "target-session-unresolved"
+        else:
+            # A fresh pane without a deferred SID-less row keeps the established
+            # first-input path; no unresolved transfer is retargeted to it.
+            pending = None
     surface = "herdr"
     claimed = None
-    if pending and t_harness != "codex" and not input_reason:
+    if (pending and t_harness != "codex" and not input_reason
+            and not peer_message._valid_pane_bound_endpoint(pending.get("to"))):
         try:
             claimed = peer_message.claim_pending_herdr(
                 transfer_ref, {"harness": t_harness, "session_id": t_sid})
         except (OSError, ValueError):
             claimed = None
-    if t_harness in {"claude", "opencode"} and not input_reason:
+    if t_harness in {"claude", "codex", "opencode"} and not input_reason:
         # Preparation/claim may take time: the final read belongs after them.
         input_reason = _prompt_input_reason(args.target, t_harness, state_before, **input_options)
         if input_reason:
             if claimed is not None:
                 peer_message.release_unsent_herdr_claim(claimed, receipt=input_reason)
                 claimed = None
-            if not args.no_trailer and pending is None:
+            if pending is None and (not args.no_trailer or can_persist_sidless):
                 try:
                     text, transfer_ref = peer_message.prepare_peer_message(
                         body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
-                        {"harness": t_harness, "session_id": t_sid, "name": _t_name},
-                        defer=True, refs=args.ref, receipt=input_reason)
+                        recipient, defer=True, refs=args.ref, receipt=input_reason,
+                        with_trailer=not args.no_trailer)
                     if on_prepared is not None:
                         on_prepared(transfer_ref)
                     pending = peer_message._read_pending(transfer_ref)
                 except (OSError, ValueError):
                     print("prompted=unverified reason=peer-pending-unavailable")
                     return 5
+    if pending and peer_message._valid_pane_bound_endpoint(pending.get("to")) and not input_reason:
+        if t_sid in (None, "", "-"):
+            input_reason = "target-session-unresolved"
+        else:
+            final_harness, final_sid, _final_name = _resolve_target(args.target)
+            final_state, final_pane = _agent_state(args.target)
+            final_reason = _prompt_input_reason(
+                args.target, t_harness, final_state,
+                expected_sid=t_sid if expected_recipient is not None else None)
+            if (final_harness, final_sid, final_pane) != (t_harness, t_sid, target_pane):
+                input_reason = "target-identity-changed"
+            elif final_reason:
+                input_reason = final_reason
+            else:
+                bound = peer_message.bind_pending_recipient(transfer_ref, recipient)
+                if bound is None:
+                    input_reason = "target-identity-changed"
+                else:
+                    pending = bound
+    if (pending and t_harness != "codex" and not input_reason
+            and peer_message._valid_pane_bound_endpoint(pending.get("to"))):
+        try:
+            claimed = peer_message.claim_pending_herdr(
+                transfer_ref, {"harness": t_harness, "session_id": t_sid, "pane_id": target_pane})
+        except (OSError, ValueError):
+            claimed = None
+        if claimed is not None:
+            pending = claimed
     if pending and pending.get("state") == "pending" and (input_reason or on_prepared is not None):
         _schedule_message_obligation(pending, args.target, target_pane)
-    if pending and t_harness == "codex":
+    if pending and t_harness == "codex" and input_reason in (None, "codex-native-queue"):
         surface = "codex-queue"
         try:
             result = peer_message.deliver_pending_codex(transfer_ref)
@@ -4464,9 +4572,13 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                 else:
                     outcome = "failed"
     if claimed is not None and outcome == "true" and not args.no_verify:
-        peer_message.receive_peer_message(
-            text, {"harness": t_harness, "session_id": t_sid},
-            summary_text="herdr send observed: " + verify)
+        if claimed.get("no_trailer"):
+            peer_message.mark_pending_queued(
+                transfer_ref, receipt="herdr-send-observed:" + verify)
+        else:
+            peer_message.receive_peer_message(
+                text, {"harness": t_harness, "session_id": t_sid},
+                summary_text="herdr send observed: " + verify)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     ledger_status = _PROMPT_LEDGER_STATUS[outcome]
     # SD-122 (11): one ledger row per send, whatever happened -- target pane,
@@ -4610,7 +4722,8 @@ def _screen_ready(harness, lines):
     """None when the visible screen shows no selection/permission form and an empty input box,
     else the reason (`form-open`, `draft`, `draft-unknown`)."""
     flat = "".join("".join(_plain(c) for c in lines).split()).lower()
-    if any(token in flat for token in _FORM_TOKENS):
+    if any(token in flat for token in _FORM_TOKENS) \
+            or (harness == "codex" and _codex_location_menu(lines)):
         return "form-open"
     draft = _draft_state(harness, lines)
     if draft == "nonempty":
@@ -4621,9 +4734,9 @@ def _screen_ready(harness, lines):
 
 
 def _codex_footer_threads(lines):
-    """Shared native footer parser used by clear observation and pane ownership."""
+    """Strict current-footer identity shared by clear observation and pane ownership."""
     from pane_ownership import codex_footer_threads
-    return codex_footer_threads([_plain(cells) for cells in lines])
+    return codex_footer_threads([_plain(cells) for cells in lines], current_id_only=True)
 
 
 def _codex_rollout_exists(thread_id):
@@ -4823,6 +4936,12 @@ def _clear_observe(target, req, request_path, before_threads=()):
     naming a new thread (its start hook only runs with the first message), OpenCode's home."""
     old = req.get("sid")
     for round_no in range(_CLEAR_OBSERVE_ROUNDS):
+        if req.get("harness") == "codex":
+            menu_lines = _read_screen(target)
+            if menu_lines is not None and _codex_location_menu(menu_lines):
+                if round_no + 1 < _CLEAR_OBSERVE_ROUNDS:
+                    _run_herdr_wait(target, ["working", "blocked"], _CLEAR_OBSERVE_SETTLE_MS)
+                continue
         held = _read_json(Path(request_path))
         seen = (held or {}).get("observed") or {}
         if seen.get("sid") and seen.get("sid") != old:

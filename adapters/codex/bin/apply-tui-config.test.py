@@ -52,7 +52,7 @@ class ApplyTuiConfigTest(unittest.TestCase):
         result = self.apply_config()
         self.assertEqual(result.returncode, 0, result.stderr)
         parsed = tomllib.loads(self.config.read_text(encoding="utf-8"))
-        self.assertEqual(parsed["tui"]["status_line"], ["thread-id", *custom])
+        self.assertEqual(parsed["tui"]["status_line"], [*custom, "thread-id"])
         self.assertIs(parsed["tui"]["status_line_use_colors"], False)
         self.assertIs(parsed["tui"]["notifications"], False)
         self.assertIs(parsed["daemon_auto_start"], False)
@@ -73,25 +73,45 @@ class ApplyTuiConfigTest(unittest.TestCase):
         self.assertIn("changed=no", second.stdout)
         self.assertEqual(self.config.read_text(encoding="utf-8"), first_text)
         self.assertEqual(tomllib.loads(first_text)["tui"]["status_line"],
-                         ["thread-id", "custom-item"])
+                         ["custom-item", "thread-id"])
 
-    def test_new_config_uses_managed_defaults_with_thread_id_first(self):
+    def test_new_config_uses_managed_defaults_with_thread_id_last(self):
         result = self.apply_config()
         self.assertEqual(result.returncode, 0, result.stderr)
         defaults = tomllib.loads(FRAGMENT.read_text(encoding="utf-8"))["tui"]
         applied = tomllib.loads(self.config.read_text(encoding="utf-8"))["tui"]
         self.assertEqual(applied, defaults)
-        self.assertEqual(applied["status_line"][0], "thread-id")
+        self.assertEqual(applied["status_line"][-1], "thread-id")
 
-    def test_existing_thread_id_moves_first_while_other_custom_items_keep_order(self):
-        self.config.write_text('[tui]\nstatus_line = ["project-name", "thread-title", '
-                               '"thread-id", "custom-item"]\nstatus_line_use_colors = false\n')
+    def test_thread_id_moves_last_and_other_items_keep_order(self):
+        for items in (("thread-id", "project-name", "thread-title", "custom-item"),
+                      ("project-name", "thread-id", "thread-title", "custom-item"),
+                      ("project-name", "thread-title", "custom-item", "thread-id", "thread-id")):
+            with self.subTest(items=items):
+                self.config.write_text('[tui]\nstatus_line = ' + repr(list(items)).replace("'", '"')
+                                       + '\nstatus_line_use_colors = false\n')
+                result = self.apply_config()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                applied = tomllib.loads(self.config.read_text())["tui"]
+                self.assertEqual(applied["status_line"],
+                                 [item for item in items if item != "thread-id"] + ["thread-id"])
+                self.assertIs(applied["status_line_use_colors"], False)
+
+    def test_explicit_empty_and_invalid_config_are_handled_without_loss(self):
+        self.config.write_text('[tui]\nstatus_line = []\nstatus_line_use_colors = false\n')
         result = self.apply_config()
         self.assertEqual(result.returncode, 0, result.stderr)
-        applied = tomllib.loads(self.config.read_text())["tui"]
-        self.assertEqual(applied["status_line"],
-                         ["thread-id", "project-name", "thread-title", "custom-item"])
-        self.assertIs(applied["status_line_use_colors"], False)
+        parsed = tomllib.loads(self.config.read_text())["tui"]
+        self.assertEqual(parsed["status_line"], ["thread-id"])
+        self.assertIs(parsed["status_line_use_colors"], False)
+
+        for invalid in ("[tui\nstatus_line = [\"custom\"]\n", "[tui]\nstatus_line = 7\n"):
+            with self.subTest(invalid=invalid):
+                before = invalid.encode()
+                self.config.write_bytes(before)
+                result = self.apply_config()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.config.read_bytes(), before)
 
 
 if __name__ == "__main__":

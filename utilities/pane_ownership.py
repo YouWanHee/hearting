@@ -23,31 +23,43 @@ _THREAD_ID_RE = re.compile(
 _ANSI_ESCAPE_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[()][A-Za-z0-9])"
 )
+_CODEX_LOCATION_MENU = (
+    "whereshouldthenewconversationrun", "whereshouldtheforkedconversationrun",
+    "usecurrentgitworktree", "keepusingthecurrentworkingdirectory", "createnewgitworktree",
+)
+_CODEX_FOOTER_HINT = ("?forshortcuts",)
 _WORKER_ENV = ("AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH", "OPENCODE_DISPATCH_SLUG",
                "FLEET_TITLE_REFRESH", "MEM_DISTILL")
 
 
 def codex_footer_threads(lines, *, current_id_only=False):
-    """Return complete thread UUIDs in the visible footer below Codex's prompt.
+    """Return thread UUIDs from the visible Codex footer.
 
-    A missing prompt or a UUID clipped by terminal width yields no match. Callers
-    decide whether multiple visible ids are ambiguous for their operation.
-    Pane binding consumes only the first native thread-id field; the broader
-    discovery form remains available to the existing peer clear observer.
+    Current identity is the whole UUID in the last native footer field, after a
+    composer/status/help-row layout. A hidden footer or a conversation-location
+    menu is unknown. Broad discovery remains available to non-ownership readers.
     """
     if not isinstance(lines, (list, tuple)):
         return set()
-    prompt = next((i for i in range(len(lines) - 1, -1, -1)
-                   if isinstance(lines[i], str) and lines[i].lstrip().startswith("›")), None)
+    cleaned = [_ANSI_ESCAPE_RE.sub("", line).replace("\r", "").replace("\u00a0", " ")
+               if isinstance(line, str) else "" for line in lines]
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    prompt = next((i for i in range(len(cleaned) - 1, -1, -1)
+                   if cleaned[i].lstrip().startswith("›")), None)
     if prompt is None:
         return set()
     if current_id_only:
-        first = next((line.strip() for line in lines[prompt + 1:]
-                      if isinstance(line, str) and line.strip()), "")
-        first_field = re.split(r"\s+[·|•]\s*", first, maxsplit=1)[0].strip()
-        match = _THREAD_ID_RE.fullmatch(first_field)
+        tail = [line.strip() for line in cleaned[prompt + 1:] if line.strip()]
+        flat = "".join("".join(cleaned[prompt + 1:]).split()).lower()
+        if (len(tail) != 2 or any(token in flat for token in _CODEX_LOCATION_MENU)
+                or not all(token in "".join(tail[-1].lower().split()) for token in _CODEX_FOOTER_HINT)):
+            return set()
+        status = tail[0]
+        last_field = status.rsplit("·", 1)[-1].strip()
+        match = _THREAD_ID_RE.fullmatch(last_field)
         return {match.group(0)} if match else set()
-    return {match.group(0) for line in lines[prompt + 1:] if isinstance(line, str)
+    return {match.group(0) for line in cleaned[prompt + 1:]
             for match in _THREAD_ID_RE.finditer(line)}
 
 

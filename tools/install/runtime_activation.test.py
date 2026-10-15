@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -566,12 +567,18 @@ class NativeContextLifecycleTest(unittest.TestCase):
                         backup.read_bytes() if backup.exists() else None)
 
     def test_codex_clean_home_leaves_no_config_or_backup(self):
-        self.assertEqual(self._lifecycle("codex"), (None, None))
+        import tomllib
+        config, backup = self._lifecycle("codex")
+        self.assertIsNotNone(config)
+        self.assertEqual(tomllib.loads(config.decode("utf-8"))["tui"]["status_line"][-1], "thread-id")
+        self.assertIsNone(backup)
 
     def test_codex_manual_window_survives_with_its_bytes(self):
         seed = b"# mine\nmodel_context_window = 800000\nmodel = \"x\"\n"
+        import tomllib
         config, backup = self._lifecycle("codex", seed)
-        self.assertEqual(config, seed)
+        self.assertTrue(config.startswith(seed))
+        self.assertEqual(tomllib.loads(config.decode("utf-8"))["tui"]["status_line"][-1], "thread-id")
         self.assertEqual(backup, seed)
 
     def test_claude_clean_home_drops_the_added_window(self):
@@ -818,6 +825,8 @@ class CodexIdentityConfigTest(unittest.TestCase):
         fragment.mkdir(parents=True)
         (fragment / "harness-identity.toml").write_bytes(
             (REPO_ROOT / "adapters/codex/config/harness-identity.toml").read_bytes())
+        (fragment / "tui-statusline.toml").write_bytes(
+            (REPO_ROOT / "adapters/codex/config/tui-statusline.toml").read_bytes())
         return release
 
     def _call(self, name, config: Path, *args):
@@ -855,6 +864,38 @@ class CodexIdentityConfigTest(unittest.TestCase):
             self.assertEqual(result["conflicts"], [])
             self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
             self._assert_clears_inherited(config)
+
+    def test_runtime_config_preparation_moves_thread_id_last_and_deactivation_keeps_it(self):
+        import tomllib
+        import native_context
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = self._release(root)
+            config = root / "home" / "config.toml"
+            original = ('[tui]\nstatus_line = ["project-name", "thread-id", "custom"]\n'
+                        'status_line_use_colors = false\n')
+            config.parent.mkdir(parents=True)
+            config.write_text(original, encoding="utf-8")
+            projection = {"native_context": {"codex": {}}, "report_lines": [],
+                          "pre_projection_exists": True,
+                          "pre_projection_bytes": original.encode("utf-8")}
+            with mock.patch.object(activation, "_config_path", return_value=config), \
+                 mock.patch.object(native_context, "project_context_window", return_value=projection):
+                changes = activation._prepare_runtime_config("codex", release, None)
+            self.assertTrue(changes[0]["tui_status_line_changed"])
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertIn(self.BEGIN, config.read_text(encoding="utf-8"))
+
+            state = {"managed_config": {"codex_identity": changes[0]["managed_config"]}}
+            with mock.patch.object(activation, "_config_path", return_value=config):
+                activation._unmerge_codex_identity_config(state, "global")
+            remaining = config.read_text(encoding="utf-8")
+            parsed = tomllib.loads(remaining)["tui"]
+            self.assertEqual(parsed["status_line"], ["project-name", "custom", "thread-id"])
+            self.assertIs(parsed["status_line_use_colors"], False)
+            self.assertNotIn(self.BEGIN, remaining)
 
     def test_native_window_restores_without_identity_record_and_deletes_created_file(self):
         with tempfile.TemporaryDirectory() as temporary:
