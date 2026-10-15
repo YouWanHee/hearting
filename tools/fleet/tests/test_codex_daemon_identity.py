@@ -33,9 +33,21 @@ class FakeDaemonWebSocket:
         self.loaded_fail = False
         self.calls = []
         self.closed = False
+        self.initialized = False
 
     def initialize(self):
+        # The live daemon refuses a second initialize on one connection.
+        if self.initialized:
+            raise OSError("Already initialized")
+        self.initialized = True
         self.calls.append(("initialize", {}))
+
+    def connect(self, _path, _timeout):
+        """Mirror codex_queue_delivery._connect: a fresh, already initialized connection."""
+        self.initialized = False
+        self.closed = False
+        self.initialize()
+        return self
 
     @staticmethod
     def _page(pages, params):
@@ -92,7 +104,7 @@ class CodexDaemonIdentityTest(unittest.TestCase):
         self._patches = [
             mock.patch.object(codex, "_control_socket", return_value=Path("/tmp/fake-codex.sock")),
             mock.patch.object(codex, "_control_socket_identity", return_value=self.socket_identity),
-            mock.patch("codex_queue_delivery._connect", return_value=self.client),
+            mock.patch("codex_queue_delivery._connect", side_effect=self.client.connect),
             mock.patch.object(codex, "_tcp_listener_snapshot", return_value=self.listener),
             mock.patch.object(codex, "_live_tui_start", return_value="778899"),
             mock.patch.object(procscan, "read_proc_start", return_value="778899"),

@@ -1285,7 +1285,7 @@ def _daemon_thread_origins(environ):
         connection = getattr(client, "socket", None)
         if connection is not None:
             connection.settimeout(min(_DAEMON_RPC_TIMEOUT, deadline - time.monotonic()))
-        client.initialize()
+        # _connect already initialized; the daemon refuses a second initialize.
         rows = _daemon_read_pages(client, "thread/loaded/list", {}, deadline,
                                   max_items=_DAEMON_MAX_THREADS)
         thread_ids = []
