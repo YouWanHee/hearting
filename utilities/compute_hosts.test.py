@@ -9,6 +9,7 @@ import io
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,66 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class ComputeRunLauncherIdentityTest(unittest.TestCase):
+    def test_registered_empty_codex_uses_parent_for_payload_lease_provenance_and_notify(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "dispatch" / "jobs.log"
+            jobs.parent.mkdir(parents=True)
+            attempt = "att-compute-owner"
+            route_id = "rt-compute-owner"
+            metadata = ",".join(("attempt_id=" + attempt, "worker_type=owner",
+                "dispatch_depth=1", "owner_route_id=" + route_id,
+                "owner_route_hash=sha256:compute-owner", "parent_sid=route-parent"))
+            jobs.write_text("\t".join(("2099-01-01T00:00:00Z", "done", "/work", "/work",
+                                      "owner", metadata)) + "\n", encoding="utf-8")
+            route_state = root / "route-chains"
+            parent_ledger = route_state / "claude" / "route-parent.jsonl"
+            parent_ledger.parent.mkdir(parents=True)
+            parent_ledger.write_text('{"event":"compose","sid":"route-parent"}\n', encoding="utf-8")
+            run_root = root / "runs"
+            observation = {"reachable": True, "gpus": [{"index": 0, "uuid": "GPU-zero",
+                "name": "NVIDIA Test GPU", "utilization_gpu_pct": 0,
+                "memory_used_mib": 0, "memory_total_mib": 24000, "processes": [],
+                "reservations": []}]}
+            receipt = {"gpus": ["0"], "gpu_lease": {"token": "remote-lease"}}
+            remote = mock.Mock(return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(receipt) + "\n", stderr=""))
+            args = SimpleNamespace(host="here", command=["python", "-c", "pass"],
+                name="resolver-fixture", cwd=None, env=None, gpus=None, share=False,
+                dry_run=False, json=True)
+            with mock.patch.dict(os.environ, {
+                    "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_JOBS": str(jobs),
+                    "AGENT_DISPATCH_ATTEMPT_ID": attempt, "AGENT_DISPATCH_DEPTH": "1",
+                    "AGENT_DISPATCH_CALLER_HARNESS": "codex", "CODEX_THREAD_ID": "",
+                    "CLAUDE_CODE_SESSION_ID": "inherited-worker-session",
+                    "XDG_STATE_HOME": str(root / "state-home"),
+                    "FLEET_ROUTE_CHAIN_DIR": str(route_state)}, clear=False), \
+                 mock.patch.object(module, "load_config", return_value={"run_root": run_root}), \
+                 mock.patch.object(module, "_select", return_value=[("here", {"ssh_host": "gpu.invalid"})]), \
+                 mock.patch.object(module, "_run_gpu_observation", return_value=observation), \
+                 mock.patch.object(module, "_launcher_provenance", return_value={
+                     "AGENT_HOME": str(ROOT), "AGENT_DISPATCH_ATTEMPT_ID": attempt}), \
+                 mock.patch.object(module, "_launcher_route", return_value={"route_id": route_id}), \
+                 mock.patch.object(module, "remote", remote), \
+                 mock.patch.object(module, "_spawn_completion_watch", return_value=False), \
+                 mock.patch("sys.stdout"):
+                self.assertEqual(module.cmd_run(args), 0)
+
+            launched = remote.call_args.args[1]
+            self.assertIn("export CLAUDE_CODE_SESSION_ID=route-parent", launched)
+            script = shlex.split(launched)[2]
+            self.assertIn("'owner': {'kind': 'session', 'harness': 'claude', 'id': 'route-parent'", script)
+            run_dirs = list(run_root.iterdir())
+            self.assertEqual(len(run_dirs), 1)
+            recorded = json.loads((run_dirs[0] / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(recorded["provenance"]["session"],
+                             {"harness": "claude", "id": "route-parent"})
+            self.assertEqual(recorded["provenance"]["notify"],
+                             {"harness": "claude", "id": "route-parent"})
 
 
 class SSHNamespacePrefixTest(unittest.TestCase):
@@ -1011,12 +1072,15 @@ class ComputeHostsTest(unittest.TestCase):
         }
         clean = {key: value for key, value in os.environ.items() if key not in identity_keys}
         gpu_pid_file = self.root / "claimed-gpu.pid"
+        child_code = ("import pathlib, subprocess, sys; "
+                      "gpu = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+                      "pathlib.Path(sys.argv[1]).write_text(str(gpu.pid)); gpu.wait()")
+        root_code = ("import os, subprocess, sys; "
+                     "child_env = {**os.environ, 'HEARTING_COMPUTE_RUN_ID': 'managed-run'}; "
+                     "child = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], "
+                     "env=child_env); child.wait()")
         process = subprocess.Popen(
-            [sys.executable, "-c", "import pathlib, subprocess, sys; "
-             "child = subprocess.Popen([sys.executable, '-c', "
-             "'import time; time.sleep(10)']); "
-             "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); child.wait()",
-             str(gpu_pid_file)],
+            [sys.executable, "-c", root_code, child_code, str(gpu_pid_file)],
             env={**clean, "CLAUDE_CODE_SESSION_ID": "previous-session"},
             start_new_session=True,
         )
@@ -1035,6 +1099,12 @@ class ComputeHostsTest(unittest.TestCase):
             claim = json.loads(claimed.stdout)
             self.assertEqual(claim["root_pid"], process.pid)
             self.assertEqual(claim["owner"]["label"], "codex:f11a0486")
+            outside_claimed = self.run_tool(
+                "claim", "here", str(os.getpid()), "--harness", "claude",
+                "--session", "outside-run-group", "--json",
+            )
+            self.assertEqual(outside_claimed.returncode, 0, outside_claimed.stderr)
+            outside_claim = json.loads(outside_claimed.stdout)
             # Without --harness/--session the launcher's own session is the owner.
             keys = {key for key, _harness in load_module().SESSION_ENV_KEYS}
             bare = {k: v for k, v in self.env.items() if k not in keys}
@@ -1053,7 +1123,7 @@ class ComputeHostsTest(unittest.TestCase):
                 **clean,
                 "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
                 "CLAIMED_GPU_PID": str(gpu_pid),
-                "HEARTING_OWNER_CLAIMS_JSON": json.dumps([claim]),
+                "HEARTING_OWNER_CLAIMS_JSON": json.dumps([claim, outside_claim]),
             }
             result = subprocess.run(
                 ["bash", "-c", module.PROBE_SCRIPT], text=True, capture_output=True,
@@ -1106,13 +1176,16 @@ class ComputeHostsTest(unittest.TestCase):
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=2)
 
-        owner = payload["gpus"][0]["processes"][0]["owner"]
-        self.assertEqual(owner["kind"], "session")
-        self.assertEqual(owner["label"], "codex:f11a0486")
-        self.assertEqual(owner["source"], "persistent-claim+ancestry")
-        self.assertEqual(payload["gpus"][0]["processes"][0]["session_owner"], owner)
+        process = payload["gpus"][0]["processes"][0]
+        owner = process["owner"]
+        self.assertEqual(owner["kind"], "run")
+        self.assertEqual(owner["id"], "managed-run")
+        session_owner = process["session_owner"]
+        self.assertEqual(session_owner["kind"], "session")
+        self.assertEqual(session_owner["label"], "codex:f11a0486")
+        self.assertEqual(session_owner["source"], "persistent-claim+ancestry")
         for rejected in (stale_payload, reused_payload):
-            rejected_owner = rejected["gpus"][0]["processes"][0]["owner"]
+            rejected_owner = rejected["gpus"][0]["processes"][0]["session_owner"]
             if rejected_owner is not None:
                 self.assertNotEqual(rejected_owner["source"], "persistent-claim+ancestry")
         for conflict in (conflict_payload, ancestry_payload):
@@ -1403,8 +1476,8 @@ class LauncherProvenanceTest(unittest.TestCase):
         self.assertIn(str(home.resolve()), result.stdout)
         self.assertIn("export AGENT_DISPATCH_ATTEMPT_ID=att-9f2c4b1ad34e",
                       result.stdout)
-        # Session identity keeps its existing independent path.
-        self.assertIn("export CODEX_THREAD_ID=launch-thread", result.stdout)
+        # Without dispatch depth, this attempt's session identity is unresolved.
+        self.assertNotIn("export CODEX_THREAD_ID=launch-thread", result.stdout)
         for canary in ("canary-secret", "canary-agent.sock", "canary-jobs.log",
                        "canary-arbitrary", "AWS_SECRET_ACCESS_KEY",
                        "SSH_AUTH_SOCK", "AGENT_DISPATCH_JOBS", "MY_ARBITRARY"):
@@ -1640,10 +1713,10 @@ class CompletionWatchTest(unittest.TestCase):
     def test_a_run_a_worker_starts_in_a_route_tells_the_routes_parent_session(self):
         module = load_module()
         jobs = self.root / "jobs.log"
-        jobs.write_text("now\tdone\t1\tparent\towner\tworker_type=owner,owner_route_id=rt-0123456789abcdef,"
-                        "parent_harness=claude,parent_sid=sid-parent\n")
+        jobs.write_text("")
         meta = {**self.meta, "provenance": {**self.meta["provenance"], "attempt_id": "att-worker-1",
-                                           "session": {"harness": "claude", "id": "sid-worker"}}}
+                                           "session": {"harness": "claude", "id": "sid-parent"},
+                                           "notify": {"harness": "claude", "id": "sid-parent"}}}
         spawned = []
         self.assertTrue(module._spawn_completion_watch(self.run_dir, meta, spawn=lambda argv, **kw: spawned.append(argv),
                                                        environ={"AGENT_DISPATCH_DEPTH": "2", "AGENT_DISPATCH_JOBS": str(jobs)}))
