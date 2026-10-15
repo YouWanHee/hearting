@@ -252,6 +252,13 @@ prove completion through the shared review classifier. Only a review admitted
 through the watchdog requires that watchdog's sealed process outcome; a missing
 watchdog outcome must not be imposed on an ordinary review. Foreground reviews
 retain their sealed exit result, and live or unobservable processes stay pending.
+For every non-owner foreground worker (stage, review, support, or frame), the
+launcher also samples activity and may seal `no-progress` after the optional
+`headless.no_progress_minutes` window (default 30 minutes; 0 disables it).
+This conservative activity check treats runtime/tool uncertainty as activity;
+owners and detached workers are outside its scope. The existing launch-origin
+4h default / 24h maximum remains the final hard deadline and retains cleanup
+authority.
 
 Each SD item below keeps the rule an agent acts on; its full decision record is verbatim in `core/ADAPTATION.md §8`.
 
@@ -466,14 +473,17 @@ a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
 
-For native Codex callbacks in a shared service, the foreground TUI's first
-full `thread-id` footer field provides the current `Thread.id`; `sessionId`
-remains its tree root. Two fresh samples share stable foreground PID/start/TTY
-and one unique endpoint/pane, also used for reporting, number lookup and title.
-Managed apply preserves other custom footer items. UUIDs elsewhere, callback
-or environment SID, cwd, title, inherited pane and shared ancestry alone remain
-hints. Missing, clipped, conflicting or stale observations stay unknown;
-registered workers have no foreground pane ownership.
+For native Codex callbacks in a shared service, exactly one `thread-id` is the
+last `[tui].status_line` item, and the complete UUID in the last visible native
+footer field provides the current `Thread.id`; `sessionId` remains its tree
+root. A UUID in an earlier field, title, transcript, or arbitrary screen text
+is not current identity. A missing, clipped, wrapped, partial, ambiguous, or
+hidden last field stays unknown. Two fresh samples share stable foreground
+PID/start/TTY and one unique endpoint/pane, also used for reporting, number
+lookup and title. Managed apply preserves every other custom footer item and
+its order. Callback or environment SID, cwd, title, inherited pane and shared
+ancestry alone remain hints; registered workers have no foreground pane
+ownership.
 
 For an unproven background caller, default `peer-steward start` locates the
 inherited pane's workspace by its live foreground directory in the caller's
@@ -1320,11 +1330,17 @@ related join-recovery; unrelated pending deliveries stay with the
 selector-less bulk `reconcile --apply` maintenance path.
 
 Progress is observed by the runtime from exact native tool identifiers and
-completion states, scoped file changes, and bounded verification leases.
-A quiet window creates a durable `no-progress` supervision notice, not a signal,
-failed row, or retry. The launcher's finite execution budget retains timeout and
-cleanup authority; progress recovery leaves a delayed success intact.
-Per-tool bookkeeping is runtime-owned. Optional heartbeats
+completion states, scoped file changes, and bounded verification leases. This
+strict observer progress supports supervision notices. Separately, the launcher
+uses a more permissive activity sample (attempt log/transcript changes, exact
+runtime tool CPU or new process identities, and an exact live verification
+lease) to stop a quiet non-owner foreground child after the optional
+`headless.no_progress_minutes` window (default 30; 0 disables it). Any activity
+or observation uncertainty keeps the child alive. A confirmed quiet window ends
+the child as `no-progress`; the launcher's finite execution budget remains the
+final hard timeout and cleanup authority. Owners and detached children are not
+covered by this foreground activity window. Progress recovery leaves a delayed
+success intact. Per-tool bookkeeping is runtime-owned. Optional heartbeats
 are work hints: test→tool is legal, and a terminal heartbeat cannot commit a
 successful result. Prose, log mtime, and repeated tool events grant no progress.
 Only declared sub-sessions receive the chain ledger/helper instructions.
@@ -1731,8 +1747,10 @@ idle pane shell's cwd before the agent starts. Any cwd or PATH bootstrap waits f
 observed final visible shell prompt, including Powerline, within the existing bound
 (seconds converted to native milliseconds). Readiness includes the native foreground
 shell; past screen prompts are not readiness. Unknown, busy, occupied, form, and native
-trust screens receive no typed input; native trust remains a human decision and is
-reported as a wait reason, separate from whether the process was started. A fresh
+trust screens receive no typed input; visible folder-trust and Codex hook-review forms
+report not-ready, retaining pending delivery for redelivery after closure. Unknown Codex
+prompt screens keep immediate typing. peer-steward observes forms without writing trust
+or selecting options; global runtime activation records hashes for Hearting's hooks. A fresh
 Codex start the steward launches runs Embedded (`--no-daemon`) unless the caller
 stated otherwise, so the new TUI owns its rollout fd and same-cwd simultaneous
 starts stay exactly attributable; time-candidate threads stay out of Embedded

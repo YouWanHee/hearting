@@ -688,6 +688,45 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
             self.assertNotEqual(peer_message.prepare_peer_message("original peer body", self.sender, changed, defer=True)[1], ref)
             self.assertNotIn(ref, [r["ref"] for r in peer_message.pending_messages(changed)])
 
+    def test_sidless_pending_stays_on_its_exact_pane_until_a_session_is_observed(self):
+        recipient = {"harness": "codex", "session_id": None, "name": "fresh",
+                     "pane_id": "w1:pX"}
+        text, ref = peer_message.prepare_peer_message(
+            "wait for folder choice", self.sender, recipient, defer=True)
+        row = peer_message._read_pending(ref)
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["to"], recipient)
+        self.assertIsNone(peer_message.pending_delivery_recipient(row))
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pOther"}))
+        bound = peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"})
+        self.assertEqual(peer_message.pending_delivery_recipient(bound), bound["bound_to"])
+        parsed = peer_message.parse_peer_trailer(
+            text, {"harness": "codex", "session_id": "new-thread"}, include_ref=True)
+        self.assertEqual(parsed["transfer_ref"], ref)
+        self.assertIsNone(peer_message.bind_pending_recipient(
+            ref, {"harness": "codex", "session_id": "different-thread", "pane_id": "w1:pX"}))
+
+    def test_no_trailer_pending_is_observed_as_queued_without_claiming_receiver_ack(self):
+        recipient = {"harness": "claude", "session_id": None, "name": "fresh",
+                     "pane_id": "w2:p1"}
+        text, ref = peer_message.prepare_peer_message(
+            "plain user message", self.sender, recipient, defer=True, with_trailer=False)
+        self.assertEqual(text, "plain user message")
+        row = peer_message._read_pending(ref)
+        self.assertTrue(row["no_trailer"])
+        bound = peer_message.bind_pending_recipient(
+            ref, {"harness": "claude", "session_id": "resolved-session", "pane_id": "w2:p1"})
+        claim = peer_message.claim_pending_herdr(ref, peer_message.pending_delivery_recipient(bound))
+        self.assertIsNotNone(claim)
+        self.assertTrue(peer_message.mark_pending_queued(ref))
+        current = peer_message._read_pending(ref)
+        self.assertEqual(current["state"], "queued")
+        self.assertIsNone(current.get("rpc_claim"))
+        self.assertIsNone(peer_message.parse_peer_trailer(text, {
+            "harness": "claude", "session_id": "resolved-session"}, include_ref=True))
+
     def test_actual_receive_once_and_replay_does_not_rewrite_notice(self):
         text, ref = self.pending()
         self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)

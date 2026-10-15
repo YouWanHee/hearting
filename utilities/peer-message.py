@@ -158,6 +158,22 @@ def _valid_transfer_endpoint(endpoint):
             and (name is None or isinstance(name, str)))
 
 
+def _valid_pane_bound_endpoint(endpoint):
+    """A deferred target with a proven pane/harness but no observed session yet."""
+    if (not isinstance(endpoint, dict)
+            or endpoint.get("harness") not in ("claude", "codex", "opencode")
+            or endpoint.get("session_id") is not None
+            or (endpoint.get("name") is not None and not isinstance(endpoint.get("name"), str))):
+        return False
+    pane = endpoint.get("pane_id")
+    return (isinstance(pane, str) and 0 < len(pane) <= 512
+            and not any(ord(ch) < 32 for ch in pane))
+
+
+def _valid_transfer_target(endpoint):
+    return _valid_transfer_endpoint(endpoint) or _valid_pane_bound_endpoint(endpoint)
+
+
 def _unknown_sender(endpoint):
     return (isinstance(endpoint, dict)
             and endpoint.get("harness") in ("claude", "codex", "opencode", "unknown", None)
@@ -170,7 +186,7 @@ def _valid_transfer_sender(endpoint):
     return _valid_transfer_endpoint(endpoint) or _unknown_sender(endpoint)
 
 
-def _prepare_peer_message(body, sender, recipient):
+def _prepare_peer_message(body, sender, recipient, *, include_trailer=True):
     """Seal a transmission intent before delivery (the receiver may run immediately).
 
     This immutable record shares the ledger's local write trust boundary; it is
@@ -178,8 +194,10 @@ def _prepare_peer_message(body, sender, recipient):
     Full identities live here, never in the generated display trailer.
     """
     ref = secrets.token_hex(16)
-    text = body.rstrip("\n") + "\n\n" + peer_trailer(
-        sender.get("harness"), sender.get("session_id"), sender.get("name"), transfer_ref=ref)
+    text = body.rstrip("\n")
+    if include_trailer:
+        text += "\n\n" + peer_trailer(
+            sender.get("harness"), sender.get("session_id"), sender.get("name"), transfer_ref=ref)
     record = {"schema_version": 1, "message_id": ref, "from": dict(sender),
               "to": dict(recipient), "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
     path = _transfer_path(ref)
@@ -234,10 +252,62 @@ def _pending_path(ref):
 def _pending_endpoint(endpoint, state, *, sender=False):
     if _valid_transfer_endpoint(endpoint) or (sender and _valid_transfer_sender(endpoint)):
         return True
+    if not sender and state in ("pending", "unverified", "queued", "received") \
+            and _valid_pane_bound_endpoint(endpoint):
+        return True
     return (state == "unverified" and isinstance(endpoint, dict)
             and endpoint.get("harness") in ("claude", "codex", "opencode", None)
             and endpoint.get("session_id") is None
             and (endpoint.get("name") is None or isinstance(endpoint.get("name"), str)))
+
+
+def pending_delivery_recipient(row):
+    """The exact session bound after a pane-only pending target becomes observable."""
+    if not isinstance(row, dict):
+        return None
+    bound = row.get("bound_to")
+    if _valid_transfer_endpoint(bound):
+        original = row.get("to") or {}
+        if (_valid_pane_bound_endpoint(original)
+                and bound.get("harness") == original.get("harness")
+                and bound.get("pane_id") == original.get("pane_id")):
+            return bound
+        return None
+    original = row.get("to")
+    return original if _valid_transfer_endpoint(original) else None
+
+
+def bind_pending_recipient(ref, recipient):
+    """Bind one SID-less pending message to the session observed on its same pane."""
+    if not _valid_transfer_endpoint(recipient):
+        return None
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        original = (row or {}).get("to") or {}
+        if not row or row.get("state") != "pending" or not _valid_pane_bound_endpoint(original):
+            return None
+        if (recipient.get("harness") != original.get("harness")
+                or recipient.get("pane_id") != original.get("pane_id")):
+            return None
+        bound = row.get("bound_to")
+        proposed = {"harness": recipient["harness"], "session_id": recipient["session_id"],
+                    "pane_id": original["pane_id"]}
+        if bound is not None and any(bound.get(key) != proposed[key]
+                                     for key in ("harness", "session_id", "pane_id")):
+            return None
+        updated = dict(row, bound_to=proposed)
+        _save_pending(updated)
+        return updated
+
+
+def _pending_target_matches(row, recipient):
+    target = pending_delivery_recipient(row)
+    if not target or not _valid_transfer_endpoint(recipient):
+        return False
+    if any(target.get(key) != recipient.get(key) for key in ("harness", "session_id")):
+        return False
+    original = row.get("to") or {}
+    return not _valid_pane_bound_endpoint(original) or target.get("pane_id") == original.get("pane_id")
 
 
 def _read_pending(ref):
@@ -264,6 +334,19 @@ def _read_pending(ref):
             or row.get("state") not in ("pending", "queued", "unverified", "received")
             or type(row.get("created")) not in (int, float) or not math.isfinite(row["created"])):
         raise ValueError("peer-pending-binding-invalid")
+    bound = row.get("bound_to")
+    original = row.get("to") or {}
+    if bound is not None and (not _valid_transfer_endpoint(bound)
+            or not _valid_pane_bound_endpoint(original)
+            or bound.get("harness") != original.get("harness")
+            or bound.get("pane_id") != original.get("pane_id")):
+        raise ValueError("peer-pending-recipient-binding-invalid")
+    if (_valid_pane_bound_endpoint(original) and row.get("state") in ("queued", "received")
+            and bound is None):
+        raise ValueError("peer-pending-recipient-binding-invalid")
+    no_trailer = row.get("no_trailer", False)
+    if type(no_trailer) is not bool:
+        raise ValueError("peer-pending-trailer-mode-invalid")
     text = row.get("text")
     if (not isinstance(row.get("refs"), list) or not all(isinstance(v, str) for v in row["refs"])
             or type(transfer.get("schema_version")) is not int or transfer["schema_version"] != 1
@@ -274,8 +357,13 @@ def _read_pending(ref):
             or hashlib.sha256(text.encode("utf-8")).hexdigest() != row["body_sha256"]):
         raise ValueError("peer-pending-body-invalid")
     if row["state"] != "received":
-        body, sep, _trailer = text.rpartition("\n\n(peer-from:")
-        if not sep or hashlib.sha256(body.encode("utf-8")).hexdigest() != row.get("source_sha256"):
+        if no_trailer:
+            source = text
+        else:
+            source, sep, _trailer = text.rpartition("\n\n(peer-from:")
+            if not sep:
+                raise ValueError("peer-pending-source-invalid")
+        if hashlib.sha256(source.encode("utf-8")).hexdigest() != row.get("source_sha256"):
             raise ValueError("peer-pending-source-invalid")
     binding = row.get("dispatch_notice")
     if binding is not None:
@@ -396,14 +484,24 @@ def pending_messages(recipient):
     return rows
 
 
-def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), receipt="target-form-open"):
+def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), receipt="target-form-open",
+                         with_trailer=True):
     """A retry reuses a pending intent; ordinary sends need no preparation lock."""
-    endpoints_verified = _valid_transfer_sender(sender) and _valid_transfer_endpoint(recipient)
+    endpoints_verified = (_valid_transfer_sender(sender)
+                          and (_valid_transfer_endpoint(recipient)
+                               or _valid_pane_bound_endpoint(recipient)))
     body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
+
+    def matches_target(row):
+        target = row.get("to") or {}
+        if _valid_pane_bound_endpoint(target):
+            return (target.get("harness") == recipient.get("harness")
+                    and target.get("pane_id") == recipient.get("pane_id"))
+        return all(target.get(key) == recipient.get(key) for key in ("harness", "session_id"))
 
     def existing():
         for row in _pending_rows():
-            if (all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id"))
+            if (matches_target(row)
                     and all(row["from"].get(k) == sender.get(k) for k in ("harness", "session_id"))
                     and (recipient.get("session_id") is not None or row["to"].get("name") == recipient.get("name"))
                     and (sender.get("session_id") is not None or row["from"].get("name") == sender.get("name"))
@@ -417,23 +515,44 @@ def prepare_peer_message(body, sender, recipient, *, defer=False, refs=(), recei
             found = existing()
         except (OSError, ValueError):
             found = None
-        return found or _prepare_peer_message(body, sender, recipient)
+        return found or _prepare_peer_message(body, sender, recipient, include_trailer=with_trailer)
     key = json.dumps([[e.get("harness"), e.get("session_id"),
-                       e.get("name") if e.get("session_id") is None else None]
+                       e.get("name") if e.get("session_id") is None else None, e.get("pane_id")]
                       for e in (sender, recipient)] + [body_hash], ensure_ascii=False)
     with pending_lock("prepare-" + hashlib.sha256(key.encode()).hexdigest()):
         found = existing()
         if found:
             return found
-        text, ref = _prepare_peer_message(body, sender, recipient)
+        text, ref = _prepare_peer_message(body, sender, recipient, include_trailer=with_trailer)
         if len(text.encode("utf-8")) > _PENDING_BYTES:
             raise ValueError("peer-pending-body-oversized")
         _save_pending({"schema_version": 1, "ref": ref, "from": dict(sender), "to": dict(recipient),
             "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "source_sha256": body_hash, "refs": list(refs), "created": time.time(),
             "state": "pending" if endpoints_verified else "unverified", "text": text,
+            "no_trailer": not with_trailer,
             "receipt": receipt if endpoints_verified else "peer-endpoint-unverified"})
         return text, ref
+
+
+def find_pending_peer_message(body, sender, recipient, *, with_trailer=True):
+    """Find an exact retry for a pending body without creating a new transfer."""
+    body_hash = hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest()
+    for row in _pending_rows():
+        target = row.get("to") or {}
+        same_target = (
+            target.get("harness") == recipient.get("harness")
+            and ((target.get("session_id") == recipient.get("session_id"))
+                 or (target.get("session_id") is None and target.get("pane_id")
+                     and target.get("pane_id") == recipient.get("pane_id")))
+        )
+        same_sender = all((row.get("from") or {}).get(key) == sender.get(key)
+                          for key in ("harness", "session_id"))
+        if (row.get("state") == "pending" and same_target and same_sender
+                and row.get("source_sha256") == body_hash
+                and bool(row.get("no_trailer", False)) == (not with_trailer)):
+            return row
+    return None
 
 
 def schedule_acceptance_reply(handoff_ref, sender, recipient):
@@ -485,7 +604,7 @@ def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
     with pending_lock(ref):
         row = _read_pending(ref)
         if (not row or row["state"] != "pending" or row.get("rpc_claim")
-                or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id"))):
+                or not _pending_target_matches(row, recipient)):
             return None
         if _registered_delivery_settled(row):
             return None
@@ -493,6 +612,17 @@ def claim_pending_herdr(ref, recipient, *, receipt="herdr-delivery-inflight"):
                  "start": process_start_ticks(os.getpid())}
         _save_pending(dict(row, state="unverified", receipt=receipt, rpc_claim=claim))
         return dict(row, rpc_claim=claim)
+
+
+def mark_pending_queued(ref, *, receipt="delivery-observed"):
+    """Record an observed no-trailer send without claiming a receiver ACK."""
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        if (not row or row.get("state") != "unverified" or not row.get("no_trailer")
+                or not row.get("rpc_claim")):
+            return False
+        _save_pending(dict(row, state="queued", rpc_claim=None, receipt=receipt))
+        return True
 
 
 def release_unsent_herdr_claim(row, *, receipt="target-form-open"):
@@ -520,9 +650,10 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             return {"status": "received", "reason": "exact-peer-ref"}
         if _registered_delivery_settled(row):
             return {"status": "not-required", "reason": "dispatch-notice-consumed"}
-        if not _valid_transfer_sender(row["from"]) or not _valid_transfer_endpoint(row["to"]):
+        recipient = pending_delivery_recipient(row)
+        if not _valid_transfer_sender(row["from"]) or not recipient:
             return {"status": "unverified", "reason": "peer-endpoint-unverified"}
-        if row["to"]["harness"] != "codex":
+        if recipient["harness"] != "codex":
             return {"status": "unsupported", "reason": "peer-native-queue-unavailable"}
         claim = row.get("rpc_claim")
         if claim:
@@ -542,7 +673,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
     error = None
     try:
         result = send_at_least_once(resolve_queue_socket(),
-            thread_id=row["to"]["session_id"], client_message_id="delivery-peer-" + ref,
+            thread_id=recipient["session_id"], client_message_id="delivery-peer-" + ref,
             message=row["text"], timeout=timeout, allow_restart=False,
             retry_ambiguous=False, allow_add=row["state"] == "pending", require_message_match=True,
             before_add=before_add)
@@ -563,10 +694,10 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             return {"status": "unverified", "reason": str(error)}
         if result["status"] == "consumed":
             # Native input consumption is a transport observation, not semantic understanding.
-            rc = 0 if _peer_notice_exists(ref, row["to"]) else cmd_record(argparse.Namespace(
+            rc = 0 if _peer_notice_exists(ref, recipient) else cmd_record(argparse.Namespace(
                 from_harness=row["from"].get("harness") or "unknown", from_session_id=row["from"].get("session_id") or "",
                 from_name=row["from"].get("name"), from_project="", to_harness="codex",
-                to_session_id=row["to"]["session_id"], to_name=None, kind="notice", surface="codex-queue",
+                to_session_id=recipient["session_id"], to_name=None, kind="notice", surface="codex-queue",
                 status="received", receipt="exact-native-history", ref=[ref, *row["refs"]],
                 transfer_ref=ref, body_file=None, body_stdin=False))
             if rc:
@@ -660,12 +791,22 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
         try:
             record = _read_transfer_record(ref)
             sender, target = record["from"], record["to"]
-            if (not _valid_transfer_sender(sender) or not _valid_transfer_endpoint(target)
+            target_matches = False
+            if _valid_transfer_endpoint(target):
+                target_matches = all(target.get(key) == recipient.get(key)
+                                     for key in ("harness", "session_id"))
+            elif _valid_pane_bound_endpoint(target):
+                pending = _read_pending(ref)
+                bound = pending_delivery_recipient(pending)
+                target_matches = bool(bound and bound.get("harness") == recipient.get("harness")
+                                      and bound.get("session_id") == recipient.get("session_id")
+                                      and bound.get("pane_id") == target.get("pane_id"))
+            if (not _valid_transfer_sender(sender) or not _valid_transfer_target(target)
                     or type(record.get("schema_version")) is not int or record["schema_version"] != 1
                     or record.get("message_id") != ref
                     or record.get("body_sha256") not in _arrived_body_digests(text, ref)
                     or (sender.get("harness") or "unknown") != result["harness"]
-                    or any(target.get(k) != recipient.get(k) for k in ("harness", "session_id"))):
+                    or not target_matches):
                 return result
             result.update(session_id=sender.get("session_id") or None, name=sender.get("name"))
             if include_ref:

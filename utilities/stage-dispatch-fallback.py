@@ -124,8 +124,8 @@ def outer_subprocess_timeout(
     parent blocks on its child, indefinite is never safe here, so the non-positive
     sentinel is clamped to a finite ceiling via ``bounded_foreground_timeout``
     (mirrored inside ``wait_foreground`` so the wrapper self-bounds too). A
-    no-progress watchdog that tells slow-but-progressing from wedged is the planned
-    follow-up. Boundary coverage: utilities/dispatch_liveness_matrix.test.py.
+    foreground launcher also samples worker activity; this outer bound remains
+    the hard fallback. Boundary coverage: utilities/dispatch_liveness_matrix.test.py.
     """
     if lifecycle != FOREGROUND_SCOPED:
         return direct_timeout

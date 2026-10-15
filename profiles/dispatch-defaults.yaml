@@ -39,6 +39,7 @@
 #       <canonical-topology-node-id>: <claude|codex|opencode|diverse>
 #   headless:
 #     claude_permission_mode: bypass   # bypass | allowlist
+#     no_progress_minutes: 30          # launcher quiet window; 0 disables; clamps to 0..1440
 #
 # The profile bands, quality-peer pairing and harness names below are
 # recommendations, not walls: a file that breaks one (a band naming a disabled
@@ -132,6 +133,7 @@ allocation:
 # `permission_mode_reason=`). Omitting the section selects `bypass`.
 headless:
   claude_permission_mode: bypass
+  no_progress_minutes: 30
 
 # SD-123: standard+ two-stage confirmation for the post-frame direction gate.
 # hybrid keeps the existing pre-plan notify plus the new post-frame gate;

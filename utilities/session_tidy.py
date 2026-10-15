@@ -80,7 +80,13 @@ COMPACT_CARD_BODY_MAX_BYTES = COMPACT_SUMMARY_MAX_BYTES + COMPACT_RECENT_MAX_BYT
 INJECTION_MAX_BYTES = 2400
 MEMORY_REFS_MAX = 8                 # "참고할 기억" (card layer B): records listed
 MEMORY_REFS_BYTES = 1200            # ... and the bytes their lines may take
-CARD_MIN_WHEN_BUNDLED = 900         # the card keeps at least this much room when B rides along
+CARD_FIRST_REPLY_GUIDANCE = (
+    "[첫 답] 이 카드로 이어받은 첫 답 맨 앞에, 도구 호출 전에, 사용자의 언어로 "
+    "'하던 일 · 남은 일 · 다음 할 일' 세 머리말을 써서 5줄 안팎 요약을 한 번 보여 준 뒤 "
+    "이어서 하세요. 사용자가 이어서하기 대신 다른 지시를 먼저 주면 요약을 생략하고 그 지시만 따르세요."
+)
+# Keep the previous body allowance when memory references ride along.
+CARD_MIN_WHEN_BUNDLED = 900 + len(CARD_FIRST_REPLY_GUIDANCE.encode("utf-8")) + 1
 NOTICE_MAX_BYTES = 500
 CARD_HISTORY_KEEP = 20
 LEDGER_FOLD_LINES = 500
@@ -1056,12 +1062,12 @@ def _ago(seconds: float) -> str:
 
 
 def build_card_injection(card: dict, card_path: Path, now: float, cap: int) -> str:
-    """Card text within ``cap`` UTF-8 bytes; header and the file path always survive."""
+    """Card text within ``cap`` UTF-8 bytes; guidance is part of the fixed header."""
     author = card.get("author") or {}
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(card.get("authored_at_epoch") or now)))
     header = (f"[세션 카드] 같은 자리에서 이어받는 작업 카드 — 작성 {stamp} "
               f"({_ago(now - float(card.get('authored_at_epoch') or now))}, {author.get('harness', '')} "
-              f"{str(author.get('sid', ''))[:8]})")
+              f"{str(author.get('sid', ''))[:8]})\n{CARD_FIRST_REPLY_GUIDANCE}")
     footer = f"카드 전문: {card_path}"
     cut_note = "…(이하 생략)"
     body = card.get("body", "")
@@ -1202,7 +1208,7 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             if handover is not None and (card_due or handed):
                 resume_text = handover.resume_line(seat, harness, sid)
                 used += len(resume_text.encode("utf-8")) + (1 if resume_text else 0)
-            room = INJECTION_MAX_BYTES - used
+            room = INJECTION_MAX_BYTES - used - 1  # reserve the CLI emitter's trailing newline
             memory_text = ""
             if memory_due:
                 wanted = build_memory_injection(memory, MEMORY_REFS_BYTES + 600)

@@ -677,6 +677,9 @@ def _ensure_pane_ingress(pane, kind, cwd=None):
         commands.append('export PATH="%s:$PATH"' % directory)
     line = " && ".join(commands)
     try:
+        block = _blocking_screen(kind, _read_screen(pane))
+        if block:
+            return block
         text = subprocess.run(_herdr_argv("pane", "send-text", pane, line),
                               capture_output=True, text=True, timeout=5)
         if text.returncode != 0:
@@ -1099,6 +1102,9 @@ def _export_opencode_tui_scoped(pane):
     line = ("export OPENCODE_TUI_CONFIG=${OPENCODE_TUI_CONFIG:-%s}"
             % shlex.quote(scoped))
     try:
+        block = _blocking_screen("opencode", _read_screen(pane))
+        if block:
+            return block
         text = subprocess.run(_herdr_argv("pane", "send-text", pane, line),
                               capture_output=True, text=True, timeout=5)
         if text.returncode != 0:
@@ -2435,11 +2441,22 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
     stopped = " stopped-background=" + json.dumps(tasks, ensure_ascii=False) if tasks else ""
     if _retire_foreground(pane, harness) != identity:
         return finish("foreground-changed", pending=True)
-    if _retire_background_dialog_lines(_read_screen(target)) is None:
-        return finish("agent-still-running", pending=True)
+    def observed_dialog():
+        current = _read_screen(target)
+        current_tasks = _retire_background_dialog_lines(current)
+        if current_tasks is not None:
+            return current_tasks, None
+        return None, _blocking_screen(harness, current)
+
+    current_tasks, screen_block = observed_dialog()
+    if current_tasks is None:
+        return finish(screen_block or "agent-still-running", pending=True)
     try:
         subprocess.run(_herdr_argv("pane", "send-text", pane, "1"),
                        capture_output=True, text=True, timeout=5)
+        current_tasks, screen_block = observed_dialog()
+        if current_tasks is None:
+            return finish(screen_block or "agent-still-running", pending=True)
         subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -2458,9 +2475,15 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
             return finish("normal-exit", True, handover=handover,
                           detail=(f"background-stopped:{stopped.strip()}") if stopped else None)
         time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    current_tasks, screen_block = observed_dialog()
+    if current_tasks is None:
+        return finish(screen_block or "agent-still-running", pending=True)
     try:
         subprocess.run(_herdr_argv("pane", "send-text", pane, "3"),
                        capture_output=True, text=True, timeout=5)
+        current_tasks, screen_block = observed_dialog()
+        if current_tasks is None:
+            return finish(screen_block or "agent-still-running", pending=True)
         subprocess.run(_herdr_argv("pane", "send-keys", pane, "enter"),
                        capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -3593,44 +3616,128 @@ def _settle(target, bound_ms=_PROMPT_SETTLE_MS):
 
 _FORM_TOKENS = ("esctocancel", "entertoselect", "entertoconfirm", "doyouwanttoproceed",
                 "tab/arrowkeys", "arrowkeystonavigate")
+_CODEX_LOCATION_TOKENS = (
+    "whereshouldthenewconversationrun", "whereshouldtheforkedconversationrun",
+    "usecurrentgitworktree", "keepusingthecurrentworkingdirectory", "createnewgitworktree",
+)
+_NATIVE_TRUST_TOKENS = {
+    "codex": ("trustthisfolder", "trustthisworkspace", "doyoutrustthisproject"),
+    "claude": ("trustthisfolder", "trustthisproject", "doyoutrustthecontentsofthisfolder"),
+    "opencode": ("trustthisfolder", "trustthisproject", "doyoutrustthisproject"),
+}
+
+
+def _blocking_screen(harness, lines, *, window=15):
+    """Return the existing wait reason for a visibly active native form.
+
+    Unknown/unreadable content is deliberately non-blocking. Codex's hook
+    review is recognized only as the standalone top-origin TUI view; quoted
+    transcript text and a composer following the quote are not a form.
+    """
+    if isinstance(lines, str):
+        lines = _screen_lines(lines)
+    if not isinstance(lines, (list, tuple)):
+        return None
+    rendered = []
+    for line in lines:
+        value = _plain(line) if isinstance(line, list) else str(line)
+        rendered.append(value.rstrip())
+    while rendered and not rendered[-1].strip():
+        rendered.pop()
+    meaningful = [line for line in rendered if line.strip()]
+    if not meaningful:
+        return None
+    flat_bottom = "".join("".join(meaningful[-window:]).split()).lower()
+    harness = str(harness or "").lower()
+    if harness == "codex":
+        normalized = ["".join(line.split()).lower() for line in meaningful]
+        title = normalized[0].strip("─━│╭╮╰╯┌┐└┘")
+        if title == "hooksneedreview" and len(normalized) > 1:
+            # This dialog owns the top of the cleared TUI. Its rows may wrap
+            # and may include progress/error text before the three options.
+            count = re.fullmatch(r"\d+hooks?(?:isnew|arenew)orchanged\.?", normalized[1])
+            option_rows = []
+            for index, row in enumerate(normalized[2:], start=2):
+                option_rows.append((index, re.sub(r"^(?:[❯›>])?(?:[123][.)])?", "", row)))
+            labels = ("reviewhooks", "trustallandcontinue", "continuewithouttrusting")
+            positions = []
+            cursor = 0
+            for label in labels:
+                found = next((i for i in range(cursor, len(option_rows))
+                              if option_rows[i][1].startswith(label)), None)
+                positions.append(found)
+                if found is not None:
+                    cursor = found + 1
+            if count and all(pos is not None for pos in positions):
+                third = positions[-1]
+                tail = "".join(row for _index, row in option_rows[third + 1:])
+                # Only the wrapped parenthetical and the native keymap footer
+                # may follow the final choice in the standalone view.
+                tail = tail.replace("(hookswon'trun)", "")
+                if (not tail or tail.startswith("won'trun)") or "entertoconfirm" in tail
+                        or "enterselect" in tail or "escskip" in tail):
+                    return "native-trust-wait"
+
+        # The /new and /fork picker is a bottom-pane popup that replaces the
+        # composer while open. A composer row (Codex `›`, or `❯`) below the
+        # title means the title is a transcript quote, not the live popup.
+        active_rows = normalized[-window:]
+        menu_choices = ("usecurrentgitworktree", "keepusingthecurrentworkingdirectory",
+                        "createnewgitworktree")
+
+        def composer_row(row):
+            return (row[:1] in ("›", "❯") and len(row) > 1
+                    and not any(choice in row for choice in menu_choices))
+
+        live_composer = composer_row(active_rows[-1])
+        location_title = next((i for i, row in enumerate(active_rows)
+                               if "whereshouldthenewconversation" in row
+                               or "whereshouldtheforkedconversation" in row), None)
+        if location_title is not None:
+            area_rows = active_rows[location_title:]
+            area = "".join(area_rows)
+            if (not any(composer_row(row) for row in area_rows[1:])
+                    and any(token in area for token in menu_choices)):
+                return "form-open"
+    else:
+        live_composer = False
+    if not live_composer and any(token in flat_bottom for token in _FORM_TOKENS):
+        return "form-open"
+    if any(token in flat_bottom for token in _NATIVE_TRUST_TOKENS.get(harness, ())):
+        return "native-trust-wait"
+    return None
+
+
+def _codex_location_menu(lines):
+    """Recognize Codex new/fork location forms after ANSI and line-wrap removal."""
+    if isinstance(lines, str):
+        lines = _screen_lines(lines)
+    if not isinstance(lines, (list, tuple)):
+        return False
+    flat = "".join("".join(_plain(line) if isinstance(line, list) else str(line)
+                          for line in lines).split()).lower()
+    return any(token in flat for token in _CODEX_LOCATION_TOKENS)
 
 
 def _form_open(target):
-    """True when the target's visible pane shows an open selection/permission
-    form (AskUserQuestion, permission prompt). Measured 2026-09-06: text
-    injected into such a form is lost and its `Enter` picks the form's
-    default answer -- the one injection path that silently destroys state.
-    herdr reports `blocked` for a normal-width pane; a narrow pane wraps the
-    footer words so the state stays `idle` (or `working` for a mid-turn
-    permission prompt), hence this whitespace-free scan of the whole visible
-    buffer, run for every state (review round 1, M3/minor 5)."""
+    """Compatibility wrapper for the shared observed-harness screen classifier."""
+    harness, _sid, _name = _resolve_target(target)
+    return _blocking_screen_for_target(target, harness) is not None
+
+
+def _blocking_screen_for_target(target, harness, *, window=15):
     try:
         proc = subprocess.run(_herdr_argv("agent", "read", target, "--source", "visible"),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())
     except (OSError, subprocess.SubprocessError):
-        return False
-    flat = "".join((proc.stdout or "").split()).lower()
-    return any(token in flat for token in _FORM_TOKENS)
+        return None
+    return _blocking_screen(harness, _screen_lines(proc.stdout or ""), window=window)
 
 
 def _bottom_form_tokens(target, window=15):
-    """Whether form tokens show in the bottom `window` screen lines.
-
-    A real form always renders at the bottom: even on a narrow pane its
-    wrapped footer words land in the trailing lines, and joining them
-    reassembles the tokens. Transcript quotes higher up never count. A quote
-    sitting in the bottom lines can still misfire, but that only delays the
-    send now (the flush redelivers later) instead of stranding it with no
-    redelivery (2026-10-07).
-    """
-    try:
-        proc = subprocess.run(_herdr_argv("agent", "read", target, "--source", "visible"),
-                              capture_output=True, text=True, timeout=_herdr_get_timeout())
-    except (OSError, subprocess.SubprocessError):
-        return False
-    lines = (proc.stdout or "").splitlines()[-window:]
-    flat = "".join("".join(lines).split()).lower()
-    return any(token in flat for token in _FORM_TOKENS)
+    """Compatibility wrapper for the shared classifier's trailing-row window."""
+    harness, _sid, _name = _resolve_target(target)
+    return _blocking_screen_for_target(target, harness, window=window) is not None
 
 
 def _prompt_form_open(target, state_before):
@@ -3642,11 +3749,10 @@ def _prompt_form_open(target, state_before):
     Any other state needs the tokens at the very bottom of the screen;
     transcript mentions of forms must not strand messages (2026-10-07).
     """
-    if state_before == "blocked":
+    harness, _sid, _name = _resolve_target(target)
+    if state_before == "blocked" and harness != "codex":
         return True
-    if state_before == "working":
-        return _form_open(target)
-    return _bottom_form_tokens(target)
+    return _blocking_screen_for_target(target, harness) is not None
 
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
@@ -3711,10 +3817,19 @@ def _prompt_input_reason(target, harness, state, *, expected_sid=None):
         return readiness.reason
     if readiness.reason.startswith("bound-registered-work") and readiness.state != "ready":
         return readiness.reason
+    if state == "blocked" and harness != "codex":
+        return "target-form-open"
+    if _blocking_screen_for_target(target, harness):
+        return "target-form-open"
+    if harness == "codex":
+        # Codex's exact native queue does not type into the pane. Read only to
+        # recognize a live choice/permission form; a blocked label alone must
+        # not turn the queue into the frontend draft path.
+        return "codex-native-queue" if state == "blocked" else None
     if _prompt_form_open(target, state):
         return "target-form-open"
     if harness not in {"claude", "opencode"}:
-        return None                 # Codex's existing queue path is unchanged.
+        return None
     lines = _read_screen(target)
     if lines is None:
         return "target-draft-unknown"
@@ -3825,11 +3940,16 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
     Never raises; failures print to stderr and leave rows for a later prompt.
     """
     stuck = []
+    if t_sid in (None, "", "-"):
+        return 0, stuck
     try:
         rows = [row for row in peer_message._pending_rows()
                 if row.get("state") == "pending"
                 and (row.get("to") or {}).get("harness") == t_harness
-                and (row.get("to") or {}).get("session_id") == t_sid]
+                and ((row.get("to") or {}).get("session_id") == t_sid
+                     or ((row.get("to") or {}).get("session_id") is None
+                         and expected_pane
+                         and (row.get("to") or {}).get("pane_id") == expected_pane))]
     except (OSError, ValueError):
         print("pending-flush-failed target=%s reason=pending-unreadable" % target, file=sys.stderr)
         return 0, stuck
@@ -3853,7 +3973,7 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
     flushed = 0
     if t_harness == "codex":
         return flushed, stuck
-    recipient = {"harness": t_harness, "session_id": t_sid}
+    recipient = {"harness": t_harness, "session_id": t_sid, "pane_id": expected_pane}
     rows.sort(key=lambda row: row.get("created") or 0)
     for row in rows[:_FLUSH_MAX_ROWS]:
         ref = row.get("ref")
@@ -3876,6 +3996,10 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
                 _current_state, current_ident, _code, _reason = _retire_target(target)
                 if current_ident.get("pane") != expected_pane:
                     break
+            if peer_message._valid_pane_bound_endpoint(row.get("to")):
+                row = peer_message.bind_pending_recipient(ref, recipient)
+                if row is None:
+                    continue
             row = peer_message.claim_pending_herdr(ref, recipient)
             if row is None:
                 continue
@@ -3898,6 +4022,12 @@ def _flush_pending_for_target(target, t_harness, t_sid, entry_state, skip=None,
             else:
                 continue
             if outcome == "true":
+                if row.get("no_trailer"):
+                    ack = peer_message.mark_pending_queued(
+                        ref, receipt="herdr-redelivery-observed:" + observed)
+                    if ack:
+                        flushed += 1
+                    continue
                 ack = peer_message.receive_peer_message(
                     text, recipient, summary_text="herdr redelivery observed: " + observed)
                 current = peer_message._read_pending(ref)
@@ -4002,13 +4132,30 @@ def _resume_message_obligation(duty, store):
     try:
         state, ident, _code, reason = _retire_target(target or recipient.get("name") or "")
         expected_pane = identity.get("pane") or ""
+        pane_bound = peer_message._valid_pane_bound_endpoint(recipient)
         if (reason or ident.get("harness") != recipient.get("harness")
-                or ident.get("session_id") != recipient.get("session_id")
-                or (expected_pane and ident.get("pane") != expected_pane)):
+                or (expected_pane and ident.get("pane") != expected_pane)
+                or (not pane_bound and ident.get("session_id") != recipient.get("session_id"))):
             store.update(duty["id"], state="unknown",
                          observation={"ref": ref, "reason": reason or "target-identity-changed",
                                       "observed_pane": ident.get("pane", "")})
             return
+        if pane_bound:
+            observed_sid = ident.get("session_id")
+            if observed_sid in (None, "", "-"):
+                store.update(duty["id"], state="pending",
+                             observation={"ref": ref, "reason": "target-session-unresolved",
+                                          "observed_pane": ident.get("pane", "")})
+                return
+            bound = peer_message.bind_pending_recipient(
+                ref, {"harness": recipient["harness"], "session_id": observed_sid,
+                      "pane_id": expected_pane or recipient.get("pane_id")})
+            if bound is None:
+                store.update(duty["id"], state="unknown",
+                             observation={"ref": ref, "reason": "target-identity-changed",
+                                          "observed_pane": ident.get("pane", "")})
+                return
+            recipient = peer_message.pending_delivery_recipient(bound)
         readiness = _pane_readiness(target, state,
                                     expected_harness=recipient.get("harness"),
                                     expected_sid=recipient.get("session_id"), purpose="input")
@@ -4018,6 +4165,11 @@ def _resume_message_obligation(duty, store):
                              observation={"ref": ref, "reason": readiness.reason,
                                           "state": readiness.state})
                 return
+        if _prompt_form_open(target, state):
+            store.update(duty["id"], state="pending",
+                         observation={"ref": ref, "reason": "target-form-open",
+                                      "state": state, "pane": expected_pane})
+            return
         if recipient.get("harness") == "codex":
             peer_message.deliver_pending_codex(ref, timeout=0.25)
         elif state in {"idle", "done", "working"}:
@@ -4347,18 +4499,35 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
         flushed, _stuck = _flush_pending_for_target(
             args.target, t_harness, t_sid, state_before,
             skip=(hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest(),
-                  from_harness, from_sid))
-    if not args.no_trailer:
+                  from_harness, from_sid), expected_pane=target_pane)
+    recipient = {"harness": t_harness, "session_id": peer_message.usable_session_id(t_sid),
+                 "name": _t_name}
+    pane_bound_defer = input_reason in {"target-form-open", "target-draft", "target-draft-unknown"}
+    if target_pane and (not input_reason or pane_bound_defer):
+        recipient["pane_id"] = target_pane
+    can_persist_sidless = t_harness in {"claude", "codex", "opencode"} and bool(target_pane)
+    if not args.no_trailer or (input_reason and can_persist_sidless) or on_prepared is not None:
         try:
             text, transfer_ref = peer_message.prepare_peer_message(
                 body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
-                {"harness": t_harness, "session_id": t_sid, "name": _t_name},
+                recipient,
                 defer=bool(input_reason) or on_prepared is not None,
-                refs=args.ref, receipt=input_reason or "target-form-open")
+                refs=args.ref, receipt=input_reason or "target-form-open",
+                with_trailer=not args.no_trailer)
             if on_prepared is not None:
                 on_prepared(transfer_ref)
         except (OSError, ValueError):
             print("prompted=unverified reason=peer-pending-or-transfer-unavailable")
+            return 5
+    elif not input_reason:
+        try:
+            pending_retry = peer_message.find_pending_peer_message(
+                body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
+                recipient, with_trailer=False)
+            if pending_retry:
+                text, transfer_ref = pending_retry["text"], pending_retry["ref"]
+        except (OSError, ValueError):
+            print("prompted=unverified reason=peer-pending-unavailable")
             return 5
     first = body.strip().splitlines()[0] if body.strip() else ""
     kind = "steer"
@@ -4377,41 +4546,72 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     except (OSError, ValueError):
         print("prompted=unverified reason=peer-pending-unavailable")
         return 5
-    if pending and not t_sid and not input_reason:
-        # Private delivery is SID-bound: a receivable target with no session
-        # yet (a fresh Codex before its first input) takes the typed send, even
-        # when a retry reused a row an earlier deferral left unaddressable.
-        pending = None
+    if pending and t_sid in (None, "", "-") and not input_reason:
+        if peer_message._valid_pane_bound_endpoint(pending.get("to")):
+            input_reason = "target-session-unresolved"
+        else:
+            # A fresh pane without a deferred SID-less row keeps the established
+            # first-input path; no unresolved transfer is retargeted to it.
+            pending = None
     surface = "herdr"
     claimed = None
-    if pending and t_harness != "codex" and not input_reason:
+    if (pending and t_harness != "codex" and not input_reason
+            and not peer_message._valid_pane_bound_endpoint(pending.get("to"))):
         try:
             claimed = peer_message.claim_pending_herdr(
                 transfer_ref, {"harness": t_harness, "session_id": t_sid})
         except (OSError, ValueError):
             claimed = None
-    if t_harness in {"claude", "opencode"} and not input_reason:
+    if t_harness in {"claude", "codex", "opencode"} and not input_reason:
         # Preparation/claim may take time: the final read belongs after them.
         input_reason = _prompt_input_reason(args.target, t_harness, state_before, **input_options)
         if input_reason:
             if claimed is not None:
                 peer_message.release_unsent_herdr_claim(claimed, receipt=input_reason)
                 claimed = None
-            if not args.no_trailer and pending is None:
+            if pending is None and (not args.no_trailer or can_persist_sidless):
                 try:
                     text, transfer_ref = peer_message.prepare_peer_message(
                         body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
-                        {"harness": t_harness, "session_id": t_sid, "name": _t_name},
-                        defer=True, refs=args.ref, receipt=input_reason)
+                        recipient, defer=True, refs=args.ref, receipt=input_reason,
+                        with_trailer=not args.no_trailer)
                     if on_prepared is not None:
                         on_prepared(transfer_ref)
                     pending = peer_message._read_pending(transfer_ref)
                 except (OSError, ValueError):
                     print("prompted=unverified reason=peer-pending-unavailable")
                     return 5
+    if pending and peer_message._valid_pane_bound_endpoint(pending.get("to")) and not input_reason:
+        if t_sid in (None, "", "-"):
+            input_reason = "target-session-unresolved"
+        else:
+            final_harness, final_sid, _final_name = _resolve_target(args.target)
+            final_state, final_pane = _agent_state(args.target)
+            final_reason = _prompt_input_reason(
+                args.target, t_harness, final_state,
+                expected_sid=t_sid if expected_recipient is not None else None)
+            if (final_harness, final_sid, final_pane) != (t_harness, t_sid, target_pane):
+                input_reason = "target-identity-changed"
+            elif final_reason:
+                input_reason = final_reason
+            else:
+                bound = peer_message.bind_pending_recipient(transfer_ref, recipient)
+                if bound is None:
+                    input_reason = "target-identity-changed"
+                else:
+                    pending = bound
+    if (pending and t_harness != "codex" and not input_reason
+            and peer_message._valid_pane_bound_endpoint(pending.get("to"))):
+        try:
+            claimed = peer_message.claim_pending_herdr(
+                transfer_ref, {"harness": t_harness, "session_id": t_sid, "pane_id": target_pane})
+        except (OSError, ValueError):
+            claimed = None
+        if claimed is not None:
+            pending = claimed
     if pending and pending.get("state") == "pending" and (input_reason or on_prepared is not None):
         _schedule_message_obligation(pending, args.target, target_pane)
-    if pending and t_harness == "codex":
+    if pending and t_harness == "codex" and input_reason in (None, "codex-native-queue"):
         surface = "codex-queue"
         try:
             result = peer_message.deliver_pending_codex(transfer_ref)
@@ -4464,9 +4664,13 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                 else:
                     outcome = "failed"
     if claimed is not None and outcome == "true" and not args.no_verify:
-        peer_message.receive_peer_message(
-            text, {"harness": t_harness, "session_id": t_sid},
-            summary_text="herdr send observed: " + verify)
+        if claimed.get("no_trailer"):
+            peer_message.mark_pending_queued(
+                transfer_ref, receipt="herdr-send-observed:" + verify)
+        else:
+            peer_message.receive_peer_message(
+                text, {"harness": t_harness, "session_id": t_sid},
+                summary_text="herdr send observed: " + verify)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     ledger_status = _PROMPT_LEDGER_STATUS[outcome]
     # SD-122 (11): one ledger row per send, whatever happened -- target pane,
@@ -4609,8 +4813,7 @@ def _opencode_left_text(body):
 def _screen_ready(harness, lines):
     """None when the visible screen shows no selection/permission form and an empty input box,
     else the reason (`form-open`, `draft`, `draft-unknown`)."""
-    flat = "".join("".join(_plain(c) for c in lines).split()).lower()
-    if any(token in flat for token in _FORM_TOKENS):
+    if _blocking_screen(harness, lines):
         return "form-open"
     draft = _draft_state(harness, lines)
     if draft == "nonempty":
@@ -4621,9 +4824,9 @@ def _screen_ready(harness, lines):
 
 
 def _codex_footer_threads(lines):
-    """Shared native footer parser used by clear observation and pane ownership."""
+    """Strict current-footer identity shared by clear observation and pane ownership."""
     from pane_ownership import codex_footer_threads
-    return codex_footer_threads([_plain(cells) for cells in lines])
+    return codex_footer_threads([_plain(cells) for cells in lines], current_id_only=True)
 
 
 def _codex_rollout_exists(thread_id):
@@ -4649,15 +4852,7 @@ def _read_screen(target):
 
 def _native_trust_reason(harness, lines):
     """Name an observed native folder trust screen without interacting with it."""
-    if not lines:
-        return None
-    flat = "".join("".join(_plain(line) for line in lines).split()).lower()
-    patterns = {
-        "codex": ("trustthisfolder", "trustthisworkspace", "doyoutrustthisproject"),
-        "claude": ("trustthisfolder", "trustthisproject", "doyoutrustthecontentsofthisfolder"),
-        "opencode": ("trustthisfolder", "trustthisproject", "doyoutrustthisproject"),
-    }
-    return "native-trust-wait" if any(token in flat for token in patterns.get(harness, ())) else None
+    return "native-trust-wait" if _blocking_screen(harness, lines) == "native-trust-wait" else None
 
 
 def _process_session(pane, harness):
@@ -4823,6 +5018,12 @@ def _clear_observe(target, req, request_path, before_threads=()):
     naming a new thread (its start hook only runs with the first message), OpenCode's home."""
     old = req.get("sid")
     for round_no in range(_CLEAR_OBSERVE_ROUNDS):
+        if req.get("harness") == "codex":
+            menu_lines = _read_screen(target)
+            if menu_lines is not None and _blocking_screen(req.get("harness"), menu_lines):
+                if round_no + 1 < _CLEAR_OBSERVE_ROUNDS:
+                    _run_herdr_wait(target, ["working", "blocked"], _CLEAR_OBSERVE_SETTLE_MS)
+                continue
         held = _read_json(Path(request_path))
         seen = (held or {}).get("observed") or {}
         if seen.get("sid") and seen.get("sid") != old:
@@ -5039,8 +5240,7 @@ def _continue_look(target, req):
     if lines is None:
         return "screen-unknown"
     if harness == "opencode":
-        flat = "".join("".join(_plain(c) for c in lines).split()).lower()
-        if any(token in flat for token in _FORM_TOKENS):
+        if _blocking_screen(harness, lines):
             return "form-open"
         draft = _draft_state(harness, lines)
         if draft == "nonempty":

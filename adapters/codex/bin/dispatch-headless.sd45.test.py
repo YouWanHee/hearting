@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,importlib.util,io,json,os,subprocess,sys,tempfile,types,unittest
+import argparse,ast,importlib.util,io,json,os,subprocess,sys,tempfile,types,unittest
 import uuid
 from contextlib import redirect_stdout
 from contextlib import ExitStack
@@ -1352,6 +1352,19 @@ class CodexFrameCapacityDowngrade(unittest.TestCase):
 
     def test_an_undeclared_top_profile_is_refused_without_a_claim_or_launch(self):
         self.flow(self).run_undeclared_profile()
+
+
+class ForegroundActivityWiring(unittest.TestCase):
+    def test_both_foreground_branches_receive_shared_activity_context(self):
+        source = Path(__file__).with_name("dispatch-headless.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "wait_foreground"]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(any(k.arg == "activity_context" for k in call.keywords) for call in calls))
+        self.assertIn('if args.launch_lifecycle == FOREGROUND_SCOPED and args.worker_type != "owner":\n            try:\n                from foreground_activity import build_activity_context', source)
+        self.assertEqual(source.count('build_activity_context('), 1)
+        self.assertIn('worker_type=args.worker_type, harness="codex"', source)
 
 
 if __name__=="__main__": unittest.main()

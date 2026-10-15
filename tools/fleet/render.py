@@ -6264,8 +6264,7 @@ def _gpu_session_label(owner, sessions=None, display_snapshot=None):
     key = _gpu_session_key(owner)
     if key is None:
         return "미귀속", "미귀속"
-    session = next((s for s in sessions or ()
-                    if (getattr(s, "harness", None), getattr(s, "session_id", None)) == key), None)
+    session = next((s for s in sessions or () if key in _gpu_session_keys(s)), None)
     name = ""
     if session is not None:
         for candidate in (getattr(session, "runtime_name", None),

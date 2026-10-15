@@ -40,6 +40,7 @@ import projector
 import retired_memory_state
 import safe_fs
 import user_model_config
+import codex_tui_config
 
 
 RUNTIMES = ("claude", "codex", "opencode")
@@ -1188,12 +1189,20 @@ def _is_harness_npm_plugin(value: str) -> bool:
 def _config_path(runtime: str, scope: str, *parts: str) -> Path:
     path = paths.runtime_home(runtime, scope).joinpath(*parts)
     _ensure_runtime_destination(runtime, path, scope)
-    if path.is_symlink():
+    if path.is_symlink() and not (runtime == "codex" and parts == ("config.toml",)):
         raise ActivationError(f"runtime config must not be a symlink: {path}")
     return path
 
 
 def _ensure_owned_destination(runtime: str, dest: Path, scope: str) -> None:
+    if runtime == "codex":
+        config = paths.runtime_home(runtime, scope) / "config.toml"
+        if config.is_symlink():
+            try:
+                if dest == config.resolve(strict=False):
+                    return
+            except (OSError, RuntimeError) as exc:
+                raise ActivationError(f"cannot resolve Codex config target: {config}: {exc}") from exc
     _ensure_runtime_destination(runtime, dest, scope)
 
 
@@ -1925,6 +1934,17 @@ def _atomic_text(path: Path, text: str, mode: Optional[int] = None) -> None:
         raise
 
 
+def _atomic_codex_config_text(path: Path, text: str, mode: Optional[int] = None) -> None:
+    """Atomically update Codex's resolved config target without replacing its link."""
+    try:
+        write_path = path.resolve(strict=False) if path.is_symlink() else path
+    except (OSError, RuntimeError) as exc:
+        raise ActivationError(f"cannot resolve Codex config target: {path}: {exc}") from exc
+    if path.is_symlink() and not write_path.parent.is_dir():
+        raise FileNotFoundError(f"Codex config target directory is missing: {write_path.parent}")
+    _atomic_text(write_path, text, mode)
+
+
 def _merge_codex_identity_config(
     active_root: Path, previous: Optional[dict], scope: str = "global", *,
     pre_projection_exists: bool | None = None, pre_projection_bytes: bytes | None = None,
@@ -2017,7 +2037,7 @@ def _merge_codex_identity_config(
             backup = config.with_name(CODEX_IDENTITY_BACKUP)
             if not backup.exists():
                 _atomic_text(backup, backup_original)
-        _atomic_text(config, final_text)
+        _atomic_codex_config_text(config, final_text)
     if identity_inserted is not None or feature_record is not None:
         result["managed_config"] = {"inserted": identity_inserted, "feature": feature_record}
     return result
@@ -2061,6 +2081,10 @@ def _unmerge_codex_identity_config(
     except (OSError, UnicodeDecodeError):
         return []
     remaining = _codex_feature_remove(text, feature)
+    try:
+        remaining = codex_tui_config.restore_status_line_text(remaining, managed.get("codex_tui"))
+    except codex_tui_config.CodexTuiConfigError:
+        pass
     block_removed = isinstance(inserted, str) and bool(inserted) and remaining.count(inserted) == 1
     if block_removed:
         remaining = remaining.replace(inserted, "", 1)
@@ -2069,6 +2093,15 @@ def _unmerge_codex_identity_config(
         remaining = restored.decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         remaining = remaining
+    trust_record = managed.get("codex_hook_trust") if isinstance(managed, dict) else None
+    if trust_record:
+        try:
+            import codex_hook_trust
+            remaining, trust_reports = codex_hook_trust.restore_trust_text(remaining, trust_record)
+            for line in trust_reports:
+                print(line, file=sys.stderr)
+        except (ImportError, ValueError) as exc:
+            print(f"Codex hook trust restore skipped: {str(exc).splitlines()[0][:180]}", file=sys.stderr)
     backup = config.with_name(CODEX_IDENTITY_BACKUP)
     if valid_native and isinstance(codex_native.get("file_created"), bool):
         created_by_activation = codex_native["file_created"]
@@ -2080,23 +2113,27 @@ def _unmerge_codex_identity_config(
         created_by_activation = block_removed and not backup.exists()
     changed = remaining.encode("utf-8") != original_bytes
     removed_file = not remaining.strip() and created_by_activation
+    try:
+        write_path = config.resolve(strict=False) if config.is_symlink() else config
+    except (OSError, RuntimeError) as exc:
+        raise ActivationError(f"cannot resolve Codex config target: {config}: {exc}") from exc
     if not dry_run:
         if removed_file:
             try:
-                with safe_fs.TargetLock(config):
-                    current = safe_fs.capture_state(config, include_payload=True)
+                with safe_fs.TargetLock(write_path):
+                    current = safe_fs.capture_state(write_path, include_payload=True)
                     if (current.kind != "file" or current.payload != original_bytes
-                            or os.lstat(config).st_nlink != 1):
+                            or os.lstat(write_path).st_nlink != 1):
                         return []
-                    auth = safe_fs.authority(config, owner="runtime-deactivate:codex-config",
-                                             allowed_paths=(config,), allow_leaf_symlink=False,
+                    auth = safe_fs.authority(write_path, owner="runtime-deactivate:codex-config",
+                                             allowed_paths=(write_path,), allow_leaf_symlink=False,
                                              expected=current)
                     safe_fs.remove_exact(auth, expected=current)
             except safe_fs.SafetyError as exc:
                 raise ActivationError(str(exc)) from exc
         elif changed:
             try:
-                _publish(config, remaining.encode("utf-8"),
+                _publish(write_path, remaining.encode("utf-8"),
                          owner="runtime-deactivate:codex-native-context", source=original_bytes)
             except ValueError as exc:
                 raise ActivationError(str(exc)) from exc
@@ -2271,7 +2308,15 @@ def _activation_protected_paths(runtime: str, scope: str = "global") -> List[Pat
     if runtime == "claude":
         paths_owned.append(_config_path(runtime, scope, "settings.json"))
     elif runtime == "codex":
-        paths_owned.append(_config_path(runtime, scope, "config.toml"))
+        config = _config_path(runtime, scope, "config.toml")
+        paths_owned.append(config)
+        if config.is_symlink():
+            try:
+                target = config.resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise ActivationError(f"cannot resolve Codex config target: {config}: {exc}") from exc
+            if target != config:
+                paths_owned.append(target)
         paths_owned.append(_config_path(runtime, scope, CODEX_IDENTITY_BACKUP))
     return paths_owned
 
@@ -2308,6 +2353,19 @@ def _prepare_runtime_config(
             pre_projection_bytes=projected.get("pre_projection_bytes"),
             file_created=codex_record.get("file_created") if isinstance(codex_record, dict) else None,
         )
+        config = _config_path("codex", scope, "config.toml")
+        fragment = active_root / "adapters" / "codex" / "config" / "tui-statusline.toml"
+        try:
+            original = config.read_text(encoding="utf-8") if config.exists() else ""
+            updated = codex_tui_config.merge_status_line_from_fragment(original, fragment)
+            prior_tui = (previous.get("managed_config") or {}).get("codex_tui") if previous else None
+            result["tui_record"] = codex_tui_config.status_line_record(original, updated, prior_tui)
+            if updated != original:
+                _atomic_codex_config_text(config, updated)
+            result["tui_status_line_changed"] = updated != original
+        except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
+            result.setdefault("conflicts", []).append("tui.status_line")
+            result["tui_status_line_detail"] = str(exc)
         result.setdefault("report_lines", []).extend(projected["report_lines"])
         result["context_projection"] = projected
         result["native_context"] = native
@@ -2849,10 +2907,7 @@ def _activation_owned_paths(
     if runtime == "claude":
         destinations.append(_config_path(runtime, scope, "settings.json"))
     elif runtime == "codex":
-        destinations.extend((
-            _config_path(runtime, scope, "config.toml"),
-            _config_path(runtime, scope, CODEX_IDENTITY_BACKUP),
-        ))
+        destinations.extend(_activation_protected_paths(runtime, scope)[1:])
 
     discovery: set[Path] = set()
     for root in roots:
@@ -3258,11 +3313,26 @@ def activate(
     context_report_lines: List[str] = []
 
     def commit_state(owned):
+        local_hook_trust_record = None
         config_changes = _prepare_runtime_config(runtime, active_root, previous, scope,
                                                  native_locked=True)
         for change in config_changes:
             context_report_lines.extend(change.get("report_lines", []))
         previous_managed = (previous or {}).get("managed_config", {})
+        if runtime == "codex" and scope == "global":
+            try:
+                import codex_hook_trust
+                prior_trust = previous_managed.get("codex_hook_trust") if isinstance(previous_managed, dict) else None
+                hooks_file = active_root / "adapters/codex/hooks/hooks.json"
+                trust_result = codex_hook_trust.record_managed_trust(
+                    paths.runtime_home("codex", scope), hooks_file, prior_trust
+                )
+                local_hook_trust_record = trust_result.get("record")
+                context_report_lines.extend(trust_result.get("report_lines", []))
+            except Exception as exc:
+                context_report_lines.append(
+                    f"Codex hook trust skipped: {str(exc).splitlines()[0][:180]}"
+                )
         previous_native = previous_managed.get("native_context", {}) if isinstance(previous_managed, dict) else {}
         native_context = dict(previous_native) if isinstance(previous_native, dict) else {}
         projected_native = next((change.get("native_context") for change in config_changes
@@ -3330,6 +3400,10 @@ def activate(
                     ),
                     None,
                 ),
+                "codex_tui": next(
+                    (change["tui_record"] for change in config_changes if "tui_record" in change),
+                    (previous.get("managed_config") or {}).get("codex_tui") if previous else None,
+                ),
                 "opencode_tui": next(
                     (
                         change.get("managed_config")
@@ -3348,6 +3422,9 @@ def activate(
                     [],
                 ),
                 "model_config": model_config_action,
+                "codex_hook_trust": local_hook_trust_record or (
+                    previous_managed.get("codex_hook_trust") if isinstance(previous_managed, dict) else None
+                ),
             },
             "replaced_installer_symlink_targets": replaced_installer_symlink_targets,
             "activated_at": _utc_now(),

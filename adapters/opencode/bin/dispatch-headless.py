@@ -2044,12 +2044,25 @@ def main(argv: list[str]) -> int:
         args.child_pid = proc.pid
         args.child_pid_start = start_ticks
         args.launch_heartbeat = seed_launch_heartbeat(args, jobs, proc.pid, start_ticks)
+        activity_context = None
+        if args.launch_lifecycle == FOREGROUND_SCOPED and args.worker_type != "owner":
+            try:
+                from foreground_activity import build_activity_context
+                activity_context = build_activity_context(
+                    worker_type=args.worker_type, harness="opencode", log_path=log_path,
+                    jobs=jobs, launch_metadata=launch_metadata, attempt_id=args.attempt_id,
+                    route_id=args.route_id, route_node=args.route_node,
+                    environment=dispatch_env, worktree=args.worktree,
+                )
+            except Exception as exc:
+                print(f"warning=foreground activity context unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
         if args.launch_lifecycle == FOREGROUND_SCOPED and foreground_review_handoff:
             binding = args.parent_binding
             try:
                 outcome = wait_foreground(
                     proc, args.foreground_timeout,
                     watchdog_budget=args.watchdog_budget,
+                    activity_context=activity_context,
                     parent_pid=binding.observed_pid if binding else None,
                     parent_pid_start=binding.observed_pid_start if binding else None,
                     parent_is_live=(
@@ -2096,6 +2109,7 @@ def main(argv: list[str]) -> int:
                     else None
                 ),
                 watchdog_budget=args.watchdog_budget,
+                activity_context=activity_context,
             )
             annotate_attempt_row(
                 jobs,

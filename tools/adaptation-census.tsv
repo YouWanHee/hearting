@@ -157,6 +157,7 @@ utility-deferred	dispatch_degradation.py
 utility-deferred	dispatch_harvest.test.py
 utility-deferred	dispatch_launch_tuple.py
 utility-deferred	dispatch_lifecycle.py
+utility-deferred	foreground_activity.py
 utility-deferred	dispatch_lifecycle.test.py
 utility-deferred	dispatch_liveness_matrix.test.py
 utility-deferred	dispatch_lock_order.py

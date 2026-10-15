@@ -597,8 +597,8 @@ def bounded_foreground_timeout(timeout: float) -> float:
         to the safe default;
       * any finite request above the hard ceiling clamps down to it, so even an
         absurd value like ``1e18`` cannot be effectively infinite.
-    (A no-progress watchdog that tells slow-but-progressing apart from wedged is
-    the planned follow-up; until it lands, a finite window is the floor of safety.)
+    The optional foreground activity window may stop confirmed quiet workers
+    earlier; this immutable finite budget remains the hard deadline.
     """
 
     return begin_finite_watchdog(timeout).timeout_seconds
@@ -841,8 +841,9 @@ def wait_foreground(
     parent_is_live: Callable[[], bool] | None = None,
     poll_interval: float = 0.2,
     watchdog_budget: FiniteWatchdogBudget | None = None,
+    activity_context: Any | None = None,
 ) -> ForegroundResult:
-    """Wait in scope, forwarding termination and returning a typed outcome."""
+    """Wait in scope, optionally stopping a confirmed quiet child before timeout."""
 
     received: list[int] = []
     previous: dict[int, object] = {}
@@ -866,6 +867,16 @@ def wait_foreground(
         previous[signum] = signal.getsignal(signum)
         signal.signal(signum, forward)
     try:
+        activity_monitor = None
+        quiet_window = None
+        last_activity = None
+        next_sample = None
+        if activity_context is not None and activity_context.window_seconds > 0:
+            from foreground_activity import ForegroundActivityMonitor
+            activity_monitor = ForegroundActivityMonitor(proc.pid, leader_start, activity_context)
+            quiet_window = activity_context.window_seconds
+            last_activity = time.monotonic()
+            next_sample = last_activity
         if watchdog_budget is None:
             bounded_timeout = bounded_foreground_timeout(timeout)
             deadline = time.monotonic() + bounded_timeout
@@ -903,7 +914,49 @@ def wait_foreground(
                     proc, leader_start, poll_interval=poll_interval
                 )
                 return ForegroundResult(exit_code, "timeout", group_empty)
-            time.sleep(min(max(poll_interval, 0.01), remaining))
+            now = time.monotonic()
+            if activity_monitor is not None and now >= next_sample:
+                observation = activity_monitor.sample()
+                if observation.active or observation.uncertain:
+                    last_activity = now
+                next_sample = now + min(30.0, max(0.01, quiet_window / 20.0))
+                if now - last_activity >= quiet_window:
+                    observation = activity_monitor.sample()
+                    if observation.active or observation.uncertain:
+                        last_activity = time.monotonic()
+                        next_sample = last_activity + min(30.0, max(0.01, quiet_window / 20.0))
+                    else:
+                        if received:
+                            exit_code, group_empty = _bounded_group_stop(
+                                proc, leader_start, poll_interval=poll_interval
+                            )
+                            return ForegroundResult(exit_code, FOREGROUND_INTERRUPTED, group_empty)
+                        if parent_is_live is not None and not parent_is_live():
+                            exit_code, group_empty = _bounded_group_stop(
+                                proc, leader_start, poll_interval=poll_interval
+                            )
+                            return ForegroundResult(exit_code, "parent-terminated", group_empty)
+                        if parent_pid is not None and parent_pid_start and not process_identity_is_live(
+                            parent_pid, parent_pid_start
+                        ):
+                            exit_code, group_empty = _bounded_group_stop(
+                                proc, leader_start, poll_interval=poll_interval
+                            )
+                            return ForegroundResult(exit_code, "parent-terminated", group_empty)
+                        if time.monotonic() >= deadline:
+                            exit_code, group_empty = _bounded_group_stop(
+                                proc, leader_start, poll_interval=poll_interval
+                            )
+                            return ForegroundResult(exit_code, "timeout", group_empty)
+                        exit_code, group_empty = _bounded_group_stop(
+                            proc, leader_start, poll_interval=poll_interval
+                        )
+                        return ForegroundResult(exit_code, "no-progress", group_empty)
+            sleep_for = min(max(poll_interval, 0.01), remaining)
+            if activity_monitor is not None:
+                sleep_for = min(sleep_for, max(0.01, next_sample - time.monotonic()),
+                                max(0.01, last_activity + quiet_window - time.monotonic()))
+            time.sleep(sleep_for)
     except BaseException:
         try:
             _exit_code, group_empty = _bounded_group_stop(
