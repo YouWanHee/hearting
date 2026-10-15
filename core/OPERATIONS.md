@@ -105,6 +105,25 @@ echo "state: branch=$br head=$head base=$def dirty=$(git status --porcelain 2>/d
 - **DONE-BRANCH:** after a branch is merged into base it is finished. At a new work cycle, a non-base branch that is zero commits ahead and is not a just-created branch for this task must be replaced with `git fetch origin && git switch -c <slug> origin/$def`. This applies to direct edits too; uncommitted work on a dead branch is already drift.
 - **Periodic recheck:** remember the entry `head`. Before each commit, stop if `head` changed underneath the session or a new `MERGE_HEAD` appeared. Non-git and single-checkout paths pass harmlessly.
 
+#### Git index-lock failure diagnosis
+
+After an actual Git failure to create an index lock with EEXIST, the existing
+failure path may attach the shared read-only diagnosis. It resolves the Git
+context and expected lock path from the failed invocation, checks only that path
+with lstat, and preserves the original stdout, stderr, return code or signal,
+and partial Git state. An unbound path, unsupported shell form, permission error,
+or observation timeout leaves the original failure intact and does not inspect a
+path quoted by untrusted output.
+
+The diagnosis is advisory. A present lock, its age, size, mode, timestamps, or a
+process not found in local observations cannot establish stale ownership across
+NFS hosts or process namespaces. Missing and unobservable locks remain distinct
+observations; neither authorizes removal. The helper does not delete, rename,
+chmod, kill, choose another index, or retry Git. Diagnosis shares one two-second
+monotonic deadline across Git context lookup and bounded file observation; it
+does not signal the failed Git process. See utilities/git_index_lock.py for the
+single implementation used by source consumers and runtime adapters.
+
 ### §5.9a. Immutable Runtime Activation and Session Pinning
 
 The active harness used by an interactive runtime is an immutable packaged

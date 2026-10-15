@@ -224,6 +224,16 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/git-index-lock-context.py\" --harness claude",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -234,6 +244,16 @@
             "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py clear",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/git-index-lock-context.py\" --harness claude",
+            "timeout": 3
           }
         ]
       }

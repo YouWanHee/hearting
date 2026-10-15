@@ -75,6 +75,11 @@ into an integration worktree. Registered owners and workers retain their
 runtime terminal path. Stage-dispatch §13.61 and artifact-path-contract §43
 govern the proof and the cycle's completion record; a finalized cycle's files stay editable (artifact-path-contract §45).
 
+An index-lock EEXIST diagnosis is attached only after the original Git
+failure, through the shared read-only helper in core/OPERATIONS.md §5.9.
+Keep the original result and partial state; never repair or retry the failed
+command automatically.
+
 ## Role Requirements
 
 Use portable role names from `roles/README.md` and `core/CONVENTIONS.md`. Concrete model names, subagent frontmatter, and runtime-specific tool lists belong in adapter files.

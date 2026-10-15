@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real process contention plus fake GitHub head/CI transitions; no live merges."""
+import base64
 import copy
 import importlib.util
 import json
@@ -659,6 +660,155 @@ class ResultDelivery(unittest.TestCase):
 
 
 class RealIntegration(unittest.TestCase):
+    def test_git_failure_keeps_original_bytes_and_final_outcome_diagnosis(self):
+        with tempfile.TemporaryDirectory(prefix="merge-line-lock-") as td:
+            repo = Path(td) / "space and quote ' repo"
+            repo.mkdir()
+            def git(*args):
+                return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                                      capture_output=True)
+            git("init", "-q")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            (repo / "tracked").write_text("base\n")
+            git("add", "tracked")
+            git("commit", "-qm", "base")
+            head = git("rev-parse", "HEAD").stdout
+            (repo / "tracked").write_text("staged\n")
+            git("add", "tracked")
+            index = git("rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip()
+            lock = Path(index + ".lock")
+            lock.write_bytes(b"")
+            lock_fd = os.open(lock, os.O_RDONLY)
+            lock.chmod(0)
+            integration = M.Integration.__new__(M.Integration)
+            integration.temp = type("Temp", (), {"name": str(repo)})()
+            with self.assertRaises(M.GitCommandFailure) as caught:
+                integration.git("commit", "-m", "must fail")
+            failure = caught.exception
+            result = M.outcome(17, False, failure)
+            self.assertEqual(failure.returncode, 128)
+            self.assertEqual(result["git_failure"]["returncode"], 128)
+            self.assertEqual(base64.b64decode(result["git_failure"]["stderr_b64"]), failure.stderr_bytes)
+            self.assertEqual(result["git_diagnosis"]["lock_path"], str(lock))
+            self.assertIn("Original Git stderr:", result["message"])
+            self.assertIn("Hearting Git index-lock diagnosis", result["message"])
+            self.assertEqual(git("rev-parse", "HEAD").stdout, head)
+            self.assertTrue(lock.exists())
+            self.assertEqual(lock.stat().st_size, 0)
+            self.assertEqual((os.stat(lock).st_dev, os.stat(lock).st_ino),
+                             (os.fstat(lock_fd).st_dev, os.fstat(lock_fd).st_ino))
+            os.close(lock_fd)
+
+    def test_check_false_returns_compatible_process_and_raw_failure_payload(self):
+        with tempfile.TemporaryDirectory(prefix="merge-line-lock-") as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            def git(*args):
+                return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                                      capture_output=True)
+            git("init", "-q")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            (repo / "tracked").write_text("base\n")
+            git("add", "tracked")
+            git("commit", "-qm", "base")
+            (repo / "tracked").write_text("staged\n")
+            git("add", "tracked")
+            index = git("rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip()
+            lock = Path(index + ".lock")
+            lock.write_bytes(b"")
+            lock_fd = os.open(lock, os.O_RDONLY)
+            lock.chmod(0)
+            integration = M.Integration.__new__(M.Integration)
+            integration.temp = type("Temp", (), {"name": str(repo)})()
+            original_run = subprocess.run
+            command_calls = []
+            def count_original_command(argv, *args, **kwargs):
+                if Path(argv[0]).name == "git" and "commit" in argv:
+                    command_calls.append(list(argv))
+                return original_run(argv, *args, **kwargs)
+            with mock.patch.object(M.subprocess, "run", side_effect=count_original_command):
+                result = integration.git("commit", "-m", "must fail", check=False)
+            self.assertEqual(result.returncode, 128)
+            self.assertEqual(len(command_calls), 1)
+            self.assertTrue(hasattr(result, "git_failure"))
+            self.assertEqual(base64.b64decode(result.git_failure["stderr_b64"]), result.raw_stderr)
+            self.assertEqual(result.git_diagnosis["lock_path"], str(lock))
+            failure = M.GitCommandFailure.from_completed(result, str(repo))
+            final = M.outcome(17, False, failure)
+            self.assertEqual(final["git_failure"], result.git_failure)
+            self.assertEqual(final["git_diagnosis"], result.git_diagnosis)
+            self.assertTrue(lock.exists())
+            self.assertEqual(lock.stat().st_size, 0)
+            self.assertEqual((os.stat(lock).st_dev, os.stat(lock).st_ino),
+                             (os.fstat(lock_fd).st_dev, os.fstat(lock_fd).st_ino))
+            os.close(lock_fd)
+
+    def test_consumer_shares_one_two_second_deadline_across_git_lookups_and_observer(self):
+        with tempfile.TemporaryDirectory(prefix="merge-line-deadline-") as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            def git(*args, check=True):
+                return subprocess.run(["git", "-C", str(repo), *args], check=check,
+                                      capture_output=True)
+            git("init", "-q")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            (repo / "tracked").write_text("base\n")
+            git("add", "tracked")
+            git("commit", "-qm", "base")
+            head = git("rev-parse", "HEAD").stdout
+            (repo / "tracked").write_text("staged\n")
+            git("add", "tracked")
+            index = git("rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip()
+            lock = Path(index + ".lock")
+            lock.write_bytes(b"bounded observer")
+            lock.chmod(0)
+            integration = M.Integration.__new__(M.Integration)
+            integration.temp = type("Temp", (), {"name": str(repo)})()
+            original_path = M.git_index_lock._run_git_path
+            calls = []
+            def delayed_path(global_args, cwd, env, path, timeout):
+                calls.append(path)
+                delay = min(0.45, max(0.0, timeout))
+                time.sleep(delay)
+                return original_path(global_args, cwd, env, path, max(0.0, timeout - delay))
+            def delayed_observer(_path, remaining):
+                time.sleep(max(0.0, remaining))
+                return {"state": "unavailable", "reason": "fixture-deadline"}
+            started = time.monotonic()
+            with mock.patch.object(M.git_index_lock, "_run_git_path", side_effect=delayed_path), \
+                    mock.patch.object(M.git_index_lock, "_observe", side_effect=delayed_observer):
+                result = integration.git("commit", "-m", "must fail", check=False)
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 128)
+            self.assertEqual(calls, ["index", "index.lock"])
+            self.assertLess(elapsed, 2.5)
+            self.assertEqual(result.git_diagnosis["state"], "unavailable")
+            self.assertEqual(result.git_diagnosis["observation"]["reason"], "fixture-deadline")
+            self.assertEqual(git("rev-parse", "HEAD").stdout, head)
+            self.assertTrue(lock.exists())
+            self.assertEqual(lock.stat().st_mode & 0o777, 0)
+
+    def test_undecodable_subprocess_failure_keeps_legacy_text_and_raw_bytes(self):
+        raw = subprocess.CompletedProcess(
+            ["git", "commit"], 128, b"out\r\n\xff", b"err\r\n\xfe")
+        integration = M.Integration.__new__(M.Integration)
+        integration.temp = type("Temp", (), {"name": "/tmp/fixture"})()
+        diagnosis = {"state": "present", "message": "Hearting Git index-lock diagnosis"}
+        with mock.patch.object(M.subprocess, "run", return_value=raw), \
+                mock.patch.object(M.git_index_lock, "diagnose_failure", return_value=diagnosis):
+            with self.assertRaises(M.GitCommandFailure) as caught:
+                integration.git("commit")
+        failure = caught.exception
+        result = M.outcome(1, False, failure)
+        self.assertEqual(failure.stdout, "out\n\ufffd")
+        self.assertEqual(failure.stderr, "err\n\ufffd")
+        self.assertEqual(base64.b64decode(result["git_failure"]["stdout_b64"]), b"out\r\n\xff")
+        self.assertEqual(base64.b64decode(result["git_failure"]["stderr_b64"]), b"err\r\n\xfe")
+        self.assertEqual(result["git_failure"]["returncode"], 128)
+
     def test_conflict_is_aborted_without_losing_good_prefix_and_temporary_branch_is_removed(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"XDG_STATE_HOME": td}):
             root = Path(td)
