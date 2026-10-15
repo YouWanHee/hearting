@@ -717,7 +717,7 @@ A legacy hash collision is diagnostic
      OpenCode `session.idle` do not prove merge/push completion and must never
      perform destructive cleanup. They may expose diagnostics only.
 4. **Shared artifacts:** route writes to shared artifact-root files through the §5.8 lock. `plans/<slug>/` remains path-separated and noncontending.
-5. **Context:** when coordination records pressure the main context, propose a session-tidy handoff card under the global continuity rule. Runtime compaction also invokes main-session tidy as described in [`capabilities/session-tidy.md`](../capabilities/session-tidy.md); the runtime hook queues memory tidying without clearing or delaying the window.
+5. **Context:** when coordination records pressure the main context, propose a session-tidy handoff card under the global continuity rule. Runtime compaction also invokes main-session tidy as described in [`capabilities/session-tidy.md`](../capabilities/session-tidy.md). Only a nonempty automatic Claude/OpenCode summary successfully saved to its own verified herdr seat can use the existing snapshot/clear/continue booking, and the detached helper clears only after transcript evidence shows the compacted turn ended (up to three hours). Manual/unknown compaction, Codex remote-V2 compaction, workers/sub-sessions, outside-herdr seats, empty summaries and failed card writes remain queue-only; Codex compaction remains queue-only. Compaction stays non-blocking.
 
 **SD-91 current Codex override:** the projected Codex Stop bridge silently reads
 only enough payload to clear one exact interaction marker. It reads no registry,

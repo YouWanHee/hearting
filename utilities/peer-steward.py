@@ -4954,6 +4954,9 @@ def cmd_clear(args):
     reason, agent, lines = _clear_look(target, req)   # the look immediately before the one send
     if reason:
         return finish(_look_outcome(reason), reason, agent)
+    req, why = clear.claim_clear(args.request, args.nonce)
+    if req is None:
+        return finish("skipped", why, agent)
     before = _codex_footer_threads(lines) if harness == "codex" else set()
     rc, payload = _herdr_prompt(target, command, wait=False, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
     if rc is None:

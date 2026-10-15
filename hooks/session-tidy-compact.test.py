@@ -91,7 +91,9 @@ class CompactHookTest(unittest.TestCase):
         self.assertEqual((row["event"], row["source"], row["epoch"]), ("compact", "compact", 1))
         card = st.read_latest_card(self.seat)
         self.assertEqual(card["origin"], "runtime-compact")
-        self.assertEqual(card["body"], "summary\n\tkept")
+        self.assertEqual(card["compact"]["summary"], "summary\n\tkept")
+        self.assertIn("요약이 보지 못한 최근 대화", card["body"])
+        self.assertIn("원본 대화 기록 경로를 확인할 수 없습니다", card["body"])
         self.assertFalse((self.state / "hearting/session-tidy/clear").exists())
         self.assertFalse((self.state / "hearting/session-tidy/handover").exists())
         self.assertEqual(st.run_hook("claude", "prompt", "sid-main", env=self.env, now=1001), "")
@@ -120,7 +122,7 @@ class CompactHookTest(unittest.TestCase):
                 st.run_hook("claude", "compact", f"sid-{kind}", phase="after", compact_summary=f"{kind} card",
                             cwd=str(self.cwd), env=self.env, now=1000)
             card = st.read_latest_card(seat)
-            self.assertEqual((card["body"], card["origin"]), (f"{kind} card", "runtime-compact"))
+            self.assertEqual((card["compact"]["summary"], card["origin"]), (f"{kind} card", "runtime-compact"))
         project = st.Seat("project", "fixture-project", harness="codex", project_key="fixture")
         with mock.patch.object(st, "resolve_seat", return_value=project):
             st.write_card(project, "codex", "sid-other", "another session's card", cwd=str(self.cwd), now=900)
@@ -134,15 +136,136 @@ class CompactHookTest(unittest.TestCase):
         self.assertEqual(self.enqueue_mock.call_args.args[0], project)
         self.assertEqual(self.enqueue_mock.call_args.args[1:3], ("codex", "sid-project"))
 
-    def test_oversized_summary_is_cut_by_the_existing_card_limit(self):
+    def test_compact_summary_above_manual_limit_is_preserved_in_full(self):
         summary = "진행 중: " + "가" * (st.CARD_BODY_MAX_BYTES // 3 + 500)
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary=summary,
                     cwd=str(self.cwd), env=self.env, now=1000)
-        body = st.read_latest_card(self.seat)["body"]
-        self.assertLessEqual(len(body.encode("utf-8")), st.CARD_BODY_MAX_BYTES)
-        self.assertTrue(summary.startswith(body))
-        self.assertEqual(body, st.sanitize_body(summary))
+        card = st.read_latest_card(self.seat)
+        self.assertEqual(card["compact"]["summary"], summary)
+        self.assertGreater(len(card["compact"]["summary"].encode("utf-8")), st.CARD_BODY_MAX_BYTES)
+        self.assertLessEqual(len(card["compact"]["summary"].encode("utf-8")), st.COMPACT_SUMMARY_MAX_BYTES)
         self.assertEqual(self.enqueue_mock.call_count, 1)
+
+    def test_compact_admission_boundaries_keep_full_summary_and_reject_overflow(self):
+        for size in (st.CARD_BODY_MAX_BYTES + 1, 32 * 1024 + 1, st.COMPACT_SUMMARY_MAX_BYTES):
+            summary = "x" * size
+            st.run_hook("claude", "compact", f"sid-{size}", phase="after", compact_summary=summary,
+                        compact_context={"trigger": "manual"}, cwd=str(self.cwd), env=self.env, now=1000 + size)
+            card = st.read_latest_card(self.seat)
+            self.assertEqual(card["compact"]["summary"], summary)
+            self.assertLessEqual(len(card["body"].encode("utf-8")), st.COMPACT_CARD_BODY_MAX_BYTES)
+        before = st.read_latest_card(self.seat)
+        too_large = "x" * (st.COMPACT_SUMMARY_MAX_BYTES + 1)
+        st.run_hook("claude", "compact", "sid-too-large", phase="after", compact_summary=too_large,
+                    compact_context={"trigger": "auto"}, cwd=str(self.cwd), env=self.env, now=5000)
+        self.assertEqual(st.read_latest_card(self.seat), before)
+        self.assertEqual(self.enqueue_mock.call_count, 4)
+
+    def test_auto_compact_uses_shared_snapshot_and_three_hour_booking(self):
+        import session_tidy_clear as clear
+        import dispatch_seat_handover as handover
+        transcript = self.root / "sid-auto.jsonl"
+        transcript.write_text(json.dumps({"type": "assistant", "uuid": "a1",
+                                          "message": {"stop_reason": "end_turn",
+                                                      "content": [{"type": "text", "text": "완료"}]}})
+                             + "\n", encoding="utf-8")
+        with mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+             mock.patch.object(clear, "_start_helper", return_value=4321), \
+             mock.patch.object(handover, "write_snapshot_locked", return_value=1) as snapshot:
+            clear.schedule_for_enqueue(self.seat, "claude", "sid-auto", str(self.cwd), no_continue=True)
+            compact_now = st.now_epoch()
+            st.run_hook("claude", "compact", "sid-auto", phase="after", compact_summary="완전한 요약",
+                        compact_context={"trigger": "auto"}, transcript=str(transcript),
+                        cwd=str(self.cwd), env=self.env, now=compact_now)
+            booking = clear.read_reservation(self.seat.key)
+            self.assertEqual(booking["origin"], "compact")
+            self.assertEqual(booking["deadline"] - booking["created"], clear.COMPACT_CLEAR_DEADLINE_SEC)
+            self.assertEqual(booking["compact"]["trigger"], "auto")
+            self.assertTrue(booking["continue_off"])
+            self.assertEqual(booking["compact"]["boundary_offset"], transcript.stat().st_size)
+            snapshot.assert_called_once()
+
+    def test_duplicate_auto_compact_callback_coalesces_card_queue_snapshot_and_booking(self):
+        import session_tidy_clear as clear
+        import dispatch_seat_handover as handover
+        transcript = self.root / "sid-duplicate.jsonl"
+        transcript.write_text(json.dumps({"type": "assistant", "uuid": "a1",
+                                          "message": {"stop_reason": "end_turn", "content": [
+                                              {"type": "text", "text": "완료"}]}}) + "\n", encoding="utf-8")
+        with mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+             mock.patch.object(clear, "_start_helper", return_value=4321) as helper, \
+             mock.patch.object(handover, "write_snapshot_locked", return_value=1) as snapshot:
+            for stamp in (1000, 1001):
+                st.run_hook("claude", "compact", "sid-duplicate", phase="after", compact_summary="same summary",
+                            compact_context={"trigger": "auto", "summary_id": "compact-id"},
+                            transcript=str(transcript), cwd=str(self.cwd), env=self.env, now=stamp)
+                if stamp == 1000:
+                    with st.seat_lock(self.seat.key):
+                        st.write_card(self.seat, "claude", "sid-duplicate", "later manual card",
+                                      cwd=str(self.cwd), now=1000.5)
+        self.assertEqual(st.read_latest_card(self.seat)["generation"], 2)
+        self.assertEqual(st.read_latest_card(self.seat)["body"], "later manual card")
+        self.assertEqual(self.enqueue_mock.call_count, 1)
+        helper.assert_called_once()
+        snapshot.assert_called_once()
+
+    def test_ineligible_compactions_queue_without_replacing_or_creating_a_clear_booking(self):
+        import session_tidy_clear as clear
+        import dispatch_seat_handover as handover
+        transcript = self.root / "sid-excluded.jsonl"
+        transcript.write_text(json.dumps({"type": "assistant", "uuid": "a1", "message": {
+            "stop_reason": "end_turn", "content": [{"type": "text", "text": "완료"}]}}) + "\n", encoding="utf-8")
+        project = st.Seat("project", "fixture-project", harness="claude", project_key="fixture")
+        cases = [
+            ("manual", "claude", {"trigger": "manual"}, "요약", self.seat, {}, 1),
+            ("unknown", "claude", {}, "요약", self.seat, {}, 1),
+            ("empty", "claude", {"trigger": "auto"}, "  \n\t ", self.seat, {}, 1),
+            ("codex", "codex", {"trigger": "auto"}, "요약", self.seat, {}, 1),
+            ("project", "claude", {"trigger": "auto"}, "요약", project, {}, 1),
+            ("worker", "claude", {"trigger": "auto"}, "요약", self.seat, {"AGENT_SESSION_ROLE": "worker"}, 0),
+        ]
+        for name, harness, context, summary, seat, extra, queued in cases:
+            with self.subTest(name), \
+                 mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+                 mock.patch.object(clear, "_start_helper", return_value=4321) as helper, \
+                 mock.patch.object(handover, "write_snapshot_locked", return_value=1) as snapshot, \
+                 mock.patch.object(st, "resolve_seat", return_value=seat):
+                before = self.enqueue_mock.call_count
+                clear.cancel(self.seat)
+                held = None
+                if name == "manual":
+                    clear.schedule_for_enqueue(self.seat, "claude", "sid-excluded", str(self.cwd), no_continue=True)
+                    held = clear.read_reservation(self.seat.key)
+                    helper.reset_mock()
+                st.run_hook(harness, "compact", "sid-excluded", phase="after", compact_summary=summary,
+                            compact_context=context, transcript=str(transcript), cwd=str(self.cwd),
+                            env={**self.env, **extra}, now=2000)
+                helper.assert_not_called()
+                snapshot.assert_not_called()
+                self.assertEqual(self.enqueue_mock.call_count - before, queued)
+                after = clear.read_reservation(self.seat.key)
+                if held is None:
+                    self.assertIsNone(after)
+                else:
+                    self.assertEqual((after["nonce"], after["continue_off"]), (held["nonce"], True))
+
+    def test_compact_text_write_failure_restores_old_card_and_never_books(self):
+        import session_tidy_clear as clear
+        previous = st.write_card(self.seat, "claude", "sid-main", "old card", cwd=str(self.cwd), now=900)
+        original_atomic_write = st.atomic_write
+
+        def fail_text(path, data):
+            if Path(path) == st.card_text_path(self.seat):
+                raise OSError("fixture text write failed")
+            return original_atomic_write(path, data)
+
+        with mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+             mock.patch.object(clear, "_start_helper", return_value=4321), \
+             mock.patch.object(st, "atomic_write", side_effect=fail_text):
+            st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="new summary",
+                        compact_context={"trigger": "auto"}, cwd=str(self.cwd), env=self.env, now=1000)
+        self.assertEqual(st.read_latest_card(self.seat)["generation"], previous["generation"])
+        self.assertIsNone(clear.read_reservation(self.seat.key))
 
     def test_start_compact_then_after_keeps_one_epoch_and_excludes_author_card(self):
         st.run_hook("claude", "start", "sid-main", source="compact", cwd=str(self.cwd),
@@ -165,7 +288,7 @@ class CompactHookTest(unittest.TestCase):
                     cwd=str(self.cwd), env=self.env, now=1010)
         card = st.read_latest_card(self.seat)
         self.assertEqual(card["generation"], 2)
-        self.assertEqual(card["body"], "second")
+        self.assertEqual(card["compact"]["summary"], "second")
         self.assertEqual(st.session_summary(self.seat)[("claude", "sid-main")]["epoch"], 1)
         self.assertEqual(self.enqueue_mock.call_count, 2)
 
@@ -209,7 +332,7 @@ class CompactHookTest(unittest.TestCase):
         st.run_hook("claude", "compact", "sid-main", phase="after", compact_summary="summary",
                     cwd=str(self.cwd), env=self.env, now=1000)
         thread.join()
-        self.assertEqual(st.read_latest_card(self.seat)["body"], "summary")
+        self.assertEqual(st.read_latest_card(self.seat)["compact"]["summary"], "summary")
         self.assertEqual(self.enqueue_mock.call_count, 1)
 
     def test_card_write_failure_does_not_suppress_queue(self):
@@ -301,7 +424,10 @@ class CompactHookTest(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--transcript") + 1], transcript)
             else:
                 self.assertNotIn("--transcript", argv)
-            self.assertEqual(json.loads(call["stdin"]), {"summary": summary})
+            expected_input = {"summary": summary}
+            if transcript:
+                expected_input["transcript"] = transcript
+            self.assertEqual(json.loads(call["stdin"]), expected_input)
 
     def test_main_wrapper_discards_partial_output_and_fails_open_on_timeout(self):
         fake_home = self.root / "fake-home"
@@ -358,6 +484,10 @@ class CompactHookTest(unittest.TestCase):
             "        sys.stderr.write(\"ledger missing\\n\"); raise SystemExit(2)\n"
             "    if argv[1] == \"compact-before\":\n"
             f"        sys.stdout.write(open({json.dumps(str(instructions))}).read())\n"
+            "    elif argv[1] == \"compact-after\" and json.loads(body or \"{}\").get(\"trigger\") == \"auto\":\n"
+            "        print(\"booking=scheduled\")\n"
+            "    elif argv[1] == \"runtime-status\":\n"
+            "        print(\"booking=pending\")\n"
             "' \"$@\"\n", encoding="utf-8")
         shim.chmod(0o700)
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
@@ -365,7 +495,9 @@ class CompactHookTest(unittest.TestCase):
 const scenario = {json.dumps(scenario)}
 const sid = "ses_fixture"
 const old = {{ info: {{ id: "old-summary", sessionID: sid, role: "assistant", summary: true, finish: "stop", time: {{ created: Date.now() - 5000 }} }}, parts: [{{ type: "text", text: "old" }}] }}
-const fresh = {{ info: {{ id: "new-summary", sessionID: sid, role: "assistant", summary: true, finish: "stop", time: {{ created: 0 }} }}, parts: [{{ type: "text", text: "fresh summary" }}, {{ type: "image", text: "ignored" }}] }}
+const compactParent = {{ info: {{ id: "compact-parent", sessionID: sid, role: "user", time: {{ created: Date.now() - 1 }} }},
+  parts: [{{ id: "compact-part", type: "compaction", auto: true, tail_start_id: "retained-start" }}] }}
+const fresh = {{ info: {{ id: "new-summary", sessionID: sid, role: "assistant", parentID: "compact-parent", summary: true, finish: "stop", time: {{ created: 0 }} }}, parts: [{{ type: "text", text: "fresh summary" }}, {{ type: "image", text: "ignored" }}] }}
 const calls = []
 const ctx = {{ directory: {json.dumps(str(self.cwd))}, worktree: {json.dumps(str(self.cwd))}, client: {{ session: {{
   get: async (request) => {{
@@ -376,12 +508,21 @@ const ctx = {{ directory: {json.dumps(str(self.cwd))}, worktree: {json.dumps(str
   messages: async (request) => {{
     calls.push(["messages", request.path.id, request.query, Boolean(request.signal)])
     fresh.info.time.created = Date.now()
-    return {{ data: [old, fresh] }}
+    return {{ data: [old, compactParent, fresh] }}
   }},
+  ...(["status-idle", "status-missing"].includes(scenario) ? {{ status: async (request) => {{
+    calls.push(["status", sid, request.query])
+    if (scenario === "status-missing") return {{ data: {{}} }}
+    return {{ data: {{ [sid]: {{ type: "idle" }} }} }}
+  }} }} : {{}}),
 }} }} }}
 const plugin = await AgentHarnessGuards(ctx)
 const result = {{ calls }}
 const output = {{ context: [], prompt: "keep this prompt" }}
+if (scenario === "status-missing") {{
+  await plugin.event({{ event: {{ type: "session.status", properties: {{ sessionID: sid, status: {{ type: "idle" }} }} }} }})
+  result.preBookingIdleEmitted = true
+}}
 try {{
   await plugin["experimental.session.compacting"]({{ sessionID: sid }}, output)
   result.before = "ok"
@@ -424,11 +565,29 @@ console.log(JSON.stringify(result))
         self.assertEqual([h[1] for h in compact], [["compact-before", "--harness", "opencode"],
                                                    ["compact-after", "--harness", "opencode"]])
         after = json.loads(compact[1][2])
-        self.assertEqual((after["sessionID"], after["summary"], after["worker"]),
-                         ("ses_fixture", "fresh summary", False))
+        self.assertEqual((after["sessionID"], after["summary"], after["worker"], after["trigger"],
+                          after["summary_id"], after["parent_id"], after["tail_start_id"],
+                          after["compaction_part_id"]),
+                         ("ses_fixture", "fresh summary", False, "auto", "new-summary", "compact-parent",
+                          "retained-start", "compact-part"))
         # a native child session gets no instructions and no tidy at all
         self.assertEqual(data["childOutput"], {"context": [], "prompt": "child prompt"})
         self.assertTrue(any(h[0] == "mem.py" and "_seen-reset" in h[1] for h in hooks))
+
+    def test_opencode_native_idle_is_forwarded_only_after_an_auto_compact_booking(self):
+        data, hooks = self._opencode_fixture("status-idle")
+        runtime = [h for h in hooks if h[0] == "worker-state-hook.py" and h[1][0] == "runtime-status"]
+        self.assertEqual(len(runtime), 1)
+        payload = json.loads(runtime[0][2])
+        self.assertEqual((payload["sessionID"], payload["status"]), ("ses_fixture", "idle"))
+        self.assertGreater(payload["observed_at"], 0)
+
+    def test_opencode_prebooking_cached_idle_is_not_relabelled_when_current_status_is_missing(self):
+        data, hooks = self._opencode_fixture("status-missing")
+        self.assertTrue(data["preBookingIdleEmitted"])
+        self.assertIn(["status", "ses_fixture", None], data["calls"])
+        runtime = [h for h in hooks if h[0] == "worker-state-hook.py" and h[1][0] == "runtime-status"]
+        self.assertEqual(runtime, [])
 
     def test_opencode_unknown_identity_keeps_the_ledger_only_compact_record(self):
         data, hooks = self._opencode_fixture("unknown")

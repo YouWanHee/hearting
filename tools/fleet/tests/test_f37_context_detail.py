@@ -176,6 +176,24 @@ class ContextDetailTruthTableTest(unittest.TestCase):
                     context=ContextProjection(20, "ok", "claude"))
                 self.assertEqual(gauge_col(worker, depth), gauge_col(owner, 1))
 
+    def test_unapplied_policy_keeps_the_native_gauge(self):
+        # An unverified runtime has no applied trigger, but its measured window and usage
+        # still draw the gauge they drew before applied triggers existed.
+        claude_row = render._context_detail_row(self._idle(
+            context_window_tokens=1_000_000, active_context_tokens=262_312,
+            context_policy={"state": "unknown", "raw_percentage": 26}), term_width=168)
+        self.assertIn("26%", text(claude_row))
+        self.assertIn(FULL * 4 + EMPTY * 12, text(claude_row))
+        codex_row = render._context_detail_row(self._idle(
+            harness="codex", context_window_tokens=475_000, active_context_tokens=317_769,
+            context_policy={"state": "unknown", "raw_percentage": None}), term_width=168)
+        self.assertIn(FULL * 5 + EMPTY * 3 + " 66%", text(codex_row))  # 12k baseline, 8-cell track
+        applied_row = render._context_detail_row(self._idle(
+            context_window_tokens=1_000_000, active_context_tokens=262_312, ctx_pct=34,
+            context_display_window_tokens=767_000,
+            context_policy={"state": "applied", "raw_percentage": 26}), term_width=168)
+        self.assertIn("34%", text(applied_row))
+
     def test_malformed_legacy_percentage_is_unavailable_not_clamped(self):
         for malformed in (-1, 101, True, "63"):
             with self.subTest(malformed=malformed):
