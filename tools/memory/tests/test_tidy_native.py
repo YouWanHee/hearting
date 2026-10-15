@@ -72,6 +72,28 @@ class NativeCase(unittest.TestCase):
             req = clear.read_reservation(self.seat.key)
         return req, path
 
+    def book_compact(self):
+        transcript = self.iso.root / "session-A.jsonl"
+        rows = [
+            {"type": "assistant", "uuid": "a-tool", "message": {"stop_reason": "tool_use",
+             "content": [{"type": "text", "text": "tool call"}]}},
+            {"type": "user", "uuid": "u-tool", "message": {"content": [
+             {"type": "tool_result", "tool_use_id": "t", "content": "result"}]}},
+        ]
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        info = transcript.stat()
+        context = {"trigger": "auto", "identity": "native-compact", "transcript": str(transcript),
+                   "boundary_offset": info.st_size,
+                   "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        with st.seat_lock(self.seat.key):
+            st.write_card(self.seat, "claude", "session-A", "complete compact summary", cwd=self.cwd,
+                          prompt_seq=st.read_prompt_seq(self.seat), origin="runtime-compact",
+                          compact_context=context)
+        with mock.patch.object(clear, "_start_helper", return_value=os.getpid()):
+            clear.schedule_for_enqueue(self.seat, "claude", "session-A", self.cwd, compact_context=context)
+        req = clear.read_reservation(self.seat.key)
+        return req, clear.reservation_path(self.seat.key), transcript
+
 
 class NativeIdentityTest(NativeCase):
     def test_inherited_pane_does_not_borrow_its_card(self):
@@ -227,6 +249,43 @@ class NativeCommandTest(NativeCase):
         req, path = self.book(); self.prepare_transport()
         st.run_hook("claude", "prompt", "session-A", cwd=self.cwd)
         self.assertEqual(self.run_command(req, path)["reason"], "new-input")
+        self.write.assert_not_called()
+
+    def test_native_compact_never_sends_on_tool_result_then_sends_after_end_turn(self):
+        req, path, transcript = self.book_compact()
+        self.prepare_transport()
+        pending = self.run_command(req, path)
+        self.assertEqual(pending["reason"], "compact-pending")
+        self.write.assert_not_called()
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "assistant", "uuid": "a-final",
+                                     "message": {"stop_reason": "end_turn", "content": [
+                                         {"type": "text", "text": "최종 응답"}]}}) + "\n")
+        self.write.side_effect = lambda fd, text: (self.publish(sessionId="session-B"), len(text))[1]
+        result = self.run_command(req, path)
+        self.assertEqual((result["cleared"], result["new_session"]), ("true", "session-B"))
+        self.write.assert_called_once()
+
+    def test_native_compact_rechecks_transcript_after_claim_before_send(self):
+        req, path, transcript = self.book_compact()
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "assistant", "uuid": "a-final",
+                                     "message": {"stop_reason": "end_turn", "content": [
+                                         {"type": "text", "text": "완료"}]}}) + "\n")
+        self.prepare_transport()
+        reads = [0]
+
+        def screen(*_args, **_kwargs):
+            reads[0] += 1
+            if reads[0] == 2:
+                with transcript.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"type": "user", "uuid": "u-late", "message": {
+                        "content": [{"type": "text", "text": "새 입력"}]}}) + "\n")
+            return [[("❯", False)], [("─", False)]]
+
+        self.view.side_effect = screen
+        result = self.run_command(req, path)
+        self.assertEqual(result["reason"], "compact-pending")
         self.write.assert_not_called()
 
     def test_changed_target_is_refused_before_attach(self):

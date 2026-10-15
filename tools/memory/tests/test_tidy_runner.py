@@ -1327,6 +1327,24 @@ class HandoffTest(RunnerCase):
             self.assertEqual(row["body"].strip(), text.strip())
         self.assertEqual(list((self.state / "handoff").glob("*")), [])      # the body file does not linger
 
+    def test_large_compact_card_reaches_peer_body_file_without_truncation(self):
+        summary = "최종 요약\n" + "세부 내용 " * 3000
+        context = {"trigger": "auto", "identity": "handoff-compact", "transcript": "fixture.jsonl"}
+        with self.iso.patched_environ(self.iso.env({"HERDR_PANE_ID": PANE})):
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            with st.seat_lock(seat.key):
+                card = st.write_card(seat, "claude", "sid-A", summary, cwd=str(self.cwd),
+                                     prompt_seq=st.read_prompt_seq(seat), origin="runtime-compact",
+                                     compact_context=context)
+        self.assertGreater(len(card["body"].encode("utf-8")), st.CARD_BODY_MAX_BYTES)
+        result = self.cli("handoff", "peer-pane", "--harness", "claude", "--session-id", "sid-A",
+                          FAKE_PEER_VERDICT="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [json.loads(x) for x in (self.fake / "steward.jsonl").read_text().splitlines()]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["body"], card["body"].rstrip() + "\n")
+        self.assertEqual(list((self.state / "handoff").glob("*")), [])
+
     def test_a_handed_off_card_is_not_continued_in_this_window(self):
         self.card()
         result = self.cli("handoff", "peer-pane", "--harness", "claude", "--session-id", "sid-A",

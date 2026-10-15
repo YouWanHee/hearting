@@ -1129,6 +1129,317 @@ class TailFirstReadingTest(TidyCase):
             self.assertEqual(tt.read_pending("opencode", sid, self.iso.opencode_db, 1 << 20).pending_after, [])
 
 
+class CompactObservationTest(TidyCase):
+    SID = "sid-compact"
+
+    def append_claude(self, path, row):
+        with path.open("ab") as handle:
+            handle.write((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    def claude_row(self, kind, uid, text="", stop=""):
+        return {"type": kind, "uuid": uid,
+                "message": {"stop_reason": stop, "content": [{"type": "text", "text": text}]}}
+
+    def test_full_compact_false_idle_waits_for_the_later_end_turn_and_keeps_recent_tail(self):
+        path = self.iso.root / f"{self.SID}.jsonl"
+        self.append_claude(path, self.claude_row("user", "u1", "작업 시작"))
+        self.append_claude(path, self.claude_row("assistant", "a1", "도구 호출", stop="tool_use"))
+        self.append_claude(path, {"type": "user", "uuid": "u-tool", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "private output"}]}})
+        self.append_claude(path, {"type": "assistant", "uuid": "summary", "isCompactSummary": True,
+                                  "compactMetadata": {"trigger": "auto"},
+                                  "message": {"content": [{"type": "text", "text": "summary"}]}})
+        boundary = path.stat().st_size
+        info = path.stat()
+        anchor = {"boundary_offset": boundary, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        with mock.patch.object(tt, "read_watermark", side_effect=AssertionError("watermark touched")), \
+             mock.patch.object(tt, "mark_applied", side_effect=AssertionError("watermark touched")):
+            pending = tt.compact_observation("claude", self.SID, str(path), anchor)
+            self.assertEqual(pending["state"], "pending")
+            self.assertEqual(pending["latest_type"], "user")
+            self.append_claude(path, self.claude_row("assistant", "a2", "최종 결과: 완료", stop="end_turn"))
+            ready = tt.compact_observation("claude", self.SID, str(path), anchor)
+        self.assertEqual(ready["state"], "ready")
+        self.assertIn("최종 결과: 완료", ready["recent"])
+        self.assertFalse((self.state / "watermarks").exists())
+
+    def test_idle_compact_uses_real_end_turn_and_preserved_segment_is_deduped(self):
+        path = self.iso.root / f"{self.SID}.jsonl"
+        self.append_claude(path, {**self.claude_row("user", "u1", "남겨 둘 시작 대화"), "parentUuid": None})
+        self.append_claude(path, {**self.claude_row("assistant", "a1", "남겨 둘 응답"), "parentUuid": "u1"})
+        self.append_claude(path, {**self.claude_row("user", "u2", "요약이 못 본 요청"), "parentUuid": "a1"})
+        self.append_claude(path, {**self.claude_row("assistant", "a2", "압축 전 완료", stop="end_turn"),
+                                  "parentUuid": "u2"})
+        self.append_claude(path, {"type": "assistant", "uuid": "summary", "isCompactSummary": True,
+                                  "compactMetadata": {"trigger": "auto", "preservedSegment": {
+                                      "startUuid": "u1", "endUuid": "u2"}},
+                                  "message": {"content": [{"type": "text", "text": "요약"}]}})
+        anchor = {"boundary_offset": path.stat().st_size}
+        observation = tt.compact_observation("claude", self.SID, str(path), anchor)
+        self.assertEqual(observation["state"], "ready")
+        self.assertIn("요약이 못 본 요청", observation["recent"])
+        self.assertEqual(observation["recent"].count("남겨 둘 시작 대화"), 1)
+
+    def test_partial_latest_row_and_replaced_transcript_fail_closed(self):
+        path = self.iso.root / f"{self.SID}.jsonl"
+        self.append_claude(path, self.claude_row("assistant", "a1", "완료", stop="end_turn"))
+        info = path.stat()
+        anchor = {"boundary_offset": info.st_size, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        with path.open("ab") as handle:
+            handle.write(b'{"type":"assistant","message":')
+        self.assertEqual(tt.compact_observation("claude", self.SID, str(path), anchor)["state"], "unknown")
+        replacement = self.iso.root / "replacement.jsonl"
+        replacement.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertEqual(tt.compact_observation("claude", self.SID, str(replacement), anchor)["state"], "unknown")
+
+
+    def test_giant_tool_result_sidechain_and_utf8_tail_keep_only_dialogue_and_latest_conclusion(self):
+        path = self.iso.root / f"{self.SID}.jsonl"
+        self.append_claude(path, self.claude_row("user", "u1", "시작 " + "가" * 6000))
+        self.append_claude(path, {"type": "assistant", "uuid": "summary", "isCompactSummary": True,
+                                  "message": {"content": [{"type": "text", "text": "요약 본문"}]}})
+        info = path.stat()
+        anchor = {"boundary_offset": info.st_size, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        self.append_claude(path, {"type": "user", "uuid": "u-tool", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "SECRET-" + "x" * (2 << 20)}]}})
+        pending = tt.compact_observation("claude", self.SID, str(path), anchor)
+        self.assertNotEqual(pending["state"], "ready")
+        self.append_claude(path, {**self.claude_row("assistant", "side", "sidechain 비공개", stop="end_turn"),
+                                  "isSidechain": True})
+        self.assertNotEqual(tt.compact_observation("claude", self.SID, str(path), anchor)["state"], "ready")
+        self.append_claude(path, self.claude_row("user", "u2", "다음 요청 " + "나" * 6000))
+        self.append_claude(path, self.claude_row("assistant", "a-final", "마지막 결론: 한글 끝", stop="end_turn"))
+        ready = tt.compact_observation("claude", self.SID, str(path), anchor)
+        self.assertEqual(ready["state"], "ready")
+        self.assertLessEqual(len(ready["recent"].encode("utf-8")), tt.COMPACT_RECENT_BYTES)
+        self.assertTrue(ready["recent"].endswith("마지막 결론: 한글 끝"))
+        self.assertNotIn("SECRET", ready["recent"])
+        self.assertNotIn("sidechain", ready["recent"])
+        ready["recent"].encode("utf-8")          # a cut inside a character never leaves invalid text
+        self.assertTrue(ready["recent_partial"])  # no preservedSegment metadata: coverage is not claimed
+
+    def test_malformed_latest_row_other_session_and_missing_boundary_never_become_ready(self):
+        path = self.iso.root / f"{self.SID}.jsonl"
+        self.append_claude(path, self.claude_row("assistant", "a1", "완료", stop="end_turn"))
+        info = path.stat()
+        anchor = {"boundary_offset": info.st_size, "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        self.assertEqual(tt.compact_observation("claude", self.SID, str(path), anchor)["state"], "ready")
+        self.assertEqual(tt.compact_observation("claude", "another-session", str(path), anchor)["state"], "unknown")
+        self.assertEqual(tt.compact_observation("claude", self.SID, str(path), {})["state"], "unknown")
+        with path.open("ab") as handle:
+            handle.write(b"{not-json}\n")
+        self.assertEqual(tt.compact_observation("claude", self.SID, str(path), anchor)["state"], "unknown")
+
+
+class OpenCodeCompactObservationTest(TidyCase):
+    SID = "ses_fixture0000000000000001"
+
+    def setUp(self):
+        super().setUp()
+        load_opencode_fixture(self.iso.opencode_db)
+
+    def message(self, con, mid, data, time_ms):
+        con.execute("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+                    (mid, self.SID, time_ms, time_ms, json.dumps(data)))
+
+    def part(self, con, pid, mid, data, time_ms):
+        con.execute("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (pid, mid, self.SID, time_ms, time_ms, json.dumps(data)))
+
+    def test_matching_auto_part_latest_user_parent_finish_and_native_idle_are_required(self):
+        con = sqlite3.connect(self.iso.opencode_db)
+        self.addCleanup(con.close)
+        base_time = 1_800_000_000_000
+        self.message(con, "compact-parent", {"role": "user", "time": {"created": base_time}}, base_time)
+        self.part(con, "compact-part", "compact-parent", {"type": "compaction", "auto": True,
+                                                            "tail_start_id": "compact-parent"}, base_time)
+        self.message(con, "summary", {"role": "assistant", "summary": True,
+                                        "parentID": "compact-parent", "time": {"created": base_time + 1}}, base_time + 1)
+        self.part(con, "summary-text", "summary", {"type": "text", "text": "요약"}, base_time + 1)
+        self.message(con, "user-current", {"role": "user", "time": {"created": base_time + 2}}, base_time + 2)
+        self.part(con, "user-text", "user-current", {"type": "text", "text": "계속 요청"}, base_time + 2)
+        self.message(con, "assistant-current", {"role": "assistant", "parentID": "user-current",
+                                                  "finish": "stop", "time": {"created": base_time + 3}}, base_time + 3)
+        self.part(con, "assistant-text", "assistant-current", {"type": "text", "text": "최종 결과"}, base_time + 3)
+        con.commit()
+        anchor = {"summary_id": "summary", "parent_id": "compact-parent",
+                  "tail_start_id": "compact-parent", "compaction_part_id": "compact-part"}
+        self.assertEqual(tt.compact_observation("opencode", self.SID, str(self.iso.opencode_db), anchor,
+                                                native_idle=False)["state"], "pending")
+        ready = tt.compact_observation("opencode", self.SID, str(self.iso.opencode_db), anchor,
+                                       native_idle=True)
+        self.assertEqual(ready["state"], "ready")
+        self.assertIn("최종 결과", ready["recent"])
+        con.execute("UPDATE message SET data = ? WHERE id = 'assistant-current'",
+                    (json.dumps({"role": "assistant", "parentID": "user-current", "finish": "tool-calls"}),))
+        con.commit()
+        self.assertEqual(tt.compact_observation("opencode", self.SID, str(self.iso.opencode_db), anchor,
+                                                native_idle=True)["state"], "pending")
+        con.execute("UPDATE message SET data = ? WHERE id = 'assistant-current'",
+                    (json.dumps({"role": "assistant", "parentID": "user-current", "finish": "stop"}),))
+        con.commit()
+        self.assertEqual(tt.compact_observation("opencode", self.SID, str(self.iso.opencode_db), anchor,
+                                                native_idle=True)["state"], "ready")
+
+    def seed_opencode_compact(self, con, *, user_data=None, assistant_data=None, auto=True):
+        base_time = 1_800_000_000_000
+        self.message(con, "compact-parent", {"role": "user", "time": {"created": base_time}}, base_time)
+        self.part(con, "compact-part", "compact-parent", {"type": "compaction", "auto": auto,
+                                                            "tail_start_id": "compact-parent"}, base_time)
+        self.message(con, "summary", {"role": "assistant", "summary": True, "finish": "stop",
+                                        "parentID": "compact-parent", "time": {"created": base_time + 1}}, base_time + 1)
+        self.part(con, "summary-text", "summary", {"type": "text", "text": "요약"}, base_time + 1)
+        if user_data is not None:
+            self.message(con, "user-current", user_data, base_time + 2)
+            self.part(con, "user-text", "user-current", {"type": "text", "text": "요청"}, base_time + 2)
+        if assistant_data is not None:
+            self.message(con, "assistant-current", assistant_data, base_time + 3)
+            self.part(con, "assistant-text", "assistant-current", {"type": "text", "text": "응답"}, base_time + 3)
+        con.commit()
+        return {"summary_id": "summary", "parent_id": "compact-parent",
+                "tail_start_id": "compact-parent", "compaction_part_id": "compact-part"}
+
+    def observe(self, anchor, idle=True):
+        return tt.compact_observation("opencode", self.SID, str(self.iso.opencode_db), anchor,
+                                      native_idle=idle)["state"]
+
+    def test_summary_finish_synthetic_continuation_error_and_manual_part_are_not_completion(self):
+        con = sqlite3.connect(self.iso.opencode_db)
+        self.addCleanup(con.close)
+        anchor = self.seed_opencode_compact(con)              # only the summary exists: its finish is not the turn
+        self.assertEqual(self.observe(anchor), "pending")
+        con.execute("DELETE FROM message WHERE id IN ('user-current', 'assistant-current')")
+        base_time = 1_800_000_000_000
+        self.message(con, "user-current", {"role": "user", "synthetic": True, "time": {"created": base_time + 2}},
+                     base_time + 2)
+        self.message(con, "assistant-current", {"role": "assistant", "parentID": "user-current", "finish": "stop",
+                                                  "time": {"created": base_time + 3}}, base_time + 3)
+        con.commit()
+        self.assertEqual(self.observe(anchor), "pending")     # synthetic continue user + an older finish
+        con.execute("UPDATE message SET data = ? WHERE id = 'user-current'",
+                    (json.dumps({"role": "user", "time": {"created": base_time + 2}}),))
+        con.execute("UPDATE message SET data = ? WHERE id = 'assistant-current'",
+                    (json.dumps({"role": "assistant", "parentID": "user-current", "finish": "stop",
+                                 "error": {"name": "UnknownError"}}),))
+        con.commit()
+        self.assertEqual(self.observe(anchor), "pending")     # an errored finish
+        con.execute("UPDATE message SET data = ? WHERE id = 'assistant-current'",
+                    (json.dumps({"role": "assistant", "parentID": "other-user", "finish": "stop"}),))
+        con.commit()
+        self.assertEqual(self.observe(anchor), "pending")     # not the latest user's answer
+        con.execute("UPDATE message SET data = ? WHERE id = 'assistant-current'",
+                    (json.dumps({"role": "assistant", "parentID": "user-current", "finish": "stop"}),))
+        con.commit()
+        self.assertEqual(self.observe(anchor, idle=False), "pending")
+        self.assertEqual(self.observe(anchor), "ready")
+        con.execute("UPDATE part SET data = ? WHERE id = 'compact-part'",
+                    (json.dumps({"type": "compaction", "auto": False}),))
+        con.commit()
+        self.assertEqual(self.observe(anchor), "unknown")     # a manual compaction never clears
+
+    def test_stale_other_session_and_pre_booking_runtime_status_never_mark_idle(self):
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root)}
+        context = {"trigger": "auto", "identity": "opencode-status", "transcript": str(self.iso.opencode_db)}
+        with self.iso.patched_environ(extra), mock.patch.object(clear, "_start_helper", return_value=1), \
+                mock.patch.object(clear, "herdr_command", return_value="/bin/true"):
+            seat = st.resolve_seat("opencode", str(self.cwd), sid=self.SID)
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "opencode", self.SID, "요약", cwd=str(self.cwd),
+                              prompt_seq=st.read_prompt_seq(seat), origin="runtime-compact",
+                              compact_context=context)
+            clear.schedule_for_enqueue(seat, "opencode", self.SID, str(self.cwd), compact_context=context)
+            req = clear.read_reservation(seat.key)
+            self.assertFalse(clear.observe_runtime_status(self.SID, "idle", observed_at=req["created"] - 5,
+                                                          cwd=str(self.cwd)))
+            self.assertFalse(clear.observe_runtime_status("ses_other", "idle", observed_at=req["created"] + 1,
+                                                          cwd=str(self.cwd)))
+            self.assertNotIn("runtime_status", clear.read_reservation(seat.key))
+            self.assertTrue(clear.observe_runtime_status(self.SID, "busy", observed_at=req["created"] + 1,
+                                                         cwd=str(self.cwd)))
+            held = clear.read_reservation(seat.key)
+            self.assertEqual(held["runtime_status"]["status"], "busy")
+            self.assertEqual(clear.compact_observation(held)["state"], "unknown")   # no anchor/idle: never ready
+
+
+    def test_matching_auto_compact_and_post_booking_idle_observation_clear_once(self):
+        import dispatch_seat_handover as handover
+        base_time = 1_800_000_000_000
+        con = sqlite3.connect(self.iso.opencode_db)
+        self.addCleanup(con.close)
+        self.message(con, "compact-parent", {"role": "user", "time": {"created": base_time}}, base_time)
+        self.part(con, "compact-part", "compact-parent", {"type": "compaction", "auto": True,
+                                                            "tail_start_id": "compact-parent"}, base_time)
+        self.message(con, "summary", {"role": "assistant", "summary": True,
+                                        "parentID": "compact-parent", "time": {"created": base_time + 1}}, base_time + 1)
+        self.part(con, "summary-text", "summary", {"type": "text", "text": "요약 전문"}, base_time + 1)
+        self.message(con, "user-current", {"role": "user", "time": {"created": base_time + 2}}, base_time + 2)
+        self.part(con, "user-text", "user-current", {"type": "text", "text": "요청"}, base_time + 2)
+        self.message(con, "assistant-current", {"role": "assistant", "parentID": "user-current",
+                                                  "finish": "stop", "time": {"created": base_time + 3}}, base_time + 3)
+        self.part(con, "assistant-text", "assistant-current", {"type": "text", "text": "새 세션에서 볼 결론"},
+                  base_time + 3)
+        con.commit()
+
+        fake_herdr = self.iso.root / "fake-herdr"
+        fake_herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_herdr.chmod(0o755)
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(fake_herdr)}
+        context = {"trigger": "auto", "identity": "opencode-e2e", "transcript": str(self.iso.opencode_db),
+                   "summary_id": "summary", "parent_id": "compact-parent",
+                   "tail_start_id": "compact-parent", "compaction_part_id": "compact-part"}
+        with self.iso.patched_environ(extra), mock.patch.object(clear, "_start_helper", return_value=1), \
+                mock.patch.object(clear, "herdr_command", return_value=str(fake_herdr)):
+            seat = st.resolve_seat("opencode", str(self.cwd), sid=self.SID)
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "opencode", self.SID, "요약 전문", cwd=str(self.cwd),
+                              prompt_seq=st.read_prompt_seq(seat), origin="runtime-compact",
+                              compact_context=context)
+            clear.schedule_for_enqueue(seat, "opencode", self.SID, str(self.cwd), compact_context=context)
+            req = clear.read_reservation(seat.key)
+            stale = st.run_hook("opencode", "runtime-status", self.SID, cwd=str(self.cwd),
+                                compact_context={"status": "idle",
+                                                 "observed_at": (req["created"] - 5) * 1000},
+                                env=os.environ)
+            self.assertEqual(stale, "")
+            held = clear.read_reservation(seat.key)
+            self.assertNotIn("runtime_status", held)
+            self.assertEqual(clear.compact_observation(held)["state"], "pending")
+            snapshot_calls, send_calls = [], []
+            idle_events, observations = [], []
+
+            def observe_new_idle(_seconds):
+                idle_events.append(st.run_hook(
+                    "opencode", "runtime-status", self.SID, cwd=str(self.cwd),
+                    compact_context={"status": "idle", "observed_at": (req["created"] + 1) * 1000},
+                    env=os.environ))
+                accepted = clear.read_reservation(seat.key)
+                observations.append((accepted["runtime_status"], clear.compact_observation(accepted)["state"]))
+
+            with mock.patch.object(handover, "write_snapshot_locked",
+                                   side_effect=lambda *a, **k: snapshot_calls.append(1) or 1):
+                result = clear.run_helper(
+                    seat.key, req["nonce"], wait=lambda *_a: "idle",
+                    steward=lambda *_a: send_calls.append("clear") or {
+                        "cleared": "true", "new_session": "sid-next"},
+                    continuer=lambda *_a: send_calls.append("continue") or {"continued": "true"},
+                    sleep=observe_new_idle)
+            with self.iso.patched_environ():
+                saved = st.read_latest_card(seat)
+        self.assertEqual(result, "continued")
+        self.assertEqual(send_calls, ["clear", "continue"])
+        self.assertEqual(idle_events, ["booking=pending"])
+        self.assertEqual(len(observations), 1)
+        runtime_status, observation_state = observations[0]
+        self.assertEqual((runtime_status["sid"], runtime_status["status"]), (self.SID, "idle"))
+        self.assertGreater(runtime_status["observed_at"], req["created"])
+        self.assertEqual(observation_state, "ready")
+        self.assertEqual(snapshot_calls, [1])
+        self.assertIn("새 세션에서 볼 결론", saved["body"])
+        self.assertIn(str(self.iso.opencode_db), saved["body"])
+
+
 class MemoryLayerTest(TidyCase):
     """Card layer B ("참고할 기억"): its own revision and receipt, beside the unchanged layer A."""
 
@@ -1384,6 +1695,14 @@ class ClearBookingTest(TidyCase):
         with self.iso.patched_environ():
             return clear.read_reservation(seat.key)
 
+    def write_compact_card(self, seat, sid="sid-A", identity="compact-A"):
+        context = {"trigger": "auto", "identity": identity, "transcript": ""}
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), st.seat_lock(seat.key):
+            st.write_card(seat, "claude", sid, "automatic summary", cwd=str(self.cwd),
+                          prompt_seq=st.read_prompt_seq(seat), origin="runtime-compact",
+                          compact_context=context)
+        return context
+
     def test_a_pane_inside_herdr_books_the_clear_with_the_exact_identity(self):
         self.hook("claude", "prompt", "sid-A")
         self.card("sid-A", "카드")
@@ -1408,6 +1727,91 @@ class ClearBookingTest(TidyCase):
             self.assertTrue(clear.read_reservation(seat.key)["continue_off"])
             self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd)), "clear=scheduled")
             self.assertFalse(clear.read_reservation(seat.key)["continue_off"])
+
+    def test_compact_booking_uses_three_hours_and_inherits_only_pending_no_continue(self):
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        with self.iso.patched_environ(extra), mock.patch.object(clear, "_start_helper", return_value=4242):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), no_continue=True)
+            context = self.write_compact_card(seat)
+            self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                        compact_context=context), "clear=scheduled continue=off")
+            req = clear.read_reservation(seat.key)
+            self.assertEqual(req["deadline"] - req["created"], clear.COMPACT_CLEAR_DEADLINE_SEC)
+            self.assertTrue(req["continue_off"])
+            self.assertEqual(req["compact"]["identity"], context["identity"])
+
+    def test_compact_does_not_replace_an_in_flight_clear_claim(self):
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        with self.iso.patched_environ(extra), mock.patch.object(clear, "_start_helper", return_value=4242):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            st.write_card(seat, "claude", "sid-A", "manual card", cwd=str(self.cwd))
+            clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd))
+            old = clear.read_reservation(seat.key)
+            claimed, reason = clear.claim_clear(clear.reservation_path(seat.key), old["nonce"])
+            self.assertEqual(reason, "")
+            context = self.write_compact_card(seat, identity="compact-B")
+            self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                        compact_context=context),
+                             "clear=skipped reason=clear-in-flight")
+            held = clear.read_reservation(seat.key)
+            self.assertEqual(held["nonce"], old["nonce"])
+            self.assertEqual(held["clear_claim"], claimed["clear_claim"])
+
+    def test_clear_claim_has_one_consumer_and_revalidates_compact_evidence(self):
+        _line, seat = self.book()
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            req = clear.read_reservation(seat.key)
+            first, reason = clear.claim_clear(clear.reservation_path(seat.key), req["nonce"])
+            self.assertEqual(reason, "")
+            self.assertIsNone(clear.claim_clear(clear.reservation_path(seat.key), req["nonce"])[0])
+            self.assertEqual(clear.validate_request(clear.reservation_path(seat.key), req["nonce"])[1], "superseded")
+            self.assertEqual(clear.validate_request(clear.reservation_path(seat.key), req["nonce"],
+                                                     _sending_claim=first["clear_claim"])[1], "")
+
+    def test_compact_to_compact_and_compact_to_manual_keep_one_booking_and_only_pending_stop(self):
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        with self.iso.patched_environ(extra), mock.patch.object(clear, "_start_helper", return_value=4242):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            first_ctx = self.write_compact_card(seat, identity="compact-1")
+            self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                        compact_context=first_ctx), "clear=scheduled")
+            first = clear.read_reservation(seat.key)
+            # the same callback again coalesces into the booking it already made
+            self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                        compact_context=first_ctx), "clear=scheduled")
+            self.assertEqual(clear.read_reservation(seat.key)["nonce"], first["nonce"])
+            second_ctx = self.write_compact_card(seat, identity="compact-2")
+            clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), compact_context=second_ctx)
+            second = clear.read_reservation(seat.key)
+            self.assertNotEqual(second["nonce"], first["nonce"])
+            self.assertEqual(second["compact"]["identity"], "compact-2")
+            self.assertFalse(second["continue_off"])
+            # a manual tidy afterwards keeps its own explicit choice and replaces the compact booking
+            self.assertEqual(clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), no_continue=True),
+                             "clear=scheduled continue=off")
+            manual = clear.read_reservation(seat.key)
+            self.assertNotIn("origin", manual)
+            self.assertNotEqual(manual["nonce"], second["nonce"])
+            # a stop carried by a finished booking, or by another session's booking, is not inherited
+            clear._finish(seat.key, manual["nonce"], "cleared")
+            third_ctx = self.write_compact_card(seat, identity="compact-3")
+            clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), compact_context=third_ctx)
+            self.assertFalse(clear.read_reservation(seat.key)["continue_off"])
+
+    def test_compact_never_inherits_a_stop_from_another_session_booking(self):
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        with self.iso.patched_environ(extra), mock.patch.object(clear, "_start_helper", return_value=4242):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            clear.schedule_for_enqueue(seat, "claude", "sid-OLD", str(self.cwd), no_continue=True)
+            context = self.write_compact_card(seat, sid="sid-A", identity="compact-other")
+            result = clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), compact_context=context)
+            self.assertEqual(result, "clear=skipped reason=booking-target-changed")
+            self.assertEqual(clear.read_reservation(seat.key)["sid"], "sid-OLD")
 
     def test_no_clear_keeps_the_window_and_cancels_a_pending_booking(self):
         line, seat = self.book()
@@ -1577,8 +1981,12 @@ class ClearHelperTest(TidyCase):
         self.fake_herdr = self.iso.root / "fake-herdr"
         self.fake_herdr.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.fake_herdr.chmod(0o755)
+        self.jobs = self.iso.root / "dispatch" / "jobs.log"
+        self.jobs.parent.mkdir()
+        self.jobs.write_text("", encoding="utf-8")
         self.extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
-                      "HEARTING_TIDY_HERDR": str(self.fake_herdr), "HEARTING_TIDY_CLEAR_OBSERVE": "0.3"}
+                      "HEARTING_TIDY_HERDR": str(self.fake_herdr), "HEARTING_TIDY_CLEAR_OBSERVE": "0.3",
+                      "AGENT_DISPATCH_JOBS": str(self.jobs)}
         self.calls = []
 
     def test_helper_env_keeps_the_herdr_socket_but_not_the_callers_pane(self):
@@ -1596,6 +2004,27 @@ class ClearHelperTest(TidyCase):
             seat = st.resolve_seat(harness, str(self.cwd))
             clear.schedule_for_enqueue(seat, harness, sid, str(self.cwd))
             return seat, clear.read_reservation(seat.key)
+
+    def compact_booked(self):
+        path = self.iso.root / "sid-A.jsonl"
+        path.write_text(json.dumps({"type": "assistant", "uuid": "a-before",
+                                    "message": {"stop_reason": "tool_use", "content": [
+                                        {"type": "text", "text": "tool call"}]}}) + "\n"
+                        + json.dumps({"type": "user", "uuid": "u-tool", "message": {
+                            "content": [{"type": "tool_result", "tool_use_id": "t", "content": "result"}]}})
+                        + "\n", encoding="utf-8")
+        info = path.stat()
+        context = {"trigger": "auto", "identity": "compact-helper-test", "transcript": str(path),
+                   "boundary_offset": info.st_size,
+                   "transcript_identity": f"{info.st_dev}:{info.st_ino}"}
+        with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=1):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            with st.seat_lock(seat.key):
+                st.write_card(seat, "claude", "sid-A", "full compact summary", cwd=str(self.cwd),
+                              prompt_seq=st.read_prompt_seq(seat), origin="runtime-compact",
+                              compact_context=context)
+            clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), compact_context=context)
+            return seat, clear.read_reservation(seat.key), path
 
     def run_helper(self, seat, req, wait="idle", verdict=None, during=None):
         def fake_wait(pane, timeout_ms):
@@ -1634,6 +2063,129 @@ class ClearHelperTest(TidyCase):
         self.assertEqual(len(self.notices(seat)), 1)
         self.assertIn("10분", self.notices(seat)[0])
         self.assertIn("/clear", self.notices(seat)[0])
+
+    def test_full_compact_false_idle_waits_for_end_turn_then_clears_and_enriches_same_card(self):
+        import dispatch_seat_handover as handover
+        seat, req, transcript = self.compact_booked()
+        def owner_row(attempt):
+            meta = {"attempt_id": attempt, "parent_sid": "sid-A", "parent_harness": "claude",
+                    "dispatch_depth": "1", "worker_type": "owner", "route_id": "rt-1",
+                    "route_hash": "sha256:aa", "route_node": "execute", "route_file": "/tmp/rt-1.json"}
+            return "2026-10-15T00:00:00Z\topen\t/w\t/w\tslug\t" + ",".join(
+                f"{key}={value}" for key, value in meta.items())
+        self.jobs.write_text(owner_row("att-before") + "\n", encoding="utf-8")
+        calls, snapshots, slept = [], [], []
+
+        def wait(_pane, _timeout):
+            calls.append("wait")
+            return "idle"                    # herdr's compact-time idle is deliberately false
+
+        def finish_turn():
+            if not slept:
+                with transcript.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"type": "assistant", "uuid": "a-final",
+                                             "message": {"stop_reason": "end_turn", "content": [
+                                                 {"type": "text", "text": "최종 결과: 끝"}]}}) + "\n")
+                with self.jobs.open("a", encoding="utf-8") as handle:
+                    handle.write(owner_row("att-after") + "\n")
+            slept.append(True)
+
+        real_snapshot = handover.write_snapshot_locked
+        def snapshot(*args, **kwargs):
+            snapshots.append(1)
+            return real_snapshot(*args, **kwargs)
+        with self.iso.patched_environ(self.extra), mock.patch.object(handover, "write_snapshot_locked",
+                                                                       side_effect=snapshot):
+            outcome = clear.run_helper(
+                seat.key, req["nonce"], wait=wait,
+                steward=lambda *_a: calls.append("clear") or {"cleared": "true", "new_session": "sid-B"},
+                continuer=lambda *_a: calls.append("continue") or {"continued": "true"},
+                sleep=lambda _s: finish_turn())
+        self.assertEqual(outcome, "continued")
+        self.assertEqual(calls, ["wait", "wait", "clear", "continue"])
+        self.assertEqual(snapshots, [1])
+        with self.iso.patched_environ(self.extra):
+            snap = handover.read_snapshot(seat.key)
+        self.assertEqual([binding["attempt"] for binding in snap["bindings"]], ["att-before", "att-after"])
+        with self.iso.patched_environ():
+            card = st.read_latest_card(seat)
+        self.assertEqual(card["generation"], req["card_generation"])
+        self.assertIn("최종 결과: 끝", card["body"])
+        self.assertEqual(card["compact"]["summary"], "full compact summary")
+
+    def test_compact_wait_exceeds_ten_minutes_but_stays_inside_three_hour_deadline(self):
+        seat, req, transcript = self.compact_booked()
+        now = [req["created"]]
+        calls = []
+
+        def advance(_seconds):
+            now[0] += 601
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "assistant", "uuid": "a-late",
+                                         "message": {"stop_reason": "end_turn", "content": [
+                                             {"type": "text", "text": "600초 뒤 완료"}]}}) + "\n")
+
+        with self.iso.patched_environ(self.extra), mock.patch.object(st, "now_epoch", side_effect=lambda: now[0]):
+            outcome = clear.run_helper(
+                seat.key, req["nonce"], wait=lambda *_a: calls.append("wait") or "idle",
+                steward=lambda *_a: calls.append("clear") or {"cleared": "true", "new_session": "sid-B"},
+                continuer=lambda *_a: {"continued": "true"}, sleep=advance)
+        self.assertEqual(outcome, "continued")
+        self.assertGreater(now[0] - req["created"], 600)
+        self.assertLess(now[0] - req["created"], clear.COMPACT_CLEAR_DEADLINE_SEC)
+        self.assertEqual(calls, ["wait", "wait", "clear"])
+
+    def test_compact_three_hour_expiry_never_calls_steward(self):
+        seat, req, _transcript = self.compact_booked()
+        now = [req["created"]]
+        calls = []
+
+        def advance(_seconds):
+            now[0] = req["deadline"] + 1
+
+        with self.iso.patched_environ(self.extra), mock.patch.object(st, "now_epoch", side_effect=lambda: now[0]):
+            outcome = clear.run_helper(seat.key, req["nonce"], wait=lambda *_a: "idle",
+                                       steward=lambda *_a: calls.append("clear") or {"cleared": "true"},
+                                       sleep=advance)
+        self.assertEqual(outcome, "skipped")
+        self.assertEqual(calls, [])
+        self.assertIn("3시간", self.notices(seat)[0])
+
+    def test_false_idle_polls_with_bounded_sleeps_and_a_replaced_booking_stops_without_a_send(self):
+        seat, req, _transcript = self.compact_booked()
+        sleeps, calls = [], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 5:                     # a newer tidy replaces the booking mid-wait
+                clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd))
+
+        with self.iso.patched_environ(self.extra), mock.patch.object(clear, "_start_helper", return_value=1):
+            outcome = clear.run_helper(seat.key, req["nonce"], wait=lambda *_a: calls.append("wait") or "idle",
+                                       steward=lambda *_a: calls.append("clear") or {"cleared": "true"},
+                                       sleep=sleep)
+        self.assertEqual(outcome, "superseded")
+        self.assertEqual(calls, ["wait"] * 5)
+        self.assertTrue(all(0 < value <= clear.COMPACT_POLL_SEC for value in sleeps))
+
+    def test_recent_tail_refresh_failure_keeps_the_complete_summary_and_still_clears(self):
+        seat, req, transcript = self.compact_booked()
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "assistant", "uuid": "a-final", "message": {
+                "stop_reason": "end_turn", "content": [{"type": "text", "text": "끝"}]}}) + "\n")
+        calls = []
+        with self.iso.patched_environ(self.extra), \
+                mock.patch.object(st, "update_compact_card_locked", side_effect=OSError("fixture")):
+            outcome = clear.run_helper(seat.key, req["nonce"], wait=lambda *_a: "idle",
+                                       steward=lambda *_a: calls.append("clear") or {
+                                           "cleared": "true", "new_session": "sid-B"},
+                                       continuer=lambda *_a: calls.append("continue") or {"continued": "true"},
+                                       sleep=lambda _s: None)
+        self.assertEqual((outcome, calls), ("continued", ["clear", "continue"]))
+        with self.iso.patched_environ():
+            card = st.read_latest_card(seat)
+        self.assertEqual(card["generation"], req["card_generation"])
+        self.assertEqual(card["compact"]["summary"], "full compact summary")
 
     def test_a_prompt_that_arrives_before_idle_cancels_the_clear(self):
         seat, req = self.booked()

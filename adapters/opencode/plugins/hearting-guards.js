@@ -33,6 +33,8 @@ const promptBySession = new Map()
 const turnBySession = new Map()
 const sessionInfoById = new Map()
 const compactStartedBySession = new Map()
+const compactStatusUntil = new Map()
+const runtimeStatusBySession = new Map()
 // Prompt-lifecycle context that must stay visible for every model call of a
 // session, not just its first one. OpenCode has no Claude-style
 // `additionalContext` that merges into the user turn and persists in history:
@@ -283,10 +285,43 @@ function runCompactHook(action, payload = {}) {
     const result = spawnSync("python3", [path.join(root, "utilities", "worker-state-hook.py"),
       action, "--harness", "opencode"], {
       cwd: root, env: { ...process.env, AGENT_HOME: root }, input: JSON.stringify(payload),
-      encoding: "utf8", timeout: 4000, killSignal: "SIGKILL",
+      encoding: "utf8", timeout: action === "runtime-status" ? 750 : 4000, killSignal: "SIGKILL",
     })
     return result.status === 0 ? (result.stdout || "").trim() : ""
   } catch { return "" }
+}
+
+function observeCompactRuntimeStatus(ctx, sid, status) {
+  if (!sid || isWorkerSession() || isCompactSubSession()) return
+  const normalized = String(status || "").toLowerCase()
+  if (!normalized) return
+  const observedAt = Date.now()
+  runtimeStatusBySession.set(sid, { status: normalized, observedAt })
+  const until = compactStatusUntil.get(sid) || 0
+  if (until <= observedAt) {
+    compactStatusUntil.delete(sid)
+    return
+  }
+  const result = runCompactHook("runtime-status", {
+    sessionID: sid, cwd: baseDir(ctx), status: normalized, observed_at: observedAt,
+  })
+  if (result !== "booking=pending") compactStatusUntil.delete(sid)
+}
+
+async function currentCompactRuntimeStatus(ctx, sid) {
+  if (typeof ctx.client?.session?.status !== "function") return ""
+  const controller = new AbortController()
+  let timer
+  try {
+    const result = await Promise.race([
+      ctx.client.session.status({ signal: controller.signal }),
+      new Promise((resolve) => { timer = setTimeout(() => { controller.abort(); resolve(null) }, 500) }),
+    ])
+    const data = sdkResponseData(result)
+    const value = data?.[sid] || data?.status?.[sid]
+    if (value == null) return ""
+    return typeof value === "string" ? value : String(value?.type || "")
+  } catch { return "" } finally { clearTimeout(timer) }
 }
 
 function compactInfoTime(info) {
@@ -380,9 +415,30 @@ async function afterCompact(ctx, event) {
       summary = (rows.find((row) => row?.info?.id === latest.id)?.parts || [])
         .filter((part) => part?.type === "text" && typeof part.text === "string")
         .map((part) => part.text).join("\n")
+      const parentID = String(latest.parentID || "")
+      const parent = rows.find((row) => row?.info?.id === parentID)
+      const compaction = (parent?.parts || []).find((part) => part?.type === "compaction")
+      const auto = typeof compaction?.auto === "boolean" ? compaction.auto
+        : typeof compaction?.data?.auto === "boolean" ? compaction.data.auto : null
+      const trigger = auto === true ? "auto" : auto === false ? "manual" : "unknown"
+      const tailStartID = String(compaction?.tail_start_id || compaction?.data?.tail_start_id || parentID)
+      const booking = runCompactHook("compact-after", {
+        sessionID: sid, cwd: baseDir(ctx), worker: false, summary, trigger,
+        summary_id: String(latest.id || ""), parent_id: parentID,
+        tail_start_id: tailStartID, compaction_part_id: String(compaction?.id || ""),
+      })
+      if (trigger === "auto" && booking === "booking=scheduled") {
+        compactStatusUntil.set(sid, Date.now() + 3 * 60 * 60 * 1000)
+      }
+      const status = compactStatusUntil.get(sid)
+      if (status && status > Date.now()) {
+        const current = await currentCompactRuntimeStatus(ctx, sid)
+        if (current) observeCompactRuntimeStatus(ctx, sid, current)
+      }
+      return
     }
   }
-  runCompactHook("compact-after", { sessionID: sid, cwd: baseDir(ctx), worker: false, summary })
+  runCompactHook("compact-after", { sessionID: sid, cwd: baseDir(ctx), worker: false, summary, trigger: "unknown" })
 }
 
 // One native launch event and one publisher belong to this module/process, not
@@ -1464,10 +1520,14 @@ export const AgentHarnessGuards = async (ctx) => {
     // touches the heartbeat; memory has no
     // idle or session-end step (it exchanges after writes and reads, D-82/D-83).
     if (event && event.type === "session.status") {
-      completionCarrier.status(event.properties?.sessionID || "", event.properties?.status?.type || "")
+      const statusSid = event.properties?.sessionID || ""
+      const statusType = event.properties?.status?.type || ""
+      completionCarrier.status(statusSid, statusType)
+      observeCompactRuntimeStatus(ctx, statusSid, statusType)
     }
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
+      observeCompactRuntimeStatus(ctx, eventSid, "idle")
       observePaneCallback(ctx, "session.idle", eventSid)
       if (!isWorkerSession()) {
         spawnSummary(eventSid, "final")
@@ -1495,6 +1555,8 @@ export const AgentHarnessGuards = async (ctx) => {
         peerGuidanceBySession.delete(sid)
         contextAlertBySession.delete(sid)
         paneProjectionRetryAt.delete(sid)
+        compactStatusUntil.delete(sid)
+        runtimeStatusBySession.delete(sid)
         invalidatePaneOrigin(sid)
       }
     }
