@@ -15,6 +15,14 @@ This is the portable capability contract for `session-tidy`. It defines runtime-
 
 ## Invocation Semantics
 
+Whenever a seat card is injected, its fixed header instructs the receiving session to
+start its first reply, before any tool call, with one summary in the user's language,
+about five lines using the three headings `하던 일 · 남은 일 · 다음 할 일`, then continue.
+If the user first gives a different instruction instead of continuing, skip the summary
+and follow only that instruction. This guidance survives body truncation within the
+2,400-byte injection limit, including bundled memory references; it is absent from
+late memory-only injections and peer handoff messages.
+
 Claude Code, Codex, and OpenCode give the interactive main session a non-blocking notice based on the latest request's input usage: strictly above 500,000 tokens recommends `/session-tidy`, and strictly above 700,000 asks for tidying now. Each threshold is emitted once per native session ID; a jump across both emits the urgent notice once and consumes both. Compaction does not reset these notices. Owners, workers, auxiliary/reviewer sessions, and subagents are excluded. These notices do not change the runtime's compaction policy.
 
 Runtime compaction counts as a session tidy invocation by the main session. Each completed summary may be saved to that session's own seat card and queues memory tidying; a shared project fallback seat only queues memory tidying, so one session's compaction never replaces another session's card. Only a nonempty automatic Claude or OpenCode summary that was successfully saved to its own verified herdr pane/native seat may use the existing tidy booking to snapshot handover state, clear, and continue. The detached helper waits for transcript evidence that the turn containing that compaction actually ended; an idle signal by itself is insufficient, and a compact booking may wait up to three hours. The card preserves the full summary, a bounded recent conversation tail the summary may not have seen, and the original transcript path. Manual or unknown compaction, an empty summary, failed card persistence, a project fallback/outside-herdr seat, workers or sub-sessions, and Codex remote-V2 compaction never trigger automatic clear. Codex compaction remains queue-only; its existing manual tidy clear/continue behavior is unchanged. Never block or delay compaction to complete tidying. Worker sessions are excluded.
