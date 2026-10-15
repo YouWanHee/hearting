@@ -65,6 +65,22 @@ class TestProgressLaunch(unittest.TestCase):
             self.assertEqual(R.read_sentinel(row["sentinel"]), 0)
 
 
+class PayloadSessionEnvironmentTest(unittest.TestCase):
+    def test_gpu_payload_uses_lease_owner_and_explicit_cpu_keeps_environment(self):
+        from session_identity import session_env
+        declared = session_env()
+        source = {key: "stale-" + key for names in declared.values() for key in names}
+        source["KEEP_ME"] = "preserved"
+        lease = {"owner": {"kind": "session", "harness": "claude", "id": "route-parent"}}
+        updated = R.gpu_payload_environment(source, lease)
+        self.assertEqual(source[declared["claude"][0]], "stale-" + declared["claude"][0])
+        self.assertEqual(updated[declared["claude"][0]], "route-parent")
+        self.assertEqual(updated["KEEP_ME"], "preserved")
+        session_keys = {key for names in declared.values() for key in names}
+        self.assertFalse((session_keys - {declared["claude"][0]}) & updated.keys())
+        self.assertIs(R.gpu_payload_environment(source, None), source)
+
+
 class TestRunner(unittest.TestCase):
     def test_verified_publication_cas_preserves_changed_or_missing_reservation(self):
         expected = {"run_id":"resume", "status":"launching", "command":["approved"], "token":"one"}

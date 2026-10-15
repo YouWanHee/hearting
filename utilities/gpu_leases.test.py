@@ -111,7 +111,8 @@ class LeasesTest(unittest.TestCase):
                 "run_dir": str(run_dir), "inner": inner}
 
     def launch(self, options):
-        code = SOURCE + '\nprint(json.dumps(launch_compute(%r, %r)))' % (options, SOURCE)
+        payload_source = G.serialized_payload_source()
+        code = SOURCE + '\nprint(json.dumps(launch_compute(%r, %r)))' % (options, payload_source)
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
@@ -140,6 +141,151 @@ class LeasesTest(unittest.TestCase):
         self.assertEqual(receipt["gpus"], "1")
         self.assertEqual(subprocess.run(["sh", "-c", env["HEARTING_GPU_LEASE_RELEASE"]]).returncode, 0)
         self.assertNotIn(lease["token"], {r["token"] for r in G.snapshot(self.state)})
+
+    def _registered_jobs(self, *, include_child=False, parent_sid="registered-parent"):
+        jobs = self.root / "dispatch" / "jobs.log"
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        owner_meta = {
+            "attempt_id": "att-route-owner", "worker_type": "owner", "dispatch_depth": "1",
+            "owner_route_id": "rt-gpu-owner", "owner_route_hash": "sha256:gpu-owner",
+            "parent_sid": parent_sid,
+        }
+        def row(status, slug, metadata):
+            values = ",".join("%s=%s" % item for item in metadata.items())
+            return "\t".join(("2099-01-01T00:00:00Z", status, "/work", "/work", slug, values)) + "\n"
+        content = row("done", "owner", owner_meta)
+        if include_child:
+            child_meta = {
+                "attempt_id": "att-route-child", "parent_attempt_id": "att-route-owner",
+                "worker_type": "stage", "dispatch_depth": "2", "route_id": "rt-gpu-owner",
+                "route_hash": "sha256:gpu-owner", "route_node": "execute",
+            }
+            content += row("open", "execute", child_meta)
+        jobs.write_text(content, encoding="utf-8")
+        return jobs, owner_meta
+
+    def _route_ledger(self, state, harness, sid):
+        path = Path(state) / harness / (sid + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"event": "compose", "sid": sid}) + "\n", encoding="utf-8")
+
+    def _owner_environment(self, jobs, *, attempt="att-route-owner", depth="1",
+                           caller="codex", session_key="CODEX_THREAD_ID", session_id=""):
+        return {"AGENT_DISPATCH_ATTEMPT_ID": attempt, "AGENT_DISPATCH_DEPTH": depth,
+                "AGENT_DISPATCH_JOBS": str(jobs), "AGENT_DISPATCH_CALLER_HARNESS": caller,
+                session_key: session_id}
+
+    def test_registered_worker_environments_resolve_parent_harness_from_unique_ledger(self):
+        launchers = (("codex", "CODEX_THREAD_ID", ""),
+                     ("claude", "CLAUDE_CODE_SESSION_ID", "claude-worker"),
+                     ("opencode", "OPENCODE_SESSION_ID", "opencode-worker"))
+        for parent_harness in ("claude", "codex", "opencode"):
+            for caller, key, worker_sid in launchers:
+                with self.subTest(parent_harness=parent_harness, caller=caller):
+                    parent_sid = "parent-%s" % parent_harness
+                    jobs, _ = self._registered_jobs(parent_sid=parent_sid)
+                    route_state = self.root / ("route-chains-%s-%s" % (parent_harness, caller))
+                    self._route_ledger(route_state, parent_harness, parent_sid)
+                    environ = self._owner_environment(
+                        jobs, caller=caller, session_key=key, session_id=worker_sid)
+                    with mock.patch.dict(os.environ, {
+                            "XDG_STATE_HOME": str(self.root / "state-home"),
+                            "FLEET_ROUTE_CHAIN_DIR": str(route_state)}, clear=False):
+                        owner = G.launcher_owner(environ)
+                    self.assertEqual((owner["harness"], owner["id"]),
+                                     (parent_harness, parent_sid))
+
+    def test_registered_depth_two_attempt_resolves_its_exact_depth_one_parent(self):
+        jobs, _ = self._registered_jobs(include_child=True, parent_sid="depth-one-parent")
+        route_state = self.root / "route-chains-depth-two"
+        self._route_ledger(route_state, "codex", "depth-one-parent")
+        environ = self._owner_environment(
+            jobs, attempt="att-route-child", depth="2", caller="claude",
+            session_key="CLAUDE_CODE_SESSION_ID", session_id="child-session")
+        with mock.patch.dict(os.environ, {
+                "XDG_STATE_HOME": str(self.root / "state-home-depth-two"),
+                "FLEET_ROUTE_CHAIN_DIR": str(route_state)}, clear=False):
+            owner = G.launcher_owner(environ)
+        self.assertEqual((owner["harness"], owner["id"]), ("codex", "depth-one-parent"))
+
+    def test_local_resource_admission_records_registered_parent_as_lease_owner(self):
+        jobs, _ = self._registered_jobs(parent_sid="local-route-parent")
+        route_state = self.root / "route-chains-local-admission"
+        self._route_ledger(route_state, "opencode", "local-route-parent")
+        with mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_ATTEMPT_ID": "att-route-owner",
+                "AGENT_DISPATCH_DEPTH": "1",
+                "AGENT_DISPATCH_JOBS": str(jobs),
+                "AGENT_DISPATCH_CALLER_HARNESS": "claude",
+                "CLAUDE_CODE_SESSION_ID": "worker-session",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "XDG_STATE_HOME": str(self.root / "state-home-local-admission"),
+                "FLEET_ROUTE_CHAIN_DIR": str(route_state)}, clear=False), \
+             mock.patch.object(G, "local_observation", return_value=OBS):
+            path, lease, _env = G.resource_admission(
+                {"resource_class": "gpu"}, ["python", "train.py"],
+                jobs=jobs, run_id="local-registered-run")
+        self.assertEqual(path, self.state)
+        self.assertEqual((lease["owner"]["harness"], lease["owner"]["id"]),
+                         ("opencode", "local-route-parent"))
+        G.release(path, lease)
+
+    def test_confirmed_handover_supplies_current_sid_and_harness_without_parent_harness(self):
+        jobs, owner_meta = self._registered_jobs(parent_sid="before-clear")
+        state_home = self.root / "state-home-handover"
+        tidy = state_home / "hearting" / "session-tidy"
+        seat_key = "seat-fixture"
+        binding = {"jobs": str(jobs.resolve()), "attempt": "att-route-owner",
+                   "route": "rt-gpu-owner", "hash": "sha256:gpu-owner",
+                   "node": "", "parent": "before-clear"}
+        snapshot = {"schema": 1, "seat": {"kind": "pane", "key": seat_key},
+                    "from": {"harness": "claude", "sid": "before-clear"},
+                    "at": 1, "bindings": [binding]}
+        handover_dir = tidy / "handover"
+        handover_dir.mkdir(parents=True)
+        (handover_dir / (seat_key + ".json")).write_text(json.dumps(snapshot), encoding="utf-8")
+        ledger_dir = tidy / "sessions"
+        ledger_dir.mkdir(parents=True)
+        event = {"event": "handover", "from": "before-clear", "sid": "after-clear",
+                 "harness": "opencode", "ts": 2, "bindings": [binding]}
+        (ledger_dir / (seat_key + ".jsonl")).write_text(json.dumps(event) + "\n", encoding="utf-8")
+        environ = self._owner_environment(
+            jobs, caller="claude", session_key="CLAUDE_CODE_SESSION_ID", session_id="worker-session")
+        with mock.patch.dict(os.environ, {
+                "XDG_STATE_HOME": str(state_home),
+                "FLEET_ROUTE_CHAIN_DIR": str(self.root / "route-chains-handover")}, clear=False):
+            owner = G.launcher_owner(environ)
+        self.assertNotIn("parent_harness", owner_meta)
+        self.assertEqual((owner["harness"], owner["id"]), ("opencode", "after-clear"))
+
+    def test_registered_lineage_failures_do_not_fall_back_to_worker_session(self):
+        jobs, _ = self._registered_jobs(parent_sid="ambiguous-parent")
+        route_state = self.root / "route-chains-ambiguous"
+        self._route_ledger(route_state, "codex", "ambiguous-parent")
+        self._route_ledger(route_state, "claude", "ambiguous-parent")
+        environ = self._owner_environment(
+            jobs, caller="claude", session_key="CLAUDE_CODE_SESSION_ID", session_id="worker-session")
+        with mock.patch.dict(os.environ, {
+                "XDG_STATE_HOME": str(self.root / "state-home-ambiguous"),
+                "FLEET_ROUTE_CHAIN_DIR": str(route_state)}, clear=False):
+            self.assertIsNone(G.launcher_owner(environ))
+            missing = {**environ, "AGENT_DISPATCH_JOBS": str(self.root / "missing.log")}
+            self.assertIsNone(G.launcher_owner(missing))
+            malformed = {**environ, "AGENT_DISPATCH_DEPTH": "7"}
+            self.assertIsNone(G.launcher_owner(malformed))
+
+    def test_unregistered_identity_fallback_and_session_environment_alias_cleanup(self):
+        direct = {"AGENT_DISPATCH_CALLER_HARNESS": "codex", "CODEX_THREAD_ID": "direct-session"}
+        self.assertEqual(G.launcher_owner(direct)["id"], "direct-session")
+        source = {"CLAUDE_CODE_SESSION_ID": "worker-session", "CLAUDE_SESSION_ID": "old-alias",
+                  "CODEX_THREAD_ID": "foreign-codex", "OPENCODE_SESSION_ID": "foreign-opencode",
+                  "KEEP_ME": "preserved"}
+        owner = {"kind": "session", "harness": "codex", "id": "route-parent"}
+        updated = G.launcher_session_environment(source, owner=owner)
+        self.assertEqual(source["CLAUDE_CODE_SESSION_ID"], "worker-session")
+        self.assertEqual(updated["KEEP_ME"], "preserved")
+        self.assertEqual(updated.get("CODEX_THREAD_ID"), "route-parent")
+        self.assertFalse((set(G.session_environment_keys()) - {"CODEX_THREAD_ID"}) & updated.keys())
 
     def test_explicit_cpu_payload_in_gpu_scoped_route_skips_gpu_probe_and_lease(self):
         for value in ("", "-1"):
