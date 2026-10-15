@@ -348,7 +348,7 @@ class CodexInteractiveTest(_CodexFixture, unittest.TestCase):
         codex._ROLLOUT_VERSION_CACHE.clear()      # each fixture rewrites the same rollout path
         codex._TURN_CONTEXT_CACHE.clear()
         tick = codex._CodexTick(default_home=self.home, proc_paths={4343: path},
-                                subagents_by_home={}, no_fallback_pids=frozenset({4343}))
+                                subagents_by_home={})
         codex.enrich(session, tick=tick)
         projection.attach_projections([session], [], now=time.time())
         return session, session.to_dict(), _plain(

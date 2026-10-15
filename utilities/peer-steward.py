@@ -4776,13 +4776,13 @@ def _native_trust_reason(harness, lines):
 def _process_session(pane, harness):
     """The session the pane's foreground runtime process is on now, or None.
 
-    Claude uses `sessions/<pid>.json`, rewritten on `/clear`; Codex uses the
-    current full footer bound to the pane's foreground PID/start/group; OpenCode
-    uses its TUI selection record. Herdr's own `agent_session`
+    Claude uses `sessions/<pid>.json`, rewritten on `/clear`; Codex uses
+    process_identity for the foreground TUI, with a visible footer as an optional
+    mismatch check; OpenCode uses its TUI selection record. Herdr's own `agent_session`
     follows a `/clear` only when its integration reports it, and has been seen to keep
     the previous session for good (live panes 2026-10-01), so a second tidy in the same
-    window would otherwise never clear it. Codex's open rollout can also be historical
-    after `/new` or resume; the current footer owns the visible conversation."""
+    window would otherwise never clear it. Shared Codex callers use CODEX_THREAD_ID;
+    pane_ownership resolves that thread to its foreground TUI."""
     try:
         proc = subprocess.run(_herdr_argv("pane", "process-info", "--pane", pane),
                               capture_output=True, text=True, timeout=_herdr_get_timeout())

@@ -5,8 +5,9 @@ translation stays in its collector:
 
 - Claude: `~/.claude/sessions/<pid>.json`, else the statusline tap matched by
   pid and start time (`collectors.claude.session_id_of_process`);
-- Codex: the rollout the process holds open, the managed registry, or the
-  start-time match (`collectors.codex.session_id_of_process`);
+- Codex: the rollout the process holds open, or the root thread whose
+  `codex_tui` MCP origin is listening on that TUI PID
+  (`collectors.codex.session_id_of_process`);
 - OpenCode: the pane's own TUI selection record
   (`collectors.opencode.session_of_process`). The `--session` a pane was
   started with is reported as `started-on`, not proof: the TUI can switch

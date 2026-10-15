@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import socket
 import urllib.error
@@ -36,6 +37,7 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 from fleet import session_registry
 from fleet.model import ContextEvidence, SESSION_WORK_SEC, SubAgent
@@ -49,6 +51,7 @@ _INDEX_TTL = 1.5
 _START_MATCH_BEFORE_SEC = 5.0
 _START_MATCH_AFTER_SEC = 30.0
 _FALLBACK_CLAIMS = {"ts": 0.0, "sids": set()}  # session ids assigned without a proc fd
+_DAEMON_ORIGINS = {}  # control socket -> loaded thread id -> (origin port, thread source)
 _PROC_PATHS = {}                                  # pid -> rollout reserved at collect tick start
 _CFG = {"ts": 0.0, "model": None, "effort": None}
 _TITLE_INDEX = {"stamp": None, "map": {}, "runtime_map": {}}   # native state stamps -> sid: title
@@ -77,9 +80,6 @@ class _CodexTick:
     default_home: str
     proc_paths: dict
     subagents_by_home: dict
-    # pids whose rollout was handed to a managed peer — they must not re-claim any
-    # rollout via the same-cwd fallback (F-24: one sid, one row).
-    no_fallback_pids: frozenset = frozenset()
     # Exact parent ids the tick's subagent maps were scoped to (prepare_tick);
     # None means unscoped (legacy full build). enrich widens to full when a
     # session id outside the scope needs a lookup.
@@ -1146,23 +1146,225 @@ def _registered_thread(pid):
     return thread
 
 
+def _control_socket(environ):
+    """The App Server control socket selected by this Codex process's own environment."""
+    utilities = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "utilities"))
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
+    from codex_queue_dispatch import resolve_queue_socket
+    raw = dict(environ or {})
+    raw.setdefault("CODEX_HOME", _home())
+    return resolve_queue_socket(raw)
+
+
+def _origin_port(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        origin = urlsplit(value)
+        if origin.scheme != "http" or origin.hostname != "127.0.0.1":
+            return None
+        port = origin.port
+    except (TypeError, ValueError):
+        return None
+    return port if isinstance(port, int) and 1 <= port <= 65535 else None
+
+
+def _thread_source(thread):
+    if not isinstance(thread, dict):
+        return None
+    value = thread.get("threadSource") or thread.get("thread_source")
+    if isinstance(value, str) and value:
+        return value.lower()
+    source = thread.get("source")
+    if source == "subagent" or isinstance(source, dict) and "subagent" in source:
+        return "subagent"
+    return None
+
+
+def _daemon_thread_origins(environ):
+    """Read loaded Codex TUI MCP origins; cache each thread until it unloads.
+
+    The only daemon calls are initialize, thread/loaded/list,
+    mcpServerStatus/list, and a turns-free thread/read for its root/subagent marker.
+    All are observations; no thread is resumed, subscribed, or modified.
+    """
+    try:
+        endpoint = _control_socket(environ)
+        key = os.path.realpath(endpoint)
+        utilities = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "utilities"))
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        from codex_queue_delivery import _connect
+        client = _connect(endpoint, 1.5)
+    except Exception:
+        return None
+    try:
+        loaded = client.request("thread/loaded/list", {})
+        rows = loaded.get("data")
+        if not isinstance(rows, list):
+            return None
+        thread_ids = []
+        for row in rows:
+            if isinstance(row, str):
+                thread_id = row
+            elif isinstance(row, dict):
+                thread_id = row.get("id") or row.get("threadId")
+            else:
+                thread_id = None
+            if (isinstance(thread_id, str)
+                    and _sid("rollout-x-%s.jsonl" % thread_id) == thread_id):
+                thread_ids.append(thread_id)
+        thread_ids = list(dict.fromkeys(thread_ids))
+        cache = _DAEMON_ORIGINS.setdefault(key, {})
+        loaded_ids = set(thread_ids)
+        for thread_id in tuple(cache):
+            if thread_id not in loaded_ids:
+                del cache[thread_id]
+        missing = [thread_id for thread_id in thread_ids if thread_id not in cache]
+        for thread_id in missing:
+            origin_port = None
+            source = None
+            try:
+                status = client.request("mcpServerStatus/list", {
+                    "threadId": thread_id, "serverName": "codex_tui",
+                    "detail": "toolsAndAuthOnly",
+                })
+                data = status.get("data")
+                entries = data if isinstance(data, list) else []
+                entry = next((item for item in entries
+                              if isinstance(item, dict) and item.get("name") == "codex_tui"), None)
+                if entry:
+                    origin_port = _origin_port(entry.get("httpOrigin"))
+                    source = _thread_source(entry)
+                thread = client.request("thread/read", {
+                    "threadId": thread_id, "includeTurns": False,
+                }).get("thread")
+                source = _thread_source(thread) or source
+                if source == "subagent" or source and origin_port:
+                    cache[thread_id] = (origin_port, source)
+            except Exception:
+                # A transient daemon/read failure is retried on the next snapshot.
+                continue
+        return dict(cache)
+    except Exception:
+        return None
+    finally:
+        client.close()
+
+
+def _tcp_listener_inodes(port):
+    inodes = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, encoding="ascii", errors="replace") as handle:
+                rows = handle.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            try:
+                if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                    inodes.add(fields[9])
+            except (IndexError, ValueError):
+                continue
+    return inodes
+
+
+def _tcp_listener_owners(port):
+    inodes = _tcp_listener_inodes(port)
+    if not inodes:
+        return set()
+    owners = set()
+    try:
+        pids = (name for name in os.listdir("/proc") if name.isdigit())
+    except OSError:
+        return owners
+    for raw_pid in pids:
+        pid = int(raw_pid)
+        try:
+            if os.stat("/proc/%s" % raw_pid).st_uid != os.geteuid():
+                continue
+            for fd in os.listdir("/proc/%s/fd" % raw_pid):
+                try:
+                    link = os.readlink("/proc/%s/fd/%s" % (raw_pid, fd))
+                except OSError:
+                    continue
+                if link.startswith("socket:[") and link[8:-1] in inodes:
+                    owners.add(pid)
+                    break
+        except OSError:
+            continue
+    return owners
+
+
+def _live_tui_start(pid):
+    """A port owner counts only while it is a live Codex conversation frontend."""
+    from . import procscan
+    start = procscan.read_proc_start(pid)
+    if not start or procscan._comm_of(pid) != "codex" or procscan.is_shared_codex_daemon(pid):
+        return None
+    argv = procscan._read_argv(pid)
+    if procscan.invocation_mode("codex", argv) != "session":
+        return None
+    return start if procscan.read_proc_start(pid) == start else None
+
+
+def _daemon_session_for_process(pid, environ=None):
+    """The sole root thread whose codex_tui listener belongs to this live TUI PID."""
+    from . import procscan
+    start = _live_tui_start(pid)
+    if not start:
+        return None
+    env = environ if isinstance(environ, dict) else procscan.read_environ(pid)
+    origins = _daemon_thread_origins(env)
+    if origins is None:
+        return None
+    listeners = {}
+    candidates = set()
+    for thread_id, (port, source) in origins.items():
+        if not port or not source or source == "subagent":
+            continue
+        owners = listeners.get(port)
+        if owners is None:
+            owners = _tcp_listener_owners(port)
+            listeners[port] = owners
+        if owners == {int(pid)}:
+            candidates.add(thread_id)
+    if len(candidates) != 1 or procscan.read_proc_start(pid) != start:
+        return None
+    return next(iter(candidates))
+
+
+def process_for_thread(thread_id, environ=None):
+    """Return the unique live root TUI PID/start owning ``thread_id``'s MCP origin."""
+    if not isinstance(thread_id, str) or _sid("rollout-x-%s.jsonl" % thread_id) != thread_id:
+        return None
+    from . import procscan
+    env = dict(environ or os.environ)
+    origins = _daemon_thread_origins(env)
+    row = origins.get(thread_id) if origins else None
+    if not row:
+        return None
+    port, source = row
+    if not port or not source or source == "subagent":
+        return None
+    owners = _tcp_listener_owners(port)
+    candidates = [(pid, _live_tui_start(pid)) for pid in owners]
+    candidates = [(pid, start) for pid, start in candidates if start]
+    if len(candidates) != 1 or procscan.read_proc_start(candidates[0][0]) != candidates[0][1]:
+        return None
+    return candidates[0]
+
+
 def session_id_of_process(pid, live_codex=None):
-    """The thread a live Codex process is running, or None — proven the way the board proves it.
+    """Return an fd-proven thread or the daemon's unique TUI-loader thread.
 
-    First the rollout the process holds open (`_proc_rollout`; measured 2026-09-25: a
-    managed `codex app-server` holds its thread's rollout open between turns, the
-    `codex --remote` TUI holds none). A direct Codex TUI can hold none either (2026-08-10),
-    so a process named exactly ``codex`` without that fd is then resolved by
-    `process_rollouts` — the board's own resolver — over every live Codex process
-    (`procscan.scan`, the board's process list), against the rollout home in that
-    process's OWN environment. An ambiguous start-time match stays None. Last, the
-    board's same-cwd step (`enrich` -> `_fallback_rollout`): the one rollout no process
-    claims that was created since this process started, and that no other unresolved
-    same-cwd process could also take; zero, several, or a shared candidate stay None.
-
-    The herdr report gate (`herdr_projection.may_report`) calls this, so no payload or
-    environment value of the caller can stand in for it. ``live_codex`` is an optional
-    zero-argument callable returning that process list, so one judgement scans at most once.
+    A Codex TUI without its own rollout fd is identified only by its
+    ``codex_tui`` MCP origin and the PID holding that origin's LISTEN socket.
+    Time, cwd, and launcher records never attach a TUI thread.
     """
     try:
         pid = int(pid)
@@ -1182,23 +1384,11 @@ def session_id_of_process(pid, live_codex=None):
     path = _proc_rollout(pid, cwd, _home())
     if path:
         return _sid(path)
-    registered = _registered_thread(pid)
-    if registered:
-        return registered
     if procscan._comm_of(pid) != "codex":
         return None                     # procscan lists only `codex` itself as a runtime
-    env = initial_env
-    home = env.get("CODEX_HOME") or (
-        os.path.join(env["HOME"], ".codex") if env.get("HOME") else None)
-    if not home:
+    if procscan.invocation_mode("codex", procscan._read_argv(pid)) != "session":
         return None
-    sessions = live_codex() if live_codex else procscan.scan(harness_filter={"codex"})
-    home = os.path.abspath(home)
-    paths, claimed = process_rollouts(sessions, home)
-    path = paths.get(pid)
-    if not path:
-        path = _mutual_fallback_rollout(pid, sessions, home, paths, claimed)
-    return _sid(path) if path else None
+    return _daemon_session_for_process(pid, initial_env)
 
 
 def _mutual_fallback_rollout(pid, sessions, home, paths, claimed):
@@ -1329,13 +1519,11 @@ def _unique_full_matching(edges):
 
 
 def process_rollouts(sessions, home):
-    """Which rollout each live Codex process is running → ``(paths, claimed)``.
+    """Return only rollouts directly held by each Codex process.
 
-    The one resolver shared by the board (`prepare_tick`) and the herdr report gate
-    (`session_id_of_process`): every held rollout fd first, then the mutually unique
-    process-start match for rows holding none. Moving a managed app-server's rollout onto
-    its visible TUI row is a display step and stays in `prepare_tick`. No module state is
-    read or written besides the rollout index cache.
+    This is telemetry ownership, not a TUI thread resolver. Daemon-attached
+    TUIs without a rollout fd are identified by ``session_id_of_process`` using
+    the loader origin; no time, cwd, or launcher matching runs here.
     """
     paths = {}
     claimed = set()
@@ -1343,8 +1531,7 @@ def process_rollouts(sessions, home):
         if getattr(sess, "harness", None) != "codex" or not getattr(sess, "cwd", None):
             continue
         path = _proc_rollout(sess.pid, sess.cwd, home)
-        # Role consumers need the native FD observation, separately from paths
-        # assigned by registry/start matching below. This does not change matching.
+        # Role consumers need the native FD observation beside direct paths.
         sess._fd_owner = bool(path)
         if not path:
             continue
@@ -1352,7 +1539,6 @@ def process_rollouts(sessions, home):
         sid = _sid(path)
         if sid:
             claimed.add(sid)
-    _reserve_start_matched_rollouts(sessions, home, paths, claimed)
     return paths, claimed
 
 
@@ -1715,12 +1901,11 @@ def share_managed_registry_state(sessions):
 
 
 def prepare_tick(sessions):
-    """Reserve proc-owned rollouts before any same-cwd fallback attribution.
+    """Reserve only process-owned rollouts before enriching Codex rows.
 
-    A rollout can be visible only on a newer Codex process while an older TUI in
-    the same cwd has no open transcript fd. Enrichment is PID-ordered, so without
-    a prepass the older row can claim the newer process's sole fallback candidate
-    and both rows display one session id/title. Reserve every owned fd first.
+    A TUI without a rollout fd gets a session id only from the pane's
+    process_identity check, which uses the daemon loader origin. Rollout timing
+    and same-cwd proximity do not assign a thread.
     """
     home = os.path.abspath(_home())
     eligible = any(
@@ -1728,11 +1913,8 @@ def prepare_tick(sessions):
         for sess in sessions
     )
     paths, claimed = process_rollouts(sessions, home)
-    # Managed Codex: move each app-server's rollout onto its own TUI client row. The sid
-    # stays in `claimed`, so no other row can pick it up through the fallback either.
-    # Running it after the start match changes nothing: that match skips every row with
-    # a managed dir, which is every row this transfer touches.
-    donated = _transfer_managed_rollouts(sessions, paths)
+    # Managed Codex: move each app-server's rollout onto its exact TUI client row.
+    _transfer_managed_rollouts(sessions, paths)
     # Herdr's current pane session can move while the process keeps an older
     # rollout open (for example, after /new or resume). Re-read direct TUI pane
     # identities even when process_rollouts already selected a path, then replace
@@ -1770,7 +1952,6 @@ def prepare_tick(sessions):
                 paths[sess.pid] = path
     _PROC_PATHS.clear()
     _PROC_PATHS.update(paths)
-    _FALLBACK_CLAIMS.update(ts=time.time(), sids=claimed)
     # Exact parents evidenced this tick (pre-existing, registry, proc-owned
     # rollout, herdr pane): the subagent index build reads lifecycle details
     # only for their edges. Heuristic fallback attributions are not exact, so
@@ -1787,7 +1968,7 @@ def prepare_tick(sessions):
             record = session_registry.read("codex", sess.pid)
         except Exception:
             record = None
-        if record:
+        if record and record.get("kind") != "codex-tui":
             sid = record.get("sessionId")
             if isinstance(sid, str) and sid:
                 exact_parent_ids.add(sid)
@@ -1799,7 +1980,6 @@ def prepare_tick(sessions):
         if isinstance(sid, str) and sid:
             exact_parent_ids.add(sid)
     tick = _CodexTick(default_home=home, proc_paths=dict(paths), subagents_by_home={},
-                      no_fallback_pids=frozenset(donated | set(pane_ids)),
                       subagents_parent_ids=frozenset(exact_parent_ids))
     homes = {home} if eligible else set()
     homes.update(
@@ -2219,14 +2399,11 @@ def account_usage():
 
 def enrich(sess, tick=None):
     home = tick.default_home if tick is not None else _home()
-    # B-3: tier-1 first. A hearting-managed session has a session_registry record
-    # (B-2) with the gateway's own observed sessionId/status — read it before any
-    # rollout-derived fallback so classify_session's `st is None` tier-2/3 branches
-    # (below, and codex-lifecycle at classify_session:1262) run only when this is
-    # absent, automatically and without touching that classifier.
+    # B-3: retain the exact gateway-owned records. The old codex-tui launcher
+    # registration was based on a newly appearing rollout and is not thread proof.
     try:
         rec = session_registry.read("codex", sess.pid)
-        if rec:
+        if rec and rec.get("kind") != "codex-tui":
             session_registry.apply_to_session(sess, rec, "codex")
     except Exception:
         pass
@@ -2235,15 +2412,9 @@ def enrich(sess, tick=None):
     if not sess.cwd:
         return
     if tick is None:
-        path = (
-            _PROC_PATHS.get(sess.pid)
-            or _proc_rollout(sess.pid, sess.cwd, home)
-            or _fallback_rollout(sess, home)
-        )
+        path = _PROC_PATHS.get(sess.pid) or _proc_rollout(sess.pid, sess.cwd, home)
     else:
         path = tick.proc_paths.get(sess.pid)
-        if not path and sess.pid not in tick.no_fallback_pids:
-            path = _fallback_rollout(sess, home)
     herdr_sid = getattr(sess, "_herdr_session_id", None)
     if path and herdr_sid and _sid(path) != herdr_sid:
         path = None                      # the pane selected another thread; never borrow this one's

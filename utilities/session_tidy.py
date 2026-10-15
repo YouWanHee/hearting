@@ -42,12 +42,9 @@ State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
 
 The seat is the herdr pane only when ``pane_ownership`` verifies its live connection,
 else harness + project. ``HERDR_PANE_ID`` is only a lookup hint.
-A Codex whose tools and hooks run in the shared app-server daemon has no pane variable; its
-pane is then the one herdr ``agent list`` entry (``agent=codex``) whose session is exactly the
-caller's thread id, else the one whose seat ledger already knows the thread (herdr's value can lag
-a ``/clear``), else the one whose confirmed auto-clear named exactly this thread as its new session,
-else -- for the first hook after an auto-clear -- the one window waiting for its successor.  No
-match or several -> the project seat, quietly.
+A Codex caller's ``CODEX_THREAD_ID`` supplies its exact thread; pane_ownership maps that
+thread to the foreground TUI PID and confirms herdr's pane process info. If no unique pane
+can be proved, the project seat is used quietly.
 A worker marker is checked before the pane: a worker that inherited its
 supervisor's pane id gets no card, ledger line or notice.
 """

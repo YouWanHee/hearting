@@ -480,31 +480,23 @@ class RuntimeProjectionTest(unittest.TestCase):
             paths, claimed = codex.process_rollouts(sessions, str(home))
         return codex, procscan, sessions, root_paths, sids, paths, claimed, cwd, str(home)
 
-    def test_start_match_solves_triangles_chains_and_is_order_independent(self):
+    def test_start_time_graphs_do_not_assign_tui_threads(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            # p1 sees r1/r2; p2 sees only r2. Delays mirror the observed incident.
             result = self.start_match_fixture(root, [1000.0, 1018.23], [1.306, 19.499])
-            _codex, _procscan, sessions, _rp, sids, paths, claimed, *_ = result
-            self.assertEqual({pid: Path(path).name for pid, path in paths.items()},
-                             {sessions[0].pid: Path(next(p for p in _rp if sids[0] in p)).name,
-                              sessions[1].pid: Path(next(p for p in _rp if sids[1] in p)).name})
-            self.assertEqual(claimed, set(sids))
+            self.assertEqual(result[5], {})
+            self.assertEqual(result[6], set())
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            # Three-step unique chain: the last process can only take the last root.
-            result = self.start_match_fixture(root, [2000.0, 2018.0, 2036.0],
+            result = self.start_match_fixture(Path(td), [2000.0, 2018.0, 2036.0],
                                               [1.0, 19.0, 37.0])
-            sessions, sids, paths, claimed = result[2], result[4], result[5], result[6]
-            self.assertEqual([codex_sid(paths.get(s.pid, "")) for s in sessions], sids)
-            self.assertEqual(claimed, set(sids))
+            self.assertEqual(result[5], {})
+            self.assertEqual(result[6], set())
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            result = self.start_match_fixture(root, [1000.0, 1018.23], [1.306, 19.499], [1, 0])
-            sessions, sids, paths = result[2], result[4], result[5]
-            self.assertEqual([codex_sid(paths.get(s.pid, "")) for s in sessions], sids)
+            result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499], [1, 0])
+            self.assertEqual(result[5], {})
+            self.assertEqual(result[6], set())
 
     def test_triangle_shared_resolver_and_may_report_keep_exact_identity(self):
         from fleet import herdr_projection as hp
@@ -541,15 +533,11 @@ class RuntimeProjectionTest(unittest.TestCase):
                     side_effect=lambda pane, harness, sid, **_kw:
                     "fixture-pane" if sid == sids[0] else ""):
                 own = codex.session_id_of_process(sessions[0].pid, lambda: sessions)
-                self.assertEqual(own, sids[0])
-                self.assertTrue(hp.may_report("codex", sids[0], worker=False))
+                self.assertIsNone(own)
+                with unittest.mock.patch.object(pane_ownership, "verified_pane", return_value=""):
+                    self.assertFalse(hp.may_report("codex", sids[0], worker=False))
                 self.assertFalse(hp.may_report("codex", sids[1], worker=False))
                 self.assertFalse(hp.may_report("codex", sids[0], worker=True))
-                # Pane proof, not the process environment, decides a Codex report: a
-                # footer that does not name the thread refuses it.
-                with unittest.mock.patch.object(pane_ownership, "verified_pane",
-                                                return_value=""):
-                    self.assertFalse(hp.may_report("codex", sids[0], worker=False))
 
     def test_same_pid_new_resume_and_fork_selection_follows_the_pane_footer(self):
         """One Codex PID keeps an older rollout open after /new, resume or fork. The
@@ -612,7 +600,7 @@ class RuntimeProjectionTest(unittest.TestCase):
         self.assertIsNone(codex._unique_full_matching(
             {1: {"r1"}, 2: {"r1"}, 3: {"r1", "r2", "r3"}}))
 
-    def test_start_match_keeps_disjoint_control_when_another_component_exceeds_budget(self):
+    def test_time_graph_size_does_not_change_unknown_tui_identity(self):
         from fleet.collectors import codex, procscan
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -642,8 +630,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                  unittest.mock.patch.object(procscan, "read_environ", return_value={"CODEX_HOME": str(home)}), \
                  unittest.mock.patch.object(procscan, "read_proc_start", side_effect=lambda pid: str(2000 + pid - 72000)):
                 found, claimed = codex.process_rollouts(sessions, str(home))
-            self.assertEqual(codex._sid(found[sessions[3].pid]), sids[3])
-            self.assertEqual(claimed, {sids[3]})
+            self.assertEqual(found, {})
+            self.assertEqual(claimed, set())
 
     def test_start_match_budget_boundary_and_unknown_home_or_stale_pid(self):
         from fleet.collectors import codex
@@ -666,7 +654,7 @@ class RuntimeProjectionTest(unittest.TestCase):
             self.assertEqual(paths, {})
             self.assertEqual(claimed, set())
 
-    def test_start_match_preserves_fd_claims_and_read_only_registry_ownership(self):
+    def test_rollout_fd_remains_exact_and_registry_or_time_does_not_assign_siblings(self):
         from fleet.collectors import codex
         with tempfile.TemporaryDirectory() as td:
             result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
@@ -679,8 +667,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                  unittest.mock.patch.object(codex, "_index", return_value={sessions[0].cwd: root_paths}):
                 paths, claimed = codex.process_rollouts(sessions, home)
             self.assertEqual(paths[sessions[0].pid], root_paths[0])
-            self.assertEqual(codex._sid(paths[sessions[1].pid]), sids[1])
-            self.assertEqual(claimed, set(sids))
+            self.assertNotIn(sessions[1].pid, paths)
+            self.assertEqual(claimed, {sids[0]})
 
         with tempfile.TemporaryDirectory() as td:
             result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
@@ -692,11 +680,10 @@ class RuntimeProjectionTest(unittest.TestCase):
                     side_effect=lambda pid: sids[0] if pid == sessions[0].pid else None), \
                  unittest.mock.patch.object(codex, "_index", return_value={cwd: root_paths}):
                 paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(codex._sid(paths[sessions[0].pid]), sids[0])
-            self.assertEqual(codex._sid(paths[sessions[1].pid]), sids[1])
-            self.assertEqual(claimed, set(sids))
+            self.assertEqual(paths, {})
+            self.assertEqual(claimed, set())
 
-    def test_duplicate_registry_sid_stays_reserved_without_blocking_unrelated_control(self):
+    def test_launcher_registry_does_not_assign_codex_tui_rollouts(self):
         from fleet.collectors import codex
         with tempfile.TemporaryDirectory() as td:
             result = self.start_match_fixture(
@@ -714,10 +701,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                  unittest.mock.patch.object(procscan, "read_proc_start",
                     side_effect=lambda pid: str(1000 + pid - sessions[0].pid)):
                 paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertNotIn(sessions[0].pid, paths)
-            self.assertNotIn(sessions[1].pid, paths)
-            self.assertEqual(codex._sid(paths[sessions[2].pid]), sids[2])
-            self.assertEqual(claimed, {sids[0], sids[2]})
+            self.assertEqual(paths, {})
+            self.assertEqual(claimed, set())
 
     def test_registry_owner_does_not_duplicate_an_independent_fd_claim(self):
         from fleet.collectors import codex
@@ -738,7 +723,7 @@ class RuntimeProjectionTest(unittest.TestCase):
             self.assertEqual(paths, {sessions[0].pid: roots[0]})
             self.assertEqual(claimed, {sids[0]})
 
-    def test_malformed_declared_identity_values_are_component_local_unknown(self):
+    def test_rollout_metadata_never_assigns_an_unowned_tui_process(self):
         from fleet.collectors import codex, procscan
         malformed_values = ([], {}, ["not-a-full-sid"], {"id": "not-a-full-sid"}, "")
         for field in ("id", "session_id"):
@@ -759,9 +744,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                          unittest.mock.patch.object(procscan, "read_environ",
                             return_value={"CODEX_HOME": home}):
                         paths, claimed = codex.process_rollouts(sessions, home)
-                    self.assertNotIn(sessions[0].pid, paths)
-                    self.assertEqual(codex._sid(paths[sessions[1].pid]), sids[1])
-                    self.assertEqual(claimed, {sids[1]})
+                    self.assertEqual(paths, {})
+                    self.assertEqual(claimed, set())
 
     def test_start_match_rechecks_pid_and_refuses_incomplete_or_colliding_roots(self):
         from fleet.collectors import codex, procscan
@@ -802,7 +786,7 @@ class RuntimeProjectionTest(unittest.TestCase):
                 self.assertEqual(paths, {})
                 self.assertEqual(claimed, set())
 
-    def test_start_match_ignores_repeated_realpath_alias(self):
+    def test_repeated_rollout_alias_does_not_assign_a_tui(self):
         with tempfile.TemporaryDirectory() as td:
             result = self.start_match_fixture(Path(td), [1000.0], [1.0])
             codex, _procscan, sessions, root_paths, sids, _paths, _claimed, cwd, home = result
@@ -810,8 +794,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                  unittest.mock.patch.object(codex, "_process_started_at", return_value=1000.0), \
                  unittest.mock.patch.object(codex, "_registered_thread", return_value=None):
                 paths, claimed = codex.process_rollouts(sessions, home)
-            self.assertEqual(codex._sid(paths[sessions[0].pid]), sids[0])
-            self.assertEqual(claimed, set(sids))
+            self.assertEqual(paths, {})
+            self.assertEqual(claimed, set())
 
     def test_start_match_respects_incoming_claim_and_process_local_home(self):
         from fleet.collectors import codex, procscan
@@ -847,13 +831,13 @@ class RuntimeProjectionTest(unittest.TestCase):
             self.assertEqual(codex._sid(found[sessions[1].pid]), sids[1])
             self.assertNotIn(sessions[0].pid, found)
 
-    def test_start_match_window_edges_and_subagent_exclusion(self):
+    def test_start_window_and_subagent_metadata_do_not_assign_a_tui(self):
         from fleet.collectors import codex
-        for offset, accepted in ((-5.0, True), (30.0, True), (-5.001, False), (30.001, False)):
+        for offset in (-5.0, 30.0, -5.001, 30.001):
             with self.subTest(offset=offset), tempfile.TemporaryDirectory() as td:
                 result = self.start_match_fixture(Path(td), [1000.0], [offset])
-                codex, _procscan, sessions, _roots, sids, _paths, _claimed, _cwd, _home = result
-                self.assertEqual(codex_sid(result[5].get(sessions[0].pid, "")) == sids[0], accepted)
+                self.assertEqual(result[5], {})
+                self.assertEqual(result[6], set())
         with tempfile.TemporaryDirectory() as td:
             result = self.start_match_fixture(Path(td), [1000.0], [1.0])
             codex, _procscan, sessions, roots, _sids, _paths, _claimed, cwd, home = result
@@ -903,9 +887,7 @@ class RuntimeProjectionTest(unittest.TestCase):
             self.assertFalse(self.direct_codex_reports(
                 root, [sid], sid, sibling=True, created_offset=60))
 
-    def test_the_gate_and_the_board_name_a_direct_tui_with_one_resolver(self):
-        """The board's `prepare_tick` and the gate's `session_id_of_process` must give a
-        fd-less direct TUI the same thread; a second copy of the match would drift."""
+    def test_fdless_embedded_tui_without_daemon_loader_stays_unknown(self):
         from fleet.collectors import codex, procscan
         sid = "0f5d1a7e-5b1c-4d2e-9f3a-2b6c8d0e1f47"
         with tempfile.TemporaryDirectory() as td:
@@ -924,8 +906,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                 with unittest.mock.patch.dict(os.environ, {"CODEX_HOME": str(root / "codex")}):
                     codex._INDEX.update(ts=0.0, map=None)
                     tick = codex.prepare_tick(procscan.scan(harness_filter={"codex"}))
-                    self.assertEqual(codex._sid(tick.proc_paths.get(proc.pid, "")), sid)
-                    self.assertEqual(codex.session_id_of_process(proc.pid), sid)
+                    self.assertIsNone(tick.proc_paths.get(proc.pid))
+                    self.assertIsNone(codex.session_id_of_process(proc.pid))
             finally:
                 proc.kill()
                 proc.wait()

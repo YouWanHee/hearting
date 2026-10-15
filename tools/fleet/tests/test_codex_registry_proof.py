@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""A launcher-written tier-1 record proves the thread of a daemon-attached Codex TUI.
-
-`peer-steward start --kind codex` binds the launched thread from the one new root rollout and
-writes the Fleet registry record for the TUI pid with its /proc start time. The herdr report
-gate asks `session_id_of_process`; a record whose `procStart` still matches the live process
-is proof (a recycled pid is not), so herdr learns the session too.
-"""
+"""A launcher registration alone does not prove a daemon-attached Codex TUI thread."""
 import os
 import subprocess
 import sys
@@ -46,9 +40,10 @@ class RegistryProofTest(unittest.TestCase):
         record.update(fields)
         session_registry.write("codex", self.proc.pid, record)
 
-    def test_a_matching_record_proves_the_thread(self):
+    def test_a_matching_launcher_record_does_not_prove_the_thread(self):
         self._write()
-        self.assertEqual(codex.session_id_of_process(self.proc.pid, lambda: []), THREAD)
+        self.assertEqual(codex._registered_thread(self.proc.pid), THREAD)
+        self.assertIsNone(codex.session_id_of_process(self.proc.pid, lambda: []))
 
     def test_a_recycled_pid_is_not_proof(self):
         self._write(procStart="1")
