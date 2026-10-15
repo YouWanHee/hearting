@@ -87,10 +87,11 @@ class ForegroundOutcomeTest(unittest.TestCase):
                      "Path(sys.argv[1]).write_text(sys.argv[2]); "
                      "print('READY',flush=True); sys.stdin.readline(); sys.exit(int(sys.argv[3]))")
             with mock.patch.dict(os.environ, env, clear=True):
-                proc = subprocess.Popen([sys.executable, "-c", child, str(log_path),
+                proc = subprocess.Popen([harness, "-c", child, str(log_path),
                                          "\n".join(map(json.dumps, rows)) + "\n",
                                          "7" if ending == "exit7" else "0"],
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+                                        executable=sys.executable, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, start_new_session=True)
                 try:
                     self.assertEqual(proc.stdout.readline(), b"READY\n")
                     if ending == "parent-exit":

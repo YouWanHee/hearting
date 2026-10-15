@@ -21,6 +21,68 @@ SPEC.loader.exec_module(L)
 
 
 class LifecycleTest(unittest.TestCase):
+    def _run_fake_runtime_chain(self, harness, mode):
+        from foreground_activity import ForegroundActivityContext
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            helper = base / "runtime_helper.py"
+            fake_cli = base / harness
+            fake_tool = base / "governor.py"
+            log = base / "attempt.log"
+            tool = {
+                "blocked": "time.sleep(5)",
+                "cpu": "end=time.monotonic()+0.65\nwhile time.monotonic()<end: pass",
+                "log": "end=time.monotonic()+0.65\nwhile time.monotonic()<end: open(log, 'a').write('x\\n'); time.sleep(0.02)",
+                "reaped-cpu": "end=time.monotonic()+0.13\nwhile time.monotonic()<end: pass",
+            }[mode]
+            fake_tool.write_text(
+                "import sys,time\n"
+                "mode,log=sys.argv[1:]\n"
+                f"{tool}\n",
+                encoding="utf-8",
+            )
+            fake_cli.write_text(
+                "import subprocess,sys,time\n"
+                "mode,log,tool=sys.argv[1:]\n"
+                "time.sleep(0.04)\n"
+                "p=subprocess.Popen([sys.executable,tool,mode,log])\n"
+                "p.wait()\n"
+                "time.sleep(0.12)\n",
+                encoding="utf-8",
+            )
+            helper.write_text(
+                "import os,subprocess,sys,time\n"
+                "harness,mode,log,tool=sys.argv[1:]\n"
+                f"p=subprocess.Popen([sys.executable,{str(fake_cli)!r},mode,log,{str(fake_tool)!r}])\n"
+                "while p.poll() is None:\n"
+                " end=time.monotonic()+0.004\n"
+                " while time.monotonic()<end: pass\n"
+                " time.sleep(0.02)\n"
+                "p.wait()\n",
+                encoding="utf-8",
+            )
+            # The outer Python leader retains its shell child; the helper remains
+            # alive and polls while the fake harness CLI waits for its tool.
+            leader = (
+                "import subprocess,sys; "
+                "subprocess.run(['sh','-c',sys.executable+' '+sys.argv[1]+' '+sys.argv[2]+' '+sys.argv[3]+' '+sys.argv[4]+' '+sys.argv[5]+'; wait'])"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-c", leader, str(helper), harness, mode, str(log), str(fake_tool)],
+                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            start = L.process_start_ticks(child.pid)
+            context = ForegroundActivityContext(
+                0.22, harness, log, {}, runtime_executable=harness,
+            )
+            try:
+                outcome = L.wait_foreground(child, 2, poll_interval=0.01,
+                                            activity_context=context)
+                return outcome
+            finally:
+                if child.poll() is None:
+                    L._bounded_group_stop(child, start or "", poll_interval=0.01)
+
     def test_quiet_foreground_child_stops_with_no_progress(self):
         from foreground_activity import ForegroundActivityContext
         with tempfile.TemporaryDirectory() as td:
@@ -31,7 +93,7 @@ class LifecycleTest(unittest.TestCase):
             )
             start = L.process_start_ticks(child.pid)
             context = ForegroundActivityContext(
-                window_seconds=0.4, harness="test", log_path=log,
+                window_seconds=0.4, harness="sh", log_path=log,
                 metadata={}, runtime_executable="/bin/true",
             )
             try:
@@ -49,14 +111,14 @@ class LifecycleTest(unittest.TestCase):
             log = Path(td) / "attempt.log"
             commands = [
                 ["/bin/sh", "-c", f"i=0; while [ $i -lt 12 ]; do echo x >> {log}; i=$((i+1)); sleep 0.05; done"],
-                [sys.executable, "-c", "import time; e=time.monotonic()+0.8\nwhile time.monotonic()<e: pass"],
+                ["/bin/sh", "-c", f"{sys.executable} -c 'import time; e=time.monotonic()+0.8; exec(\"while time.monotonic()<e: pass\")'"],
             ]
             for command in commands:
                 child = subprocess.Popen(command, start_new_session=True,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 start = L.process_start_ticks(child.pid)
                 context = ForegroundActivityContext(
-                    window_seconds=0.25, harness="test", log_path=log,
+                    window_seconds=0.25, harness=Path(command[0]).name, log_path=log,
                     metadata={}, runtime_executable="/bin/true",
                 )
                 try:
@@ -78,7 +140,7 @@ class LifecycleTest(unittest.TestCase):
             )
             start = L.process_start_ticks(runtime.pid)
             context = ForegroundActivityContext(
-                window_seconds=0.3, harness="test", log_path=log,
+                window_seconds=0.3, harness=Path(sys.executable).name, log_path=log,
                 metadata={}, runtime_executable=sys.executable,
             )
             try:
@@ -101,6 +163,39 @@ class LifecycleTest(unittest.TestCase):
             finally:
                 if tool_parent.poll() is None:
                     L._bounded_group_stop(tool_parent, start or "", poll_interval=0.01)
+
+    def test_missing_harness_cli_stays_uncertain_until_hard_deadline(self):
+        from foreground_activity import ForegroundActivityContext
+        with tempfile.TemporaryDirectory() as td:
+            child = subprocess.Popen(
+                ["/bin/sh", "-c", "sleep 2"], start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            start = L.process_start_ticks(child.pid)
+            context = ForegroundActivityContext(
+                0.12, "codex", Path(td) / "attempt.log", {},
+            )
+            began = time.monotonic()
+            try:
+                outcome = L.wait_foreground(child, 0.55, poll_interval=0.02,
+                                            activity_context=context)
+                self.assertEqual(outcome.failure, "timeout")
+                self.assertGreaterEqual(time.monotonic() - began, 0.5)
+                self.assertLess(time.monotonic() - began, 1.5)
+            finally:
+                if child.poll() is None:
+                    L._bounded_group_stop(child, start or "", poll_interval=0.01)
+
+    def test_real_adapter_shaped_runtime_chains_distinguish_blocked_from_tools(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                blocked = self._run_fake_runtime_chain(harness, "blocked")
+                self.assertEqual(blocked.failure, "no-progress")
+                for mode in ("cpu", "log", "reaped-cpu"):
+                    with self.subTest(harness=harness, mode=mode):
+                        active = self._run_fake_runtime_chain(harness, mode)
+                        self.assertNotEqual(active.failure, "no-progress")
+                        self.assertEqual(active.failure, "")
     def test_namespace_detection_supports_host_and_remounted_proc(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

@@ -2045,23 +2045,17 @@ def main(argv: list[str]) -> int:
         args.child_pid_start = start_ticks
         args.launch_heartbeat = seed_launch_heartbeat(args, jobs, proc.pid, start_ticks)
         activity_context = None
-        if args.launch_lifecycle == FOREGROUND_SCOPED:
-            from foreground_activity import resolve_activity_policy, make_activity_context
-            activity_policy = resolve_activity_policy(args.worker_type)
-            for warning in activity_policy.warnings:
-                print(f"warning={warning}", file=sys.stderr)
-            activity_context = make_activity_context(
-                activity_policy, worker_type=args.worker_type, harness="opencode",
-                log_path=log_path, jobs=Path(jobs),
-                metadata={**{str(k): str(v) for k, v in launch_metadata.items()},
-                          "attempt_id": args.attempt_id, "route_id": args.route_id or "",
-                          "route_node": args.route_node or ""},
-                runtime_executable="opencode",
-                transcript_roots=(
-                    Path(launch_metadata["opencode_runtime_dir"]) / "data" / "opencode" / "opencode.db",
-                    Path(launch_metadata["opencode_runtime_dir"]) / "data" / "opencode" / "opencode.db-wal",
-                ),
-            )
+        if args.launch_lifecycle == FOREGROUND_SCOPED and args.worker_type != "owner":
+            try:
+                from foreground_activity import build_activity_context
+                activity_context = build_activity_context(
+                    worker_type=args.worker_type, harness="opencode", log_path=log_path,
+                    jobs=jobs, launch_metadata=launch_metadata, attempt_id=args.attempt_id,
+                    route_id=args.route_id, route_node=args.route_node,
+                    environment=dispatch_env, worktree=args.worktree,
+                )
+            except Exception as exc:
+                print(f"warning=foreground activity context unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
         if args.launch_lifecycle == FOREGROUND_SCOPED and foreground_review_handoff:
             binding = args.parent_binding
             try:

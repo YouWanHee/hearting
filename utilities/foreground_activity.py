@@ -8,6 +8,8 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import sys
 import time
 from typing import Mapping
 
@@ -71,6 +73,53 @@ def make_activity_context(policy: ActivityPolicy, *, worker_type: str, harness: 
     )
 
 
+def build_activity_context(*, worker_type: str, harness: str, log_path: Path,
+                           jobs: Path, launch_metadata: Mapping[str, str],
+                           attempt_id: str, route_id: str | None,
+                           route_node: str | None, environment: Mapping[str, str],
+                           worktree: Path) -> ForegroundActivityContext | None:
+    """Build adapter-specific observation state without risking a live child."""
+    if worker_type == "owner":
+        return None
+    try:
+        policy = resolve_activity_policy(worker_type)
+        if policy.window_seconds is None:
+            for warning in policy.warnings:
+                print(f"warning={warning}", file=sys.stderr)
+            return None
+        roots = ()
+        if harness == "claude":
+            from claude_project_dir import encode_project_dir
+            project = Path(environment["CLAUDE_CONFIG_DIR"]) / "projects" / encode_project_dir(worktree)
+            roots = (project,)
+        elif harness == "codex":
+            roots = (Path(environment["CODEX_HOME"]) / "sessions",)
+        elif harness == "opencode":
+            runtime = Path(launch_metadata["opencode_runtime_dir"])
+            data = runtime / "data" / "opencode"
+            roots = (data / "opencode.db", data / "opencode.db-wal")
+        else:
+            raise ValueError(f"unsupported foreground activity harness: {harness}")
+        metadata = {
+            **{str(key): str(value) for key, value in launch_metadata.items()},
+            "attempt_id": attempt_id,
+            "route_id": route_id or "",
+            "route_node": route_node or "",
+        }
+        context = make_activity_context(
+            policy, worker_type=worker_type, harness=harness,
+            log_path=Path(log_path), jobs=Path(jobs), metadata=metadata,
+            runtime_executable=harness, transcript_roots=roots,
+        )
+        for warning in policy.warnings:
+            print(f"warning={warning}", file=sys.stderr)
+        return context
+    except Exception as exc:
+        print(f"warning=foreground activity context unavailable: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return None
+
+
 def _stat(path: Path):
     raw = path.read_text(encoding="utf-8")
     end = raw.rfind(")")
@@ -81,7 +130,9 @@ def _stat(path: Path):
         raise ValueError("short proc stat")
     return {
         "state": tail[0], "ppid": int(tail[1]), "pgid": int(tail[2]),
-        "cpu": sum(int(value) for value in tail[11:15]), "start": tail[19],
+        "self_cpu": sum(int(value) for value in tail[11:13]),
+        "children_cpu": sum(int(value) for value in tail[13:15]),
+        "start": tail[19],
     }
 
 
@@ -201,14 +252,71 @@ class ForegroundActivityMonitor:
                 members.add(key)
         return members
 
+    def _runtime_lineage(self, table, members):
+        """Return the shallowest harness CLI identities and their ancestors."""
+        by_pid = {pid: (pid, start) for pid, start in members}
+        depths = { (self.proc_pid, self.leader_start): 0 }
+        pending = [ (self.proc_pid, self.leader_start) ]
+        while pending:
+            parent = pending.pop(0)
+            parent_pid = parent[0]
+            for key in members:
+                if key not in depths and table[key]["ppid"] == parent_pid:
+                    depths[key] = depths[parent] + 1
+                    pending.append(key)
+
+        interpreter_names = {"python", "node", "nodejs", "bun"}
+        matches = []
+        for key in members:
+            proc = Path("/proc") / str(key[0])
+            try:
+                raw = (proc / "cmdline").read_bytes()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(f"process command line unreadable: {key[0]}") from exc
+            argv = [os.fsdecode(part) for part in raw.rstrip(b"\0").split(b"\0") if part]
+            if not argv:
+                continue
+            first = Path(argv[0]).name
+            identity = first == self.context.harness
+            is_interpreter = first in interpreter_names or re.fullmatch(r"python\d+(?:\.\d+)*", first)
+            if not identity and is_interpreter and len(argv) > 1:
+                identity = Path(argv[1]).name == self.context.harness
+            if identity:
+                if key not in depths:
+                    raise RuntimeError("harness CLI is not a descendant of the foreground leader")
+                matches.append(key)
+        if not matches:
+            raise RuntimeError("harness CLI identity absent from member process set")
+
+        shallowest = min(depths[key] for key in matches)
+        lineage = set()
+        for cli in matches:
+            if depths[cli] != shallowest:
+                continue
+            current = cli
+            while True:
+                lineage.add(current)
+                if current == (self.proc_pid, self.leader_start):
+                    break
+                parent_pid = table[current]["ppid"]
+                parent = by_pid.get(parent_pid)
+                if parent is None or parent not in depths:
+                    raise RuntimeError("harness CLI ancestor chain does not reach foreground leader")
+                current = parent
+        return lineage
+
     def sample(self) -> ActivityObservation:
         reasons = []
         try:
             files = self._files()
             table = self._processes()
             members = self._members(table)
+            runtime_lineage = self._runtime_lineage(table, members)
             lease = self._lease_active()
-            cpu = {key: table[key]["cpu"] for key in members}
+            cpu = {key: (table[key]["self_cpu"], table[key]["children_cpu"])
+                   for key in members}
             if self._file_baseline is None:
                 self._file_baseline = files
                 self._process_baseline = cpu
@@ -217,23 +325,17 @@ class ForegroundActivityMonitor:
             if files != self._file_baseline:
                 reasons.append("attempt-file-change")
             old = self._process_baseline
-            for key, ticks in cpu.items():
-                argv = (Path("/proc") / str(key[0]) / "cmdline").read_bytes().split(b"\0")
-                executable = os.fsdecode(argv[0]) if argv and argv[0] else ""
-                runtime = self.context.runtime_executable
-                is_runtime = bool(runtime and (executable == runtime or Path(executable).name == Path(runtime).name))
-                command = b"\0".join(argv)
-                is_helper = any(marker in command for marker in (
-                    b"dispatch-headless.py", b"launch-fence.py", b"model-governor.py",
-                    b"model-governor", b"governor.py",
-                ))
-                if is_runtime or is_helper:
-                    continue
+            for key, (self_ticks, children_ticks) in cpu.items():
                 previous = old.get(key)
                 if previous is None:
-                    reasons.append("new-process-identity")
-                elif ticks > previous:
+                    if key not in runtime_lineage:
+                        reasons.append("new-process-identity")
+                    if children_ticks > 0:
+                        reasons.append("children-cpu")
+                elif key not in runtime_lineage and self_ticks > previous[0]:
                     reasons.append("process-cpu")
+                if previous is not None and children_ticks > previous[1]:
+                    reasons.append("children-cpu")
             if lease:
                 reasons.append("exact-verification-lease")
             self._file_baseline = files

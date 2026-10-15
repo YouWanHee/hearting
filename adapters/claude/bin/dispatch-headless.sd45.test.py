@@ -1072,7 +1072,8 @@ class ForegroundActivityWiring(unittest.TestCase):
                  and isinstance(node.func, ast.Name) and node.func.id == "wait_foreground"]
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(any(k.arg == "activity_context" for k in call.keywords) for call in calls))
-        self.assertIn('resolve_activity_policy(args.worker_type)', source)
+        self.assertIn('if args.launch_lifecycle == FOREGROUND_SCOPED and args.worker_type != "owner":\n            try:\n                from foreground_activity import build_activity_context', source)
+        self.assertEqual(source.count('build_activity_context('), 1)
         self.assertIn('worker_type=args.worker_type, harness="claude"', source)
 
 

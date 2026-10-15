@@ -132,7 +132,7 @@ class NamespaceLocalForegroundCellTest(unittest.TestCase):
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             start = L.process_start_ticks(child.pid)
             context = ForegroundActivityContext(
-                0.35, "matrix", Path(td) / "attempt.log", {},
+                0.35, "sleep", Path(td) / "attempt.log", {},
                 runtime_executable="/bin/false",
             )
             began = time.monotonic()

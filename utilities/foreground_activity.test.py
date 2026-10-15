@@ -39,8 +39,48 @@ class ForegroundActivityTests(unittest.TestCase):
             sample = _stat(p)
         self.assertEqual(sample["ppid"], 12)
         self.assertEqual(sample["pgid"], 10)
-        self.assertEqual(sample["cpu"], 14)
+        self.assertEqual(sample["self_cpu"], 5)
+        self.assertEqual(sample["children_cpu"], 9)
         self.assertEqual(sample["start"], "987")
+
+    def test_context_helper_skips_owner_and_disabled_policy_inputs(self):
+        arguments = dict(
+            worker_type="owner", harness="codex", log_path=Path("/no/log"),
+            jobs=Path("/no/jobs"), launch_metadata={}, attempt_id="a",
+            route_id=None, route_node=None, environment={}, worktree=Path("/work"),
+        )
+        with mock.patch.object(A, "resolve_activity_policy", side_effect=AssertionError):
+            self.assertIsNone(A.build_activity_context(**arguments))
+
+        arguments["worker_type"] = "stage"
+        with mock.patch.object(A, "resolve_activity_policy", return_value=A.ActivityPolicy(None, "disabled")):
+            self.assertIsNone(A.build_activity_context(**arguments))
+
+    def test_context_helper_builds_for_each_non_owner_worker_type(self):
+        for worker_type in ("stage", "review", "support", "frame"):
+            context = A.build_activity_context(
+                worker_type=worker_type, harness="codex", log_path=Path("/tmp/log"),
+                jobs=Path("/tmp/jobs"), launch_metadata={}, attempt_id="a",
+                route_id="route", route_node="execute", environment={"CODEX_HOME": "/tmp/codex"},
+                worktree=Path("/tmp/work"),
+            )
+            self.assertIsNotNone(context, worker_type)
+            self.assertEqual(context.harness, "codex")
+            self.assertEqual(context.transcript_roots, (Path("/tmp/codex/sessions"),))
+
+    def test_context_failure_warns_once_and_returns_none(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        error = StringIO()
+        with redirect_stderr(error):
+            context = A.build_activity_context(
+                worker_type="stage", harness="codex", log_path=Path("/tmp/log"),
+                jobs=Path("/tmp/jobs"), launch_metadata={}, attempt_id="a",
+                route_id=None, route_node=None, environment={}, worktree=Path("/tmp/work"),
+            )
+        self.assertIsNone(context)
+        self.assertEqual(len(error.getvalue().splitlines()), 1)
+        self.assertTrue(error.getvalue().startswith("warning="))
 
 
 if __name__ == "__main__":
