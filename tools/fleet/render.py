@@ -4686,10 +4686,12 @@ def _dispatch_summary_detail_row(job, depth=1, term_width=None, orphan=False, in
         # F-65: a missing first-turn denominator is an unknown gauge, not a missing row.
         # Dispatch rows retain their dim visual weight and sit two cells AFTER their own
         # spinner, matching the main row's ``spinner + 2`` relationship without flattening
-        # the hierarchy back onto the main-session detail column.
+        # the hierarchy back onto the main-session detail column. Inside a card the box
+        # already carries the hierarchy, so every worker gauge shares the owner's column.
         shown_depth = min(depth, 1) if in_card else depth
         indicator_col = _dw("  " + _dispatch_prefix(job, orphan=orphan, in_card=in_card))
-        detail_indent = (4 + _HW - _CTX_LABEL_W if _route_rides_the_rail(job, None, in_card)
+        detail_indent = (4 + _HW - _CTX_LABEL_W
+                         if _route_rides_the_rail(job, None, in_card) or (in_card and not orphan)
                          else indicator_col + 2)
         content_width = (_dispatch_box_width(term_width) - 2 if in_card and term_width else
                          _context_content_width(term_width))
@@ -5282,7 +5284,7 @@ def _context_detail_row(entity, depth=0, term_width=None, dim=False,
     indent = " " * max(0, int(indent_width))
     available = max(0, (term_width or _SUMMARY_FALLBACK_W) - _dw(indent))
     gauge_width = _compact_context_gauge_width(available, depth=depth)
-    track = _context_gauge_track(getattr(entity, "context_window_tokens", None))
+    track = _context_gauge_track(getattr(entity, "context_display_window_tokens", None))
     if (isinstance(pct, (int, float)) and not isinstance(pct, bool)
             and 0 <= pct <= 100):
         shown_pct = int(round(pct))

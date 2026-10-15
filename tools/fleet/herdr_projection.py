@@ -23,9 +23,11 @@ pane belongs to the interactive session that owns it.
 Every herdr report from a hook — this projection and `hooks/herdr-agent-state.sh` — asks
 `may_report()` first. A process may report a session only when it IS that session's
 runtime, proven from the process itself, never from the payload or the environment
-(OpenCode proves the harness only — see `may_report`). Codex is proven by Fleet's own
-resolver: the rollout the process holds open, else the board's mutually unique
-process-start match; an ambiguous match proves nothing. Test suites run the real
+(OpenCode proves the harness only — see `may_report`). For Codex, a direct frontend's
+two fresh native footer reads prove the current thread and must agree with the exact
+foreground PID and pane. An open rollout can be historical after a session switch.
+Shared services still need an exact native session match, and ambiguous process
+ownership proves nothing. Test suites run the real
 hooks with fake session ids while inheriting the interactive pane's `HERDR_PANE_ID` and
 often strip the worker markers, so the worker check alone let `directpromptsid` repaint a
 live pane as `[0d] codex` and take over its `agent_session_id` (2026-09-24). When the
@@ -150,13 +152,27 @@ def verified_pane(pane, harness, session_id=None, **kwargs):
     return verify(pane, harness, session_id, **kwargs)
 
 
+def _nearest_codex_pid():
+    """Return the nearest Codex process in this hook's ancestry, if any."""
+    pid = os.getpid()
+    for _ in range(_MAX_ANCESTORS):
+        if not pid or pid <= 1:
+            break
+        comm = _comm(pid)
+        if comm == "codex" or comm.startswith("codex-"):
+            return pid
+        pid = _parent(pid)
+    return None
+
+
 def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> bool:
     """The ONE decision whether this process may report ``session_id`` to herdr.
 
     - never for a registered/background worker (D-42);
-    - Claude and Codex: the nearest runtime above this process must be proven to be on
-      ``session_id`` (see `runtime_identity`); the payload and the environment
-      (``CODEX_THREAD_ID`` included) are never the proof;
+    - Claude: the nearest runtime above this process must be proven to be on
+      ``session_id`` (see `runtime_identity`); the payload and environment are never proof;
+    - Codex: the current footer must prove ``session_id`` for the exact foreground PID and
+      pane; rollout identity may be historical after /new, resume, or fork;
     - OpenCode: the nearest runtime must be OpenCode, and when that process proves its
       session (its TUI selection record) the id must match it. A process
       that proves none — an older TUI without the selection record — keeps the
@@ -171,9 +187,16 @@ def may_report(harness: str, session_id: str, *, worker=None, pane_id=None) -> b
     runtime, own = runtime_identity()
     if runtime != harness:
         return False
+    pane = pane_id or os.environ.get("HERDR_PANE_ID")
+    if harness == "codex":
+        # An open rollout can continue to name A after the foreground TUI has
+        # selected B. The current footer must authorize both B and reject a late
+        # callback for A, even while the process still holds A's rollout open.
+        pid = _nearest_codex_pid()
+        return bool(pid and verified_pane(pane, harness, session_id, pid=pid))
     if not (runtime == "opencode" and own is None) and own != session_id:
         return False
-    if not verified_pane(pane_id or os.environ.get("HERDR_PANE_ID"), harness, session_id):
+    if not verified_pane(pane, harness, session_id):
         return False
     return True
 
@@ -395,7 +418,8 @@ def _in_shared_codex_service() -> bool:
     return False
 
 
-def _defer_until_proven(session_id: str, report_session: bool) -> None:
+def _defer_until_proven(session_id: str, report_session: bool, *,
+                        session_seq=None, session_start_source=None) -> None:
     """Report a Codex session its own hook could not prove, once its TUI is proven.
 
     A Codex TUI started without the managed app-server attaches to the user's shared
@@ -411,6 +435,10 @@ def _defer_until_proven(session_id: str, report_session: bool) -> None:
                "--session-id", session_id, "--await-codex-tui"]
     if not report_session:
         command.append("--no-report-session")
+    if session_seq is not None:
+        command += ["--seq", str(session_seq)]
+    if session_start_source is not None:
+        command += ["--session-start-source", session_start_source]
     try:
         subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
@@ -466,7 +494,8 @@ def _codex_tui_pane(session_id: str, *, transport=None):
     return pane
 
 
-def _await_tui_and_project(session_id: str, report_session: bool) -> None:
+def _await_tui_and_project(session_id: str, report_session: bool, *,
+                           session_seq=None, session_start_source=None) -> None:
     import fcntl
     import tempfile
     # One waiter per session: every later prompt's helper exits while one is waiting.
@@ -484,7 +513,9 @@ def _await_tui_and_project(session_id: str, report_session: bool) -> None:
             pane = _codex_tui_pane(session_id, transport=transport)
             if pane:
                 with _herdr_endpoint(transport.get("socket_path")):
-                    _report("codex", session_id, pane, report_session)
+                    _report("codex", session_id, pane, report_session,
+                            session_seq=session_seq, session_start_source=session_start_source,
+                            _proof=lambda: _codex_tui_pane(session_id) == pane)
                 return
             time.sleep(2)
     finally:
@@ -524,13 +555,17 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
         if observation is not None:
             observation["reason"] = "pane-unavailable"
         if codex_main:
-            _defer_until_proven(session_id, report_session)
+            _defer_until_proven(session_id, report_session, session_seq=session_seq,
+                                session_start_source=session_start_source)
         return True
     if not may_report(harness, session_id, worker=worker, pane_id=pane):
         if observation is not None:
             observation["reason"] = "guard-refused"
-        if codex_main and runtime_identity() == ("codex", None):
-            _defer_until_proven(session_id, report_session)
+        if codex_main and runtime_identity()[0] == "codex":
+            pid = _nearest_codex_pid()
+            if pid and verified_pane(pane, "codex", pid=pid):
+                _defer_until_proven(session_id, report_session, session_seq=session_seq,
+                                    session_start_source=session_start_source)
         return True
     if report_session and session_seq is None and session_start_source is None:
         # A start may precede native process identity. The next existing callback
@@ -548,8 +583,17 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
     lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
     if lifecycle is None:
         report_session, lifecycle = False, {}
+    if harness == "codex" and not may_report(harness, session_id, worker=worker, pane_id=pane):
+        # The start-source lookup above takes real time. A /new, resume or fork that landed
+        # meanwhile makes this callback historical: neither report may name the old session.
+        if observation is not None:
+            observation["reason"] = "guard-refused-before-report"
+        return True
     if observation is not None:
         lifecycle["observation"] = observation
+    if harness == "codex":
+        lifecycle["_proof"] = lambda: may_report(
+            harness, session_id, worker=worker, pane_id=pane)
     _report(harness, session_id, pane, report_session, **lifecycle)
     return True
 
@@ -584,7 +628,8 @@ def _metadata_command(herdr, harness, session_id, pane):
 
 
 def _report(harness: str, session_id: str, pane: str, report_session: bool,
-            observation=None, session_seq=None, session_start_source=None) -> None:
+            observation=None, session_seq=None, session_start_source=None,
+            _proof=None) -> None:
     herdr = shutil.which("herdr")
     if not herdr:
         if observation is not None:
@@ -594,6 +639,15 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
     lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
     if lifecycle is None:
         report_session = False
+    def current():
+        try:
+            return _proof is None or bool(_proof())
+        except Exception:
+            return False
+    if not current():
+        if observation is not None:
+            observation["reason"] = "guard-refused-before-report"
+        return
     if report_session:
         session_command = [herdr, "pane", "report-agent-session", pane, "--source", source,
                            "--agent", harness, "--agent-session-id", session_id]
@@ -605,6 +659,10 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
         # this new pane. Otherwise its first metadata report still uses the hash.
         _send_projection(session_command, observation)
     metadata = _metadata_command(herdr, harness, session_id, pane)
+    if not current():
+        if observation is not None:
+            observation["reason"] = "guard-refused-before-metadata"
+        return
     if observation is not None and not report_session:
         observation["session_report"] = "skipped"
     _send_projection(metadata, observation)
@@ -632,7 +690,9 @@ def main(argv=None) -> int:
                         help="exit 0 when this process may report the session, else 1")
     args = parser.parse_args(argv)
     if args.await_codex_tui:
-        _await_tui_and_project(args.session_id, not args.no_report_session)
+        _await_tui_and_project(args.session_id, not args.no_report_session,
+                               session_seq=args.seq,
+                               session_start_source=args.session_start_source)
         return 0
     if args.may_report:
         return 0 if may_report(args.harness, args.session_id) else 1

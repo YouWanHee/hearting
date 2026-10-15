@@ -252,8 +252,18 @@ def session_from_env(harness: Optional[str] = None, env=None) -> tuple[Optional[
     Read by `session_identity`; with several harnesses' ids inherited and none
     named, the first in its claude, codex, opencode order answers.
     """
+    live_process = env is None
+    env = os.environ if env is None else env
     from session_identity import identity, session_ids
     sessions = session_ids(env)
+    if live_process and env.get("HERDR_PANE_ID"):
+        named = env.get("AGENT_DISPATCH_CALLER_HARNESS") or env.get("AGENT_DISPATCH_CURRENT_HARNESS")
+        if (harness in (None, "codex") and (not named or named == "codex")
+                and sessions.get("codex")):
+            from pane_ownership import current_codex_thread_for_caller
+            current = current_codex_thread_for_caller(env.get("HERDR_PANE_ID"))
+            if current is not None:
+                return "codex", current or None
     if harness:
         session_id = sessions.get(harness, (None, None))[0]
         return harness, session_id.strip() if session_id else None

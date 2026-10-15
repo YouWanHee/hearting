@@ -521,6 +521,20 @@ class ReplacementTest(unittest.TestCase):
                 or SimpleNamespace(returncode=0)))
         self.assertEqual(result['reason'],'replacement-launch-pending')
 
+    def test_a_plain_retry_already_continues_the_source_so_advance_claims_nothing(self):
+        # A fallback-hop retry has its own row with no replacement family; a claim would only
+        # compete with it, so a parked owner's checkpoint observes instead of looping on an error.
+        retry={k:v for k,v in self.meta.items() if k not in {'note','launch_outcome'}}
+        self.write({**retry,'attempt_id':'att-retry','automatic_retry_of':'att-source','harness':'claude',
+                    'failure_class':'pass'},append=True)
+        run=mock.Mock(side_effect=AssertionError('no replacement launch'))
+        with mock.patch.object(R,'_authorized'):
+            self.assertEqual(R.advance(self.jobs,'att-source',run=run),{'state':'not-applicable'})
+            effective,mapping,attention=R.advance_batch(self.jobs,{'att-source','att-retry'},run=run)
+        self.assertEqual((effective,mapping,attention),({'att-source','att-retry'},[],[]))
+        run.assert_not_called()
+        self.assertFalse((R._directory(self.jobs)/'claims').exists())
+
     def _launch_env(self,worker_type,prepare):
         self.write({**self.meta,'worker_type':worker_type,'route_file':str(self.path)} if worker_type=='owner' else {**self.meta,'worker_type':worker_type})
         seen={}

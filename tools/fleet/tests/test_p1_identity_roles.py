@@ -37,6 +37,8 @@ class CurrentSessionTest(unittest.TestCase):
             "status": "idle", "name": "이틀 전 작업 완료", "updatedAt": 1000000,
         }))
         (self.home / ".statusline").mkdir()
+        # These legacy taps prove raw percentages and identity, not an applied
+        # compaction policy. Keep the raw diagnostic without inventing a gauge.
         for sid, pct in (("old", 26), ("current", 17)):
             (self.home / ".statusline" / (sid + ".json")).write_text(json.dumps({
                 "session_id": sid, "context_window": {"used_percentage": pct},
@@ -55,7 +57,8 @@ class CurrentSessionTest(unittest.TestCase):
     def test_clear_uses_current_sid_for_all_telemetry_without_old_idle_or_name(self):
         s = self.enrich(["old"])
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
         self.assertIsNone(s.status)
         self.assertIsNone(s.registry_name)
         self.assertTrue(s._transcript_path.endswith("current.jsonl"))
@@ -121,13 +124,15 @@ class CurrentSessionTest(unittest.TestCase):
     def test_incomplete_other_pane_keeps_current_identity_and_telemetry(self):
         s = self._enrich_pane_observation(bound=True, complete=False)
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
         self.assertIsNone(s.status)
 
     def test_complete_pane_observation_resolves_first_snapshot(self):
         s = self._enrich_pane_observation(bound=True, complete=True)
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
 
     def test_agent_list_failure_does_not_reconfirm_herdr_registry(self):
         s = self._enrich_failed_agent_list("herdr")
@@ -150,13 +155,15 @@ class CurrentSessionTest(unittest.TestCase):
     def test_agent_list_failure_preserves_already_observed_pane_identity(self):
         s = self._enrich_failed_agent_list("herdr", bound=True)
         self.assertEqual(s.session_id, "current")
-        self.assertEqual(s.ctx_pct, 17)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 17)
         self.assertIsNone(s.status)
 
     def test_absent_herdr_preserves_plain_terminal_native_identity(self):
         s = self._enrich_failed_agent_list("terminal")
         self.assertEqual(s.session_id, "old")
-        self.assertEqual(s.ctx_pct, 26)
+        self.assertIsNone(s.ctx_pct)
+        self.assertEqual(s.context_policy["raw_percentage"], 26)
 
     def test_standalone_failed_target_pane_is_unobserved(self):
         with mock.patch.object(procscan, "_comm_of", return_value="claude"), \

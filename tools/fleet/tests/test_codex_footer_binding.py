@@ -145,7 +145,8 @@ class CodexFooterBindingTest(unittest.TestCase):
                         mock.patch.object(projection.shutil, "which", return_value="/fake/herdr"), \
                         mock.patch.object(projection, "_in_shared_codex_service", return_value=True), \
                         mock.patch.object(projection, "_defer_until_proven",
-                                          side_effect=lambda sid, include: projection._await_tui_and_project(sid, include)), \
+                                          side_effect=lambda sid, include, **lifecycle:
+                                          projection._await_tui_and_project(sid, include, **lifecycle)), \
                         mock.patch.object(projection, "session_title", return_value="fixture title"), \
                         mock.patch.object(projection, "_formatter_overrides", return_value=(None, None)), \
                         mock.patch.object(projection, "compose", return_value=("[46] codex", "fixture title")), \
@@ -260,13 +261,13 @@ class CodexFooterBindingTest(unittest.TestCase):
                     self.assertEqual(pane_ownership.verified_pane(
                         pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
 
-    def test_native_selection_conflict_refuses_even_when_footer_claims_callback_id(self):
+    def test_current_footer_supersedes_the_same_frontends_old_native_identity(self):
         pid, pane = 42401, "wB:pconflict"
         self.add_frontend(pid, pane, THREAD_A)
         self.native[pid] = TREE_ROOT
         self.assertEqual(pane_ownership.verified_pane(
-            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), "")
-        self.assertEqual(self.screen_reads, [])
+            pane, "codex", THREAD_A, pid=pid, executable="/fake/herdr"), pane)
+        self.assertGreaterEqual(len(self.screen_reads), 2)
 
     def test_stale_process_start_and_changed_current_selection_refuse(self):
         pid, pane = 42501, "wB:pstale"
@@ -303,10 +304,10 @@ class CodexFooterBindingTest(unittest.TestCase):
         report = mock.Mock()
         scan = self.scan_panes([pid])
 
-        def observe_once(sid, include_session):
+        def observe_once(sid, include_session, **lifecycle):
             selected_pane = projection._codex_tui_pane(sid)
             if selected_pane:
-                projection._report("codex", sid, selected_pane, include_session)
+                projection._report("codex", sid, selected_pane, include_session, **lifecycle)
 
         with scan[0], scan[1], scan[2], \
                 mock.patch.object(projection.shutil, "which", return_value="/fake/herdr"), \

@@ -330,7 +330,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--foreground-timeout",
         type=float,
-        default=float(os.environ.get("CLAUDE_DISPATCH_FOREGROUND_TIMEOUT", "3600")),
+        default=float(os.environ.get("CLAUDE_DISPATCH_FOREGROUND_TIMEOUT", "14400")),
         help="maximum child lifetime for foreground-scoped launch; non-positive clamps to the safe default (never waits indefinitely)",
     )
     add_stage_session_arguments(p)
@@ -1085,6 +1085,42 @@ def completion_lease_path(args: argparse.Namespace) -> Path:
     if not args.attempt_id:
         return dispatch_state_root(args.jobs_path) / "supervisor-state" / "preview-only.lease"
     return supervisor_lease_path(args.jobs_path, args.attempt_id)
+
+
+_COMPACTION_ENV_KEYS = {
+    "window": "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "pct_override": "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "disable_auto_compact_env": "DISABLE_AUTO_COMPACT",
+    "disable_compact_env": "DISABLE_COMPACT",
+    "max_output_env": "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+}
+
+
+def claude_compaction_inputs(env: dict[str, str]) -> dict[str, str]:
+    """Allowlisted inputs of Claude's auto-compaction consumer for this exact launch.
+
+    Claude assigns its settings `env` block over the inherited environment at startup, so
+    the home settings value is recorded beside the launch env value; the Fleet collector
+    treats a disagreement as unknown instead of choosing one.
+    """
+    settings_env: dict = {}
+    try:
+        document = json.loads(
+            (Path(env["CLAUDE_CONFIG_DIR"]) / "settings.json").read_text(encoding="utf-8"))
+        candidate = document.get("env") if isinstance(document, dict) else None
+        settings_env = candidate if isinstance(candidate, dict) else {}
+    except (KeyError, OSError, ValueError):
+        pass
+
+    def text(value) -> str:
+        return "absent" if value is None or value == "" else str(value)[:128]
+
+    metadata: dict[str, str] = {}
+    for field, name in _COMPACTION_ENV_KEYS.items():
+        key = "claude_context_window_request" if field == "window" else f"claude_compaction_{field}"
+        metadata[key] = text(env.get(name))
+        metadata[f"claude_settings_{field}"] = text(settings_env.get(name))
+    return metadata
 
 
 def apply_context_window_environment(env: dict[str, str], settings: dict[str, str]) -> dict[str, str]:
@@ -1933,6 +1969,7 @@ def main(argv: list[str]) -> int:
             **args.launch_lifecycle_resolution.metadata(),
             "runtime_sandbox": "adapter-default",
             "runtime_home": env["CLAUDE_CONFIG_DIR"],
+            **claude_compaction_inputs(env),
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("claude", env))

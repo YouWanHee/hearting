@@ -295,7 +295,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--foreground-timeout",
         type=float,
-        default=float(os.environ.get("OPENCODE_DISPATCH_FOREGROUND_TIMEOUT", "3600")),
+        default=float(os.environ.get("OPENCODE_DISPATCH_FOREGROUND_TIMEOUT", "14400")),
         help="maximum child lifetime for foreground-scoped launch",
     )
     p.add_argument(
@@ -1514,6 +1514,19 @@ def main(argv: list[str]) -> int:
             "context_window_final_limit_context": "absent" if final_limits["context"] is None else str(final_limits["context"]),
             "context_window_final_limit_input": "absent" if final_limits["input"] is None else str(final_limits["input"]),
             "context_window_final_limit_output": "absent" if final_limits["output"] is None else str(final_limits["output"]),
+            "context_policy_state": context_capture["compaction_policy"]["state"],
+            "context_policy_enabled": ("unknown" if context_capture["compaction_policy"]["enabled"] is None
+                                        else str(context_capture["compaction_policy"]["enabled"]).lower()),
+            "context_policy_trigger": ("absent" if context_capture["compaction_policy"]["trigger_tokens"] is None
+                                       else str(context_capture["compaction_policy"]["trigger_tokens"])),
+            "context_policy_output_allowance": ("absent" if context_capture["compaction_policy"]["output_allowance_tokens"] is None
+                                                 else str(context_capture["compaction_policy"]["output_allowance_tokens"])),
+            "context_policy_configured_reserve": ("absent" if context_capture["compaction_policy"]["configured_reserve_tokens"] is None
+                                                  else str(context_capture["compaction_policy"]["configured_reserve_tokens"])),
+            "context_policy_effective_reserve": ("absent" if context_capture["compaction_policy"]["effective_reserve_tokens"] is None
+                                                 else str(context_capture["compaction_policy"]["effective_reserve_tokens"])),
+            "context_policy_reason": context_capture["compaction_policy"]["reason"] or "none",
+            "context_policy_runtime_version": context_capture["runtime_version"] or "unknown",
         })
     log_dir = (
         Path(args.log_dir)
@@ -1809,6 +1822,19 @@ def main(argv: list[str]) -> int:
         }
         from dispatch_capacity_evidence import launch_scope
         launch_metadata.update(launch_scope("opencode", dispatch_env))
+        launch_metadata["opencode_context_window_request"] = str(
+            args.resolved_model_settings.get("context_window", ""))
+        for key in (
+                "context_window_native_model",
+                "context_window_final_limit_context", "context_window_final_limit_input",
+                "context_window_final_limit_output", "context_policy_state",
+                "context_policy_runtime_version",
+                "context_policy_enabled", "context_policy_trigger",
+                "context_policy_output_allowance", "context_policy_configured_reserve",
+                "context_policy_effective_reserve", "context_policy_reason"):
+            value = args.resolved_model_settings.get(key)
+            if value is not None:
+                launch_metadata["opencode_" + key] = str(value)
         grant_route_id, grant_route_hash = args.route_id, args.route_hash
         if not grant_route_id and not grant_route_hash and args.owner_route_binding:
             grant_route_id = args.owner_route_binding.route_id

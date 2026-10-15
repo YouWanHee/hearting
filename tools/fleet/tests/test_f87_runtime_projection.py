@@ -58,9 +58,20 @@ class RuntimeProjectionTest(unittest.TestCase):
         fixture = root / "python-fixture"
         fixture.mkdir(exist_ok=True)
         (fixture / "sitecustomize.py").write_text(
-            f"import sys; sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
+            f"import os, sys; sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
             "import pane_ownership\n"
             "def admitted(pane,harness,sid=None,*,pid=None,**kw):\n"
+            "    if harness == 'codex':\n"
+            "        # Stand-in for the two-read footer proof: the footer names the thread the\n"
+            "        # pane has selected (HERDR_CURRENT_FOOTER), by default the one this\n"
+            "        # process holds open.\n"
+            "        current = os.environ.get('HERDR_CURRENT_PID')\n"
+            "        if pid is None or (current is not None and str(pid) != current):\n"
+            "            return ''\n"
+            "        footer = os.environ.get('HERDR_CURRENT_FOOTER')\n"
+            "        if footer is None:\n"
+            "            footer = pane_ownership._native_session(pid, 'codex')\n"
+            "        return (pane or '') if sid and sid == footer else ''\n"
             "    if pid is not None and sid and pane_ownership._native_session(pid,harness)!=sid:\n"
             "        return ''\n"
             "    return pane or ''\n"
@@ -403,9 +414,14 @@ class RuntimeProjectionTest(unittest.TestCase):
                     "HERDR_ENV": "1", "HERDR_PANE_ID": "wB:pN",
                     "HERDR_SOCKET_PATH": str(root / "live.sock"),
                     "HERDR_LOG": str(log), "HERDR_MODE": "ok", "HERDR_EXIT": "0"})
-        runner = prelude + ("import subprocess,sys;subprocess.run([%r,%r],input=sys.argv[1],"
-                            "text=True,capture_output=True,timeout=60)"
-                            % (sys.executable, str(hook)))
+        # The footer names one thread only for one rollout and no competing sibling; an
+        # ambiguous pair leaves it unreadable, which proves nothing.
+        footer = sids[0] if len(sids) == 1 and not sibling else ""
+        runner = prelude + ("import os,subprocess,sys;os.environ['HERDR_CURRENT_PID']=str(os.getpid());"
+                            "os.environ['HERDR_CURRENT_FOOTER']=%r;"
+                            "subprocess.run([%r,%r],input=sys.argv[1],text=True,"
+                            "capture_output=True,timeout=60)"
+                            % (footer, sys.executable, str(hook)))
         payload = json.dumps({"prompt": "deterministic recall", "session_id": payload_sid,
                               "turn_id": "directturnid", "cwd": ""})
         other = None
@@ -493,6 +509,7 @@ class RuntimeProjectionTest(unittest.TestCase):
     def test_triangle_shared_resolver_and_may_report_keep_exact_identity(self):
         from fleet import herdr_projection as hp
         from fleet.collectors import codex, procscan
+        import pane_ownership
         with tempfile.TemporaryDirectory() as td:
             result = self.start_match_fixture(Path(td), [1000.0, 1018.23], [1.306, 19.499])
             _codex, _procscan, sessions, root_paths, sids, _paths, _claimed, cwd, home = result
@@ -519,14 +536,66 @@ class RuntimeProjectionTest(unittest.TestCase):
                  unittest.mock.patch.object(hp, "_parent",
                     side_effect=lambda pid: sessions[0].pid if pid == os.getpid() else 0), \
                  unittest.mock.patch.object(hp, "_comm",
-                    side_effect=lambda pid: "codex" if pid == sessions[0].pid else "python"):
+                    side_effect=lambda pid: "codex" if pid == sessions[0].pid else "python"), \
+                 unittest.mock.patch.object(pane_ownership, "verified_pane",
+                    side_effect=lambda pane, harness, sid, **_kw:
+                    "fixture-pane" if sid == sids[0] else ""):
                 own = codex.session_id_of_process(sessions[0].pid, lambda: sessions)
                 self.assertEqual(own, sids[0])
                 self.assertTrue(hp.may_report("codex", sids[0], worker=False))
                 self.assertFalse(hp.may_report("codex", sids[1], worker=False))
                 self.assertFalse(hp.may_report("codex", sids[0], worker=True))
-                with unittest.mock.patch.object(procscan, "read_environ", return_value={}):
+                # Pane proof, not the process environment, decides a Codex report: a
+                # footer that does not name the thread refuses it.
+                with unittest.mock.patch.object(pane_ownership, "verified_pane",
+                                                return_value=""):
                     self.assertFalse(hp.may_report("codex", sids[0], worker=False))
+
+    def test_same_pid_new_resume_and_fork_selection_follows_the_pane_footer(self):
+        """One Codex PID keeps an older rollout open after /new, resume or fork. The
+        reporting gate follows the pane's proven footer for that PID, in both directions,
+        and never trusts the open rollout or the callback's own claim."""
+        from fleet import herdr_projection as hp
+        import pane_ownership
+        old, new, fork = (CODEX_SID, "01a0c233-96b3-7cf3-871b-7beb1fc71680",
+                          "01a0c233-96b3-7cf3-871b-7beb1fc71681")
+        footer = {"sid": new}
+        calls = []
+
+        def verified(pane, harness, sid, **kwargs):
+            calls.append((pane, harness, sid, kwargs.get("pid")))
+            return pane if sid == footer["sid"] and kwargs.get("pid") == 4242 else ""
+
+        with unittest.mock.patch.object(hp, "_parent",
+                side_effect=lambda pid: 4242 if pid == os.getpid() else 0), \
+             unittest.mock.patch.object(hp, "_comm",
+                side_effect=lambda pid: "codex" if pid == 4242 else "python"), \
+             unittest.mock.patch.object(hp, "runtime_identity", return_value=("codex", old)), \
+             unittest.mock.patch.object(pane_ownership, "verified_pane", side_effect=verified):
+            self.assertTrue(hp.may_report("codex", new, worker=False, pane_id="pane-9"))
+            self.assertFalse(hp.may_report("codex", old, worker=False, pane_id="pane-9"))
+            footer["sid"] = old                      # backward resume on the same PID
+            self.assertTrue(hp.may_report("codex", old, worker=False, pane_id="pane-9"))
+            footer["sid"] = fork                     # fork A -> C
+            self.assertTrue(hp.may_report("codex", fork, worker=False, pane_id="pane-9"))
+            self.assertFalse(hp.may_report("codex", new, worker=False, pane_id="pane-9"))
+            self.assertFalse(hp.may_report("codex", fork, worker=True, pane_id="pane-9"))
+        self.assertTrue(all(call[3] == 4242 for call in calls))
+
+    def test_a_selection_change_during_the_report_window_suppresses_both_reports(self):
+        from fleet import herdr_projection as hp
+        decisions = iter([True, False])
+        sent = []
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="/usr/bin/herdr"), \
+             unittest.mock.patch.object(hp, "may_report",
+                side_effect=lambda *a, **k: next(decisions)), \
+             unittest.mock.patch.object(hp, "_report", side_effect=lambda *a, **k: sent.append(a)), \
+             unittest.mock.patch.object(hp, "runtime_identity", return_value=("codex", None)):
+            observation = {}
+            self.assertTrue(hp.project("codex", CODEX_SID, pane_id="pane-9", worker=False,
+                                       report_session=False, observation=observation))
+        self.assertEqual(sent, [])
+        self.assertEqual(observation["reason"], "guard-refused-before-report")
 
     def test_start_match_refuses_ambiguous_deficient_and_surplus_components(self):
         from fleet.collectors import codex
@@ -1098,6 +1167,34 @@ class ProjectionObservationTest(unittest.TestCase):
                 self.assertNotIn("received", observation)
                 self.assertTrue(all(call.kwargs["stdout"] == subprocess.DEVNULL and
                                     call.kwargs["stderr"] == subprocess.DEVNULL for call in run.call_args_list))
+
+    def test_known_old_runtime_sid_can_wait_for_the_new_foreground_footer(self):
+        from tools.fleet import herdr_projection as hp
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="herdr"), \
+             unittest.mock.patch.object(hp, "may_report", return_value=False), \
+             unittest.mock.patch.object(hp, "runtime_identity", return_value=("codex", "old")), \
+             unittest.mock.patch.object(hp, "_nearest_codex_pid", return_value=42), \
+             unittest.mock.patch.object(hp, "verified_pane", return_value="pane"), \
+             unittest.mock.patch.object(hp, "_defer_until_proven") as defer, \
+             unittest.mock.patch.object(hp, "_report") as report:
+            hp.project("codex", "new", pane_id="pane", worker=False,
+                       session_seq=7, session_start_source="clear")
+            defer.assert_called_once_with("new", True, session_seq=7,
+                                          session_start_source="clear")
+            report.assert_not_called()
+
+    def test_a_switch_during_metadata_formatting_suppresses_the_old_metadata(self):
+        from tools.fleet import herdr_projection as hp
+        with unittest.mock.patch.object(hp.shutil, "which", return_value="herdr"), \
+             unittest.mock.patch.object(hp, "_metadata_command", return_value=["metadata"]), \
+             unittest.mock.patch.object(hp, "_send_projection") as send:
+            observation = {}
+            proof = iter((True, False))
+            hp._report("codex", "old", "pane", True, observation=observation,
+                       _proof=lambda: next(proof))
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_args.args[0][2], "report-agent-session")
+            self.assertEqual(observation["reason"], "guard-refused-before-metadata")
 
     def test_unavailable_and_no_report_session_observation_never_promote_identity(self):
         from tools.fleet import herdr_projection as hp

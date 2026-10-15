@@ -3837,7 +3837,7 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                     self.assertIn("reason=target-changed", line)
 
     def test_a_pane_record_without_a_session_id_is_cleared_only_when_the_process_names_the_booked_one(self):
-        # herdr names no session (`-`): not a confirmed match -- only the process can vouch for it.
+        # herdr names no session (`-`): only a current native pane proof can vouch for it.
         for harness, collector in (("claude", "claude"), ("codex", "codex")):
             for proof, expect_typed in (("sid-A", 1), ("sid-other", 0), (None, 0)):
                 with self.subTest(harness=harness, process_says=proof):
@@ -3845,6 +3845,8 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                     screen = CLAUDE_EMPTY if harness == "claude" else CODEX_EMPTY
                     world = _ClearWorld(harness=harness, sid=None, new_sid=None, screens=[screen])
                     with mock.patch(f"fleet.collectors.{collector}.session_id_of_process", return_value=proof), \
+                            mock.patch("pane_ownership.current_codex_thread",
+                                       return_value=proof or ""), \
                             mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
                         rc, line = self.clear_cmd(world)
                     self.assertEqual(len(world.typed()), expect_typed, line)
@@ -4026,6 +4028,7 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward.subprocess, "run", side_effect=world.run), \
              mock.patch("fleet.collectors.claude.session_id_of_process", return_value=process), \
              mock.patch("fleet.collectors.codex.session_id_of_process", return_value=process), \
+             mock.patch("pane_ownership.current_codex_thread", return_value=process or ""), \
              mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
             rc = peer_steward.main(argv)
         return rc, (printed[-1] if printed else "")

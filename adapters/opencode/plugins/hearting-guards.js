@@ -1,7 +1,7 @@
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync, spawn } from "node:child_process"
-import { existsSync, mkdirSync, writeFileSync, utimesSync, openSync, readSync, closeSync, realpathSync, readFileSync, readdirSync } from "node:fs"
+import { existsSync, mkdirSync, writeFileSync, renameSync, utimesSync, openSync, readSync, closeSync, realpathSync, readFileSync, readdirSync } from "node:fs"
 import { createHash } from "node:crypto"
 
 const pluginDir = path.dirname(fileURLToPath(import.meta.url))
@@ -21,6 +21,10 @@ const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
 const contextWindowHelper = path.join(root, "utilities", "opencode_context_window.py")
+const nativeContextPolicyVersion = "1.19.0"
+let resolvedRuntimeConfig = null
+let contextPolicyRuntimeVersion = null
+let contextPolicyRequestedWindow = null
 const frameNativeAnswer = path.join(root, "utilities", "frame_native_answer.py")
 const startReceipt = path.join(root, "utilities", "start_receipt.py")
 const routeGateTools = new Set(["write", "edit", "multiedit", "patch", "apply_patch", "bash"])
@@ -1291,6 +1295,127 @@ function promptText(output) {
     .join("\n")
 }
 
+function contextPolicyProcess() {
+  try {
+    const pid = process.pid
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+    const close = stat.lastIndexOf(") ")
+    if (close < 0) return null
+    const start = stat.slice(close + 2).trim().split(/\s+/)[19]
+    const own = Number.isInteger(pid) && pid > 1 && /^\d+$/.test(start || "") ? { pid, start } : null
+    const origin = paneNativeOrigin
+    if (!isWorkerSession() && origin && origin.state !== "invalidated"
+        && Number.isInteger(origin.pid) && origin.pid > 1 && /^\d+$/.test(String(origin.start || ""))) {
+      return { pid: origin.pid, start: String(origin.start) }
+    }
+    return own
+  } catch { return null }
+}
+
+function detectContextPolicyRuntimeVersion() {
+  if (typeof process.env.OPENCODE_VERSION === "string" && process.env.OPENCODE_VERSION) {
+    return process.env.OPENCODE_VERSION
+  }
+  try {
+    const result = spawnSync(process.execPath, ["--version"], {
+      encoding: "utf8", timeout: 1000, maxBuffer: 4096,
+    })
+    if (result.status !== 0) return null
+    return (String(result.stdout || "").match(/(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)/) || [])[1] || null
+  } catch { return null }
+}
+
+function contextPolicyFromChat(input, output) {
+  const model = input?.model || {}
+  const limit = model.limit && typeof model.limit === "object" ? model.limit : {}
+  const compaction = resolvedRuntimeConfig?.compaction
+    && typeof resolvedRuntimeConfig.compaction === "object" ? resolvedRuntimeConfig.compaction : {}
+  const context = Number.isSafeInteger(limit.context) && limit.context >= 0 ? limit.context : null
+  const inputLimit = Number.isSafeInteger(limit.input) && limit.input >= 0 ? limit.input : null
+  const configuredReserved = compaction.reserved
+  const reservedValid = configuredReserved === undefined || configuredReserved === null
+    || Number.isSafeInteger(configuredReserved) && configuredReserved >= 0
+  const outputAllowance = Number.isSafeInteger(output?.maxOutputTokens) && output.maxOutputTokens >= 0
+    ? output.maxOutputTokens
+    : Number.isSafeInteger(limit.output) && limit.output >= 0 ? limit.output : null
+  const requestText = typeof contextPolicyRequestedWindow === "string"
+    ? contextPolicyRequestedWindow.slice(0, 128) : null
+  const requestTokens = requestText !== null && /^\d+$/.test(requestText)
+    ? Number(requestText) : null
+  const policy = {
+    state: "unknown", source: "opencode-native-chat-params",
+    runtime_version: contextPolicyRuntimeVersion,
+    configured_request_tokens: Number.isSafeInteger(requestTokens) ? requestTokens : null,
+    configured_request: requestText,
+    effective_window_tokens: context,
+    applied_trigger_tokens: null,
+    output_allowance_tokens: outputAllowance,
+    compaction_reserve_tokens: null,
+    disabled: null, enabled: null, enforced: null,
+    raw_percentage: null, session_id: input?.sessionID || null,
+    attempt_id: process.env.AGENT_DISPATCH_ATTEMPT_ID || null,
+    reason: "native-policy-input-unavailable",
+  }
+  if (contextPolicyRuntimeVersion !== nativeContextPolicyVersion) {
+    policy.reason = "native-consumer-version-unverified"
+    return policy
+  }
+  if (compaction.auto === false || context === 0) {
+    return { ...policy, state: "disabled", disabled: true, enabled: false, enforced: false,
+      reason: "native-auto-compaction-disabled" }
+  }
+  if (compaction.auto !== undefined && compaction.auto !== true || !reservedValid) {
+    policy.reason = "native-compaction-config-invalid"
+    return policy
+  }
+  policy.enabled = true
+  const configuredReserveTokens = Number.isSafeInteger(configuredReserved)
+    ? configuredReserved : null
+  let effectiveReserve = null
+  let trigger = null
+  if (inputLimit !== null && inputLimit > 0) {
+    effectiveReserve = configuredReserveTokens !== null ? configuredReserveTokens
+      : outputAllowance !== null ? Math.min(20_000, outputAllowance) : null
+    if (effectiveReserve !== null) trigger = Math.max(0, inputLimit - effectiveReserve)
+  } else if (context !== null && outputAllowance !== null) {
+    effectiveReserve = outputAllowance
+    trigger = Math.max(0, context - outputAllowance)
+  }
+  if (trigger === null) {
+    policy.reason = "native-output-or-input-limit-unavailable"
+    return policy
+  }
+  return { ...policy, state: "applied", enabled: true, enforced: true, disabled: false,
+    applied_trigger_tokens: trigger, compaction_reserve_tokens: effectiveReserve, reason: null }
+}
+
+function writeContextPolicy(input, output) {
+  try {
+    const sid = input?.sessionID
+    const own = contextPolicyProcess()
+    if (typeof sid !== "string" || !sid || !own) return
+    const env = process.env || {}
+    const stateRoot = env.FLEET_SESSION_REGISTRY_DIR
+      ? path.dirname(path.resolve(env.FLEET_SESSION_REGISTRY_DIR))
+      : path.join(env.XDG_STATE_HOME || path.join(env.HOME || "", ".local", "state"), "agent-fleet")
+    if (!stateRoot || stateRoot === "." || !path.isAbsolute(stateRoot)) return
+    const directory = path.join(stateRoot, "context-policy", "opencode")
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const attemptID = env.AGENT_DISPATCH_ATTEMPT_ID || null
+    const name = attemptID ? `attempt-${attemptID}.json` : `${own.pid}-${own.start}.json`
+    if (!/^[A-Za-z0-9._-]{1,180}\.json$/.test(name)) return
+    const target = path.join(directory, name)
+    const temporary = `${target}.tmp-${own.pid}`
+    const policy = contextPolicyFromChat(input, output)
+    const payload = { schema: "hearting-context-policy-v1", harness: "opencode",
+      session_id: sid, pid: own.pid, proc_start: own.start, attempt_id: attemptID,
+      model: `${input?.model?.providerID || input?.provider?.info?.id || ""}/${input?.model?.id || ""}`,
+      observed_at: Date.now() / 1000, policy }
+    writeFileSync(temporary, JSON.stringify(payload), { encoding: "utf8", mode: 0o600 })
+    renameSync(temporary, target)
+  } catch { /* Display telemetry must never delay or block a native model request. */ }
+}
+
 // The inherited caller name and the other harnesses' session identity variables, blanked in
 // OpenCode tool commands. The worker marker AGENT_DISPATCH_CURRENT_HARNESS is left alone.
 const inheritedIdentityEnv = [
@@ -1323,6 +1448,10 @@ export const AgentHarnessGuards = async (ctx) => {
   dispose: () => { completionCarrier.dispose(); retirePaneContext(ctx) },
   async config(input) {
     const config = input && typeof input === "object" ? input : {}
+    if (contextPolicyRuntimeVersion === null) {
+      contextPolicyRuntimeVersion = detectContextPolicyRuntimeVersion()
+    }
+    resolvedRuntimeConfig = config
     const child = spawnSync(python3, [contextWindowHelper], {
       cwd: root,
       env: { ...process.env, AGENT_HOME: root },
@@ -1337,6 +1466,8 @@ export const AgentHarnessGuards = async (ctx) => {
     }
     try {
       const result = JSON.parse(child.stdout || "{}")
+      contextPolicyRequestedWindow = typeof result?.context_window_request === "string"
+        ? result.context_window_request : null
       const projected = result?.config?.provider
       if (!projected || typeof projected !== "object") return config
       if (!config.provider || typeof config.provider !== "object") config.provider = {}
@@ -1361,6 +1492,9 @@ export const AgentHarnessGuards = async (ctx) => {
       process.stderr.write("hearting: context window config hook returned invalid data\n")
       return config
     }
+  },
+  "chat.params": async (input, output) => {
+    writeContextPolicy(input, output)
   },
   event: async ({ event }) => {
     if (event && event.type === "session.created") {

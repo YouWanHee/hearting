@@ -343,7 +343,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--foreground-timeout",
         type=float,
-        default=float(os.environ.get("CODEX_DISPATCH_FOREGROUND_TIMEOUT", "3600")),
+        default=float(os.environ.get("CODEX_DISPATCH_FOREGROUND_TIMEOUT", "14400")),
         help="maximum child lifetime for foreground-scoped launch; non-positive clamps to the safe default (never waits indefinitely)",
     )
     add_stage_session_arguments(p)

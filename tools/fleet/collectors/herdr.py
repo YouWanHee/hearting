@@ -163,12 +163,12 @@ def pane_pids(panes, runner=subprocess.run, bindings=None):
                         errors=getattr(evidence, "errors", ()))
 
 
-def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
-    """Exact thread IDs for unresolved Codex TUIs, bounded by cwd and cached by PID.
+def codex_pane_sessions(sessions, panes=None, runner=subprocess.run, *, force_current=False):
+    """Exact thread IDs for Codex TUIs, bounded by cwd and cached by PID.
 
     Herdr pane metadata can be stale (a closed pane may retain a thread ID), so a
     matching live foreground Codex PID and its original process start are required.
-    This is called only for TUIs still missing a rollout after process attribution.
+    Current-session transitions bypass the short-lived identity cache.
     """
     from . import procscan
 
@@ -181,7 +181,8 @@ def codex_pane_sessions(sessions, panes=None, runner=subprocess.run):
     key = tuple(sorted((pid, str(s.proc_start), os.path.realpath(s.cwd or ""))
                        for pid, s in targets.items()))
     now = time.monotonic()
-    if panes is None and runner is subprocess.run and key == _CODEX_PANE_CACHE["key"] \
+    if not force_current and panes is None and runner is subprocess.run \
+            and key == _CODEX_PANE_CACHE["key"] \
             and now < _CODEX_PANE_CACHE["until"]:
         found = _CODEX_PANE_CACHE["identities"]
     else:

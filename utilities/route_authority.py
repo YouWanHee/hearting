@@ -393,7 +393,7 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         return ContinuationDecision(False, "protected", facts["history_conflict"], "report")
     if action == "replacement-progress":
         from dispatch_contract import verdict_pass
-        from dispatch_replacement import _replacement_in_flight
+        from dispatch_replacement import _plain_retry_successor, _replacement_in_flight
         if facts.get("record") is not None:
             kind = _replacement_kind(status, metadata, jobs=jobs)
             if status not in {"open", "running"}:
@@ -413,6 +413,9 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
             return ContinuationDecision(True, "advance", next_action="start")
         kind = facts.get("kind")
         if kind is None:
+            return ContinuationDecision(False, "not-applicable", next_action="observe")
+        if _plain_retry_successor(facts.get("registry_rows") or {}, metadata.get("attempt_id")):
+            # An ordinary retry already continues this attempt; a claim would only compete with it.
             return ContinuationDecision(False, "not-applicable", next_action="observe")
         if not facts.get("resume_capacity") and not _replacement_in_flight(jobs, facts["registry_rows"], metadata):
             if kind == "capacity":
