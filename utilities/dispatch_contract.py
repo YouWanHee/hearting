@@ -479,7 +479,7 @@ FOREGROUND_OUTCOME_SOURCE = "wait-foreground-v1"
 # stays `signal-N`.
 FOREGROUND_FAILURES = frozenset({
     "none", "timeout", "parent-terminated", "process-identity-unavailable",
-    "interrupted",
+    "interrupted", "no-progress",
 })
 # The fixed failure words; `exit-N`/`signal-N` are validated separately.
 _FOREGROUND_FIXED_FAILURES = FOREGROUND_FAILURES - {"none"}

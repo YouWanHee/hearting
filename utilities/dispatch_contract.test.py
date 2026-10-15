@@ -6715,6 +6715,14 @@ class ForegroundInterruptedOutcomeTest(unittest.TestCase):
   self.assertEqual(D._foreground_outcome_values_from_pipe(pipe)["foreground_process_failure"],
                    "interrupted")
 
+ def test_no_progress_round_trips_as_a_fixed_failure(self):
+  self.assertIn("no-progress",D.FOREGROUND_FAILURES)
+  values=D._foreground_outcome_values(exit_code=-15,failure="no-progress",group_empty=True)
+  pipe=",".join(f"{key}={value}" for key,value in
+                {**values,"foreground_outcome_source":D.FOREGROUND_OUTCOME_SOURCE}.items())
+  self.assertEqual(D._foreground_outcome_values_from_pipe(pipe)["foreground_process_failure"],
+                   "no-progress")
+
  def test_unknown_words_and_the_none_exit_relation_still_fail(self):
   for failure,exit_code in (("interrupted-1",-15),("interrupt",-15),("interrupted",0)):
    with self.subTest(failure=failure,exit_code=exit_code), \
