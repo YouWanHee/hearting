@@ -397,6 +397,31 @@ _PROOF_WAIT_S = 90
 _THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
+def _codex_status_line_feasibility() -> str:
+    """Read only the current direct Codex frontend's known effective config."""
+    try:
+        from fleet.collectors import procscan
+        pid = _nearest_codex_pid()
+        if not pid or procscan.is_shared_codex_daemon(pid):
+            return "unknown"
+        argv = procscan._read_argv(pid)
+        if procscan.invocation_mode("codex", argv) != "session":
+            return "unknown"
+        env = procscan.read_environ(pid)
+        home = env.get("CODEX_HOME")
+        if not home and env.get("HOME"):
+            home = os.path.join(env["HOME"], ".codex")
+        if not home:
+            return "unknown"
+        utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+        if utilities not in sys.path:
+            sys.path.insert(0, utilities)
+        from codex_tui_config import status_line_capability_for_home
+        return status_line_capability_for_home(home, argv=argv)
+    except Exception:
+        return "unknown"
+
+
 def _in_shared_codex_service() -> bool:
     """True when this hook runs inside the shared background Codex service.
 
@@ -430,6 +455,8 @@ def _defer_until_proven(session_id: str, report_session: bool, *,
     TUI on this session and reports to the pane herdr gave that TUI.
     """
     if not _THREAD_ID.fullmatch(session_id or ""):
+        return
+    if _codex_status_line_feasibility() == "incapable":
         return
     command = [sys.executable, str(Path(__file__).resolve()), "--harness", "codex",
                "--session-id", session_id, "--await-codex-tui"]

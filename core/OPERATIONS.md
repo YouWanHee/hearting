@@ -433,14 +433,17 @@ a parked job or shared socket is insufficient. Missing or ambiguous proof keeps
 tidy at its existing project seat and pane hooks silent, without new user input
 or runtime-state migration.
 
-For native Codex callbacks in a shared service, the foreground TUI's first
-full `thread-id` footer field provides the current `Thread.id`; `sessionId`
-remains its tree root. Two fresh samples share stable foreground PID/start/TTY
-and one unique endpoint/pane, also used for reporting, number lookup and title.
-Managed apply preserves other custom footer items. UUIDs elsewhere, callback
-or environment SID, cwd, title, inherited pane and shared ancestry alone remain
-hints. Missing, clipped, conflicting or stale observations stay unknown;
-registered workers have no foreground pane ownership.
+For native Codex callbacks in a shared service, exactly one `thread-id` is the
+last `[tui].status_line` item, and the complete UUID in the last visible native
+footer field provides the current `Thread.id`; `sessionId` remains its tree
+root. A UUID in an earlier field, title, transcript, or arbitrary screen text
+is not current identity. A missing, clipped, wrapped, partial, ambiguous, or
+hidden last field stays unknown. Two fresh samples share stable foreground
+PID/start/TTY and one unique endpoint/pane, also used for reporting, number
+lookup and title. Managed apply preserves every other custom footer item and
+its order. Callback or environment SID, cwd, title, inherited pane and shared
+ancestry alone remain hints; registered workers have no foreground pane
+ownership.
 
 For an unproven background caller, default `peer-steward start` locates the
 inherited pane's workspace by its live foreground directory in the caller's

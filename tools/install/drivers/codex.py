@@ -8,6 +8,7 @@ or the bootstrap surface.
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -19,6 +20,11 @@ import user_model_config
 import safe_fs
 import claude_settings_config
 import codex_launcher
+
+_UTILITIES = str(Path(__file__).resolve().parents[3] / "utilities")
+if _UTILITIES not in sys.path:
+    sys.path.insert(0, _UTILITIES)
+import codex_tui_config
 
 RUNTIME = "codex"
 
@@ -85,9 +91,20 @@ def _plugin_action(dry_run):
 def install(scope="global", plugin=False, dry_run=False):
     """Apply the symlink projection and optional plugin wrapper."""
     entries = projector.plan(["codex"], scope=scope)["codex"]
-
-    actions = [claude_settings_config.retire_hook_registrations(
-        paths.runtime_home(RUNTIME, scope) / "hooks.json", dry_run=dry_run)]
+    runtime_home = paths.runtime_home(RUNTIME, scope)
+    fragment = Path(__file__).resolve().parents[3] / "adapters" / "codex" / "config" / "tui-statusline.toml"
+    try:
+        tui_result = codex_tui_config.apply_status_line(
+            runtime_home / "config.toml", fragment, dry_run=dry_run)
+        tui_action = {"action": "codex-tui-statusline", "dest": tui_result["path"],
+                      "status": ("planned" if dry_run and tui_result["changed"] else
+                                 "updated" if tui_result["changed"] else "unchanged"),
+                      "detail": "thread-id is last; other items and explicit colors are preserved"}
+    except (OSError, UnicodeError, codex_tui_config.CodexTuiConfigError) as exc:
+        tui_action = {"action": "codex-tui-statusline", "dest": str(runtime_home / "config.toml"),
+                      "status": "skipped", "detail": str(exc)}
+    actions = [tui_action, claude_settings_config.retire_hook_registrations(
+        runtime_home / "hooks.json", dry_run=dry_run)]
 
     for entry in entries:
         action = entry["action"]
