@@ -45,8 +45,9 @@ class ZenGoTokenTest(unittest.TestCase):
 class ZenGoFetchTest(unittest.TestCase):
     def setUp(self):
         self.cache = {"ts": 0.0, "ok_ts": 0.0, "data": None}
-        with mock.patch.object(zen_go_usage, "_cache", self.cache):
-            pass
+        cache_patcher = mock.patch.object(zen_go_usage, "_cache", self.cache)
+        cache_patcher.start()
+        self.addCleanup(cache_patcher.stop)
 
     def _fetch_with(self, body):
         opener = mock.MagicMock()
