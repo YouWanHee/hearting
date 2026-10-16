@@ -1710,6 +1710,8 @@ def _retire_subject_state(duty):
     if not isinstance(original, dict) or not original.get("pid") or not original.get("start"):
         return "unknown"
     current = _retire_process_record(original["pid"])
+    if current is None and _retire_zombie_matches(original["pid"], original["start"]):
+        return "gone"
     start = current["start"] if current is not None else _proc_start_ticks(original["pid"])
     if start is not None:
         return "same" if start == original["start"] else "gone"
@@ -1720,6 +1722,26 @@ def _retire_subject_state(duty):
     except OSError:
         pass
     return "unknown"
+
+
+def _retire_zombie_matches(pid, expected_start):
+    """A same-birth zombie has exited, but /proc still exists until its parent reaps it."""
+    if (type(pid) is not int or pid <= 1 or not isinstance(expected_start, str)
+            or not expected_start.isdigit()):
+        return False
+    try:
+        root = Path(f"/proc/{pid}")
+        raw = (root / "stat").read_text()
+        split = raw.rfind(")")
+        if split < 0 or int(raw[:raw.find(" (")]) != pid:
+            return False
+        fields = raw[split + 1:].split()
+        if (len(fields) <= 19 or fields[0] not in {"Z", "X"}
+                or fields[19] != expected_start):
+            return False
+        return os.readlink(root / "ns/pid") == os.readlink("/proc/self/ns/pid")
+    except (OSError, ValueError, IndexError):
+        return False
 
 
 def _complete_gone_retire(store, duty):

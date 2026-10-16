@@ -4341,6 +4341,31 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_retire_subject_treats_only_same_birth_same_namespace_zombie_as_gone(self):
+        def stat_row(state, start):
+            fields = [state, *(["0"] * 18), start]
+            return "4242 (opencode) " + " ".join(fields)
+
+        def readlink(path):
+            return "pid:[same]" if str(path) in {"/proc/4242/ns/pid", "/proc/self/ns/pid"} else ""
+
+        with mock.patch.object(peer_steward.Path, "read_text", return_value=stat_row("Z", "800")), \
+             mock.patch.object(peer_steward.os, "readlink", side_effect=readlink):
+            self.assertTrue(peer_steward._retire_zombie_matches(4242, "800"))
+            self.assertFalse(peer_steward._retire_zombie_matches(4242, "801"))
+
+        def foreign_namespace(path):
+            return "pid:[foreign]" if str(path) == "/proc/4242/ns/pid" else "pid:[same]"
+
+        with mock.patch.object(peer_steward.Path, "read_text", return_value=stat_row("Z", "800")), \
+             mock.patch.object(peer_steward.os, "readlink", side_effect=foreign_namespace):
+            self.assertFalse(peer_steward._retire_zombie_matches(4242, "800"))
+
+        duty = {"intent": {"identity": {"foreground": {"pid": 4242, "start": "800"}}}}
+        with mock.patch.object(peer_steward, "_retire_process_record", return_value=None), \
+             mock.patch.object(peer_steward, "_retire_zombie_matches", return_value=True):
+            self.assertEqual(peer_steward._retire_subject_state(duty), "gone")
+
     def test_exact_opencode_native_status_overrides_stale_herdr_state(self):
         world = _RetireWorld(harness="opencode", status="working")
         native = {"status": "idle"}
