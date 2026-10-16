@@ -1773,6 +1773,7 @@
           {
             "id": "smoke",
             "kind": "review-worker",
+            "execution_needs": ["compute-hosts"],
             "depends_on": [
               "scaffold"
             ],
@@ -1808,6 +1809,7 @@
           {
             "id": "full-run",
             "kind": "resource-runner",
+            "execution_needs": ["compute-hosts"],
             "depends_on": [
               "smoke"
             ],
@@ -1840,6 +1842,7 @@
           {
             "id": "run-verify",
             "kind": "review-worker",
+            "execution_needs": ["compute-hosts"],
             "depends_on": [
               "full-run"
             ],
@@ -2052,6 +2055,7 @@
           {
             "id": "eval-run",
             "kind": "resource-runner",
+            "execution_needs": ["compute-hosts"],
             "depends_on": [],
             "role": "orchestrator",
             "inputs": [

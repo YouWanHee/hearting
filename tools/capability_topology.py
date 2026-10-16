@@ -940,6 +940,12 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
         )
     gates = set(recipe["completion_gates"])
     for node in nodes:
+        execution_needs = node.get("execution_needs", [])
+        if (not isinstance(execution_needs, list)
+                or any(not isinstance(item, str) for item in execution_needs)
+                or len(execution_needs) != len(set(execution_needs))
+                or not set(execution_needs) <= {"compute-hosts"}):
+            raise TopologyError(f"{recipe['capability']}:{node['id']}: invalid execution needs")
         requirements = node.get("runtime_requirements", [])
         if (
             not isinstance(requirements, list)

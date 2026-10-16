@@ -47,6 +47,7 @@ from dispatch_contract import success_note, verdict_pass  # noqa: E402
 import workflow_state as WS  # noqa: E402
 import resource_run_registry as RR  # noqa: E402
 import resource_resume as RESOURCE_RESUME  # noqa: E402
+import resource_run_evidence as RUN_EVIDENCE  # noqa: E402
 import dispatch_pending_delivery as PENDING  # noqa: E402
 import frame_interview as INTERVIEW  # noqa: E402
 import human_gate_receipt as HUMAN_GATE  # noqa: E402
@@ -520,6 +521,8 @@ def cmd_arm(args):
         "successor_log": args.successor_log,
         "artifact_base": str(Path(args.artifact_base).resolve()) if args.artifact_base else None,
         "declared_outputs": list(node.get("outputs") or []),
+        "write_scope": list(node.get("write_scope") or []),
+        "part_io": dict(node.get("part_io") or {}),
         "armed_at": WS.now_iso(),
     }
     if args.predecessor_kind == "resource":
@@ -640,11 +643,17 @@ def resource_output_evidence(route, armed, evidence):
     row = _checked_resource_row(armed, evidence, require_success=False)
     if row is None:
         raise SupervisorError("resource-evidence-changed")
+    try:
+        receipt = RUN_EVIDENCE.paths(armed)
+    except ValueError as exc:
+        if "resource-output-node-binding-mismatch" in str(exc):
+            return {"expected_outputs": [], "runtime_output": None, "runtime_only": False}
+        raise
     preserve = False
     if armed.get("jobs"):
         directory = route_module().completion_dir(route["route_id"], jobs=armed["jobs"])
         preserve = (directory / (armed["node"] + ".json")).is_file()
-        output = RUN_EVIDENCE.paths(armed)["runtime_output"]
+        output = receipt["runtime_output"]
         for marker in directory.glob("*.json") if output and not preserve else ():
             try:
                 recorded = json.loads(marker.read_text())["evidence"]["path"]
@@ -836,7 +845,7 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
         resolved = {**evidence, "artifacts": current_artifacts}
         resolved.pop("awaiting_next_resource", None)
         route_module().write_completion_marker(route, WS.route_node(route, node), node,
-            Path(armed["artifact_base"]) / "run.json", jobs=jobs)
+            Path(RUN_EVIDENCE.paths(armed)["runtime_output"]), jobs=jobs)
         if stage.get("state") == "FAILED_RETRYABLE":
             ledger.record(node, "READY", evidence=resolved, actor="completion-controller")
         for state in WS.completion_transition_path(
@@ -957,7 +966,7 @@ def _evaluate(route, ledger, armed, results):
                 # Bind the original producer bytes before ordinary owner admission;
                 # this resource marker is not an independent verifier verdict.
                 route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
-                    Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
+                    Path(RUN_EVIDENCE.paths(armed)["runtime_output"]), jobs=armed["jobs"])
                 ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
                 started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
         except (INPUT.InputError, KeyError):
@@ -966,7 +975,7 @@ def _evaluate(route, ledger, armed, results):
     else:
         if RESOURCE_RESUME.route_selected(route):
             route_module().write_completion_marker(route, WS.route_node(route, node_id), node_id,
-                Path(armed["artifact_base"]) / "run.json", jobs=armed["jobs"])
+                Path(RUN_EVIDENCE.paths(armed)["runtime_output"]), jobs=armed["jobs"])
         ledger.record(node_id, "STAGE_SUCCEEDED", evidence=evidence, actor="poll")
         started = _claim_successors(route, ledger, armed, node_id, armed["successors"], evidence)
     row["action"] = "advanced"

@@ -32,6 +32,34 @@ def paths(armed, *, prepare=False):
     base = Path(base)
     expected = [base / name for name in outputs(armed)]
     runtime = base / "run.json"
+    route_file = armed.get("route_file")
+    node_id = armed.get("node")
+    if route_file and node_id and Path(route_file).is_file():
+        try:
+            route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+            if (route.get("route_id") != armed.get("route_id")
+                    or route.get("route_hash") != armed.get("route_hash")):
+                raise ValueError("resource-output-route-binding-mismatch")
+            node = next((item for item in route.get("nodes", []) if item.get("id") == node_id), None)
+            if node is None:
+                raise ValueError("resource-output-node-binding-mismatch")
+            from artifact_context import ArtifactContext
+            context = ArtifactContext(
+                Path(route.get("artifact_root")) if route.get("artifact_root") else None,
+                route, node, node_id, None, None, base, None, "resource-run",
+            )
+            binding = context.resolve_output("run-record")
+            runtime = binding.path
+            if runtime not in expected:
+                raise ValueError("resource-run-output-not-declared")
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ValueError("resource-output-route-invalid:" + str(exc)) from exc
+    elif any(path.name == "run.json" and path.parent == base for path in expected):
+        # Older native armed records may not retain a readable route file.
+        # Their declared root run.json contract remains sufficient.
+        runtime = base / "run.json"
+    elif route_file and node_id:
+        raise ValueError("resource-output-route-invalid:route file unavailable")
     for path in [runtime, *expected]:
         if not path.resolve().is_relative_to(base.resolve()):
             raise ValueError("resource-output-path-escape:" + str(path))

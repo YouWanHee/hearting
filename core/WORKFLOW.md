@@ -603,6 +603,13 @@ artifact roots, the temp directory, runtime homes, CI and dev activation pass;
 any judgement failure passes; `HEARTING_ROUTE_GATE=off` turns it off.
 `capability-route.py verify`/`status` still only inspect a route that exists.
 
+Compute-host storage access follows the registered origin stage's
+`execution_needs` declaration in `capabilities/topologies.json`. Native and
+borrowed route nodes resolve the same declaration from their sealed stage
+identity; the need is not copied into sealed nodes or inferred from the outer
+capability, node name, or task text. Routes without a declared compute stage
+retain their ordinary execution access.
+
 Before approval, choose from compact manifest routing metadata and §0.2; do not
 load the full entry Skill body or its references merely to propose a route. At
 `standard+`, the dispatch-depth-1 owner reads the selected capability contract and each

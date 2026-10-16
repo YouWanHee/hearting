@@ -1,11 +1,15 @@
 # Lab 실행 저장소와 명시적 데이터 접근
 
-`autopilot-lab` owner를 시작하거나 재개하면 초기화된 compute-hosts inventory의
-정확한 `run_root`가 기존 `execution_access_v1` 요청에 포함된다. Inventory는
+compute 실행 필요를 선언한 origin stage가 있는 route의 owner를 시작하거나
+재개하면 초기화된 compute-hosts inventory의 정확한 `run_root`가 기존
+`execution_access_v1` 요청에 포함된다. 이 요구는 `capabilities/topologies.json`의
+origin stage 한 곳에 선언되며 sealed node의 stage identity로 조회한다. borrowed
+stage도 같은 선언을 사용한다. Inventory는
 `COMPUTE_HOSTS_CONFIG`, 또는 `${XDG_CONFIG_HOME:-~/.config}/hearting/compute-hosts.yaml`에서
 기존 loader로 읽는다. GPU 작업과 compute-hosts resource 실행의 로그·PID 저장소를
-owner의 정상 접근 범위 안에 두기 위한 기본값이다. 일반 code owner와 frame에는
-이 기본값을 추가하지 않는다. Resource child는 실제 부모 grant 안에서만 접근한다.
+owner의 정상 접근 범위 안에 두기 위한 기본값이다. compute stage가 없는 일반
+code owner와 frame에는 이 기본값을 추가하지 않는다. Resource child는 실제 부모
+grant 안에서만 접근한다.
 
 GPU 실행 범위가 있는 lab owner는 inventory 폴더를 읽기 전용으로 받고, 별도 명시 요청이
 없으면 compute-hosts SSH 네트워크 필요도 같은 요청에 포함된다. OpenCode 작업자 홈은
