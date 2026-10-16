@@ -163,7 +163,6 @@ class CompactHookTest(unittest.TestCase):
 
     def test_auto_compact_uses_shared_snapshot_and_three_hour_booking(self):
         import session_tidy_clear as clear
-        import dispatch_seat_handover as handover
         transcript = self.root / "sid-auto.jsonl"
         transcript.write_text(json.dumps({"type": "assistant", "uuid": "a1",
                                           "message": {"stop_reason": "end_turn",
@@ -171,7 +170,7 @@ class CompactHookTest(unittest.TestCase):
                              + "\n", encoding="utf-8")
         with mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
              mock.patch.object(clear, "_start_helper", return_value=4321), \
-             mock.patch.object(handover, "write_snapshot_locked", return_value=1) as snapshot:
+             mock.patch.object(clear, "herdr_command", return_value="/bin/true"):
             clear.schedule_for_enqueue(self.seat, "claude", "sid-auto", str(self.cwd), no_continue=True)
             compact_now = st.now_epoch()
             st.run_hook("claude", "compact", "sid-auto", phase="after", compact_summary="완전한 요약",
@@ -183,18 +182,16 @@ class CompactHookTest(unittest.TestCase):
             self.assertEqual(booking["compact"]["trigger"], "auto")
             self.assertTrue(booking["continue_off"])
             self.assertEqual(booking["compact"]["boundary_offset"], transcript.stat().st_size)
-            snapshot.assert_called_once()
+            self.assertEqual(booking["snapshot_state"], "deferred")
 
     def test_duplicate_auto_compact_callback_coalesces_card_queue_snapshot_and_booking(self):
         import session_tidy_clear as clear
-        import dispatch_seat_handover as handover
         transcript = self.root / "sid-duplicate.jsonl"
         transcript.write_text(json.dumps({"type": "assistant", "uuid": "a1",
                                           "message": {"stop_reason": "end_turn", "content": [
                                               {"type": "text", "text": "완료"}]}}) + "\n", encoding="utf-8")
         with mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
-             mock.patch.object(clear, "_start_helper", return_value=4321) as helper, \
-             mock.patch.object(handover, "write_snapshot_locked", return_value=1) as snapshot:
+             mock.patch.object(clear, "_start_helper", return_value=4321) as helper:
             for stamp in (1000, 1001):
                 st.run_hook("claude", "compact", "sid-duplicate", phase="after", compact_summary="same summary",
                             compact_context={"trigger": "auto", "summary_id": "compact-id"},
@@ -205,9 +202,12 @@ class CompactHookTest(unittest.TestCase):
                                       cwd=str(self.cwd), now=1000.5)
         self.assertEqual(st.read_latest_card(self.seat)["generation"], 2)
         self.assertEqual(st.read_latest_card(self.seat)["body"], "later manual card")
-        self.assertEqual(self.enqueue_mock.call_count, 1)
+        self.assertEqual(self.enqueue_mock.call_count, 2)  # both retries carry one operation identity
+        self.assertEqual([call.kwargs.get("operation_id") for call in self.enqueue_mock.call_args_list],
+                         [self.enqueue_mock.call_args_list[0].kwargs.get("operation_id")] * 2)
+        self.assertTrue(self.enqueue_mock.call_args_list[0].kwargs.get("operation_id"))
         helper.assert_called_once()
-        snapshot.assert_called_once()
+        self.assertEqual(clear.read_reservation(self.seat.key)["snapshot_state"], "deferred")
 
     def test_ineligible_compactions_queue_without_replacing_or_creating_a_clear_booking(self):
         import session_tidy_clear as clear

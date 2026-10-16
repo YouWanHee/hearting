@@ -232,18 +232,94 @@ def _card_seat(item: dict) -> "st.Seat":
 # enqueue: write the entry, start the detached runner, return
 # ---------------------------------------------------------------------------
 
-def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: str = "") -> dict:
+def _existing_operation(operation_id: str) -> Optional[dict]:
+    matches = [item for item in list_items() if item.get("operation_id") == operation_id]
+    return min(matches, key=lambda item: (float(item.get("created", 0) or 0), item["id"])) if matches else None
+
+
+def _start_queued(item: dict) -> dict:
+    """Best-effort launch; the durable queued item remains discoverable after a failure."""
+    if item.get("status") != "queued":
+        return item
+    pid = item.get("runner_pid")
+    started = str(item.get("runner_pid_start") or "")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            current = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            current = current[current.rfind(")") + 2:].split()[19]
+            if not started or current == started:
+                return item
+        except (OSError, IndexError, ValueError):
+            pass
+    try:
+        pid = start_detached(item["id"])
+        item.pop("runner_start_error", None)
+        if pid:
+            item["runner_pid"] = int(pid)
+            try:
+                raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+                item["runner_pid_start"] = raw[raw.rfind(")") + 2:].split()[19]
+            except (OSError, IndexError, ValueError):
+                item["runner_pid_start"] = ""
+        write_item(item)
+    except (OSError, subprocess.SubprocessError) as exc:
+        item["runner_start_error"] = type(exc).__name__
+        write_item(item)
+    return item
+
+
+def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: str = "", *,
+                 operation_id: Optional[str] = None, queue_id: Optional[str] = None,
+                 start: bool = True) -> dict:
+    """Durably enqueue one memory operation, optionally idempotent across hook retries.
+
+    ``operation_id`` is used by automatic compact/idle events. Re-observing that event returns
+    the same queue row and never creates a second apply. A saved queued row survives a detached
+    runner launch failure so a later normal hook can start it again.
+    """
+    if operation_id:
+        existing = _existing_operation(operation_id)
+        if existing:
+            return _start_queued(existing) if start else existing
     queue_seat = dataclasses.replace(seat, harness=harness, sid=sid) if seat.kind == "project" else seat
-    item = {"schema": SCHEMA, "id": new_id(), "created": _now(), "status": "queued", "updated": _now(),
+    if queue_id is None and operation_id:
+        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:32]
+        queue_id = f"tidy-op-{digest}"
+    if queue_id:
+        existing = read_item(queue_id)
+        if existing:
+            if operation_id and existing.get("operation_id") not in (None, operation_id):
+                raise RunnerFailure("queue-id-operation-mismatch")
+            if operation_id and not existing.get("operation_id"):
+                existing["operation_id"] = operation_id
+                write_item(existing)
+            return _start_queued(existing) if start else existing
+    item = {"schema": SCHEMA, "id": queue_id or new_id(), "created": _now(), "status": "queued", "updated": _now(),
             "seat": queue_seat.as_dict(), "harness": harness, "sid": sid, "cwd": cwd, "transcript": transcript,
             "attempts": 0}
+    if operation_id:
+        item["operation_id"] = operation_id
     with contextlib.suppress(BaseException):
         card = st.read_latest_card(_card_seat(item))
         if card:
             item["card_generation"] = int(card.get("generation", 0) or 0)   # the card this batch was queued under
     write_item(item)
-    start_detached(item["id"])
-    return item
+    return _start_queued(item) if start else item
+
+
+def reconcile_queued(seat: "st.Seat", harness: str, sid: str) -> int:
+    """Restart durable queued rows for this exact session after an earlier launch miss."""
+    resumed = 0
+    for item in list_items():
+        if item.get("status") != "queued" or (item.get("harness"), item.get("sid")) != (harness, sid):
+            continue
+        if (item.get("seat") or {}).get("key") != seat.key:
+            continue
+        before = item.get("runner_start_error")
+        started = _start_queued(item)
+        if before and not started.get("runner_start_error"):
+            resumed += 1
+    return resumed
 
 
 def start_detached(qid: str) -> int:

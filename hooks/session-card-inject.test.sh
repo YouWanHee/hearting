@@ -6,7 +6,12 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-TMP=$(mktemp -d /var/tmp/session-card-test.XXXXXX)
+TMP_BASE=${TMPDIR:-/tmp}
+TMP_BASE=${TMP_BASE%/}
+if ! mkdir -p "$TMP_BASE" 2>/dev/null || [ ! -w "$TMP_BASE" ]; then
+  TMP_BASE=/tmp
+fi
+TMP=$(mktemp -d "$TMP_BASE/session-card-test.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 FAILS=0
 ok() { printf 'ok - %s\n' "$1"; }
@@ -24,7 +29,7 @@ export HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/home/.config" XDG_DATA_HOME="$TMP/
   MEM_STORE="$TMP/mem" TMPDIR="$TMP/tmp" AGENT_HOME="$ROOT"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME/hearting" "$TMPDIR"
 printf '{"enabled": false}\n' > "$XDG_CONFIG_HOME/hearting/memory-sync.json"
-case "$XDG_STATE_HOME" in /var/tmp/session-card-test.*) ;; *) echo "isolation failed"; exit 2 ;; esac
+case "$XDG_STATE_HOME" in "$TMP_BASE"/session-card-test.*/*) ;; *) echo "isolation failed"; exit 2 ;; esac
 
 TIDY="$ROOT/utilities/session_tidy.py"
 REAL_PYTHON=$(command -v python3)

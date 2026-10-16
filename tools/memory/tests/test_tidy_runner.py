@@ -386,6 +386,33 @@ class RunnerCase(unittest.TestCase):
 
 class EnqueueTest(RunnerCase):
 
+    def test_operation_identity_reuses_queue_row_and_recovers_runner_launch_failure(self):
+        operation = "compact-event-identity"
+        with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            with mock.patch.object(runner, "start_detached", side_effect=[OSError("launch"), 4242]) as start:
+                first = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                            operation_id=operation, start=False)
+                failed = runner._start_queued(first)
+                self.assertEqual(failed["id"], first["id"])
+                self.assertEqual(failed["status"], "queued")
+                self.assertEqual(failed["runner_start_error"], "OSError")
+
+                resumed = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                              operation_id=operation)
+                self.assertEqual(resumed["id"], first["id"])
+                self.assertEqual(resumed["runner_pid"], 4242)
+                self.assertEqual(start.call_count, 2)
+                self.assertEqual(len([item for item in runner.list_items()
+                                      if item.get("operation_id") == operation]), 1)
+
+                resumed["status"] = "notified"
+                runner.write_item(resumed)
+                terminal = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                               operation_id=operation)
+                self.assertEqual((terminal["id"], terminal["status"]), (first["id"], "notified"))
+                self.assertEqual(start.call_count, 2)
+
     def test_enqueue_returns_one_line_at_once_and_the_tidy_finishes_on_its_own(self):
         shutil.copy(FIXTURES / "claude-choice.jsonl", self.projects / f"{CHOICE_SID}.jsonl")
         self.scenario([{"mode": "ok", "gate": self.gate(), "actions": [

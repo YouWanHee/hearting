@@ -49,7 +49,8 @@ try:
     import session_tidy
     session_tidy.run_hook(
         "claude", event, sid, source=text("source"),
-        transcript=text("transcript_path"), cwd=text("cwd") or os.getcwd(), emit=emit)
+        transcript=text("transcript_path"), cwd=text("cwd") or os.getcwd(), emit=emit,
+        prompt_text=text("prompt"))
 except Exception:
     pass
 notice = ""

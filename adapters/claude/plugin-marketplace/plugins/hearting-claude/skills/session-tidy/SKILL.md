@@ -37,6 +37,20 @@ seats, workers/sub-sessions, and Codex remote-V2 compaction never auto-clear. Co
 queue-only for automatic compaction; its existing manual tidy behavior is unchanged. Do not
 enqueue a duplicate tidy for the same compaction; invoke this Skill for separate work.
 
+An idle tidy is separate from compaction and manual tidy. It is eligible only after a real
+main-session turn-end/idle signal with known latest-request context tokens at or above the
+configured threshold (default 200,000), followed by the configured wait (default 3,240
+seconds). The wait is not a promise about provider cache lifetime. Current adapter payloads
+do not expose a verified request cache expiry, so the configured wait is used and
+`cache_margin_seconds` is recorded but not applied. Provider/request cache expiry stays
+unknown unless the actual configuration and request evidence establish it.
+When the exact idle request arrives, use this conversation to write the normal session card
+and run the existing enqueue command. Do not resume the work: after clear, the successor is
+asked for a brief card-based status and to wait for the next user input. New input, a draft,
+form/approval, busy or unknown state, an unknown token count, or a different session cancels
+or withholds the automatic request. Duplicate events keep the original due time. Only a real
+user prompt after the status reply rearms another idle tidy.
+
 Modes: `정리` (default), `정리만` (same, but keep this window) and `인계 <받을 세션>` (same
 work, then pass the card to a peer session; only this calling window is cleared, never the
 target). The tool is `python3 $AGENT_HOME/utilities/session_tidy.py`.

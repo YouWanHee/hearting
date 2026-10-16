@@ -1452,7 +1452,7 @@ class OpenCodeCompactObservationTest(TidyCase):
                 accepted = clear.read_reservation(seat.key)
                 observations.append((accepted["runtime_status"], clear.compact_observation(accepted)["state"]))
 
-            with mock.patch.object(handover, "write_snapshot_locked",
+            with mock.patch.object(handover, "publish_snapshot_locked",
                                    side_effect=lambda *a, **k: snapshot_calls.append(1) or 1):
                 result = clear.run_helper(
                     seat.key, req["nonce"], wait=lambda *_a: "idle",
@@ -1876,6 +1876,37 @@ class ClearBookingTest(TidyCase):
             clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd), compact_context=third_ctx)
             self.assertFalse(clear.read_reservation(seat.key)["continue_off"])
 
+    def test_replayed_compact_resumes_helper_start_failure_without_replacing_booking(self):
+        extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
+                 "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
+        with self.iso.patched_environ(extra):
+            seat = st.resolve_seat("claude", str(self.cwd))
+            context = self.write_compact_card(seat, identity="compact-resume")
+            with mock.patch.object(clear, "_start_helper", side_effect=[OSError("injected"), 4242]) as start:
+                first = clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                   compact_context=context, operation_id="compact-resume",
+                                                   queue_id="tidy-op-resume")
+                before = clear.read_reservation(seat.key)
+                self.assertEqual(first, "clear=pending reason=helper-not-started-OSError")
+                self.assertEqual(before["status"], "reserved")
+                self.assertEqual(before["helper_start"]["state"], "failed")
+
+                second = clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                    compact_context=context, operation_id="compact-resume",
+                                                    queue_id="tidy-op-resume")
+                after = clear.read_reservation(seat.key)
+                self.assertEqual(second, "clear=scheduled")
+                self.assertEqual(after["nonce"], before["nonce"])
+                self.assertEqual(after["queue_id"], "tidy-op-resume")
+                self.assertEqual(start.call_count, 2)
+
+                clear.cancel(seat)
+                replay = clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                    compact_context=context, operation_id="compact-resume",
+                                                    queue_id="tidy-op-resume")
+                self.assertEqual(replay, "clear=off")
+                self.assertEqual(start.call_count, 2)
+
     def test_compact_never_inherits_a_stop_from_another_session_booking(self):
         extra = {"HERDR_PANE_ID": PANE, "HEARTING_TIDY_TEST_ROOT": str(self.iso.root),
                  "HEARTING_TIDY_HERDR": str(self.fake_herdr)}
@@ -2164,11 +2195,11 @@ class ClearHelperTest(TidyCase):
                     handle.write(owner_row("att-after") + "\n")
             slept.append(True)
 
-        real_snapshot = handover.write_snapshot_locked
+        real_snapshot = handover.publish_snapshot_locked
         def snapshot(*args, **kwargs):
             snapshots.append(1)
             return real_snapshot(*args, **kwargs)
-        with self.iso.patched_environ(self.extra), mock.patch.object(handover, "write_snapshot_locked",
+        with self.iso.patched_environ(self.extra), mock.patch.object(handover, "publish_snapshot_locked",
                                                                        side_effect=snapshot):
             outcome = clear.run_helper(
                 seat.key, req["nonce"], wait=wait,
