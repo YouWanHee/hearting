@@ -3062,6 +3062,23 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     def prompt(self, body="peer body"):
         return peer_steward.main(["prompt", "child", body])
 
+    def test_body_file_keeps_crlf_and_tail_bytes_in_long_reference(self):
+        body = ("[steer] exact body-file input\r\n" + "line detail with English and 한글 " * 120
+                + "\r\n실행하지 말 것\r\nSTFT 크기 하한 1e-5·위상 유지  \r\n")
+        path = self.tmp_root / "peer-body.txt"
+        path.write_bytes(body.encode("utf-8"))
+
+        self.assertEqual(peer_steward.main(["prompt", "child", "--body-file", str(path)]), 0)
+        self.assertEqual(len(self.messages), 1)
+        wire = self.messages[0]
+        self.assertLessEqual(len(wire.encode("utf-8")), 1024)
+        self.assertNotIn("STFT 크기 하한", wire)
+        transfer = peer_steward.peer_message.parse_peer_trailer(
+            wire, {"harness": "claude", "session_id": self.sid}, include_ref=True)
+        payload = peer_steward.peer_message.read_peer_payload(transfer["transfer_ref"])
+        self.assertEqual(payload["body"], body)
+        self.assertEqual(Path(payload["path"]).read_bytes(), body.encode("utf-8"))
+
     def test_idle_parent_prompt_with_pending_or_unknown_children_accepts_input(self):
         from dispatch_contract import ObservedAttemptLiveness
         meta = ("attempt_id=att-bound,parent_sid=sid-child,parent_pane=w1:pX,"

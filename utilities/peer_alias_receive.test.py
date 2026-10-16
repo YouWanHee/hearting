@@ -477,6 +477,28 @@ process.stdout.write(JSON.stringify(result));
         for row in rows:
             self.assertEqual(row["from"]["session_id"], self.sender["session_id"] if row["to"]["session_id"] == "recipient-a" else "")
 
+    def test_long_original_remains_readable_after_each_harness_receipt(self):
+        tail = "실행하지 말 것; 확인 답장에는 마지막 조건만 인용\nSTFT 크기 하한 1e-5·위상 유지"
+        body = "[steer] preserve every instruction\n" + "evidence detail with English and 한글 " * 240 + "\n" + tail
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                recipient = {"harness": harness, "session_id": f"{harness}-recipient"}
+                sender = dict(self.sender, session_id=f"sender-{harness}")
+                text, ref = pm.prepare_peer_message(body, sender, recipient, defer=True)
+                self.assertLessEqual(len(text.encode("utf-8")), 1024)
+                self.assertNotIn("STFT 크기 하한", text)
+                path = Path(pm.read_peer_payload(ref)["path"])
+                self.assertTrue(path.is_absolute())
+                self.assertEqual(path.read_bytes(), body.encode("utf-8"))
+                self.assertIn("Open the complete referenced file before acting",
+                              pm.receiver_guidance(text, recipient, cwd=str(ROOT)))
+
+                self._receive_actual(harness, text, recipient["session_id"])
+                self.assertEqual(pm._read_pending(ref)["state"], "received")
+                self.assertIsNone(pm._read_pending(ref)["text"])
+                self.assertEqual(pm.read_peer_payload(ref)["body"], body)
+                self.assertIn(tail, path.read_bytes().decode("utf-8"))
+
     def test_opencode_plugin_forwards_actual_prompt_to_canonical_cli(self):
         # Run the unchanged plugin function in a VM with a recording transport;
         # then execute the captured Python CLI synchronously in the temp root.
@@ -515,7 +537,8 @@ class PendingCallbacks(unittest.TestCase):
 
     def test_opencode_peer_guidance_reaches_model_system_context_without_acceptance(self):
         recipient = {"harness": "opencode", "session_id": "fixture-oc"}
-        text, ref = pm.prepare_peer_message("[handoff] exact card", self.sender, recipient, defer=True)
+        body = "[handoff] exact card\n" + "complete context " * 260 + "\nfinal instruction: preserve the original"
+        text, ref = pm.prepare_peer_message(body, self.sender, recipient, defer=True)
         js = r'''
 import { pathToFileURL } from "node:url";
 const root = process.env.AGENT_HOME;
@@ -534,8 +557,9 @@ console.log(JSON.stringify(output));
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(run.returncode, 0, run.stderr)
         context = "\n".join(json.loads(run.stdout)["system"])
-        self.assertIn("send acceptance before processing", context)
-        self.assertIn("ACK are not execution", context)
+        self.assertIn("immediate results once", context)
+        self.assertIn("Receipt/queue/ACK is not execution", context)
+        self.assertIn("Open the complete referenced file before acting", context)
         self.assertNotIn("handoff accept", context)
         self.assertNotIn("acceptance", pm._read_pending(ref))
 

@@ -680,6 +680,116 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(stat.S_IMODE(peer_message._pending_dir().stat().st_mode), 0o700)
         self.assertFalse(self._ledger_file("sender").exists())
 
+    def test_long_message_reference_preserves_raw_bytes_and_survives_receipt(self):
+        body = ("[steer] header\r\n" + "중요한 설명 with English data " * 140
+                + "\r\n실행하지 말 것\r\nSTFT 크기 하한 1e-5·위상 유지\n")
+        text, ref = self.pending(body, refs=["proof-ref"])
+        row = peer_message._read_pending(ref)
+        transfer = peer_message._read_transfer_record(ref)
+        payload = peer_message.read_peer_payload(ref)
+        path = Path(payload["path"])
+        raw = body.encode("utf-8")
+
+        self.assertLessEqual(len(text.encode("utf-8")), peer_message._BODY_REFERENCE_ENVELOPE_BYTES)
+        self.assertNotIn("STFT 크기 하한", text)
+        self.assertIn(str(path), text)
+        self.assertEqual(payload["body"], body)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        self.assertEqual(row["body_ref"], transfer["body_ref"])
+        self.assertEqual(row["body_sha256"], hashlib.sha256(text.encode("utf-8")).hexdigest())
+        self.assertEqual(row["source_sha256"], hashlib.sha256(body.rstrip("\n").encode("utf-8")).hexdigest())
+        self.assertEqual(transfer["body_ref"]["raw_size_bytes"], len(raw))
+        self.assertEqual(transfer["body_ref"]["payload_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(transfer["body_ref"]["source_sha256"], row["source_sha256"])
+        self.assertNotIn(body, json.dumps(transfer, ensure_ascii=False))
+
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        received = peer_message._read_pending(ref)
+        self.assertEqual(received["state"], "received")
+        self.assertIsNone(received["text"])
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(peer_message.read_peer_payload(ref)["body"], body)
+
+    def test_reference_threshold_is_utf8_bytes_and_no_trailer_stays_inline(self):
+        bodies = ("한" * 682 + "a", "한" * 682 + "ab", "한" * 683)
+        self.assertEqual([len(body.encode("utf-8")) for body in bodies], [2047, 2048, 2049])
+        for body in bodies:
+            with self.subTest(raw_bytes=len(body.encode("utf-8"))):
+                text, ref = self.pending(body)
+                descriptor = peer_message._read_transfer_record(ref).get("body_ref")
+                self.assertEqual(descriptor is not None, len(body.encode("utf-8")) > 2048)
+                if descriptor:
+                    self.assertLessEqual(len(text.encode("utf-8")), 1024)
+                    self.assertEqual(peer_message.read_peer_payload(ref)["body"], body)
+                else:
+                    self.assertTrue(text.startswith(body))
+
+        long_body = "inline only " * 300
+        text, ref = peer_message.prepare_peer_message(
+            long_body, self.sender, self.recipient, defer=True, with_trailer=False)
+        self.assertEqual(text, long_body)
+        self.assertNotIn("body_ref", peer_message._read_pending(ref))
+        self.assertNotIn("body_ref", peer_message._read_transfer_record(ref))
+        self.assertFalse((peer_message.peer_state_root() / "peer-messages" / "payloads" / (ref + ".txt")).exists())
+
+    def test_long_retry_reuses_exact_reference_and_different_tail_does_not(self):
+        body = "[steer] same preview\n" + "proof data " * 300 + "\nfinal condition A"
+        text, ref = self.pending(body)
+        retry = peer_message.prepare_peer_message(
+            body, dict(self.sender, name="renamed"), self.recipient, defer=True)
+        self.assertEqual(retry, (text, ref))
+        changed = body[:-1] + "B"
+        different = peer_message.prepare_peer_message(changed, self.sender, self.recipient, defer=True)
+        self.assertNotEqual(different[1], ref)
+        self.assertEqual(peer_message.read_peer_payload(different[1])["body"], changed)
+
+    def test_payload_publication_failure_falls_back_to_complete_inline_body(self):
+        body = "[steer] fallback\n" + "fallback detail " * 180
+        with mock.patch.object(peer_message, "_write_body_payload", side_effect=PermissionError("read-only")):
+            text, ref = self.pending(body)
+        self.assertTrue(text.startswith(body.rstrip("\n")))
+        self.assertNotIn("body_ref", peer_message._read_pending(ref))
+        self.assertNotIn("body_ref", peer_message._read_transfer_record(ref))
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+
+    def test_missing_or_changed_reference_payload_never_receipts(self):
+        body = "[steer] message\n" + "integrity proof " * 200
+        text, ref = self.pending(body)
+        path = Path(peer_message.read_peer_payload(ref)["path"])
+        original = path.read_bytes()
+        path.write_bytes(b"X" + original[1:])
+        with self.assertRaisesRegex(ValueError, "digest-invalid"):
+            peer_message._read_pending(ref)
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 1)
+        pending = json.loads(peer_message._pending_path(ref).read_text())
+        self.assertEqual(pending["state"], "pending")
+        self.assertFalse(self._ledger_file("sender").exists())
+
+        path.write_bytes(original)
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "file-unsafe"):
+            peer_message._read_pending(ref)
+        path.chmod(0o600)
+        path.unlink()
+        path.symlink_to(self.tmp_root / "outside")
+        with self.assertRaises(OSError):
+            peer_message._read_pending(ref)
+
+    def test_ambiguous_payload_roots_fail_closed(self):
+        body = "[steer] duplicate roots\n" + "same payload " * 200
+        _text, ref = self.pending(body)
+        source = Path(peer_message.read_peer_payload(ref)["path"])
+        duplicate_root = self.tmp_root / "other-state"
+        duplicate = duplicate_root / "peer-messages" / "payloads" / (ref + ".txt")
+        duplicate.parent.mkdir(mode=0o700, parents=True)
+        duplicate.write_bytes(source.read_bytes())
+        duplicate.chmod(0o600)
+        with mock.patch.object(peer_message, "steward_marker_roots", return_value=([duplicate_root], "fixture")):
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                peer_message.read_peer_payload(ref)
+
     def test_pending_retry_reuses_ref_but_different_body_or_sid_does_not(self):
         text, ref = self.pending()
         renamed = dict(self.sender, name="renamed")
@@ -830,8 +940,9 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         with self.assertRaises(OSError):
             peer_message._read_pending(ref)
         path.unlink() # Remove this fixture's unsafe link before independent size check.
-        with self.assertRaisesRegex(ValueError, "oversized"):
-            self.pending("x" * 16384)
+        long_text, long_ref = self.pending("x" * 16384)
+        self.assertLessEqual(len(long_text.encode("utf-8")), 1024)
+        self.assertEqual(len(peer_message.read_peer_payload(long_ref)["body"]), 16384)
 
     def test_same_ref_claim_is_nonblocking_without_blocking_other_recipient(self):
         import codex_queue_delivery as queue
@@ -1261,7 +1372,8 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
                 recipient = {"harness": harness, "session_id": harness + "-receiver", "name": "new"}
-                text, ref = peer_message.prepare_peer_message("[handoff] card", self.sender, recipient, defer=True)
+                card = "[handoff] card\n" + "referenced document and predecessor details " * 120
+                text, ref = peer_message.prepare_peer_message(card, self.sender, recipient, defer=True)
                 predecessor = {**self.predecessor}
                 successor = {**recipient, "pane": "p2", "server": "default",
                              "foreground": {"pid": 22, "start": "202"}}
@@ -1292,6 +1404,8 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
                 self.assertEqual(args.cwd, str(self.tmp_root.resolve()))
                 after = peer_message._read_pending(ref)
                 self.assertNotIn("acceptance", after)
+                self.assertIn("Open the complete referenced file before acting", guidance)
+                self.assertEqual(peer_message.read_peer_payload(ref)["body"], card)
         self.assertEqual(self.store.list(), [])
 
     def test_received_scrubbed_handoff_keeps_exact_guidance_without_accepting(self):

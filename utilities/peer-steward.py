@@ -4166,7 +4166,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
     if args.body_file:
-        with open(args.body_file, encoding="utf-8", errors="replace") as handle:
+        with open(args.body_file, encoding="utf-8", errors="replace", newline="") as handle:
             body = handle.read()
     elif args.body_stdin:
         body = sys.stdin.read()
