@@ -2437,12 +2437,35 @@ def _remove_path(path: Path) -> None:
         raise ActivationError(str(exc)) from exc
 
 
+_HERDR_INSTALL_HEADER = re.compile(r"^(?:#|//)\s*installed by herdr\s*$", re.M)
+_HERDR_INTEGRATION_ID = re.compile(r"^(?:#|//)\s*HERDR_INTEGRATION_ID=(\S+)\s*$", re.M)
+
+
+def _herdr_integration_id(path: Path) -> Optional[str]:
+    """The integration id of a file carrying herdr's own install header, else None."""
+    try:
+        head = path.read_bytes()[:4096].decode("utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if not _HERDR_INSTALL_HEADER.search(head):
+        return None
+    match = _HERDR_INTEGRATION_ID.search(head)
+    return match.group(1) if match else None
+
+
 def _safe_existing_dest(
-    dest: Path, kind: str, owned: set, allowed_link_roots: Sequence[Path]
+    dest: Path, kind: str, owned: set, allowed_link_roots: Sequence[Path],
+    source: Optional[Path] = None,
 ) -> None:
     if not (dest.exists() or dest.is_symlink()):
         return
     if str(dest) in owned:
+        return
+    # herdr overwrites its own integration file on reinstall; hearting now ships the
+    # same integration, so adopt that file (the caller snapshots it first).
+    if (source is not None and kind != "copytree" and not dest.is_symlink() and dest.is_file()
+            and _herdr_integration_id(source) is not None
+            and _herdr_integration_id(dest) == _herdr_integration_id(source)):
         return
     if dest.is_symlink():
         target = dest.resolve(strict=False)
@@ -2810,7 +2833,9 @@ def _apply_transaction(
             seen.add(key)
             _ensure_owned_destination(runtime, dest, scope)
             kind = desired_by_dest.get(key, {}).get("kind", "remove")
-            _safe_existing_dest(dest, kind, owned, allowed_link_roots)
+            source = desired_by_dest.get(key, {}).get("source")
+            _safe_existing_dest(dest, kind, owned, allowed_link_roots,
+                                Path(source) if source else None)
             record = _snapshot_record(dest, backup_root, len(snapshots))
             record["postimage"] = (
                 safe_fs.PathState("missing").public()
