@@ -650,8 +650,11 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
         binding_digest = subject.get("binding_digest")
         if not attempt_id or not binding_digest:
             return "superseded", "completion-review-source-binding-unknown"
-        state_root = Path(completion_dir).parent.parent
-        jobs_path = Path(os.environ.get("AGENT_DISPATCH_JOBS") or state_root / "jobs.log").resolve()
+        # The caller selected this completion directory from the source route's
+        # resolved registry. Keep exact-row and binding lookup on that same root;
+        # ambient process selection must not redirect currency to another jobs.log.
+        state_root = Path(completion_dir).resolve().parent.parent
+        jobs_path = (state_root / "jobs.log").resolve()
         exact_rows = []
         try:
             for line in jobs_path.read_text(encoding="utf-8", errors="replace").splitlines():

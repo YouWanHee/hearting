@@ -235,6 +235,14 @@ and symlink safety, lock ownership and process-liveness checks remain enforced.
 Historical records are preserved; bypassing identity comparisons does not
 rewrite them or turn a live process into completed work.
 
+Continuation reads marker, attempt-link, and source-binding currency from the
+jobs registry resolved with the source route; ambient `AGENT_DISPATCH_JOBS`
+cannot redirect those reads. If a reusable prefix reaches an implementation
+review whose PASS is source-stale or legacy source-unbound, continuation cuts
+the prefix at that review and schedules the ordinary independent review there.
+The old marker remains historical, and legacy source is not inferred from
+`launch_head`.
+
 Completion evidence has two moments. First close proves the current readable
 evidence for the exact route, owner/attempt and terminal claim; an unreadable
 or conflicting record cannot establish completion. Once the existing outcome

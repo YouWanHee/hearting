@@ -378,6 +378,64 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         self.assertEqual(self.currency(marker).reason,
                          "completion-review-source-binding-missing")
 
+    def test_marker_currency_uses_sealed_registry_under_ambient_mismatch(self):
+        self.current_smoke_markers("sealed-registry")
+        metadata, marker = self.complete_review("att-review-sealed-registry")
+        sealed_before = self.jobs.read_bytes()
+
+        missing_ambient = self.base / "missing-ambient" / "jobs.log"
+        os.environ["AGENT_DISPATCH_JOBS"] = str(missing_ambient)
+        missing_result = self.currency(marker)
+
+        conflicting_ambient = self.base / "conflicting-ambient" / "jobs.log"
+        conflicting_ambient.parent.mkdir(parents=True)
+        row = next(line for line in self.jobs.read_text(encoding="utf-8").splitlines()
+                   if DC.parse_registry_metadata(line.split("\t")[5]).get("attempt_id")
+                   == metadata["attempt_id"])
+        fields = row.split("\t")
+        row_metadata = DC.parse_registry_metadata(fields[5])
+        row_metadata["review_subject_binding_digest"] = "0" * 64
+        fields[5] = ",".join(f"{key}={value}" for key, value in sorted(row_metadata.items()))
+        conflicting_bytes = ("\t".join(fields) + "\n").encode("utf-8")
+        conflicting_ambient.write_bytes(conflicting_bytes)
+        os.environ["AGENT_DISPATCH_JOBS"] = str(conflicting_ambient)
+        conflicting_result = self.currency(marker)
+
+        self.assertFalse(missing_ambient.exists(), "currency must not create ambient registry")
+        self.assertEqual(conflicting_ambient.read_bytes(), conflicting_bytes,
+                         "currency must not mutate the conflicting ambient registry")
+        self.assertEqual(self.jobs.read_bytes(), sealed_before,
+                         "currency must only read the route-bound registry")
+        self.assertEqual((missing_result.state, conflicting_result.state), ("current", "current"),
+                         (missing_result, conflicting_result))
+
+    def test_public_complete_node_binds_registered_review_source(self):
+        self.current_smoke_markers("public-completion")
+        attempt = "att-review-public-complete-node"
+        metadata = self.prepare_review(attempt, status="running")
+        evidence = self.artifact_root / f"{attempt}.md"
+        evidence.write_text("public completion PASS", encoding="utf-8")
+
+        marker, row = ROUTE_WRITER.complete_node(
+            self.route, self.review_node, self.review_node["id"], evidence,
+            jobs=self.jobs, attempt_id=attempt,
+        )
+
+        self.assertEqual(row["status"], "closed")
+        self.assertEqual(marker["source_subject"]["digest"], metadata["review_subject_digest"])
+        self.assertEqual(marker["source_subject"]["binding_digest"],
+                         metadata["review_subject_binding_digest"])
+        self.assertEqual(self.currency(marker).state, "current")
+        with mock.patch.object(
+            DC, "attempt_process_quiescence",
+            return_value=DC.ProcessQuiescence("quiescent", "fixture-terminal-observation"),
+        ):
+            terminal = ROUTE_WRITER._marker_identity_row(
+                self.route, self.review_node, self.review_node["id"],
+                self.review_node["completion_gate"], jobs=self.jobs, exact_terminal=True,
+            )
+        self.assertTrue(terminal["passed"], terminal)
+
     def test_gates_off_does_not_reuse_a_stale_review_pass(self):
         self.current_smoke_markers("A")
         _meta, a_pass = self.complete_review("att-review-gate-off-A")

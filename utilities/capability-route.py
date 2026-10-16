@@ -810,18 +810,44 @@ def _continuation_reused_evidence(route, node):
     )
     return public,(str(last_turn_id) if last_turn_id else None)
 
-def _source_evidence_snapshot(route, node_ids):
+def _source_evidence_prefix(route, node_ids):
     by_id={str(node.get("id")):node for node in route.get("nodes",[])}
     rows=[]; turns={}
     for node_id in node_ids:
         node=by_id.get(str(node_id))
         if node is None:
-            raise ValueError(f"continuation-source-node-unknown:{node_id}")
-        row,last_turn_id=_continuation_reused_evidence(route,node)
+            return rows,_sha256_record(rows),turns,f"continuation-source-node-unknown:{node_id}",str(node_id)
+        try:
+            row,last_turn_id=_continuation_reused_evidence(route,node)
+        except ValueError as exc:
+            return rows,_sha256_record(rows),turns,str(exc),str(node_id)
         rows.append(row)
         if last_turn_id:
             turns[str(node_id)]=last_turn_id
-    return rows,_sha256_record(rows),turns
+    return rows,_sha256_record(rows),turns,None,None
+
+def _source_evidence_snapshot(route, node_ids):
+    rows,digest,turns,error,_failed_node=_source_evidence_prefix(route,node_ids)
+    if error:
+        raise ValueError(error)
+    return rows,digest,turns
+
+def _continuation_fresh_review_boundary(route, node_id, error):
+    """Return a stale/unbound implementation review that must be rerun."""
+    prefix=f"continuation-source-node-unverified:{node_id}:"
+    if not error.startswith(prefix):
+        return None
+    reason=error[len(prefix):]
+    if reason not in {
+        "completion-source-subject-unknown",
+        "completion-review-source-stale",
+    }:
+        return None
+    node=next((row for row in route.get("nodes",[]) if str(row.get("id"))==str(node_id)),None)
+    if node is None:
+        return None
+    from review_source_subject import is_implementation_review
+    return str(node_id) if is_implementation_review(route,node) else None
 
 def _terminal_owner_for_revised_ancestor(route, jobs):
     """The ended owner of the continuation being superseded, not a review verdict."""
@@ -1278,23 +1304,25 @@ def build_continuation_route(
     reused_ids=node_ids[:resume_index] if resume_index is not None else []
     reused=[]; reused_turns={}; evidence_digest=_sha256_record([])
     if first_blocker is None:
-        try:
-            reused,evidence_digest,reused_turns=_source_evidence_snapshot(
-                source_route,reused_ids
+        reused,evidence_digest,reused_turns,reuse_error,failed_node=(
+            _source_evidence_prefix(source_route,reused_ids)
+        )
+        if reuse_error:
+            restart_node=_continuation_fresh_review_boundary(
+                source_route,failed_node,reuse_error
             )
-        except ValueError as exc:
-            first_blocker=str(exc)
-            reused=[]; reused_turns={}
-            for node_id in reused_ids:
-                try:
-                    row,turn=_continuation_reused_evidence(
-                        source_route,source_nodes[node_ids.index(node_id)]
-                    )
-                except ValueError:
-                    break
-                reused.append(row)
-                if turn: reused_turns[node_id]=turn
-            evidence_digest=_sha256_record(reused)
+            if restart_node is not None:
+                # Keep the old PASS historical and cut the reusable prefix at
+                # the first review that cannot prove its source. The ordinary
+                # suffix starts there and receives a new source binding.
+                resume_index=node_ids.index(restart_node)
+                resume_from_node=restart_node
+                reused_ids=node_ids[:resume_index]
+                reused,evidence_digest,reused_turns,first_blocker,_failed_node=(
+                    _source_evidence_prefix(source_route,reused_ids)
+                )
+            else:
+                first_blocker=reuse_error
     lineage=_continuation_lineage(
         source_route,reused,reused_turns,operation=lineage_operation,
         thread_id=thread_id,new_thread_id=new_thread_id,

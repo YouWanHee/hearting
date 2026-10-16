@@ -131,6 +131,11 @@ Stage-local gates must not become full independent QA loops after every sub-stag
 
 **Corrections are batched, never atomic.** A failed review gate (`plan-check`, `impl-review`, `test`) is followed by exactly one correction pass that closes every 🔴 finding of that round together, plus the follow-on gaps the review named; the owner never redispatches the full `plan` or `execute` node to fix a single finding. The plan correction runs through the `code-refine` boundary and the code correction re-enters the `execute` boundary as a bounded fix under the same node. A re-review of the same implementation source is a **closure check** under the review unit's Round Protocol — the assignment names the prior blocking review and asks whether its 🔴 items are closed and the delta is clean. A changed implementation source receives its own ordinary independent review budget and full independent review; a prior subject's PASS is historical and cannot satisfy it. Each same-subject correction consumes one unit of the `core/CONVENTIONS.md §1.1` retry budget. Owner-closure remains available only for an exhausted history with an eligible blocking review; an exhausted all-PASS history cannot be converted into owner-closure. When the existing writer admits owner-closure, the owner completes that exact blocking attempt with the evidence contract in `core/OPERATIONS.md §5.10`.
 
+When continuation would reuse an implementation-review PASS for a different
+source, or reaches a legacy PASS with no source binding, it automatically
+resumes at that review node for the ordinary independent review. It does not
+infer a legacy subject or ask for a new command or approval.
+
 **Pre-owner direction gate (SD-123).** Depth-0 compiles/binds the route and
 begins its producer cycle before launching the frame pair. The direction gate
 binds at `one-shot` entry for `quick`, `plan` entry for `standard+`. Legacy
