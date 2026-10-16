@@ -77,10 +77,15 @@ Adapters must preserve the portable invariants relevant to this capability:
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
 - use DB memory paths, not runtime-native memory files.
 
-Lab owner start/resume prepares the existing execution access request with the
-initialized compute-hosts inventory's exact `run_root`, so normal resource work
-can write its run records. This default belongs to the lab owner, not frame
-sessions or ordinary code owners. External data roots come from the approved
+An owner route that contains a registered stage whose part catalog row declares
+the `compute-hosts` execution need prepares the existing execution access
+request with the initialized inventory's exact `run_root`. The declaration is
+on the origin stage's row in the `part_catalog` of
+`capabilities/topologies.json`; native and borrowed sealed nodes resolve it by
+stage identity. It is not copied into each sealed node. This covers the
+lab stages that execute or verify compute work, including when code borrows one.
+Frame sessions and routes without such a stage do not receive this default.
+External data roots come from the approved
 task: a folder the start card's `범위:` field names is the owner's write root, and
 other folders the task names are read roots. An explicit `execution_access_v1`
 file through `AGENT_DISPATCH_EXECUTION_ACCESS_FILE` or the existing dispatch

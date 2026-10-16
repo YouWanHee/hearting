@@ -239,6 +239,7 @@ class TestRunner(unittest.TestCase):
                     "artifact_root": str(base), "route_id": "rt-resource-probe",
                     "route_hash": "sha256:resource-probe", "nodes": [{"id": "full-run",
                     "kind": "resource-runner", "resource_class": "gpu",
+                    "outputs": ["run.json"], "write_scope": ["run.json"],
                     "resource_transport": "detached-process"}]}), encoding="utf-8")
                 env = {**base_env, "AGENT_HOME": str(ROOT),
                     "AGENT_DISPATCH_ATTEMPT_ID": "att-route-owner",

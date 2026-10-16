@@ -527,8 +527,9 @@ def _start(route, path, jobs, node, harness, run):
     # input with their inventory run storage through the same request format.
     # Otherwise the request carries what the approved task names (its target
     # table and the roots derived from its text); start/resume share this path.
-    lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
-    if lab_owner or not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
+    from execution_access import compute_execution_scope
+    compute_owner = node == "owner" and compute_execution_scope(route, owner=True)
+    if compute_owner or not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
         try:
             prepared = prepare_task_request(route, jobs, node=node)
         except ExecutionAccessError as exc:

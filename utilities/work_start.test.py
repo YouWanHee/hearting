@@ -215,7 +215,8 @@ class WorkStartTest(unittest.TestCase):
 
     def test_lab_owner_start_and_resume_pass_inventory_and_explicit_data_to_dispatch(self):
         root = Path(self.tmp.name)
-        inventory = root / "compute-hosts.yaml"
+        inventory = root / "configuration" / "compute-hosts.yaml"
+        inventory.parent.mkdir()
         run_root = root / "custom-runs"
         data_root = root / "approved-data"
         inventory.write_text(
@@ -229,7 +230,7 @@ class WorkStartTest(unittest.TestCase):
         original = explicit.read_bytes()
         route = {**self.route, "route_id": "rt-lab-data", "route_hash": "sha256:" + "c" * 64,
                  "capability": "autopilot-lab", "cwd": str(root / "worktree"),
-                 "artifact_root": str(root / "artifacts")}
+                 "artifact_root": str(root / "artifacts"), "nodes": [{"id": "full-run"}]}
         calls = []
 
         def run(command, **kwargs):
@@ -246,10 +247,43 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual(paths[0], paths[1])
         request = json.loads(paths[0].read_text())
         self.assertEqual({str(data_root), str(run_root)}, set(request["writable_roots"]))
+        self.assertEqual([str(inventory.parent)], request["read_roots"])
+        self.assertFalse(request["network"]["required"])
         self.assertEqual("os-sandbox", request["enforcement_required"])
         self.assertEqual(original, explicit.read_bytes())
         self.assertFalse(data_root.exists())
         self.assertFalse(run_root.exists())
+
+        given_route = {**route, "route_id": "rt-lab-parent-given",
+                       "route_hash": "sha256:" + "f" * 64}
+        given_route_file = root / "parent-given-route.json"
+        given_route_file.write_text(json.dumps(given_route))
+        from execution_access import AccessContext, load_request, normalized_request
+        import route_authority as RA
+        given_data = root / "parent-given.json"
+        given_data.write_text(json.dumps({
+            "schema_version": 1, "writable_roots": [str(data_root)],
+            "read_roots": [], "network": {"required": False, "reason": "", "hosts": []},
+            "enforcement_required": "any", "justification": {str(data_root): "parent-approved output"},
+        }))
+        context = AccessContext.build(
+            worktree=given_route["cwd"], artifact_root=given_route["artifact_root"],
+            dispatch_state_root=root, agent_home=W.ROOT,
+            environ={"HOME": str(root / "home")},
+        )
+        given_request = load_request(given_data, context=context)
+        RA.record_access_change(
+            given_route, request=normalized_request(given_request),
+            request_sha256=given_request.request_sha256,
+            by={"harness": "codex", "session_id": "fixture-parent"}, source="unattributed",
+        )
+        with mock.patch.dict(os.environ, {"HOME": str(root / "home"),
+                                           "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            W._start(given_route, given_route_file, self.jobs, "owner", "codex", run)
+        given_path = Path(calls[-1][calls[-1].index("--execution-access-file") + 1])
+        combined = json.loads(given_path.read_text())
+        self.assertEqual({str(data_root), str(run_root)}, set(combined["writable_roots"]))
+        self.assertFalse(combined["network"]["required"])
 
         explicit.write_text("{")
         calls.clear()
@@ -261,6 +295,60 @@ class WorkStartTest(unittest.TestCase):
         self.assertEqual([], calls)
         self.assertEqual(69, result["exit_code"])
         self.assertIn("execution-access-invalid-json", result["execution_access_diagnostic"])
+
+    def test_real_start_prepares_equal_native_and_borrowed_compute_defaults_and_none_for_plain_routes(self):
+        root = Path(self.tmp.name)
+        inventory = root / "configuration" / "compute-hosts.yaml"
+        inventory.parent.mkdir()
+        run_root = root / "shared-runs"
+        inventory.write_text(
+            f"schema_version: 1\nrun_root: {run_root}\nhosts:\n  fixture:\n    ssh_host: local\n")
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "started=1\n", "")
+
+        native = {**self.route, "route_id": "rt-native", "route_hash": "sha256:" + "d" * 64,
+                  "capability": "autopilot-lab", "cwd": str(root / "native"),
+                  "artifact_root": str(root / "native-artifacts"), "nodes": [{"id": "full-run"}]}
+        borrowed = {**self.route, "route_id": "rt-borrowed", "route_hash": "sha256:" + "e" * 64,
+                    "capability": "autopilot-code", "cwd": str(root / "borrowed"),
+                    "artifact_root": str(root / "borrowed-artifacts"),
+                    "nodes": [{"id": "lab-full-run", "part": "autopilot-lab:full-run"}]}
+        with mock.patch.dict(os.environ, {"HOME": str(root / "home"),
+                                           "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
+            requests = []
+            for route in (native, borrowed):
+                route_file = root / f"{route['route_id']}.json"
+                route_file.write_text(json.dumps(route))
+                W._start(route, route_file, root / "jobs.log", "owner", "codex", run)
+                request_file = Path(calls[-1][calls[-1].index("--execution-access-file") + 1])
+                requests.append(json.loads(request_file.read_text()))
+            self.assertEqual(requests[0]["writable_roots"], requests[1]["writable_roots"])
+            self.assertEqual([str(run_root)], requests[0]["writable_roots"])
+            self.assertEqual(requests[0]["read_roots"], requests[1]["read_roots"])
+            self.assertEqual([str(inventory.parent)], requests[0]["read_roots"])
+            self.assertEqual(requests[0]["network"], requests[1]["network"])
+            self.assertTrue(requests[0]["network"]["required"])
+            from execution_access import COMPUTE_NETWORK_REASON
+            self.assertEqual(COMPUTE_NETWORK_REASON,
+                             requests[0]["network"]["reason"])
+
+            plain_routes = (
+                {"route_id": "rt-plain-code", "capability": "autopilot-code", "nodes": [{"id": "execute"}]},
+                {"route_id": "rt-frame", "capability": "route-frame", "nodes": [{"id": "frame"}]},
+            )
+            for index, partial in enumerate(plain_routes):
+                route = {**self.route, **partial,
+                         "route_hash": "sha256:" + str(index + 1) * 64,
+                         "cwd": str(root / partial["route_id"]),
+                         "artifact_root": str(root / (partial["route_id"] + "-artifacts"))}
+                route_file = root / f"{route['route_id']}.json"
+                route_file.write_text(json.dumps(route))
+                before = len(calls)
+                W._start(route, route_file, root / "jobs.log", "owner", "codex", run)
+                self.assertNotIn("--execution-access-file", calls[before])
 
     def observe(self, **kw):
         return {"state": "ready" if self.ready else "timeout", "children": []}
@@ -569,6 +657,11 @@ class WorkStartTest(unittest.TestCase):
                 stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
                 stack.enter_context(mock.patch.object(owner, "_authoritative_jobs", return_value=str(self.jobs)))
                 stack.enter_context(mock.patch.object(owner, "_sealed_owner_context", return_value=context))
+                # This case tests selector choice, while subprocess.run is the
+                # mocked wrapper boundary below; avoid running a real foreground
+                # owner lifecycle inside the isolated fixture.
+                stack.enter_context(mock.patch.object(owner, "select_launch_lifecycle",
+                                                      return_value="detached"))
                 stack.enter_context(mock.patch.object(owner, "_usage", return_value=dict.fromkeys(("claude", "codex", "opencode"), "ok")))
                 stack.enter_context(mock.patch.object(owner._capacity, "capacity_report", return_value={
                     "scores": {"claude": headroom, "codex": 50, "opencode": 0}, "sources": {}}))

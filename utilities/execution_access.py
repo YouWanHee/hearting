@@ -782,7 +782,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 def _lab_run_root(route: Mapping[str, object], node: str) -> Path | None:
     """Read normal lab run storage from the existing inventory loader only."""
 
-    if node != "owner" or route.get("capability") != "autopilot-lab":
+    if not compute_execution_scope(route, node=node, owner=(node == "owner")):
         return None
     path = Path(__file__).resolve().parent / "compute-hosts.py"
     spec = importlib.util.spec_from_file_location("_execution_compute_hosts", path)
@@ -796,6 +796,65 @@ def _lab_run_root(route: Mapping[str, object], node: str) -> Path | None:
         if exc.status in {"missing", "template"}:
             return None
         raise ExecutionAccessError("execution-access-compute-inventory-invalid", str(exc)) from exc
+
+
+_TOPOLOGY_REGISTRY_CACHE: dict[str, tuple[object, object]] = {}
+
+
+def _topology_registry():
+    topology_path = (Path(__file__).resolve().parents[1] / "tools" / "capability_topology.py").resolve()
+    key = str(topology_path)
+    cached = _TOPOLOGY_REGISTRY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location("_execution_capability_topology", topology_path)
+    if spec is None or spec.loader is None:
+        return None
+    topology = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(topology)
+    registry = topology.load_registry()
+    cached = (topology, registry)
+    _TOPOLOGY_REGISTRY_CACHE[key] = cached
+    return cached
+
+
+def compute_execution_scope(route: Mapping[str, object], *, node: str | None = None,
+                            owner: bool = True) -> bool:
+    """Resolve compute access from each sealed node's registered origin stage."""
+    try:
+        loaded = _topology_registry()
+        if loaded is None:
+            return False
+        topology, registry = loaded
+    except (OSError, ValueError, ImportError):
+        return False
+
+    selected = []
+    nodes = route.get("nodes") if isinstance(route.get("nodes"), list) else []
+    if node not in (None, "owner"):
+        selected = [item for item in nodes if isinstance(item, dict) and item.get("id") == node]
+    elif owner:
+        selected = [item for item in nodes if isinstance(item, dict)]
+    else:
+        selected = [item for item in nodes if isinstance(item, dict) and item.get("id") == node]
+
+    for sealed in selected:
+        part = sealed.get("part")
+        if isinstance(part, str):
+            identity = part
+        else:
+            stage = sealed.get("parallel_anchor") or sealed.get("id")
+            capability = route.get("capability")
+            if not isinstance(capability, str) or not isinstance(stage, str):
+                continue
+            identity = f"{capability}:{stage}"
+        try:
+            found = topology.part_row(registry, identity)
+        except (KeyError, TypeError, ValueError):
+            found = None
+        if found and "compute-hosts" in (found.get("execution_needs") or []):
+            return True
+    return False
 
 
 def _route_identity(route: Mapping[str, object]) -> tuple[str, str] | None:
@@ -853,18 +912,15 @@ def prepare_task_request(
     result. An older snapshot adds only its missing read inputs once."""
 
     # The explicit typed request keeps precedence over preview-table input.
-    lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
+    compute_owner = node == "owner" and compute_execution_scope(route, owner=True)
     explicit = request_path(None) if environment else None
     given = _given_access(route, jobs) if explicit is None else None
-    if given is not None and not lab_owner:
+    if given is not None and not compute_owner:
         return given
     explicit = explicit if given is None else given
-    targets = None if lab_owner and explicit is not None else resolve_task_targets(route)
+    targets = None if compute_owner and explicit is not None else resolve_task_targets(route)
     run_root = _lab_run_root(route, node)
-    # The same typed execution scope as the GPU sandbox selector, without
-    # applying any Codex-specific caller overrides to another harness.
-    from gpu_execution_sandbox import select as gpu_selection
-    compute_scope = lab_owner and run_root is not None and gpu_selection(route, environ={})["gpu_scope"]
+    compute_scope = compute_owner and run_root is not None
     inventory_root = None
     if compute_scope:
         inventory = os.environ.get("COMPUTE_HOSTS_CONFIG") or (

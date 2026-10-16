@@ -87,7 +87,7 @@ FROZEN_GLOBAL_TABLE_DIGESTS = {
     "human_gate_positions": "fc45768a57481792e0643d4bec1faae15743411bc06096fdb1740f632f0707b0",
     "artifact_buckets": "ccbd32ef24b84897147e3d1a0862a824d9c6f893a12aed07f53c9f77724cb835",
     "producer_lifecycle": "a9f26a373d2e3af19f55be8c37b8cd0126f30165cdfa0407ef0242aa7c2f9816",
-    "part_catalog": "4a90cec3f0df00c09bb16f4c4e44f1f2f7372f88f75bde6b8c84f51cb2ba4a03",
+    "part_catalog": "1b06bb1ed2f3d4cd561dd7c67c205c4b05bc5905c2a8482b4eee3e2aab181180",
 }
 FROZEN_GATE_CONTRACT_DIGEST = "4b243bd3f897ea98d1ba93283f8297c10c88155c2c2ee80146322023902adb58"
 FROZEN_RECIPE_COUNT = 14
