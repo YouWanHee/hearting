@@ -3957,9 +3957,17 @@ def _resume_registered_obligation(duty, store):
     if transfer_ref:
         transferred = peer_message._read_pending(transfer_ref)
         if transferred and transferred.get("state") == "received":
-            peer_obligations.acknowledge_registered_delivery(transferred, roots=[jobs.parent])
+            bound_received = peer_obligations.acknowledge_registered_delivery(
+                transferred, roots=[jobs.parent])
         if transferred and peer_obligations.registered_delivery_settled(transferred, roots=[jobs.parent]):
             transferred = None
+        elif transferred and transferred.get("state") == "received" and bound_received:
+            # The exact recipient receipt is durable even when this ACK write
+            # failed. Keep the existing duty/ref for the next natural retry;
+            # preparing another transfer would duplicate a known receipt.
+            store.update(duty["id"], observation={**observation,
+                "reason": "received-delivery-ack-pending"})
+            return
     parent = [row.metadata.get(key, "") for key in
               ("parent_runtime_pid", "parent_runtime_pid_start", "parent_runtime_ns")]
     # A native hook belongs to its original runtime. A live holder cannot wake
@@ -4015,7 +4023,8 @@ def _resume_registered_obligation(duty, store):
             pending.reclaim(jobs.parent, storage_recipient, delivery_id,
                             now_ns=time.monotonic_ns())
         record = pending.claim(jobs.parent, storage_recipient, delivery_id,
-                               claim_owner=owner, lease_seconds=30, require_generation_proof=False)
+                               claim_owner=owner, lease_seconds=30, require_generation_proof=False,
+                               jobs=jobs)
         if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
             return
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
@@ -4871,6 +4880,9 @@ def cmd_clear(args):
     if req is None:
         print(f"cleared=skipped reason={why}")
         return _CLEAR_EXIT["skipped"]
+    if req.get("snapshot_state") in ("pending", "deferred"):
+        print("cleared=skipped reason=snapshot-pending")
+        return _CLEAR_EXIT["skipped"]
     harness, old_sid, target = req.get("harness"), req.get("sid"), args.target
     command = _CLEAR_COMMAND.get(harness)
     started = time.monotonic()
@@ -4920,6 +4932,98 @@ def cmd_clear(args):
     if new_session is None:
         return finish("unverified", "new-session-not-observed", agent)
     return finish("true", None, agent)
+
+
+def cmd_idle_card_request(args):
+    """Send one claim-bound request to the exact idle main session to author its own card."""
+    import session_tidy_clear as clear
+    path = Path(args.request)
+    req, why = clear.validate_idle_request(path, args.nonce)
+
+    def finish(outcome, reason=""):
+        harness = str((req or {}).get("harness") or "unknown")
+        sid = str((req or {}).get("sid") or "")
+        pane = (req or {}).get("seat", {}).get("pane")
+        receipt = (f"action=idle-card-request accepted={outcome} harness={harness} session={sid}"
+                   + (f" reason={reason}" if reason else ""))
+        try:
+            _record(to_harness=harness, to_name=args.target, kind="notice",
+                    summary_text="[notice] session-tidy idle card request", to_session_id=sid,
+                    to_pane=pane, ref=[], status="sent" if outcome == "true" else "unknown",
+                    receipt=receipt, from_identity=(sid, harness, _project_of((req or {}).get("cwd"))),
+                    from_name=_from_name(harness, sid))
+        except Exception:
+            pass
+        print(f"accepted={outcome} target={args.target} harness={harness} session={sid}"
+              + (f" reason={reason}" if reason else ""))
+        return 0 if outcome == "true" else (3 if outcome in ("queued", "skipped") else 5)
+
+    if req is None:
+        return finish("skipped", why)
+    seat = req.get("seat") or {}
+    if seat.get("kind") == "native":
+        from session_tidy_native import idle_card_request
+        verdict = idle_card_request(req, str(path), args.nonce, screen_ready=_screen_ready)
+        return finish(verdict.get("accepted", "failed"), verdict.get("reason", ""))
+    if _herdr_missing():
+        return finish("failed", "herdr-not-found")
+    if seat.get("kind") != "pane" or seat.get("pane") != args.target:
+        return finish("skipped", "target-changed")
+
+    def exact_session(agent):
+        if req.get("harness") != "opencode":
+            return True
+        if isinstance(agent, dict) and agent.get("session_id") not in (None, "", req.get("sid")):
+            return False
+        try:
+            import session_tidy as st
+            seat = st.seat_from_dict(req["seat"])
+            latest = st.latest_session(seat, "opencode")
+            return bool(latest and latest.get("sid") == req.get("sid"))
+        except Exception:
+            return False
+
+    reason, agent, _lines = _clear_look(args.target, req)
+    if not reason and not exact_session(agent):
+        reason = "target-changed"
+    if reason:
+        queued = reason in {"draft", "draft-unknown", "form-open", "screen-unknown"} \
+            or reason.startswith("not-idle-")
+        return finish("queued" if queued else _look_outcome(reason), reason)
+    req, why = clear.validate_idle_request(path, args.nonce)
+    if req is None:
+        return finish("skipped", why)
+    reason, agent, _lines = _clear_look(args.target, req)  # immediately before the one claimed send
+    if not reason and not exact_session(agent):
+        reason = "target-changed"
+    if reason:
+        queued = reason in {"draft", "draft-unknown", "form-open", "screen-unknown"} \
+            or reason.startswith("not-idle-")
+        return finish("queued" if queued else _look_outcome(reason), reason)
+    claim, why = clear.claim_idle_card_request(path, args.nonce)
+    if claim is None:
+        return finish("skipped", why)
+    reason, agent, _lines = _clear_look(args.target, claim)
+    if not reason and not exact_session(agent):
+        reason = "target-changed"
+    if reason:
+        clear.release_unsent_idle_request(claim)
+        queued = reason in {"draft", "draft-unknown", "form-open", "screen-unknown"} \
+            or reason.startswith("not-idle-")
+        return finish("queued" if queued else _look_outcome(reason), reason)
+    checked, why = clear.validate_idle_request(path, args.nonce, _sending_claim=claim.get("idle_request"))
+    if checked is None:
+        clear.release_unsent_idle_request(claim)
+        return finish("skipped", why)
+    text = clear.idle_card_request_text(claim)
+    rc, payload = _herdr_prompt(args.target, text, wait=True, timeout_ms=_PROMPT_VERIFY_TIMEOUT_MS)
+    if rc != 0:
+        reason = "herdr-invocation-failed" if rc is None else _herdr_error_reason(payload, rc)
+        clear.finish_idle_card_request(claim, accepted=False, reason=reason)
+        return finish("unverified", reason)
+    if clear.finish_idle_card_request(claim, accepted=True):
+        return finish("true")
+    return finish("unverified", "arrival-not-observed")
 
 
 def _look_outcome(reason):
@@ -5052,7 +5156,7 @@ def cmd_continue(args):
         print(f"continued=skipped reason={why}")
         return _CLEAR_EXIT["skipped"]
     harness, old_sid, new_sid, target = req.get("harness"), req.get("sid"), req.get("new_session"), args.target
-    text = clear.CONTINUE_TEXT
+    text = clear.followup_text(req)
     started = time.monotonic()
     verify, pane = "none", (req.get("seat") or {}).get("pane")
 
@@ -5262,6 +5366,12 @@ def build_parser():
                          help="the seat's auto-clear booking (session_tidy_clear.py)")
     p_clear.add_argument("--nonce", default=None, help="the booking's nonce, when the caller holds one")
     p_clear.set_defaults(func=cmd_clear)
+
+    p_idle_card = sub.add_parser("idle-card-request")
+    p_idle_card.add_argument("target")
+    p_idle_card.add_argument("--request", required=True)
+    p_idle_card.add_argument("--nonce", default=None)
+    p_idle_card.set_defaults(func=cmd_idle_card_request)
 
     p_continue = sub.add_parser("continue")
     p_continue.add_argument("target")

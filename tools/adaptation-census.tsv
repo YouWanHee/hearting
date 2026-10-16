@@ -61,6 +61,8 @@ shared-utility-deferred	report_verification_projection.py
 shared-utility-deferred	resource_resume.py
 shared-utility-deferred	review_input.py
 shared-utility-deferred	review_watchdog.py
+shared-utility-deferred	session_tidy_idle.py
+shared-utility-deferred	session_tidy_policy.py
 shared-utility-deferred	route_parent_close.py
 shared-utility-deferred	route_plan.py
 shared-utility-deferred	route_presence_gate.py

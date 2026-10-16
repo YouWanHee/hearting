@@ -53,12 +53,19 @@ class IsolatedRootMixin:
         home = base / "home"
         xdg = base / "xdg-state"
         harness = base / "harness-state"
-        for d in (home, xdg, harness):
+        peer = base / "peer-ledger"
+        jobs = harness / "jobs.log"
+        for d in (home, xdg, harness, peer):
             d.mkdir(parents=True, exist_ok=True)
         self._env_patch = {
             "HOME": str(home),
             "XDG_STATE_HOME": str(xdg),
+            "XDG_CONFIG_HOME": str(base / "xdg-config"),
             "HARNESS_STATE_ROOT": str(harness),
+            "AGENT_PEER_LEDGER_ROOT": str(peer),
+            "AGENT_DISPATCH_JOBS": str(jobs),
+            "CODEX_HOME": str(home / ".codex"),
+            "CLAUDE_CONFIG_DIR": str(home / ".claude"),
         }
         self._saved_env = {k: os.environ.get(k) for k in self._env_patch}
         os.environ.update(self._env_patch)
@@ -156,6 +163,33 @@ class CreateTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual((retired["state"], retired["expiry_reason"]), ("rejected", "replacement-consumed"))
         self.assertIsNone(retired["acked_at_ns"])
         self.assertEqual(retired["receipt"], original["receipt"])
+
+    def test_blank_registry_uses_only_valid_carrier_context_without_rewriting_receipt(self):
+        import dispatch_replacement as replacement
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.write_text("")
+        kwargs, record = self._create(receipt=_receipt(job_registry=""))
+        path = PD.record_path(self.root, kwargs["recipient_key"], kwargs["delivery_id"])
+        sealed = path.read_bytes()
+        outside = Path(self._tmp.name) / "outside" / "jobs.log"
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("")
+        symlink = self.root / "jobs-link.log"
+        symlink.symlink_to(jobs)
+        with unittest.mock.patch.object(replacement, "_rows", return_value={}), \
+             unittest.mock.patch.object(replacement, "effective_attempts",
+                                        side_effect=lambda _jobs, attempts: (attempts, [])), \
+             unittest.mock.patch.object(replacement, "recovery_delivery_state", return_value="accepted"):
+            self.assertEqual(PD._replacement_disposition(
+                self.root, kwargs["recipient_key"], record), "")
+            self.assertEqual(PD._replacement_disposition(
+                self.root, kwargs["recipient_key"], record, jobs=jobs), "defer")
+            self.assertEqual(PD._replacement_disposition(
+                self.root, kwargs["recipient_key"], record, jobs=outside), "defer")
+            self.assertEqual(PD._replacement_disposition(
+                self.root, kwargs["recipient_key"], record, jobs=symlink), "defer")
+        self.assertEqual(path.read_bytes(), sealed)
 
     def test_human_gate_is_not_deferred_with_its_replaced_attempt(self):
         import dispatch_replacement as replacement
@@ -379,6 +413,77 @@ class ClaimCasTest(IsolatedRootMixin, unittest.TestCase):
         )
         self.assertEqual(acked["state"], "acked")
         self.assertIsNotNone(acked["acked_at_ns"])
+
+    def test_generic_ack_does_not_gain_pending_state_authority(self):
+        path = PD.record_path(self.root, "sess-claim", self.kwargs["delivery_id"])
+        before = path.read_bytes()
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.ack(self.root, "sess-claim", self.kwargs["delivery_id"], acked_by="tokenless")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_verified_received_ack_survives_reclaim_and_claimant_change(self):
+        did = self.kwargs["delivery_id"]
+        original = PD.read(self.root, "sess-claim", did)
+        identity = PD.received_ack_identity(original, "sess-claim", did)
+        first = PD.claim(self.root, "sess-claim", did, claim_owner="first", lease_seconds=1)
+        PD.reclaim(self.root, "sess-claim", did, now_ns=first["claim_deadline_ns"] + 1)
+        successor = PD.claim(self.root, "sess-claim", did, claim_owner="successor", lease_seconds=30)
+        self.assertNotEqual(successor["claim_owner"], original["claim_owner"])
+        acked = PD.ack_received(self.root, "sess-claim", did,
+                                expected_identity=identity, acked_by="peer-received:exact-ref")
+        self.assertEqual(acked["state"], "acked")
+        self.assertEqual(acked["attempts"], 2)
+        self.assertEqual(PD.received_ack_identity(acked, "sess-claim", did), identity)
+
+    def test_received_ack_rejects_changed_immutable_identity_without_write(self):
+        did = self.kwargs["delivery_id"]
+        original = PD.read(self.root, "sess-claim", did)
+        identity = PD.received_ack_identity(original, "sess-claim", did)
+        identity["route_node"] = "report"
+        path = PD.record_path(self.root, "sess-claim", did)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(PD.PendingDeliveryError, "received-identity-changed"):
+            PD.ack_received(self.root, "sess-claim", did,
+                            expected_identity=identity, acked_by="peer-received:exact-ref")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_received_ack_preserves_acked_expired_and_rejected_record_bytes(self):
+        did = self.kwargs["delivery_id"]
+        identity = PD.received_ack_identity(PD.read(self.root, "sess-claim", did), "sess-claim", did)
+        claimed = PD.claim(self.root, "sess-claim", did, claim_owner="carrier", lease_seconds=30)
+        PD.reject_claimed(self.root, "sess-claim", did, claim_owner="carrier", reason="permanent-refusal")
+        path = PD.record_path(self.root, "sess-claim", did)
+        before = path.read_bytes()
+        result = PD.ack_received(self.root, "sess-claim", did,
+                                 expected_identity=identity, acked_by="peer-received:exact-ref")
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(path.read_bytes(), before)
+
+        other = dict(self.kwargs, delivery_id="delivery-" + "d" * 32)
+        PD.create(**other)
+        expired_identity = PD.received_ack_identity(PD.read(self.root, "sess-claim", other["delivery_id"]),
+                                                    "sess-claim", other["delivery_id"])
+        PD.expire_if_due(self.root, "sess-claim", other["delivery_id"],
+                         actor="dispatch-reconcile", reason="pending-delivery-ttl-exceeded")
+        expired_path = PD.record_path(self.root, "sess-claim", other["delivery_id"])
+        expired_bytes = expired_path.read_bytes()
+        result = PD.ack_received(self.root, "sess-claim", other["delivery_id"],
+                                 expected_identity=expired_identity, acked_by="peer-received:exact-ref")
+        self.assertEqual(result["state"], "expired")
+        self.assertEqual(expired_path.read_bytes(), expired_bytes)
+
+        acked_id = "delivery-" + "e" * 32
+        acked_kwargs = dict(self.kwargs, delivery_id=acked_id)
+        PD.create(**acked_kwargs)
+        acked_identity = PD.received_ack_identity(PD.read(self.root, "sess-claim", acked_id), "sess-claim", acked_id)
+        PD.claim(self.root, "sess-claim", acked_id, claim_owner="carrier", lease_seconds=30)
+        PD.ack(self.root, "sess-claim", acked_id, acked_by="token-bearing-surface")
+        acked_path = PD.record_path(self.root, "sess-claim", acked_id)
+        acked_bytes = acked_path.read_bytes()
+        result = PD.ack_received(self.root, "sess-claim", acked_id,
+                                 expected_identity=acked_identity, acked_by="peer-received:exact-ref")
+        self.assertEqual(result["state"], "acked")
+        self.assertEqual(acked_path.read_bytes(), acked_bytes)
 
     def test_reclaim_before_lease_expiry_is_refused(self):
         claimed = PD.claim(

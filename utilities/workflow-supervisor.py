@@ -545,7 +545,7 @@ def cmd_arm(args):
         target = armed_dir(ledger) / f"{args.node}.json"
         if args.predecessor_kind == "resource" and target.exists():
             prior = json.loads(target.read_text())
-            if any(prior.get(k) != record.get(k) for k in record if k != "armed_at"):
+            if any(_comparable_armed(prior, record).get(k) != record.get(k) for k in record if k != "armed_at"):
                 replace_resource_predecessor(route, ledger, prior, record, resource)
             else:
                 print(json.dumps({"armed": args.node, "replayed": True,
@@ -746,13 +746,25 @@ def resource_predecessors(ledger, node):
     return result
 
 
+# Keys an older release's `arm` did not write. Each is read from the route node the record
+# names, and `route_hash` is still compared, so a missing key means the value this release
+# derives from the same sealed node.
+ARMED_NODE_KEYS_ADDED = ("write_scope", "part_io")
+
+
+def _comparable_armed(prior, record):
+    """`prior` as this release would have written it, for comparison only (never stored)."""
+    return {**{key: record.get(key) for key in ARMED_NODE_KEYS_ADDED if key not in prior}, **prior}
+
+
 def replace_resource_predecessor(route, ledger, prior, record, resource):
     """Called under the ledger lock, with the old run and journal preserved."""
     import dispatch_resource_wait as OWNER_RESOURCE
     changing = {"predecessor_id", "resource_registry", "resource_binding", "armed_at"}
+    comparable = _comparable_armed(prior, record)
     if (prior.get("predecessor_kind") != "resource"
             or prior.get("predecessor_id") == record.get("predecessor_id")
-            or any(prior.get(k) != record.get(k) for k in set(prior) | set(record) if k not in changing)
+            or any(comparable.get(k) != record.get(k) for k in set(comparable) | set(record) if k not in changing)
             or resource.get("resource_policy") not in {"supervised-owner", "verified-resume"}):
         raise SupervisorError("resource-watch-binding-conflict")
     evidence = resource_evidence(prior)

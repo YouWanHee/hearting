@@ -30,6 +30,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session-tidy-idle.py\""
+          }
+        ]
+      }
     ]
   }
 }

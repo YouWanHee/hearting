@@ -96,6 +96,7 @@ class ClaudeSettingsConfigTests(unittest.TestCase):
         import user_config
         ids = [surface["id"] for surface in user_config.SURFACES]
         self.assertIn("claude-settings.defaultMode", ids)
+        self.assertIn("session-tidy", ids)
 
 
 if __name__ == "__main__":

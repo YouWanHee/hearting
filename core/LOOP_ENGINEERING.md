@@ -31,6 +31,12 @@ describe how to reach them; judge any structure or change against these first.
    execution. There are no per-harness exception branches or duplicated
    judgments. (See §3 and §5.)
 
+For durable completion delivery, an exact recipient-side receipt remains valid
+after the transport claim expires or changes owner. The shared delivery record
+may settle only the matching delivery from that verified receipt; receiving a
+notice does not mean its work or follow-up has completed. Emission remains
+recoverable when no receipt exists.
+
 ## 1. The unit of a feature is a responsibility carried to the end
 
 `intent → execution → observation → result settlement → follow-up or recovery → closure → handoff`
