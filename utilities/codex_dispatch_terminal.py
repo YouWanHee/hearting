@@ -716,7 +716,7 @@ def _bound_terminal_output(
     artifact: str, binding: Mapping[str, object] | None, *, root: Path,
     worktree: str | Path | None,
 ) -> tuple[Path | None, str | None]:
-    """Use only the attempt's sealed route and producer binding for cycle paths."""
+    """Use the exact route lineage, with owner binding when the row has one."""
     if not isinstance(binding, Mapping):
         return None, None
     route_file = binding.get("route_file")
@@ -725,22 +725,44 @@ def _bound_terminal_output(
     node_id = binding.get("route_node")
     attempt_id = binding.get("attempt_id")
     worker_type = binding.get("worker_type")
+    has_parent_binding = "parent_attempt_id" in binding
     parent_attempt = binding.get("parent_attempt_id")
-    producer_attempt_id = (attempt_id if worker_type == "owner" else parent_attempt)
+    if worker_type == "owner":
+        producer_attempt_id = attempt_id
+        require_producer_binding = True
+    elif has_parent_binding:
+        # A supplied parent is authoritative. Missing, malformed, or conflicting
+        # producer bindings must not be reinterpreted as a pre-owner frame.
+        if not isinstance(parent_attempt, str) or not parent_attempt:
+            return None, None
+        producer_attempt_id = parent_attempt
+        require_producer_binding = True
+    else:
+        # The one legacy shape without a parent owner is a registered depth-1
+        # frame. Its exact sealed route and admitted cycle are its authority.
+        if (worker_type != "frame" or node_id != "frame"
+                or str(binding.get("dispatch_depth", "")) != "1"):
+            return None, None
+        producer_attempt_id = None
+        require_producer_binding = False
     if not all(isinstance(value, str) and value for value in
-               (route_file, route_id, route_hash, node_id, attempt_id, producer_attempt_id)):
+               (route_file, route_id, route_hash, node_id, attempt_id)):
         return None, None
     try:
         from artifact_context import ArtifactContextError, resolve_context
         context = resolve_context(
             environ={}, route=str(route_file), node_id=str(node_id),
-            parent_attempt_id=str(producer_attempt_id),
+            parent_attempt_id=(str(producer_attempt_id) if producer_attempt_id is not None else None),
             explicit={"artifact_root": str(root), "source_worktree": str(worktree) if worktree else None},
-            require_producer_binding=True,
+            require_producer_binding=require_producer_binding,
         )
         if (not context.route or context.route.get("route_id") != route_id
                 or context.route.get("route_hash") != route_hash
                 or context.node_id != node_id):
+            return None, None
+        if not require_producer_binding and (
+                not context.node or context.node.get("worker_type") != "frame"
+                or str(context.node.get("dispatch_depth", "")) != "1"):
             return None, None
         return context.resolve_terminal_artifact(artifact), None
     except ArtifactContextError as exc:

@@ -237,6 +237,7 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
         }
         binding_path = T.producer_binding_path(self.root, self.route["route_id"],
                                                "att-owner-frame-fixture")
+        self.owner_binding_path = binding_path
         binding_path.parent.mkdir(parents=True)
         binding_path.write_text(json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n",
                                 encoding="utf-8")
@@ -337,6 +338,85 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
         self.assertEqual(row["status"], "closed")
         self.assertEqual(marker["evidence"]["path"], str(self.output))
 
+    def test_parentless_pre_owner_frames_reconcile_and_complete_live_and_sealed_cycles(self):
+        # This matches the real depth-1 frame shape: route identity is present,
+        # but there is no parent owner attempt to bind. Keep the fixture cycle
+        # owner-binding-free so route lineage is the only cycle authority.
+        self.owner_binding_path.unlink()
+        frame = next(node for node in self.route["nodes"] if node.get("id") == "frame")
+        self.assertEqual(frame.get("dispatch_depth"), 1)
+        self.assertEqual(frame.get("worker_type"), "frame")
+        for phase in ("live", "sealed"):
+            if phase == "sealed":
+                self.close(self.route, self.route_file)
+                clean_env = {
+                    "AGENT_HOME": str(Path(self._tmp.name) / "agent-home"),
+                    "AGENT_DISPATCH_JOBS": str(self.jobs),
+                    "HEARTING_GATES": "off",
+                }
+                with mock.patch.dict(os.environ, clean_env, clear=True):
+                    sealed = P.finalize(self.root, cycle_id=self.cycle["cycle_id"])
+                self.assertIn(sealed.get("status"), {"sealed", "already-sealed"})
+
+            for harness in ("claude", "codex", "opencode"):
+                attempt_id = f"att-parentless-{phase}-{harness}"
+                attempt = {key: value for key, value in self.binding.items()
+                           if key != "parent_attempt_id"}
+                attempt.update({
+                    "attempt_id": attempt_id,
+                    "dispatch_depth": "1",
+                    "worker_type": "frame",
+                })
+                log = self._log(harness, "shards/frame/direction-brief.md",
+                                f"{phase}-parentless")
+                metadata = {
+                    **attempt,
+                    "attempt_schema_version": "2",
+                    "transport": "headless",
+                    "execution_surface": "registered-headless",
+                    "registered_worker": "1",
+                    "fallback_hop": "same-harness-headless",
+                    "harness": harness,
+                    "artifact_root": str(self.root.resolve()),
+                    "log_file": str(log),
+                }
+                self.assertNotIn("parent_attempt_id", metadata)
+                ambient = (
+                    {},
+                    {
+                        "AGENT_ARTIFACT_ROOT": str(Path(self._tmp.name) / "wrong-root"),
+                        "AGENT_ARTIFACT_CYCLE_ID": "cyc_" + "f" * 32,
+                        "AGENT_ARTIFACT_OUTPUT_DIR": str(Path(self._tmp.name) / "wrong-output"),
+                        "AGENT_ROUTE_FILE": str(Path(self._tmp.name) / "wrong-route.json"),
+                        "AGENT_ROUTE_ID": "rt-unrelated",
+                        "AGENT_ROUTE_NODE": "research",
+                        "AGENT_DISPATCH_PARENT_ATTEMPT_ID": "att-unrelated-owner",
+                    },
+                )
+                for env in ambient:
+                    isolated = {
+                        "AGENT_HOME": str(Path(self._tmp.name) / "agent-home"),
+                        "AGENT_DISPATCH_JOBS": str(self.jobs),
+                        "HEARTING_GATES": "off",
+                        **env,
+                    }
+                    with self.subTest(phase=phase, harness=harness, ambient=bool(env)), \
+                            mock.patch.dict(os.environ, isolated, clear=True):
+                        resolved, reason = JOIN.route_completion_evidence(
+                            metadata, worktree=str(self.source))
+                        self.assertEqual((resolved, reason), (str(self.output), ""))
+                        pipe = ",".join(f"{key}={value}" for key, value in metadata.items())
+                        self.jobs.write_text("\t".join([
+                            "2026-10-16T00:00:00Z", "open", str(self.source), str(self.source),
+                            "frame", pipe,
+                        ]) + "\n", encoding="utf-8")
+                        marker, row = PRODUCER_FIXTURE.R.complete_node(
+                            self.route, frame, "frame", Path(resolved), jobs=self.jobs,
+                            attempt_id=attempt_id,
+                        )
+                        self.assertEqual(row["status"], "closed")
+                        self.assertEqual(marker["evidence"]["path"], str(self.output))
+
     def test_ambient_context_cannot_replace_the_attempt_binding_on_reinspection(self):
         for env in (
             {},
@@ -359,6 +439,10 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
         legacy.write_text("authorized existing target\n", encoding="utf-8")
         relative = self._inspect("target-artifact.md", suffix="target")
         self.assertEqual((relative["state"], self._decoded(relative["artifact_path_b64"])),
+                         ("valid", legacy))
+        absolute_target = self._inspect(str(legacy), suffix="absolute-target")
+        self.assertEqual((absolute_target["state"],
+                          self._decoded(absolute_target["artifact_path_b64"])),
                          ("valid", legacy))
 
     def test_wrong_owner_cycle_and_node_scope_do_not_select_the_cycle_output(self):
@@ -385,6 +469,64 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
         for result in (cycle_result, owner_result, scope_result):
             self.assertEqual((result["state"], result["reason"]),
                              ("invalid", "artifact-outside-root"))
+
+        missing_binding = {**self.binding, "parent_attempt_id": "att-owner-not-published"}
+        missing_result = self._inspect("shards/frame/direction-brief.md", binding=missing_binding,
+                                       suffix="missing-owner-binding")
+        self.assertEqual((missing_result["state"], missing_result["reason"]),
+                         ("invalid", "artifact-outside-root"))
+
+        non_frame = {key: value for key, value in self.binding.items()
+                     if key != "parent_attempt_id"}
+        non_frame.update({"worker_type": "stage", "dispatch_depth": "1"})
+        non_frame_result = self._inspect("shards/frame/direction-brief.md", binding=non_frame,
+                                         suffix="parentless-non-frame")
+        self.assertEqual((non_frame_result["state"], non_frame_result["reason"]),
+                         ("invalid", "artifact-outside-root"))
+
+        wrong_route_file = {**self.binding, "route_file": str(self.other_route_file.resolve())}
+        wrong_route_id = {**self.binding, "route_id": self.other_route["route_id"]}
+        wrong_route_hash = {**self.binding, "route_hash": "sha256:" + "f" * 64}
+        for suffix, bad_binding in (("wrong-route-file", wrong_route_file),
+                                    ("wrong-route-id", wrong_route_id),
+                                    ("wrong-route-hash", wrong_route_hash)):
+            with self.subTest(route_binding=suffix):
+                result = self._inspect("shards/frame/direction-brief.md", binding=bad_binding,
+                                       suffix=suffix)
+                self.assertEqual((result["state"], result["reason"]),
+                                 ("invalid", "artifact-outside-root"))
+
+        undeclared = self.output.parent / "not-declared.md"
+        undeclared.write_text("inside cycle, absent from node outputs\n", encoding="utf-8")
+        undeclared_result = self._inspect("shards/frame/not-declared.md", suffix="undeclared-output")
+        self.assertEqual((undeclared_result["state"], undeclared_result["reason"]),
+                         ("invalid", "artifact-outside-root"))
+
+    def test_invalid_existing_terminal_row_is_unchanged_by_reinspection(self):
+        log = self._log("codex", "../outside.md", "existing-invalid")
+        metadata = {
+            **self.binding,
+            "attempt_schema_version": "2",
+            "dispatch_depth": "1",
+            "transport": "headless",
+            "execution_surface": "registered-headless",
+            "registered_worker": "1",
+            "fallback_hop": "same-harness-headless",
+            "worker_type": "frame",
+            "harness": "codex",
+            "artifact_root": str(self.root.resolve()),
+            "log_file": str(log),
+        }
+        pipe = ",".join(f"{key}={value}" for key, value in metadata.items())
+        self.jobs.write_text("\t".join([
+            "2026-10-16T00:00:00Z", "done", str(self.source), str(self.source),
+            "frame", pipe,
+        ]) + "\n", encoding="utf-8")
+        before = self.jobs.read_bytes()
+        artifact, reason = JOIN.route_completion_evidence(metadata, worktree=str(self.source))
+        self.assertIsNone(artifact)
+        self.assertEqual(reason, "evidence-not-valid")
+        self.assertEqual(self.jobs.read_bytes(), before)
 
     def test_traversal_symlink_escape_and_ambiguous_legacy_output_remain_refused(self):
         traversal = self._inspect("../outside.md", suffix="traversal")
