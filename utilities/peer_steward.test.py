@@ -2579,6 +2579,23 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
                 "child", "codex", "thread", "idle"), (0, []))
         queue.assert_called_once_with(codex_ref, timeout=0.25)
 
+    def test_claude_prompt_guard_accepts_a_finished_turn_but_not_work_or_questions(self):
+        ident = {"harness": "claude", "session_id": "sid-1", "pane": "w1:p1"}
+        proof = {"pid": 1, "start": "2", "pid_namespace": "pid:[1]", "session_id": "sid-1"}
+        ready = mock.Mock(state="ready", reason=None)
+        for state, expected in (("idle", None), ("done", None), ("working", "native-state-working"),
+                                ("blocked", "native-state-blocked")):
+            with self.subTest(state=state), \
+                 mock.patch.object(peer_steward, "_retire_target", return_value=(state, ident, 0, None)), \
+                 mock.patch.object(peer_steward, "_agent_state", return_value=(state, "w1:p1")), \
+                 mock.patch.object(peer_steward, "_pane_readiness", return_value=ready), \
+                 mock.patch.object(peer_steward, "_claude_prompt_foreground_proof", return_value=proof), \
+                 mock.patch.object(peer_steward, "_read_screen", return_value=["> "]), \
+                 mock.patch.object(peer_steward, "_screen_ready", return_value=None):
+                reason, got = peer_steward._claude_idle_prompt_guard("w1:p1", "sid-1", "w1:p1")
+                self.assertEqual(reason, expected)
+                self.assertEqual(got, proof if expected is None else None)
+
     def test_source_has_no_general_prompt_observation_or_no_verify_bypass(self):
         source = (_HERE / "../utilities/peer-steward.py").resolve().read_text()
         start = source.index("def cmd_prompt(")
