@@ -260,6 +260,8 @@ def command(req, request_path, nonce, *, continuing, screen_ready):
             while True:
                 current, why = validator(request_path, nonce)
                 if current is None: return result("skipped", why)
+                if current.get("snapshot_state") in ("pending", "deferred"):
+                    return result("skipped", "snapshot-pending")
                 why = idle_reason(target, sid)
                 if not why and continuing:
                     seat = st.seat_from_dict(req["seat"])
@@ -302,7 +304,7 @@ def command(req, request_path, nonce, *, continuing, screen_ready):
             if current is None:
                 if continuing: clear.release_unsent_continue(claim)
                 return result("skipped", why)
-            text = clear.CONTINUE_TEXT if continuing else "/clear"
+            text = clear.followup_text(req) if continuing else "/clear"
             # A single write includes Enter; partial/failed writes are never retried.
             data = (text + "\r").encode()
             if os.write(fd, data) != len(data): return result("unverified", "partial-send")
@@ -319,6 +321,73 @@ def command(req, request_path, nonce, *, continuing, screen_ready):
                 # Drain the PTY so the attacher never stalls on a full output buffer.
                 if select.select([fd], [], [], 0.1)[0]:
                     with contextlib.suppress(OSError): os.read(fd, 65536)
+            return result("unverified", "arrival-not-observed")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return result("failed", "native-attach-unavailable")
+
+
+def idle_card_request(req, request_path, nonce, *, screen_ready):
+    """One exact Claude attach send for an accepted idle booking; never uses an inherited pane."""
+    import session_tidy_clear as clear
+
+    def result(outcome, reason=""):
+        return {"accepted": outcome, "reason": reason}
+
+    target = (req.get("seat") or {}).get("native")
+    if req.get("harness") != "claude" or not target:
+        return result("skipped", "unsupported-harness")
+    req, why = clear.validate_idle_request(request_path, nonce)
+    if req is None:
+        return result("skipped", why)
+    try:
+        with attachment(target) as (fd, proc):
+            view = View(fd)
+            reason = idle_reason(target, req.get("sid"))
+            if reason:
+                return result("queued" if reason == "not-idle-native" else "skipped", reason)
+            lines = view.read()
+            reason = "screen-unknown" if lines is None else screen_ready("claude", lines)
+            if reason:
+                queued = reason in {"draft", "draft-unknown", "form-open", "screen-unknown"}
+                return result("queued" if queued else "skipped", reason)
+            req, why = clear.validate_idle_request(request_path, nonce)
+            if req is None:
+                return result("skipped", why)
+            claim, why = clear.claim_idle_card_request(request_path, nonce)
+            if claim is None:
+                return result("skipped", why)
+            lines = view.read(timeout=1)
+            reason = "screen-unknown" if lines is None else screen_ready("claude", lines)
+            reason = reason or idle_reason(target, claim.get("sid"))
+            current, why = clear.validate_idle_request(
+                request_path, nonce, _sending_claim=claim.get("idle_request"))
+            if reason or current is None or proc.poll() is not None:
+                clear.release_unsent_idle_request(claim)
+                queued = reason in {"draft", "draft-unknown", "form-open", "screen-unknown"} \
+                    or str(reason or why).startswith("not-idle-")
+                return result("queued" if queued else "skipped", reason or why or "target-changed")
+            data = (clear.idle_card_request_text(claim) + "\r").encode("utf-8")
+            try:
+                written = os.write(fd, data)
+            except OSError as exc:
+                clear.finish_idle_card_request(claim, accepted=False, reason=type(exc).__name__)
+                return result("unverified", "partial-send")
+            if written != len(data):
+                clear.finish_idle_card_request(claim, accepted=False, reason="partial-send")
+                return result("unverified", "partial-send")
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                held = clear.read_reservation(claim["seat"]["key"]) or {}
+                arrived = held.get("idle_request") if isinstance(held.get("idle_request"), dict) else {}
+                if held.get("nonce") != nonce or held.get("status") != "reserved":
+                    return result("skipped", "superseded")
+                if arrived.get("state") == "arrived":
+                    return result("true") if clear.finish_idle_card_request(
+                        claim, accepted=True) else result("unverified", "arrival-not-observed")
+                if select.select([fd], [], [], 0.1)[0]:
+                    with contextlib.suppress(OSError):
+                        os.read(fd, 65536)
+            clear.finish_idle_card_request(claim, accepted=False, reason="arrival-not-observed")
             return result("unverified", "arrival-not-observed")
     except (OSError, subprocess.SubprocessError, ValueError):
         return result("failed", "native-attach-unavailable")

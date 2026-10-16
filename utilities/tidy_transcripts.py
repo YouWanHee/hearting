@@ -412,9 +412,83 @@ def compact_observation(harness: str, sid: str, source_hint: str, anchor: dict,
         return {"state": "unknown", "reason": "transcript-not-found", "source": source_hint or ""}
     if harness == "claude":
         return _claude_compact_observation(sid, source, anchor)
+    if harness == "codex":
+        return _codex_compact_observation(sid, source, anchor)
     if harness == "opencode":
         return _opencode_compact_observation(sid, source, anchor, native_idle=native_idle)
     return {"state": "unknown", "reason": "unsupported-harness", "source": str(source)}
+
+
+def _codex_compact_observation(sid: str, source: Path, anchor: dict) -> dict:
+    """Confirm this Codex compacted turn from a later exact-session task_complete row."""
+    try:
+        info = source.lstat()
+        if source.is_symlink() or not stat.S_ISREG(info.st_mode):
+            return {"state": "unknown", "reason": "unsafe-transcript", "source": str(source)}
+        expected_identity = str(anchor.get("transcript_identity") or "")
+        identity = f"{info.st_dev}:{info.st_ino}"
+        if not expected_identity or expected_identity != identity:
+            return {"state": "unknown", "reason": "transcript-identity-changed", "source": str(source)}
+        boundary = anchor.get("boundary_offset")
+        if isinstance(boundary, bool) or not isinstance(boundary, int) or boundary < 0 or info.st_size < boundary:
+            return {"state": "unknown", "reason": "compact-boundary-invalid", "source": str(source)}
+        with source.open("rb") as handle:
+            head = handle.read(HEAD_SCAN_BYTES)
+            handle.seek(max(boundary, info.st_size - COMPACT_SCAN_BYTES))
+            start = handle.tell()
+            tail = handle.read(COMPACT_SCAN_BYTES)
+        meta = None
+        for raw in head.splitlines():
+            try:
+                row = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(row, dict) and row.get("type") == "session_meta":
+                meta = row.get("payload") if isinstance(row.get("payload"), dict) else None
+                break
+        if (not isinstance(meta, dict) or str(meta.get("id") or meta.get("session_id") or "") != sid
+                or (isinstance(meta.get("source"), dict) and meta["source"].get("subagent"))):
+            return {"state": "unknown", "reason": "session-identity-changed", "source": str(source)}
+        expected_turn = str(anchor.get("turn_id") or "")
+        rows = tail.splitlines(keepends=True)
+        if start > 0:
+            with source.open("rb") as handle:
+                handle.seek(start - 1)
+                if handle.read(1) != b"\n":
+                    rows = rows[1:]
+        completed = None
+        latest_input = -1
+        offset = start
+        for index, raw in enumerate(rows):
+            line_start = offset
+            offset += len(raw)
+            try:
+                row = json.loads(raw.rstrip(b"\r\n"))
+            except (ValueError, UnicodeDecodeError):
+                if index == len(rows) - 1:
+                    return {"state": "pending", "reason": "transcript-incomplete", "source": str(source)}
+                return {"state": "unknown", "reason": "malformed-transcript-row", "source": str(source)}
+            if not isinstance(row, dict):
+                return {"state": "unknown", "reason": "malformed-transcript-row", "source": str(source)}
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            row_type = str(row.get("type") or "")
+            if row_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                latest_input = line_start
+            if row_type == "event_msg" and payload.get("type") in ("task_complete", "turn_completed"):
+                turn_id = str(payload.get("turn_id") or payload.get("turnId") or "")
+                if expected_turn and turn_id != expected_turn:
+                    continue
+                completed = {"turn_id": turn_id, "offset": line_start}
+        if not completed:
+            return {"state": "pending", "reason": "turn-not-ended", "source": str(source),
+                    "boundary": boundary, "turn_id": expected_turn}
+        if latest_input > int(completed["offset"]):
+            return {"state": "pending", "reason": "new-input-after-turn", "source": str(source),
+                    "boundary": boundary, "turn_id": completed["turn_id"]}
+        return {"state": "ready", "reason": "", "source": str(source), "boundary": boundary,
+                "completion_offset": completed["offset"], "turn_id": completed["turn_id"]}
+    except OSError as exc:
+        return {"state": "unknown", "reason": f"transcript-{type(exc).__name__}", "source": str(source)}
 
 
 # ---------------------------------------------------------------------------

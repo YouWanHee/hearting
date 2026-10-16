@@ -107,26 +107,32 @@ echo "state: branch=$br head=$head base=$def dirty=$(git status --porcelain 2>/d
 
 #### Git index-lock failure diagnosis
 
-After an actual Git failure to create an index lock with EEXIST, the existing
-failure path may attach the shared read-only diagnosis. It resolves the Git
-context and expected lock path from the failed invocation, checks only that path
-with lstat, and preserves the original stdout, stderr, return code or signal,
-and partial Git state. An unbound path, unsupported shell form, permission error,
-or observation timeout leaves the original failure intact and does not inspect a
-path quoted by untrusted output.
+Dispatched worker children run with `GIT_OPTIONAL_LOCKS=0`
+(`git_optional_locks_env()`, applied after every nested environment merge), so
+read-only `status` and `diff` skip the optional index lock. `add` and `commit`
+keep Git's mandatory locking.
 
-The diagnosis is advisory. A present lock, its age, size, mode, timestamps, or a
-process not found in local observations cannot establish stale ownership across
-NFS hosts or process namespaces. Missing and unobservable locks remain distinct
-observations; neither authorizes removal. The helper does not delete, rename,
-chmod, choose another index, or retry Git. Git context lookup and file
-observation run inside one newly created diagnostic process group under a shared
-two-second wall-clock deadline. On expiry, the caller signals only that group
-and returns without an unbounded wait; the failed Git writer receives no
-signal.
-A process held in an uninterruptible kernel wait may outlive that signal, so a
-timeout preserves the original failure without promising kernel cancellation.
-See utilities/git_index_lock.py for the single implementation used by source
+After an index-lock error, the existing failure path may attach the shared
+read-only diagnosis. It resolves the expected lock path from the failed
+invocation's Git context, observes only that path with lstat, and preserves the
+original stdout, stderr, return code or signal, and partial Git state. Python or
+multiline wrapper text is used only when the reported path binds to the selected
+worktree's default index, and matching text does not prove Git returned EEXIST.
+An unbound path, unsupported context, permission error, or observation timeout
+leaves the original failure intact and does not inspect a path quoted by
+untrusted output.
+
+The diagnosis is advisory. A present lock, its age, size, mode, timestamps, NFS
+cache age, or a process not found locally cannot establish that it is stale: on
+NFS an outstanding CREATE or post-create SETATTR can look the same. The helper
+does not delete, rename, chmod, choose another index, retry Git, or replay the
+failed command. Git context lookup and file observation run inside one newly
+created diagnostic process group under a shared two-second wall-clock deadline.
+On expiry, the caller signals only that group and returns without an unbounded
+wait; the failed Git writer receives no signal. A process held in an
+uninterruptible kernel wait may outlive that signal, so a timeout preserves the
+original failure without promising kernel cancellation. See
+`utilities/git_index_lock.py` for the single implementation used by source
 consumers and runtime adapters.
 
 Native coverage is envelope-specific: Claude's supported post-tool events use
@@ -779,7 +785,7 @@ A legacy hash collision is diagnostic
      OpenCode `session.idle` do not prove merge/push completion and must never
      perform destructive cleanup. They may expose diagnostics only.
 4. **Shared artifacts:** route writes to shared artifact-root files through the §5.8 lock. `plans/<slug>/` remains path-separated and noncontending.
-5. **Context:** when coordination records pressure the main context, propose a session-tidy handoff card under the global continuity rule. Runtime compaction also invokes main-session tidy as described in [`capabilities/session-tidy.md`](../capabilities/session-tidy.md). Only a nonempty automatic Claude/OpenCode summary successfully saved to its own verified herdr seat can use the existing snapshot/clear/continue booking, and the detached helper clears only after transcript evidence shows the compacted turn ended (up to three hours). Manual/unknown compaction, Codex remote-V2 compaction, workers/sub-sessions, outside-herdr seats, empty summaries and failed card writes remain queue-only; Codex compaction remains queue-only. Compaction stays non-blocking.
+5. **Context:** when coordination records pressure the main context, propose a session-tidy handoff card under the global continuity rule. Runtime compaction also invokes main-session tidy as described in [`capabilities/session-tidy.md`](../capabilities/session-tidy.md). A nonempty automatic Claude/OpenCode summary saved to its own verified herdr seat can use the existing snapshot/clear/continue booking after transcript evidence confirms the compacted turn ended (up to three hours). An explicitly automatic Codex remote-V2 event can join after its exact turn ends; the helper asks that main session for a real card through the verified pane and waits for matching card/enqueue evidence. Manual/unknown events, workers/sub-sessions, unsupported seats, changed input/target/card and uncertain sends stay queue-only. Compaction stays non-blocking.
 
 **SD-91 current Codex override:** the projected Codex Stop bridge silently reads
 only enough payload to clear one exact interaction marker. It reads no registry,

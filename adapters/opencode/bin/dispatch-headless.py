@@ -35,6 +35,7 @@ from dispatch_contract import (
     DispatchContractError,
     foreground_review_launch_identity,
     bytecode_cache_env,
+    git_optional_locks_env,
     GROUP_REAP_PROOF,
     GOVERNOR_RESERVATION_ENV,
     REPLICA_RESERVATION_ROW_KEYS,
@@ -1853,6 +1854,8 @@ def main(argv: list[str]) -> int:
         launch_metadata["runtime_home"] = dispatch_env["OPENCODE_CONFIG_DIR"]
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
+        # Nested runtime and worker-home overlays are already applied above.
+        dispatch_env.update(git_optional_locks_env())
         try:
             proc, launch_metadata = spawn_claimed_attempt(
                 jobs,

@@ -17,6 +17,8 @@ import paths
 import report_bundle_config
 import routing_config
 import user_model_config  # noqa: F401  (documents the models.conf owner)
+import sys
+from pathlib import Path
 
 
 # status -> (ok, short human reading)
@@ -43,6 +45,14 @@ def _models_conf(runtime):
         return {"status": "shipped-default", "ok": True, "path": str(path),
                 "detail": "adapters/<runtime>/config/models.conf applies until seeded"}
     return validate
+
+
+def _session_tidy_policy():
+    utilities = str(Path(__file__).resolve().parents[2] / "utilities")
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
+    from session_tidy_policy import validate_user_config
+    return validate_user_config()
 
 
 SURFACES = (
@@ -80,6 +90,13 @@ SURFACES = (
         "seeded_by": "harness memory join --remote-url <git>",
         "when_absent": "memory stays local to this host",
         "validate": memory_sync_config.validate,
+    },
+    {
+        "id": "session-tidy",
+        "title": "session-tidy idle policy",
+        "seeded_by": "user (optional JSON; never created by install)",
+        "when_absent": "the built-in idle policy applies",
+        "validate": _session_tidy_policy,
     },
     {
         "id": "claude-settings.defaultMode",

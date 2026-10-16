@@ -6016,6 +6016,11 @@ def launch_mismatch_annotation(detail: str) -> dict[str, str]:
     return annotation
 
 
+def git_optional_locks_env() -> dict[str, str]:
+    """Disable Git's optional index refreshes in the dispatched worker."""
+    return {"GIT_OPTIONAL_LOCKS": "0"}
+
+
 def bytecode_cache_env(
     environ: dict[str, str] | os._Environ[str] | None = None,
 ) -> dict[str, str]:

@@ -980,6 +980,13 @@
       "hard_block": false
     },
     {
+      "slug": "hook__session-tidy-idle.py__Stop",
+      "name": "session-tidy-idle.py",
+      "mono": "session-tidy-idle.py",
+      "event": "Stop",
+      "hard_block": false
+    },
+    {
       "slug": "hook__dispatch-session-sweep.py__UserPromptSubmit",
       "name": "dispatch-session-sweep.py",
       "mono": "dispatch-session-sweep.py",

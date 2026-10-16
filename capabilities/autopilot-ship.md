@@ -180,10 +180,20 @@ failed or interrupted request is never retried automatically; inspect its
 retained execution evidence and the project's rollback procedure.
 
 Preparation records the existing review attempts automatically under the normal
-registry lock. Only independent reviews registered after that exact request can
-authorize execution, including the realized parallel legs. Preparing the same
-normalized command and input hashes preserves this binding across an owner
-replacement; changing them requires fresh reviews within the existing ceilings.
+registry lock. The reviews that judge the command — those whose verdict `deploy`
+reads, reviews holding the same gate (such as a plan's security or release stage)
+and their realized parallel legs — authorize execution only when registered
+independently after that exact request. Preparing the same normalized command
+and input hashes preserves this binding across an owner replacement; changing
+them requires fresh command reviews within the existing ceilings. Another review
+before `deploy`, such as a functional check, does not judge the command. When
+only argv, cwd, timeout or argv-named files changed and every file listed in
+`inputs` keeps its hash, its independent PASS remains valid if it was registered
+after the earliest preparation that observed those inputs; the request records
+that preparation automatically. A changed or empty `inputs` list, or a review
+registered before that preparation, needs a fresh review as before, so list the
+files a functional check depends on in `inputs`. If `deploy` reads no review
+verdict, every review judges the command.
 The original marker's independence record is consumed even when the registered
 review row was subsequently closed by an owner. This adds no review override,
 manual proof input or approval step.

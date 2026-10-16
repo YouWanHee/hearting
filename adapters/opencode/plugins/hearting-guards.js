@@ -17,6 +17,7 @@ const preflight = path.join(root, "adapters", "opencode", "bin", "preflight.sh")
 const summaryTrigger = path.join(root, "utilities", "session_summary_trigger.py")
 const checkpointTrigger = path.join(root, "utilities", "artifact_checkpoint_trigger.py")
 const sessionTidy = path.join(root, "utilities", "session_tidy.py")
+const sessionTidyIdle = path.join(root, "utilities", "session_tidy_idle.py")
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
@@ -268,6 +269,24 @@ function spawnCheckpoint(sid) {
     child.unref()
   } catch {
     // best-effort; a turn never depends on the checkpoint observation
+  }
+}
+
+function spawnIdleObserver(sid, cwd) {
+  if (!sid || isWorkerSession()) return
+  try {
+    const child = spawn("python3", [sessionTidyIdle, "--harness", "opencode", "--detach"], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+    })
+    child.on("error", () => {})
+    child.stdin.on("error", () => {})
+    child.stdin.end(JSON.stringify({ event: "session.idle", session_id: sid, cwd: cwd || root }))
+    child.unref()
+  } catch {
+    // Optional idle observation never delays summary, checkpoint or peer delivery.
   }
 }
 
@@ -1204,12 +1223,13 @@ function createCompletionCarrier(ctx) {
 
 // Session card / tidy notice: `session_tidy.py hook` records the event and prints
 // what this session is due, once. Every failure is empty (no card, no throw).
-function collectCard(event, sid, cwd) {
+function collectCard(event, sid, cwd, prompt = "") {
   if (!sid || isWorkerSession()) return ""
   const result = spawnSync("python3", [sessionTidy, "hook", "--harness", "opencode",
     "--event", event, "--session-id", sid, "--cwd", cwd], {
     cwd: root,
     env: { ...process.env, AGENT_HOME: root },
+    input: JSON.stringify({ prompt }),
     encoding: "utf8",
     timeout: 4000,
     killSignal: "SIGKILL",
@@ -1876,6 +1896,7 @@ export const AgentHarnessGuards = async (ctx) => {
         })
       }
       if (!isWorkerSession()) {
+        spawnIdleObserver(eventSid, baseDir(ctx))
         spawnSummary(eventSid, "final")
         await projectPane(eventSid, ctx)
       }
@@ -1943,7 +1964,7 @@ export const AgentHarnessGuards = async (ctx) => {
     }
     const cardTurn = turn || prompt
     if (eventSid && (!cardTurn || cardBySession.get(sid)?.turn !== cardTurn)) {
-      cardBySession.set(sid, { turn: cardTurn, text: collectCard("prompt", eventSid, baseDir(ctx)) })
+      cardBySession.set(sid, { turn: cardTurn, text: collectCard("prompt", eventSid, baseDir(ctx), prompt) })
     }
   },
   "experimental.chat.system.transform": async (input, output) => {

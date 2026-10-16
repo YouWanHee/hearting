@@ -3373,6 +3373,90 @@ class _ContinueWorld(_ClearWorld):
         return super().run(argv, **kw)
 
 
+class IdleCardRequestTest(_TmpRootMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        import session_tidy as st
+        import session_tidy_clear as clear
+        self.st, self.clear = st, clear
+
+    def booking(self, harness="claude", sid="sid-A", pane="w1:pX"):
+        st, clear = self.st, self.clear
+        seat = st.Seat("pane", st._digest("pane", pane), pane, harness, "")
+        now = time.time()
+        with st.seat_lock(seat.key):
+            card = st.write_card(seat, harness, sid, "prior card", prompt_seq=0)
+            clear._write_reservation({
+                "schema": 1, "nonce": "idle-nonce", "status": "reserved", "created": now - 60,
+                "deadline": now + 300, "seat": seat.as_dict(), "harness": harness,
+                "sid": sid, "cwd": str(self.tmp_root), "card_generation": card["generation"],
+                "prompt_seq": 0, "origin": "idle", "followup_kind": "status-only",
+                "snapshot_state": "ready", "idle": {"identity": "idle-event", "due_at": now - 1,
+                                                          "tokens": 200000, "min_tokens": 200000}})
+        return seat, clear.reservation_path(seat.key)
+
+    def invoke(self, req, *, looks=None, prompt_reply=None):
+        pane = req["seat"]["pane"]
+        args = SimpleNamespace(request=str(self.clear.reservation_path(req["seat"]["key"])),
+                               nonce=req["nonce"], target=pane)
+        agent = {"pane": pane, "harness": req["harness"], "session_id": req["sid"]}
+        result = {"accepted": "true"}
+
+        def prompt(_target, text, **_kwargs):
+            if prompt_reply:
+                return prompt_reply(text)
+            with mock.patch.object(self.st, "resolve_seat", return_value=self.seat_obj):
+                self.st.run_hook(req["harness"], "prompt", req["sid"], cwd=req["cwd"], prompt_text=text)
+            return 0, {}
+
+        self.seat_obj = self.st.seat_from_dict(req["seat"])
+        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_clear_look", side_effect=looks or [(None, agent, [])] * 3), \
+             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=prompt) as send, \
+             mock.patch.object(peer_steward, "_record"), mock.patch("builtins.print") as output:
+            rc = peer_steward.cmd_idle_card_request(args)
+        return rc, output.call_args[0][0], send
+
+    def test_claimed_request_sends_once_and_needs_the_exact_prompt_arrival_receipt(self):
+        seat, path = self.booking()
+        self.seat_obj = seat
+        req = self.clear.read_reservation(seat.key)
+        with mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             mock.patch.object(peer_steward, "_clear_look", return_value=(None,
+                 {"pane": seat.pane, "harness": "claude", "session_id": "sid-A"}, [])), \
+             mock.patch.object(peer_steward, "_record"), mock.patch("builtins.print") as output, \
+             mock.patch.object(peer_steward, "_herdr_prompt") as send:
+            def prompt(_target, text, **_kwargs):
+                with mock.patch.object(self.st, "resolve_seat", return_value=seat):
+                    self.st.run_hook("claude", "prompt", "sid-A", cwd=req["cwd"], prompt_text=text)
+                return 0, {}
+            send.side_effect = prompt
+            rc = peer_steward.cmd_idle_card_request(SimpleNamespace(request=str(path), nonce=req["nonce"],
+                                                                      target=seat.pane))
+        self.assertEqual(rc, 0)
+        self.assertIn("accepted=true", output.call_args[0][0])
+        send.assert_called_once()
+        booking = self.clear.read_reservation(seat.key)
+        self.assertEqual(booking["idle_request"]["state"], "sent")
+        self.assertEqual(booking["idle_request"]["arrival"]["sid"], "sid-A")
+
+    def test_draft_or_other_opencode_session_sends_nothing(self):
+        seat, path = self.booking()
+        req = self.clear.read_reservation(seat.key)
+        blocked = ("draft", {"pane": seat.pane, "harness": "claude", "session_id": "sid-A"}, None)
+        rc, line, sent = self.invoke(req, looks=[blocked])
+        self.assertEqual((rc, line.split()[0]), (3, "accepted=queued"))
+        sent.assert_not_called()
+        self.assertNotIn("idle_request", self.clear.read_reservation(seat.key))
+
+        op_seat, op_path = self.booking(harness="opencode", sid="op-sid", pane="w1:pO")
+        op_req = self.clear.read_reservation(op_seat.key)
+        wrong = (None, {"pane": op_seat.pane, "harness": "opencode", "session_id": "foreign"}, [])
+        rc, line, sent = self.invoke(op_req, looks=[wrong])
+        self.assertEqual((rc, line), (3, "accepted=skipped target=w1:pO harness=opencode session=op-sid reason=target-changed"))
+        sent.assert_not_called()
+
+
 TIMEOUT_REPLY = (1, json.dumps({"error": {"code": "timeout"}}))
 
 

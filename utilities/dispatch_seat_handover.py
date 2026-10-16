@@ -442,18 +442,39 @@ def current_bindings(harness: str, sid: str, jobs=None) -> list:
 
 def write_snapshot_locked(seat, harness: str, sid: str, *, now: Optional[float] = None, jobs=None) -> int:
     """Take (or drop) the snapshot; return its flat binding count.  Caller holds the seat lock."""
+    bindings = collect_snapshot_bindings(harness, sid, jobs=jobs)
+    return publish_snapshot_locked(seat, harness, sid, bindings, now=now, jobs=jobs)
+
+
+def collect_snapshot_bindings(harness: str, sid: str, jobs=None) -> list[dict]:
+    """Read the registry outside a seat lock; publication performs the identity recheck."""
+    return current_bindings(harness, sid, jobs)
+
+
+def publish_snapshot_locked(seat, harness: str, sid: str, bindings: list[dict], *,
+                            now: Optional[float] = None, expected_prompt_seq: Optional[int] = None,
+                            expected_card_generation: Optional[int] = None, jobs=None) -> int:
+    """Publish a previously collected snapshot only if the seat's card/input window still matches."""
     st = _st()
     now = st.now_epoch() if now is None else now
     if seat.kind not in ("pane", "native"):
         return 0
-    bindings = current_bindings(harness, sid, jobs)
+    if expected_prompt_seq is not None and st.read_prompt_seq(seat) != expected_prompt_seq:
+        raise RuntimeError("snapshot-input-changed")
+    card = st.read_latest_card(seat)
+    generation = int(card.get("generation", 0) or 0) if card else 0
+    if expected_card_generation is not None and generation != expected_card_generation:
+        raise RuntimeError("snapshot-card-changed")
     if not bindings:
         with contextlib.suppress(OSError):
             os.unlink(_snapshot_path(seat.key))
         return 0
+    path = _snapshot_path(seat.key)
+    st._reject_symlink(path)
     st.atomic_write_json(_snapshot_path(seat.key), {
         "schema": SCHEMA, "seat": seat.as_dict(), "from": {"harness": harness, "sid": sid},
-        "at": now, "bindings": bindings})
+        "at": now, "prompt_seq": st.read_prompt_seq(seat), "card_generation": generation,
+        "bindings": bindings})
     return len(bindings)
 
 
