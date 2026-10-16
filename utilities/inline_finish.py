@@ -3,14 +3,68 @@ from __future__ import annotations
 import fcntl, hashlib, json, os, stat, subprocess, sys, tempfile, time
 import fnmatch
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import artifact_producer, artifact_lifecycle, dispatch_terminal_commit
 
 class InlineFinishError(ValueError):
     pass
 
+
+_SYNTHETIC_WRITE_SCOPES = frozenset({
+    "source-scoped", "source/**", "source-alternative/**", "target-artifact",
+})
+
+
 def _digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _scope_matches(path: str, item: str) -> bool:
+    """Whether a tracked path intersects one concrete declared source scope."""
+    if not item or item in _SYNTHETIC_WRITE_SCOPES:
+        return False
+    if item.endswith("/**"):
+        base = item[:-3].rstrip("/")
+        if any(char in base for char in "*?["):
+            return fnmatch.fnmatchcase(path, base + "/*")
+        return path == base or path.startswith(base + "/")
+    base = item.rstrip("/")
+    if path == base or path.startswith(base + "/"):
+        return True
+    return fnmatch.fnmatchcase(path, item)
+
+
+def _unscoped_tracked_dirt(cwd: str, scope: Sequence[str]) -> list[str]:
+    """Fresh tracked paths outside concrete scope; synthetic authority is not a path."""
+    status = subprocess.run(
+        ["git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=no"],
+        capture_output=True,
+    )
+    if status.returncode:
+        raise InlineFinishError("finish-git-status-unavailable")
+    records = status.stdout.split(b"\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            raise InlineFinishError("finish-git-status-unavailable")
+        paths.append(os.fsdecode(record[3:]))
+        if b"R" in record[:2] or b"C" in record[:2]:
+            if index >= len(records) or not records[index]:
+                raise InlineFinishError("finish-git-status-unavailable")
+            paths.append(os.fsdecode(records[index]))
+            index += 1
+    paths = sorted(set(paths))
+    concrete_scope = [item for item in scope
+                      if isinstance(item, str) and item not in _SYNTHETIC_WRITE_SCOPES]
+    if any(_scope_matches(path, item) for path in paths for item in concrete_scope):
+        raise InlineFinishError("finish-scoped-tracked-dirt")
+    return paths
+
 
 def _atomic(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,15 +271,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
         raise InlineFinishError("finish-commit-not-source-descendant")
     # Tracked edits inside this direct node's declared scope are not admissible.
     scope = (node.get("write_scope") or [])
-    dirty = subprocess.run(["git", "-C", route["cwd"], "status", "--porcelain", "--untracked-files=no"],
-                           capture_output=True, text=True)
-    if dirty.returncode:
-        raise InlineFinishError("finish-git-status-unavailable")
-    for line in dirty.stdout.splitlines():
-        path = line[3:].strip().strip('"')
-        if any(item == "source-scoped" or fnmatch.fnmatchcase(path, item.removesuffix("/**") + "/*")
-               or path == item.removesuffix("/**") for item in scope):
-            raise InlineFinishError("finish-scoped-tracked-dirt")
+    _unscoped_tracked_dirt(route["cwd"], scope)
     identity = artifact_lifecycle.read_root_identity(root)
     if not identity: raise InlineFinishError("finish-artifact-root-identity-missing")
     try:
@@ -280,16 +326,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
                 facts={"registered_route": registered_route(route, jobs, bool(inherited_jobs))})
             if not choice.allowed:
                 raise InlineFinishError(choice.reason)
-            locked_dirty = subprocess.run(
-                ["git", "-C", route["cwd"], "status", "--porcelain", "--untracked-files=no"],
-                capture_output=True, text=True)
-            if locked_dirty.returncode:
-                raise InlineFinishError("finish-git-status-unavailable")
-            for line in locked_dirty.stdout.splitlines():
-                path = line[3:].strip().strip('"')
-                if any(item == "source-scoped" or fnmatch.fnmatchcase(path, item.removesuffix("/**") + "/*")
-                       or path == item.removesuffix("/**") for item in scope):
-                    raise InlineFinishError("finish-scoped-tracked-dirt")
+            unscoped_tracked_dirt = _unscoped_tracked_dirt(route["cwd"], scope)
             latest = artifact_producer.read_cycle_record(root, record["cycle_id"])
             if (not latest or latest.get("state") not in {"open", "sealed"}
                     or not dispatch_terminal_commit.cycle_identity_matches(
@@ -483,6 +520,7 @@ def finish(args, route: Mapping[str, Any], route_file: Path, api, *, _admission=
                         or state.get("receipt", {}).get("terminal_marker_digest") != marker_digest):
                     raise InlineFinishError("finish-seal-drift")
             result = dict(state["receipt"]); result["replay"] = replayed_at_entry
+            result["unscoped_tracked_dirt"] = unscoped_tracked_dirt
             if finished and verified.get("deleted"):
                 # Information only: the cycle (or its campaign) was deleted after the finish.
                 result["deleted_since"] = True
