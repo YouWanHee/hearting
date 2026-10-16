@@ -1583,7 +1583,17 @@ class CarrierOneClaimGateTest(unittest.TestCase):
         # this repo checkout is that checkout.
         self.agent_home = MODULE_PATH.parents[1]
         self.environment = mock.patch.dict(
-            os.environ, {"AGENT_HOME": str(self.agent_home), "AGENT_DISPATCH_JOBS": str(self.jobs)},
+            os.environ, {
+                "AGENT_HOME": str(self.agent_home),
+                "AGENT_DISPATCH_JOBS": str(self.jobs),
+                "HOME": str(self.root / "home"),
+                "XDG_STATE_HOME": str(self.root / "xdg-state"),
+                "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
+                "HARNESS_STATE_ROOT": str(self.root / "harness-state"),
+                "AGENT_PEER_LEDGER_ROOT": str(self.root / "peer-ledger"),
+                "CODEX_HOME": str(self.root / "home" / ".codex"),
+                "CLAUDE_CONFIG_DIR": str(self.root / "home" / ".claude"),
+            },
             clear=False
         )
         self.environment.start()
@@ -1627,8 +1637,8 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             f"{stamp}\topen\t/repo\t/wt\towner\t{pipe}\n", encoding="utf-8"
         )
 
-    def _close_and_materialize(self):
-        self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", "completed-marker"))
+    def _close_and_materialize(self, note="completed-marker"):
+        self.assertTrue(D.close_attempt_row(self.jobs, "att-owner-1", note))
         fields = self.jobs.read_text(encoding="utf-8").splitlines()[0].split("\t")
         path = JOIN.materialize_pending_delivery(self.jobs, fields)
         self.assertIsNotNone(path)
@@ -1670,7 +1680,18 @@ class CarrierOneClaimGateTest(unittest.TestCase):
     def test_a_notice_consumed_by_another_carrier_suppresses_its_deferred_peer_payload(self):
         self._check_restored_courier(immediate=False, other_carrier=True)
 
-    def _check_restored_courier(self, *, immediate, other_carrier=False):
+    def test_repeated_received_callback_repairs_ack_after_transient_failure(self):
+        self._check_restored_courier(immediate=True, recovery="repeat-receive")
+
+    def test_retained_courier_repairs_ack_after_reclaim_without_resend(self):
+        self._check_restored_courier(immediate=True, recovery="courier-reentry",
+                                     close_note="dead-worker-fail")
+
+    def test_new_courier_instance_repairs_ack_after_receiver_interruption(self):
+        self._check_restored_courier(immediate=True, recovery="crash-before-ack")
+
+    def _check_restored_courier(self, *, immediate, other_carrier=False, recovery=None,
+                                close_note="completed-marker"):
         spec = importlib.util.spec_from_file_location("restored_steward_test", ROOT / "utilities/peer-steward.py")
         steward = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(steward)
@@ -1682,7 +1703,7 @@ class CarrierOneClaimGateTest(unittest.TestCase):
             with self.subTest(harness=harness):
                 self._open_row()
                 self.jobs.write_text(self.jobs.read_text().replace("claude-parent-runtime", carrier))
-                path = self._close_and_materialize()
+                path = self._close_and_materialize(close_note)
                 with mock.patch.object(rewake.peer_obligations, "ensure_normal_runner"):
                     activate(self.root, carrier, "session-1")
                 store = rewake.peer_obligations.ObligationStore(self.root)
@@ -1691,10 +1712,31 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                 agents = {"result": {"agents": []}}
                 real_prompt = steward.cmd_prompt
                 delivered = []
+                sent_texts = []
+                prepared_refs = []
+                real_write = rewake.pending_delivery._write_unlocked
+                real_receiver_ack = steward.peer_message._ack_registered_delivery
+                ack_failure = {"remaining": 2 if recovery else 0}
+                crash_failure = {"remaining": 1 if recovery == "crash-before-ack" else 0}
+                def write_record(path, value):
+                    if ack_failure["remaining"] and value.get("state") == "acked":
+                        ack_failure["remaining"] -= 1
+                        raise OSError("simulated received-delivery ACK write failure")
+                    return real_write(path, value)
+                def receiver_ack(received):
+                    if crash_failure["remaining"]:
+                        crash_failure["remaining"] -= 1
+                        raise SystemExit("simulated interruption after received persistence")
+                    return real_receiver_ack(received)
+                real_bind = steward.peer_message.bind_dispatch_notice
+                def bind(ref, binding):
+                    prepared_refs.append(ref)
+                    return real_bind(ref, binding)
                 def prompt(args, **kwargs):
                     # Run the real preparation and dispatch binding. Only the external
                     # transport is substituted; no timer expiry is involved.
                     def receive(text):
+                        sent_texts.append(text)
                         record = json.loads(path.read_text())
                         self.assertGreater(record["claim_deadline_ns"], time.monotonic_ns())
                         self.assertEqual(sweep_deliver(self.root, carrier, "session-1")[0], [])
@@ -1709,7 +1751,12 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                             return {"status": "queued", "reason": "native-queue-accepted"}
                         receive(steward.peer_message._read_pending(ref)["text"])
                         return {"status": "received", "reason": "exact-peer-ref"}
-                    with mock.patch.object(steward, "_herdr_missing", return_value=False), \
+                    with mock.patch.object(rewake.pending_delivery, "_write_unlocked",
+                                           side_effect=write_record), \
+                            mock.patch.object(steward.peer_message, "_ack_registered_delivery",
+                                              side_effect=receiver_ack), \
+                            mock.patch.object(steward.peer_message, "bind_dispatch_notice", side_effect=bind), \
+                            mock.patch.object(steward, "_herdr_missing", return_value=False), \
                             mock.patch.object(steward, "_current_session_identity", return_value=("sender-1", "claude")), \
                             mock.patch.object(steward, "_from_name", return_value="fixture"), \
                             mock.patch.object(steward, "_agent_state", return_value=("idle", "w1:p9")), \
@@ -1725,6 +1772,8 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                         return code
                 with mock.patch.object(steward.subprocess, "run", side_effect=lambda *a, **kw:
                         type("Reply", (), {"stdout": json.dumps(agents), "returncode": 0})()), \
+                        mock.patch.object(rewake.pending_delivery, "claim",
+                                          wraps=rewake.pending_delivery.claim) as claim_spy, \
                         mock.patch.object(steward, "_resolve_target", return_value=(harness, "session-1", None)), \
                         mock.patch.object(steward, "cmd_prompt", side_effect=prompt) as prompt_call:
                     steward._resume_registered_obligation(duty, store)
@@ -1733,9 +1782,15 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                     self.assertEqual(store.get(duty["id"])["observation"]["reason"], "recipient-unavailable")
                     agents["result"]["agents"] = [{"agent": harness, "pane_id": "w1:p9",
                                                     "agent_session": {"value": "session-1"}}]
-                    steward._resume_registered_obligation(store.get(duty["id"]), store)
+                    if recovery == "crash-before-ack":
+                        with self.assertRaisesRegex(SystemExit, "after received persistence"):
+                            steward._resume_registered_obligation(store.get(duty["id"]), store)
+                    else:
+                        steward._resume_registered_obligation(store.get(duty["id"]), store)
                     self.assertEqual(prompt_call.call_count, 1)
                     self.assertEqual(prompt_call.call_args.kwargs["expected_recipient"], (harness, "session-1"))
+                    self.assertTrue(any(call.kwargs.get("jobs") == self.jobs
+                                        for call in claim_spy.call_args_list))
                     if not immediate:
                         queued = store.get(duty["id"])
                         self.assertEqual(queued["state"], "pending")
@@ -1769,10 +1824,45 @@ class CarrierOneClaimGateTest(unittest.TestCase):
                             continue
                         self.assertEqual(steward.peer_message.receive_peer_message(text, {
                             "harness": harness, "session_id": "session-1"}), 0)
-                    else:
+                    elif recovery != "crash-before-ack":
                         self.assertEqual(len(delivered), 1)
-                    self.assertEqual(json.loads(path.read_text())["state"], "acked")
-                    self.assertEqual(store.get(duty["id"])["state"], "complete")
+                    if recovery == "repeat-receive":
+                        self.assertIn("required_action=advance-completed", sent_texts[-1])
+                        self.assertEqual(json.loads(path.read_text())["state"], "sent-ambiguous")
+                        self.assertEqual(steward.peer_message.receive_peer_message(sent_texts[-1], {
+                            "harness": harness, "session_id": "session-1"}), 0)
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(prompt_call.call_count, 1)
+                        self.assertEqual(len(prepared_refs), 1)
+                    elif recovery == "courier-reentry":
+                        self.assertIn("required_action=inspect-done-failure", sent_texts[-1])
+                        current = json.loads(path.read_text())
+                        current_duty = store.get(duty["id"])
+                        rewake.pending_delivery.reclaim(self.root, "session-1",
+                            current_duty["observation"]["delivery_id"],
+                            now_ns=current["claim_deadline_ns"] + 1)
+                        steward._resume_registered_obligation(current_duty, store)
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(prompt_call.call_count, 1)
+                        self.assertEqual(len(prepared_refs), 1)
+                    elif recovery == "crash-before-ack":
+                        self.assertEqual(json.loads(path.read_text())["state"], "claimed")
+                        fresh_spec = importlib.util.spec_from_file_location(
+                            "restarted_steward_test", ROOT / "utilities/peer-steward.py")
+                        fresh = importlib.util.module_from_spec(fresh_spec)
+                        fresh_spec.loader.exec_module(fresh)
+                        with mock.patch.object(fresh.subprocess, "run",
+                                               side_effect=AssertionError("received work must not rerun transport")), \
+                                mock.patch.object(fresh, "cmd_prompt",
+                                                  side_effect=AssertionError("received notice must not be resent")):
+                            fresh._resume_registered_obligation(store.get(duty["id"]), store)
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(prompt_call.call_count, 1)
+                        self.assertEqual(len(prepared_refs), 1)
+                        self.assertEqual(store.get(duty["id"])["state"], "complete")
+                    else:
+                        self.assertEqual(json.loads(path.read_text())["state"], "acked")
+                        self.assertEqual(store.get(duty["id"])["state"], "complete")
                 with mock.patch.object(steward, "cmd_prompt") as prompt:
                     steward._resume_registered_obligation(store.get(duty["id"]), store)
                     prompt.assert_not_called()

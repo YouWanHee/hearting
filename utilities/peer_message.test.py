@@ -34,19 +34,15 @@ class _TmpRootMixin:
         self._old_environ = dict(os.environ)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root / "peer-state")
-        # C-9 made `_iter_records` (list/status) read through `steward_marker_roots()`,
-        # whose "fleet-reader" branch always adds `stable_state_root(os.environ)`
-        # (dispatch_state_roots) AND every installed runtime's own root
-        # (_runtime_ledger_roots: ~/.codex, ~/.claude, ~/.config/opencode) as read
-        # candidates. Without isolating HOME too, those candidates fall through to
-        # this machine's real per-user roots and a list/status assertion here would
-        # see live records (CODEX_HOME/CLAUDE_CONFIG_DIR are unset in the real
-        # environment, so overriding HOME alone covers all three).
+        # C-9 makes `_iter_records` include dispatch and installed-runtime roots.
+        # Isolate each root explicitly so list/status assertions cannot read live
+        # peer records from this machine.
         os.environ["HOME"] = str(self.tmp_root / "home")
-        os.environ.pop("XDG_STATE_HOME", None)
-        os.environ.pop("HARNESS_STATE_ROOT", None)
-        os.environ.pop("CODEX_HOME", None)
-        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ["XDG_STATE_HOME"] = str(self.tmp_root / "xdg-state")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "xdg-config")
+        os.environ["HARNESS_STATE_ROOT"] = str(self.tmp_root / "harness-state")
+        os.environ["CODEX_HOME"] = str(self.tmp_root / "home" / ".codex")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.tmp_root / "home" / ".claude")
         os.environ.pop("AGENT_HOME", None)
         self.addCleanup(self._restore_environ)
 
@@ -887,7 +883,11 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         text, ref = self.pending()
         self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
         original = self._ledger_file("sender").read_bytes()
-        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        received = peer_message._read_pending(ref)
+        with mock.patch.object(peer_message, "_ack_registered_delivery",
+                               wraps=peer_message._ack_registered_delivery) as repair_ack:
+            self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+            repair_ack.assert_called_once_with(received)
         self.assertEqual(self._ledger_file("sender").read_bytes(), original)
         self.assertEqual(peer_message._read_pending(ref)["state"], "received")
         self.assertIsNone(peer_message._read_pending(ref)["text"])
@@ -1246,11 +1246,14 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     def test_exact_native_history_ack_once_after_queued_and_replay(self):
         import codex_queue_delivery as queue
         _text, ref = self.pending()
-        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "consumed"}) as send:
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "consumed"}) as send, \
+                mock.patch.object(peer_message, "_ack_registered_delivery",
+                                  wraps=peer_message._ack_registered_delivery) as repair_ack:
             self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "received")
             original = self._ledger_file("sender").read_bytes()
             self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "received")
             self.assertEqual(send.call_count, 1)
+            self.assertEqual(repair_ack.call_count, 2)
         self.assertEqual(self._ledger_file("sender").read_bytes(), original)
 
     def test_stale_or_unsupported_callback_retains_pending(self):
