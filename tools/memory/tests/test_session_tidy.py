@@ -2540,6 +2540,11 @@ class SeatHandoverTest(TidyCase):
         self.jobs.write_text("\n".join(self.rows) + "\n", encoding="utf-8")
         return meta
 
+    def open_route(self, route, digest):
+        path = self.cwd / f"{route}.json"
+        path.write_text(json.dumps({"route_id": route, "route_hash": digest}), encoding="utf-8")
+        return str(path)
+
     def seat(self, pane=PANE):
         return st.resolve_seat("claude", str(self.cwd), {"HERDR_PANE_ID": pane})
 
@@ -2574,6 +2579,133 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual([b["attempt"] for b in snap["bindings"]], [keep["attempt_id"]])
         self.assertEqual(snap["from"], {"harness": "claude", "sid": "sid-A"})
 
+    def test_the_twelve_job_cap_keeps_every_attempt_for_each_selected_job(self):
+        self.row("att-active-1", node="active-one")
+        self.row("att-active-2", node="active-two", worker="frame")
+        route_file = self.open_route("rt-frame", "sha256:frame")
+        frame_attempts = []
+        for index in range(12):
+            meta = self.row(f"att-frame-{index}", status="done", route="rt-frame", node="frame",
+                            worker="frame", digest="sha256:frame", route_file=route_file)
+            frame_attempts.append(meta["attempt_id"])
+
+        self.assertEqual(self.snapshot(), 14)  # logical job cap, flat binding count
+        with self.iso.patched_environ():
+            snap = self.handover.read_snapshot(self.seat().key)
+        self.assertEqual(len(snap["bindings"]), 14)
+        self.assertEqual({(b["route"], b["hash"], b["node"]) for b in snap["bindings"]}, {
+            ("rt-1", "sha256:aa", "active-one"),
+            ("rt-1", "sha256:aa", "active-two"),
+            ("rt-frame", "sha256:frame", "frame"),
+        })
+        frame_bindings = [b for b in snap["bindings"] if b["node"] == "frame"]
+        self.assertEqual({b["attempt"] for b in frame_bindings}, set(frame_attempts))
+        self.assertEqual({b["parent"] for b in frame_bindings}, {"sid-A"})
+
+    def test_active_jobs_precede_finished_jobs_and_thirteen_active_jobs_are_deterministic(self):
+        self.row("att-running", status="running", node="running")
+        route_file = self.open_route("rt-finished", "sha256:finished")
+        for index in range(12):
+            self.row(f"att-finished-{index}", status="done", route="rt-finished", node=f"done-{index}",
+                     digest="sha256:finished", route_file=route_file)
+        self.assertEqual(self.snapshot(), 12)
+        with self.iso.patched_environ():
+            snap = self.handover.read_snapshot(self.seat().key)
+        nodes = {b["node"] for b in snap["bindings"]}
+        self.assertIn("running", nodes)
+        self.assertEqual(nodes & {f"done-{index}" for index in range(12)},
+                         {f"done-{index}" for index in range(1, 12)})
+
+        self.rows.clear()
+        for index in range(13):
+            self.row(f"att-open-{index}", node=f"open-{index}")
+        self.assertEqual(self.snapshot(), 12)
+        with self.iso.patched_environ():
+            snap = self.handover.read_snapshot(self.seat().key)
+        self.assertEqual({b["node"] for b in snap["bindings"]},
+                         {f"open-{index}" for index in range(1, 13)})
+
+        self.rows.clear()
+        route_file = self.open_route("rt-latest", "sha256:latest")
+        self.row("att-latest-done", status="open", route="rt-latest", node="latest",
+                 digest="sha256:latest", route_file=route_file)
+        self.row("att-latest-done", status="done", route="rt-latest", node="latest",
+                 digest="sha256:latest", route_file=route_file)
+        for index in range(12):
+            self.row(f"att-final-{index}", status="done", route="rt-latest", node=f"final-{index}",
+                     digest="sha256:latest", route_file=route_file)
+        self.assertEqual(self.snapshot(), 12)
+        with self.iso.patched_environ():
+            snap = self.handover.read_snapshot(self.seat().key)
+        self.assertNotIn("latest", {b["node"] for b in snap["bindings"]})
+        self.assertEqual({b["node"] for b in snap["bindings"]},
+                         {f"final-{index}" for index in range(12)})
+
+    def test_a_confirmed_clear_refreshes_only_the_selected_jobs_after_snapshot(self):
+        original = self.row("att-before-clear", node="selected")
+        self.assertEqual(self.snapshot(now=st.now_epoch() - 5), 1)
+
+        # This permitted retry appears in the registry after enqueue but before
+        # the confirmed start hook.  The hook must bind its exact row identity.
+        retry = self.row("att-after-snapshot", node="selected", worker="frame")
+        self.row("att-unselected", node="other")
+        out, rows = self.start("sid-B")
+        self.assertEqual(len(rows), 1)
+        expected = {("att-before-clear", "sid-A"), ("att-after-snapshot", "sid-A")}
+        with self.iso.patched_environ():
+            snapshot = self.handover.read_snapshot(self.seat().key)
+        snapshot_pairs = {(b["attempt"], b["parent"]) for b in snapshot["bindings"]}
+        ledger_pairs = {(b["attempt"], b["parent"]) for b in rows[0]["bindings"]}
+        self.assertEqual(snapshot_pairs, expected)
+        self.assertEqual(ledger_pairs, expected)
+        self.assertEqual(retry["parent_sid"], "sid-A")
+        self.assertEqual(original["parent_sid"], "sid-A")
+        self.assertNotIn("att-unselected", {b["attempt"] for b in rows[0]["bindings"]})
+
+    def test_retire_selects_the_kept_union_once_and_preserves_all_flat_bindings(self):
+        shared_route = self.open_route("rt-shared", "sha256:shared")
+        finished_route = self.open_route("rt-finished", "sha256:finished")
+        self.row("att-kept-1", parent="sid-B", route="rt-shared", node="shared",
+                 digest="sha256:shared", route_file=shared_route)
+        self.row("att-kept-2", parent="sid-B", route="rt-shared", node="shared", worker="frame",
+                 digest="sha256:shared", route_file=shared_route)
+        self.row("att-new-1", parent="sid-A", route="rt-shared", node="shared",
+                 digest="sha256:shared", route_file=shared_route)
+        self.row("att-new-2", parent="sid-A", route="rt-shared", node="shared", worker="frame",
+                 digest="sha256:shared", route_file=shared_route)
+        for index in range(12):
+            self.row(f"att-done-{index}", parent="sid-A", status="done", route="rt-finished",
+                     node=f"done-{index}", digest="sha256:finished", route_file=finished_route)
+
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
+            seat = self.seat(PANE_BESIDE)
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-B", "start", cwd=str(self.cwd),
+                                now=st.now_epoch() - 9)
+                self.assertEqual(self.handover.write_snapshot_locked(
+                    seat, "claude", "sid-B", now=st.now_epoch() - 5, jobs=self.jobs), 2)
+        row = self.retire("sid-A", "claude", "sid-B", "claude")
+        self.assertIsNotNone(row)
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
+            snapshot = self.handover.read_snapshot(seat.key)
+        self.assertEqual(len(snapshot["bindings"]), 15)
+        self.assertEqual(len({(b["jobs"], b["route"], b["hash"], b["node"])
+                              for b in snapshot["bindings"]}), 12)
+        self.assertEqual({(b["attempt"], b["parent"]) for b in snapshot["bindings"] if b["node"] == "shared"}, {
+            ("att-kept-1", "sid-B"), ("att-kept-2", "sid-B"),
+            ("att-new-1", "sid-A"), ("att-new-2", "sid-A"),
+        })
+        self.assertNotIn("att-done-0", {b["attempt"] for b in snapshot["bindings"]})
+        self.assertEqual({b["attempt"] for b in row["bindings"]},
+                         {b["attempt"] for b in snapshot["bindings"] if b["parent"] == "sid-A"})
+
+        # The next clear uses the merged snapshot as its bounded authority set.
+        _out, next_rows = self.start("sid-C", pane=PANE_BESIDE)
+        self.assertEqual([(r["from"], r["sid"]) for r in next_rows],
+                         [("sid-A", "sid-B"), ("sid-B", "sid-C")])
+        self.assertEqual({(b["attempt"], b["parent"]) for b in next_rows[-1]["bindings"]},
+                         {(b["attempt"], b["parent"]) for b in snapshot["bindings"]})
+
     def test_no_live_attempt_leaves_no_snapshot(self):
         self.row("att-1")
         self.assertEqual(self.snapshot(), 1)
@@ -2581,6 +2713,26 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(self.snapshot(), 0)
         with self.iso.patched_environ():
             self.assertIsNone(self.handover.read_snapshot(self.seat().key))
+
+    def test_schema_one_snapshot_and_ledger_keep_legacy_flat_rows_readable(self):
+        meta = self.row("att-legacy")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            binding = self.handover.binding_of(self.jobs, meta)
+            legacy_without_parent = {key: value for key, value in binding.items() if key != "parent"}
+            snapshot = {"schema": 1, "seat": seat.as_dict(),
+                        "from": {"harness": "claude", "sid": "sid-A"}, "at": st.now_epoch(),
+                        "bindings": [binding, dict(binding), legacy_without_parent]}
+            st.atomic_write_json(self.handover._snapshot_path(seat.key), snapshot)
+            ledger_path = st._ledger_path(seat)
+            st.ensure_dir(ledger_path.parent)
+            ledger_path.write_text(json.dumps({"event": "handover", "from": "sid-A", "sid": "sid-B",
+                "harness": "claude", "ts": 1, "bindings": [dict(binding), legacy_without_parent]}) + "\n")
+
+            self.assertEqual(self.handover.read_snapshot(seat.key)["bindings"], snapshot["bindings"])
+            self.assertEqual(len(self.handover.handover_rows(seat)), 1)
+            self.assertEqual(self.handover.storage_recipients("sid-B"),
+                             [("sid-B", None), ("sid-A", frozenset({"att-legacy"}))])
 
     def test_a_confirmed_clear_start_records_one_row_and_the_successor_answers(self):
         meta = self.row("att-1")

@@ -228,6 +228,99 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         self.assertEqual(PD.read(self.root, "sess-old", "delivery-" + "b" * 32)["state"], "pending")
         self.assertIsNone(PD.read(self.root, "sess-new", "delivery-" + "a" * 32))
 
+    def test_real_clear_handover_delivers_late_and_aggregate_records_from_the_original_store(self):
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        import pane_ownership
+
+        jobs = self.root / "jobs.log"
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs.touch()
+        selected = [
+            "att-0000000000000000000000000000bbbb",
+            "att-0000000000000000000000000000cccc",
+        ]
+        foreign = "att-0000000000000000000000000000dddd"
+
+        def append_attempt(attempt, status="running", *, route="rt-sweep", digest="sha256:sweep",
+                           node="execute"):
+            metadata = {
+                "attempt_id": attempt,
+                "parent_sid": "sess-old",
+                "parent_harness": "claude",
+                "dispatch_depth": "1",
+                "worker_type": "frame",
+                "route_id": route,
+                "route_hash": digest,
+                "route_node": node,
+            }
+            with jobs.open("a", encoding="utf-8") as handle:
+                handle.write("now\t" + status + "\t/w\t/w\ttask\t" +
+                             ",".join(f"{key}={value}" for key, value in metadata.items()) + "\n")
+            return metadata
+
+        append_attempt(selected[0])
+        self._seed(session_id="sess-old", delivery_id="delivery-" + "a" * 32,
+                   attempt_ids=[selected[0]], row_revisions={selected[0]: "old"})
+
+        pane = "w1:pOld"
+        old_environment = {
+            "AGENT_DISPATCH_JOBS": str(jobs),
+            "CLAUDE_SESSION_ID": "sess-old",
+            "HERDR_PANE_ID": pane,
+        }
+        with mock.patch.dict(os.environ, old_environment, clear=False), \
+             mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda value, *a, **kw: value or ""):
+            seat = tidy.resolve_seat("claude", str(self.root), os.environ, sid="sess-old")
+            with tidy.seat_lock(seat.key):
+                tidy.record_event(seat, "claude", "sess-old", "start", cwd=str(self.root))
+                self.assertEqual(handover.write_snapshot_locked(
+                    seat, "claude", "sess-old", jobs=jobs), 1)
+
+            # A same-key attempt registered after the initial snapshot is refreshed
+            # by the actual confirmed-start hook.
+            append_attempt(selected[1])
+            append_attempt(foreign, route="rt-other", digest="sha256:other", node="unrelated")
+            os.environ["CLAUDE_SESSION_ID"] = "sess-new"
+            tidy.run_hook("claude", "start", "sess-new", source="clear", cwd=str(self.root))
+
+            snapshot = handover.read_snapshot(seat.key)
+            ledger = handover.handover_rows(seat)
+            expected = {(selected[0], "sess-old"), (selected[1], "sess-old")}
+            self.assertEqual({(b["attempt"], b["parent"]) for b in snapshot["bindings"]}, expected)
+            self.assertEqual({(b["attempt"], b["parent"]) for b in ledger[0]["bindings"]}, expected)
+
+            # One completion is already pending before clear; the second is a late
+            # completion materialized afterward.  A selected-only aggregate is
+            # accepted, while an aggregate containing an unrelated attempt is refused.
+            self._seed(session_id="sess-old", delivery_id="delivery-" + "b" * 32,
+                       attempt_ids=[selected[1]], row_revisions={selected[1]: "late"})
+            self._seed(session_id="sess-old", delivery_id="delivery-" + "c" * 32,
+                       attempt_ids=selected, row_revisions={selected[0]: "old", selected[1]: "late"})
+            self._seed(session_id="sess-old", delivery_id="delivery-" + "d" * 32,
+                       attempt_ids=[selected[0], foreign], row_revisions={selected[0]: "old", foreign: "foreign"})
+
+            addressed, count = SWEEP.addressed_records(self.root, "claude-parent-runtime", "sess-new")
+            self.assertEqual(count, 4)
+            self.assertEqual({record["delivery_id"] for record in addressed}, {
+                "delivery-" + "a" * 32, "delivery-" + "b" * 32, "delivery-" + "c" * 32,
+            })
+            records, sweep_count = SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-new")
+            self.assertEqual(sweep_count, 4)
+            self.assertEqual({record["delivery_id"] for record in records}, {
+                "delivery-" + "a" * 32, "delivery-" + "b" * 32, "delivery-" + "c" * 32,
+            })
+            self.assertEqual({record[SWEEP.STORAGE_KEY] for record in records}, {"sess-old"})
+            self.assertEqual(SWEEP.ack_delivered(self.root, "sess-new", records, acked_by="clear-12-test"), 3)
+            self.assertEqual(SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-new")[0], [])
+
+        for suffix in "abc":
+            stored = PD.read(self.root, "sess-old", "delivery-" + suffix * 32)
+            self.assertEqual(stored["state"], "acked")
+            self.assertIsNone(PD.read(self.root, "sess-new", stored["delivery_id"]))
+        self.assertEqual(PD.read(self.root, "sess-old", "delivery-" + "d" * 32)["state"], "pending")
+
     def test_without_a_handover_another_session_still_receives_nothing(self):
         self._seed(session_id="sess-old")
         self.assertEqual(SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-new"), ([], 0))

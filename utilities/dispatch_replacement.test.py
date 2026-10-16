@@ -151,6 +151,41 @@ class ReplacementTest(unittest.TestCase):
         self.assertFalse(R.route_authority.replacement_parent_matches(registered['att-source'][1],candidate,self.jobs))
         self.assertEqual(self.claim(),record)
 
+    def test_confirmed_clear_refreshes_a_permitted_retry_registered_after_snapshot(self):
+        import dispatch_seat_handover as H
+        import session_tidy as S
+
+        self.bind_fixture_route()
+        self.bind_source_parent()
+        seat = S.Seat("pane", "replacement-race-seat", "wY:p5")
+        now = S.now_epoch()
+        with mock.patch.object(S, "resolve_seat", return_value=seat):
+            with S.seat_lock(seat.key):
+                S.record_event(seat, "codex", "parent", "start", cwd=str(self.root), now=now - 10)
+                self.assertEqual(H.write_snapshot_locked(
+                    seat, "codex", "parent", now=now - 5, jobs=self.jobs), 1)
+
+            # This follows the real replacement claim/admission/registry path and
+            # occurs strictly between the snapshot and the confirmed start hook.
+            record = self.claim()
+            candidate = self.replacement_candidate(record, parent="parent", harness="codex")
+            with mock.patch.dict(os.environ, self.parent_env("parent", "codex"), clear=True):
+                self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), candidate), record)
+            row = "now\topen\t" + str(self.root) + "\t" + str(self.root) + "\treplacement\t" + \
+                ",".join(k + "=" + v for k, v in candidate.items())
+            self.assertTrue(D.claim_attempt_row(self.jobs, candidate["attempt_id"], row, launch=False))
+
+            S.run_hook("codex", "start", "successor", source="clear", cwd=str(self.root), env={})
+
+        snapshot = H.read_snapshot(seat.key)
+        ledger = H.handover_rows(seat)
+        self.assertEqual(len(ledger), 1)
+        expected = {("att-source", "parent"), (candidate["attempt_id"], "parent")}
+        self.assertEqual({(b["attempt"], b["parent"]) for b in snapshot["bindings"]}, expected)
+        self.assertEqual({(b["attempt"], b["parent"]) for b in ledger[0]["bindings"]}, expected)
+        self.assertEqual(R._rows(self.jobs.read_text().splitlines())[candidate["attempt_id"]][1]["parent_sid"],
+                         "parent")
+
     def test_handover_replacement_admission_is_shared_by_all_parent_harnesses(self):
         self.bind_source_parent(carrier=True)
         record=self.claim()
@@ -647,6 +682,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
 
     def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
+        import dispatch_lifecycle as L
         seen=[]
         def slow(command,**kwargs):
             seen.append((command,kwargs['timeout']))
