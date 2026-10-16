@@ -126,6 +126,16 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         kwargs.update(overrides)
         return PD.create(**kwargs)
 
+    def test_empty_terminal_registry_uses_only_the_resolved_carrier_jobs_path(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs=self.root/'jobs.log';jobs.touch()
+        record={"receipt":{"job_registry":""}}
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root), \
+             mock.patch("dispatch_contract.resolve_global_registry",
+                        return_value=SimpleNamespace(path=jobs)):
+            self.assertEqual(SWEEP.record_jobs(self.root, record), jobs.resolve())
+            self.assertIsNone(SWEEP.record_jobs(self.root/'another-root', record))
+
     # -- 2026-08-29: Claude carrier 2 delivers (sweep_deliver / ack_delivered).
 
     def test_deliver_claims_pending_record_without_generation_proof(self):
@@ -178,6 +188,25 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         )
         records, count = SWEEP.sweep_deliver(self.root, "codex-stop-hook", "sess-owner")
         self.assertEqual((records, count), ([], 1))
+
+    def test_standalone_notice_delivers_without_a_registry_binding(self):
+        from session_notice import notify
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs = self.root / "jobs.log"
+        jobs.touch()
+        with mock.patch("dispatch_contract.resolve_global_registry",
+                        return_value=SimpleNamespace(path=self.root / "elsewhere" / "jobs.log")):
+            notice = notify("claude", "sess-owner", key="run-finished",
+                            subject="compute run host-1", text="finished with exit 0",
+                            jobs=jobs)
+            claimed, count = SWEEP.sweep_deliver(
+                self.root, "claude-parent-runtime", "sess-owner")
+
+        self.assertEqual(count, 1)
+        self.assertEqual([record["delivery_id"] for record in claimed], [notice["delivery_id"]])
+        self.assertEqual(SWEEP.ack_delivered(self.root, "sess-owner", claimed, acked_by="test"), 1)
+        self.assertEqual(SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")[0], [])
 
     def test_a_successor_at_the_same_pane_receives_the_stored_record_and_acks_it_under_the_old_key(self):
         # After a /clear the record stays stored (and acked) under the registered parent; the
