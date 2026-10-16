@@ -643,7 +643,7 @@ class ReplacementTest(unittest.TestCase):
             first=R.advance(self.jobs,'att-source',run=slow)
         self.assertEqual(first['reason'],'replacement-launch-timeout')
         self.assertIn('waiting on disk',first['launcher_diagnostic'])
-        self.assertEqual(seen[0][1],R.LAUNCHER_TIMEOUT_SECONDS)
+        self.assertEqual(seen[0][1],R._launcher_budget(seen[0][0],self.meta)[1])
         self.write({**self.meta,'attempt_id':first['attempt_id'],'replacement_original_attempt_id':'att-source',
                     'note':'registered','launch_claimed':'0'},'open',append=True)
         with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):

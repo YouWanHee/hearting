@@ -278,6 +278,36 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
             "producer_id": self.other_cycle["producer_id"],
         }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
+    def test_explicit_noncanonical_route_file_is_read_by_the_real_loader(self):
+        canonical = Path(self.route_file)
+        saved = canonical.with_name(canonical.name + ".saved")
+        explicit = self.root / "route-fixture.json"
+        explicit.write_bytes(canonical.read_bytes())
+        canonical.rename(saved)
+        try:
+            with mock.patch.object(P, "route_cycle_for", return_value=None):
+                context = C.resolve_context(
+                    route=self.route, route_file=explicit,
+                    environ={"AGENT_DISPATCH_WORKTREE": str(self.source)},
+                )
+            self.assertEqual(context.route["route_id"], self.route["route_id"])
+            self.assertEqual(context.route["route_hash"], self.route["route_hash"])
+            self.assertEqual(context.source_worktree, self.source.resolve())
+        finally:
+            saved.rename(canonical)
+
+    def test_explicit_route_file_mismatch_and_missing_file_do_not_fall_back_by_id(self):
+        env = {"AGENT_DISPATCH_WORKTREE": str(self.source)}
+        with self.subTest(case="identity-mismatch"):
+            with self.assertRaises(C.ArtifactContextError) as raised:
+                C.resolve_context(route=self.route, route_file=self.other_route_file, environ=env)
+            self.assertEqual(raised.exception.code, "completion-route-hash-mismatch")
+        with self.subTest(case="missing-explicit-file"):
+            missing = self.root / "missing-route.json"
+            with self.assertRaises(C.ArtifactContextError) as raised:
+                C.resolve_context(route=self.route, route_file=missing, environ=env)
+            self.assertEqual(raised.exception.code, "route-unreadable")
+
     def _log(self, harness, artifact, suffix):
         envelope = f"artifact: {artifact}\nverdict: PASS\nblocker: none"
         rows = {

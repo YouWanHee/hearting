@@ -243,6 +243,26 @@ class NodeScopeTest(unittest.TestCase):
         }), encoding="utf-8")
         return route_file
 
+    def test_sealed_scope_passes_the_exact_route_file_to_the_shared_resolver(self):
+        node = {"id": "execute", "outputs": ["dev_logs/execute.md"],
+                "write_scope": ["dev_logs/**"]}
+        route = {"route_id": "rt-" + "a" * 16, "route_hash": "sha256:" + "a" * 64,
+                 "artifact_root": "/tmp/artifacts", "nodes": [node]}
+        context = SimpleNamespace(
+            node=node, cycle_record=None, output_dir=None, source_worktree=Path("/worktree"),
+            inherited_cycle_mismatch=False,
+        )
+        exact_file = "/tmp/noncanonical-route.json"
+        with mock.patch("artifact_context.resolve_context", return_value=context) as resolver:
+            W.resolve_node_scope(
+                route, "execute", {}, route_file=exact_file,
+                source_worktree="/linked-worktree", source_worktree_verified=True,
+            )
+        self.assertEqual(resolver.call_args.kwargs["route_file"], exact_file)
+        self.assertEqual(resolver.call_args.kwargs["explicit"],
+                         {"source_worktree": "/linked-worktree",
+                          "source_worktree_verified": True})
+
     def test_stage_worker_prompt_carries_resolved_node_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

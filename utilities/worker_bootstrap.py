@@ -257,6 +257,8 @@ class NodeScope(NamedTuple):
 
 def resolve_node_scope(
     route, node_id: str | None, environ, *, parent_attempt_id: str | None = None,
+    route_file: str | Path | None = None, source_worktree: str | Path | None = None,
+    source_worktree_verified: bool = False,
 ) -> NodeScope:
     """One resolver for "what is this node's write scope, as an absolute path".
 
@@ -275,6 +277,10 @@ def resolve_node_scope(
         context = artifact_context.resolve_context(
             environ=environ, route=route, node_id=node_id,
             parent_attempt_id=parent_attempt_id,
+            route_file=route_file,
+            explicit=({"source_worktree": source_worktree,
+                       "source_worktree_verified": source_worktree_verified}
+                      if source_worktree is not None else None),
         )
         node = context.node
         outputs = tuple((node or {}).get("outputs", []))
@@ -681,9 +687,13 @@ def assignment_prompt(args, task: str, environ) -> str:
         if not route_file:
             return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}"
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        source_worktree = _linked_slice_source_worktree(args, route)
         scope = resolve_node_scope(
             route, getattr(args, "route_node", None), environ,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
+            route_file=route_file,
+            source_worktree=source_worktree,
+            source_worktree_verified=source_worktree is not None,
         )
         return (f"Assignment:\n{task.rstrip()}\n\n{plan_leg_prompt(route, getattr(args, 'route_node', None))}"
                 f"{node_scope_prompt(scope)}{input_sources_prompt(route, getattr(args, 'route_node', None))}\n"
@@ -693,9 +703,13 @@ def assignment_prompt(args, task: str, environ) -> str:
     route_file = getattr(args, "route_file", None)
     if route_file:
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
+        source_worktree = _linked_slice_source_worktree(args, route)
         scope = resolve_node_scope(
             route, getattr(args, "route_node", None), environ,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
+            route_file=route_file,
+            source_worktree=source_worktree,
+            source_worktree_verified=source_worktree is not None,
         )
         outputs = (
             _resolved_paths(scope.output_dir, scope.outputs) if scope.output_dir else list(scope.outputs)
@@ -709,6 +723,43 @@ def assignment_prompt(args, task: str, environ) -> str:
         + ("This frame's declared output: " + json.dumps(outputs, ensure_ascii=False) + "\n" if outputs else "")
         + "\n"
     )
+
+
+def _linked_slice_source_worktree(args, route) -> Path | None:
+    """Reuse the wrapper's exact live-parent validation for a declared slice.
+
+    Only a stage-authority-zero sub-session with the exact resolved parent may
+    use its linked execution worktree for source provenance. Ordinary children,
+    incomplete bindings, and review-bound launches keep the route/environment
+    worktree check unchanged.
+    """
+    candidate = getattr(args, "worktree", None)
+    parent = getattr(args, "parent_binding", None)
+    parent_attempt_id = getattr(args, "parent_attempt_id", None)
+    if (not candidate or not parent or not parent_attempt_id
+            or getattr(parent, "attempt_id", None) != parent_attempt_id
+            or getattr(args, "review_output_binding", None)):
+        return None
+    metadata = {
+        "subsession_id": getattr(args, "subsession_id", None),
+        "stage_authority": str(getattr(args, "stage_authority", 1)),
+    }
+    import dispatch_contract
+    if not dispatch_contract.is_linked_worktree_slice(metadata):
+        return None
+    sealed = route.get("cwd")
+    parent_worktree = getattr(parent, "worktree", None)
+    if not sealed or not parent_worktree:
+        return None
+    sealed_path = Path(str(sealed)).expanduser().resolve(strict=False)
+    parent_path = Path(str(parent_worktree)).expanduser().resolve(strict=False)
+    source_path = Path(str(candidate)).expanduser().resolve(strict=False)
+    if parent_path != sealed_path or source_path == sealed_path:
+        return None
+    if (dispatch_contract.canonical_repository_identity(source_path)
+            != dispatch_contract.canonical_repository_identity(sealed_path)):
+        return None
+    return source_path
 
 
 def worker_ending_prompt(*, supervised_owner: bool = False) -> str:

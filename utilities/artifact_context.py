@@ -301,6 +301,7 @@ def resolve_context(
     *, environ: Mapping[str, str] | None = None, route=None,
     node_id: str | None = None, parent_attempt_id: str | None = None,
     explicit: Mapping[str, Any] | None = None, require_producer_binding: bool = False,
+    route_file: str | Path | None = None,
 ) -> ArtifactContext:
     """Resolve the exact route cycle and source worktree from existing bindings.
 
@@ -319,8 +320,8 @@ def resolve_context(
     raw_route = route_ref if isinstance(route_ref, Mapping) else None
     artifact_root_value = (explicit.get("artifact_root") or env.get("AGENT_ARTIFACT_ROOT")
                            or (raw_route or {}).get("artifact_root"))
-    route_path = None
-    if route_ref is not None and not raw_route:
+    route_path = Path(route_file) if route_file is not None else None
+    if route_ref is not None and not raw_route and route_path is None:
         route_path = Path(str(route_ref))
         if not route_path.is_absolute() and artifact_root_value:
             route_path = Path(artifact_root_value) / ".runtime" / "routes" / f"{route_path.name}.json"
@@ -337,9 +338,12 @@ def resolve_context(
         raise ArtifactContextError("artifact-root-not-absolute", str(root))
     try:
         if raw_route:
-            route_data = producer.load_route(root, Path(str((raw_route or {}).get("route_id", ""))))
-            if route_data.get("route_hash") != raw_route.get("route_hash"):
-                raise ArtifactContextError("route-binding-mismatch", "route hash changed")
+            if route_path is not None:
+                route_data = producer.load_route(root, route_path, expected_identity=raw_route)
+            else:
+                route_data = producer.load_route(root, Path(str(raw_route.get("route_id", ""))))
+                if route_data.get("route_hash") != raw_route.get("route_hash"):
+                    raise ArtifactContextError("route-binding-mismatch", "route hash changed")
         else:
             route_data = producer.load_route(root, route_path)
     except ArtifactContextError:
@@ -518,14 +522,21 @@ def source_git_state(worktree: str | Path | None) -> tuple[str, str | None]:
 
 def _verified_worktree(route: Mapping[str, Any], env, explicit) -> Path | None:
     sealed = route.get("cwd")
-    candidate = explicit.get("source_worktree") or env.get("AGENT_DISPATCH_WORKTREE") or sealed
+    source_override = explicit.get("source_worktree")
+    candidate = source_override or env.get("AGENT_DISPATCH_WORKTREE") or sealed
     if not candidate:
         return None
     path = Path(str(candidate)).expanduser().resolve(strict=False)
     if not path.is_absolute():
         raise ArtifactContextError("source-worktree-not-absolute", str(path))
     if sealed and path != Path(str(sealed)).resolve(strict=False):
-        raise ArtifactContextError("source-worktree-route-mismatch", str(path))
+        if source_override is None or explicit.get("source_worktree_verified") is not True:
+            raise ArtifactContextError("source-worktree-route-mismatch", str(path))
+        import dispatch_contract
+        sealed_path = Path(str(sealed)).expanduser().resolve(strict=False)
+        if (dispatch_contract.canonical_repository_identity(path)
+                != dispatch_contract.canonical_repository_identity(sealed_path)):
+            raise ArtifactContextError("source-worktree-route-mismatch", str(path))
     return path
 
 
