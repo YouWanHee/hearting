@@ -2,9 +2,11 @@
 
 Legacy worker credentials may be the only surviving copy of a rotated token,
 or may be stale relative to a later main login. The file format does not carry
-trusted generation ordering, so this module only follows explicit configuration,
-builder metadata, and an intact credential symlink. It never promotes or deletes
-a credential file.
+trusted generation ordering, so this module follows explicit configuration,
+builder metadata, and intact credential symlinks. A marked legacy worker with
+no known origin keeps its selected config directory as a local cohort store;
+that does not promote its credential into main authentication. This module
+never promotes or deletes a credential file.
 """
 import json
 from pathlib import Path
@@ -35,11 +37,14 @@ def _worker_metadata(config_home):
 
 
 def resolve_storage_binding(env, config_home, *, settings_env=None, cwd=None):
-    """Return the safe native storage binding, or None when legacy origin is unknown.
+    """Return the selected native store without guessing legacy token lineage.
 
     Claude settings' `env` is applied over the inherited launch environment, so
     its explicit value is considered first. Empty strings remain meaningful and
-    are not replaced by a default path.
+    are not replaced by a default path. If a marked legacy worker has no stored
+    origin or intact credential link, its selected config directory remains a
+    local cohort store; it is never treated as the main account's canonical
+    store.
     """
     cwd = Path.cwd() if cwd is None else Path(cwd)
     settings_env = settings_env if isinstance(settings_env, dict) else {}
@@ -61,10 +66,10 @@ def resolve_storage_binding(env, config_home, *, settings_env=None, cwd=None):
         return _normalize(str(target.parent), cwd)
 
     if metadata is not None:
-        # A regular credential in a legacy worker home has no trustworthy
-        # account or generation link to the original source. Preserve it in
-        # place and leave the store unresolved rather than selecting it.
-        return None
+        # Keep auth continuity within this selected legacy cohort. The CLI
+        # owns refresh and locking in this directory; no credential is copied,
+        # promoted to main, or fabricated when the directory is empty.
+        return _normalize(str(config_home.resolve(strict=False)), cwd)
 
     default_home = Path(env.get("HOME") or str(Path.home())) / ".claude"
     resolved_config = config_home.resolve(strict=False)

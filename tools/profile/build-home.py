@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -90,6 +91,44 @@ def first_existing(*paths):
         if p.exists():
             return p
     return None
+
+
+def claude_global_config_file(env, *, cwd=None):
+    """Resolve Claude's global config file for account metadata projection.
+
+    Claude Code 2.1.300 checks the legacy `.config.json` in its resolved
+    config directory first, then uses `.claude.json` under a non-empty custom
+    CLAUDE_CONFIG_DIR or the home directory. An explicitly empty config-dir
+    value keeps the CLI's config directory empty, while its global config file
+    still falls back to the home directory.
+    """
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    home_dir = Path(env.get('HOME') or str(Path.home())).resolve(strict=False)
+    raw_config_dir = env.get('CLAUDE_CONFIG_DIR')
+    if raw_config_dir is None:
+        config_dir = home_dir / '.claude'
+        global_dir = home_dir
+    elif raw_config_dir == '':
+        config_dir = cwd
+        global_dir = home_dir
+    else:
+        config_dir = Path(raw_config_dir)
+        if not config_dir.is_absolute():
+            config_dir = cwd / config_dir
+        config_dir = config_dir.resolve(strict=False)
+        global_dir = config_dir
+
+    legacy_config = config_dir / '.config.json'
+    current_config = global_dir / '.claude.json'
+    try:
+        metadata = legacy_config.stat()
+        if stat.S_ISREG(metadata.st_mode) and (
+                metadata.st_size > 0 or
+                (metadata.st_mode & 0o222) == 0 and not current_config.exists()):
+            return legacy_config
+    except OSError:
+        pass
+    return current_config
 
 
 def load_declaration(agent_home, name):
@@ -543,7 +582,8 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         source = source.resolve(strict=False)
         # Capacity identity lives separately from credentials/settings. Keep
         # its account metadata without inheriting global MCP/onboarding state.
-        account = read_json(source / '.claude.json').get('oauthAccount')
+        account = read_json(claude_global_config_file(
+            env, cwd=Path.cwd())).get('oauthAccount')
         if account:
             write_json(home / '.claude.json', {'oauthAccount': account})
         symlink(source / 'hooks', home / 'hooks')

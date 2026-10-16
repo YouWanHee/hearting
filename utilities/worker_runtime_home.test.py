@@ -89,6 +89,75 @@ class WorkerHomes(unittest.TestCase):
         self.assertIn('--strict-mcp-config', claude_worker_arguments(env))
         self.assertNotIn('--bare', claude_worker_arguments(env))
 
+    def test_claude_oauth_account_projection_uses_native_global_config_path(self):
+        cli_home = self.base / 'cli-home'
+        user_config = cli_home / '.claude'
+        user_config.mkdir(parents=True)
+        root_account = {'accountUuid': 'synthetic-home-account'}
+        wrong_nested_account = {'accountUuid': 'synthetic-nested-account'}
+        (cli_home / '.claude.json').write_text(json.dumps({
+            'oauthAccount': root_account, 'mcpServers': {'private': {}}}))
+        (user_config / '.claude.json').write_text(json.dumps({
+            'oauthAccount': wrong_nested_account}))
+
+        cases = (
+            ('unset', {}, root_account),
+            ('empty', {'CLAUDE_CONFIG_DIR': ''}, root_account),
+        )
+        for label, override, expected in cases:
+            with self.subTest(config_dir=label):
+                destination = self.base / f'account-projection-{label}'
+                self.assertFalse(destination.exists())
+                values = prepare_worker_home(
+                    ROOT, 'claude', 'stage', 'account-projection-' + label,
+                    env={**self.env, 'HOME': str(cli_home), **override},
+                    destination=destination)
+                self.assertEqual(json.loads(
+                    (Path(values['CLAUDE_CONFIG_DIR']) / '.claude.json').read_text()),
+                    {'oauthAccount': expected})
+
+        empty_cwd = self.base / 'empty-config-cwd'
+        empty_cwd.mkdir()
+        empty_legacy_account = {'accountUuid': 'synthetic-empty-legacy-account'}
+        (empty_cwd / '.config.json').write_text(json.dumps({
+            'oauthAccount': empty_legacy_account}))
+        empty_legacy_destination = self.base / 'account-projection-empty-legacy'
+        with patch('pathlib.Path.cwd', return_value=empty_cwd):
+            values = prepare_worker_home(
+                ROOT, 'claude', 'stage', 'account-projection-empty-legacy',
+                env={**self.env, 'HOME': str(cli_home), 'CLAUDE_CONFIG_DIR': ''},
+                destination=empty_legacy_destination)
+        self.assertEqual(json.loads(
+            (Path(values['CLAUDE_CONFIG_DIR']) / '.claude.json').read_text()),
+            {'oauthAccount': empty_legacy_account})
+
+        custom = self.base / 'custom-config'
+        custom.mkdir()
+        custom_account = {'accountUuid': 'synthetic-custom-account'}
+        (custom / '.claude.json').write_text(json.dumps({
+            'oauthAccount': custom_account, 'mcpServers': {'private': {}}}))
+        destination = self.base / 'account-projection-custom'
+        self.assertFalse(destination.exists())
+        values = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'account-projection-custom',
+            env={**self.env, 'HOME': str(cli_home), 'CLAUDE_CONFIG_DIR': str(custom)},
+            destination=destination)
+        self.assertEqual(json.loads(
+            (Path(values['CLAUDE_CONFIG_DIR']) / '.claude.json').read_text()),
+            {'oauthAccount': custom_account})
+
+        legacy_account = {'accountUuid': 'synthetic-custom-legacy-account'}
+        (custom / '.config.json').write_text(json.dumps({
+            'oauthAccount': legacy_account}))
+        destination = self.base / 'account-projection-custom-legacy'
+        values = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'account-projection-custom-legacy',
+            env={**self.env, 'HOME': str(cli_home), 'CLAUDE_CONFIG_DIR': str(custom)},
+            destination=destination)
+        self.assertEqual(json.loads(
+            (Path(values['CLAUDE_CONFIG_DIR']) / '.claude.json').read_text()),
+            {'oauthAccount': legacy_account})
+
     def test_claude_binding_covers_worker_types_and_cross_harness_descendants(self):
         source = self.base / 'main-claude-config'
         source.mkdir()
@@ -198,7 +267,7 @@ class WorkerHomes(unittest.TestCase):
         self.assertNotEqual(child['CLAUDE_CONFIG_DIR'], first['CLAUDE_CONFIG_DIR'])
         self.assertEqual(child[SECURE_STORAGE_ENV], binding)
 
-    def test_claude_legacy_symlink_resolves_to_store_but_regular_candidate_stays(self):
+    def test_claude_legacy_links_and_regular_candidates_keep_selected_store(self):
         canonical = self.base / 'legacy-canonical'
         canonical.mkdir()
         (canonical / '.credentials.json').write_text('{"synthetic":"canonical"}')
@@ -221,21 +290,69 @@ class WorkerHomes(unittest.TestCase):
         legacy_regular_home = self.base / 'legacy-regular-home'
         legacy_regular_home.mkdir()
         candidate = legacy_regular_home / '.credentials.json'
-        candidate.write_text('{"synthetic":"opaque-candidate"}')
+        candidate.write_bytes(b'{"synthetic":"opaque-candidate"}')
         before = candidate.read_bytes()
         (legacy_regular_home / 'worker-home.json').write_text('{"harness":"claude"}')
+        (legacy_regular_home / 'settings.json').write_text(json.dumps({
+            'permissions': {'deny': ['Read(secret)']},
+            'env': {'USER_GUARD': '1'}}))
+        legacy_main_home = self.base / 'legacy-main-home'
+        (legacy_main_home / '.claude').mkdir(parents=True)
+        main_candidate = legacy_main_home / '.claude' / '.credentials.json'
+        main_candidate.write_bytes(b'{"synthetic":"main-current"}')
+        main_before = main_candidate.read_bytes()
         regular_destination = self.base / 'new-regular-home'
-        regular_destination.mkdir()
-        destination_candidate = regular_destination / '.credentials.json'
-        destination_candidate.write_bytes(b'{"synthetic":"sole-destination-candidate"}')
-        destination_before = destination_candidate.read_bytes()
-        unresolved = prepare_worker_home(
-            ROOT, 'claude', 'stage', 'legacy-opaque-candidate',
-            env={**self.env, 'CLAUDE_CONFIG_DIR': str(legacy_regular_home)},
+        self.assertFalse(regular_destination.exists())
+        env = {**self.env, 'HOME': str(legacy_main_home),
+               'CLAUDE_CONFIG_DIR': str(legacy_regular_home)}
+        regular = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'legacy-opaque-candidate', env=env,
             destination=regular_destination)
-        self.assertNotIn(SECURE_STORAGE_ENV, unresolved)
+        self.assertEqual(regular[SECURE_STORAGE_ENV], str(legacy_regular_home.resolve()))
+        self.assertNotEqual(regular['CLAUDE_CONFIG_DIR'], str(legacy_regular_home))
+        self.assertFalse((regular_destination / '.credentials.json').exists())
         self.assertEqual(candidate.read_bytes(), before)
+        self.assertEqual(main_candidate.read_bytes(), main_before)
+        self.assertEqual(json.loads((regular_destination / 'settings.json').read_text())[
+                         'permissions'], {'deny': ['Read(secret)']})
+        self.assertEqual(json.loads((regular_destination / 'worker-home.json').read_text())[
+                         'claude_secure_storage_dir'], str(legacy_regular_home.resolve()))
+
+        occupied_destination = self.base / 'occupied-regular-home'
+        occupied_destination.mkdir()
+        destination_candidate = occupied_destination / '.credentials.json'
+        destination_candidate.write_bytes(b'{"synthetic":"destination-candidate"}')
+        destination_before = destination_candidate.read_bytes()
+        occupied = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'legacy-opaque-candidate-occupied', env=env,
+            destination=occupied_destination)
+        self.assertEqual(occupied[SECURE_STORAGE_ENV], str(legacy_regular_home.resolve()))
         self.assertEqual(destination_candidate.read_bytes(), destination_before)
+        self.assertEqual(candidate.read_bytes(), before)
+        self.assertEqual(main_candidate.read_bytes(), main_before)
+
+        nested_destination = self.base / 'nested-regular-home'
+        nested = prepare_worker_home(
+            ROOT, 'claude', 'review', 'nested-legacy-opaque-candidate',
+            env={**env, **regular}, destination=nested_destination)
+        self.assertEqual(nested[SECURE_STORAGE_ENV], str(legacy_regular_home.resolve()))
+        self.assertNotEqual(nested['CLAUDE_CONFIG_DIR'], regular['CLAUDE_CONFIG_DIR'])
+        self.assertFalse((nested_destination / '.credentials.json').exists())
+        self.assertEqual(candidate.read_bytes(), before)
+        self.assertEqual(main_candidate.read_bytes(), main_before)
+
+        empty_legacy_home = self.base / 'legacy-without-credentials'
+        empty_legacy_home.mkdir()
+        (empty_legacy_home / 'worker-home.json').write_text('{"harness":"claude"}')
+        empty_destination = self.base / 'new-home-without-credentials'
+        empty = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'legacy-no-credential',
+            env={**env, 'CLAUDE_CONFIG_DIR': str(empty_legacy_home)},
+            destination=empty_destination)
+        self.assertEqual(empty[SECURE_STORAGE_ENV], str(empty_legacy_home.resolve()))
+        self.assertFalse((empty_legacy_home / '.credentials.json').exists())
+        self.assertFalse((empty_destination / '.credentials.json').exists())
+        self.assertEqual(main_candidate.read_bytes(), main_before)
 
     def test_codex_hook_alias_preserves_user_decisions_and_rereads_them_on_resume(self):
         hooks = self.source / 'hooks.json'

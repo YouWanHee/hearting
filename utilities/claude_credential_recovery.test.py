@@ -56,7 +56,7 @@ class ClaudeCredentialRecovery(unittest.TestCase):
         self.assertEqual(resolve_storage_binding(
             {'HOME': str(self.root / 'user')}, worker, cwd=self.cwd), str(store.resolve()))
 
-    def test_opaque_regular_legacy_candidate_is_preserved_and_never_promoted(self):
+    def test_legacy_candidate_uses_local_cohort_store_without_promotion(self):
         main = self.root / 'main'
         main.mkdir()
         main_file = main / '.credentials.json'
@@ -68,9 +68,20 @@ class ClaudeCredentialRecovery(unittest.TestCase):
         candidate.write_bytes(b'{"synthetic":"opaque-worker-token"}')
         before = candidate.read_bytes()
         main_before = main_file.read_bytes()
-        self.assertIsNone(resolve_storage_binding(
-            {'HOME': str(self.root / 'user')}, worker, cwd=self.cwd))
+        self.assertEqual(resolve_storage_binding(
+            {'HOME': str(self.root / 'user')}, worker, cwd=self.cwd),
+            str(worker.resolve()))
         self.assertEqual(candidate.read_bytes(), before)
+        self.assertEqual(main_file.read_bytes(), main_before)
+
+        empty_worker = self.root / 'legacy-worker-without-credentials'
+        empty_worker.mkdir()
+        (empty_worker / 'worker-home.json').write_text(
+            json.dumps({'harness': 'claude'}))
+        self.assertEqual(resolve_storage_binding(
+            {'HOME': str(self.root / 'user')}, empty_worker, cwd=self.cwd),
+            str(empty_worker.resolve()))
+        self.assertFalse((empty_worker / '.credentials.json').exists())
         self.assertEqual(main_file.read_bytes(), main_before)
 
     def test_new_worker_metadata_propagates_binding_across_nested_launches(self):
