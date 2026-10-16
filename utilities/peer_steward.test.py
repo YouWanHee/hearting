@@ -6287,7 +6287,12 @@ class ClosedParentNativeHandoverTest(_TmpRootMixin, unittest.TestCase):
         ledger = self.tidy._ledger_path(self.seat).read_bytes()
         row = json.loads(ledger)
         self.assertEqual({b["attempt"] for b in row["bindings"]}, {m["attempt_id"] for _, m in self.rows[:3]})
-        self.assertEqual(len(self.handover.read_snapshot(self.seat.key)["bindings"]), 1)
+        snapshot_bindings = self.handover.read_snapshot(self.seat.key)["bindings"]
+        self.assertEqual(len(snapshot_bindings), 3)
+        expected = {(meta["attempt_id"], meta["parent_sid"]) for _, meta in self.rows[:3]}
+        self.assertEqual({(binding["attempt"], binding["parent"]) for binding in snapshot_bindings}, expected)
+        current = self.handover.current_bindings("opencode", self.SUCCESSOR, self.jobs_path)
+        self.assertTrue(all(binding in current for binding in row["bindings"]))
         self.replay()
         self.assertEqual(self.tidy._ledger_path(self.seat).read_bytes(), ledger)
         self.assertEqual(self.protected(), before)
