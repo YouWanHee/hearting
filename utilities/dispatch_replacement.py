@@ -1650,36 +1650,64 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
 
 
 def effective_attempts(jobs, attempts):
-    """Read a verified one-edge mapping; failed originals remain in the ledger."""
+    """Project each input slot to its final launched successor, if any.
+
+    Every hop is checked against its immutable claim and registry row. The
+    receipt stays bounded to one original-to-final projection per slot; the
+    first edge's family and digest retain the historical receipt contract.
+    A claim, registration, or launch reservation without ``launch_started``
+    is not execution and cannot take delivery of the source failure.
+    """
     rows = _rows(Path(jobs).read_text().splitlines())
-    effective = set(attempts); mapping = []
+    effective = set(attempts)
+    projected = []
     for aid in sorted(attempts):
         if aid not in rows:
             continue
-        _, source = rows[aid]
-        binding = source_binding(jobs, source)
-        if not binding or not binding[0] or not binding[1]:
-            continue
-        family, replacement, claim_digest = binding
-        record = _check_record(_read(_record_path(jobs,family)), family,
-                               {'replacement_claim_digest': claim_digest or None})
-        if (not record or record.get('original_attempt_id') != aid
-                or record.get('replacement_attempt_id') != replacement
-                or record.get('family_id') != family):
-            raise DC.DispatchContractError('replacement-lineage-unproven',aid)
-        if replacement not in rows:
-            continue  # A claim is not a launch receipt.
-        _, target = rows[replacement]
-        if (target.get('replacement_claim_digest') != _digest(record)
-                or target.get('replacement_family_id') != family or target.get('automatic_retry_of') != aid
-                or target.get('replacement_original_attempt_id') != aid
-                or not route_authority.replacement_parent_matches(source, target, jobs, lineage=True)
-                or any(target.get(k) != source.get(k) for k in ('worker_type','dispatch_depth'))):
-            raise DC.DispatchContractError('replacement-lineage-unproven',replacement)
-        effective.discard(aid); effective.add(replacement)
-        mapping.append({'original_attempt_id':aid,'replacement_attempt_id':replacement,
-                        'family_id':family,'claim_digest':_digest(record)})
-    return effective,mapping
+        current = aid
+        seen = {aid}
+        chain = [aid]
+        first = None
+        while current in rows:
+            _, source = rows[current]
+            binding = source_binding(jobs, source)
+            if not binding or not binding[0] or not binding[1]:
+                break
+            family, replacement, claim_digest = binding
+            record = _check_record(_read(_record_path(jobs, family)), family,
+                                   {'replacement_claim_digest': claim_digest or None})
+            if (not record or record.get('original_attempt_id') != current
+                    or record.get('replacement_attempt_id') != replacement
+                    or record.get('family_id') != family):
+                raise DC.DispatchContractError('replacement-lineage-unproven', current)
+            _no_competing_successor(rows, current, replacement)
+            if replacement not in rows:
+                break  # A durable claim alone is not a launch receipt.
+            _, target = rows[replacement]
+            if (target.get('replacement_claim_digest') != _digest(record)
+                    or target.get('replacement_family_id') != family
+                    or target.get('automatic_retry_of') != current
+                    or target.get('replacement_original_attempt_id') != current
+                    or not route_authority.replacement_parent_matches(source, target, jobs, lineage=True)
+                    or any(target.get(k) != source.get(k) for k in ('worker_type', 'dispatch_depth'))):
+                raise DC.DispatchContractError('replacement-lineage-unproven', replacement)
+            if target.get('launch_started') != '1':
+                break  # Registration and launch claim do not prove execution.
+            if replacement in seen:
+                raise DC.DispatchContractError('replacement-lineage-cycle', replacement)
+            seen.add(replacement)
+            chain.append(replacement)
+            if first is None:
+                first = {'original_attempt_id': aid, 'replacement_attempt_id': replacement,
+                         'family_id': family, 'claim_digest': _digest(record)}
+            current = replacement
+        if first is not None:
+            effective.discard(aid)
+            effective.add(current)
+            projected.append((chain, {**first, 'replacement_attempt_id': current}))
+    covered = {attempt for chain, _edge in projected for attempt in chain[1:]}
+    mapping = [edge for chain, edge in projected if chain[0] not in covered]
+    return effective, mapping
 
 
 def advance_batch(jobs, attempts, *, authority_check=None, run=subprocess.run):

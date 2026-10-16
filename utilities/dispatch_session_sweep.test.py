@@ -126,6 +126,16 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         kwargs.update(overrides)
         return PD.create(**kwargs)
 
+    def test_empty_terminal_registry_uses_only_the_resolved_carrier_jobs_path(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        jobs=self.root/'jobs.log';jobs.touch()
+        record={"receipt":{"job_registry":""}}
+        with mock.patch("dispatch_contract.resolve_agent_home", return_value=self.root), \
+             mock.patch("dispatch_contract.resolve_global_registry",
+                        return_value=SimpleNamespace(path=jobs)):
+            self.assertEqual(SWEEP.record_jobs(self.root, record), jobs.resolve())
+            self.assertIsNone(SWEEP.record_jobs(self.root/'another-root', record))
+
     # -- 2026-08-29: Claude carrier 2 delivers (sweep_deliver / ack_delivered).
 
     def test_deliver_claims_pending_record_without_generation_proof(self):
