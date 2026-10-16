@@ -424,6 +424,34 @@ def context(receipt: dict, delivery_id: str) -> dict:
             "additionalContext": {"hearting-supervision": {"kind": "application", "value": render_text(receipt)}}}
 
 
+def _project_replacement_lineage(edges: list[dict], roots: set[str]) -> list[dict]:
+    """Collapse observed exact edges to one bounded original-to-final row."""
+    outgoing = {}
+    for edge in edges:
+        original = edge.get("original_attempt_id")
+        target = edge.get("replacement_attempt_id")
+        if not isinstance(original, str) or not isinstance(target, str):
+            raise SupervisionError("replacement-lineage-invalid")
+        previous = outgoing.get(original)
+        if previous is not None and previous.get("replacement_attempt_id") != target:
+            raise SupervisionError("replacement-lineage-conflict")
+        outgoing[original] = edge
+    projected = []
+    for root in sorted(roots):
+        first = outgoing.get(root)
+        if first is None:
+            continue
+        target = first["replacement_attempt_id"]
+        seen = {root}
+        while target in outgoing:
+            if target in seen:
+                raise SupervisionError("replacement-lineage-cycle")
+            seen.add(target)
+            target = outgoing[target]["replacement_attempt_id"]
+        projected.append({**first, "replacement_attempt_id": target})
+    return projected
+
+
 def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
                    jobs: Path, parent_attempt_id: str = "", emit: Callable[[dict], None] | None = None,
                    on_timeout: Callable[[set[str]], None] | None = None,
@@ -448,7 +476,9 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
     `join-deadline` notice already used.
     """
     ordinal = 0
+    lineage_edges = []
     lineage = []
+    roots = set(attempts)
     attention = []
     while True:
         observer_error, deferred = "", None
@@ -456,7 +486,8 @@ def wait_for_batch(*, join: Callable[[set[str]], dict], attempts: set[str],
             receipt = join(set(attempts))
             if replacement_checkpoint is not None:
                 effective, edges, attention = replacement_checkpoint(set(attempts))
-                lineage.extend(edge for edge in edges if edge not in lineage)
+                lineage_edges.extend(edge for edge in edges if edge not in lineage_edges)
+                lineage = _project_replacement_lineage(lineage_edges, roots)
                 if set(effective) != set(attempts):
                     attempts = set(effective)
                     continue

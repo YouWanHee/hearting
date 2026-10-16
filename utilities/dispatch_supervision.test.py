@@ -73,6 +73,31 @@ class ResponsibilityTest(unittest.TestCase):
         changed = dict(receipt, delivery_timing={"arbitrary": 2})
         self.assertEqual(identity.receipt_digest(receipt), identity.receipt_digest(changed))
 
+    def test_wait_projects_multigeneration_lineage_to_one_original_final_edge(self):
+        targets = {
+            "att-a": ("att-b", {"original_attempt_id":"att-a", "replacement_attempt_id":"att-b",
+                                 "family_id":"fam-a", "claim_digest":"digest-a"}),
+            "att-b": ("att-c", {"original_attempt_id":"att-b", "replacement_attempt_id":"att-c",
+                                 "family_id":"fam-b", "claim_digest":"digest-b"}),
+            "att-c": ("att-d", {"original_attempt_id":"att-c", "replacement_attempt_id":"att-d",
+                                 "family_id":"fam-c", "claim_digest":"digest-c"}),
+            "att-d": ("att-d", None),
+        }
+
+        def checkpoint(selected):
+            source=next(iter(selected))
+            target,edge=targets[source]
+            return {target}, [edge] if edge else [], []
+
+        result=supervision.wait_for_batch(
+            join=lambda selected: {"state":"ready", "children":[{"attempt_id":next(iter(selected))}]},
+            attempts={"att-a"}, jobs=Path("/unused"), replacement_checkpoint=checkpoint)
+        self.assertEqual(result["children"], [{"attempt_id":"att-d"}])
+        self.assertEqual(result["replacement_lineage"], [{
+            "original_attempt_id":"att-a", "replacement_attempt_id":"att-d",
+            "family_id":"fam-a", "claim_digest":"digest-a",
+        }])
+
     def test_exact_retry_claim_converges_across_competing_processes(self):
         self.jobs.write_text(row("att-failed", status="done", note="dead-launch-error", launch_outcome="never-launched"))
         script = """import sys,json; from pathlib import Path

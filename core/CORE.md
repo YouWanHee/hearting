@@ -537,12 +537,19 @@ under those same locks and uses ordinary atomic rename, as producer admission do
 ## 4. Workflow Invariants
 
 Transport deaths have no cumulative automatic replacement count limit. The
-existing controller may replace each settled, proven-dead attempt with one
-successor per exact predecessor. It preserves original results, completed
-stages, review ceilings, runtime pins and normal backoff. Live or unknown
-processes, unsettled cleanup, readable FAIL or BLOCKED, and human decisions
-retain their existing handling. A route paused only by the old replacement
-count resumes through its ordinary `start` surface.
+existing controller may replace each settled, resultless, proven-dead attempt
+with one stable successor per exact predecessor. A join carries one bounded
+original-to-final projection while the registry retains every verified edge.
+Carriers use their verified jobs path when the sealed terminal receipt
+intentionally has an empty `job_registry`; a registered or merely claimed
+successor is not execution or consumption. Intermediate failure stays pending
+while a launched successor owns the result, and the final result or inability
+to continue follows the existing delivery path. Original rows and receipts,
+completed stages, review ceilings, runtime pins, live or unknown work,
+unsettled cleanup, semantic FAIL or BLOCKED, and human decisions retain their
+existing handling. Automatic replacement currently follows the existing
+controller timing; no per-generation delay is persisted. A route paused only
+by the old replacement count resumes through its ordinary `start` surface.
 
 Artifacts move forward in one direction:
 
