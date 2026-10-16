@@ -2676,16 +2676,29 @@ class TestContinuation(unittest.TestCase):
   evidence=Path(evidence_root)/f"{node['id']}.md"
   evidence.parent.mkdir(parents=True,exist_ok=True)
   evidence.write_text(f"{node['id']} exact output\n",encoding="utf-8")
+  jobs=Path(route["launch_compatibility_tuple"]["jobs_path"]["path"])
   metadata={
    "attempt_schema_version":2,"dispatch_depth":node["dispatch_depth"],
    "transport":"headless","execution_surface":"registered-headless",
    "registered_worker":"1","fallback_hop":"same-harness-headless",
+   "attempt_id":attempt_id,"route_id":route["route_id"],
+   "route_hash":route["route_hash"],"route_node":node["id"],
   }
-  R.complete_node(
-   route,node,node["id"],evidence,attempt_id=attempt_id,
-   explicit_attempt_metadata=metadata,
-  )
-  jobs=Path(route["launch_compatibility_tuple"]["jobs_path"]["path"])
+  from review_source_subject import is_implementation_review,seal_attempt
+  if is_implementation_review(route,node):
+   metadata.update(seal_attempt(jobs,route,node,attempt_id,worktree=route["cwd"]))
+   # This fixture models a settled completion, not the child lifecycle. Use
+   # the common marker writer with the exact source binding; the matching
+   # terminal row is attached below for continuation's exact-link checks.
+   R._publish_completion_locked(
+    route,node,node["id"],evidence,attempt_id=attempt_id,
+    attempt_metadata=metadata,jobs=jobs,
+   )
+  else:
+   R.complete_node(
+    route,node,node["id"],evidence,attempt_id=attempt_id,
+    explicit_attempt_metadata=metadata,
+   )
   link_path=R._attempt_completion_path(
    route,node["id"],attempt_id,jobs=jobs
   )
@@ -2696,10 +2709,14 @@ class TestContinuation(unittest.TestCase):
    "last_turn_id":f"turn-{node['id']}",
   })
   R.atomic_write(link_path,link)
-  # A completed node has a registry row: production cannot reach a completion
-  # marker without one. Fixtures that skipped this were the only reason the
-  # rebind ever saw a missing registry, which B2 now (correctly) declines.
-  self._write_attempt_row(jobs,route["route_id"],node["id"],attempt_id)
+  # Preserve the exact route/source identity in the synthetic terminal row;
+  # source-bound review currency reads this row and its write-once sidecar.
+  self._write_attempt_row(
+   jobs,route["route_id"],node["id"],attempt_id,
+   extra_metadata={"route_hash":route["route_hash"],
+                   **{key:value for key,value in metadata.items()
+                      if key.startswith("review_subject_")}},
+  )
   return evidence
  def _complete_prefix(self,route,resume_from,evidence_root,skip=()):
   evidence={}
@@ -3627,7 +3644,10 @@ class TestContinuation(unittest.TestCase):
     source=self._source(artifact,cwd=repo)
     pinned=source["source_commit"]; self.assertEqual(pinned,self._git_head(repo))
     self._complete_prefix(source,"plan",Path(tmp)/"evidence")
-    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-qam","fast-forward"],check=True)
+    docs=repo/"docs"; docs.mkdir()
+    (docs/"fast-forward.md").write_text("documentation-only fast-forward\n")
+    subprocess.run(["git","-C",str(repo),"add","docs/fast-forward.md"],check=True)
+    subprocess.run(["git","-C",str(repo),"commit","-qm","fast-forward"],check=True)
     head=self._git_head(repo); self.assertNotEqual(head,pinned)
     source_path=Path(tmp)/"source-route.json"
     source_path.write_text(json.dumps(source),encoding="utf-8")
@@ -3962,7 +3982,7 @@ class TestContinuation(unittest.TestCase):
         if f"route_node={node_id}," not in line+"," ]
   jobs.write_text("".join(f"{line}\n" for line in kept),encoding="utf-8")
 
- def _write_attempt_row(self,jobs,route_id,node_id,attempt_id,status="done"):
+ def _write_attempt_row(self,jobs,route_id,node_id,attempt_id,status="done",extra_metadata=None):
   # A fixture registry is a tmpdir registry. A route built without
   # AGENT_DISPATCH_JOBS pointed at one seals the *canonical* jobs path, and
   # appending there writes fake attempt rows into the operator's live registry
@@ -3975,7 +3995,9 @@ class TestContinuation(unittest.TestCase):
     "Set AGENT_DISPATCH_JOBS to a path under the test's TemporaryDirectory "
     "before building the route."
    )
-  meta=f"route_id={route_id},route_node={node_id},attempt_id={attempt_id}"
+  values={"route_id":route_id,"route_node":node_id,"attempt_id":attempt_id,
+          **(extra_metadata or {})}
+  meta=",".join(f"{key}={value}" for key,value in sorted(values.items()))
   jobs.parent.mkdir(parents=True,exist_ok=True)
   with jobs.open("a",encoding="utf-8") as handle:
    handle.write("\t".join(["2026-09-04T00:00:00Z",status,"repo","worktree","slug",meta])+"\n")
@@ -4187,7 +4209,10 @@ class TestContinuation(unittest.TestCase):
    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
    source=self._source(artifact,cwd=repo)
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
-   (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-qam","fast-forward"],check=True)
+   docs=repo/"docs"; docs.mkdir()
+   (docs/"fast-forward.md").write_text("documentation-only fast-forward\n")
+   subprocess.run(["git","-C",str(repo),"add","docs/fast-forward.md"],check=True)
+   subprocess.run(["git","-C",str(repo),"commit","-qm","fast-forward"],check=True)
    continuation=self._build(source)
    self.assertEqual(continuation["source_commit"],self._git_head(repo))
    R.verify_route(continuation)
@@ -4208,8 +4233,9 @@ class TestContinuation(unittest.TestCase):
    # descend from the pin and is legitimately a rebind, not a divergence.
    subprocess.run(["git","-C",str(repo),"reset","-q","--hard",source["source_commit"]],check=True)
    subprocess.run(["git","-C",str(repo),"commit","--amend","-qm","rewritten"],check=True)
-   with self.assertRaisesRegex(ValueError,"continuation-source-commit-diverged"):
-    self._build(source)
+   with mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}):
+    with self.assertRaisesRegex(ValueError,"continuation-source-commit-diverged"):
+     self._build(source)
 
  def test_continuation_cli_requires_exact_registered_depth1_owner(self):
   import subprocess,sys
