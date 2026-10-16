@@ -3628,10 +3628,10 @@ def _claude_idle_prompt_guard(target, expected_sid, expected_pane, expected_fore
             or ident.get("session_id") != expected_sid
             or ident.get("pane") != expected_pane):
         return reason or "target-identity-changed", None
-    if state != "idle":
+    if state not in ("idle", "done"):
         return "native-state-" + str(state), None
     current_state, current_pane = _agent_state(target)
-    if current_state != "idle" or current_pane != expected_pane:
+    if current_state not in ("idle", "done") or current_pane != expected_pane:
         return "target-state-changed", None
     readiness = _pane_readiness(target, current_state, expected_harness="claude",
                                 expected_sid=expected_sid, expected_pane=expected_pane,
@@ -4453,7 +4453,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
             direct_reason = "no-trailer-callback-only"
         elif pending["state"] != "pending":
             direct_reason = "peer-delivery-already-submitted"
-        elif state_before != "idle":
+        elif state_before not in ("idle", "done"):
             direct_reason = "native-state-" + str(state_before)
         elif not target_pane or not peer_message.usable_session_id(t_sid):
             direct_reason = "target-identity-unverified"
