@@ -10833,6 +10833,53 @@ def _print(payload: Any) -> None:
     print(json.dumps(payload, sort_keys=True))
 
 
+def _route_cli_context(argv: Sequence[str]):
+    values = list(argv)
+    command = values[0] if values else ""
+    if command not in {"begin", "resolve-output"}:
+        return values, None
+    if not (os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_ROUTE_ID")):
+        return values, None
+    def option_value(name):
+        for index, value in enumerate(values):
+            if value == name and index + 1 < len(values):
+                return values[index + 1]
+            if value.startswith(name + "="):
+                return value.split("=", 1)[1]
+        return None
+    explicit_root = option_value("--artifact-root")
+    explicit_route = option_value("--route") if command == "begin" else None
+    try:
+        import artifact_context
+        context = artifact_context.resolve_context(
+            environ=os.environ, route=explicit_route,
+            node_id=option_value("--node"),
+            explicit={"artifact_root": explicit_root} if explicit_root else None,
+        )
+    except Exception as exc:
+        if getattr(exc, "code", None):
+            raise ProducerError(exc.code, getattr(exc, "detail", str(exc))) from exc
+        raise
+    if not context.route or not context.artifact_root:
+        return values, None
+    supplied_node = option_value("--node")
+    env_node = os.environ.get("AGENT_ROUTE_NODE")
+    if supplied_node and env_node and supplied_node != env_node:
+        raise ProducerError("route-node-mismatch", supplied_node)
+    defaults = {"--artifact-root": str(context.artifact_root)}
+    if command == "begin":
+        defaults["--route"] = str(context.artifact_root / ".runtime" / "routes"
+                                  / f"{context.route['route_id']}.json")
+        if context.node_id:
+            defaults["--node"] = context.node_id
+    insertion = 1
+    for flag, value in defaults.items():
+        if option_value(flag) is None:
+            values[insertion:insertion] = [flag, value]
+            insertion += 2
+    return values, context
+
+
 def _checkpoint_cli(args: argparse.Namespace) -> Dict[str, Any]:
     route_file: Optional[Path] = None
     root_value = args.artifact_root or os.environ.get("AGENT_ARTIFACT_ROOT") or ""
@@ -11031,7 +11078,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--bucket", required=True)
     p.add_argument("--cycle-dir")
 
-    args = parser.parse_args(argv)
+    try:
+        prepared_argv, _route_context = _route_cli_context(sys.argv[1:] if argv is None else argv)
+    except ProducerError as exc:
+        _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
+        return BLOCKED
+    args = parser.parse_args(prepared_argv)
     try:
         if args.command not in {"check-write"}:
             dispatch_terminal_commit.require_current_cleanup("producer-" + args.command)
@@ -11195,7 +11247,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _print(result)
             return OK if result["verdict"] == "allow" else BLOCKED
         elif args.command == "resolve-output":
-            directory, layout = resolve_output_dir(root, args.bucket, cycle_dir_hint=args.cycle_dir)
+            if _route_context and _route_context.node:
+                if args.cycle_dir and Path(args.cycle_dir).resolve(strict=False) != _route_context.cycle_dir:
+                    raise ProducerError("artifact-cycle-binding-mismatch", args.cycle_dir)
+                try:
+                    binding = _route_context.resolve_bucket(args.bucket)
+                except Exception as exc:
+                    raise ProducerError(getattr(exc, "code", "artifact-output-role-missing"), str(exc)) from exc
+                directory, layout = binding.path, "cycle"
+            else:
+                directory, layout = resolve_output_dir(root, args.bucket, cycle_dir_hint=args.cycle_dir)
             result = {"status": "ok", "output_dir": str(directory), "layout": layout}
             if layout == "legacy":
                 fallback = legacy_fallback_state(root)

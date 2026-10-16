@@ -321,6 +321,30 @@ def _emit(payload) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] in {"bucket-dirs", "glob", "spec-dir", "resolve", "hold"}:
+        explicit_root = None
+        for index, value in enumerate(values):
+            if value == "--artifact-root" and index + 1 < len(values):
+                explicit_root = values[index + 1]
+                break
+            if value.startswith("--artifact-root="):
+                explicit_root = value.split("=", 1)[1]
+                break
+        env_root = os.environ.get("AGENT_ARTIFACT_ROOT")
+        if not explicit_root or (env_root and Path(explicit_root).expanduser().resolve(strict=False)
+                                 == Path(env_root).expanduser().resolve(strict=False)):
+            from artifact_context import resolve_context
+            context = resolve_context(environ=os.environ,
+                explicit={"artifact_root": explicit_root} if explicit_root else None)
+            if context.route and context.artifact_root:
+                if not explicit_root:
+                    values[1:1] = ["--artifact-root", str(context.artifact_root)]
+                if (values[0] == "spec-dir" and context.cycle_dir
+                        and "--cycle-dir" not in values
+                        and not any(value.startswith("--cycle-dir=") for value in values)):
+                    position = values.index("--artifact-root") + 2 if "--artifact-root" in values else 1
+                    values[position:position] = ["--cycle-dir", str(context.cycle_dir)]
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("bucket-dirs", help="ordered read candidates for a bucket")
@@ -342,7 +366,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     address.add_argument("--campaign")
     p = sub.add_parser("hold", help="nonterminal resplit (D-77-a) or relayout (A-17.8) journal hold, if any")
     p.add_argument("--artifact-root", required=True)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(values)
     root = Path(args.artifact_root).resolve()
     if args.command == "bucket-dirs":
         _emit([{"path": str(p), **m} for p, m in bucket_dirs(root, args.bucket, include_legacy=not args.no_legacy)])

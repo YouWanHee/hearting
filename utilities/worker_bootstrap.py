@@ -268,6 +268,39 @@ def resolve_node_scope(
     Neither source available means the caller must say so, not guess a
     root-relative path that the write oracle then refuses.
     """
+    # Sealed routes go through the shared resolver. Keep the small legacy
+    # projection below for pre-route callers and minimal import fixtures only.
+    if route.get("route_id") and route.get("route_hash") and route.get("artifact_root"):
+        import artifact_context
+        context = artifact_context.resolve_context(
+            environ=environ, route=route, node_id=node_id,
+            parent_attempt_id=parent_attempt_id,
+        )
+        node = context.node
+        outputs = tuple((node or {}).get("outputs", []))
+        write_scope = tuple((node or {}).get("write_scope", []))
+        if (route.get("capability") == "autopilot-code"
+                and route.get("effective_intensity") == "quick" and node_id == "one-shot"
+                and (node or {}).get("kind") == "capability-owner"
+                and (node or {}).get("unit") == "_kernel/owner"
+                and set(write_scope) == {"source-scoped", "plans/<cycle>/**"}):
+            write_scope = ("source-scoped", "**")
+        has_matching_env = bool(context.cycle_record and environ.get("AGENT_ARTIFACT_OUTPUT_DIR")) and all(
+            not environ.get(key) or environ.get(key) == expected
+            for key, expected in (
+                ("AGENT_ARTIFACT_CYCLE_ID", context.cycle_record.get("cycle_id")),
+                ("AGENT_ARTIFACT_CAMPAIGN_ID", context.cycle_record.get("campaign_id")),
+                ("AGENT_ARTIFACT_PRODUCER_ID", context.cycle_record.get("producer_id")),
+            )
+        ) and not context.inherited_cycle_mismatch
+        source = ("env" if has_matching_env else
+                  "producer-binding" if context.output_dir else "unbound")
+        return NodeScope(
+            str(context.output_dir) if context.output_dir else None,
+            str(context.source_worktree) if context.source_worktree else None,
+            outputs, write_scope, source,
+        )
+
     node = None
     if node_id:
         node = next((n for n in route.get("nodes", []) if n.get("id") == node_id), None)
@@ -309,7 +342,8 @@ def resolve_node_scope(
 
 
 def _resolved_paths(output_dir: str, paths) -> list[str]:
-    return [str(Path(output_dir) / path) for path in paths]
+    import artifact_context
+    return artifact_context.render_outputs(output_dir, paths)
 
 
 def route_node_commit_expected(route, node_id: str | None, worker_type: str,
@@ -350,15 +384,19 @@ def stage_commit_enabled(args) -> bool:
 
 def _resolved_write_scopes(scope: NodeScope) -> tuple[list[str], list[str]]:
     """Resolve repository mutation vocabulary separately from artifact scopes."""
+    import artifact_context
     artifact, source = [], []
     for value in scope.write_scope:
         path = Path(value)
         if path.is_absolute():
             (source if scope.worktree_dir and path.is_relative_to(scope.worktree_dir) else artifact).append(str(path))
-        elif value in ("source-scoped", "source/**", "source-alternative/**"):
+        elif artifact_context.classify_scope(value) == "source" and value in (
+                "source-scoped", "source/**", "source-alternative/**"):
             source.append(str(Path(scope.worktree_dir) / "**") if scope.worktree_dir else value)
-        elif value.startswith("tests/"):
+        elif artifact_context.classify_scope(value) == "source":
             source.append(str(Path(scope.worktree_dir) / value) if scope.worktree_dir else value)
+        elif artifact_context.classify_scope(value) == "target":
+            artifact.append(value)
         elif scope.output_dir:
             artifact.append(str(Path(scope.output_dir) / value))
         else:

@@ -38,13 +38,13 @@ Adapters may expose this capability through native commands, skill files, prompt
 
 Artifact root: `core/CONVENTIONS.md §5.1`.
 
-Code work normally writes to `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`, even when a `spec/` directory exists. `spec/` is the blueprint bucket; `plans/` is the work-cycle bucket.
+The standalone default is `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`, even when a `spec/` directory exists. Routed stages use their sealed node outputs and write scope; `AGENT_ARTIFACT_OUTPUT_DIR` supplies only the cycle base.
 
 Artifact intensity policy:
 
 - `direct`: no new plan root, no `plan.md`, and no durable pipeline artifact unless the adapter or current repo policy explicitly requires one;
 - `quick`: no durable `plan.md` by default; record a short summary/evidence only when a work-cycle artifact is already required;
-- `standard+`: create or resume `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`.
+- `standard+`: the selected route graph declares its plan, implementation, test, and report outputs.
 
 The default full graph produces the following public artifacts. A selected
 subgraph produces only its declared outputs; omitted planning does not require
@@ -70,14 +70,13 @@ binds `direct`, `quick`, and `standard+`; only the acting owner differs.
    While the cutover is inactive and the root already holds legacy content,
    inline start returns `legacy-compat` (`AGENT_ARTIFACT_ROOT` only) and the
    legacy `<artifact-root>/plans/` layout stays writable.
-   Compile-only legacy routes can still use explicit producer `begin`.
 2. **write only inside the open cycle.** Every durable artifact goes under
-   `<cycle_dir>/artifacts/plans/...` (`AGENT_ARTIFACT_OUTPUT_DIR`).
+   the current node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`.
    `artifact_producer.py` owns cycle output paths and shared revisions.
 3. **stage workers join, never fork.** `standard+` stage workers receive
    `AGENT_ARTIFACT_CAMPAIGN_ID`/`CYCLE_ID`/`PRODUCER_ID`/`CYCLE_DIR`/`OUTPUT_DIR`
-   from the owner (dispatch env pass-through) and call `begin --node <id>`
-   on the same route, which resumes the owner's open cycle.
+   from the owner (dispatch env pass-through); the resolver applies the
+   sealed node's outputs and write scope.
 4. **runtime-owned closure.** New registered owners write their report and
    return the final handoff. After exact PASS and process cleanup, the shared
    completion controller completes the workflow, closes the route and seals
@@ -200,7 +199,7 @@ Additional code-entry gates:
 ## Portable Procedure
 
 1. Parse arguments and infer `dev`, `debug`, or `audit` when the adapter allows natural-language entry.
-2. Resolve artifact root and create or resume a `plans/<date>_<slug>/` work cycle.
+2. Use the selected route node's declared outputs; standalone work keeps the `plans/<date>_<slug>/` default.
 3. Run git/worktree preflight and remember the starting `HEAD`.
 4. If `spec/` exists, read `spec/prd.md` plus relevant mode contracts before planning.
 5. Emit `spec-significance: within-spec` or `spec-significance: SPEC-SIGNIFICANT (...)`.

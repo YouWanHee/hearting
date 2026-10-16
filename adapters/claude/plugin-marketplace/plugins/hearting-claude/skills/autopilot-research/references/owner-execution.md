@@ -2,7 +2,7 @@
 
 Run shared upfront research across academic, technology, and market domains through a `search → analyze → report` pipeline, then route the result to downstream work such as `autopilot-draft` or `autopilot-code`. Keep only routing and stage contracts here; load the references below for detailed orchestration and report templates.
 
-Store outputs under `<artifact-root>/research/<topic>/`. Follow the three-tier output convention (`<agent-home>/core/CONVENTIONS.md#5-skill-output-convention--t1t2t3`): keep raw metadata such as `search_results.json`, `phase_a_*.json`, `chaining_results.md`, and `code_search.md`, together with reviews, under `_internal/`; keep T1/T2 chapters and `cards/` at the research root. Resolve `<artifact-root>` using the workspace assumption (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
+The standalone default is `<artifact-root>/research/<topic>/`. Routed stages use declared node outputs and write scope. Follow the three-tier output convention for standalone layout; resolve the artifact root using the workspace assumption (`<agent-home>/core/CONVENTIONS.md#51-workspace-assumption`).
 
 ## Invocation
 
@@ -47,7 +47,7 @@ Read `invocation-and-modes.md` for exact defaults and flag behavior.
 
 ## Resume
 
-Inspect both the request and current working directory to distinguish a new run from a resumed run. If `<artifact-root>/research/<topic>/pipeline_state.yaml` is absent, start at Step 1. If it exists, infer the intended `search`, `analyze`, or `report` re-entry stage from the request. An explicit `--from` always wins. Route one- or two-line corrections to `autopilot-refine`.
+For standalone work, inspect the request and `<artifact-root>/research/<topic>/pipeline_state.yaml` to distinguish a new run from a resumed run. Routed work reads the inputs supplied by its node and writes to its declared outputs. An explicit `--from` always wins. Route one- or two-line corrections to `autopilot-refine`.
 
 Read `invocation-and-modes.md` for the detection table, confirmation format, and `pipeline_state.yaml` schema.
 
@@ -96,18 +96,10 @@ by the dispatch-depth-1 owner). Full contract: `capabilities/autopilot-research.
 §Artifact Producer Lifecycle and `producer_lifecycle` in
 `capabilities/topologies.json`.
 
-1. After the route is compiled and bound, and before the first durable
-   artifact: `python3 <agent-home>/utilities/artifact_producer.py begin
-   --artifact-root <root> --route <route file> --capability autopilot-research
-   --intensity <intensity> --env-file <env>`; export the returned
-   `AGENT_ARTIFACT_*` variables. `legacy-compat` means the cutover is inactive
-   and the legacy `research/` layout is still the write target.
-2. Write every artifact under `$AGENT_ARTIFACT_OUTPUT_DIR/research/...`; never
-   write to a legacy top-level bucket while the cutover is active, never write
-   under `shared/`.
-3. Pass the exported `AGENT_ARTIFACT_*` variables to every stage dispatch
-   (the adapters forward them); stage workers call `begin --node <id>` and
-   join the same cycle.
+1. The launcher prepares the route's cycle and carries its exact context.
+2. Write routed outputs using the selected node's declarations; never write
+   directly under `shared/`.
+3. The runtime carries the same producer context through stage dispatch.
 4. Close the route, then `artifact_producer.py finalize --artifact-root <root>
    --cycle $AGENT_ARTIFACT_CYCLE_ID`; on `recovery-required`, run
    `artifact_producer.py recover` and retry.

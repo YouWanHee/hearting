@@ -116,12 +116,14 @@ class ProducerTestBase(unittest.TestCase):
         home = Path(self._tmp.name) / "agent-home"
         (home / "core").mkdir(parents=True, exist_ok=True)
         (home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
-        self._env = {k: os.environ.get(k) for k in (
-            "AGENT_HOME", "AGENT_DISPATCH_JOBS", "AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT")}
+        self._env = {k: v for k, v in os.environ.items() if k == "AGENT_HOME" or k.startswith((
+            "AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_"))}
         os.environ["AGENT_HOME"] = str(home)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
-        for key in ("AGENT_ARTIFACT_CYCLE_DIR", "AGENT_ARTIFACT_ROOT"):
-            os.environ.pop(key, None)
+        for key in tuple(os.environ):
+            if key.startswith(("AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_")) \
+                    and key != "AGENT_DISPATCH_JOBS":
+                os.environ.pop(key, None)
         self.addCleanup(self._restore)
 
     def _restore(self):

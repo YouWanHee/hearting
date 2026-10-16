@@ -4,7 +4,7 @@ Code-work entrypoint. Detect spec context and close the `plan → execute → te
 
 ## Quick Contract
 
-- Default output: `<artifact-root>/plans/<date>_<slug>/`. `direct` creates no durable plan; `quick` uses a micro-plan; `standard+` writes the selected graph’s declared outputs; plan/checklist belong only to selected planning work.
+- Standalone default output: `<artifact-root>/plans/<date>_<slug>/`. Routed work uses the selected graph's declared outputs. `direct` creates no durable plan; `quick` uses a micro-plan; plan/checklist belong only to selected planning work.
 - When a spec exists, emit a one-line `spec-significance` judgment before editing code. Route spec-significant changes through an `autopilot-spec` update first.
 - Recheck git and worktree state at entry and immediately before durable write-back or commit. Follow `<agent-home>/core/OPERATIONS.md §5.9` for active operations, conflict-resolution authority, detached HEAD, and unexpected HEAD changes.
 - Do not parallelize QA at every stage. Scale `plan-check` and final `code-test` from the rigor derived from intensity (CONVENTIONS §1.1).
@@ -104,10 +104,9 @@ unchanged; consume the gate declarations of your assigned route.
 ## Artifact Producer Lifecycle (W7C)
 
 The shared completion controller owns registered route preparation and closure.
-The launcher supplies the exact cycle context; stage workers join it with
-`begin --node <id>` on the same route. Write artifacts under
-`$AGENT_ARTIFACT_OUTPUT_DIR/plans/...`, finish the declared work and return the
-report's final handoff. After exact PASS and process cleanup, the controller
+The launcher supplies the exact cycle context. Stage workers use their sealed
+node outputs and write scope, finish the declared work, and return the report's
+final handoff. After exact PASS and process cleanup, the controller
 completes the workflow, closes the route and seals the cycle using one durable
 transaction. An interruption retains that transaction and sends a recovery
 notice; it does not convert PASS to failure or require a new model execution.

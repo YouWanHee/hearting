@@ -12,6 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import EXECUTION_SURFACES, FALLBACK_HOPS, WRAPPER_TRANSPORTS  # noqa: E402
+from artifact_context import SEMANTIC_OUTPUTS, is_semantic_output  # noqa: E402
 
 import model_profile as PROFILE
 from owner_write_advisory import worktree_mutating_scope  # noqa: E402
@@ -221,21 +222,8 @@ def _parallel_path(path, suffix):
     return f"{head}{sep}{name}.{suffix}{dot}{ext}"
 
 
-SEMANTIC_OUTPUTS = frozenset({
-    "applied-artifact", "apply-log", "components", "config",
-    "diff-preview", "evidence-map", "experiment-artifact",
-    "experiment-scaffold", "final-artifact", "render",
-    "research-artifact", "revised-artifact", "ship-checklist",
-    "snapshot", "source-diff", "strategy", "summary-stats",
-    "tokens", "version-snapshot",
-})
-
-
 def _is_semantic_output(output):
-    return output in SEMANTIC_OUTPUTS or any(
-        re.fullmatch(re.escape(token) + r"-[a-z0-9]+(?:-[a-z0-9]+)*", output)
-        for token in SEMANTIC_OUTPUTS
-    )
+    return is_semantic_output(output)
 
 
 def _output_within_scope(output, scope):
