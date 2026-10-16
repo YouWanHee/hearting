@@ -3957,9 +3957,17 @@ def _resume_registered_obligation(duty, store):
     if transfer_ref:
         transferred = peer_message._read_pending(transfer_ref)
         if transferred and transferred.get("state") == "received":
-            peer_obligations.acknowledge_registered_delivery(transferred, roots=[jobs.parent])
+            bound_received = peer_obligations.acknowledge_registered_delivery(
+                transferred, roots=[jobs.parent])
         if transferred and peer_obligations.registered_delivery_settled(transferred, roots=[jobs.parent]):
             transferred = None
+        elif transferred and transferred.get("state") == "received" and bound_received:
+            # The exact recipient receipt is durable even when this ACK write
+            # failed. Keep the existing duty/ref for the next natural retry;
+            # preparing another transfer would duplicate a known receipt.
+            store.update(duty["id"], observation={**observation,
+                "reason": "received-delivery-ack-pending"})
+            return
     parent = [row.metadata.get(key, "") for key in
               ("parent_runtime_pid", "parent_runtime_pid_start", "parent_runtime_ns")]
     # A native hook belongs to its original runtime. A live holder cannot wake
@@ -4015,7 +4023,8 @@ def _resume_registered_obligation(duty, store):
             pending.reclaim(jobs.parent, storage_recipient, delivery_id,
                             now_ns=time.monotonic_ns())
         record = pending.claim(jobs.parent, storage_recipient, delivery_id,
-                               claim_owner=owner, lease_seconds=30, require_generation_proof=False)
+                               claim_owner=owner, lease_seconds=30, require_generation_proof=False,
+                               jobs=jobs)
         if not keep_claim(jobs.parent, storage_recipient, delivery_id, record, owner, jobs=jobs):
             return
         from dispatch_supervision import CONTINUED_KEY, continue_for_parent
