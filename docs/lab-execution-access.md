@@ -1,9 +1,9 @@
 # Lab 실행 저장소와 명시적 데이터 접근
 
-compute 실행 필요를 선언한 origin stage가 있는 route의 owner를 시작하거나
+`part_catalog` row에 compute 실행 필요를 선언한 origin stage가 있는 route의 owner를 시작하거나
 재개하면 초기화된 compute-hosts inventory의 정확한 `run_root`가 기존
 `execution_access_v1` 요청에 포함된다. 이 요구는 `capabilities/topologies.json`의
-origin stage 한 곳에 선언되며 sealed node의 stage identity로 조회한다. borrowed
+`part_catalog`에서 origin stage의 row 한 곳에 선언되며 sealed node의 stage identity로 조회한다. borrowed
 stage도 같은 선언을 사용한다. Inventory는
 `COMPUTE_HOSTS_CONFIG`, 또는 `${XDG_CONFIG_HOME:-~/.config}/hearting/compute-hosts.yaml`에서
 기존 loader로 읽는다. GPU 작업과 compute-hosts resource 실행의 로그·PID 저장소를

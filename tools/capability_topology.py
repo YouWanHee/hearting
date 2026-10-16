@@ -940,12 +940,6 @@ def _validate_recipe(recipe, registry, standard_plus_owner_profile):
         )
     gates = set(recipe["completion_gates"])
     for node in nodes:
-        execution_needs = node.get("execution_needs", [])
-        if (not isinstance(execution_needs, list)
-                or any(not isinstance(item, str) for item in execution_needs)
-                or len(execution_needs) != len(set(execution_needs))
-                or not set(execution_needs) <= {"compute-hosts"}):
-            raise TopologyError(f"{recipe['capability']}:{node['id']}: invalid execution needs")
         requirements = node.get("runtime_requirements", [])
         if (
             not isinstance(requirements, list)
@@ -1427,7 +1421,7 @@ def _validate_producer_lifecycle(registry):
 PART_ID_RE = re.compile(r"^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$")
 PART_ROW_KEYS = frozenset({
     "summary", "shareable", "hosts", "start_approval", "unit_choices",
-    "input_names", "optional_inputs", "optional",
+    "input_names", "optional_inputs", "optional", "execution_needs",
 })
 PART_SHAREABLE_KINDS = ("map-worker", "pipeline-stage", "review-worker", "resource-runner")
 PART_ANCHOR_BY_KIND = {"map-worker": "map_anchor", "review-worker": "review_anchor"}
@@ -1650,6 +1644,12 @@ def _validate_part_catalog(registry, owner_profile):
             raise TopologyError(f"invalid part id {part_id!r}")
         if not isinstance(row, dict) or set(row) - PART_ROW_KEYS:
             raise TopologyError(f"part {part_id}: unknown catalog fields {sorted(set(row) - PART_ROW_KEYS)}")
+        execution_needs = row.get("execution_needs", [])
+        if (not isinstance(execution_needs, list)
+                or any(not isinstance(item, str) for item in execution_needs)
+                or len(execution_needs) != len(set(execution_needs))
+                or not set(execution_needs) <= {"compute-hosts"}):
+            raise TopologyError(f"part {part_id}: invalid execution_needs")
         summary = row.get("summary")
         if not isinstance(summary, str) or not summary.strip() or "\n" in summary:
             raise TopologyError(f"part {part_id}: a one-line summary is required")

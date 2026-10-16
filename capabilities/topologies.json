@@ -1773,7 +1773,6 @@
           {
             "id": "smoke",
             "kind": "review-worker",
-            "execution_needs": ["compute-hosts"],
             "depends_on": [
               "scaffold"
             ],
@@ -1809,7 +1808,6 @@
           {
             "id": "full-run",
             "kind": "resource-runner",
-            "execution_needs": ["compute-hosts"],
             "depends_on": [
               "smoke"
             ],
@@ -1842,7 +1840,6 @@
           {
             "id": "run-verify",
             "kind": "review-worker",
-            "execution_needs": ["compute-hosts"],
             "depends_on": [
               "full-run"
             ],
@@ -2055,7 +2052,6 @@
           {
             "id": "eval-run",
             "kind": "resource-runner",
-            "execution_needs": ["compute-hosts"],
             "depends_on": [],
             "role": "orchestrator",
             "inputs": [
@@ -4858,6 +4854,9 @@
         "hosts": [
           "autopilot-code",
           "autopilot-lab"
+        ],
+        "execution_needs": [
+          "compute-hosts"
         ]
       },
       "autopilot-lab:full-run": {
@@ -4867,10 +4866,16 @@
           "autopilot-code",
           "autopilot-lab"
         ],
-        "start_approval": "full-run"
+        "start_approval": "full-run",
+        "execution_needs": [
+          "compute-hosts"
+        ]
       },
       "autopilot-lab:run-verify": {
-        "summary": "Check the finished run's record, logs and artifact."
+        "summary": "Check the finished run's record, logs and artifact.",
+        "execution_needs": [
+          "compute-hosts"
+        ]
       },
       "autopilot-lab:handoff": {
         "summary": "Owner records the successor workflow for the finished run."
@@ -4880,7 +4885,10 @@
         "input_names": {
           "smoke-attestation": "reviews/smoke-attestation.json",
           "eval-spec": "eval-spec.md"
-        }
+        },
+        "execution_needs": [
+          "compute-hosts"
+        ]
       },
       "autopilot-lab:metrics": {
         "summary": "Compute metrics and summary statistics from raw results.",
@@ -5130,7 +5138,10 @@
             "advance_class": "runtime-eligible",
             "commit_expected": false
           }
-        }
+        },
+        "execution_needs": [
+          "compute-hosts"
+        ]
       },
       "autopilot-lab:resume-run": {
         "summary": "Run one explicitly approved already-verified same-code/config resume, epoch extension or repeat.",
@@ -5171,7 +5182,10 @@
             "commit_expected": false,
             "resource_policy": "verified-resume"
           }
-        }
+        },
+        "execution_needs": [
+          "compute-hosts"
+        ]
       }
     }
   }

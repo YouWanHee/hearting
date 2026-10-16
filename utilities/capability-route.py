@@ -3108,9 +3108,6 @@ def compose_subgraph_recipe(registry, base_recipe, graph_spec, find_input=None, 
     meta = {}
     for index, (key, node_id, unit, part) in enumerate(rows):
         node = json.loads(json.dumps(source_of[node_id]))
-        # execution needs remain registry-owned and resolve through the sealed
-        # origin identity; copying them into route nodes creates a second rule.
-        node.pop("execution_needs", None)
         part_id = key if part else f"{host}:{node_id}"
         catalog_row = TOPO.part_row(registry, part_id)
         capability = part["capability"] if part else host
@@ -5008,7 +5005,6 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
             auxiliary_check_units=registry.get("auxiliary_check_units"),
         )
         for node in nodes:
-            node.pop("execution_needs", None)
             node.pop("fallback_hops", None)
         selection_basis=[{"axis":"promotion","signal":s,"source":"caller"} for s in signals]
     _validate_output_scopes(nodes)
@@ -5162,10 +5158,7 @@ def _compile_from_recipe(registry, recipe, capability, capability_mode, requeste
         payload["dispatch_evidence_scope_version"]=DISPATCH_EVIDENCE_SCOPE_VERSION
     if composed:
         payload["composed"]=True
-        sealed_recipe=json.loads(json.dumps(recipe))
-        for node in sealed_recipe.get("standard_plus", {}).get("nodes", []):
-            node.pop("execution_needs", None)
-        payload["composed_recipe"]=sealed_recipe
+        payload["composed_recipe"]=json.loads(json.dumps(recipe))
     if route_plan is not None:
         payload["route_plan"]=json.loads(json.dumps(route_plan))
     digest=route_hash(payload); payload["route_hash"]=digest; payload["route_id"]=ROUTE_IDENTITY.route_id_from_hash(digest)
@@ -5451,8 +5444,6 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
             route.get("effective_intensity"), route.get("capability"),
             auxiliary_check_units=registry.get("auxiliary_check_units"),
             persona_policy=persona_version == 1)
-        for node in expected_nodes:
-            node.pop("execution_needs", None)
         _project_entry_scope_nodes(expected_nodes, entry_scope)
         if route.get("profile_selection_contract_version") == 1:
             # Same ladder, same order as the compiler: stamp, then seal (under the policy the
@@ -5486,8 +5477,6 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
                 route.get("effective_intensity"), route.get("capability"),
                 auxiliary_check_units=registry.get("auxiliary_check_units"),
             persona_policy=persona_version == 1)
-            for node in expected_nodes:
-                node.pop("execution_needs", None)
             _project_entry_scope_nodes(expected_nodes, entry_scope)
             if route.get("profile_selection_contract_version") == 1:
                 # Same ladder, same order as the compiler: stamp, then seal (under the policy the

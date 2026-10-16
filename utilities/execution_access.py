@@ -832,10 +832,10 @@ def compute_execution_scope(route: Mapping[str, object], *, node: str | None = N
                 continue
             identity = f"{capability}:{stage}"
         try:
-            found = topology.part_recipe(registry, identity)
+            found = topology.part_row(registry, identity)
         except (KeyError, TypeError, ValueError):
             found = None
-        if found and "compute-hosts" in (found[1].get("execution_needs") or []):
+        if found and "compute-hosts" in (found.get("execution_needs") or []):
             return True
     return False
 

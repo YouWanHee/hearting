@@ -77,11 +77,12 @@ Adapters must preserve the portable invariants relevant to this capability:
 - resolve artifact root through `utilities/artifact-root.sh` or equivalent logic;
 - use DB memory paths, not runtime-native memory files.
 
-An owner route that contains a registered stage declaring the `compute-hosts`
-execution need prepares the existing execution access request with the
-initialized inventory's exact `run_root`. The declaration stays on the origin
-stage in `capabilities/topologies.json`; native and borrowed sealed nodes resolve
-it by stage identity. It is not copied into each sealed node. This covers the
+An owner route that contains a registered stage whose part catalog row declares
+the `compute-hosts` execution need prepares the existing execution access
+request with the initialized inventory's exact `run_root`. The declaration is
+on the origin stage's row in the `part_catalog` of
+`capabilities/topologies.json`; native and borrowed sealed nodes resolve it by
+stage identity. It is not copied into each sealed node. This covers the
 lab stages that execute or verify compute work, including when code borrows one.
 Frame sessions and routes without such a stage do not receive this default.
 External data roots come from the approved
