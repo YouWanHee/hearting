@@ -578,16 +578,51 @@ def _lock_mkdir_lines(trace_text, lock_paths):
 
 
 def _wait_for_pending_lock_mkdir(harness, alias, lock_paths, timeout=15):
-    """Wait until strace has printed a delayed lock mkdir that has not returned."""
+    """Return the thread id whose delayed lock mkdir is printed but not returned."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        lines = _lock_mkdir_lines(_trace_text(harness, alias), lock_paths)
-        if any(' = ' not in line for line in lines):
-            return
-        if lines:
+        traces = harness.traces(harness.root / f'trace-{alias}')
+        for path, content in traces.items():
+            if any(' = ' not in line for line in _lock_mkdir_lines(content, lock_paths)):
+                return path.name.rsplit('.', 1)[-1]
+        if _lock_mkdir_lines('\n'.join(traces.values()), lock_paths):
             raise RuntimeError(f'{alias} completed its lock mkdir before the pause')
         time.sleep(0.03)
     raise RuntimeError(f'{alias} did not reach the native refresh lock')
+
+
+def _thread_group(tid):
+    status = Path(f'/proc/{tid}/status').read_text(encoding='ascii')
+    return re.search(r'^Tgid:\s+(\d+)$', status, re.M).group(1)
+
+
+def _watch_child_threads(tracer_pid, seen, stop):
+    """Record (process, thread) ids of a tracer's children while they run."""
+    while not stop.is_set():
+        try:
+            children = Path(f'/proc/{tracer_pid}/task/{tracer_pid}/children').read_text(
+                encoding='ascii').split()
+        except OSError:
+            children = []
+        for child in children:
+            try:
+                seen.update((child, tid) for tid in os.listdir(f'/proc/{child}/task'))
+            except OSError:
+                pass
+        time.sleep(0.005)
+
+
+def _timed_lines(harness, alias, threads):
+    """Return (timestamp, line) from the given threads' strace -ttt files."""
+    events = []
+    for path, content in harness.traces(harness.root / f'trace-{alias}').items():
+        if path.name.rsplit('.', 1)[-1] not in threads:
+            continue
+        for line in content.splitlines():
+            stamp = line.split(' ', 1)[0]
+            if re.fullmatch(r'\d+\.\d+', stamp):
+                events.append((float(stamp), line))
+    return sorted(events)
 
 
 def _wait_for_lock_contention(harness, alias, lock_path, timeout=12):
@@ -1047,7 +1082,9 @@ def _native_child(cli, root):
         # has read the expired credential and decided to refresh. While C is
         # held at that syscall entry, actual CLI A refreshes and releases the
         # same lock. C then acquires the lock successfully and must reread the
-        # canonical file under it and use A's token without a second refresh.
+        # canonical file while holding it and use A's token without a second
+        # refresh. The CLI performs file I/O on pool threads, so ordering is
+        # judged by strace timestamps across the threads of C's own process.
         harness.state.reset('post-lock-reread')
         reread_home = root / 'post-lock-home'
         reread_store = root / 'post-lock-auth'
@@ -1061,9 +1098,8 @@ def _native_child(cli, root):
         pause_us = 10_000_000
         trace_c = root / 'trace-post-lock-c'
         command_c = [
-            '/usr/bin/strace', '-ff', '-qq', '-e', 'trace=%file,execve',
-            '-P', reread_locks[0], '-P', reread_locks[1],
-            '-P', str(reread_credential), '-P', harness.cli,
+            '/usr/bin/strace', '-ff', '-qq', '-ttt', '-T', '-e', 'trace=%file,execve',
+            '-P', reread_locks[0], '-P', str(reread_credential), '-P', harness.cli,
             '-e', f'inject=mkdir,mkdirat:delay_enter={pause_us}:when=1',
             '-s', '200', '-o', str(trace_c), harness.cli,
             '-p', 'post-lock-c', '--output-format', 'text', '--model', MODEL,
@@ -1076,7 +1112,13 @@ def _native_child(cli, root):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             start_new_session=True)
         harness.processes.append(proc_c)
-        _wait_for_pending_lock_mkdir(harness, 'post-lock-c', reread_locks)
+        c_threads = set()
+        stop_threads = threading.Event()
+        thread_watcher = threading.Thread(target=_watch_child_threads, args=(
+            proc_c.pid, c_threads, stop_threads), daemon=True)
+        thread_watcher.start()
+        paused_tid = _wait_for_pending_lock_mkdir(harness, 'post-lock-c', reread_locks)
+        paused_process = _thread_group(paused_tid)
         if harness.state.refresh_count != 0:
             raise RuntimeError('worker C refreshed before reaching the native lock')
         trace_a_reread, _ = harness.run_cli(
@@ -1091,25 +1133,36 @@ def _native_child(cli, root):
         if not any(' = ' not in line for line in pending):
             raise RuntimeError('worker C left its paused lock mkdir before A finished')
         out_c, _ = proc_c.communicate(timeout=40)
+        stop_threads.set()
+        thread_watcher.join(timeout=2)
         if proc_c.returncode != 0:
             raise RuntimeError(f'worker C failed: {_clean_text(out_c[-1200:])}')
         trace_c_text = _trace_text(harness, 'post-lock-c')
-        c_lines = trace_c_text.splitlines()
-        delayed = [index for index, line in enumerate(c_lines)
-                   if line in _lock_mkdir_lines(trace_c_text, reread_locks)
-                   and '(DELAYED)' in line]
-        if len(delayed) < 1 or not all(
-                ' = 0 (DELAYED)' in c_lines[index] for index in delayed):
-            raise RuntimeError('worker C did not acquire the lock after its pause')
-        contended = [line for line in _lock_mkdir_lines(trace_c_text, reread_locks)
-                     if 'EEXIST' in line]
-        if contended:
+        c_process = harness.cli_pid(trace_c, prompt='post-lock-c')
+        if c_process != [paused_process]:
+            raise RuntimeError('paused lock thread does not belong to worker C')
+        own_threads = {tid for process, tid in c_threads if process == paused_process}
+        if paused_tid not in own_threads:
+            raise RuntimeError('worker C thread inventory missed the paused thread')
+        if [line for line in _lock_mkdir_lines(trace_c_text, reread_locks)
+                if 'EEXIST' in line or ('(DELAYED)' in line and ' = 0 (DELAYED)' not in line)]:
             raise RuntimeError('worker C contended instead of acquiring the free lock')
-        rereads = [index for index, line in enumerate(c_lines)
+        timeline = _timed_lines(harness, 'post-lock-c', own_threads)
+        acquired = [(stamp, line) for stamp, line in timeline
+                    if line in _lock_mkdir_lines(line, reread_locks[:1])
+                    and ' = 0 (DELAYED)' in line]
+        released = [stamp for stamp, line in timeline
+                    if f'rmdir("{reread_locks[0]}")' in line and ' = 0 ' in line]
+        if len(acquired) != 1 or len(released) != 1:
+            raise RuntimeError('worker C did not acquire and release the lock once')
+        lock_returned = acquired[0][0] + float(
+            re.search(r'<([0-9.]+)>\s*$', acquired[0][1]).group(1))
+        rereads = [stamp for stamp, line in timeline
                    if '.credentials.json' in line and 'openat(' in line
-                   and index > delayed[0]]
+                   and ' = -1 ' not in line and lock_returned <= stamp <= released[0]]
         if not rereads:
-            raise RuntimeError('worker C did not reread credentials after acquiring the lock')
+            raise RuntimeError('worker C did not reread credentials while holding the lock')
+        reread_delay_ms = round((rereads[0] - lock_returned) * 1000, 3)
         c_generations = [event['access_generation'] for event in harness.state.events
                          if event.get('event') == 'message' and
                          event.get('prompt') == 'post-lock-c']
@@ -1126,6 +1179,9 @@ def _native_child(cli, root):
                 'worker_c': harness.cli_pid(trace_c, prompt='post-lock-c'),
             },
             'worker_c_paused_at_lock_mkdir_us': pause_us,
+            'paused_thread_in_worker_c_process': True,
+            'reread_under_lock_after_return_ms': reread_delay_ms,
+            'reread_opens_while_lock_held': len(rereads),
             'worker_a_refreshed_while_c_paused': True,
             'successful_reacquire_then_reread': True,
             'worker_c_lock_contention': False,
