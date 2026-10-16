@@ -89,6 +89,7 @@ CARD_HISTORY_KEEP = 20
 LEDGER_FOLD_LINES = 500
 LEDGER_KEEP_RAW = 100
 HANDOVER_KEEP_ROWS = 40
+TIDY_CLAIM_KEEP_ROWS = 64
 PROMPT_LEDGER_THROTTLE_SEC = 20
 COMPACT_DEDUPE_SEC = 60
 AUTHOR_STALE_SEC = 10 * 60
@@ -533,11 +534,108 @@ def _read_ledger_lines(seat: Seat) -> list[dict]:
     return entries
 
 
+def _append_ledger_entry(seat: Seat, entry: dict) -> None:
+    """Append a caller-locked ledger row and fold without dropping tidy provenance."""
+    path = _ledger_path(seat)
+    ensure_dir(path.parent)
+    _reject_symlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    _fold_ledger(seat)
+
+
+def record_tidy_claim(seat: Seat, *, harness: str, sid: str, claim_id: str, nonce: str,
+                      token: str, digest: str, origin: str, operation_id: str,
+                      sent_seq: int, state: str, now: Optional[float] = None,
+                      arrival_seq: Optional[int] = None, target_sid: str = "",
+                      acceptance: Optional[dict] = None) -> None:
+    """Persist one claim transition in the existing seat ledger (caller holds its lock)."""
+    if not claim_id or not nonce or not token or not digest or harness not in HARNESSES or not sid:
+        return
+    entry = {"ts": now_epoch() if now is None else now, "harness": harness, "sid": sid,
+             "event": "tidy-claim", "claim_id": claim_id[:96], "nonce": nonce[:64],
+             "token": token[:64], "digest": digest[:64], "origin": origin[:24],
+             "operation_id": operation_id[:96], "sent_seq": max(0, int(sent_seq)),
+             "state": state[:24]}
+    if target_sid:
+        entry["target_sid"] = target_sid[:160]
+    if arrival_seq is not None and not isinstance(arrival_seq, bool) and int(arrival_seq) >= 0:
+        entry["arrival_seq"] = int(arrival_seq)
+    if isinstance(acceptance, dict):
+        entry["acceptance"] = acceptance
+    _append_ledger_entry(seat, entry)
+
+
+def tidy_claim_by_id(seat: Seat, claim_id: str) -> Optional[dict]:
+    if not claim_id:
+        return None
+    return next((row for row in reversed(_read_ledger_lines(seat))
+                 if row.get("event") == "tidy-claim" and row.get("claim_id") == claim_id), None)
+
+
+def matching_tidy_claim(seat: Seat, harness: str, sid: str, prompt: str, sequence: int) -> Optional[dict]:
+    """Find an exact, still-classifiable request claim for this session and prompt boundary."""
+    if not prompt or harness not in HARNESSES or not sid:
+        return None
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    latest: dict[str, dict] = {}
+    for row in _read_ledger_lines(seat):
+        if row.get("event") == "tidy-claim" and row.get("claim_id"):
+            latest[str(row["claim_id"])] = row
+    candidates = [row for row in latest.values()
+                  if row.get("harness") == harness and row.get("digest") == digest
+                  and row.get("state") not in {"released", "superseded"}
+                  and int(row.get("sent_seq", sequence) or 0) < sequence
+                  and row.get("target_sid") in (None, "", sid)
+                  and (row.get("sid") == sid or row.get("target_sid") == sid
+                       or row.get("origin") in ("status-only", "continue") and row.get("sid") == "-")]
+    return max(candidates, key=lambda row: (int(row.get("sent_seq", 0) or 0), float(row.get("ts", 0) or 0)),
+               default=None)
+
+
+def real_prompt_frontier(seat: Seat, harness: str, sid: str) -> Optional[dict]:
+    """Latest actual user prompt for this exact session, independent of ledger throttling."""
+    rows = [row for row in _read_ledger_lines(seat)
+            if row.get("event") == "real-prompt" and row.get("harness") == harness and row.get("sid") == sid]
+    return max(rows, key=lambda row: int(row.get("sequence", 0) or 0), default=None)
+
+
+def record_real_prompt(seat: Seat, harness: str, sid: str, sequence: int, now: float) -> None:
+    """Persist user activity after prompt-source classification (caller holds the seat lock)."""
+    _append_ledger_entry(seat, {"ts": now, "harness": harness, "sid": sid,
+                                "event": "real-prompt", "sequence": max(0, int(sequence))})
+
+
+def mark_prompt_source(seat: Seat, harness: str, sid: str, sequence: int, source: str,
+                       claim_id: str = "") -> None:
+    """Tag the current physical prompt boundary after its exact source has been classified."""
+    path = _prompt_seq_path(seat)
+    current = read_json(path)
+    if (not isinstance(current, dict) or int(current.get("seq", -1)) != sequence
+            or current.get("harness") != harness or current.get("sid") != sid):
+        return
+    current["source"] = source
+    if claim_id:
+        current["claim_id"] = claim_id[:96]
+    else:
+        current.pop("claim_id", None)
+    atomic_write_json(path, current)
+
+
+def prompt_state(seat: Seat) -> Optional[dict]:
+    data = read_json(_prompt_seq_path(seat))
+    return data if isinstance(data, dict) else None
+
+
 def session_summary(seat: Seat) -> dict[tuple[str, str], dict]:
     """Fold the ledger: ``(harness, sid) -> first_seen, last_seen, epoch, transcript, cwd, ...``."""
     out: dict[tuple[str, str], dict] = {}
     for item in _read_ledger_lines(seat):
-        if item.get("event") == "handover":     # a relation row (dispatch_seat_handover), not a session event
+        if item.get("event") in {"handover", "tidy-claim", "real-prompt"}:
+            # Relations and prompt provenance are not session activity timestamps.
             continue
         key = (str(item.get("harness") or ""), str(item["sid"]))
         row = out.setdefault(key, {"harness": key[0], "sid": key[1], "first_seen": item.get("first_seen", item.get("ts", 0)),
@@ -639,15 +737,7 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
         entry["compact"] = compact
     if summary is None:
         entry["first_seen"] = now
-    path = _ledger_path(seat)
-    ensure_dir(path.parent)
-    _reject_symlink(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
-    finally:
-        os.close(fd)
-    _fold_ledger(seat)
+    _append_ledger_entry(seat, entry)
     return session_summary(seat).get((harness, sid), entry)
 
 
@@ -658,9 +748,21 @@ def _fold_ledger(seat: Seat) -> None:
         return
     # Handover rows (A -> B, with their bindings) are the seat's authority record: they stay raw.
     relations = [l for l in lines if l.get("event") == "handover"][-HANDOVER_KEEP_ROWS:]
-    lines = [l for l in lines if l.get("event") != "handover"]
-    recent = lines[-LEDGER_KEEP_RAW:]
-    older = lines[:-LEDGER_KEEP_RAW]
+    claims: dict[str, dict] = {}
+    real_frontiers: dict[tuple[str, str], dict] = {}
+    activity = [l for l in lines if l.get("event") not in {"handover", "tidy-claim", "real-prompt"}]
+    for item in lines:
+        if item.get("event") == "tidy-claim" and item.get("claim_id"):
+            claims[str(item["claim_id"])] = item
+        elif item.get("event") == "real-prompt":
+            key = (str(item.get("harness") or ""), str(item.get("sid") or ""))
+            prior = real_frontiers.get(key)
+            if prior is None or int(item.get("sequence", 0) or 0) >= int(prior.get("sequence", 0) or 0):
+                real_frontiers[key] = item
+    claim_rows = sorted(claims.values(), key=lambda row: float(row.get("ts", 0) or 0))[-TIDY_CLAIM_KEEP_ROWS:]
+    provenance = claim_rows + list(real_frontiers.values())
+    recent = activity[-LEDGER_KEEP_RAW:]
+    older = activity[:-LEDGER_KEEP_RAW]
     folded: dict[tuple[str, str], dict] = {}
     for item in older:
         key = (str(item.get("harness") or ""), str(item["sid"]))
@@ -677,7 +779,8 @@ def _fold_ledger(seat: Seat) -> None:
         for field in ("transcript", "cwd"):
             if item.get(field):
                 row[field] = item[field]
-    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in list(folded.values()) + relations + recent)
+    body = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
+                    for r in list(folded.values()) + relations + provenance + recent)
     atomic_write(_ledger_path(seat), body.encode("utf-8"))
 
 
@@ -1009,15 +1112,14 @@ def read_prompt_seq(seat: Seat) -> int:
 
 
 def bump_prompt_seq(seat: Seat, harness: str, sid: str, now: float) -> int:
-    """Count one real prompt (caller holds the seat lock).
+    """Count one physical prompt boundary before its source is classified (caller holds the seat lock).
 
     A file of its own, written for every prompt: the ledger throttles prompt lines and
-    folds old ones, and neither may lose a request that decides whether the window is
-    still safe to clear.
+    folds old ones. The source tag is filled immediately by the shared claim classifier.
     """
     seq = read_prompt_seq(seat) + 1
     atomic_write_json(_prompt_seq_path(seat), {"schema": SCHEMA, "seq": seq, "at": now,
-                                              "harness": harness, "sid": sid})
+                                              "harness": harness, "sid": sid, "source": "pending"})
     return seq
 
 
@@ -1456,6 +1558,19 @@ def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transc
             return (f"booking=pending reason=compact-state-{type(exc).__name__} "
                     f"queue-write={type(queue_exc).__name__}")
 
+    compact_queue = None
+    if codex_auto:
+        try:
+            import session_tidy_runner as runner
+            queue_transcript = str(context.get("transcript") or (prior or {}).get("transcript", ""))
+            compact_queue = runner.enqueue_item(seat, harness, sid, cwd, queue_transcript,
+                                                operation_id=context["identity"], start=False)
+            context["queue_id"] = compact_queue["id"]
+            context["operation_id"] = context["identity"]
+            compact_queue = runner._start_queued(compact_queue)
+        except BaseException as exc:  # noqa: BLE001 - the ledger event lets an ordinary hook retry
+            return f"booking=pending reason=queue-write-{type(exc).__name__}"
+
     if preserve_idle:
         return "booking=skipped reason=idle-origin-preserved"
     if compact_request_in_progress and not (ledger_event and
@@ -1468,11 +1583,9 @@ def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transc
     transcript_path = str(context.get("transcript") or (prior or {}).get("transcript", ""))
     if codex_auto:
         if not context.get("card_request_required") or seat.kind != "pane" or not seat.pane:
-            try:
-                runner.enqueue_item(seat, harness, sid, cwd, transcript_path, operation_id=operation_id)
-            except BaseException as exc:  # noqa: BLE001
-                return f"booking=pending reason=queue-write-{type(exc).__name__}"
-            return f"booking=queue-only reason={context.get('turn_evidence_reason') or 'exact-pane-unavailable'}"
+            launch_error = (compact_queue or {}).get("runner_start_error")
+            return f"booking=queue-only reason={context.get('turn_evidence_reason') or 'exact-pane-unavailable'}" + (
+                f" runner-start={str(launch_error)[:48]}" if launch_error else "")
         try:
             wait = max(0.0, min(COMPACT_LOCK_WAIT_SEC, started + COMPACT_HOOK_BUDGET_SEC - time.monotonic()))
             booked = clear.schedule_compact_card_request(seat, harness, sid, cwd, context,
@@ -1521,7 +1634,8 @@ def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transc
 
 
 def reconcile_compact_frontier(harness: str, sid: str, cwd: str = "", *, env=None,
-                               now: Optional[float] = None) -> str:
+                               now: Optional[float] = None,
+                               lock_wait: Optional[float] = None) -> str:
     """Resume one automatic compact event from its seat ledger/card and stable queue identity."""
     env = os.environ if env is None else env
     if is_worker(env) or harness not in HARNESSES or not sid:
@@ -1536,6 +1650,18 @@ def reconcile_compact_frontier(harness: str, sid: str, cwd: str = "", *, env=Non
     if not event or not identity or compact.get("trigger") != "auto":
         return ""
     try:
+        import session_tidy_runner as runner
+        transcript = str(compact.get("transcript") or event.get("transcript") or "")
+        # Queue receipt and runner restart are independent of card request and clear state.
+        # The stable operation ID makes this safe after cancellation, timeout or partial booking.
+        queued = runner.enqueue_item(seat, harness, sid, cwd or str(event.get("cwd") or ""), transcript,
+                                     operation_id=identity, queue_id=runner.operation_queue_id(identity),
+                                     start=False)
+        context_queue_id = str(queued.get("id") or "")
+
+        def start_queue():
+            return runner._start_queued(queued)
+
         import session_tidy_clear as clear
         held = clear.read_reservation(seat.key)
         if held and (held.get("compact") or {}).get("identity") == identity:
@@ -1544,25 +1670,33 @@ def reconcile_compact_frontier(harness: str, sid: str, cwd: str = "", *, env=Non
                 runner.reconcile_reservation_queue(seat)
                 return "booking=scheduled" if clear.reconcile_pending(seat) else "booking=pending reason=helper-reconcile"
             if read_prompt_seq(seat) == int(compact.get("prompt_seq", -1)):
+                start_queue()
                 return f"booking=completed reason={held.get('status') or 'terminal'}"
+            start_queue()
             return ""
         if held and held.get("status") == "reserved":
+            start_queue()
             return "booking=pending reason=booking-pending"
         if int(compact.get("prompt_seq", -1)) != read_prompt_seq(seat):
+            start_queue()
             return "booking=skipped reason=new-input"
         current_card = read_latest_card(seat)
         generation = int((current_card or {}).get("generation", 0) or 0)
         card_request_required = compact.get("card_request_required") is True
         if card_request_required and generation != int(compact.get("card_generation", generation)):
+            start_queue()
             return "booking=skipped reason=card-changed"
         context = dict(compact)
         context["identity"] = identity
         context["trigger"] = "auto"
-        context["transcript"] = str(context.get("transcript") or event.get("transcript") or "")
+        context["transcript"] = transcript
         context["card_request_required"] = card_request_required
         if context["card_request_required"]:
+            context["queue_id"] = context_queue_id
+            start_queue()
             booked = clear.schedule_compact_card_request(
-                seat, harness, sid, cwd or str(event.get("cwd") or ""), context, now=now)
+                seat, harness, sid, cwd or str(event.get("cwd") or ""), context, now=now,
+                lock_wait=lock_wait)
             return _compact_booking_result(booked)
         if (not current_card or (current_card.get("compact") or {}).get("identity") != identity
                 or (current_card.get("author") or {}).get("harness") != harness
@@ -1571,6 +1705,7 @@ def reconcile_compact_frontier(harness: str, sid: str, cwd: str = "", *, env=Non
         import session_tidy_runner as runner
         _item, booked = _enqueue_tidy(seat, harness, sid, cwd or str(event.get("cwd") or ""),
                                       context["transcript"], compact_context=context,
+                                      bounded_until=(time.monotonic() + lock_wait if lock_wait is not None else None),
                                       compact_started_at=float(event.get("ts", 0) or 0),
                                       operation_id=identity, runner=runner)
         return _compact_booking_result(booked)

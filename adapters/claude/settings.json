@@ -291,11 +291,6 @@
           },
           {
             "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 session-tidy-idle.py",
-            "timeout": 5
-          },
-          {
-            "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 herdr-session-projection.py",
             "timeout": 5
           }
@@ -376,6 +371,11 @@
           {
             "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 open-cycle-checkpoint.py",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 session-tidy-idle.py",
             "timeout": 5
           }
         ]

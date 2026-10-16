@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
+import runpy
 import sqlite3
 import sys
 import unittest
@@ -250,6 +252,186 @@ class IdleObserverTests(unittest.TestCase):
             self.assertTrue(clear.idle_clear_armed(seat, "claude", "sid-B"))
             self.assertEqual(idle.observe_payload(
                 "claude", {**successor_payload, "turn_id": "user-turn"}, now=clock[0] + 2), "booking=scheduled")
+
+    def test_late_unverified_claim_keeps_idle_provenance_after_booking_terminal(self):
+        clock = [1000.0]
+        with self.iso.patched_environ(self.extra), \
+             mock.patch.object(clear, "herdr_command", return_value=str(self.iso.root / "fake-herdr")), \
+             mock.patch.object(clear, "_start_helper", return_value=12345), \
+             mock.patch.object(st, "now_epoch", side_effect=lambda: clock[0]):
+            self.assertEqual(self.observe_claude(now=clock[0]), "booking=scheduled")
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            booking = clear.read_reservation(seat.key)
+            clock[0] = 4241
+            claim, reason = clear.claim_idle_card_request(clear.reservation_path(seat.key), booking["nonce"])
+            self.assertEqual(reason, "")
+            request = clear.idle_card_request_text(claim)
+            self.assertFalse(clear.finish_idle_card_request(claim, accepted=True))
+            self.assertTrue(clear._finish(seat.key, booking["nonce"], "unverified", "arrival-not-observed"))
+
+            # The exact claimed request arrives after the helper has recorded uncertainty.
+            clock[0] = 4242
+            st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), prompt_text=request, now=clock[0])
+            context = clear.idle_context_for_enqueue(seat, "claude", "sid-A")
+            self.assertIsNotNone(context, "late self-request lost its idle provenance")
+            self.assertEqual(context["origin"], "idle")
+            self.assertFalse(context["eligible"], "late arrival must not restore clear permission")
+
+            import session_tidy_runner as runner
+            item = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                       operation_id=context["identity"], start=False)
+            outcome = clear.schedule_for_enqueue(seat, "claude", "sid-A", str(self.cwd),
+                                                 idle_context=context, operation_id=context["identity"],
+                                                 queue_id=item["id"])
+            self.assertNotEqual(outcome, "clear=scheduled")
+            self.assertEqual(clear.read_reservation(seat.key)["nonce"], booking["nonce"])
+
+    def test_self_request_stop_after_unverified_terminal_does_not_book_a_new_idle_nonce(self):
+        clock = [1000.0]
+        with self.iso.patched_environ(self.extra), \
+             mock.patch.object(clear, "herdr_command", return_value=str(self.iso.root / "fake-herdr")), \
+             mock.patch.object(clear, "_start_helper", return_value=12345), \
+             mock.patch.object(st, "now_epoch", side_effect=lambda: clock[0]):
+            self.assertEqual(self.observe_claude(event_id="idle-A", now=clock[0]), "booking=scheduled")
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            booking = clear.read_reservation(seat.key)
+            clock[0] = 4241
+            claim, reason = clear.claim_idle_card_request(clear.reservation_path(seat.key), booking["nonce"])
+            self.assertEqual(reason, "")
+            st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd),
+                        prompt_text=clear.idle_card_request_text(claim), now=clock[0])
+            self.assertTrue(clear.finish_idle_card_request(claim, accepted=True))
+            self.assertTrue(clear._finish(seat.key, booking["nonce"], "unverified", "helper-timeout"))
+
+            clock[0] = 4242
+            result = self.observe_claude(event_id="self-request-stop", now=clock[0])
+            self.assertEqual(result, "booking=skipped reason=not-rearmed")
+            self.assertEqual(clear.read_reservation(seat.key)["nonce"], booking["nonce"])
+            notices = st.read_json(st._notices_path(seat))
+            text = "\n".join(item.get("text", "") for item in notices.get("items", []))
+            self.assertNotIn("/clear", text)
+            self.assertNotIn("이어서해", text)
+
+    def test_real_prompt_in_new_same_pane_session_rearms_after_status_only_clear(self):
+        with self.iso.patched_environ(self.extra), \
+             mock.patch.object(clear, "herdr_command", return_value=str(self.iso.root / "fake-herdr")), \
+             mock.patch.object(clear, "_start_helper", return_value=12345):
+            self.assertEqual(self.observe_claude(event_id="idle-A", now=1000), "booking=scheduled")
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            booking = clear.read_reservation(seat.key)
+            self.assertTrue(clear._finish(seat.key, booking["nonce"], "cleared", observed="sid-B"))
+            with st.seat_lock(seat.key):
+                current = clear.read_reservation(seat.key)
+                current["continued"]["state"] = "sending"
+                clear._write_reservation(current)
+
+            st.run_hook("claude", "prompt", "sid-B", cwd=str(self.cwd),
+                        prompt_text=clear.STATUS_ONLY_TEXT, now=1001)
+            self.assertTrue(clear._finish_continue(seat.key, booking["nonce"], "true"))
+            self.assertEqual(self.observe_claude(sid="sid-B", event_id="status-stop", now=1002),
+                             "booking=skipped reason=not-rearmed")
+
+            st.run_hook("claude", "prompt", "sid-C", cwd=str(self.cwd),
+                        prompt_text="사용자가 새 세션에서 입력", now=1003)
+            self.assertEqual(self.observe_claude(sid="sid-C", event_id="sid-C-stop", now=1004),
+                             "booking=scheduled")
+
+    def test_forced_fold_keeps_late_duplicate_claim_and_real_prompt_frontier_distinct(self):
+        clock = [1000.0]
+        with self.iso.patched_environ(self.extra), \
+             mock.patch.object(clear, "herdr_command", return_value=str(self.iso.root / "fake-herdr")), \
+             mock.patch.object(clear, "_start_helper", return_value=12345), \
+             mock.patch.object(st, "now_epoch", side_effect=lambda: clock[0]):
+            self.assertEqual(self.observe_claude(event_id="fold-idle", now=clock[0]), "booking=scheduled")
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            booking = clear.read_reservation(seat.key)
+            clock[0] = 4241
+            claim, reason = clear.claim_idle_card_request(clear.reservation_path(seat.key), booking["nonce"])
+            self.assertEqual(reason, "")
+            claim_id = claim["idle_request"]["token"]
+            request = clear.idle_card_request_text(claim)
+            self.assertTrue(clear._finish(seat.key, booking["nonce"], "unverified", "arrival-not-observed"))
+
+            with st.seat_lock(seat.key):
+                for index in range(st.LEDGER_FOLD_LINES + 8):
+                    st.record_event(seat, "claude", "sid-A", "card", cwd=str(self.cwd), now=5000 + index)
+                st._fold_ledger(seat)
+            self.assertLess(len(st._read_ledger_lines(seat)), st.LEDGER_FOLD_LINES)
+
+            clock[0] = 6000
+            st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), prompt_text=request, now=clock[0])
+            clock[0] += 1
+            st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd), prompt_text=request, now=clock[0])
+            self.assertFalse(clear.idle_clear_armed(seat, "claude", "sid-A"))
+            clock[0] += 1
+            st.run_hook("claude", "prompt", "sid-A", cwd=str(self.cwd),
+                        prompt_text="actual user input", now=clock[0])
+            self.assertTrue(clear.idle_clear_armed(seat, "claude", "sid-A"))
+
+            prompt_state = st.prompt_state(seat)
+            with st.seat_lock(seat.key):
+                st._fold_ledger(seat)
+            saved_claim = st.tidy_claim_by_id(seat, claim_id)
+            frontier = st.real_prompt_frontier(seat, "claude", "sid-A")
+            self.assertEqual((saved_claim["state"], saved_claim["arrival_seq"]), ("arrived", 1))
+            self.assertEqual((prompt_state["source"], frontier["sequence"]), ("real", prompt_state["seq"]))
+
+    def test_detached_launcher_keeps_pane_hint_and_strips_worker_context(self):
+        captured = {}
+
+        def spawn(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            captured["payload"] = os.pread(kwargs["stdin"], 48 * 1024, 0)
+            return object()
+
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.iso.home),
+               "XDG_CONFIG_HOME": str(self.iso.xdg_config), "XDG_STATE_HOME": str(self.iso.xdg_state),
+               "HERDR_PANE_ID": self.pane, "HERDR_SOCKET_PATH": str(self.iso.root / "fake.sock"),
+               "AGENT_SESSION_ROLE": "main", "AGENT_ARTIFACT_PRODUCER_ID": "parent"}
+        payload = {"hook_event_name": "Stop", "session_id": "sid-A", "cwd": str(self.cwd)}
+        self.assertTrue(idle.launch_observer("claude", payload, environ=env, popen=spawn))
+        self.assertEqual(json.loads(captured["payload"]), payload)
+        self.assertTrue(captured["kwargs"]["start_new_session"])
+        self.assertIn(captured["kwargs"]["stdin"], captured["kwargs"]["pass_fds"])
+        self.assertEqual(captured["kwargs"]["env"]["HERDR_PANE_ID"], self.pane)
+        self.assertEqual(captured["kwargs"]["env"]["HERDR_SOCKET_PATH"], env["HERDR_SOCKET_PATH"])
+        self.assertNotIn("AGENT_SESSION_ROLE", captured["kwargs"]["env"])
+        self.assertNotIn("AGENT_ARTIFACT_PRODUCER_ID", captured["kwargs"]["env"])
+
+    def test_detached_launcher_excludes_worker_owner_auxiliary_and_reviewer(self):
+        spawn = mock.Mock()
+        payload = {"hook_event_name": "Stop", "session_id": "sid-A", "cwd": str(self.cwd)}
+        for role in ("worker", "owner", "auxiliary", "reviewer"):
+            with self.subTest(role=role):
+                env = {"AGENT_SESSION_ROLE": role}
+                self.assertFalse(idle.launch_observer("claude", payload, environ=env, popen=spawn))
+        spawn.assert_not_called()
+
+    def test_claude_idle_bridge_is_registered_on_stop_not_session_start(self):
+        settings = json.loads((ROOT / "adapters/claude/settings.json").read_text(encoding="utf-8"))
+        plugin = json.loads((ROOT / "adapters/claude/plugin-marketplace/plugins/hearting-claude/hooks/hooks.json")
+                            .read_text(encoding="utf-8"))
+
+        def commands(config, event):
+            return [hook.get("command", "") for group in config.get("hooks", {}).get(event, [])
+                    for hook in group.get("hooks", [])]
+
+        self.assertTrue(any("session-tidy-idle.py" in command for command in commands(settings, "Stop")))
+        self.assertFalse(any("session-tidy-idle.py" in command for command in commands(settings, "SessionStart")))
+        self.assertTrue(any("session-tidy-idle.py" in command for command in commands(plugin, "Stop")))
+        self.assertFalse(any("session-tidy-idle.py" in command for command in commands(plugin, "SessionStart")))
+
+    def test_claude_stop_bridge_only_launches_the_detached_observer(self):
+        payload = {"hook_event_name": "Stop", "session_id": "sid-A", "cwd": str(self.cwd)}
+        calls = []
+        with mock.patch.dict(os.environ, {"AGENT_HOME": str(ROOT)}, clear=True), \
+                mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+                mock.patch.object(idle, "launch_observer", side_effect=lambda harness, value:
+                                  calls.append((harness, value))):
+            bridge = runpy.run_path(str(ROOT / "hooks/session-tidy-idle.py"), run_name="idle_bridge_test")
+            bridge["main"]()
+        self.assertEqual(calls, [("claude", payload)])
 
 
 if __name__ == "__main__":

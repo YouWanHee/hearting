@@ -272,6 +272,24 @@ function spawnCheckpoint(sid) {
   }
 }
 
+function spawnIdleObserver(sid, cwd) {
+  if (!sid || isWorkerSession()) return
+  try {
+    const child = spawn("python3", [sessionTidyIdle, "--harness", "opencode", "--detach"], {
+      cwd: root,
+      env: { ...process.env, AGENT_HOME: root },
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+    })
+    child.on("error", () => {})
+    child.stdin.on("error", () => {})
+    child.stdin.end(JSON.stringify({ event: "session.idle", session_id: sid, cwd: cwd || root }))
+    child.unref()
+  } catch {
+    // Optional idle observation never delays summary, checkpoint or peer delivery.
+  }
+}
+
 // Pane-header identity, shared with Claude and Codex (tools/fleet/herdr_projection.py).
 // OpenCode has no user-configurable status line, so the pane header is the only place
 // this session can say which session it is -- and it must say it in the same shape the
@@ -1534,13 +1552,7 @@ export const AgentHarnessGuards = async (ctx) => {
       observeCompactRuntimeStatus(ctx, eventSid, "idle")
       observePaneCallback(ctx, "session.idle", eventSid)
       if (!isWorkerSession()) {
-        try {
-          spawnSync(python3, [sessionTidyIdle, "--harness", "opencode"], {
-            cwd: root, env: { ...process.env, AGENT_HOME: root },
-            input: JSON.stringify({ event: "session.idle", session_id: eventSid, cwd: baseDir(ctx) }),
-            encoding: "utf8", timeout: 4000, killSignal: "SIGKILL",
-          })
-        } catch { /* Idle tidy is optional; keep summary/checkpoint and peer delivery alive. */ }
+        spawnIdleObserver(eventSid, baseDir(ctx))
         spawnSummary(eventSid, "final")
         await projectPane(eventSid, ctx)
       }

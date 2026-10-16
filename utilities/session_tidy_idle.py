@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 from typing import Any
 
@@ -143,7 +144,8 @@ def _tokens_and_provider(harness: str, payload: dict, sid: str, transcript: str)
         model or _walk(payload, "model", "model_id", "modelID")
 
 
-def observe_payload(harness: str, payload: dict, *, now: float | None = None) -> str:
+def observe_payload(harness: str, payload: dict, *, now: float | None = None,
+                    lock_wait: float | None = None) -> str:
     """Accept one actual Stop/session.idle payload; unknown usage never books a clear."""
     if harness not in ("claude", "codex", "opencode") or not isinstance(payload, dict):
         return "booking=skipped reason=invalid-payload"
@@ -163,7 +165,7 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None) ->
             "owner", "worker", "auxiliary", "reviewer"}:
         return "booking=skipped reason=worker"
     from session_tidy import reconcile_compact_frontier
-    compact_result = reconcile_compact_frontier(harness, sid, cwd, now=now)
+    compact_result = reconcile_compact_frontier(harness, sid, cwd, now=now, lock_wait=lock_wait)
     if compact_result and compact_result not in ("booking=skipped reason=new-input",
                                                   "booking=skipped reason=card-changed"):
         return compact_result
@@ -179,20 +181,72 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None) ->
     if not event_id:
         return "booking=skipped reason=turn-identity-unknown"
     from session_tidy_clear import observe_idle_event
-    return observe_idle_event(harness, sid, cwd, event_id=event_id, provider=provider,
-                              model=model, tokens=tokens, now=now)
+    try:
+        return observe_idle_event(harness, sid, cwd, event_id=event_id, provider=provider,
+                                  model=model, tokens=tokens, now=now, lock_wait=lock_wait)
+    except (BlockingIOError, TimeoutError):
+        return "booking=skipped reason=seat-busy"
+
+
+def launch_observer(harness: str, payload: dict, *, environ=None, popen=None) -> bool:
+    """Start the optional observer as a detached, worker-scrubbed child and return immediately."""
+    environ = os.environ if environ is None else environ
+    if harness not in ("claude", "codex", "opencode") or not isinstance(payload, dict):
+        return False
+    from session_tidy import is_worker
+    if is_worker(environ) or str(environ.get("AGENT_SESSION_ROLE", "")).lower() in {
+            "owner", "worker", "auxiliary", "reviewer"}:
+        return False
+    payload_fd = None
+    try:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(body) > 48 * 1024:
+            return False
+        memfd = getattr(os, "memfd_create", None)
+        if memfd is None:
+            return False
+        payload_fd = memfd("hearting-idle-observer", getattr(os, "MFD_CLOEXEC", 0))
+        view = memoryview(body)
+        while view:
+            written = os.write(payload_fd, view)
+            view = view[written:]
+        os.lseek(payload_fd, 0, os.SEEK_SET)
+        from session_tidy_runner import clean_env
+        child_env = clean_env(environ)
+        # A pane id is only a lookup hint and is revalidated by the normal seat resolver.
+        for key in ("HERDR_PANE_ID", "HERDR_SOCKET_PATH"):
+            if environ.get(key):
+                child_env[key] = str(environ[key])
+        command = [sys.executable, str(Path(__file__).resolve()), "--harness", harness]
+        spawn = subprocess.Popen if popen is None else popen
+        spawn(command, stdin=payload_fd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              close_fds=True, pass_fds=(payload_fd,), start_new_session=True,
+              env=child_env, cwd=str(ROOT))
+        return True
+    except (OSError, subprocess.SubprocessError, BrokenPipeError, ValueError, TypeError):
+        return False
+    finally:
+        if payload_fd is not None:
+            try:
+                os.close(payload_fd)
+            except OSError:
+                pass
 
 
 def main(argv=None) -> int:
     import argparse
     parser = argparse.ArgumentParser(prog="session_tidy_idle.py")
     parser.add_argument("--harness", choices=("claude", "codex", "opencode"), required=True)
+    parser.add_argument("--detach", action="store_true")
     args = parser.parse_args(argv)
     try:
         payload = json.load(sys.stdin)
     except (ValueError, OSError):
         return 0
-    result = observe_payload(args.harness, payload)
+    if args.detach:
+        launch_observer(args.harness, payload)
+        return 0
+    result = observe_payload(args.harness, payload, lock_wait=0.05)
     if result:
         print(result)
     return 0

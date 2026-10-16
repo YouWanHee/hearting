@@ -790,7 +790,8 @@ class LedgerTest(TidyCase):
             row = st.session_summary(seat)[("claude", "sid-A")]
             lines = st._read_ledger_lines(seat)
         self.assertEqual(row["epoch"], 1)
-        self.assertLessEqual(len(lines), 4)                                       # start, one prompt, compact (+ slack)
+        activity = [line for line in lines if line.get("event") not in {"tidy-claim", "real-prompt"}]
+        self.assertLessEqual(len(activity), 4)
 
     def test_a_long_ledger_folds_without_losing_epochs_or_first_seen(self):
         with self.library():
@@ -1385,7 +1386,8 @@ class CodexCompactBridgeTest(TidyCase):
             self.assertEqual(result, "booking=scheduled")
             booking = clear.read_reservation(self.seat.key)
             self.assertTrue(booking["compact"]["card_request_required"])
-            self.assertEqual(booking["memory_state"], "awaiting-card")
+            self.assertEqual(booking["memory_state"], "queued")
+            self.assertEqual(runner.read_item(booking["queue_id"])["operation_id"], booking["operation_id"])
             with path.open("ab") as handle:
                 handle.write((json.dumps({"type": "event_msg", "payload": {
                     "type": "task_complete", "turn_id": "turn-compact-1"}}) + "\n").encode())
@@ -1403,8 +1405,95 @@ class CodexCompactBridgeTest(TidyCase):
         card = st.read_latest_card(self.seat)
         self.assertEqual(card["body"], "진행 중: 실제 main 카드\n다음 할 일: 다음 입력을 기다림")
         queue = runner.read_item(accepted["queue_id"])
-        self.assertEqual((queue["operation_id"], queue["card_generation"]),
-                         (accepted["operation_id"], card["generation"]))
+        self.assertEqual(queue["operation_id"], accepted["operation_id"])
+        self.assertEqual(int(queue.get("card_generation", 0) or 0), accepted["acceptance"]["source_generation"])
+        self.assertEqual(accepted["acceptance"]["card_generation"], card["generation"])
+
+    def test_auto_compact_persists_same_operation_queue_before_card_request_and_after_cancel(self):
+        path = self.rollout()
+        starts = []
+
+        def start_once(*args, **kwargs):
+            starts.append((args, kwargs))
+            return None if len(starts) == 1 else 9876
+
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), \
+                mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+                mock.patch.object(clear, "_start_helper", return_value=4321), \
+                mock.patch.object(runner, "start_detached", side_effect=start_once):
+            result = st.run_hook("codex", "compact", self.SID, phase="after", compact_summary="",
+                                 compact_context={"trigger": "auto", "turn_id": "turn-early-queue",
+                                                  "event_id": "compact-early-queue"},
+                                 transcript=str(path), cwd=str(self.cwd), env=self.env)
+            self.assertEqual(result, "booking=scheduled")
+            booking = clear.read_reservation(self.seat.key)
+            queue_id = booking["queue_id"]
+            item = runner.read_item(queue_id)
+            self.assertIsNotNone(item, "card-request booking has no durable memory queue row")
+            operation_id = booking["operation_id"]
+            self.assertEqual((item["operation_id"], item["id"]), (operation_id, queue_id))
+
+            st.run_hook("codex", "prompt", self.SID, cwd=str(self.cwd), env=self.env,
+                        prompt_text="new user input cancels the card request")
+            cancelled = clear.read_reservation(self.seat.key)
+            self.assertEqual(cancelled["status"], "cancelled")
+            retained = runner.read_item(queue_id)
+            self.assertIsNotNone(retained)
+            self.assertEqual((retained["id"], retained["operation_id"]), (queue_id, operation_id))
+            self.assertGreaterEqual(len(starts), 2, "normal prompt reconciliation did not restart the same queue")
+
+    def test_old_booking_and_queue_can_be_accepted_but_partial_relation_cannot_clear(self):
+        path = self.rollout()
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), \
+                mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
+                mock.patch.object(clear, "_start_helper", return_value=4321), \
+                mock.patch.object(runner, "start_detached", return_value=9876):
+            result = st.run_hook("codex", "compact", self.SID, phase="after", compact_summary="",
+                                 compact_context={"trigger": "auto", "turn_id": "turn-legacy",
+                                                  "event_id": "compact-legacy"},
+                                 transcript=str(path), cwd=str(self.cwd), env=self.env)
+            self.assertEqual(result, "booking=scheduled")
+            booking = clear.read_reservation(self.seat.key)
+            booking["compact"]["turn_end_observed"] = True
+            booking.pop("acceptance", None)
+            booking.pop("source_card_generation", None)
+            booking["memory_state"] = "awaiting-card"
+            clear._write_reservation(booking)
+
+            queue = runner.read_item(booking["queue_id"])
+            source_generation = queue.get("card_generation")
+            queue.pop("operation_id", None)  # legacy queue row remains addressable by its stable ID
+            runner.write_item(queue)
+            claim, reason = clear.claim_idle_card_request(clear.reservation_path(self.seat.key), booking["nonce"])
+            self.assertEqual(reason, "")
+            st.run_hook("codex", "prompt", self.SID, cwd=str(self.cwd), env=self.env,
+                        prompt_text=clear.idle_card_request_text(claim))
+            self.assertTrue(clear.finish_idle_card_request(claim, accepted=True))
+            with st.seat_lock(self.seat.key):
+                st.write_card(self.seat, "codex", self.SID, "실제 compact 카드", cwd=str(self.cwd),
+                              prompt_seq=st.read_prompt_seq(self.seat))
+            args = SimpleNamespace(harness="codex", session_id=self.SID, cwd=str(self.cwd),
+                                   no_clear=False, no_continue=False)
+            with mock.patch.object(st, "resolve_caller", return_value=(self.seat, "codex", self.SID)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(st.cmd_enqueue(args), 0)
+
+            accepted = clear.read_reservation(self.seat.key)
+            accepted_queue = runner.read_item(booking["queue_id"])
+            self.assertEqual(accepted["acceptance"]["schema"], 1)
+            self.assertEqual(accepted_queue.get("card_generation"), source_generation)
+            self.assertEqual(accepted_queue["operation_id"], accepted["operation_id"])
+            valid, reason = clear.validate_request(clear.reservation_path(self.seat.key), booking["nonce"])
+            self.assertIsNotNone(valid, reason)
+
+            accepted["acceptance"] = {"schema": 1, "nonce": booking["nonce"], "queue_id": booking["queue_id"]}
+            clear._write_reservation(accepted)
+            invalid, reason = clear.validate_request(clear.reservation_path(self.seat.key), booking["nonce"])
+            self.assertIsNone(invalid)
+            self.assertEqual(reason, "idle-card-not-accepted")
+            retained = runner.read_item(booking["queue_id"])
+            self.assertEqual((retained["id"], retained["operation_id"]),
+                             (booking["queue_id"], accepted["operation_id"]))
 
     def test_manual_unknown_or_unidentified_codex_compaction_stays_queue_only(self):
         path = self.rollout()
@@ -1426,6 +1515,7 @@ class CodexCompactBridgeTest(TidyCase):
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), \
                 mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
                 mock.patch.object(clear, "_start_helper", return_value=4321), \
+                mock.patch.object(runner, "start_detached", return_value=9876), \
                 mock.patch.object(clear, "_run_idle_card_request") as request:
             result = st.run_hook("codex", "compact", self.SID, phase="after", compact_summary="",
                                  compact_context=context, transcript=str(path), cwd=str(self.cwd), env=self.env)
@@ -1454,6 +1544,7 @@ class CodexCompactBridgeTest(TidyCase):
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), \
                 mock.patch.object(clear, "herdr_command", return_value="/bin/true"), \
                 mock.patch.object(clear, "_start_helper", return_value=4321), \
+                mock.patch.object(runner, "start_detached", return_value=9876), \
                 mock.patch.object(clear, "_run_idle_card_request", side_effect=uncertain):
             st.run_hook("codex", "compact", self.SID, phase="after", compact_summary="",
                         compact_context={"trigger": "auto", "turn_id": "turn-uncertain",
@@ -2042,8 +2133,10 @@ class PromptSeqTest(TidyCase):
         self.hook("claude", "start", "sid-A")
         for _ in range(5):                                   # all within PROMPT_LEDGER_THROTTLE_SEC
             self.hook("claude", "prompt", "sid-A")
-        lines = (next((self.state / "sessions").glob("*.jsonl"))).read_text(encoding="utf-8").splitlines()
-        self.assertLess(len(lines), 1 + 5)                   # the ledger did throttle ...
+        lines = [json.loads(line) for line in (next((self.state / "sessions").glob("*.jsonl")))
+                 .read_text(encoding="utf-8").splitlines()]
+        self.assertLess(sum(row.get("event") == "prompt" for row in lines), 5)
+        self.assertEqual(sum(row.get("event") == "real-prompt" for row in lines), 5)
         self.assertEqual(self.seq(), 5)                      # ... the count did not
 
     def test_a_reread_is_not_a_prompt_and_a_second_pane_counts_alone(self):
@@ -2576,7 +2669,10 @@ class ClearHelperTest(TidyCase):
                                        sleep=advance)
         self.assertEqual(outcome, "skipped")
         self.assertEqual(calls, [])
-        self.assertIn("3시간", self.notices(seat)[0])
+        notice = self.notices(seat)[0]
+        self.assertIn("자동 정리", notice)
+        self.assertNotIn("/clear", notice)
+        self.assertNotIn("이어서해", notice)
 
     def test_false_idle_polls_with_bounded_sleeps_and_a_replaced_booking_stops_without_a_send(self):
         seat, req, _transcript = self.compact_booked()

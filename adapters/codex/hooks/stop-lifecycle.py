@@ -53,7 +53,7 @@ def main() -> int:
         if session_id:
             try:
                 import session_tidy_idle
-                session_tidy_idle.observe_payload("codex", payload)
+                session_tidy_idle.launch_observer("codex", payload)
             except Exception:
                 pass
             from fleet import interaction
