@@ -16,6 +16,7 @@ from unittest import mock
 import worker_bootstrap as W
 import dispatch_terminal_commit as T
 import artifact_producer as AP
+import route_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -276,6 +277,92 @@ class NodeScopeTest(unittest.TestCase):
                 prompt,
             )
             self.assertIn(str(cycle_dir / "artifacts" / "shards" / "research" / "notes.md"), prompt)
+
+    def test_child_prompt_uses_child_node_and_preserves_exact_review_cycle_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact_root = root / "artifacts"
+            artifact_root.mkdir()
+            child_worktree = root / "child-worktree"
+            child_worktree.mkdir()
+            parent_worktree = root / "parent-worktree"
+            parent_worktree.mkdir()
+            route = {
+                "capability": "autopilot-code",
+                "effective_intensity": "standard",
+                "artifact_root": str(artifact_root),
+                "cwd": str(child_worktree),
+                "nodes": [
+                    {"id": "parent", "outputs": ["parent-report.md"],
+                     "write_scope": ["parent/**"]},
+                    {"id": "child", "outputs": ["dev_logs/child.md"],
+                     "write_scope": ["dev_logs/**"]},
+                ],
+            }
+            route["route_hash"] = route_identity.route_hash(route)
+            route["route_id"] = route_identity.route_id_from_hash(route["route_hash"])
+            route_file = root / "sealed-child-route.json"
+            route_file.write_text(json.dumps(route), encoding="utf-8")
+
+            cycle_dir = artifact_root / "campaigns" / "camp-exact" / "cyc-exact"
+            cycle = {
+                "campaign_id": "camp-exact", "cycle_id": "cyc-exact",
+                "producer_id": "prod-exact", "route_id": route["route_id"],
+            }
+            review_output = str(cycle_dir / "artifacts" / "review.md")
+            jobs = root / "jobs.log"
+            jobs.write_text("", encoding="utf-8")
+            parent_env = {
+                "AGENT_ARTIFACT_ROOT": str(artifact_root),
+                "AGENT_ARTIFACT_CAMPAIGN_ID": cycle["campaign_id"],
+                "AGENT_ARTIFACT_CYCLE_ID": cycle["cycle_id"],
+                "AGENT_ARTIFACT_PRODUCER_ID": cycle["producer_id"],
+                "AGENT_ARTIFACT_CYCLE_DIR": str(cycle_dir),
+                "AGENT_ARTIFACT_OUTPUT_DIR": str(cycle_dir / "artifacts"),
+                "AGENT_DISPATCH_JOBS": str(jobs),
+                "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-review",
+                "AGENT_DISPATCH_PARENT_ATTEMPT_ID": "att-grandparent",
+                "AGENT_DISPATCH_WORKTREE": str(parent_worktree),
+                "AGENT_REVIEW_OUTPUT": review_output,
+                "AGENT_REVIEW_CYCLE_ID": cycle["cycle_id"],
+                "AGENT_REVIEW_PRODUCER_ID": cycle["producer_id"],
+                "AGENT_ROUTE_ID": route["route_id"],
+                "AGENT_ROUTE_NODE": "parent",
+            }
+            original_env = dict(parent_env)
+            args = SimpleNamespace(
+                worker_type="stage", route_file=str(route_file), route_id=route["route_id"],
+                artifact_root=str(artifact_root), route_node="child", worktree=str(child_worktree),
+                parent_attempt_id="att-grandparent", attempt_id="att-child-review",
+            )
+            validated = {}
+
+            def validate_review_binding(_jobs, **kwargs):
+                validated.update(kwargs)
+                return {
+                    "output_path": review_output, "cycle_id": cycle["cycle_id"],
+                    "producer_id": cycle["producer_id"],
+                }
+
+            for worker_type in ("stage", "frame"):
+                args.worker_type = worker_type
+                with self.subTest(worker_type=worker_type), \
+                     mock.patch.object(AP, "read_cycle_record", return_value=cycle), \
+                     mock.patch.object(AP, "cycle_dir", return_value=cycle_dir), \
+                     mock.patch("dispatch_contract.validate_review_output_binding",
+                                side_effect=validate_review_binding) as review_validator:
+                    prompt = W.assignment_prompt(args, "prepare the child", parent_env)
+
+                self.assertIn(str(cycle_dir / "artifacts" / "dev_logs" / "child.md"), prompt)
+                self.assertNotIn("parent-report.md", prompt)
+                self.assertEqual(validated["attempt_id"], "att-child-review")
+                self.assertEqual(validated["output_path"], review_output)
+                self.assertEqual(validated["cycle_id"], cycle["cycle_id"])
+                self.assertEqual(validated["producer_id"], cycle["producer_id"])
+                self.assertEqual(Path(validated["worktree"]), child_worktree)
+                self.assertEqual(Path(validated["artifact_root"]), artifact_root)
+                review_validator.assert_called_once()
+                self.assertEqual(parent_env, original_env)
 
     def test_code_one_shot_owns_approved_cycle_deliverables_and_source_is_not_an_artifact(self):
         node = {"id": "one-shot", "kind": "capability-owner", "unit": "_kernel/owner",

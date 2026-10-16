@@ -635,19 +635,31 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
 
     def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
+        import dispatch_lifecycle as L
         seen=[]
+        foreground_timeout=3600
+        expected_timeout=(R.LAUNCHER_TIMEOUT_SECONDS + foreground_timeout
+                          + L.FORWARDED_TERMINATION_GRACE)
+        def foreground_command(_jobs,record,_source,_replay):
+            return ['wrapper','--attempt-id',record['replacement_attempt_id'],
+                    '--launch-lifecycle','foreground-scoped',
+                    '--foreground-timeout',str(foreground_timeout)]
         def slow(command,**kwargs):
             seen.append((command,kwargs['timeout']))
             raise subprocess.TimeoutExpired(command,kwargs['timeout'],output='waiting on disk',stderr=b'')
-        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+        with mock.patch.object(R,'_command',side_effect=foreground_command),mock.patch.object(R,'_authorized'), \
+             mock.patch('dispatch_replacement_batch.command',return_value=None):
             first=R.advance(self.jobs,'att-source',run=slow)
         self.assertEqual(first['reason'],'replacement-launch-timeout')
         self.assertIn('waiting on disk',first['launcher_diagnostic'])
-        self.assertEqual(seen[0][1],R._launcher_budget(seen[0][0],self.meta)[1])
+        self.assertEqual(seen[0][0][seen[0][0].index('--launch-lifecycle')+1],'foreground-scoped')
+        self.assertEqual(seen[0][1],expected_timeout)
         self.write({**self.meta,'attempt_id':first['attempt_id'],'replacement_original_attempt_id':'att-source',
                     'note':'registered','launch_claimed':'0'},'open',append=True)
-        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+        with mock.patch.object(R,'_command',side_effect=foreground_command),mock.patch.object(R,'_authorized'), \
+             mock.patch('dispatch_replacement_batch.command',return_value=None):
             R.advance(self.jobs,'att-source',run=slow)
+        self.assertEqual([timeout for _command,timeout in seen],[expected_timeout,expected_timeout])
         self.assertEqual(seen[1][0][seen[1][0].index('--attempt-id')+1],first['attempt_id'])
 
     def test_foreground_601_seconds_is_not_killed_by_detached_admission_budget(self):

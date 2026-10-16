@@ -675,6 +675,44 @@ def owner_close_prompt(args) -> str:
     return "\n".join(lines) + ("\n\n" if lines else "")
 
 
+def _child_scope_environment(args, route, environ, source_worktree=None):
+    """Project validated launch identity over the caller's context for scope lookup.
+
+    Prompt construction runs before adapters build the child environment. Keep
+    inherited producer-cycle and review bindings intact, while replacing the
+    parent-specific route node/worktree with the child values already checked
+    by the wrapper. The linked-slice worktree is supplied only by
+    ``_linked_slice_source_worktree`` after its parent and repository checks.
+    """
+    child = dict(environ or {})
+    route_file = getattr(args, "route_file", None)
+    route_id = getattr(args, "route_id", None) or route.get("route_id")
+    artifact_root = getattr(args, "artifact_root", None) or route.get("artifact_root")
+    node_id = getattr(args, "route_node", None)
+    binding = getattr(args, "review_output_binding", None)
+    worktree = (source_worktree
+                or (binding or {}).get("worktree")
+                or getattr(args, "worktree", None)
+                or route.get("cwd"))
+
+    if route_file:
+        child["AGENT_ROUTE_FILE"] = str(route_file)
+    if route_id:
+        child["AGENT_ROUTE_ID"] = str(route_id)
+    child["AGENT_ROUTE_NODE"] = str(node_id or "")
+    if artifact_root:
+        child["AGENT_ARTIFACT_ROOT"] = str(artifact_root)
+    if worktree:
+        child["AGENT_DISPATCH_WORKTREE"] = str(worktree)
+    parent_attempt_id = getattr(args, "parent_attempt_id", None)
+    if parent_attempt_id:
+        child["AGENT_DISPATCH_PARENT_ATTEMPT_ID"] = str(parent_attempt_id)
+    attempt_id = getattr(args, "attempt_id", None)
+    if attempt_id:
+        child["AGENT_DISPATCH_ATTEMPT_ID"] = str(attempt_id)
+    return child
+
+
 def assignment_prompt(args, task: str, environ) -> str:
     """Project the route's input/output boundary, rather than ask a caller to copy it.
 
@@ -688,8 +726,9 @@ def assignment_prompt(args, task: str, environ) -> str:
             return f"Assignment:\n{task.rstrip()}\n\n{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}"
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         source_worktree = _linked_slice_source_worktree(args, route)
+        scope_environment = _child_scope_environment(args, route, environ, source_worktree)
         scope = resolve_node_scope(
-            route, getattr(args, "route_node", None), environ,
+            route, getattr(args, "route_node", None), scope_environment,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
             route_file=route_file,
             source_worktree=source_worktree,
@@ -704,8 +743,9 @@ def assignment_prompt(args, task: str, environ) -> str:
     if route_file:
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         source_worktree = _linked_slice_source_worktree(args, route)
+        scope_environment = _child_scope_environment(args, route, environ, source_worktree)
         scope = resolve_node_scope(
-            route, getattr(args, "route_node", None), environ,
+            route, getattr(args, "route_node", None), scope_environment,
             parent_attempt_id=getattr(args, "parent_attempt_id", None),
             route_file=route_file,
             source_worktree=source_worktree,

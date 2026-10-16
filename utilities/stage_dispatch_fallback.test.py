@@ -878,10 +878,8 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(len(augmented),1,augmented)
   self.assertEqual(augmented[0].read_text(encoding="utf-8"),"BASE PROMPT TEXT\n"+expected_block)
 
- def _producer_revision_entry(self,surface):
-  from hearting_gates import gates_on
-  auto_revision_enabled=gates_on()
-  with self.dispatch_env():
+ def _producer_revision_entry(self,surface,*,gates_enabled):
+  with self.dispatch_env(HEARTING_GATES="on" if gates_enabled else "off"):
    path=self.route(same_status="supported",intensity="standard")
    route=json.loads(path.read_text())
    self.seed_parent()
@@ -923,7 +921,34 @@ class FallbackTest(unittest.TestCase):
    launcher_patch=(mock.patch.object(F,"run_wrapper",side_effect=run_wrapper)
                    if surface=="chain" else
                    mock.patch.object(F.DISPATCH_NODE,"run_launcher",side_effect=run_node))
-   with mock.patch.object(sys,"argv",argv),launcher_patch, \
+   start_events=[]
+   import hashlib
+   import review_input
+   real_resolve_input=review_input.resolve_input
+   real_publish_revision=F.DISPATCH_NODE.ROUTE.publish_revision_locked
+   def publish_revision(*args,**kwargs):
+    result=real_publish_revision(*args,**kwargs)
+    start_events.append(("producer-revision",result["marker"]))
+    return result
+   def resolve_bound_input(*args,**kwargs):
+    current_marker=json.loads(marker_path.read_text())
+    if gates_enabled:
+     self.assertEqual(current_marker["sequence"],2)
+     self.assertEqual(current_marker["stage_authority"],"revision")
+     self.assertEqual(current_marker["evidence"]["path"],str(evidence.resolve()))
+     self.assertEqual(current_marker["evidence"]["sha256"],
+                      hashlib.sha256(evidence.read_bytes()).hexdigest())
+    else:
+     self.assertEqual(current_marker["sequence"],1)
+     self.assertNotIn("revision",current_marker)
+     self.assertNotEqual(current_marker["evidence"]["sha256"],
+                         hashlib.sha256(evidence.read_bytes()).hexdigest())
+    result=real_resolve_input(*args,**kwargs)
+    start_events.append(("review-input",result["path"]))
+    return result
+   with mock.patch.object(F.DISPATCH_NODE.ROUTE,"publish_revision_locked",side_effect=publish_revision), \
+        mock.patch("review_input.resolve_input",side_effect=resolve_bound_input), \
+        mock.patch.object(sys,"argv",argv),launcher_patch, \
         mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})), \
         contextlib.redirect_stdout(io.StringIO()) as output:
     if surface=="chain": code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
@@ -931,11 +956,20 @@ class FallbackTest(unittest.TestCase):
      with self.assertRaises(SystemExit) as stopped:F.DISPATCH_NODE.main()
      code=stopped.exception.code
    self.assertEqual(code,0,output.getvalue())
-   if auto_revision_enabled:
+   reviewed_inputs=[event[1] for event in start_events if event[0]=="review-input"]
+   self.assertTrue(reviewed_inputs)
+   self.assertEqual(reviewed_inputs,[str(evidence.resolve())]*len(reviewed_inputs))
+   if gates_enabled:
+    event_kinds=[event[0] for event in start_events]
+    self.assertEqual(event_kinds.count("producer-revision"),1)
+    self.assertEqual(event_kinds.count("review-input"),len(reviewed_inputs))
+    self.assertLess(event_kinds.index("producer-revision"),event_kinds.index("review-input"))
     self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"current")
     marker=json.loads(marker_path.read_text())
     self.assertEqual(marker["sequence"],2)
     self.assertEqual(marker["revision"]["recorded_by"],"runtime-auto")
+    self.assertEqual(marker["evidence"]["path"],str(evidence.resolve()))
+    self.assertEqual(marker["revision"]["evidence_sha256"],marker["evidence"]["sha256"])
    else:
     # Gates-off operations keep a live evidence edit as history; they do not
     # synthesize a revision marker. The real completion gate's history writer
@@ -945,22 +979,30 @@ class FallbackTest(unittest.TestCase):
     marker=json.loads(marker_path.read_text())
     self.assertEqual(marker["sequence"],1)
     self.assertNotIn("revision",marker)
+    self.assertEqual([event[0] for event in start_events],
+                     ["review-input"]*len(reviewed_inputs))
+    self.assertNotEqual(marker["evidence"]["sha256"],
+                        hashlib.sha256(evidence.read_bytes()).hexdigest())
    link_path=marker_path.parent/"plan.att-fixture-plan.attempt.json"
    original_link=link_path.read_bytes();link=json.loads(original_link)
    for wrong in (marker_path.parent/"other-node.json",self.art/"plan.json"):
     link["completion_marker"]=str(wrong);link_path.write_text(json.dumps(link))
     self.assertNotEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"current")
    link_path.write_bytes(original_link)
-   if auto_revision_enabled:
+   if gates_enabled:
     self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"current")
    else:
     self.assertEqual(R.gate_currency(route,plan,marker_path).state,"current")
-   if auto_revision_enabled:
+   if gates_enabled:
     self.assertEqual(json.loads(marker_path.read_text())["revision"]["recorded_by"],"runtime-auto")
- def test_sd161_chain_respects_gate_evidence_mode_before_resolving_review_input(self):
-  self._producer_revision_entry("chain")
- def test_sd161_node_respects_gate_evidence_mode_before_resolving_review_input(self):
-  self._producer_revision_entry("node")
+ def test_sd161_chain_gate_enabled_revises_before_review_input(self):
+  self._producer_revision_entry("chain",gates_enabled=True)
+ def test_sd161_chain_gate_disabled_keeps_evidence_history(self):
+  self._producer_revision_entry("chain",gates_enabled=False)
+ def test_sd161_node_gate_enabled_revises_before_review_input(self):
+  self._producer_revision_entry("node",gates_enabled=True)
+ def test_sd161_node_gate_disabled_keeps_evidence_history(self):
+  self._producer_revision_entry("node",gates_enabled=False)
 
  def test_cross_harness_direct_precedes_inline(self):
   result=self.run_chain(self.route()); self.assertEqual(result.returncode,0,result.stdout+result.stderr)
