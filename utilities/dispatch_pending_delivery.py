@@ -11,19 +11,23 @@ the carrier-independent materializer
 caller of :func:`create`. Carriers (P3/P4) only call :func:`claim` and the
 emit/ack helpers on a record that already exists.
 
-State machine (SD-111 §13.33.1-(4), unchanged):
+Base claim/emission state machine (SD-111 §13.33.1-(4)):
 
     None -> pending -> claimed -> {acked | sent-ambiguous | pending (lease reclaim)}
     sent-ambiguous -> {acked | pending (bounded reclaim)}
     pending | claimed | sent-ambiguous -> expired
     acked, expired terminal
 
+A validated recipient-side receipt may settle its exact open delivery through
+:func:`ack_received` after reclaim; the generic :func:`ack` keeps its
+token-bearing claim-state contract.
+
 ack-before-output is forbidden on token-less surfaces (stdout
 ``systemMessage``, ``additionalContext``): those surfaces call
-:func:`mark_sent_ambiguous`, never :func:`ack`. This module does not enforce
-that by itself -- it exposes both transitions because some recipients
-(codex-managed-gateway) do have a real consumption token -- the carrier
-wiring in P3/P4 is what withholds the ``ack`` call for token-less recipients.
+:func:`mark_sent_ambiguous`, never the generic :func:`ack`. The queue exposes
+that token-bearing transition for recipients such as codex-managed-gateway;
+carrier wiring withholds it for token-less recipients. The separate
+:func:`ack_received` transition requires the caller's verified receipt binding.
 """
 
 from __future__ import annotations
@@ -595,6 +599,63 @@ def ack(
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"
             )
+        updated = dict(value)
+        updated["state"] = "acked"
+        updated["acked_at_ns"] = time.monotonic_ns()
+        updated["acked_by"] = acked_by
+        _write_unlocked(path, updated)
+        return updated
+
+
+def received_ack_identity(record: dict, recipient_key: str, delivery_id: str) -> dict:
+    """Freeze the immutable queue identity used by a verified peer receipt.
+
+    Claim ownership, lease state, and attempt counters describe transport
+    progress and deliberately do not participate in this identity.
+    """
+    if (not isinstance(record, dict) or record.get("delivery_id") != delivery_id
+            or record.get("recipient_digest") != recipient_digest(recipient_key)):
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "received-identity-binding")
+    canonical_digest = _canonical_receipt_digest(record.get("receipt"))
+    if canonical_digest != record.get("receipt_digest"):
+        raise PendingDeliveryError("pending-delivery-identity-conflict", "receipt-digest-mismatch")
+    fields = (
+        "delivery_id", "recipient_digest", "recipient_kind", "session_generation",
+        "session_generation_supported", "attempt_ids", "parent_attempt_id", "route_id",
+        "route_node", "receipt_digest", "row_revisions", "lineage",
+    )
+    identity = {key: record.get(key) for key in fields}
+    identity["receipt_canonical_digest"] = canonical_digest
+    return json.loads(json.dumps(identity, sort_keys=True, separators=(",", ":")))
+
+
+def ack_received(
+    root: Path,
+    recipient_key: str,
+    delivery_id: str,
+    *,
+    expected_identity: dict,
+    acked_by: str,
+) -> dict:
+    """Settle an exact recipient receipt, independent of its transport lease.
+
+    The caller must establish the receipt-to-delivery binding. This transition
+    rechecks that immutable identity and the latest state inside the queue's
+    record lock. Existing terminal records are returned without rewriting any
+    bytes; only an open delivery can transition to ``acked``.
+    """
+    path = record_path(root, recipient_key, delivery_id)
+    with _record_lock(path):
+        value = _read_unlocked(path)
+        if value is None:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "record-missing")
+        actual_identity = received_ack_identity(value, recipient_key, delivery_id)
+        if actual_identity != expected_identity:
+            raise PendingDeliveryError("pending-delivery-identity-conflict", "received-identity-changed")
+        if value["state"] in TERMINAL_STATES:
+            return value
+        if value["state"] not in OPEN_STATES:
+            raise PendingDeliveryError("pending-delivery-claim-refused", f"state={value['state']}")
         updated = dict(value)
         updated["state"] = "acked"
         updated["acked_at_ns"] = time.monotonic_ns()

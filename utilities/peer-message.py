@@ -765,7 +765,7 @@ def _registered_delivery_settled(row):
     try:
         from peer_obligations import registered_delivery_settled
         return registered_delivery_settled(row)
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, RuntimeError):
         return False
 
 
@@ -951,6 +951,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
         recipient = pending_delivery_recipient(row)
         if row["state"] == "received":
             _observe_continue_receipt(recipient or {}, ref)
+            _ack_registered_delivery(row)
             return {"status": "received", "reason": "exact-peer-ref"}
         if _registered_delivery_settled(row):
             return {"status": "not-required", "reason": "dispatch-notice-consumed"}
@@ -993,6 +994,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
         if not current:
             return {"status": "unverified", "reason": "peer-pending-missing-after-rpc"}
         if current["state"] == "received":
+            _ack_registered_delivery(current)
             return {"status": "received", "reason": "exact-peer-ref"}
         if (current.get("rpc_claim") or {}).get("token") != token:
             return {"status": "unverified", "reason": "peer-claim-changed-after-rpc"}
@@ -1135,9 +1137,10 @@ def _peer_notice_exists(ref, recipient):
 def _ack_registered_delivery(received):
     try:
         from peer_obligations import acknowledge_registered_delivery
-        acknowledge_registered_delivery(received)
-    except (OSError, ValueError, KeyError):
+        return acknowledge_registered_delivery(received)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         pass  # The retained courier retries the same receipt, never another send.
+    return False
 
 
 def _ordinary_receiver_guidance():
@@ -1341,6 +1344,7 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
     with pending_lock(ref or "legacy-receive"):
         pending = _read_pending(ref) if ref else None
         if pending and pending["state"] == "received":
+            _ack_registered_delivery(pending)
             return 0
         already_received = ref and _peer_notice_exists(ref, recipient)
         rc = 0 if already_received else cmd_record(argparse.Namespace(
@@ -1513,6 +1517,7 @@ def cmd_pending(args):
             if not isinstance(args.message_id, str) or not args.message_id.strip():
                 return 1
             if row["state"] == "received":
+                _ack_registered_delivery(row)
                 return 0
             _save_pending(dict(row, state="queued", receipt="context-api-accepted", actual_message_id=args.message_id))
             return 0

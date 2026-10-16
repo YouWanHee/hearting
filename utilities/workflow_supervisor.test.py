@@ -439,6 +439,33 @@ class TestSupervisorAdvance(WorkflowFixture):
         self.assertEqual(launch.call_count, 0)
         return result, commit.call_count
 
+    def test_owner_settlement_marker_receives_the_mapped_run_record(self):
+        route, path = self.two_stage_route(route_id="rt-mapped-marker")
+        mapped = "parts/autopilot-lab/full-run/run.json"
+        route["nodes"][0].update(outputs=[mapped], write_scope=[mapped],
+                                 part_io={"run.json": mapped})
+        path.write_text(json.dumps(route))
+        registry = self.resource_registry(exit_code=0)
+        jobs = self.base / "jobs.log"
+        jobs.write_text("")
+        self.arm(path, registry, extra=["--artifact-base", str(self.base), "--jobs", str(jobs)])
+        ledger = SUP.ledger_for(route, jobs)
+        mapped_output = self.base / mapped
+        mapped_output.parent.mkdir(parents=True, exist_ok=True)
+        marker_calls = []
+        route_module = SUP.route_module()
+
+        def capture(*args, **kwargs):
+            marker_calls.append(args[3])
+            return None
+
+        with mock.patch.object(SUP.RESOURCE_RESUME, "route_selected", return_value=True), \
+                mock.patch.object(route_module, "write_completion_marker", side_effect=capture):
+            result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]["action"], "advanced")
+        self.assertEqual(marker_calls, [mapped_output])
+        self.assertFalse((self.base / "run.json").exists())
+
     def test_owner_settlement_resolves_late_resource_output_without_rerun(self):
         route, path, jobs, registry, ledger, producer, original = self._late_resource_artifacts_fixture()
         failure_journal = ledger.journal_path.read_bytes()
@@ -3949,6 +3976,25 @@ def gate_epoch(ledger, gate):
 
 
 class TestHarnessResourceEvidence(WorkflowFixture):
+    def test_mapped_run_record_is_the_resource_and_completion_output(self):
+        route, path = self.two_stage_route(route_id="rt-mapped-run-output")
+        mapped = "parts/autopilot-lab/full-run/run.json"
+        route["nodes"][0].update(
+            part="autopilot-lab:full-run", outputs=[mapped], write_scope=[mapped],
+            part_io={"run.json": mapped},
+        )
+        path.write_text(json.dumps(route))
+        registry = self.resource_registry(exit_code=0)
+        self.arm(path, registry, extra=["--artifact-base", str(self.base)])
+        armed = SUP.read_armed(SUP.ledger_for(route))["run"]
+        import resource_run_evidence as RUN_EVIDENCE
+        resolved = Path(RUN_EVIDENCE.paths(armed)["runtime_output"])
+        self.assertEqual(resolved, self.base / mapped)
+        evidence = SUP.resource_evidence(armed)
+        SUP.resource_output_evidence(route, armed, evidence)
+        self.assertTrue(resolved.is_file())
+        self.assertFalse((self.base / "run.json").exists())
+
     def test_owner_fields_added_to_runtime_document_preserve_exact_bytes(self):
         route, path = self.two_stage_route()
         registry = self.resource_registry(exit_code=0)

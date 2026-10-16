@@ -22,6 +22,7 @@ from execution_access import (
     request_path,
     publish_effective_grant,
     prepare_task_request,
+    compute_execution_scope,
     read_roots_data,
     resolve_task_targets,
 )
@@ -82,6 +83,9 @@ class ExecutionAccessTest(unittest.TestCase):
             "route_id": "rt-lab-access",
             "route_hash": "sha256:" + "a" * 64,
             "capability": "autopilot-lab",
+            "nodes": [{"id": "smoke", "kind": "review-worker"},
+                      {"id": "full-run", "kind": "resource-runner"},
+                      {"id": "run-verify", "kind": "review-worker"}],
             "cwd": str(self.worktree),
             "artifact_root": str(self.artifact),
             "work_request": {"text": "Use /data/unapproved-text for the experiment"},
@@ -109,6 +113,17 @@ class ExecutionAccessTest(unittest.TestCase):
         self.assertEqual((run_root,), request.writable_roots)
         self.assertFalse(run_root.exists())
         self.assertNotIn(Path("/data/unapproved-text"), request.writable_roots)
+
+    def test_compute_need_comes_only_from_registered_native_or_borrowed_stage_identity(self) -> None:
+        native = self.lab_route(nodes=[{"id": "full-run"}])
+        borrowed = self.lab_route(capability="autopilot-code", nodes=[
+            {"id": "lab-run", "part": "autopilot-lab:full-run"}])
+        misleading = self.lab_route(capability="autopilot-code", nodes=[{"id": "full-run"}],
+                                    work_request={"text": "compute-hosts GPU run"})
+        self.assertTrue(compute_execution_scope(native, owner=True))
+        self.assertTrue(compute_execution_scope(borrowed, owner=True))
+        self.assertFalse(compute_execution_scope(misleading, owner=True))
+        self.assertFalse(compute_execution_scope(self.lab_route(nodes=[]), owner=True))
 
     def test_inventory_default_is_not_given_to_code_owners_or_frames(self) -> None:
         inventory = self.inventory(self.root / "runs")
@@ -176,7 +191,7 @@ class ExecutionAccessTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {**self.env, "COMPUTE_HOSTS_CONFIG": str(inventory)}, clear=True):
             prepared = prepare_task_request(self.lab_route(), self.state / "jobs.log")
         request = load_request(prepared, context=self.context)
-        parent = ParentGrant(writable_roots=request.writable_roots)
+        parent = ParentGrant(writable_roots=request.writable_roots, network_allowed=request.network_required)
         assert_within_parent(request, parent, is_child=True)
         outside = self.request(read_roots=[], writable_roots=[str(self.root / "outside")], justification={})
         with self.assertRaises(ExecutionAccessError) as raised:
@@ -835,8 +850,11 @@ class DerivedAccessTest(unittest.TestCase):
         self.jobs = self.state / "jobs.log"
 
     def route(self, text, *, capability="autopilot-code"):
+        nodes = ([{"id": "full-run", "kind": "resource-runner"}]
+                 if capability == "autopilot-lab" else [])
         return {"route_id": "rt-derive", "route_hash": "sha256:" + "d" * 64, "cwd": str(self.worktree),
-                "artifact_root": str(self.artifact), "capability": capability, "work_request": {"text": text}}
+                "artifact_root": str(self.artifact), "capability": capability,
+                "nodes": nodes, "work_request": {"text": text}}
 
     def task(self):
         o = self.other
@@ -889,14 +907,18 @@ class DerivedAccessTest(unittest.TestCase):
         manual = self.root / "manual.json"
         manual.write_text(json.dumps({"schema_version": 1, "writable_roots": [str(self.elsewhere)],
                                       "read_roots": [], "network": {"required": False}}), encoding="utf-8")
-        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(manual)}):
+        inventory = self.home / ".config/hearting/compute-hosts.yaml"
+        inventory.parent.mkdir(parents=True, exist_ok=True)
+        inventory.write_text("schema_version: 1\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(manual),
+                                          "COMPUTE_HOSTS_CONFIG": str(inventory)}):
             self.assertIsNone(prepare_task_request(self.route(self.task()), self.jobs))
             run_root = self.root / "runs"
             with mock.patch.object(EA, "_lab_run_root", return_value=run_root):
                 path = prepare_task_request(self.route(self.task(), capability="autopilot-lab"), self.jobs)
         request, binding = self.prepared(path)
         self.assertEqual(request["writable_roots"], sorted([str(self.elsewhere), str(run_root)]))
-        self.assertEqual(request["read_roots"], [])
+        self.assertEqual(request["read_roots"], [str(inventory.parent)])
         self.assertNotIn("derivation", binding)
 
     def test_gpu_compute_defaults_upgrade_old_requests_and_reach_each_harness(self):
@@ -905,13 +927,13 @@ class DerivedAccessTest(unittest.TestCase):
         run_root = self.root / 'compute-runs'
         inventory.write_text(f'schema_version: 1\nrun_root: {run_root}\nhosts:\n  fixture:\n    ssh_host: example.invalid\n')
         route = self.route(self.task(), capability='autopilot-lab')
+        route['nodes'] = [{'id': 'full-run', 'kind': 'resource-runner'}]
         old = prepare_task_request(route, self.jobs)
         old_bytes = old.read_bytes()
         # This is the already prepared BC-style route, upgraded at normal start.
-        route['nodes'] = [{'id': 'full-run', 'kind': 'resource-runner'}]
         prepared = prepare_task_request(route, self.jobs)
         request, binding = self.prepared(prepared)
-        self.assertNotEqual(old, prepared)
+        self.assertEqual(old, prepared)
         self.assertEqual(old.read_bytes(), old_bytes)
         self.assertEqual(binding['derivation'], self.prepared(old)[1]['derivation'])
         self.assertIn(str(inventory.parent), request['read_roots'])
@@ -1146,7 +1168,7 @@ class DerivedAccessTest(unittest.TestCase):
         self.handed(lab, [self.elsewhere])
         with mock.patch.object(EA, "_lab_run_root", return_value=run_root):
             merged = prepare_task_request(lab, self.jobs)
-        self.assertEqual(merged.parent.parent.name, "access")
+        self.assertEqual(merged.parent.name, "compute")
         self.assertEqual(json.loads(merged.read_text(encoding="utf-8"))["writable_roots"],
                          sorted([str(self.elsewhere), str(run_root)]))
         # An explicit file in the caller's environment still wins, unless the caller asks for the route's own.

@@ -4118,6 +4118,11 @@ class SharedBaseGuardTest(ProducerTestBase):
         with self.assertRaises(P.ProducerError) as ctx:
             self._admit(cycle, 0, base_revision="none")
         self.assertEqual(ctx.exception.code, "shared-base-mismatch")
+        # The refusal names what was compared: the requested base against the source's own receipt.
+        self.assertIn("--base-revision=none", ctx.exception.detail)
+        self.assertIn(P.SPEC_BASE_RECEIPT, ctx.exception.detail)
+        self.assertIn(first["shared_reference_revision_id"], ctx.exception.detail)
+        self.assertNotIn("latest=", ctx.exception.detail)
         self.assertEqual(self._admit(cycle, 0)["status"], "admitted")
 
     def test_malformed_sealed_receipt_cannot_fall_back_to_cli_base(self):

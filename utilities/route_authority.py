@@ -1969,9 +1969,9 @@ def bind_launch_access(args, *, runtime: str, default_roots, network_available: 
         raise ExecutionAccessError("route-record-unreadable", str(exc)) from exc
     args.contract_read_roots = contract_read_roots(args.agent_home, route)
     if route_file and request_path(args.execution_access_file, os.environ) is not None:
-        from gpu_execution_sandbox import select as gpu_selection
-        compute_scope = gpu_selection(route, node=getattr(args, "route_node", None),
-                                      owner=args.dispatch_depth == 1, environ={})["gpu_scope"]
+        from execution_access import compute_execution_scope
+        compute_scope = compute_execution_scope(
+            route, node=getattr(args, "route_node", None), owner=args.dispatch_depth == 1)
     if args.dispatch_depth >= 2 and request_path(args.execution_access_file, os.environ) is not None:
         if args.parent_binding is None:
             # Prospective probes without an access request need no live owner.

@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -59,6 +60,39 @@ class ArtifactContextTest(unittest.TestCase):
         self.assertNotEqual(report.path, diagnostics.path)
         with self.assertRaisesRegex(C.ArtifactContextError, "artifact-output-role-missing"):
             context.resolve_output("ship-deploy")
+
+    def test_run_record_resolves_native_mapped_and_separate_resource_outputs(self):
+        base = self._context()
+        native_node = {"id": "full-run", "outputs": ["run.json"], "write_scope": ["run.json"]}
+        native = replace(base, node=native_node, node_id="full-run")
+        self.assertEqual(native.resolve_output("run-record").path,
+                         self.root / "fixture-cycle/artifacts/run.json")
+
+        mapped = "parts/autopilot-lab/full-run/run.json"
+        borrowed_node = {"id": "lab-full-run", "part": "autopilot-lab:full-run",
+                         "outputs": [mapped], "write_scope": [mapped],
+                         "part_io": {"run.json": mapped}}
+        borrowed = replace(base, node=borrowed_node, node_id="lab-full-run")
+        self.assertEqual(borrowed.resolve_output("run-record").path,
+                         self.root / "fixture-cycle/artifacts" / mapped)
+
+        eval_output = "parts/autopilot-lab/eval-run/run.json"
+        evaluation = replace(base, node={"id": "eval-run", "outputs": [eval_output],
+                            "write_scope": [eval_output], "part_io": {"run.json": eval_output}},
+                            node_id="eval-run")
+        self.assertEqual(evaluation.resolve_output("run-record").path,
+                         self.root / "fixture-cycle/artifacts" / eval_output)
+        self.assertNotEqual(borrowed.resolve_output("run-record").path,
+                            evaluation.resolve_output("run-record").path)
+
+        traversal = replace(base, node={"id": "bad", "outputs": ["../run.json"],
+                                       "write_scope": ["../run.json"]}, node_id="bad")
+        with self.assertRaisesRegex(C.ArtifactContextError, "artifact-output-path-invalid"):
+            traversal.resolve_output("run-record")
+        outside = replace(base, node={"id": "outside", "outputs": ["elsewhere/run.json"],
+                                     "write_scope": ["parts/autopilot-lab/full-run/**"]}, node_id="outside")
+        with self.assertRaisesRegex(C.ArtifactContextError, "artifact-output-outside-node-scope"):
+            outside.resolve_output("run-record")
 
     def test_logical_outputs_are_not_reconstructed_as_paths(self):
         self.assertEqual(C.render_outputs(self.root / "cycle/artifacts", ["source-diff"]), ["source-diff"])

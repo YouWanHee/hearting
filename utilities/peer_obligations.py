@@ -395,15 +395,30 @@ def retain_registered_completion(jobs, attempt_id, session_id, carrier, *, holde
         ensure_normal_runner(Path(jobs).parent)
 
 
-def _registered_delivery_bindings(message, roots=None):
+def _registered_delivery_bindings(message, roots=None, *, received_only=False):
+    if (received_only and (message.get("state") != "received"
+            or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"})):
+        return
+    if message.get("state") not in {"pending", "queued", "unverified", "received"}:
+        return
     binding = message.get("dispatch_notice") or {}
-    if not binding or binding.get("duty_id") not in (message.get("refs") or []):
+    expected_binding = {"duty_id", "jobs", "attempt_id", "carrier", "recipient_sid",
+                        "storage_recipient", "delivery_id", "claim_owner"}
+    if (not isinstance(binding, dict) or set(binding) != expected_binding
+            or binding.get("duty_id") not in (message.get("refs") or [])
+            or not isinstance(message.get("ref"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", message["ref"])):
         return
     from dispatch_completion_join import current_attempt_row
     import dispatch_pending_delivery as pending
     recipient = message.get("to") or {}
     jobs = Path(binding["jobs"])
-    root = jobs.resolve().parent
+    if not jobs.is_absolute() or jobs.is_symlink() or not jobs.is_file():
+        return
+    try:
+        root = jobs.resolve(strict=True).parent
+    except (OSError, RuntimeError, ValueError):
+        return
     if roots is not None and root not in {Path(r).resolve() for r in roots}:
         return
     store = ObligationStore(root)
@@ -414,14 +429,33 @@ def _registered_delivery_bindings(message, roots=None):
             or identity.get("attempt_id") != binding.get("attempt_id")
             or identity.get("harness") != recipient.get("harness")
             or binding.get("recipient_sid") != recipient.get("session_id")
-            or intent.get("carrier") != binding.get("carrier")):
+            or intent.get("carrier") != binding.get("carrier")
+            or binding.get("claim_owner") != "retained-rewake:" + binding["duty_id"]):
         return
-    row = current_attempt_row(jobs, binding["attempt_id"])
-    storage, delivery_id = binding["storage_recipient"], binding["delivery_id"]
-    record = pending.read(root, storage, delivery_id)
-    if (row is None or not record or row.attempt_id not in record.get("attempt_ids", [])
-            or record.get("recipient_kind") != binding.get("carrier")
-            or row.metadata.get("parent_sid") != storage):
+    try:
+        row = current_attempt_row(jobs, binding["attempt_id"])
+        storage, delivery_id = binding["storage_recipient"], binding["delivery_id"]
+        record = pending.read(root, storage, delivery_id)
+        if (row is None or not record or record.get("delivery_id") != delivery_id
+                or row.attempt_id not in record.get("attempt_ids", [])
+                or record.get("recipient_kind") != binding.get("carrier")
+                or record.get("recipient_digest") != pending.recipient_digest(storage)
+                or row.metadata.get("parent_sid") != storage
+                or row.metadata.get("parent_completion_delivery") != binding.get("carrier")):
+            return
+        from dispatch_seat_handover import effective_parent
+        if effective_parent(row.metadata, jobs) != binding["recipient_sid"]:
+            return
+        if (row.metadata.get("delivery_intent") == "1"
+                and row.metadata.get("delivery_id") == delivery_id and (
+                not row.metadata.get("delivery_receipt_digest")
+                or record.get("receipt_digest") != row.metadata.get("delivery_receipt_digest")
+                or not row.metadata.get("delivery_row_revision")
+                or (record.get("row_revisions") or {}).get(row.attempt_id)
+                    != row.metadata.get("delivery_row_revision"))):
+            return
+        identity = pending.received_ack_identity(record, storage, delivery_id)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return
     yield store, duty, row, record, root, storage, delivery_id
 
@@ -434,24 +468,37 @@ def registered_delivery_settled(message, *, roots=None):
 
 
 def acknowledge_registered_delivery(message, *, roots=None):
-    """Consume only the dispatch notice bound before this exact peer transfer was sent."""
+    """Settle only a delivery proven by this exact recipient-side peer receipt.
+
+    Return true when the receipt is bound to the current delivery, even if the
+    queue write needs a later retry. Callers use that fact to avoid preparing a
+    duplicate transfer while preserving the open delivery for recovery.
+    """
     if message.get("state") != "received":
-        return
+        return False
     import dispatch_pending_delivery as pending
-    from dispatch_seat_handover import effective_parent
-    for store, duty, row, record, root, storage, delivery_id in _registered_delivery_bindings(message, roots):
-        binding = message["dispatch_notice"]
-        if (record.get("claim_owner") != binding.get("claim_owner")
-                or effective_parent(row.metadata, Path(binding["jobs"])) != binding["recipient_sid"]):
-            continue
-        if record["state"] in {"claimed", "sent-ambiguous"}:
-            pending.ack(root, storage, delivery_id, acked_by="peer-received:" + message["ref"])
-        elif record["state"] != "acked":
+    matched = False
+    for store, duty, row, record, root, storage, delivery_id in _registered_delivery_bindings(
+            message, roots, received_only=True):
+        matched = True
+        settled = record
+        if record["state"] in pending.OPEN_STATES:
+            try:
+                identity = pending.received_ack_identity(record, storage, delivery_id)
+                settled = pending.ack_received(root, storage, delivery_id,
+                    expected_identity=identity, acked_by="peer-received:" + message["ref"])
+            except (OSError, ValueError, RuntimeError):
+                continue
+        if settled["state"] != "acked":
             continue
         terminal = row.status == "done" and row.metadata.get("delivery_id") == delivery_id
         if duty.get("state") not in {"complete", "cancelled"}:
-            store.update(duty["id"], state="complete" if terminal else "pending",
-                         delivery="acknowledged", cleanup="complete" if terminal else "pending")
+            try:
+                store.update(duty["id"], state="complete" if terminal else "pending",
+                             delivery="acknowledged", cleanup="complete" if terminal else "pending")
+            except (OSError, ValueError, RuntimeError):
+                pass
+    return matched
 
 
 class ObligationStore:

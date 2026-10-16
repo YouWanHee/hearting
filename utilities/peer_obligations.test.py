@@ -30,9 +30,24 @@ class ObligationStoreTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.jobs = self.root / "route-jobs.tsv"
+        self.jobs.touch()
+        self._saved_env = dict(os.environ)
+        os.environ.update({
+            "HOME": str(self.root / "home"),
+            "XDG_STATE_HOME": str(self.root / "xdg-state"),
+            "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
+            "HARNESS_STATE_ROOT": str(self.root / "harness-state"),
+            "AGENT_PEER_LEDGER_ROOT": str(self.root / "peer-ledger"),
+            "AGENT_DISPATCH_JOBS": str(self.jobs),
+            "CODEX_HOME": str(self.root / "home" / ".codex"),
+            "CLAUDE_CONFIG_DIR": str(self.root / "home" / ".claude"),
+        })
         self.store = obligations.ObligationStore(self.root)
 
     def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved_env)
         self.temp.cleanup()
 
     def test_current_runner_starts_once_while_legacy_runner_lock_is_held(self):
@@ -103,38 +118,118 @@ class ObligationStoreTest(unittest.TestCase):
 
     def test_a_received_gate_does_not_close_a_later_terminal_completion(self):
         from types import SimpleNamespace
-        identity = {"jobs": str(self.root / "route-jobs.tsv"), "attempt_id": "att-owner",
+        import dispatch_pending_delivery as pending
+        identity = {"jobs": str(self.jobs), "attempt_id": "att-owner",
                     "session_id": "sid", "harness": "claude"}
         duty = self.store.create("registered-batch-fixture", "registered-batch", identity,
                                  {"carrier": "claude-parent-runtime"})
+        owner = "retained-rewake:" + duty["id"]
         observation = {"transfer_ref": "a" * 32, "recipient_sid": "sid",
-                       "delivery_id": "delivery-gate", "storage_recipient": "sid", "claim_owner": "owner"}
+                       "delivery_id": "delivery-gate", "storage_recipient": "sid", "claim_owner": owner}
         self.store.update(duty["id"], observation=observation)
-        message = {"state": "received", "ref": "a" * 32, "refs": [duty["id"]],
+        def transfer(ref, delivery_id, attempt_id="att-owner"):
+            return {"state": "received", "receipt": "exact-peer-ref", "ref": ref,
+                   "refs": [duty["id"]],
                    "to": {"harness": "claude", "session_id": "sid"},
-                   "dispatch_notice": {**observation, "duty_id": duty["id"],
-                       "jobs": identity["jobs"], "attempt_id": identity["attempt_id"],
-                       "carrier": "claude-parent-runtime"}}
+                   "dispatch_notice": {"duty_id": duty["id"], "jobs": identity["jobs"],
+                       "attempt_id": attempt_id, "carrier": "claude-parent-runtime",
+                       "recipient_sid": "sid", "storage_recipient": "sid",
+                       "delivery_id": delivery_id, "claim_owner": owner}}
         row = SimpleNamespace(status="done", attempt_id="att-owner",
-                              metadata={"parent_sid": "sid", "delivery_id": "delivery-final"})
-        record = {"state": "claimed", "attempt_ids": ["att-owner"], "claim_owner": "owner",
-                  "recipient_kind": "claude-parent-runtime"}
+                              metadata={"parent_sid": "sid", "parent_completion_delivery": "claude-parent-runtime",
+                                        "delivery_intent": "1",
+                                        "delivery_id": "delivery-final",
+                                        "delivery_receipt_digest": "digest-final",
+                                        "delivery_row_revision": "rev-final"})
+        def record(delivery_id, state, digest, revision):
+            return {"delivery_id": delivery_id, "recipient_digest": pending.recipient_digest("sid"),
+                    "recipient_kind": "claude-parent-runtime", "state": state,
+                    "attempt_ids": ["att-owner"], "receipt_digest": digest,
+                    "row_revisions": {"att-owner": revision}, "receipt": {"kind": "completion"},
+                    "session_generation": "", "session_generation_supported": "0",
+                    "parent_attempt_id": "att-parent", "route_id": "rt-fixture",
+                    "route_node": "report", "lineage": []}
+        gate = record("delivery-gate", "claimed", "digest-gate", "rev-gate")
+        final = record("delivery-final", "claimed", "digest-final", "rev-final")
+        records = {"delivery-gate": gate, "delivery-final": final}
+        def read_record(_root, _storage, delivery_id):
+            return records.get(delivery_id)
+        def acknowledge(_root, _storage, delivery_id, **_kwargs):
+            records[delivery_id]["state"] = "acked"
+            return records[delivery_id]
+        message = transfer("a" * 32, "delivery-gate")
         with mock.patch("dispatch_completion_join.current_attempt_row", return_value=row), \
-                mock.patch("dispatch_pending_delivery.read", return_value=record), \
-                mock.patch("dispatch_pending_delivery.ack") as ack:
-            obligations.acknowledge_registered_delivery(message, roots=[self.root])
+                mock.patch("dispatch_seat_handover.effective_parent", return_value="sid"), \
+                mock.patch("dispatch_pending_delivery.read", side_effect=read_record), \
+                mock.patch("dispatch_pending_delivery.received_ack_identity",
+                           side_effect=lambda value, _storage, _did: {"delivery_id": value["delivery_id"]}), \
+                mock.patch("dispatch_pending_delivery.ack_received", side_effect=acknowledge) as ack:
+            self.assertTrue(obligations.acknowledge_registered_delivery(message, roots=[self.root]))
             ack.assert_called_once()
             self.assertEqual(self.store.get(duty["id"])["state"], "pending")
             self.store.update(duty["id"], observation={**observation, "transfer_ref": "b" * 32,
                                                       "delivery_id": "delivery-final"})
-            record["state"] = "acked"
             self.assertTrue(obligations.registered_delivery_settled(message, roots=[self.root]))
             obligations.acknowledge_registered_delivery(message, roots=[self.root])
             self.assertEqual(self.store.get(duty["id"])["state"], "pending")
-            record["state"] = "claimed"
-            final = {**message, "ref": "b" * 32,
-                     "dispatch_notice": {**message["dispatch_notice"], "delivery_id": "delivery-final"}}
-            obligations.acknowledge_registered_delivery(final, roots=[self.root])
+            ack.reset_mock()
+
+            for invalid in (
+                {**message, "ref": "z" * 32},
+                {**message, "to": {"harness": "claude", "session_id": "other"}},
+                {**message, "to": {"harness": "codex", "session_id": "sid"}},
+                transfer("b" * 32, "delivery-gate", attempt_id="att-other"),
+                transfer("b" * 32, "delivery-missing"),
+                {**message, "dispatch_notice": {
+                    **message["dispatch_notice"], "storage_recipient": "other"}},
+            ):
+                self.assertFalse(obligations.acknowledge_registered_delivery(invalid, roots=[self.root]))
+            self.assertFalse(obligations.acknowledge_registered_delivery(
+                message, roots=[self.root / "foreign-artifacts"]))
+            self.assertEqual(ack.call_count, 0)
+            with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor"):
+                self.assertFalse(obligations.acknowledge_registered_delivery(message, roots=[self.root]))
+            self.assertEqual(ack.call_count, 0)
+
+            successor_duty = self.store.create(
+                "registered-batch-successor", "registered-batch", identity,
+                {"carrier": "claude-parent-runtime"})
+            successor_owner = "retained-rewake:" + successor_duty["id"]
+            records["delivery-successor"] = record(
+                "delivery-successor", "claimed", "digest-successor", "rev-successor")
+            successor_transfer = {"state": "received", "receipt": "exact-native-history",
+                "ref": "c" * 32, "refs": [successor_duty["id"]],
+                "to": {"harness": "claude", "session_id": "successor"},
+                "dispatch_notice": {"duty_id": successor_duty["id"], "jobs": identity["jobs"],
+                    "attempt_id": "att-owner", "carrier": "claude-parent-runtime",
+                    "recipient_sid": "successor", "storage_recipient": "sid",
+                    "delivery_id": "delivery-successor", "claim_owner": successor_owner}}
+            with mock.patch("dispatch_seat_handover.effective_parent", return_value="successor"):
+                self.assertTrue(obligations.acknowledge_registered_delivery(
+                    successor_transfer, roots=[self.root]))
+            self.assertEqual(records["delivery-successor"]["state"], "acked")
+            ack.reset_mock()
+
+            final_transfer = transfer("b" * 32, "delivery-final")
+            final["receipt_digest"] = "tampered-digest"
+            self.assertFalse(obligations.acknowledge_registered_delivery(final_transfer, roots=[self.root]))
+            self.assertEqual(ack.call_count, 0)
+            final["receipt_digest"] = "digest-final"
+            real_update = obligations.ObligationStore.update
+            failed_update = {"remaining": 1}
+            def update_once(store, duty_id, **kwargs):
+                if failed_update["remaining"] and kwargs.get("state") == "complete":
+                    failed_update["remaining"] -= 1
+                    raise OSError("simulated duty persistence interruption")
+                return real_update(store, duty_id, **kwargs)
+            with mock.patch.object(obligations.ObligationStore, "update", autospec=True,
+                                   side_effect=update_once):
+                self.assertTrue(obligations.acknowledge_registered_delivery(final_transfer,
+                                                                            roots=[self.root]))
+            self.assertEqual(self.store.get(duty["id"])["state"], "pending")
+            self.assertEqual(final["state"], "acked")
+            self.assertTrue(obligations.acknowledge_registered_delivery(final_transfer, roots=[self.root]))
+            self.assertEqual(ack.call_count, 1)
             self.assertEqual(self.store.get(duty["id"])["state"], "complete")
 
     def test_registered_completion_producer_uses_shared_normal_runner_helper(self):

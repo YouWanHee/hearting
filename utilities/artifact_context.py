@@ -121,6 +121,25 @@ class ArtifactContext:
         options = _ROLE_OUTPUTS.get(role)
         if options is None:
             raise ArtifactContextError("artifact-output-role-unknown", role)
+        if role == "run-record":
+            part_io = (self.node or {}).get("part_io") or {}
+            mapped = part_io.get("run.json") if isinstance(part_io, Mapping) else None
+            declared = [value for value in self.outputs if not is_semantic_output(value)]
+            if mapped is not None:
+                matches = [value for value in declared if value == mapped]
+            else:
+                matches = [value for value in declared
+                           if value == "run.json" or value.endswith("/run.json")]
+            unique = list(dict.fromkeys(matches))
+            if len(unique) != 1:
+                code = "artifact-output-role-missing" if not unique else "artifact-output-role-ambiguous"
+                raise ArtifactContextError(code, f"{role}: {unique or declared}")
+            relative = _safe_relative(unique[0])
+            if not scope_matches(relative, self.write_scope):
+                raise ArtifactContextError("artifact-output-outside-node-scope", relative)
+            if leaf is not None and leaf not in (relative, "run.json"):
+                raise ArtifactContextError("artifact-output-leaf-not-allowed", role)
+            return OutputBinding(role, "artifact", unique[0], self.output_dir / PurePosixPath(relative))
         candidates = []
         declarations = [value for value in self.outputs if not is_semantic_output(value)]
         if role in {"config-seal", "spec-output"}:

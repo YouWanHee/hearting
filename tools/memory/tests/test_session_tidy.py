@@ -2662,6 +2662,38 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(original["parent_sid"], "sid-A")
         self.assertNotIn("att-unselected", {b["attempt"] for b in rows[0]["bindings"]})
 
+    def test_the_clear_start_reads_the_registry_once_and_asks_only_about_new_attempts(self):
+        # The card hook has seconds: one registry read or route verification per binding of the
+        # same job let a cleared supervisor's SessionStart time out and lose its card.
+        route_file = self.open_route("rt-frame", "sha256:frame")
+        for index in range(12):
+            self.row(f"att-frame-{index}", status="done", route="rt-frame", node="frame", worker="frame",
+                     digest="sha256:frame", route_file=route_file)
+        self.row("att-open", route_file="/tmp/rt-1.json")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}):
+            seat = self.seat()
+            with st.seat_lock(seat.key):
+                st.record_event(seat, "claude", "sid-A", "start", cwd=str(self.cwd), now=st.now_epoch() - 9)
+                st.write_card(seat, "claude", "sid-A", "카드 본문", cwd=str(self.cwd))
+                self.assertEqual(self.handover.write_snapshot_locked(
+                    seat, "claude", "sid-A", now=st.now_epoch() - 5, jobs=self.jobs), 13)
+        self.row("att-retry", worker="frame", route_file="/tmp/rt-1.json")
+
+        import route_authority
+        asked, reads = [], []
+        decide, read = route_authority.decide_continuation, self.handover.latest_rows
+        with mock.patch.object(route_authority, "decide_continuation",
+                               side_effect=lambda **kw: asked.append(kw["metadata"]["attempt_id"]) or decide(**kw)), \
+                mock.patch.object(self.handover, "latest_rows", side_effect=lambda jobs: reads.append(jobs) or read(jobs)):
+            out, rows = self.start("sid-B")
+        text = "\n".join(out)
+        self.assertIn("카드 본문", text)
+        self.assertIn("[이어받은 진행 작업] route=rt-1", text)
+        self.assertEqual(asked, ["att-retry"])
+        self.assertEqual(len(reads), 2)                     # the refresh and the resume line, once each
+        self.assertEqual({b["attempt"] for b in rows[0]["bindings"]},
+                         {f"att-frame-{index}" for index in range(12)} | {"att-open", "att-retry"})
+
     def test_retire_selects_the_kept_union_once_and_preserves_all_flat_bindings(self):
         shared_route = self.open_route("rt-shared", "sha256:shared")
         finished_route = self.open_route("rt-finished", "sha256:finished")
