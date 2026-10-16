@@ -971,7 +971,7 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertIn(str(lock), advisory)
         self.assertIn("Ownership: unknown", advisory)
         self.assertIn("Codex App Server aggregatedOutput", advisory)
-        self.assertIn("stdout/stderr separation and raw bytes are unavailable", advisory)
+        self.assertIn("Stdout/stderr separation or raw bytes may be unavailable", advisory)
 
         events = [json.loads(line) for line in result.stdout.splitlines()]
         feedback = [row for row in events
@@ -1043,6 +1043,10 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         error_path = self.base / ".git" / "index.lock"
         error_output = f"fatal: Unable to create '{error_path}': File exists.\n"
         command = "zsh -lc " + shlex.quote(f"git -C {self.base} commit -m fixture")
+        wrapped_command = "python3 -c " + shlex.quote(
+            "import subprocess; subprocess.run(['git', 'add', 'x'], check=True)")
+        self.assertTrue(module.git_index_lock.codex_command_candidate(
+            wrapped_command, str(self.base), 1, error_output))
         candidates = []
         diagnosis = {"state": "present", "message": "fixture diagnosis"}
 
@@ -1071,7 +1075,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             for index in range(feedback.MAX_COMMANDS_PER_TURN + 1):
                 item = {
                     "type": "commandExecution", "id": f"eligible-{index}",
-                    "command": command, "cwd": str(self.base), "status": "failed",
+                    "command": wrapped_command if index % 2 else command,
+                    "cwd": str(self.base), "status": "failed",
                     "exitCode": 128, "aggregatedOutput": error_output,
                 }
                 candidates.append((item, json.dumps(item, sort_keys=True)))

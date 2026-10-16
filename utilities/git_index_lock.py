@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only diagnosis for a Git index-lock creation collision."""
+"""Bounded, read-only diagnosis of Git index-lock failures."""
 from __future__ import annotations
 
 import argparse
@@ -32,6 +32,7 @@ _GIT_ENV_PATHS = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_CEILING_DIRECTORIES",
 }
+_GIT_CONFIG_FILE_SELECTORS = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
 _RESPONSE_CODES = ("exit_code", "exitCode", "returncode", "code")
 
 
@@ -312,6 +313,7 @@ def _diagnose_bound_path(argv: list[str], cwd: str, returncode: int, reported_pa
     observation = observe(expected, max(0.0, deadline - time.monotonic()))
     if not isinstance(observation, dict):
         observation = {"state": "unavailable", "reason": "observer-invalid-result"}
+    cleanup = {"outcome": "not-attempted", "reason": "read-only-diagnosis"}
     state = observation.get("state", "unavailable")
     if state == "present" and observation.get("kind") == "symlink":
         observed = "present (symlink; target not followed)"
@@ -326,19 +328,30 @@ def _diagnose_bound_path(argv: list[str], cwd: str, returncode: int, reported_pa
         observed = f"unavailable ({observation.get('reason', 'unknown reason')})"
     checks = _read_only_commands(argv, cwd, process_env, expected)
     check_lines = "\n".join(f"  {command}" for command in checks)
-    source_note = (f"Output source: {output_source}; stdout/stderr separation and raw bytes are unavailable.\n"
-                   if output_source != "Git stderr" else "")
+    source_note = (
+        f"Output source: {output_source}; matching text is advisory and does not prove Git returned EEXIST. "
+        "Stdout/stderr separation or raw bytes may be unavailable.\n"
+        if output_source != "Git stderr" else ""
+    )
+    ownership_note = (
+        "Ownership: unknown. Mode, size, timestamps, cache age, and local process visibility "
+        "do not exclude an outstanding NFS client operation.\n"
+    )
+    cleanup_note = (
+        "Lock mutation: none. This bounded diagnosis never renames, unlinks, quarantines, "
+        "restores, retries, or replays the failed command.\n"
+    )
     return {
         "state": state, "lock_path": expected, "observation": observation,
+        "cleanup": cleanup,
         "message": (
             "Hearting Git index-lock diagnosis\n"
             f"Index lock: {expected}\n"
             f"{source_note}"
             f"Observation: {observed}\n"
-            "Ownership: unknown. Local process visibility and file age/attributes do not prove "
-            "ownership or staleness across NFS hosts and namespaces.\n"
-            "No file was changed and Git was not retried. Review active work in this worktree. "
-            "Optional read-only checks:\n"
+            f"{ownership_note}"
+            f"{cleanup_note}"
+            "Review active work in this worktree. Optional read-only checks:\n"
             f"{check_lines}"
         ),
     }
@@ -350,8 +363,8 @@ def _worker_unavailable(reason: str, description: str) -> dict:
         "observation": {"state": "unavailable", "reason": reason},
         "message": ("Hearting Git index-lock diagnosis\n"
                     f"Observation: unavailable ({description})\n"
-                    "Ownership: unknown. The original Git failure is unchanged; "
-                    "no file was changed and Git was not retried."),
+                    "Ownership: unknown. The original Git failure is unchanged. "
+                    "Diagnosis is read-only; no lock mutation or Git retry was attempted."),
     }
 
 
@@ -462,8 +475,9 @@ def _diagnose_payload(payload: dict) -> dict | None:
 def diagnose_failure(argv: list[str], cwd: str, returncode: int, stdout: bytes, stderr: bytes,
                      *, env: dict[str, str] | None = None,
                      budget_seconds: float = DIAGNOSIS_BUDGET_SECONDS,
-                     observer=None, git_runner=None) -> dict | None:
-    """Return an advisory only for a context-bound index.lock EEXIST failure."""
+                     observer=None, git_runner=None,
+                     output_source: str = "Git stderr") -> dict | None:
+    """Return a bounded, read-only observation for a context-bound lock error."""
     if returncode <= 0 or not isinstance(stderr, bytes):
         return None
     reported_path = _lock_path_from_error(stderr)
@@ -475,13 +489,14 @@ def diagnose_failure(argv: list[str], cwd: str, returncode: int, stdout: bytes, 
         budget = 0.0
     deadline = time.monotonic() + budget
     payload = {"argv": argv, "cwd": cwd, "returncode": int(returncode),
-               "reported_path": reported_path, "env": env, "deadline": deadline}
+               "reported_path": reported_path, "env": env, "deadline": deadline,
+               "output_source": output_source}
     # Injected callbacks are deterministic unit seams, not production timeout evidence.
     if observer is not None or git_runner is not None:
         try:
             return _diagnose_bound_path(
                 argv, cwd, int(returncode), reported_path, env=env, deadline=deadline,
-                observer=observer, git_runner=git_runner,
+                observer=observer, git_runner=git_runner, output_source=output_source,
             )
         except (TypeError, ValueError, OSError):
             return None
@@ -499,8 +514,32 @@ def _codex_command_argv(command: str, cwd: str):
     return parse_shell_command(command, cwd)
 
 
+def _fallback_worktree_context(cwd: str, env: dict[str, str] | None = None):
+    """Select only the dispatch worktree (or exact absolute tool cwd) default index."""
+    source = os.environ if env is None else env
+    if any(source.get(key) for key in _GIT_ENV_PATHS):
+        return None
+    # GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM only pick config files, like ~/.gitconfig;
+    # injected settings (GIT_CONFIG_COUNT/KEY_n/VALUE_n/PARAMETERS) stay unsupported.
+    if any(key.startswith("GIT_CONFIG_") and key not in _GIT_CONFIG_FILE_SELECTORS and value
+           for key, value in source.items()):
+        return None
+    dispatched = source.get("AGENT_DISPATCH_WORKTREE")
+    if dispatched:
+        if not os.path.isabs(dispatched):
+            return None
+        selected = os.path.realpath(dispatched)
+    else:
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        selected = os.path.realpath(cwd)
+    if not os.path.isdir(selected):
+        return None
+    return ["git", "-C", selected, "status"], selected, {}
+
+
 def _shell_failure_candidate(command: str, cwd: str, exit_code: int,
-                             output: str, parse_command):
+                             output: str, parse_command, env: dict[str, str] | None = None):
     """Cheaply recognize a structured, supported index-lock failure candidate."""
     if (not isinstance(command, str) or len(command) > 64 * 1024
             or not isinstance(cwd, str) or len(cwd) > 16 * 1024 or not os.path.isabs(cwd)
@@ -510,23 +549,27 @@ def _shell_failure_candidate(command: str, cwd: str, exit_code: int,
         return None
     match = _LOCK_ERROR_TEXT.search(output)
     parsed = parse_command(command, cwd)
-    if not match or parsed is None:
+    if not match:
+        return None
+    if parsed is None:
+        parsed = _fallback_worktree_context(cwd, env)
+    if parsed is None:
         return None
     return parsed, match.group("path")
 
 
 def codex_command_candidate(command: str, cwd: str, exit_code: int,
-                            aggregated_output: str) -> bool:
+                            aggregated_output: str, *, env: dict[str, str] | None = None) -> bool:
     """Return whether a native App Server item merits bounded path diagnosis."""
     return _shell_failure_candidate(
-        command, cwd, exit_code, aggregated_output, _codex_command_argv,
+        command, cwd, exit_code, aggregated_output, _codex_command_argv, env,
     ) is not None
 
 
 def _diagnose_shell_failure(command: str, cwd: str, exit_code: int, output: str,
                             *, output_source: str, parse_command,
                             env: dict[str, str] | None = None):
-    candidate = _shell_failure_candidate(command, cwd, exit_code, output, parse_command)
+    candidate = _shell_failure_candidate(command, cwd, exit_code, output, parse_command, env)
     if candidate is None:
         return None
     (argv, effective_cwd, command_env), reported_path = candidate
@@ -657,10 +700,16 @@ def diagnose_hook_payload(payload: dict, harness: str) -> dict | None:
         return None
     command, cwd, code, stdout, stderr, raw_available = fields
     parsed = parse_shell_command(command, cwd)
+    unparsed_output = parsed is None
+    if unparsed_output:
+        parsed = _fallback_worktree_context(cwd)
     if parsed is None:
         return None
     argv, effective_cwd, extra_env = parsed
-    diagnosis = diagnose_failure(argv, effective_cwd, code, stdout, stderr, env=extra_env)
+    diagnosis = diagnose_failure(
+        argv, effective_cwd, code, stdout, stderr, env=extra_env,
+        output_source="unparsed wrapper output" if unparsed_output else "Git stderr",
+    )
     if diagnosis is not None:
         diagnosis["raw_bytes_available"] = raw_available
     return diagnosis
