@@ -72,9 +72,12 @@ runtime terminal path. Stage-dispatch §13.61 and artifact-path-contract §43
 govern the proof and the cycle's completion record; a finalized cycle's files stay editable (artifact-path-contract §45).
 
 An index-lock EEXIST diagnosis is attached only after the original Git
-failure, through the shared read-only helper in core/OPERATIONS.md §5.9.
-Keep the original result and partial state; never repair or retry the failed
-command automatically.
+failure, through the shared bounded helper in core/OPERATIONS.md §5.9. It may
+remove only a context-bound NFSv3 residual that passes the complete freshness,
+identity, mode, size, and timestamp predicate there. Keep the original result
+and partial state; the helper never replays the original command. After feedback
+confirms removal, the acting agent may retry that same command. Unparsed wrapper
+failures require exact binding to the selected worktree's default index.
 
 ## Role Requirements
 

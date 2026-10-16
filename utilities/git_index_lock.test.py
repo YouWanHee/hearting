@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated regressions for the shared, read-only Git index-lock diagnosis."""
+"""Isolated regressions for bounded Git index-lock diagnosis and cleanup."""
 from __future__ import annotations
 
 import base64
@@ -7,6 +7,7 @@ import importlib.util
 import os
 from pathlib import Path
 import subprocess
+import stat
 import tempfile
 import time
 import unittest
@@ -123,6 +124,8 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         self.assertEqual(diagnosis["lock_path"], str(lock))
         self.assertEqual(diagnosis["observation"]["mode"], "0o0")
         self.assertIn("Ownership: unknown", diagnosis["message"])
+        self.assertEqual(diagnosis["cleanup"]["outcome"], "not-eligible")
+        self.assertEqual(diagnosis["cleanup"]["reason"], "not-nfsv3")
         self.assertEqual(self.fd_bytes(lock_fd), b"")
         self.assertEqual(lock.stat().st_mode & 0o777, 0)
         self.assertEqual(self.path_identity(lock), lock_identity)
@@ -320,6 +323,23 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
                 self.assertEqual(self.git_state(), after_failure_before_diagnosis)
                 self.assertEqual(self.fd_bytes(lock_fd), b"")
 
+    def test_confirmed_residual_removal_advises_agent_retry_without_replaying(self):
+        result, lock, *_ = self.fail_commit()
+        runner = mock.Mock(return_value=str(lock)[:-5])
+        observation = {"state": "present", "kind": "regular-file", "mode": "0o0",
+                       "size": 0, "mtime_ns": 1}
+        cleanup = {"outcome": "removed",
+                   "reason": "verified-nfsv3-exclusive-create-remnant"}
+        with mock.patch.object(git_index_lock, "_observe", return_value=observation), \
+             mock.patch.object(git_index_lock, "_cleanup_stale_index_lock",
+                               return_value=cleanup) as remove:
+            diagnosis = self.diagnose(result, git_runner=runner)
+        self.assertEqual(diagnosis["cleanup"], cleanup)
+        self.assertIn("acting agent may retry that same command", diagnosis["message"])
+        self.assertIn("original Git command was not replayed", diagnosis["message"])
+        self.assertEqual(runner.call_count, 1)
+        remove.assert_called_once()
+
     def test_success_signal_permission_other_lock_and_unrecognized_locale_are_not_reclassified(self):
         result, lock, *_ = self.fail_commit()
         argv = ["git", "-C", str(self.repo), "commit"]
@@ -387,6 +407,7 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         self.assertEqual(diagnosis["state"], "unavailable")
         self.assertEqual(diagnosis["observation"]["reason"], "diagnostic-timeout")
         self.assertLess(elapsed, git_index_lock.DIAGNOSIS_BUDGET_SECONDS + 0.75)
+        self.assertNotIn("no file was changed", diagnosis["message"].lower())
         self.assertEqual(self.fd_bytes(lock_fd), b"")
         self.assertEqual(lock.stat().st_mode & 0o777, 0)
 
@@ -398,6 +419,163 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         self.assertEqual(base64.b64decode(record["stdout_b64"]), stdout)
         self.assertEqual(base64.b64decode(record["stderr_b64"]), stderr)
         self.assertEqual(record["returncode"], 128)
+
+
+class NfsV3StaleSignatureTest(unittest.TestCase):
+    def setUp(self):
+        self.now = time.time_ns()
+        ctime = self.now - 300 * 1_000_000_000
+        self.valid = {
+            "state": "present", "mode": stat.S_IFREG, "size": 0,
+            "dev_major": 0, "dev_minor": 1, "ino": 123,
+            "mtime_ns": ctime - 25 * 60 * 60 * 1_000_000_000,
+            "ctime_ns": ctime,
+        }
+        self.mount = {"nfs_v3": True, "cache_grace_seconds": 120}
+
+    def test_only_the_complete_fresh_nfs_v3_signature_is_eligible(self):
+        self.assertEqual(git_index_lock._stale_nfs_signature(
+            self.valid, self.mount, self.now),
+            (True, "verified-nfsv3-exclusive-create-remnant"))
+        cases = (
+            ({**self.valid, "mode": stat.S_IFREG | 0o664}, self.mount, "mode-not-zero"),
+            ({**self.valid, "mode": stat.S_IFREG | stat.S_ISUID}, self.mount,
+             "mode-not-zero"),
+            ({**self.valid, "size": 1}, self.mount, "not-empty"),
+            ({**self.valid, "mode": stat.S_IFLNK}, self.mount, "not-regular-file"),
+            ({**self.valid, "mtime_ns": self.valid["ctime_ns"]}, self.mount,
+             "mtime-ctime-gap-too-small"),
+            ({**self.valid, "ctime_ns": self.now + 1}, self.mount, "future-timestamp"),
+            ({**self.valid, "mtime_ns": self.now + 1}, self.mount, "future-timestamp"),
+            ({**self.valid, "ctime_ns": self.now - 119 * 1_000_000_000}, self.mount,
+             "attribute-cache-grace"),
+            (self.valid, {"nfs_v3": False, "reason": "not-nfsv3"}, "not-nfsv3"),
+            (self.valid, {"nfs_v3": True, "cache_grace_seconds": 3600},
+             "attribute-cache-grace"),
+            ({key: value for key, value in self.valid.items() if key != "ino"},
+             self.mount, "required-attributes-missing"),
+        )
+        for attributes, mount, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(git_index_lock._stale_nfs_signature(
+                    attributes, mount, self.now), (False, reason))
+
+
+class NfsV3StaleCleanupTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="hearting-nfs-cleanup-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.lock = self.root / "index.lock"
+        self.lock.write_bytes(b"")
+        self.lock.chmod(0)
+        actual = os.lstat(self.lock)
+        now = time.time_ns()
+        ctime = now - 300 * 1_000_000_000
+        self.attributes = {
+            "state": "present", "mode": stat.S_IFREG, "size": 0,
+            "dev_major": os.major(actual.st_dev), "dev_minor": os.minor(actual.st_dev),
+            "ino": actual.st_ino,
+            "mtime_ns": ctime - 25 * 60 * 60 * 1_000_000_000,
+            "ctime_ns": ctime,
+        }
+        self.mount = {"nfs_v3": True, "cache_grace_seconds": 120}
+
+    def snapshots(self, *, post=None, changed_before=None):
+        first = dict(self.attributes)
+        second = dict(changed_before or self.attributes)
+        before_rename = dict(second)
+        after_rename = dict(post or second)
+        after_rename["ctime_ns"] = time.time_ns()
+        return [first, second, before_rename, after_rename]
+
+    def run_cleanup(self, snapshots):
+        with mock.patch.object(git_index_lock, "_mount_info", return_value=self.mount), \
+             mock.patch.object(git_index_lock, "_statx_at", side_effect=snapshots):
+            return git_index_lock._cleanup_stale_index_lock(
+                str(self.lock), time.monotonic() + 1)
+
+    def test_verified_candidate_is_quarantined_rechecked_and_removed(self):
+        result = self.run_cleanup(self.snapshots())
+        self.assertEqual(result["outcome"], "removed")
+        self.assertFalse(self.lock.exists())
+        self.assertEqual(list(self.root.glob(".hearting-index-lock-*")), [])
+
+    def test_mode_664_and_replaced_pre_rename_objects_are_preserved(self):
+        ordinary = dict(self.attributes, mode=stat.S_IFREG | 0o664)
+        with mock.patch.object(git_index_lock, "_mount_info", return_value=self.mount), \
+             mock.patch.object(git_index_lock, "_statx_at", return_value=ordinary):
+            result = git_index_lock._cleanup_stale_index_lock(
+                str(self.lock), time.monotonic() + 1)
+        self.assertEqual((result["outcome"], result["reason"]),
+                         ("not-eligible", "mode-not-zero"))
+        self.assertTrue(self.lock.exists())
+
+        replacement = dict(self.attributes, ino=self.attributes["ino"] + 1)
+        result = self.run_cleanup(self.snapshots(changed_before=replacement))
+        self.assertEqual(result["outcome"], "changed")
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(list(self.root.glob(".hearting-index-lock-*")), [])
+
+    def test_changed_quarantined_object_is_restored_without_overwrite(self):
+        changed = dict(self.attributes, ino=self.attributes["ino"] + 1)
+        result = self.run_cleanup(self.snapshots(post=changed))
+        self.assertEqual(result["outcome"], "changed")
+        self.assertEqual(result["restore"], "restored")
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(self.lock.stat().st_mode & 0o777, 0)
+        self.assertEqual(list(self.root.glob(".hearting-index-lock-*")), [])
+
+    def test_replacement_at_original_name_preserves_both_objects(self):
+        changed = dict(self.attributes, ino=self.attributes["ino"] + 1)
+        real_rename = os.rename
+
+        def race_rename(*args, **kwargs):
+            real_rename(*args, **kwargs)
+            with self.lock.open("xb") as stream:
+                stream.write(b"new live lock")
+
+        with mock.patch.object(git_index_lock, "_mount_info", return_value=self.mount), \
+             mock.patch.object(git_index_lock, "_statx_at",
+                               side_effect=self.snapshots(post=changed)), \
+             mock.patch.object(git_index_lock.os, "rename", side_effect=race_rename):
+            result = git_index_lock._cleanup_stale_index_lock(
+                str(self.lock), time.monotonic() + 1)
+        self.assertEqual(result["restore"], "original-path-occupied")
+        self.assertEqual(self.lock.read_bytes(), b"new live lock")
+        quarantine = Path(result["quarantine_path"])
+        self.assertTrue(quarantine.exists())
+        quarantine.unlink()
+        quarantine.parent.rmdir()
+
+    def test_unlink_failure_restores_candidate_and_expired_budget_does_not_drop_it(self):
+        real_unlink = os.unlink
+        failed = False
+
+        def fail_once(path, *args, **kwargs):
+            nonlocal failed
+            if path == "candidate" and not failed:
+                failed = True
+                raise PermissionError("injected unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(git_index_lock, "_mount_info", return_value=self.mount), \
+             mock.patch.object(git_index_lock, "_statx_at", side_effect=self.snapshots()), \
+             mock.patch.object(git_index_lock.os, "unlink", side_effect=fail_once):
+            result = git_index_lock._cleanup_stale_index_lock(
+                str(self.lock), time.monotonic() + 1)
+        self.assertEqual(result["restore"], "restored")
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(list(self.root.glob(".hearting-index-lock-*")), [])
+
+        times = iter((0.0, 0.0, 0.0, 2.0))
+        with mock.patch.object(git_index_lock, "_mount_info", return_value=self.mount), \
+             mock.patch.object(git_index_lock, "_statx_at", side_effect=self.snapshots()), \
+             mock.patch.object(git_index_lock.time, "monotonic", side_effect=lambda: next(times)):
+            result = git_index_lock._cleanup_stale_index_lock(str(self.lock), 1.0)
+        self.assertEqual(result["restore"], "restored")
+        self.assertEqual(result["reason"], "deadline-exhausted-after-quarantine")
+        self.assertTrue(self.lock.exists())
 
 
 if __name__ == "__main__":

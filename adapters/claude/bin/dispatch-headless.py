@@ -40,6 +40,7 @@ from dispatch_contract import (
     annotate_attempt_row,
     adapter_launch_failure_outcome,
     bytecode_cache_env,
+    git_optional_locks_env,
     launch_mismatch_annotation,
     attempt_launch_is_available,
     attempt_launch_state,
@@ -1989,6 +1990,8 @@ def main(argv: list[str]) -> int:
             launch_metadata["execution_access_effective_sha256"] = effective_sha256
         if args.dispatch_depth >= 2 and os.environ.get("AGENT_DISPATCH_CHILD") == "1":
             launch_metadata["pid_scope"] = "namespace-local"
+        # Apply after the masked home and every nested environment merge.
+        env.update(git_optional_locks_env())
         try:
             proc, launch_metadata = spawn_claimed_attempt(
                 jobs,

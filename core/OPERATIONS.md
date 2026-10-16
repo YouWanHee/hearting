@@ -108,25 +108,39 @@ echo "state: branch=$br head=$head base=$def dirty=$(git status --porcelain 2>/d
 #### Git index-lock failure diagnosis
 
 After an actual Git failure to create an index lock with EEXIST, the existing
-failure path may attach the shared read-only diagnosis. It resolves the Git
-context and expected lock path from the failed invocation, checks only that path
-with lstat, and preserves the original stdout, stderr, return code or signal,
-and partial Git state. An unbound path, unsupported shell form, permission error,
-or observation timeout leaves the original failure intact and does not inspect a
-path quoted by untrusted output.
+failure path may attach the shared diagnosis. It resolves the Git context and
+expected lock path from the failed invocation, checks only that path, and
+preserves the original stdout, stderr, return code or signal, and partial Git
+state. A Python-wrapped or otherwise unparsed command is eligible only when its
+reported lock is bound to the selected worktree's default index; an unbound path,
+unsupported context, permission error, or observation timeout leaves the original
+failure intact and never inspects a path quoted by untrusted output.
 
-The diagnosis is advisory. A present lock, its age, size, mode, timestamps, or a
-process not found in local observations cannot establish stale ownership across
-NFS hosts or process namespaces. Missing and unobservable locks remain distinct
-observations; neither authorizes removal. The helper does not delete, rename,
-chmod, choose another index, or retry Git. Git context lookup and file
-observation run inside one newly created diagnostic process group under a shared
-two-second wall-clock deadline. On expiry, the caller signals only that group
-and returns without an unbounded wait; the failed Git writer receives no
-signal.
-A process held in an uninterruptible kernel wait may outlive that signal, so a
-timeout preserves the original failure without promising kernel cancellation.
-See utilities/git_index_lock.py for the single implementation used by source
+The helper may remove only a narrowly identified NFSv3 exclusive-create remnant:
+a freshly synchronized, no-follow regular-file observation must show the same
+device and inode, zero size, mode and special bits all zero, an mtime at least 24
+hours from ctime, and a non-future ctime older than the mount's attribute-cache
+grace (`max(120 seconds, acregmax + 60 seconds)`, or the NFS default when mount
+options omit it). Missing metadata, a non-NFSv3 mount, a recent or ordinary lock,
+or any changed identity leaves the lock untouched. Mode, age, uid, or absence of
+a locally visible process alone never authorizes removal. The helper operates
+only on the context-bound index lock: it renames into a private quarantine in the
+same directory, rechecks identity and file shape, then unlinks only the verified
+candidate. If the object changes, it restores without overwriting a new path or
+preserves both objects and reports the uncertainty. Other lock types and paths
+are outside this cleanup.
+
+The original Git command is never replayed by the helper. Only after the
+diagnosis reports that the eligible remnant was removed does it advise the
+acting agent to retry the same command. All other outcomes retain the original
+failure and distinguish an unchanged lock from an unavailable or changed
+observation. Git context lookup and file handling run inside one bounded
+diagnostic process group under the shared two-second wall-clock deadline. On
+expiry, the caller signals only that group and returns without an unbounded
+wait; the failed Git writer receives no signal. A process held in an
+uninterruptible kernel wait may outlive that signal, and timeout does not claim
+that an already-started filesystem mutation was cancelled. See
+utilities/git_index_lock.py for the single implementation used by source
 consumers and runtime adapters.
 
 Native coverage is envelope-specific: Claude's supported post-tool events use

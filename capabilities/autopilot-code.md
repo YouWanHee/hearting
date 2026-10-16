@@ -215,8 +215,10 @@ Additional code-entry gates:
    `skipped/extension-unavailable` without changing code-cycle completion.
 
 If Git fails to create an index lock, preserve that failure and its partial
-state; attach only the shared read-only diagnosis in core/OPERATIONS.md §5.9.
-Do not remove the lock or rerun Git automatically.
+state; use the context-bound diagnosis and narrowly limited NFSv3 residual-lock
+cleanup in core/OPERATIONS.md §5.9. Only a confirmed removal advises the acting
+agent to retry the same command. The helper never retries Git or replays an
+arbitrary shell or Python command.
 
 ## Mode-Specific Semantics
 

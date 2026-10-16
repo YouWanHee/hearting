@@ -6810,4 +6810,15 @@ class ReviewSelfDispositionObserverTest(unittest.TestCase):
   origin.write_bytes(origin.read_bytes()+b" ")
   self.assertIsNone(D._marker_bound_prepare_marker_proof(meta,"att-review-self"))
 
+
+class GitOptionalLocksEnvironmentTest(unittest.TestCase):
+ def test_worker_override_is_fixed_and_does_not_mutate_parent_environment(self):
+  for inherited in (None, "0", "1"):
+   with self.subTest(inherited=inherited):
+    values={} if inherited is None else {"GIT_OPTIONAL_LOCKS": inherited}
+    with mock.patch.dict(os.environ, values, clear=True):
+     before=dict(os.environ)
+     self.assertEqual(D.git_optional_locks_env(), {"GIT_OPTIONAL_LOCKS":"0"})
+     self.assertEqual(dict(os.environ), before)
+
 if __name__=="__main__": unittest.main()

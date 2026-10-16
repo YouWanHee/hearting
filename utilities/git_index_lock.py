@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Read-only diagnosis for a Git index-lock creation collision."""
+"""Bounded diagnosis and narrowly proven NFSv3 index-lock cleanup."""
 from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import errno
 import io
 import json
 import locale
+import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import select
 import signal
@@ -19,6 +23,11 @@ import sys
 import time
 
 DIAGNOSIS_BUDGET_SECONDS = 2.0
+_NFSV3_MTIME_CTIME_GAP_NS = 24 * 60 * 60 * 1_000_000_000
+_STATX_BASIC_STATS = 0x000007FF
+_STATX_REQUIRED = 0x00000001 | 0x00000002 | 0x00000040 | 0x00000080 | 0x00000100 | 0x00000200
+_AT_SYMLINK_NOFOLLOW = 0x00000100
+_AT_STATX_FORCE_SYNC = 0x00002000
 _LOCK_ERROR = re.compile(
     rb"unable to create ['\"](?P<path>[^\r\n]*?index\.lock)['\"]:\s*file exists\b",
     re.IGNORECASE,
@@ -196,6 +205,279 @@ def errno_name(exc: OSError) -> str:
         exc.errno, "observation-error")
 
 
+class _StatxTimestamp(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_int64), ("tv_nsec", ctypes.c_uint32),
+                ("reserved", ctypes.c_int32)]
+
+
+class _Statx(ctypes.Structure):
+    _fields_ = [
+        ("mask", ctypes.c_uint32), ("blksize", ctypes.c_uint32),
+        ("attributes", ctypes.c_uint64), ("nlink", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32), ("gid", ctypes.c_uint32),
+        ("mode", ctypes.c_uint16), ("spare0", ctypes.c_uint16),
+        ("ino", ctypes.c_uint64), ("size", ctypes.c_uint64),
+        ("blocks", ctypes.c_uint64), ("attributes_mask", ctypes.c_uint64),
+        ("atime", _StatxTimestamp), ("btime", _StatxTimestamp),
+        ("ctime", _StatxTimestamp), ("mtime", _StatxTimestamp),
+        ("rdev_major", ctypes.c_uint32), ("rdev_minor", ctypes.c_uint32),
+        ("dev_major", ctypes.c_uint32), ("dev_minor", ctypes.c_uint32),
+        ("mnt_id", ctypes.c_uint64), ("dio_mem_align", ctypes.c_uint32),
+        ("dio_offset_align", ctypes.c_uint32), ("spare3", ctypes.c_uint64 * 12),
+    ]
+
+
+def _statx_at(directory_fd: int, name: str) -> dict:
+    """Get no-follow, server-synchronized attributes or report them unavailable."""
+    function = getattr(ctypes.CDLL(None, use_errno=True), "statx", None)
+    if function is None:
+        return {"state": "unavailable", "reason": "statx-unsupported"}
+    function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                         ctypes.c_uint, ctypes.POINTER(_Statx))
+    function.restype = ctypes.c_int
+    result = _Statx()
+    status = function(directory_fd, os.fsencode(name),
+                      _AT_SYMLINK_NOFOLLOW | _AT_STATX_FORCE_SYNC,
+                      _STATX_BASIC_STATS, ctypes.byref(result))
+    if status != 0:
+        code = ctypes.get_errno()
+        if code == errno.ENOENT:
+            return {"state": "not_found"}
+        return {"state": "unavailable", "reason": errno.errorcode.get(code, "statx-error").lower()}
+    if result.mask & _STATX_REQUIRED != _STATX_REQUIRED:
+        return {"state": "unavailable", "reason": "statx-required-fields-missing"}
+    return {
+        "state": "present", "mode": int(result.mode), "size": int(result.size),
+        "dev_major": int(result.dev_major), "dev_minor": int(result.dev_minor),
+        "ino": int(result.ino),
+        "mtime_ns": int(result.mtime.tv_sec) * 1_000_000_000 + int(result.mtime.tv_nsec),
+        "ctime_ns": int(result.ctime.tv_sec) * 1_000_000_000 + int(result.ctime.tv_nsec),
+    }
+
+
+def _unescape_mount_field(value: str) -> str:
+    return re.sub(r"\\(040|011|012|134)", lambda match: {
+        "040": " ", "011": "\t", "012": "\n", "134": "\\",
+    }[match.group(1)], value)
+
+
+def _mount_info(path: str) -> dict:
+    """Resolve the containing mount and its NFSv3 attribute-cache bound."""
+    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    target = os.path.join(parent, os.path.basename(path))
+    candidates = []
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+            for line in stream:
+                left, separator, right = line.rstrip("\n").partition(" - ")
+                if not separator:
+                    continue
+                before, after = left.split(), right.split()
+                if len(before) < 6 or len(after) < 3:
+                    continue
+                mountpoint = _unescape_mount_field(before[4])
+                try:
+                    if os.path.commonpath((target, mountpoint)) != mountpoint:
+                        continue
+                except ValueError:
+                    continue
+                options = set(before[5].split(",")) | set(after[2].split(","))
+                candidates.append((len(mountpoint), mountpoint, after[0], options))
+    except OSError:
+        return {"nfs_v3": False, "reason": "mount-info-unavailable"}
+    if not candidates:
+        return {"nfs_v3": False, "reason": "mount-not-found"}
+    _, mountpoint, filesystem, options = max(candidates, key=lambda value: value[0])
+    values = {}
+    for option in options:
+        key, separator, value = option.partition("=")
+        if separator:
+            values[key] = value
+    version = values.get("vers", values.get("nfsvers"))
+    if filesystem != "nfs" or version != "3":
+        return {"nfs_v3": False, "reason": "not-nfsv3", "mountpoint": mountpoint,
+                "filesystem": filesystem, "version": version}
+    cache_values = []
+    for key in ("acregmax", "actimeo"):
+        if key in values:
+            try:
+                number = float(values[key])
+            except ValueError:
+                return {"nfs_v3": False, "reason": "invalid-mount-cache-option"}
+            if not math.isfinite(number) or number < 0:
+                return {"nfs_v3": False, "reason": "invalid-mount-cache-option"}
+            cache_values.append(number)
+    cache_max = max(cache_values) if cache_values else 60.0
+    return {"nfs_v3": True, "reason": "nfsv3", "mountpoint": mountpoint,
+            "cache_max_seconds": cache_max,
+            "cache_grace_seconds": max(120.0, cache_max + 60.0)}
+
+
+def _stale_nfs_signature(attributes: dict, mount: dict, now_ns: int) -> tuple[bool, str]:
+    """Pure conservative predicate for a broken NFSv3 exclusive-create remnant."""
+    if not isinstance(mount, dict) or mount.get("nfs_v3") is not True:
+        return False, str(mount.get("reason", "not-nfsv3")) if isinstance(mount, dict) else "mount-info-missing"
+    required = ("mode", "size", "dev_major", "dev_minor", "ino", "mtime_ns", "ctime_ns")
+    if not isinstance(attributes, dict) or any(key not in attributes for key in required):
+        return False, "required-attributes-missing"
+    values = [attributes[key] for key in required]
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+        return False, "invalid-attributes"
+    mode, size, dev_major, dev_minor, ino, mtime_ns, ctime_ns = values
+    if min(size, dev_major, dev_minor, ino, mtime_ns, ctime_ns) < 0 or ino == 0:
+        return False, "invalid-attributes"
+    if not stat.S_ISREG(mode):
+        return False, "not-regular-file"
+    if size != 0:
+        return False, "not-empty"
+    if mode & 0o7777:
+        return False, "mode-not-zero"
+    if ctime_ns > now_ns or mtime_ns > now_ns:
+        return False, "future-timestamp"
+    if abs(mtime_ns - ctime_ns) < _NFSV3_MTIME_CTIME_GAP_NS:
+        return False, "mtime-ctime-gap-too-small"
+    cache_grace = mount.get("cache_grace_seconds")
+    if (not isinstance(cache_grace, (int, float)) or isinstance(cache_grace, bool)
+            or not math.isfinite(cache_grace) or cache_grace < 0):
+        return False, "attribute-cache-bound-unavailable"
+    if now_ns - ctime_ns < int(cache_grace * 1_000_000_000):
+        return False, "attribute-cache-grace"
+    return True, "verified-nfsv3-exclusive-create-remnant"
+
+
+def _same_snapshot(left: dict, right: dict, *, post_rename: bool = False) -> bool:
+    keys = ["mode", "size", "dev_major", "dev_minor", "ino", "mtime_ns"]
+    if not post_rename:
+        keys.append("ctime_ns")
+    return (isinstance(left, dict) and isinstance(right, dict)
+            and left.get("state") == right.get("state") == "present"
+            and all(left.get(key) == right.get(key) for key in keys))
+
+
+def _cleanup_stale_index_lock(path: str, deadline: float) -> dict:
+    """Quarantine and remove only a freshly revalidated NFSv3 remnant."""
+    if time.monotonic() >= deadline:
+        return {"outcome": "unavailable", "reason": "deadline-exhausted"}
+    parent = os.path.dirname(os.path.abspath(path))
+    name = os.path.basename(path)
+    directory_fd = quarantine_fd = None
+    quarantine_name = None
+
+    def cleanup_empty_quarantine():
+        nonlocal quarantine_fd, quarantine_name
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+            quarantine_fd = None
+        if quarantine_name is not None:
+            try:
+                os.rmdir(quarantine_name, dir_fd=directory_fd)
+                quarantine_name = None
+                return True
+            except OSError:
+                return False
+        return True
+
+    def preserve_moved_object(reason: str) -> dict:
+        """Restore by a no-overwrite hard link; keep both names on conflict."""
+        try:
+            os.link("candidate", name, src_dir_fd=quarantine_fd,
+                    dst_dir_fd=directory_fd, follow_symlinks=False)
+            try:
+                os.unlink("candidate", dir_fd=quarantine_fd)
+            except OSError as exc:
+                return {"outcome": "unavailable", "reason": reason,
+                        "restore": "linked-but-quarantine-unlink-failed",
+                        "quarantine_path": os.path.join(parent, quarantine_name, "candidate"),
+                        "error": errno_name(exc)}
+            quarantine_removed = cleanup_empty_quarantine()
+            result = {"outcome": "changed", "reason": reason, "restore": "restored"}
+            if not quarantine_removed and quarantine_name is not None:
+                result["quarantine_path"] = os.path.join(parent, quarantine_name)
+            return result
+        except FileExistsError:
+            return {"outcome": "changed", "reason": reason,
+                    "restore": "original-path-occupied",
+                    "quarantine_path": os.path.join(parent, quarantine_name, "candidate")}
+        except OSError as exc:
+            return {"outcome": "unavailable", "reason": reason,
+                    "restore": "failed",
+                    "quarantine_path": os.path.join(parent, quarantine_name, "candidate"),
+                    "error": errno_name(exc)}
+
+    try:
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        first = _statx_at(directory_fd, name)
+        if first.get("state") != "present":
+            return {"outcome": "unavailable" if first.get("state") == "unavailable" else "not-eligible",
+                    "reason": first.get("reason", first.get("state", "attributes-unavailable"))}
+        mount = _mount_info(path)
+        eligible, reason = _stale_nfs_signature(first, mount, time.time_ns())
+        if not eligible:
+            return {"outcome": "not-eligible", "reason": reason}
+        if time.monotonic() >= deadline:
+            return {"outcome": "unavailable", "reason": "deadline-exhausted"}
+        second = _statx_at(directory_fd, name)
+        eligible, reason = _stale_nfs_signature(second, mount, time.time_ns())
+        if not eligible:
+            return {"outcome": "changed" if second.get("state") == "present" else "unavailable",
+                    "reason": reason}
+        if not _same_snapshot(first, second):
+            return {"outcome": "changed", "reason": "attributes-changed-before-quarantine"}
+
+        for _ in range(4):
+            quarantine_name = ".hearting-index-lock-" + secrets.token_hex(12)
+            try:
+                os.mkdir(quarantine_name, 0o700, dir_fd=directory_fd)
+                break
+            except FileExistsError:
+                quarantine_name = None
+        if quarantine_name is None:
+            return {"outcome": "unavailable", "reason": "quarantine-name-collision"}
+        quarantine_fd = os.open(quarantine_name,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                                dir_fd=directory_fd)
+        if time.monotonic() >= deadline:
+            cleanup_empty_quarantine()
+            quarantine_fd = quarantine_name = None
+            return {"outcome": "unavailable", "reason": "deadline-exhausted"}
+        before_rename = _statx_at(directory_fd, name)
+        eligible, reason = _stale_nfs_signature(before_rename, mount, time.time_ns())
+        if not eligible or not _same_snapshot(second, before_rename):
+            cleanup_empty_quarantine()
+            quarantine_fd = quarantine_name = None
+            return {"outcome": "changed", "reason": reason if not eligible else "attributes-changed-before-quarantine"}
+        try:
+            os.rename(name, "candidate", src_dir_fd=directory_fd, dst_dir_fd=quarantine_fd)
+        except OSError as exc:
+            cleanup_empty_quarantine()
+            quarantine_fd = quarantine_name = None
+            return {"outcome": "changed" if exc.errno in (errno.ENOENT, errno.EEXIST) else "unavailable",
+                    "reason": errno_name(exc)}
+        after_rename = _statx_at(quarantine_fd, "candidate")
+        if not _same_snapshot(before_rename, after_rename, post_rename=True):
+            return preserve_moved_object("identity-or-shape-changed-after-quarantine")
+        if time.monotonic() >= deadline:
+            return preserve_moved_object("deadline-exhausted-after-quarantine")
+        try:
+            os.unlink("candidate", dir_fd=quarantine_fd)
+        except OSError as exc:
+            restored = preserve_moved_object("quarantine-unlink-failed")
+            restored["error"] = errno_name(exc)
+            return restored
+        quarantine_removed = cleanup_empty_quarantine()
+        result = {"outcome": "removed", "reason": "verified-nfsv3-exclusive-create-remnant"}
+        if not quarantine_removed and quarantine_name is not None:
+            result["quarantine_path"] = os.path.join(parent, quarantine_name)
+        return result
+    except OSError as exc:
+        return {"outcome": "unavailable", "reason": errno_name(exc)}
+    finally:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def _observe(path: str, timeout: float) -> dict:
     """Observe directly; production calls run inside the bounded worker group."""
     if timeout <= 0:
@@ -312,6 +594,9 @@ def _diagnose_bound_path(argv: list[str], cwd: str, returncode: int, reported_pa
     observation = observe(expected, max(0.0, deadline - time.monotonic()))
     if not isinstance(observation, dict):
         observation = {"state": "unavailable", "reason": "observer-invalid-result"}
+    cleanup = {"outcome": "not-attempted", "reason": "injected-observer"}
+    if observer is None and observation.get("state") == "present":
+        cleanup = _cleanup_stale_index_lock(expected, deadline)
     state = observation.get("state", "unavailable")
     if state == "present" and observation.get("kind") == "symlink":
         observed = "present (symlink; target not followed)"
@@ -328,17 +613,37 @@ def _diagnose_bound_path(argv: list[str], cwd: str, returncode: int, reported_pa
     check_lines = "\n".join(f"  {command}" for command in checks)
     source_note = (f"Output source: {output_source}; stdout/stderr separation and raw bytes are unavailable.\n"
                    if output_source != "Git stderr" else "")
+    outcome = cleanup.get("outcome", "unavailable")
+    if outcome == "removed":
+        cleanup_note = (
+            "Cleanup: removed a freshly revalidated NFSv3 exclusive-create remnant. "
+            "The original Git command was not replayed; the acting agent may retry that same command.\n"
+        )
+        ownership_note = "The lock matched the bounded NFSv3 residual signature.\n"
+    elif outcome == "not-attempted":
+        cleanup_note = "Cleanup: not attempted by the injected observer.\n"
+        ownership_note = "Ownership: unknown. Local process visibility and file age/attributes do not prove ownership.\n"
+    else:
+        detail = cleanup.get("reason", "unknown")
+        quarantine = cleanup.get("quarantine_path")
+        suffix = f" Preserved quarantine path: {quarantine}." if quarantine else ""
+        cleanup_note = f"Cleanup: {outcome} ({detail}).{suffix} Git was not replayed.\n"
+        if outcome == "not-eligible":
+            cleanup_note += "No file was changed by this diagnosis.\n"
+        else:
+            cleanup_note += "A filesystem mutation may have started; its outcome is reported above.\n"
+        ownership_note = "Ownership: unknown unless the bounded residual predicate was met.\n"
     return {
         "state": state, "lock_path": expected, "observation": observation,
+        "cleanup": cleanup,
         "message": (
             "Hearting Git index-lock diagnosis\n"
             f"Index lock: {expected}\n"
             f"{source_note}"
             f"Observation: {observed}\n"
-            "Ownership: unknown. Local process visibility and file age/attributes do not prove "
-            "ownership or staleness across NFS hosts and namespaces.\n"
-            "No file was changed and Git was not retried. Review active work in this worktree. "
-            "Optional read-only checks:\n"
+            f"{ownership_note}"
+            f"{cleanup_note}"
+            "Review active work in this worktree. Optional read-only checks:\n"
             f"{check_lines}"
         ),
     }
@@ -350,8 +655,9 @@ def _worker_unavailable(reason: str, description: str) -> dict:
         "observation": {"state": "unavailable", "reason": reason},
         "message": ("Hearting Git index-lock diagnosis\n"
                     f"Observation: unavailable ({description})\n"
-                    "Ownership: unknown. The original Git failure is unchanged; "
-                    "no file was changed and Git was not retried."),
+                    "Ownership: unknown. The original Git failure is unchanged. "
+                    "A filesystem mutation may have started before timeout; its outcome is uncertain. "
+                    "Git was not retried."),
     }
 
 
@@ -499,8 +805,29 @@ def _codex_command_argv(command: str, cwd: str):
     return parse_shell_command(command, cwd)
 
 
+def _fallback_worktree_context(cwd: str, env: dict[str, str] | None = None):
+    """Select only the dispatch worktree (or exact absolute tool cwd) default index."""
+    source = os.environ if env is None else env
+    if any(source.get(key) for key in _GIT_ENV_PATHS):
+        return None
+    if any(key.startswith("GIT_CONFIG_") and value for key, value in source.items()):
+        return None
+    dispatched = source.get("AGENT_DISPATCH_WORKTREE")
+    if dispatched:
+        if not os.path.isabs(dispatched):
+            return None
+        selected = os.path.realpath(dispatched)
+    else:
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        selected = os.path.realpath(cwd)
+    if not os.path.isdir(selected):
+        return None
+    return ["git", "-C", selected, "status"], selected, {}
+
+
 def _shell_failure_candidate(command: str, cwd: str, exit_code: int,
-                             output: str, parse_command):
+                             output: str, parse_command, env: dict[str, str] | None = None):
     """Cheaply recognize a structured, supported index-lock failure candidate."""
     if (not isinstance(command, str) or len(command) > 64 * 1024
             or not isinstance(cwd, str) or len(cwd) > 16 * 1024 or not os.path.isabs(cwd)
@@ -510,23 +837,27 @@ def _shell_failure_candidate(command: str, cwd: str, exit_code: int,
         return None
     match = _LOCK_ERROR_TEXT.search(output)
     parsed = parse_command(command, cwd)
-    if not match or parsed is None:
+    if not match:
+        return None
+    if parsed is None:
+        parsed = _fallback_worktree_context(cwd, env)
+    if parsed is None:
         return None
     return parsed, match.group("path")
 
 
 def codex_command_candidate(command: str, cwd: str, exit_code: int,
-                            aggregated_output: str) -> bool:
+                            aggregated_output: str, *, env: dict[str, str] | None = None) -> bool:
     """Return whether a native App Server item merits bounded path diagnosis."""
     return _shell_failure_candidate(
-        command, cwd, exit_code, aggregated_output, _codex_command_argv,
+        command, cwd, exit_code, aggregated_output, _codex_command_argv, env,
     ) is not None
 
 
 def _diagnose_shell_failure(command: str, cwd: str, exit_code: int, output: str,
                             *, output_source: str, parse_command,
                             env: dict[str, str] | None = None):
-    candidate = _shell_failure_candidate(command, cwd, exit_code, output, parse_command)
+    candidate = _shell_failure_candidate(command, cwd, exit_code, output, parse_command, env)
     if candidate is None:
         return None
     (argv, effective_cwd, command_env), reported_path = candidate
@@ -657,6 +988,8 @@ def diagnose_hook_payload(payload: dict, harness: str) -> dict | None:
         return None
     command, cwd, code, stdout, stderr, raw_available = fields
     parsed = parse_shell_command(command, cwd)
+    if parsed is None:
+        parsed = _fallback_worktree_context(cwd)
     if parsed is None:
         return None
     argv, effective_cwd, extra_env = parsed

@@ -113,6 +113,47 @@ class GitIndexLockConsumerTest(unittest.TestCase):
         payload["tool_response"] = "command completed without an index-lock failure"
         self.assertEqual(self.run_bridge("codex", payload).stdout, "")
 
+    def test_python_wrapped_git_add_uses_only_the_selected_worktree_default_index(self):
+        code = "import subprocess; subprocess.run(['git', 'add', 'tracked.txt'], check=True)"
+        wrapped = "python3 -c " + shlex.quote(code) + "\n"
+        failed = subprocess.run(["python3", "-c", code], cwd=self.repo,
+                                capture_output=True, text=True, timeout=10, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        output = failed.stdout + failed.stderr
+        env = {"AGENT_DISPATCH_WORKTREE": str(self.repo)}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertTrue(git_index_lock.codex_command_candidate(
+                wrapped, str(self.root), failed.returncode, output, env=env))
+            codex = git_index_lock.diagnose_codex_command(
+                wrapped, str(self.root), failed.returncode, output, env=env)
+            codex_hook = git_index_lock.diagnose_hook_payload({
+                "hook_event_name": "PostToolUse", "tool_name": "exec_command",
+                "cwd": str(self.root), "tool_input": {"cmd": wrapped, "workdir": str(self.root)},
+                "tool_response": {"exit_code": failed.returncode,
+                                  "stdout": failed.stdout, "stderr": failed.stderr},
+            }, "codex")
+            claude_hook = git_index_lock.diagnose_hook_payload({
+                "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                "cwd": str(self.root), "tool_input": {"command": wrapped},
+                "error": f"Exit code {failed.returncode}\n{failed.stderr}",
+            }, "claude")
+            opencode = git_index_lock.diagnose_opencode_command(
+                wrapped, str(self.root), failed.returncode, output)
+            unbound = git_index_lock.diagnose_codex_command(
+                wrapped, str(self.root), failed.returncode,
+                output.replace(str(self.lock), "/tmp/unrelated/index.lock"), env=env)
+        for diagnosis in (codex, codex_hook, claude_hook, opencode):
+            with self.subTest(state=diagnosis["state"] if diagnosis else None):
+                self.assertIsNotNone(diagnosis)
+                self.assertEqual(diagnosis["state"], "present")
+                self.assertEqual(diagnosis["lock_path"], str(self.lock))
+                self.assertEqual(diagnosis["cleanup"]["outcome"], "not-eligible")
+        self.assertEqual(unbound["state"], "unbound")
+        self.assertTrue(self.lock.exists())
+        self.assertFalse(git_index_lock.codex_command_candidate(
+            wrapped, str(self.root), failed.returncode, output,
+            env={**env, "GIT_INDEX_FILE": "alternate-index"}))
+
     def test_codex_app_server_command_result_uses_aggregated_output_without_forging_streams(self):
         command = "zsh -lc " + shlex.quote(self.command)
         output = self.response_text(self.result.stderr)
@@ -127,9 +168,14 @@ class GitIndexLockConsumerTest(unittest.TestCase):
             command, str(self.root), 0, output))
         self.assertIsNone(git_index_lock.diagnose_codex_command(
             command, str(self.root), 130, output))
-        self.assertIsNone(git_index_lock.diagnose_codex_command(
-            "zsh -lc 'git commit && echo unsafe'", str(self.root),
-            self.result.returncode, output))
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_WORKTREE": str(self.repo)},
+                             clear=False):
+            fallback = git_index_lock.diagnose_codex_command(
+                "zsh -lc 'git commit && echo unsafe'", str(self.root),
+                self.result.returncode, output)
+        self.assertEqual(fallback["state"], "present")
+        self.assertEqual(fallback["lock_path"], str(self.lock))
+        self.assertIn("was not replayed", fallback["message"])
         unrelated = output.replace(str(self.lock), "/tmp/unrelated/index.lock")
         unbound = git_index_lock.diagnose_codex_command(
             command, str(self.root), self.result.returncode, unrelated)
