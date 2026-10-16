@@ -60,6 +60,14 @@ class AliasReceive(unittest.TestCase):
     def prepare(self, body="검증할 실제 본문", sender=None, recipient=None):
         return pm.prepare_peer_message(body, sender or self.sender, recipient or self.recipient)
 
+    def prepare_legacy_reference(self, body, sender=None, recipient=None):
+        sender = sender or self.sender
+        recipient = recipient or self.recipient
+        evidence = {"schema": "legacy-reference-fixture", "recipient": dict(recipient)}
+        with mock.patch.object(pm, "_reference_access_evidence_valid", return_value=True):
+            return pm.prepare_peer_message(body, sender, recipient, defer=True,
+                                           reference_evidence=evidence)
+
     def parse(self, text, recipient=None):
         return pm.parse_peer_trailer(text, recipient or self.recipient)["session_id"]
 
@@ -484,14 +492,18 @@ process.stdout.write(JSON.stringify(result));
             with self.subTest(harness=harness):
                 recipient = {"harness": harness, "session_id": f"{harness}-recipient"}
                 sender = dict(self.sender, session_id=f"sender-{harness}")
-                text, ref = pm.prepare_peer_message(body, sender, recipient, defer=True)
+                text, ref = self.prepare_legacy_reference(body, sender, recipient)
                 self.assertLessEqual(len(text.encode("utf-8")), 1024)
                 self.assertNotIn("STFT 크기 하한", text)
                 path = Path(pm.read_peer_payload(ref)["path"])
                 self.assertTrue(path.is_absolute())
                 self.assertEqual(path.read_bytes(), body.encode("utf-8"))
-                self.assertIn("Open the complete referenced file before acting",
-                              pm.receiver_guidance(text, recipient, cwd=str(ROOT)))
+                guidance = pm.receiver_guidance(text, recipient, cwd=str(ROOT))
+                if harness == "codex":
+                    self.assertIn("Open the complete referenced file before acting", guidance)
+                else:
+                    self.assertIn(body, guidance)
+                    self.assertIn("Do not act on the bounded preview", guidance)
 
                 self._receive_actual(harness, text, recipient["session_id"])
                 self.assertEqual(pm._read_pending(ref)["state"], "received")
@@ -537,8 +549,8 @@ class PendingCallbacks(unittest.TestCase):
 
     def test_opencode_peer_guidance_reaches_model_system_context_without_acceptance(self):
         recipient = {"harness": "opencode", "session_id": "fixture-oc"}
-        body = "[handoff] exact card\n" + "complete context " * 260 + "\nfinal instruction: preserve the original"
-        text, ref = pm.prepare_peer_message(body, self.sender, recipient, defer=True)
+        body = "[handoff] exact card\n" + "complete context " * 260 + "\nDo not run; final instruction: preserve the original"
+        text, ref = AliasReceive.prepare_legacy_reference(self, body, self.sender, recipient)
         js = r'''
 import { pathToFileURL } from "node:url";
 const root = process.env.AGENT_HOME;
@@ -559,9 +571,93 @@ console.log(JSON.stringify(output));
         context = "\n".join(json.loads(run.stdout)["system"])
         self.assertIn("immediate results once", context)
         self.assertIn("Receipt/queue/ACK is not execution", context)
-        self.assertIn("Open the complete referenced file before acting", context)
-        self.assertNotIn("handoff accept", context)
+        self.assertIn(body, context)
+        self.assertIn("Do not act on the bounded preview", context)
+        self.assertIn("final instruction: preserve the original", context)
+        self.assertNotIn("handoff accept " + ref, context)
         self.assertNotIn("acceptance", pm._read_pending(ref))
+
+    def test_limited_or_changed_receiver_gets_verified_body_in_native_context_without_resealing(self):
+        body = "[steer] full source\n" + "supporting detail " * 180 + "\nDo not execute; final condition: keep sign"
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness):
+                recipient = {"harness": harness, "session_id": harness + "-limited"}
+                limited_root = self.state / "different-limited-read-root"
+                limited_root.mkdir(exist_ok=True)
+                if harness == "claude":
+                    recipient.update(cwd=str(limited_root), read_roots=[str(limited_root)])
+                text, ref = AliasReceive.prepare_legacy_reference(self, body, self.sender, recipient)
+                original_transfer = pm._read_transfer_record(ref)
+                changed = {"harness": "claude", "session_id": "replacement-session"}
+                if harness == "codex":
+                    changed_guidance = pm.receiver_guidance(text, changed)
+                    self.assertIn(body, changed_guidance)
+                    self.assertIn("do not execute it in this session", changed_guidance)
+                    self.assertEqual(pm.receive_peer_message(text, changed), 0)
+                    self.assertEqual(pm._read_pending(ref)["state"], "pending")
+                    import codex_queue_delivery as queue
+                    import codex_queue_dispatch as queue_dispatch
+                    with mock.patch.object(pm, "_codex_model_read_access", return_value=False), \
+                         mock.patch.object(queue_dispatch, "resolve_queue_socket", return_value="fixture-socket"), \
+                         mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
+                        self.assertEqual(pm.deliver_pending_codex(ref)["status"], "queued")
+                    queued = pm._read_pending(ref)
+                    self.assertTrue(queued["reference_context_fallback"])
+                    self.assertEqual(queued["text"], text)
+                    self.assertEqual(send.call_args.kwargs["message"], text)
+                    self.assertEqual(pm._read_transfer_record(ref), original_transfer)
+                self.assertEqual(pm.receive_peer_message(text, recipient), 0)
+                if harness == "codex":
+                    guidance = pm.receiver_guidance(text, recipient, cwd=str(limited_root))
+                else:
+                    guidance = pm.receiver_guidance(text, recipient,
+                        cwd=str(limited_root))
+                self.assertIn(body, guidance)
+                self.assertIn("Do not act on the bounded preview", guidance)
+                self.assertIn("final condition: keep sign", guidance)
+                self.assertEqual(pm._read_transfer_record(ref), original_transfer)
+
+                if harness == "codex":
+                    self.assertEqual(pm._read_pending(ref)["state"], "received")
+
+                if harness == "claude":
+                    output = io.StringIO()
+                    pm.emit_peer_context(recipient, "UserPromptSubmit",
+                                         extra_context=guidance, stream=output)
+                    native = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+                else:
+                    hook = module("fallback_codex_hook", "adapters/codex/hooks/userprompt-lifecycle.py")
+                    output = io.StringIO()
+                    with mock.patch("sys.stdout", output):
+                        hook.emit_context("UserPromptSubmit", [guidance])
+                    native = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+                self.assertIn(body, native)
+                self.assertIn("Do not act on the bounded preview", native)
+                self.assertIn("final condition: keep sign", native)
+
+    def test_unreadable_original_is_blocked_in_native_context_without_receipt(self):
+        recipient = {"harness": "codex", "session_id": "codex-unreadable"}
+        body = "[steer] original unavailable\n" + "source detail " * 200 + "\nfinal condition: keep phase"
+        text, ref = AliasReceive.prepare_legacy_reference(self, body, self.sender, recipient)
+        payload_path = Path(pm.read_peer_payload(ref)["path"])
+        payload_path.unlink()
+        self.assertEqual(pm.receive_peer_message(text, recipient), 1)
+        guidance = pm.receiver_guidance(text, recipient)
+        hook = module("unreadable_codex_hook", "adapters/codex/hooks/userprompt-lifecycle.py")
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            hook.emit_context("UserPromptSubmit", [guidance])
+        native = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Do not act on this preview", native)
+        self.assertIn("existing continuation", native)
+        pending = json.loads(pm._pending_path(ref).read_text())
+        self.assertEqual(pending["state"], "pending")
+        self.assertEqual(pending["text"], text)
+        self.assertFalse([row for row in self.rows() if row.get("transfer_ref") == ref])
+        pm._transfer_path(ref).unlink()
+        missing_seal = pm.receiver_guidance(text, recipient)
+        self.assertIn("transfer seal is missing or invalid", missing_seal)
+        self.assertIn("Do not act on this preview", missing_seal)
 
     def test_opencode_normal_registration_and_callback_observation_is_bounded_and_fail_soft(self):
         js = r'''

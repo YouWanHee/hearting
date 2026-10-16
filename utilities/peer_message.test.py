@@ -665,8 +665,48 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     sender = {"harness": "codex", "session_id": "sender", "name": "original"}
     recipient = {"harness": "codex", "session_id": "recipient"}
 
+    def prepare_reference(self, body, recipient=None, **kwargs):
+        recipient = recipient or self.recipient
+        evidence = {
+            "schema": "peer-read-access-observation-v1",
+            "observed_at": time.monotonic(),
+            "recipient": {"harness": recipient["harness"],
+                          "session_id": recipient["session_id"], "pane_id": "w1:pTest"},
+            "local_process": {"pid": os.getpid(), "start": "1", "argv": ["codex"],
+                              "pid_namespace": "test"},
+        }
+        with mock.patch.object(peer_message, "_reference_local_process_matches", return_value=True):
+            return peer_message.prepare_peer_message(
+                body, self.sender, recipient, reference_evidence=evidence, **kwargs)
+
     def pending(self, body="original peer body", **kwargs):
-        return peer_message.prepare_peer_message(body, self.sender, self.recipient, defer=True, **kwargs)
+        return self.prepare_reference(body, defer=True, **kwargs)
+
+    def test_production_read_scope_source_is_codex_adapter_contract_only(self):
+        self.assertTrue(peer_message._codex_model_read_access(self.recipient))
+        self.assertFalse(peer_message._codex_model_read_access(
+            {"harness": "claude", "session_id": "claude-session"}))
+        self.assertFalse(peer_message._codex_model_read_access(
+            {"harness": "opencode", "session_id": "opencode-session"}))
+        self.assertFalse(peer_message._codex_model_read_access(
+            {"harness": "codex", "session_id": None}))
+
+    def test_unknown_or_unproven_access_keeps_complete_source_inline(self):
+        body = "[steer] complete request\n" + "detail " * 2000 + "\n실행하지 말 것; STFT 크기 하한 1e-5 유지"
+        recipients = (
+            {"harness": "unknown", "session_id": None},
+            {"harness": "claude", "session_id": "other-runtime"},
+            {"harness": "codex", "session_id": "sidless", "pane_id": "w1:pNew"},
+            self.recipient,
+        )
+        for recipient in recipients:
+            with self.subTest(recipient=recipient):
+                text, ref = peer_message.prepare_peer_message(
+                    body, self.sender, recipient, defer=True)
+                self.assertIn(body.rstrip("\n"), text)
+                self.assertLessEqual(len(text.encode("utf-8")), peer_message._PENDING_BYTES)
+                self.assertIsNone(peer_message._read_transfer_record(ref).get("body_ref"))
+
 
     def test_private_payload_preserves_body_endpoints_refs_and_digest(self):
         text, ref = self.pending(refs=["original-proof"])
@@ -741,7 +781,7 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
             body, dict(self.sender, name="renamed"), self.recipient, defer=True)
         self.assertEqual(retry, (text, ref))
         changed = body[:-1] + "B"
-        different = peer_message.prepare_peer_message(changed, self.sender, self.recipient, defer=True)
+        different = self.prepare_reference(changed, defer=True)
         self.assertNotEqual(different[1], ref)
         self.assertEqual(peer_message.read_peer_payload(different[1])["body"], changed)
 
@@ -802,17 +842,22 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     def test_sidless_pending_stays_on_its_exact_pane_until_a_session_is_observed(self):
         recipient = {"harness": "codex", "session_id": None, "name": "fresh",
                      "pane_id": "w1:pX"}
+        body = "[steer] unresolved pane\n" + "detail " * 400 + "\n실행하지 말 것; STFT 크기 하한 1e-5"
         text, ref = peer_message.prepare_peer_message(
-            "wait for folder choice", self.sender, recipient, defer=True)
+            body, self.sender, recipient, defer=True)
         row = peer_message._read_pending(ref)
         self.assertEqual(row["state"], "pending")
         self.assertEqual(row["to"], recipient)
+        self.assertIn(body.rstrip("\n"), text)
+        self.assertIsNone(peer_message._read_transfer_record(ref).get("body_ref"))
         self.assertIsNone(peer_message.pending_delivery_recipient(row))
         self.assertIsNone(peer_message.bind_pending_recipient(
             ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pOther"}))
         bound = peer_message.bind_pending_recipient(
             ref, {"harness": "codex", "session_id": "new-thread", "pane_id": "w1:pX"})
         self.assertEqual(peer_message.pending_delivery_recipient(bound), bound["bound_to"])
+        self.assertEqual(bound["text"], text)
+        self.assertIsNone(bound.get("body_ref"))
         parsed = peer_message.parse_peer_trailer(
             text, {"harness": "codex", "session_id": "new-thread"}, include_ref=True)
         self.assertEqual(parsed["transfer_ref"], ref)
@@ -1176,6 +1221,28 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
             peer_message.deliver_pending_codex(ref)
         self.assertFalse(send.call_args.kwargs["allow_add"])
 
+    def test_queue_runtime_access_loss_keeps_envelope_and_requests_context_fallback(self):
+        import codex_queue_delivery as queue
+        body = "[steer] queued original\n" + "long detail " * 260 + "\nDo not run; final condition: preserve phase"
+        text, ref = self.pending(body)
+        transfer_before = peer_message._read_transfer_record(ref)
+        digest_before = transfer_before["body_sha256"]
+        with mock.patch.object(peer_message, "_codex_model_read_access", return_value=False), \
+             mock.patch.object(queue, "send_at_least_once", return_value={"status": "queued"}) as send:
+            result = peer_message.deliver_pending_codex(ref)
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(send.call_args.kwargs["message"], text)
+        row = peer_message._read_pending(ref)
+        self.assertTrue(row["reference_context_fallback"])
+        self.assertEqual(row["text"], text)
+        self.assertEqual(row["body_sha256"], digest_before)
+        transfer_after = peer_message._read_transfer_record(ref)
+        self.assertEqual(transfer_after, transfer_before)
+        context = peer_message.receiver_guidance(text, self.recipient)
+        self.assertIn(body, context)
+        self.assertIn("Do not act on the bounded preview", context)
+        self.assertIn("final condition: preserve phase", context)
+
     def test_exact_native_history_ack_once_after_queued_and_replay(self):
         import codex_queue_delivery as queue
         _text, ref = self.pending()
@@ -1323,6 +1390,12 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
         for p in patches:
             p.start(); self.addCleanup(p.stop)
 
+    def legacy_reference(self, body, sender, recipient):
+        evidence = {"schema": "legacy-reference-fixture", "recipient": dict(recipient)}
+        with mock.patch.object(peer_message, "_reference_access_evidence_valid", return_value=True):
+            return peer_message.prepare_peer_message(
+                body, sender, recipient, defer=True, reference_evidence=evidence)
+
     def test_ordinary_sealed_message_skips_runtime_handoff_resolution(self):
         import session_tidy
         text, ref = peer_message.prepare_peer_message(
@@ -1373,7 +1446,7 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
             with self.subTest(harness=harness):
                 recipient = {"harness": harness, "session_id": harness + "-receiver", "name": "new"}
                 card = "[handoff] card\n" + "referenced document and predecessor details " * 120
-                text, ref = peer_message.prepare_peer_message(card, self.sender, recipient, defer=True)
+                text, ref = self.legacy_reference(card, self.sender, recipient)
                 predecessor = {**self.predecessor}
                 successor = {**recipient, "pane": "p2", "server": "default",
                              "foreground": {"pid": 22, "start": "202"}}
@@ -1391,7 +1464,7 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
                      mock.patch.object(self.steward, "_retire_target",
                                        return_value=("idle", current, None, None)):
                     guidance = peer_message.receiver_guidance(text, recipient, cwd=str(self.tmp_root))
-                self.assertEqual(guidance.count("handoff accept"), 1)
+                self.assertEqual(guidance.count("handoff accept "), 1)
                 command = guidance.split("run exactly:\n`", 1)[1].split("`", 1)[0]
                 tokens = shlex.split(command)
                 self.assertEqual(tokens[:3], ["python3", "$AGENT_HOME/utilities/session_tidy.py", "handoff"])
@@ -1404,7 +1477,11 @@ class HandoffAcceptanceTest(_TmpRootMixin, unittest.TestCase):
                 self.assertEqual(args.cwd, str(self.tmp_root.resolve()))
                 after = peer_message._read_pending(ref)
                 self.assertNotIn("acceptance", after)
-                self.assertIn("Open the complete referenced file before acting", guidance)
+                if harness == "codex":
+                    self.assertIn("Open the complete referenced file before acting", guidance)
+                else:
+                    self.assertIn(card, guidance)
+                    self.assertIn("Do not act on the bounded preview", guidance)
                 self.assertEqual(peer_message.read_peer_payload(ref)["body"], card)
         self.assertEqual(self.store.list(), [])
 

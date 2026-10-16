@@ -2053,6 +2053,65 @@ def _agent_json(harness, sid, name, status="idle"):
         "agent_session": ({"agent": harness, "kind": "id", "value": sid} if sid else None)}}}
 
 
+class PeerReferenceAccessEvidenceTest(_TmpRootMixin, unittest.TestCase):
+    def test_exact_local_codex_session_uses_declared_read_scope_evidence(self):
+        target = {"harness": "codex", "session_id": "thread-exact", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "1", "argv": ["codex", "--resume"]}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", target, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_foreground", return_value=foreground), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            evidence = peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "thread-exact", "w1:pX")
+        self.assertEqual(evidence["recipient"], {
+            "harness": "codex", "session_id": "thread-exact", "pane_id": "w1:pX"})
+        self.assertEqual(evidence["local_process"]["pid"], os.getpid())
+        self.assertEqual(evidence["local_process"]["pid_namespace"],
+                         os.readlink(f"/proc/{os.getpid()}/ns/pid"))
+        self.assertEqual(evidence["schema"], "peer-read-access-observation-v1")
+
+    def test_proven_ordinary_codex_recipient_keeps_reference_presentation(self):
+        target = {"harness": "codex", "session_id": "thread-exact", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "1", "argv": ["codex", "--resume"]}
+        body = "[steer] normal supported delivery\n" + "evidence " * 300 + "\nlast condition: retain phase"
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", target, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_foreground", return_value=foreground), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            evidence = peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "thread-exact", "w1:pX")
+            text, ref = peer_steward.peer_message.prepare_peer_message(
+                body, {"harness": "claude", "session_id": "sender"},
+                {"harness": "codex", "session_id": "thread-exact"},
+                defer=True, reference_evidence=evidence)
+        self.assertLess(len(text.encode("utf-8")), 1024)
+        self.assertNotIn("last condition", text)
+        self.assertEqual(peer_steward.peer_message.read_peer_payload(ref)["body"], body)
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["to"]["session_id"], "thread-exact")
+
+    def test_unknown_sidless_other_runtime_and_changed_session_fail_conservative(self):
+        with mock.patch.object(peer_steward, "_retire_target") as target:
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "fresh-pane", "codex", None, "w1:pX"))
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "claude-pane", "claude", "claude-session", "w1:pX"))
+        target.assert_not_called()
+
+        replies = iter((
+            ("idle", {"harness": "codex", "session_id": "old-thread", "pane": "w1:pX"}, 0, None),
+            ("idle", {"harness": "codex", "session_id": "replacement", "pane": "w1:pX"}, 0, None),
+        ))
+        with mock.patch.object(peer_steward, "_retire_target", side_effect=lambda _target: next(replies)), \
+             mock.patch.object(peer_steward, "_retire_foreground",
+                               return_value={"pid": os.getpid(), "start": "1", "argv": ["codex"]}), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "old-thread", "w1:pX"))
+
+
 class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
     """F-100c — the steward send is `prompt`: herdr resolves the target's exact session
     id, the sender's registry name rides the record, and the body gets the trailer."""
@@ -3062,7 +3121,7 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     def prompt(self, body="peer body"):
         return peer_steward.main(["prompt", "child", body])
 
-    def test_body_file_keeps_crlf_and_tail_bytes_in_long_reference(self):
+    def test_unknown_model_read_scope_keeps_body_file_inline_without_losing_tail(self):
         body = ("[steer] exact body-file input\r\n" + "line detail with English and 한글 " * 120
                 + "\r\n실행하지 말 것\r\nSTFT 크기 하한 1e-5·위상 유지  \r\n")
         path = self.tmp_root / "peer-body.txt"
@@ -3071,13 +3130,12 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(peer_steward.main(["prompt", "child", "--body-file", str(path)]), 0)
         self.assertEqual(len(self.messages), 1)
         wire = self.messages[0]
-        self.assertLessEqual(len(wire.encode("utf-8")), 1024)
-        self.assertNotIn("STFT 크기 하한", wire)
+        self.assertIn(body, wire)
+        self.assertIn("STFT 크기 하한 1e-5·위상 유지", wire)
         transfer = peer_steward.peer_message.parse_peer_trailer(
             wire, {"harness": "claude", "session_id": self.sid}, include_ref=True)
-        payload = peer_steward.peer_message.read_peer_payload(transfer["transfer_ref"])
-        self.assertEqual(payload["body"], body)
-        self.assertEqual(Path(payload["path"]).read_bytes(), body.encode("utf-8"))
+        self.assertIsNotNone(transfer.get("transfer_ref"))
+        self.assertIsNone(peer_steward.peer_message.read_peer_payload(transfer["transfer_ref"]))
 
     def test_idle_parent_prompt_with_pending_or_unknown_children_accepts_input(self):
         from dispatch_contract import ObservedAttemptLiveness

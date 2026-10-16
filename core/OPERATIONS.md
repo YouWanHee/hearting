@@ -1923,6 +1923,24 @@ keeps only its existing bounded summary and digest. A bounded envelope carries
 a preview, the absolute payload path, a read-the-whole-file instruction, and the
 usual sender/ref trailer; the preview is not the execution request.
 
+Reference presentation is prepared only for an exact Codex session whose
+existing herdr identity, live foreground PID/namespace, and adapter OS-sandbox
+read-everywhere contract agree. The native queue checks the Codex contract again
+at submission. Unknown, stale, unresolved, contradictory, and other-runtime
+evidence keeps the complete body inline; SID-less panes remain inline until
+session binding. Helper file reads and model-readable access are separate
+observations.
+
+Queued and ambiguous envelopes retain their original wire body, digest, and
+identity. When queue submission or a receiver callback cannot establish current
+access, the existing Codex callback supplies the verified source through native
+context. A runtime/session mismatch gets recovery context for the existing owner
+continuation and an execution prohibition for that mismatched session. If the
+helper cannot verify the source, the callback prohibits preview-only action,
+keeps the existing continuation responsible, and records no original
+consumption. Transport receipts remain distinct from model reading, work
+execution, and typed handoff acceptance.
+
 The raw payload preserves UTF-8 bytes, including line endings and trailing
 whitespace. The normalized `source_sha256` remains the existing retry key
 (`body.rstrip("\n")`); `body_sha256` covers the actual wire envelope and

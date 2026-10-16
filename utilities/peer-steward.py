@@ -3148,6 +3148,47 @@ def _agent_state(target):
     return state, (pane if pane and pane != "-" else None)
 
 
+def _peer_reference_access_evidence(target, harness, session_id, pane):
+    """Observe the one supported model-read path: this host's exact Codex session.
+
+    Herdr supplies the verified runtime/session binding; its foreground process
+    must also match a live local PID and namespace. The Codex adapter declaration
+    supplies the read-everywhere sandbox contract. Other runtimes and incomplete
+    observations keep the complete body on the inline delivery path.
+    """
+    recipient = {"harness": harness, "session_id": session_id}
+    if (harness != "codex" or not peer_message.usable_session_id(session_id)
+            or not isinstance(pane, str) or not pane
+            or not peer_message._codex_model_read_access(recipient)):
+        return None
+    try:
+        from harness_capabilities import capabilities
+        if capabilities("codex")["session_identity"]["herdr_session_id"] != "verified":
+            return None
+        _state, first, _code, _reason = _retire_target(target)
+        if (first.get("harness") != harness or first.get("session_id") != session_id
+                or first.get("pane") != pane):
+            return None
+        foreground = _retire_foreground(pane, harness)
+        if not isinstance(foreground, dict):
+            return None
+        namespace = os.readlink(f"/proc/{foreground['pid']}/ns/pid")
+        _state, second, _code, _reason = _retire_target(target)
+        if (second.get("harness") != harness or second.get("session_id") != session_id
+                or second.get("pane") != pane):
+            return None
+        evidence = {
+            "schema": "peer-read-access-observation-v1",
+            "observed_at": time.monotonic(),
+            "recipient": {"harness": harness, "session_id": session_id, "pane_id": pane},
+            "local_process": {"pid": foreground["pid"], "start": foreground["start"],
+                              "argv": foreground["argv"], "pid_namespace": namespace},
+        }
+        return evidence if peer_message._reference_access_evidence_valid(evidence, recipient) else None
+    except Exception:
+        return None
+
+
 def _prompt_box_evidence(target):
     """`(evidence, readable)` from `herdr agent explain`.
 
@@ -4207,6 +4248,11 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     if target_pane and (not input_reason or pane_bound_defer):
         recipient["pane_id"] = target_pane
     can_persist_sidless = t_harness in {"claude", "codex", "opencode"} and bool(target_pane)
+    reference_evidence = None
+    if (not args.no_trailer
+            and len(body.encode("utf-8")) > peer_message._BODY_REFERENCE_THRESHOLD):
+        reference_evidence = _peer_reference_access_evidence(
+            args.target, t_harness, t_sid, target_pane)
     if not args.no_trailer or (input_reason and can_persist_sidless) or on_prepared is not None:
         try:
             text, transfer_ref = peer_message.prepare_peer_message(
@@ -4214,7 +4260,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                 recipient,
                 defer=bool(input_reason) or on_prepared is not None,
                 refs=args.ref, receipt=input_reason or "target-form-open",
-                with_trailer=not args.no_trailer)
+                with_trailer=not args.no_trailer, reference_evidence=reference_evidence)
             if on_prepared is not None:
                 on_prepared(transfer_ref)
         except (OSError, ValueError):
@@ -4272,10 +4318,15 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                 claimed = None
             if pending is None and (not args.no_trailer or can_persist_sidless):
                 try:
+                    reference_evidence = None
+                    if (not args.no_trailer
+                            and len(body.encode("utf-8")) > peer_message._BODY_REFERENCE_THRESHOLD):
+                        reference_evidence = _peer_reference_access_evidence(
+                            args.target, t_harness, t_sid, target_pane)
                     text, transfer_ref = peer_message.prepare_peer_message(
                         body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
                         recipient, defer=True, refs=args.ref, receipt=input_reason,
-                        with_trailer=not args.no_trailer)
+                        with_trailer=not args.no_trailer, reference_evidence=reference_evidence)
                     if on_prepared is not None:
                         on_prepared(transfer_ref)
                     pending = peer_message._read_pending(transfer_ref)
