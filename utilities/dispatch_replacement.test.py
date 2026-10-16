@@ -1335,9 +1335,12 @@ class ReplacementTest(unittest.TestCase):
                        'delivery_recipient_kind','delivery_receipt_digest','delivery_receipt_b64',
                        'delivery_row_revision','delivery_persistence_refused'}
         meta={k:v for k,v in parent.items() if k not in terminal_keys}
-        meta.update(attempt_id=aid,automatic_retry_of=record['original_attempt_id'],launch_claimed='1',
-                    replacement_family_id=record['family_id'],replacement_original_attempt_id=record['original_attempt_id'],
-                    replacement_ordinal='1',replacement_claim_digest=R._digest(record),**changes)
+        meta.update({
+            'attempt_id':aid, 'automatic_retry_of':record['original_attempt_id'], 'launch_claimed':'1',
+            'replacement_family_id':record['family_id'],
+            'replacement_original_attempt_id':record['original_attempt_id'],
+            'replacement_ordinal':'1', 'replacement_claim_digest':R._digest(record), **changes,
+        })
         meta.update(D.parse_registry_metadata(R.seal_launch_input(args,'codex','the raw task')))
         self.write(meta,status,append=True)
         return meta
@@ -1443,6 +1446,12 @@ class ReplacementTest(unittest.TestCase):
         self.assertIsNotNone(original_path)
         original_record=PD.read(self.root, 'parent', original_path.stem)
         self.assertEqual(original_record['receipt']['job_registry'], '')
+        import dispatch_session_sweep as SWEEP
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS':str(self.jobs)}):
+            early, early_count=SWEEP.sweep_deliver(self.root, 'claude-parent-runtime', 'parent')
+        self.assertEqual((early, early_count), ([], 1))
+        self.assertEqual(PD.read(self.root, 'parent', original_record['delivery_id'])['state'], 'pending')
+        self.assertEqual(PD.read(self.root, 'parent', original_record['delivery_id'])['attempts'], 0)
 
         current=self.meta
         records=[original_record]
@@ -1484,9 +1493,15 @@ class ReplacementTest(unittest.TestCase):
                 self.assertIn('replacement-defer', refused.exception.detail)
 
         final_record=records[-1]
-        claimed=PD.claim(self.root, 'parent', final_record['delivery_id'],
-                         claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
-        self.assertTrue(PD.ack(self.root, 'parent', final_record['delivery_id'], acked_by='fixture'))
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS':str(self.jobs)}):
+            delivered, count=SWEEP.sweep_deliver(self.root, 'claude-parent-runtime', 'parent')
+        self.assertEqual(count, 4)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]['attempt_ids'], [current['attempt_id']])
+        context=SWEEP.delivery_context([(self.root, delivered)])
+        self.assertIn(current['attempt_id'], context)
+        self.assertNotIn('att-source', context)
+        self.assertEqual(SWEEP.ack_delivered(self.root, 'parent', delivered, acked_by='fixture-receiver'), 1)
         self.assertEqual(PD.read(self.root, 'parent', final_record['delivery_id'])['state'], 'acked')
         for intermediate in (records[0], records[2]):
             with self.assertRaises(PD.PendingDeliveryError):
@@ -1494,9 +1509,9 @@ class ReplacementTest(unittest.TestCase):
                          claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
             self.assertEqual(PD.read(self.root, 'parent', intermediate['delivery_id'])['state'], 'rejected')
         self.assertEqual(PD.read(self.root, 'parent', old_intermediate['delivery_id'])['state'], 'acked')
-        self.assertEqual(claimed['state'], 'claimed')
+        self.assertEqual(delivered[0]['state'], 'claimed')
 
-    def test_terminal_failure_remains_claimable_with_registered_unlaunched_successor(self):
+    def test_terminal_delivery_is_deferred_before_successor_registration(self):
         import dispatch_completion_join as JOIN
         import dispatch_pending_delivery as PD
 
@@ -1510,19 +1525,182 @@ class ReplacementTest(unittest.TestCase):
         path=JOIN.materialize_after_terminal_close(self.jobs, 'att-source')
         original=PD.read(self.root, 'parent', path.stem)
         claim=R.claim(self.jobs, 'att-source')
-        visible=PD.claim(self.root, 'parent', original['delivery_id'],
-                         claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
-        self.assertEqual(visible['state'], 'claimed')
-        PD.release_claim(self.root, 'parent', original['delivery_id'], claim_owner='fixture')
-        self._successor(claim, self.meta, status='open')
+        with self.assertRaises(PD.PendingDeliveryError) as refused:
+            PD.claim(self.root, 'parent', original['delivery_id'],
+                     claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
+        self.assertIn('replacement-defer', refused.exception.detail)
+        self.assertEqual(PD.read(self.root, 'parent', original['delivery_id'])['state'], 'pending')
+        self._successor(claim, self.meta, status='open', launch_claimed='0',
+                        launch_outcome='never-launched')
 
         effective, lineage=R.effective_attempts(self.jobs, {'att-source'})
         self.assertEqual(effective, {'att-source'})
         self.assertEqual(lineage, [])
-        visible=PD.claim(self.root, 'parent', original['delivery_id'],
-                         claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
-        self.assertEqual(visible['state'], 'claimed')
-        self.assertEqual(visible['receipt']['job_registry'], '')
+        with self.assertRaises(PD.PendingDeliveryError) as still_waiting:
+            PD.claim(self.root, 'parent', original['delivery_id'],
+                     claim_owner='fixture', lease_seconds=30, jobs=self.jobs)
+        self.assertIn('replacement-defer', still_waiting.exception.detail)
+        self.assertEqual(PD.read(self.root, 'parent', original['delivery_id'])['receipt']['job_registry'], '')
+
+    def _materialize_parent_failure(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+        self.meta.update(parent_sid='parent', parent_attempt_id='att-parent',
+                         parent_completion_delivery='claude-parent-runtime')
+        (R._directory(self.jobs)/'inputs/att-source.json').unlink()
+        self.meta.update(D.parse_registry_metadata(R.seal_launch_input(self.args, 'codex', 'the raw task')))
+        self.write(self.meta, status='open')
+        self.assertTrue(D.close_attempt_row(self.jobs, 'att-source', 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        path=JOIN.materialize_after_terminal_close(self.jobs, 'att-source')
+        self.assertIsNotNone(path)
+        return PD.read(self.root, 'parent', path.stem)
+
+    def _sweep_and_ack_one(self, expected_attempt):
+        import dispatch_pending_delivery as PD
+        import dispatch_session_sweep as SWEEP
+        with mock.patch.dict(os.environ, {'AGENT_DISPATCH_JOBS':str(self.jobs)}):
+            delivered, count=SWEEP.sweep_deliver(self.root, 'claude-parent-runtime', 'parent')
+        self.assertGreaterEqual(count, 1)
+        pending_rows=sorted((path.stem, PD.read(self.root, 'parent', path.stem)['state'])
+                            for path in PD.record_directory(self.root, 'parent').glob('delivery-*.json'))
+        self.assertEqual(len(delivered), 1, (count, pending_rows))
+        self.assertEqual(delivered[0]['attempt_ids'], [expected_attempt])
+        receiver=SWEEP.delivery_context([(self.root, delivered)])
+        self.assertIn(expected_attempt, receiver)
+        self.assertEqual(SWEEP.ack_delivered(self.root, 'parent', delivered, acked_by='fixture-receiver'), 1)
+        self.assertEqual(PD.read(self.root, 'parent', delivered[0]['delivery_id'])['state'], 'acked')
+        return delivered[0], receiver
+
+    def test_registration_refusal_and_unlaunched_successor_settle_to_one_source_failure(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        record=R.claim(self.jobs, 'att-source')
+        refused=SimpleNamespace(returncode=1, stdout='reason=replacement-registration-refused\n', stderr='')
+        with mock.patch.object(R, '_command', return_value=['launcher']), \
+             mock.patch('dispatch_replacement_batch.command', return_value=None):
+            outcome=R.advance(self.jobs, 'att-source', authority_check=lambda *_: True,
+                              run=lambda *args, **kwargs: refused)
+        self.assertEqual(outcome['reason'], 'replacement-launch-pending')
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'settled')
+
+        unstarted=self._successor(record, self.meta, status='open', launch_claimed='0',
+                                  launch_started='0', launch_outcome='never-launched')
+        self.assertTrue(D.close_attempt_row(self.jobs, unstarted['attempt_id'], 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        successor_path=JOIN.materialize_after_terminal_close(self.jobs, unstarted['attempt_id'])
+        self.assertIsNotNone(successor_path)
+        successor=PD.read(self.root, 'parent', successor_path.stem)
+
+        delivered, _receiver=self._sweep_and_ack_one('att-source')
+        self.assertEqual(delivered['delivery_id'], source['delivery_id'])
+        settled_source=PD.read(self.root, 'parent', source['delivery_id'])
+        self.assertEqual(settled_source['receipt'], source['receipt'])
+        self.assertEqual(settled_source['receipt_digest'], source['receipt_digest'])
+        source_row=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        self.assertEqual((source_row['note'], source_row['failure_class']),
+                         ('dead-exact-pid', 'contract'))
+        self.assertEqual(PD.read(self.root, 'parent', successor['delivery_id'])['state'], 'rejected')
+        self.assertEqual(PD.read(self.root, 'parent', successor['delivery_id'])['expiry_reason'],
+                         'replacement-successor-not-launched')
+
+    def test_launched_successor_launch_refusal_delivers_only_its_final_notice(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        first=R.claim(self.jobs, 'att-source')
+        launched=self._successor(first, self.meta, status='open', launch_claimed='1', launch_started='1')
+        self.assertTrue(D.close_attempt_row(self.jobs, launched['attempt_id'], 'dead-exact-pid',
+                                            evidence={'failure_class':'contract'}))
+        path=JOIN.materialize_after_terminal_close(self.jobs, launched['attempt_id'])
+        final=PD.read(self.root, 'parent', path.stem)
+        self.assertEqual(R.recovery_delivery_state(self.jobs, launched['attempt_id']), 'accepted')
+
+        refused=SimpleNamespace(returncode=1, stdout='reason=replacement-launch-refused\n', stderr='')
+        with mock.patch.object(R, '_command', return_value=['launcher']), \
+             mock.patch('dispatch_replacement_batch.command', return_value=None):
+            outcome=R.advance(self.jobs, launched['attempt_id'], authority_check=lambda *_: True,
+                              run=lambda *args, **kwargs: refused)
+        self.assertEqual(outcome['reason'], 'replacement-launch-pending')
+        self.assertEqual(R.recovery_delivery_state(self.jobs, launched['attempt_id']), 'settled')
+
+        delivered, _receiver=self._sweep_and_ack_one(launched['attempt_id'])
+        self.assertEqual(delivered['delivery_id'], final['delivery_id'])
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='after-final',
+                     lease_seconds=30, jobs=self.jobs)
+        self.assertEqual(PD.read(self.root, 'parent', source['delivery_id'])['state'], 'rejected')
+
+    def test_authority_loss_settles_once_and_unknown_registry_reenters_same_duty(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        no_spawn=mock.Mock(side_effect=AssertionError('unauthorized spawn'))
+        result=R.advance(self.jobs, 'att-source', authority_check=lambda *_: False, run=no_spawn)
+        self.assertEqual(result['reason'], 'replacement-parent-identity-unproven')
+        no_spawn.assert_not_called()
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'settled')
+        replay=R.advance(self.jobs, 'att-source', run=no_spawn)
+        self.assertEqual(replay['state'], 'not-applicable')
+        no_spawn.assert_not_called()
+        delivered, _receiver=self._sweep_and_ack_one('att-source')
+        self.assertEqual(delivered['delivery_id'], source['delivery_id'])
+
+    def test_unknown_registry_reenters_same_duty_without_false_ack_or_spawn(self):
+        import dispatch_completion_join as JOIN
+        import dispatch_pending_delivery as PD
+
+        source=self._materialize_parent_failure()
+        attention_path=R._directory(self.jobs)/'attention/by-source/att-source.json'
+        attention_path.parent.mkdir(parents=True, exist_ok=True)
+        attention_path.write_text(json.dumps({
+            'attention': {'source_attempt_id':'att-source','state':'needs-attention',
+                          'reason':'replacement-parent-identity-unproven','node':'frame',
+                          'failure':'dead-exact-pid'},
+            'proof': {'family_id':R.source_reservation(self.jobs,'att-source')['family_id'],
+                      'claim_digest':'tampered'},
+        }))
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'unknown')
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='tampered-settlement',
+                     lease_seconds=30, jobs=self.jobs)
+        attention_path.unlink()
+        missing=self.root/'jobs-shadow.log'
+        missing.write_text('')
+        with self.assertRaises(PD.PendingDeliveryError) as unknown:
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='unknown-registry',
+                     lease_seconds=30, jobs=missing)
+        self.assertIn('replacement-defer', unknown.exception.detail)
+        self.assertEqual(PD.read(self.root, 'parent', source['delivery_id'])['state'], 'pending')
+        slow=lambda command, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(command, kwargs['timeout'], output='uncertain', stderr=''))
+        with mock.patch.object(R, '_authorized'), \
+             mock.patch('dispatch_replacement_batch.command', return_value=None), \
+             mock.patch('dispatch_lifecycle.reconcile_launch_lifecycle',
+                        return_value=SimpleNamespace(effective='detached')):
+            first=R.advance(self.jobs, 'att-source', run=slow)
+        self.assertEqual(first['reason'], 'replacement-launch-timeout')
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'accepted')
+        with self.assertRaises(PD.PendingDeliveryError):
+            PD.claim(self.root, 'parent', source['delivery_id'], claim_owner='reentry-check',
+                     lease_seconds=30, jobs=self.jobs)
+        same=self._successor(first['record'], self.meta, status='open', launch_claimed='1',
+                             launch_started='1')
+        with mock.patch.object(R, '_authorized'):
+            resumed=R.advance(self.jobs, 'att-source', run=mock.Mock(side_effect=AssertionError('duplicate spawn')))
+        self.assertEqual((resumed['state'], resumed['attempt_id']), ('running', same['attempt_id']))
+        self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))), 1)
+
+        self.assertTrue(D.close_attempt_row(self.jobs, same['attempt_id'], 'completed-marker',
+                                            evidence={'failure_class':'pass'}))
+        final_path=JOIN.materialize_after_terminal_close(self.jobs, same['attempt_id'])
+        final=PD.read(self.root, 'parent', final_path.stem)
+        delivered, _receiver=self._sweep_and_ack_one(same['attempt_id'])
+        self.assertEqual(delivered['delivery_id'], final['delivery_id'])
 
     def test_replacement_row_as_source_binds_through_index_not_row(self):
         self._capacity_owner()

@@ -442,10 +442,23 @@ def _replacement_disposition(root: Path, recipient_key: str, value: dict,
             or selected_jobs.parent != Path(root).resolve()):
         return "defer" if carrier_jobs is not None else ""
     try:
-        from dispatch_replacement import effective_attempts, _rows
+        from dispatch_replacement import effective_attempts, recovery_delivery_state, _rows
         selected = set(value.get("attempt_ids") or [])
+        rows = _rows(selected_jobs.read_text().splitlines())
+        if selected and all(
+            aid in rows
+            and rows[aid][1].get("replacement_original_attempt_id")
+            and rows[aid][1].get("launch_started") != "1"
+            for aid in selected
+        ):
+            # A registered successor that never crossed the launch fence is not
+            # a logical-stage result. Keep the source's original failure live.
+            return "superseded"
         effective, edges = effective_attempts(selected_jobs, selected)
         if not edges:
+            states = [recovery_delivery_state(selected_jobs, aid) for aid in selected]
+            if any(state in {"accepted", "unknown"} for state in states):
+                return "defer"
             return ""
         if all(_gateway_consumed(root, recipient_key, edge["original_attempt_id"]) for edge in edges):
             return "consumed"
@@ -514,8 +527,10 @@ def claim(
             )
         disposition = _replacement_disposition(root, recipient_key, value, jobs=jobs)
         if disposition:
-            if disposition == "consumed":
-                retired = dict(value, state="rejected", expiry_reason="replacement-consumed")
+            if disposition in {"consumed", "superseded"}:
+                reason = ("replacement-consumed" if disposition == "consumed"
+                          else "replacement-successor-not-launched")
+                retired = dict(value, state="rejected", expiry_reason=reason)
                 _write_unlocked(path, retired)
             raise PendingDeliveryError("pending-delivery-claim-refused", "replacement-" + disposition)
         now = time.monotonic_ns()

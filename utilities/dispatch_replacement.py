@@ -911,6 +911,128 @@ def claim(jobs: Path, aid: str) -> dict:
         return record
 
 
+def accept_terminal_delivery_duty(jobs, aid):
+    """Publish an eligible automatic recovery claim before its notice is materialized.
+
+    The caller runs after the terminal registry transaction releases its lock.
+    Capacity pauses remain user resumed; a resultless death (including an
+    answered correction) gets the same exact-edge claim the existing controller
+    will later launch or settle.
+    """
+    jobs = Path(jobs)
+    try:
+        rows = _rows(jobs.read_text().splitlines())
+    except (OSError, DC.DispatchContractError):
+        return None
+    row = rows.get(aid)
+    if row is None or not row[1].get('delivery_intent'):
+        return None
+    try:
+        kind = death_kind(row[0], row[1], jobs=jobs)
+        if kind is None or kind in PAUSE_KINDS:
+            return None
+        return claim(jobs, aid)
+    except DC.DispatchContractError:
+        # Ineligible or unproven terminal rows retain their ordinary notice;
+        # the controller owns any later recovery attempt.
+        return None
+
+
+def recovery_delivery_state(jobs, aid):
+    """Return the existing exact-edge duty state used by terminal delivery.
+
+    ``accepted`` is revocable and never an acknowledgement: the controller may
+    still launch or re-enter the same stable claim. ``settled`` requires the
+    existing replacement-attention record to name that exact claim. Missing or
+    conflicting evidence stays ``unknown`` for the normal recovery path.
+    """
+    try:
+        rows = _rows(Path(jobs).read_text().splitlines())
+        index = source_reservation(jobs, aid)
+        row = rows.get(aid)
+        if row is None:
+            return 'unknown' if index else 'none'
+        _, meta = row
+        binding = source_binding(jobs, meta)
+        family = (index or {}).get('family_id') or (binding or ('',))[0]
+        if not family:
+            return 'none'
+        record = _check_record(_read(_record_path(jobs, family)), family)
+        if record.get('original_attempt_id') != aid:
+            return 'unknown'
+        saved = _read(_directory(jobs)/'attention/by-source'/(_id(aid)+'.json'))
+        if saved is not None:
+            proof = saved.get('proof') or {}
+            attention = saved.get('attention') or {}
+            reason = attention.get('reason')
+            if (set(saved) == {'attention', 'proof'}
+                    and set(proof) == {'family_id', 'claim_digest'}
+                    and proof.get('family_id') == family
+                    and proof.get('claim_digest') == _digest(record)
+                    and set(attention) == {'source_attempt_id', 'state', 'reason', 'node', 'failure'}
+                    and attention.get('source_attempt_id') == aid
+                    and attention.get('state') == 'needs-attention'
+                    and isinstance(reason, str)
+                    and re.fullmatch(r'[a-z0-9][a-z0-9:-]{0,159}', reason)
+                    and attention.get('node') == (meta.get('route_node') or '__owner__')
+                    and isinstance(attention.get('failure'), str)):
+                return 'settled'
+            return 'unknown'
+        return 'accepted'
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, DC.DispatchContractError):
+        return 'unknown'
+
+
+def _settle_recovery_attention(jobs, aid, result):
+    """Settle one accepted duty in the existing attention ledger after a known refusal."""
+    try:
+        jobs = Path(jobs)
+        with _locked(jobs) as lines:
+            rows = _rows(lines)
+            row = rows.get(aid)
+            if row is None:
+                return
+            _, meta = row
+            index = source_reservation(jobs, aid)
+            binding = source_binding(jobs, meta)
+            family = (index or {}).get('family_id') or (binding or ('',))[0]
+            if not family:
+                return
+            record = _check_record(_read(_record_path(jobs, family)), family)
+            if record.get('original_attempt_id') != aid:
+                return
+            target_row = rows.get(record['replacement_attempt_id'])
+            if target_row is not None:
+                target = target_row[1]
+                if (target.get('replacement_claim_digest') != _digest(record)
+                        or target.get('replacement_family_id') != family
+                        or target.get('automatic_retry_of') != aid
+                        or target.get('launch_started') == '1'):
+                    return
+            reason = result.get('reason') or 'replacement-observation-unavailable'
+            if not isinstance(reason, str) or not re.fullmatch(r'[a-z0-9][a-z0-9:-]{0,159}', reason):
+                reason = 'replacement-observation-unavailable'
+            attention = {
+                'source_attempt_id': aid,
+                'state': 'needs-attention',
+                'reason': reason,
+                'node': meta.get('route_node') or '__owner__',
+                'failure': meta.get('note') or meta.get('failure_class') or 'terminal-failure',
+            }
+            proof = {'family_id': family, 'claim_digest': _digest(record)}
+            path = _directory(jobs)/'attention/by-source'/(_id(aid)+'.json')
+            existing = _read(path)
+            candidate = {'attention': attention, 'proof': proof}
+            if existing is not None:
+                if existing.get('proof') == proof:
+                    return
+                raise DC.DispatchContractError('replacement-attention-conflict')
+            _once(path, candidate)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, DC.DispatchContractError):
+        # A failed settlement write leaves the accepted claim visible and retryable.
+        return
+
+
 def _approved_fix_answers(record, jobs, rows=None):
     """Read the FAILs an approved claim already pinned, including owner-closed reviews.
 
@@ -1106,6 +1228,8 @@ def validate_claim_source(jobs, lines, record):
     if canonical != record:
         raise DC.DispatchContractError('replacement-claim-drift')
     rows = _rows(lines); prior = record['original_attempt_id']
+    if recovery_delivery_state(jobs, prior) == 'settled':
+        raise DC.DispatchContractError('replacement-duty-settled')
     if prior not in rows:
         raise DC.DispatchContractError('replacement-source-missing')
     fields, source = rows[prior]
@@ -1487,7 +1611,7 @@ def _retry_model(source, kind):
     return resolve_runtime_profile(source.get('harness'), FRAME_TRANSITION['to'])[0]['model']
 
 
-def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capacity=False):
+def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capacity=False):
     """A bound runtime checkpoint, never a read-only observer, calls this.
 
     `resume_capacity` is set only by an explicit `start`: a usage-limit stop is replaced
@@ -1496,6 +1620,8 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
     rows = _rows(Path(jobs).read_text().splitlines())
     if aid not in rows:
         return {'state':'unavailable','reason':'replacement-source-missing'}
+    if recovery_delivery_state(jobs, aid) == 'settled':
+        return {'state': 'not-applicable'}
     fields, source = rows[aid]
     kind = death_kind(fields, source, jobs=jobs)
     progress = route_authority.decide_continuation(action='replacement-progress', jobs=jobs,
@@ -1647,6 +1773,35 @@ def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capac
         if getattr(exc, 'retry_when', ''):
             result.update(next_action=exc.next_action, retry_when=exc.retry_when)
         return result
+
+
+def advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capacity=False):
+    """Run the existing controller and settle only conclusive duty refusals."""
+    result = _advance(jobs, aid, run=run, authority_check=authority_check,
+                      resume_capacity=resume_capacity)
+    if result.get('state') == 'needs-attention':
+        reason = result.get('reason', '')
+        diagnostic = dict(
+            line.split('=', 1) for line in result.get('launcher_diagnostic', '').splitlines()
+            if '=' in line
+        )
+        definitive = (
+            reason in {
+                'replacement-parent-identity-unproven',
+                'replacement-human-gate-pending',
+                'replacement-workflow-not-open',
+                'pin-ignored-for-replacement',
+            }
+            or diagnostic.get('reason') in {
+                'replacement-registration-refused',
+                'replacement-launch-refused',
+                'replacement-spawn-refused',
+            }
+        )
+        if definitive:
+            for source in {aid, result.get('source_attempt_id') or aid}:
+                _settle_recovery_attention(jobs, source, result)
+    return result
 
 
 def effective_attempts(jobs, attempts):
