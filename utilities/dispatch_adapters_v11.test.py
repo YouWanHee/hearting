@@ -267,6 +267,68 @@ class AdapterV11Test(unittest.TestCase):
    self.assertIn(f"source_commit_sealed={sealed}",row)
    self.assertIn("source_commit_distance=1",row)
 
+ def test_claude_registered_child_receives_native_auth_binding_from_builder(self):
+  with tempfile.TemporaryDirectory() as td:
+   root=Path(td); repo,art=self.fixture(root); jobs=root/"jobs.log"; logs=root/"logs"
+   main_config=root/"main-config"; main_config.mkdir()
+   credential=main_config/".credentials.json"
+   credential.write_text('{"claudeAiOauth":{"accessToken":"synthetic","refreshToken":"synthetic"}}')
+   credential.chmod(0o600)
+   settings=main_config/"settings.json"
+   settings.write_text('{"permissions":{"deny":["Read(secret)"]},"env":{"USER_GUARD":"1"}}')
+   capture=root/"child-env"
+   fakebin=root/"bin"; fakebin.mkdir()
+   fake=fakebin/"claude"
+   fake.write_text(
+    "#!/bin/sh\n"
+    f"printf '%s\\n%s\\n' \"${{CLAUDE_CONFIG_DIR-}}\" \"${{CLAUDE_SECURESTORAGE_CONFIG_DIR-}}\" > '{capture}'\n"
+    "exec sleep 60\n",encoding="utf-8")
+   fake.chmod(0o755)
+   self.seed_parent(jobs,repo,harness="claude")
+   wrapper=self.load_wrapper("claude")
+   command=self.command("claude","start",repo,jobs,logs)+["--foreground-timeout","5"]
+   argv=["dispatch-headless.py",*command[2:]]
+   env={"PATH":str(fakebin)+os.pathsep+os.environ.get("PATH",""),
+        "HOME":str(root/"home"),"CLAUDE_CONFIG_DIR":str(main_config),
+        "AGENT_HOME":str(ROOT),"AGENT_ARTIFACT_ROOT":str(art),
+        "AGENT_DISPATCH_JOBS":str(jobs),"AGENT_DISPATCH_CHILD":"1",
+        "AGENT_DISPATCH_ATTEMPT_ID":"att-parent-fixture",
+        "XDG_STATE_HOME":str(root/"state")}
+   Path(env["HOME"]).mkdir()
+   resolution=wrapper.reconcile_launch_lifecycle(
+    wrapper.DETACHED,{},evidence={
+     "lifecycle_selector_source":"nspid-vector",
+     "lifecycle_nspid_width":"2",
+     "lifecycle_pid1_class":"non-system-init",
+    })
+   patches=[mock.patch.dict(os.environ,env,clear=True),
+            mock.patch.object(wrapper,"parent_attempt_binding_is_live",return_value=False),
+            mock.patch.object(wrapper,"reconcile_launch_lifecycle",return_value=resolution)]
+   for name,value in (("check_runtime_projection",0),
+                      ("ensure_runtime_home_projection",None),
+                      ("launch_summary_owner",{"summary_owner":"test-fixture"})):
+    if hasattr(wrapper,name): patches.append(mock.patch.object(wrapper,name,return_value=value))
+   output=io.StringIO()
+   for item in patches: item.start()
+   try:
+    with redirect_stdout(output): code=wrapper.main(argv)
+    for _ in range(100):
+     if capture.is_file(): break
+     time.sleep(.02)
+    self.assertTrue(capture.is_file(),output.getvalue())
+    values=capture.read_text(encoding="utf-8").splitlines()
+    self.assertEqual(len(values),2,values)
+    masked=Path(values[0]); native=Path(values[1])
+    self.assertNotEqual(masked.resolve(),main_config.resolve())
+    self.assertEqual(native.resolve(),main_config.resolve())
+    self.assertFalse((masked/".credentials.json").exists())
+    self.assertEqual(credential.read_text(),
+                     '{"claudeAiOauth":{"accessToken":"synthetic","refreshToken":"synthetic"}}')
+    self.assertEqual(code,0,output.getvalue())
+   finally:
+    for item in reversed(patches): item.stop()
+    fixture_processes.reap(td)
+
  def test_launch_home_row_field_is_the_resolved_release_never_the_current_symlink(self):
   # SD-115 axis 4 (a): a wrapper launched under a mutable pointer (the real
   # shape is `<share>/hearting/current`, mirrored here as a plain symlink to
