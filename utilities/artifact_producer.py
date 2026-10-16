@@ -2798,9 +2798,13 @@ def _bucket_type(rel: str) -> str:
 
 
 def _unmanifestable_reason(rel: str) -> Optional[str]:
-    """Why a payload path cannot carry the current D-6 locator grammar."""
-    report = artifact_manifest.validate_locator_path(rel)
-    return None if report.ok else report.violations[0].code
+    """Why a relocated legacy file cannot carry a D-6 locator (None when it can)."""
+    for part in rel.split("/"):
+        if part.startswith("."):
+            return "hidden-component"
+        if not artifact_manifest._LOCATOR_COMPONENT_RE.match(part):
+            return "invalid-component"
+    return None
 
 
 _TEMPORARY_FILE_SUFFIXES = (".pyc", ".swp", "~", ".tmp", ".part")
@@ -2902,7 +2906,8 @@ def _output_paths(directory: Path, *, exclude_hidden: bool = False,
         if payload_root is None:
             violations.append(f"file-outside-artifacts:{rel}")
             continue
-        if exclude_hidden and _unmanifestable_reason(rel) is not None:
+        if (exclude_hidden and payload_root == "artifacts"
+                and _unmanifestable_reason(rel) is not None):
             if excluded is not None:
                 excluded.append(rel)
             continue
