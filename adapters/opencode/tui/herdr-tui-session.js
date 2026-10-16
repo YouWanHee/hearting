@@ -13,6 +13,16 @@ const ROUTE_POLL_INTERVAL_MS = 100;
 const SELECTION_RETRY_DELAYS_MS = [100, 400, 1_000];
 const SESSION_START_SOURCES = ["startup", "resume", "select", "clear", "compact", "fork"];
 
+function nativeResumeWireArgv(argv, sessionID) {
+  if (!Array.isArray(argv) || argv.length === 0 || argv.length > 64
+      || argv.some((arg) => typeof arg !== "string" || !arg || arg.includes("\0"))
+      || argv.reduce((bytes, arg) => bytes + Buffer.byteLength(arg, "utf8"), 0) > 8192) return null;
+  const executable = argv[0];
+  if (executable !== AGENT && !(path.isAbsolute(executable) && path.basename(executable) === AGENT)) return null;
+  if (typeof sessionID !== "string" || !sessionID || !argv.includes(sessionID)) return null;
+  return [AGENT, ...argv.slice(1)];
+}
+
 function nativeSessionLifecycle(sessionID) {
   try {
     const pid = process.pid;
@@ -38,9 +48,9 @@ function nativeSessionLifecycle(sessionID) {
       result.session_start_source = record.sessionStartSource;
     }
     const argv = process.argv;
-    if (["resume", "select"].includes(result.session_start_source) && Array.isArray(argv)
-        && argv[0] === "opencode" && argv.includes(sessionID)) {
-      result.resume_argv = argv.slice();
+    if (["resume", "select"].includes(result.session_start_source)) {
+      const wireArgv = nativeResumeWireArgv(argv, sessionID);
+      if (wireArgv) result.resume_argv = wireArgv;
     }
     return result;
   } catch { return {} }

@@ -2224,13 +2224,17 @@ when its session, pane, foreground PID birth, and PID namespace still match.
 Pane-scoped session history is keyed by the concrete Herdr socket when one is
 known, not by pane label alone. The OpenCode TUI selection record carries its
 native sequence and observed start source for the Python CLI projection and
-the state-plugin socket projection. Resume argv is copied as the original
-array only when the current native SID and foreground PID birth prove that
-launcher; absent transcript, cwd, model, permission, or argv evidence stays
-omitted. The stored argv restores a session and grants no execution or owner
-authority. Clear checks OpenCode's current process-bound selection before
-using the pane record, and an older delayed start callback cannot replace a
-later session on that seat.
+the state-plugin socket projection. Local launch/history metadata retains the
+process-proven executable and raw argv unchanged. The optional native
+`resume_argv` uses the proven harness executable as a plain command name and
+copies every remaining argument unchanged, only when the current native SID
+and foreground PID birth prove that launcher. Foreign executables, unsupported
+wrappers, relative paths, malformed argv, or mismatched current identity omit
+that optional field while retaining a valid session-only report. Absent transcript, cwd,
+model, permission, or argv evidence stays omitted. The wire argv restores a
+session and grants no execution or owner authority. Clear checks OpenCode's
+current process-bound selection before using the pane record, and an older
+delayed start callback cannot replace a later session on that seat.
 
 Watch observers settle their existing duty only after a complete snapshot on
 the exact endpoint confirms pane absence or a changed session identity, or

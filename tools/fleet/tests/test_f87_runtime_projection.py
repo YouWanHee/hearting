@@ -819,7 +819,7 @@ class ProjectionObservationTest(unittest.TestCase):
                     "--source", "herdr:opencode", "--display-agent", "opencode", "--title", "opencode title"])
                 self.assertEqual(observation["session_report"], "exit0" if report_session else "skipped")
 
-    def test_absolute_native_resume_argv_is_serialized_without_reconstruction(self):
+    def test_absolute_native_resume_argv_is_canonicalized_only_at_wire_boundary(self):
         from tools.fleet import herdr_projection as hp
         for harness in ("claude", "codex", "opencode"):
             sid = "ses_A"
@@ -827,7 +827,8 @@ class ProjectionObservationTest(unittest.TestCase):
                     "--resume", sid, "--model", "fixture", "--setting-sources", "user"]
             with self.subTest(harness=harness):
                 lifecycle = hp._session_lifecycle(harness, 1000001, "resume", argv, session_id=sid)
-                self.assertEqual(lifecycle["resume_argv"], argv)
+                self.assertEqual(lifecycle["resume_argv"], [harness, *argv[1:]])
+                self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
                 self.assertNotIn("resume_argv", hp._session_lifecycle(
                     harness, 1000002, "clear", argv, session_id=sid))
         self.assertNotIn("resume_argv", hp._session_lifecycle(

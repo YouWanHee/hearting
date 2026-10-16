@@ -276,6 +276,13 @@ def is_native_resume_argv(argv, harness, session_id=None):
     return session_id is None or isinstance(session_id, str) and session_id in argv
 
 
+def native_resume_wire_argv(argv, harness, session_id=None):
+    """Translate proven raw argv to Herdr's plain-command resume wire form."""
+    if not is_native_resume_argv(argv, harness, session_id):
+        return None
+    return [harness, *argv[1:]]
+
+
 def launch_context(pid, harness, session_id):
     """Read argv and cwd only while the exact native session and PID birth agree."""
     if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1

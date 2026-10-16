@@ -225,7 +225,10 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 "    executable = argv[0]\n"
                 "    if not (executable == harness or os.path.isabs(executable) and "
                 "os.path.basename(executable) == harness): return False\n"
-                "    return session_id is None or isinstance(session_id,str) and session_id in argv\n",
+                "    return session_id is None or isinstance(session_id,str) and session_id in argv\n"
+                "def native_resume_wire_argv(argv, harness, session_id=None):\n"
+                "    if not is_native_resume_argv(argv,harness,session_id): return None\n"
+                "    return [harness, *argv[1:]]\n",
                 encoding="utf-8",
             )
             if harness == "claude":
@@ -310,7 +313,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                         self.assertNotIn("resume_argv", params)
                     self.assertGreater(params["seq"], 10**18)
 
-    def test_native_hooks_preserve_proven_absolute_launcher_argv_verbatim(self):
+    def test_native_hooks_translate_proven_absolute_launcher_argv_for_wire(self):
         for harness in ("claude", "codex"):
             launch = [f"/home/user/.local/bin/{harness}", "--color", "always",
                       "--resume", "ses-A", "--model", "fixture", "--setting-sources", "user"]
@@ -319,7 +322,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
             }, allowed=True, launch_argv=launch)
             params = request["params"]
-            self.assertEqual(params["resume_argv"], launch)
+            self.assertEqual(params["resume_argv"], [harness, *launch[1:]])
             self.assertEqual(params["agent_session_id"], "ses-A")
             self.assertEqual(params["agent_session_path"], "/fixture/transcript.jsonl")
             self.assertEqual(params["session_start_source"], "resume")
@@ -327,6 +330,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
 
             for bad_argv in (["/usr/bin/env", harness, "--resume", "ses-A"],
                              ["/usr/bin/python3", f"/opt/{harness}", "--resume", "ses-A"],
+                             [f"bin/{harness}", "--resume", "ses-A"],
                              [f"/opt/{harness}", "--resume", "other-session"],
                              [f"/opt/{harness}", "--resume", "ses-A", "\0bad"],
                              [f"/opt/{harness}", "--resume", "ses-A", "x" * 8192]):
@@ -336,6 +340,9 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                         "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
                     }, allowed=True, launch_argv=bad_argv)
                     self.assertNotIn("resume_argv", request["params"])
+                    self.assertEqual(request["params"]["agent_session_id"], "ses-A")
+                    self.assertEqual(request["params"]["agent_session_path"], "/fixture/transcript.jsonl")
+                    self.assertEqual(request["params"]["session_start_source"], "resume")
 
     def test_native_session_reporters_refuse_worker_and_mismatched_codex_identity(self):
         for harness, launch in (("claude", ["claude", "--resume", "ses-A"]),
@@ -440,7 +447,7 @@ console.log("Claude/Codex session hooks and OpenCode v1/v2 assets registered");
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("registered", result.stdout)
 
-    def test_opencode_state_plugin_preserves_only_proven_native_absolute_resume_argv(self):
+    def test_opencode_state_plugin_canonicalizes_only_proven_native_resume_argv(self):
         script = r'''import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -488,18 +495,21 @@ async function capture(index, identitySid, argv, identityStart = start) {
     { timeout = setTimeout(() => reject(new Error("session report timeout")), 2500); })]);
   clearTimeout(timeout);
   await new Promise((resolve) => server.close(resolve));
-  return request.params;
+  return {params: request.params, processArgv: process.argv.slice()};
 }
 const validArgv = ["/home/user/.local/bin/opencode", "/opt/opencode-cli.js", "run",
   "--color", "always", "--resume", sid, "--model", "fixture", "--setting-sources", "user"];
 const valid = await capture(1, sid, validArgv);
-if (JSON.stringify(valid.resume_argv) !== JSON.stringify(validArgv)) throw Error("absolute native argv was changed or omitted");
-if (valid.agent_session_id !== sid || valid.session_start_source !== "resume" || valid.seq !== 1700000000123) {
+const expectedWireArgv = ["opencode", ...validArgv.slice(1)];
+if (JSON.stringify(valid.params.resume_argv) !== JSON.stringify(expectedWireArgv)) throw Error("native wire argv was not canonicalized");
+if (JSON.stringify(valid.processArgv) !== JSON.stringify(validArgv)) throw Error("raw process argv was mutated");
+if (valid.params.agent_session_id !== sid || valid.params.session_start_source !== "resume" || valid.params.seq !== 1700000000123) {
   throw Error("native session metadata changed");
 }
 const rejected = [
   [sid, ["/usr/bin/env", "opencode", "run", "--resume", sid]],
   [sid, ["/usr/bin/python3", "/opt/opencode", "run", "--resume", sid]],
+  [sid, ["bin/opencode", "/opt/opencode-cli.js", "run", "--resume", sid]],
   [sid, ["/opt/opencode", "/opt/opencode-cli.js", "run", "--resume", "other-session"]],
   [sid, ["/opt/opencode", "/opt/opencode-cli.js", "run", "--resume", sid, "\0bad"]],
   [sid, ["/opt/opencode", "/opt/opencode-cli.js", "run", "--resume", sid, "x".repeat(8192)]],
@@ -508,17 +518,19 @@ const rejected = [
 for (let index = 0; index < rejected.length; index += 1) {
   const [identitySid, argv] = rejected[index];
   const params = await capture(index + 2, identitySid, argv);
-  if ("resume_argv" in params) throw Error(`unproven launcher argv accepted at ${index}`);
+  if ("resume_argv" in params.params) throw Error(`unproven launcher argv accepted at ${index}`);
+  if (params.params.agent_session_id !== sid || params.params.session_start_source !== "resume"
+      || params.params.seq !== 1700000000123) throw Error(`optional argv erased session identity at ${index}`);
 }
 const mismatched = await capture(20, "ses-other", validArgv);
-if ("resume_argv" in mismatched || "seq" in mismatched || "session_start_source" in mismatched) {
+if ("resume_argv" in mismatched.params || "seq" in mismatched.params || "session_start_source" in mismatched.params) {
   throw Error("current selection mismatch was accepted");
 }
 const changedBirth = await capture(21, sid, validArgv, "0");
-if ("resume_argv" in changedBirth || "seq" in changedBirth || "session_start_source" in changedBirth) {
+if ("resume_argv" in changedBirth.params || "seq" in changedBirth.params || "session_start_source" in changedBirth.params) {
   throw Error("changed PID birth was accepted");
 }
-console.log("OpenCode state plugin preserved bounded proven native argv");
+console.log("OpenCode state plugin canonicalized bounded proven native argv");
 '''
         with tempfile.TemporaryDirectory(prefix="herdr-opencode-plugin-") as temporary:
             asset_root = Path(temporary)
@@ -534,7 +546,7 @@ console.log("OpenCode state plugin preserved bounded proven native argv");
                 text=True, capture_output=True, timeout=30, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertIn("preserved bounded proven native argv", result.stdout)
+        self.assertIn("canonicalized bounded proven native argv", result.stdout)
 
     def test_opencode_tui_report_uses_pid_birth_bound_lifecycle_and_omits_unproven_argv(self):
         script = r'''import fs from "node:fs";
@@ -557,13 +569,13 @@ const api = {
     listen: () => () => {},
   },
 };
-async function capture(index, identitySid, argv) {
+async function capture(index, identitySid, argv, identityStart = start) {
   const state = `${base}/state-${index}`;
   const identityDir = `${state}/hearting/tui-identity`;
   fs.mkdirSync(identityDir, {recursive: true});
   fs.writeFileSync(`${identityDir}/${process.pid}-${start}.json`, JSON.stringify({
     schema: "hearting-tui-selection-v1", sessionID: identitySid, pid: process.pid,
-    start, sessionSeq: 1700000000123000, sessionStartSource: "resume",
+    start: identityStart, sessionSeq: 1700000000123000, sessionStartSource: "resume",
   }));
   const socketPath = `${base}/herdr-${index}.sock`;
   process.env.HERDR_ENV = "1";
@@ -592,17 +604,39 @@ async function capture(index, identitySid, argv) {
   clearTimeout(timeout);
   dispose();
   await new Promise((resolve) => server.close(resolve));
-  return request.params;
+  return {params: request.params, processArgv: process.argv.slice()};
 }
-const valid = await capture(1, sid, ["opencode", "--resume", sid]);
-const mismatched = await capture(2, "ses-other", ["opencode", "--resume", sid]);
-if (valid.seq !== 1700000000123000 || valid.seq > Number.MAX_SAFE_INTEGER) throw Error("OpenCode seq compatibility");
-if (valid.session_start_source !== "resume") throw Error("native OpenCode source missing");
-if (JSON.stringify(valid.resume_argv) !== JSON.stringify(["opencode", "--resume", sid])) throw Error("actual OpenCode argv missing");
-if (mismatched.session_start_source !== "select" || "seq" in mismatched || "resume_argv" in mismatched) {
+const rawArgv = ["/home/user/.local/bin/opencode", "--resume", sid, "--model", "fixture"];
+const valid = await capture(1, sid, rawArgv);
+const mismatched = await capture(2, "ses-other", rawArgv);
+const changedBirth = await capture(3, sid, rawArgv, "0");
+const invalidArgvs = [
+  ["bin/opencode", "--resume", sid],
+  ["/usr/bin/env", "opencode", "--resume", sid],
+  ["/home/user/.local/bin/opencode", "--resume", "other-session"],
+  ["/home/user/.local/bin/opencode", "--resume", sid, "\0bad"],
+  ["/home/user/.local/bin/opencode", "--resume", sid, "x".repeat(8192)],
+  ["/home/user/.local/bin/opencode", ...Array(64).fill("x"), sid],
+];
+const invalidResults = [];
+for (let index = 0; index < invalidArgvs.length; index += 1) {
+  invalidResults.push(await capture(index + 4, sid, invalidArgvs[index]));
+}
+if (valid.params.seq !== 1700000000123000 || valid.params.seq > Number.MAX_SAFE_INTEGER) throw Error("OpenCode seq compatibility");
+if (valid.params.session_start_source !== "resume") throw Error("native OpenCode source missing");
+if (JSON.stringify(valid.params.resume_argv) !== JSON.stringify(["opencode", ...rawArgv.slice(1)])) throw Error("native OpenCode wire argv missing");
+if (JSON.stringify(valid.processArgv) !== JSON.stringify(rawArgv)) throw Error("TUI mutated its raw argv");
+if (mismatched.params.session_start_source !== "select" || "seq" in mismatched.params || "resume_argv" in mismatched.params
+    || "resume_argv" in changedBirth.params) {
   throw Error("unproven OpenCode identity fields were emitted");
 }
-console.log(JSON.stringify({valid, mismatched}));
+for (const [index, item] of invalidResults.entries()) {
+  if ("resume_argv" in item.params) throw Error(`invalid TUI argv accepted at ${index}`);
+  if (item.params.agent_session_id !== sid || item.params.session_start_source !== "resume"
+      || item.params.seq !== 1700000000123000) throw Error(`optional TUI argv erased session identity at ${index}`);
+}
+console.log(JSON.stringify({valid: valid.params, mismatched: mismatched.params,
+  changedBirth: changedBirth.params, invalid: invalidResults.map(item => item.params)}));
 '''
         with tempfile.TemporaryDirectory(prefix="herdr-opencode-session-") as temporary:
             asset_root = Path(temporary)

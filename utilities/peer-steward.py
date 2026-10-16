@@ -2145,7 +2145,12 @@ def cmd_retire(args):
             # Keep the existing event-driven agent wait as the bounded
             # fallback; its status is only a wake signal, never shell-return
             # proof. One final pane/kernel observation decides the result.
-            _run_herdr_wait(target, ["idle", "done"], int(wait_seconds * 1000))
+            # For OpenCode, the exact native idle state that authorized this
+            # exit can satisfy `idle` before the foreground process has left.
+            # Wait for terminal `done`; the exact PID/birth check below still
+            # decides whether the normal exit completed.
+            wait_states = ["done"] if harness == "opencode" else ["idle", "done"]
+            _run_herdr_wait(target, wait_states, int(wait_seconds * 1000))
     finally:
         if event_transport is not None:
             event_transport.close()

@@ -807,6 +807,7 @@ function fixture(options = {}) {
         with tempfile.TemporaryDirectory() as tmp:
             module_path = Path(tmp) / "hearting-guards-fixture.mjs"
             module_path.write_text(source)
+            fixture_state = Path(tmp) / "state"
             js = r'''
 import { pathToFileURL } from "node:url";
 import { EventEmitter } from "node:events";
@@ -911,6 +912,7 @@ if (process.env.FIXTURE_BARE_NATIVE_ORIGIN === "1") {
             env.pop("OPENCODE_DISPATCH_SLUG", None)
             env.update({"AGENT_HOME": str(ROOT), "AGENT_ARTIFACT_CHECKPOINT": "off",
                         "FIXTURE_GUARDS": str(module_path),
+                        "XDG_STATE_HOME": str(fixture_state),
                         "FIXTURE_BARE_NATIVE_ORIGIN": "1" if bare_origin else "0",
                         "FIXTURE_SELECTION_SID": selection_sid})
             if pending_ref:
@@ -1058,6 +1060,39 @@ console.log(JSON.stringify(rows));
                              ("default", "fixture-pane", "opencode", "ses_A"))
             self.assertGreater(row["pid"], 1)
             self.assertRegex(row["pid_start"], r"^\d+$")
+
+    def test_opencode_bare_native_status_uses_current_selection_and_rejects_old_callback(self):
+        result = self.run_agent_initializer_fixture(r'''
+const fs = await import("node:fs");
+const path = await import("node:path");
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {
+  app: {log: async () => {}}, session: {get: async () => ({data: {id: "ses_A"}})},
+}};
+const hooks = await AgentHarnessGuards(ctx);
+await hooks.event({event: {type: "session.status", properties: {
+  sessionID: "ses_A", status: {type: "idle"}}}});
+const stat = fs.readFileSync("/proc/self/stat", "utf8");
+const close = stat.lastIndexOf(") ");
+const start = stat.slice(close + 2).trim().split(/\s+/)[19];
+const selection = path.join(process.env.XDG_STATE_HOME, "hearting", "tui-identity", `${process.pid}-${start}.json`);
+const row = JSON.parse(fs.readFileSync(selection, "utf8"));
+row.sessionID = "ses_B";
+fs.writeFileSync(selection, JSON.stringify(row));
+await hooks.event({event: {type: "session.status", properties: {
+  sessionID: "ses_A", status: {type: "idle"}}}});
+const reports = globalThis.__fixtureSyncCalls
+  .filter(call => call.args[0].endsWith("herdr_observation.py") && call.args[1] === "record-native-turn")
+  .map(call => JSON.parse(call.options.input));
+hooks.dispose();
+console.log(JSON.stringify(reports));
+''', bare_origin=True, selection_sid="ses_A")
+        self.assertEqual(len(result), 1)
+        row = result[0]
+        self.assertEqual((row["harness"], row["session_id"], row["status"]),
+                         ("opencode", "ses_A", "idle"))
+        self.assertEqual((row["endpoint"], row["pane"]), ("default", "fixture-pane"))
+        self.assertGreater(row["pid"], 1)
+        self.assertRegex(row["pid_start"], r"^\d+$")
 
     def test_opencode_dispose_cancels_the_initializer_startup_timer(self):
         result = self.run_agent_initializer_fixture(r'''

@@ -4563,8 +4563,8 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                 self.assertEqual(world.actions(), [])
 
     def test_retire_uses_bounded_agent_wait_and_one_final_process_observation(self):
-        world = _RetireWorld(status="idle", exits=False)
-        with mock.patch.object(peer_steward, "_RETIRE_SECONDS", 0.01):
+        world = _RetireWorld(harness="opencode", status="idle", exits=False)
+        with mock.patch.object(peer_steward, "_OPENCODE_RETIRE_SECONDS", 0.01):
             rc, line = self.retire(world)
         self.assertEqual(rc, 0, line)
         self.assertIn("reason=agent-still-running", line)
@@ -4573,8 +4573,9 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         post_send_reads = [argv for argv in world.calls[sent_at + 1:]
                            if argv[:3] == ["herdr", "pane", "process-info"]]
         self.assertEqual(len(post_send_reads), 1)
-        self.assertTrue(any(argv[:3] == ["herdr", "agent", "wait"]
-                            for argv in world.calls))
+        wait_args = next(argv for argv in world.calls if argv[:3] == ["herdr", "agent", "wait"])
+        wait_states = [wait_args[index + 1] for index, value in enumerate(wait_args[:-1]) if value == "--until"]
+        self.assertEqual(wait_states, ["done"])
 
     def retire(self, world, record=None, *, clear_existing=True, resume_request_id=None):
         printed = []

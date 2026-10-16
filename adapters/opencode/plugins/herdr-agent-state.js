@@ -110,6 +110,11 @@ function isNativeResumeArgv(argv, sessionID) {
   return argv.includes(sessionID);
 }
 
+function nativeResumeWireArgv(argv, sessionID) {
+  if (!isNativeResumeArgv(argv, sessionID)) return null;
+  return [AGENT, ...argv.slice(1)];
+}
+
 function request(method, params) {
   const pending = requestChain.then(() => requestOnce(method, params));
   requestChain = pending.catch(() => {});
@@ -185,9 +190,9 @@ function nativeSessionLifecycle(sessionID) {
       result.session_start_source = record.sessionStartSource;
     }
     const argv = process.argv;
-    if (["resume", "select"].includes(result.session_start_source)
-        && isNativeResumeArgv(argv, sessionID)) {
-      result.resume_argv = argv.slice();
+    if (["resume", "select"].includes(result.session_start_source)) {
+      const wireArgv = nativeResumeWireArgv(argv, sessionID);
+      if (wireArgv) result.resume_argv = wireArgv;
     }
     return result;
   } catch { return {} }

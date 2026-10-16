@@ -185,12 +185,15 @@ class LaunchContextTest(unittest.TestCase):
 
 
 class NativeResumeArgvTest(unittest.TestCase):
-    def test_supported_absolute_launchers_keep_their_original_argument_arrays(self):
+    def test_wire_argv_uses_plain_harness_name_without_mutating_raw_launch_argv(self):
         for harness in ("claude", "codex", "opencode"):
             argv = [f"/home/user/.local/bin/{harness}", "--color", "always",
                     "--resume", SID, "--model", "fixture", "--setting-sources", "user"]
             with self.subTest(harness=harness):
                 self.assertTrue(P.is_native_resume_argv(argv, harness, SID))
+                self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
+                wire = P.native_resume_wire_argv(argv, harness, SID)
+                self.assertEqual(wire, [harness, *argv[1:]])
                 self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
 
     def test_bad_executables_foreign_wrappers_wrong_sid_and_bounded_inputs_are_rejected(self):
@@ -208,6 +211,7 @@ class NativeResumeArgvTest(unittest.TestCase):
         for argv, harness, sid in cases:
             with self.subTest(argv=argv[:3], harness=harness, sid=sid):
                 self.assertFalse(P.is_native_resume_argv(argv, harness, sid))
+                self.assertIsNone(P.native_resume_wire_argv(argv, harness, sid))
 
 
 if __name__ == "__main__":

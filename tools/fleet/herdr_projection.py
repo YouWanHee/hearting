@@ -533,7 +533,7 @@ def _await_tui_and_project(session_id: str, report_session: bool, *,
 
 def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=None, *, session_id=None):
     """Optional native bootstrap fields; never infer a source or widen a guard."""
-    from .process_identity import is_native_resume_argv
+    from .process_identity import native_resume_wire_argv
 
     if session_seq is None and session_start_source is None and resume_argv is None:
         return {}
@@ -544,12 +544,13 @@ def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=N
         return None
     result = dict(session_seq=session_seq, session_start_source=session_start_source)
     if resume_argv is not None:
-        if (session_start_source not in {"resume", "select"} or not isinstance(resume_argv, list)
-                or not isinstance(session_id, str) or not session_id
-                or not is_native_resume_argv(resume_argv, harness, session_id)):
+        wire_argv = (native_resume_wire_argv(resume_argv, harness, session_id)
+                     if session_start_source in {"resume", "select"}
+                     and isinstance(session_id, str) and session_id else None)
+        if wire_argv is None:
             result.pop("resume_argv", None)
         else:
-            result["resume_argv"] = list(resume_argv)
+            result["resume_argv"] = wire_argv
     return result
 
 

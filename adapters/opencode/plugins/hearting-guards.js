@@ -297,7 +297,7 @@ function observeCompactRuntimeStatus(ctx, sid, status) {
   if (!normalized) return
   const observedAt = Date.now()
   runtimeStatusBySession.set(sid, { status: normalized, observedAt })
-  recordNativeTurnStatus(sid, normalized)
+  recordNativeTurnStatus(ctx, sid, normalized)
   const until = compactStatusUntil.get(sid) || 0
   if (until <= observedAt) {
     compactStatusUntil.delete(sid)
@@ -309,14 +309,20 @@ function observeCompactRuntimeStatus(ctx, sid, status) {
   if (result !== "booking=pending") compactStatusUntil.delete(sid)
 }
 
-function recordNativeTurnStatus(sid, status) {
+function recordNativeTurnStatus(ctx, sid, status) {
   const pane = process.env.HERDR_PANE_ID || ""
   const endpoint = process.env.AGENT_HERDR_SESSION || "default"
   const origin = paneNativeOrigin
-  if (!origin || origin.state === "invalidated" || origin.sid !== sid) return
+  const binding = paneContexts.get(ctx)
+  const generation = paneProjectionGeneration
+  if (!sid || isWorkerSession() || isCompactSubSession()
+      || !binding?.active || binding.generation !== generation || paneOwningContext !== ctx
+      || !origin || origin.state === "invalidated" || !pendingPeerRoot(ctx, sid)
+      || !sameNativePaneContext(ctx)) return
   const identity = contextPolicyProcess()
   if (!pane || !identity || !Number.isInteger(identity.pid) || identity.pid <= 1
-      || !/^\d+$/.test(String(identity.start || ""))) return
+      || !/^\d+$/.test(String(identity.start || ""))
+      || identity.pid !== origin.pid || String(identity.start) !== String(origin.start)) return
   const lower = String(status || "").toLowerCase()
   const normalized = lower === "idle" ? "idle"
     : ["active", "busy", "pending", "retry", "running", "streaming", "working"].includes(lower) ? "working"
