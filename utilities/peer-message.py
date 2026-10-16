@@ -927,6 +927,24 @@ def mark_pending_queued(ref, *, receipt="delivery-observed"):
         return True
 
 
+def mark_pending_prompt_queued(ref, claim, *, receipt="claude-pty-prompt-submitted"):
+    """Record one exact claimed Claude prompt submission, never its consumption."""
+    if receipt != "claude-pty-prompt-submitted" or not isinstance(claim, dict):
+        return False
+    from dispatch_contract import process_start_ticks
+    current_pid = os.getpid()
+    current_start = process_start_ticks(current_pid)
+    if not current_start or claim.get("pid") != current_pid or claim.get("start") != current_start:
+        return False
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        if (not row or row.get("state") != "unverified" or row.get("no_trailer")
+                or row.get("rpc_claim") != claim):
+            return False
+        _save_pending(dict(row, state="queued", rpc_claim=None, receipt=receipt))
+        return True
+
+
 def release_unsent_herdr_claim(row, *, receipt="target-form-open"):
     """Release this exact claim only when its caller has not submitted the message."""
     with pending_lock(row["ref"]):

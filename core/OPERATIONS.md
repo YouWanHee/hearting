@@ -2121,13 +2121,17 @@ leaving an extra anonymous target.
 
 **Peer submission is reference-based, never inferred from transport status.**
 `peer-steward.py prompt` seals a private transfer ref for the exact sender, recipient
-session and body digest. It does not inspect or send a target's composer. Codex uses
-the exact thread queue and `client_message_id`; OpenCode saves a `noReply` message
-through the current plugin client, then resumes only that persisted ID on an idle,
-verified root session. Claude uses its existing hook context and exact receiving
-callback. On a plain interactive Claude TUI without a supported wake carrier, the
-ref stays pending until the next native callback. A queued ref is not a receipt;
-only exact bound native history or the receiver callback can mark it received.
+session and body digest. Its support matrix is `Claude plain TUI: idle -> existing
+steward prompt delivery; busy -> callback`. The Claude idle path checks exact SID,
+pane, foreground PID birth and namespace, native idle state, registered-work
+readiness, an empty visible composer, and no open form or question before sending
+through the existing steward prompt helper. A dim prompt suggestion counts as an
+empty composer. Busy, blocked, unknown, form-open, nonempty-draft, or unreadable
+targets remain on the callback path and receive no PTY input. Codex uses the exact
+thread queue and `client_message_id`; OpenCode saves a `noReply` message through the
+current plugin client, then resumes only that persisted ID on an idle, verified root
+session. A queued ref is not a receipt; only exact bound native history or the
+receiver callback can mark it received.
 
 A lost native response is reconciled from exact persisted history before continuing
 the same ref. Duplicate or ambiguous matches are left pending without resubmitting
@@ -2143,14 +2147,13 @@ send once and keep pending refs until exact native receipt. Neither invents a wa
 or falls back to an inherited pane prompt.
 
 Clear and retire retain their checked foreground/form/draft and successor safety.
-They are the remaining pane commands; peer and continue submission no longer use
-`herdr agent prompt`, a composer read, a transcript-arrival guess or a keystroke.
-Same-behavior guarantees are still not claimed: the watched-side herdr realization is
-measured for both Claude and Codex, and **no runtime's steward-side wake is measured** —
-the Claude carrier becomes `measured` only after a live-session capture, not before. The
-memory handoff channel is pull-only (next prompt's `UserPromptSubmit` candidate or `mem
-recall`), so it is not a wake path either. Gateway `steer`/`watch-idle` ops are **not
-implemented**. The primary completion-report path is the
+Claude peer submission uses `herdr agent prompt` only for the guarded idle plain-TUI
+case above; busy Claude delivery waits for its existing callback. Neither a helper
+return nor a status flip is a receive receipt. Continue retains its existing native
+carrier and booking checks. The memory handoff channel is pull-only (next prompt's
+`UserPromptSubmit` candidate or `mem recall`), so it is not a wake path either.
+Gateway `steer`/`watch-idle` ops are **not implemented**. The primary
+completion-report path is the
 detached watch receipt plus the adapter wake (the watching side reads screen/disk
 directly); `SendMessage` is secondary.
 

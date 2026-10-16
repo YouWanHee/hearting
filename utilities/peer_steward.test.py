@@ -2305,25 +2305,181 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
             ["herdr", "agent", "send-keys"],
         )]
 
-    def test_claude_and_opencode_prompt_create_exact_pending_without_screen_send(self):
+    def test_opencode_prompt_keeps_its_native_callback_path(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
-        for harness in ("claude", "opencode"):
-            with self.subTest(harness=harness):
-                calls = []
-                payload = _agent_json(harness, "sid-" + harness, "child", status="idle")
-                with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
-                     mock.patch.object(peer_steward.subprocess, "run",
-                                       side_effect=self._fake_run(payload, calls)), \
-                     mock.patch("builtins.print") as printed:
-                    rc = peer_steward.main(["prompt", "child", "[steer] deliver once"])
-                self.assertEqual(rc, 3)
-                self.assertIn("prompted=queued", printed.call_args[0][0])
-                self.assertEqual(self._pane_io_calls(calls), [])
-                row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
+        harness = "opencode"
+        calls = []
+        payload = _agent_json(harness, "sid-" + harness, "child", status="idle")
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run",
+                               side_effect=self._fake_run(payload, calls)), \
+             mock.patch.object(peer_steward, "_schedule_message_obligation"), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["prompt", "child", "[steer] deliver once"])
+        self.assertEqual(rc, 3)
+        self.assertIn("prompted=queued", printed.call_args[0][0])
+        self.assertEqual(self._pane_io_calls(calls), [])
+        row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["to"]["session_id"], "sid-opencode")
+        self.assertTrue(peer_steward.peer_message.parse_peer_trailer(
+            row["text"], row["to"], include_ref=True))
+
+    def _run_claude_prompt(self, *, state="idle", screen=None,
+                           consume=False, readiness=None, foregrounds=None,
+                           send_result=(0, {})):
+        if screen is None:
+            screen = CLAUDE_SUGGESTION
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        ident = {"harness": "claude", "session_id": "sid-child",
+                 "name": "child", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "fixture-start",
+                      "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                      "session_id": "sid-child"}
+        snapshots = iter(foregrounds or [foreground, foreground])
+        sent = []
+        def deliver(target, text, *, wait, timeout_ms):
+            sent.append((target, text, wait, timeout_ms))
+            if consume:
+                self.assertEqual(peer_steward.peer_message.receive_peer_message(
+                    text, {"harness": "claude", "session_id": "sid-child"}), 0)
+            return send_result
+        ready = readiness or SimpleNamespace(state="ready", reason="")
+        screen_reader = mock.Mock(return_value=peer_steward._screen_lines(screen))
+        if state != "idle":
+            screen_reader.side_effect = AssertionError("busy/blocked target screen must not be read")
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward, "_current_session_identity",
+                               return_value=("sid-steward", "claude")), \
+             mock.patch.object(peer_steward, "_from_name", return_value="steward"), \
+             mock.patch.object(peer_steward, "_project_of", return_value="/fixture"), \
+             mock.patch.object(peer_steward, "_resolve_target",
+                               return_value=("claude", "sid-child", "child")), \
+             mock.patch.object(peer_steward, "_agent_state",
+                               return_value=(state, "w1:pX")), \
+             mock.patch.object(peer_steward, "_retire_target",
+                               return_value=(state, ident, 0, None)), \
+             mock.patch.object(peer_steward, "_pane_readiness", return_value=ready), \
+             mock.patch.object(peer_steward, "_claude_prompt_foreground_proof",
+                               side_effect=lambda *_a, **_k: next(snapshots)), \
+             mock.patch.object(peer_steward, "_read_screen", screen_reader), \
+             mock.patch.object(peer_steward, "_herdr_prompt", side_effect=deliver), \
+             mock.patch.object(peer_steward, "_schedule_message_obligation") as schedule, \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner",
+                               return_value=False), \
+             mock.patch("builtins.print") as printed:
+            args = peer_steward.build_parser().parse_args(
+                ["prompt", "child", "[steer] exact private recipient ref"])
+            rc = peer_steward.cmd_prompt(args)
+            if state != "idle":
+                self.assertEqual(screen_reader.call_count, 0)
+        record = self._all_records()[-1]
+        row = peer_steward.peer_message._read_pending(record["transfer_ref"])
+        return rc, printed.call_args[0][0], row, sent, schedule
+
+    def test_idle_claude_empty_composer_uses_exact_prompt_and_receiver_ref(self):
+        rc, line, row, sent, schedule = self._run_claude_prompt(consume=True)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("verify=exact-peer-ref", line)
+        self.assertEqual(row["state"], "received")
+        self.assertEqual(row["receipt"], "exact-peer-ref")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual((sent[0][0], sent[0][2]), ("w1:pX", False))
+        self.assertEqual(schedule.call_count, 0)
+
+    def test_idle_prompt_return_stays_queued_without_exact_receiver_ref(self):
+        rc, line, row, sent, _schedule = self._run_claude_prompt()
+        self.assertEqual(rc, 3, line)
+        self.assertIn("verify=native-prompt-submitted", line)
+        self.assertEqual((row["state"], row["receipt"]),
+                         ("queued", "claude-pty-prompt-submitted"))
+        self.assertEqual(len(sent), 1)
+
+    def test_ambiguous_claude_prompt_reply_keeps_exact_claim_and_owner_without_retry(self):
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            send_result=(None, None))
+        self.assertEqual(rc, 5, line)
+        self.assertIn("verify=native-prompt-unverified", line)
+        self.assertEqual(row["state"], "unverified")
+        self.assertIsNotNone(row.get("rpc_claim"))
+        self.assertEqual(len(sent), 1)
+        schedule.assert_called_once()
+
+    def test_busy_claude_uses_callback_without_reading_or_typing_into_pane(self):
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            state="working", screen="busy screen is intentionally unread")
+        self.assertEqual(rc, 3, line)
+        self.assertIn("verify=native-callback", line)
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(sent, [])
+        schedule.assert_called_once()
+
+    def test_busy_claude_with_native_busy_readiness_stays_callback_owned(self):
+        readiness = SimpleNamespace(state="pending", reason="native-turn-busy")
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            state="working", readiness=readiness)
+        self.assertEqual(rc, 3, line)
+        self.assertIn("verify=native-callback", line)
+        self.assertEqual((row["state"], sent), ("pending", []))
+        schedule.assert_called_once()
+
+    def test_claude_prompt_foreground_proof_requires_sid_pid_birth_and_namespace(self):
+        pid = 424242
+        group = pid
+        info = {"pane_id": "w1:pX", "shell_pid": 123,
+                "foreground_process_group_id": group,
+                "foreground_processes": [{"pid": pid, "argv": ["/usr/bin/claude", "--tui"]}]}
+        fields = ["S", "1", str(group), "0", "0", *(["0"] * 14), "123"]
+        stat = f"{pid} (claude) " + " ".join(fields)
+
+        def prove(*, session_ids=("sid-child", "sid-child"),
+                  starts=("123", "123"),
+                  target_ns="pid:[77]", sender_ns="pid:[77]"):
+            def read_text(path, *args, **kwargs):
+                if str(path) == f"/proc/{pid}/stat":
+                    return stat
+                if str(path) == f"/proc/{pid}/comm":
+                    return "claude\n"
+                raise AssertionError(f"unexpected proc read: {path}")
+            def readlink(path):
+                return sender_ns if str(path) == "/proc/self/ns/pid" else target_ns
+            with mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+                 mock.patch.object(peer_steward.Path, "read_text", autospec=True,
+                                   side_effect=read_text), \
+                 mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=starts), \
+                 mock.patch.object(peer_steward, "_proven_session", side_effect=session_ids), \
+                 mock.patch.object(peer_steward.os, "readlink", side_effect=readlink):
+                return peer_steward._claude_prompt_foreground_proof("w1:pX", "sid-child")
+
+        proof = prove()
+        self.assertEqual(proof, {"pid": pid, "start": "123",
+                                 "pid_namespace": "pid:[77]", "session_id": "sid-child"})
+        self.assertIsNone(prove(session_ids=("sid-child", "different-sid")))
+        self.assertIsNone(prove(starts=("123", "456")))
+        self.assertIsNone(prove(target_ns="pid:[other]"))
+
+    def test_forms_drafts_unknown_boxes_and_blocked_state_never_receive_prompt_input(self):
+        for state, screen in (("idle", CLAUDE_FORM), ("idle", CLAUDE_DRAFT),
+                              ("idle", "screen without a composer"),
+                              ("blocked", CLAUDE_EMPTY)):
+            with self.subTest(state=state, screen=screen[:20]):
+                rc, line, row, sent, _schedule = self._run_claude_prompt(state=state, screen=screen)
+                self.assertEqual(rc, 3, line)
                 self.assertEqual(row["state"], "pending")
-                self.assertEqual(row["to"]["session_id"], "sid-" + harness)
-                self.assertTrue(peer_steward.peer_message.parse_peer_trailer(
-                    row["text"], row["to"], include_ref=True))
+                self.assertEqual(sent, [])
+
+    def test_foreground_birth_change_between_checks_releases_unsent_claim(self):
+        first = {"pid": os.getpid(), "start": "old-start",
+                 "pid_namespace": os.readlink("/proc/self/ns/pid"), "session_id": "sid-child"}
+        changed = {**first, "start": "new-start"}
+        rc, line, row, sent, schedule = self._run_claude_prompt(
+            foregrounds=[first, changed])
+        self.assertEqual(rc, 3, line)
+        self.assertIn("target-process-changed", line)
+        self.assertEqual(row["state"], "pending")
+        self.assertIsNone(row.get("rpc_claim"))
+        self.assertEqual(sent, [])
+        schedule.assert_called_once()
 
     def test_codex_prompt_uses_exact_native_queue_and_never_prompt_typing(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
@@ -2428,9 +2584,11 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         start = source.index("def cmd_prompt(")
         end = source.index("# --- clear:", start)
         prompt = source[start:end]
-        for obsolete in ("_herdr_prompt(", "_prompt_box", "_verify_after_send", "_transcript_arrival",
-                         "_prompt_input_reason", "no_verify"):
+        for obsolete in ("_prompt_box", "_verify_after_send", "_transcript_arrival",
+                         "_prompt_input_reason", "no_verify", "state-flip"):
             self.assertNotIn(obsolete, prompt)
+        self.assertIn("elif t_harness == \"claude\"", prompt)
+        self.assertIn("_claude_idle_prompt_guard", prompt)
         self.assertNotIn("--no-verify", peer_steward.build_parser().format_help())
 
 
@@ -2535,7 +2693,7 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
 
     def run_herdr(self, argv, **kwargs):
         if argv[:3] == ["herdr", "agent", "get"]:
-            return _herdr_json(_agent_json(self.harness, self.sid, "child", status="idle"))
+            return _herdr_json(_agent_json(self.harness, self.sid, "child", status="working"))
         return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
 
     def prompt(self, body="peer body"):

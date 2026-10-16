@@ -791,6 +791,16 @@ receiver's consumption evidence records `received`; completion and acceptance
 remain separate duties. A transport timeout or ambiguous reply retains the
 same transfer reference and its existing owner.
 
+The peer-delivery support matrix is transport-specific: `Claude plain TUI:
+idle -> existing steward prompt delivery; busy -> callback`; Codex uses its
+exact native per-thread queue, and OpenCode uses its native plugin callback.
+Claude's idle prompt path requires the exact native SID, pane, foreground PID
+birth and namespace, native `idle` state, ready registered-work state, no open
+form or question, and an empty visible composer. A dim prompt suggestion is
+empty. Busy, blocked, unknown, form-open, nonempty-draft, or unreadable targets
+stay on the existing callback path and receive no PTY input. Prompt submission
+is only `queued`; the exact receiver ref remains the only peer-delivery receipt.
+
 For Herdr observation, the endpoint is part of identity and cache keys. A
 subscription is established before its snapshot is applied. A successful,
 complete snapshot may confirm pane absence; failed, partial, or timed-out
