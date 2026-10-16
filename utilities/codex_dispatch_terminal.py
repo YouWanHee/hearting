@@ -740,7 +740,7 @@ def _bound_terminal_output(
     else:
         # The one legacy shape without a parent owner is a registered depth-1
         # frame. Its exact sealed route and admitted cycle are its authority.
-        if (worker_type != "frame" or node_id != "frame"
+        if (worker_type != "frame"
                 or str(binding.get("dispatch_depth", "")) != "1"):
             return None, None
         producer_attempt_id = None

@@ -339,13 +339,24 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
         self.assertEqual(marker["evidence"]["path"], str(self.output))
 
     def test_parentless_pre_owner_frames_reconcile_and_complete_live_and_sealed_cycles(self):
+        self._assert_parentless_frame_reconciles_and_completes("frame")
+
+    def test_parentless_alternative_pre_owner_frames_reconcile_and_complete_live_and_sealed_cycles(self):
+        self._assert_parentless_frame_reconciles_and_completes("frame-alternative")
+
+    def _assert_parentless_frame_reconciles_and_completes(self, node_id):
         # This matches the real depth-1 frame shape: route identity is present,
         # but there is no parent owner attempt to bind. Keep the fixture cycle
         # owner-binding-free so route lineage is the only cycle authority.
         self.owner_binding_path.unlink()
-        frame = next(node for node in self.route["nodes"] if node.get("id") == "frame")
+        frame = next(node for node in self.route["nodes"] if node.get("id") == node_id)
         self.assertEqual(frame.get("dispatch_depth"), 1)
         self.assertEqual(frame.get("worker_type"), "frame")
+        relative = f"shards/{node_id}/direction-brief.md"
+        self.assertIn(relative, frame["outputs"])
+        output = Path(self.cycle["cycle_dir"]) / "artifacts" / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("Frame direction\n", encoding="utf-8")
         for phase in ("live", "sealed"):
             if phase == "sealed":
                 self.close(self.route, self.route_file)
@@ -359,16 +370,16 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
                 self.assertIn(sealed.get("status"), {"sealed", "already-sealed"})
 
             for harness in ("claude", "codex", "opencode"):
-                attempt_id = f"att-parentless-{phase}-{harness}"
+                attempt_id = f"att-parentless-{node_id}-{phase}-{harness}"
                 attempt = {key: value for key, value in self.binding.items()
                            if key != "parent_attempt_id"}
                 attempt.update({
                     "attempt_id": attempt_id,
+                    "route_node": node_id,
                     "dispatch_depth": "1",
                     "worker_type": "frame",
                 })
-                log = self._log(harness, "shards/frame/direction-brief.md",
-                                f"{phase}-parentless")
+                log = self._log(harness, relative, f"{node_id}-{phase}-parentless")
                 metadata = {
                     **attempt,
                     "attempt_schema_version": "2",
@@ -404,18 +415,18 @@ class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
                             mock.patch.dict(os.environ, isolated, clear=True):
                         resolved, reason = JOIN.route_completion_evidence(
                             metadata, worktree=str(self.source))
-                        self.assertEqual((resolved, reason), (str(self.output), ""))
+                        self.assertEqual((resolved, reason), (str(output), ""))
                         pipe = ",".join(f"{key}={value}" for key, value in metadata.items())
                         self.jobs.write_text("\t".join([
                             "2026-10-16T00:00:00Z", "open", str(self.source), str(self.source),
-                            "frame", pipe,
+                            node_id, pipe,
                         ]) + "\n", encoding="utf-8")
                         marker, row = PRODUCER_FIXTURE.R.complete_node(
-                            self.route, frame, "frame", Path(resolved), jobs=self.jobs,
+                            self.route, frame, node_id, Path(resolved), jobs=self.jobs,
                             attempt_id=attempt_id,
                         )
                         self.assertEqual(row["status"], "closed")
-                        self.assertEqual(marker["evidence"]["path"], str(self.output))
+                        self.assertEqual(marker["evidence"]["path"], str(output))
 
     def test_ambient_context_cannot_replace_the_attempt_binding_on_reinspection(self):
         for env in (
