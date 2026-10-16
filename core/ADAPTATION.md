@@ -20,6 +20,26 @@ Every file in this repo must fall into one category.
 | Continuity state | Cross-project agent worklog/notes data that survives sessions but is not harness source. | `<agent-notes-root>/cards`, `_layer2`, `_triage`, `digests`, `oncall`, `study` | Never committed to this repo; may be versioned in a separate notes/data repo |
 | Local board app state | Worklog-board local app workspace, generated output, DB/cache, dispatch logs, and worktrees. | `<worklog-board-app>/.cache`, `.next`, `.dispatch`, `.env*`, `node_modules`, `<worklog-board-app>-wt/` | Never committed to this repo |
 
+For registered Claude workers, configuration and authentication have separate
+owners: the masked `CLAUDE_CONFIG_DIR` keeps worker settings isolated, while
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` points each same-account process at the
+runtime's shared native credential store and refresh lock. The shared builder
+preserves explicit secure-storage overrides, including an empty value. A
+legacy credential file found only in a worker home is not proof that it belongs
+to the current account or is newer than the main login; it must not replace the
+main store without supported identity and ordering evidence. Such a file stays
+in place and is never used as an authentication source: when a marked legacy
+Claude worker has no recorded main-store origin or intact credential link, new
+launches from it use the source config home its builder recorded in that
+worker's launch environment, or the default `HOME/.claude` store; a legacy
+worker built from a separate custom-account config is resolved only through
+that recorded environment. A legacy
+process already running on a split file keeps its stale token until it exits.
+Account metadata projection follows Claude Code's resolved global config file
+and copies only `oauthAccount` into the masked child config. Existing processes
+retain the environment they started with, so transition limits are reported
+from observed runtime behavior.
+
 Project files and adapter runtime state need not share a filesystem. If a
 child runtime requires user-owned state but the project filesystem maps
 runtime directories to a different UID, its adapter uses the existing canonical

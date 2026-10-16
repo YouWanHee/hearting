@@ -81,7 +81,7 @@ class _TmpRootMixin:
         os.environ.pop("AGENT_HERDR_SESSION", None)
         self._old_herdr_session = peer_steward._HERDR_SESSION
         peer_steward._HERDR_SESSION = None
-        runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner_patch = mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False)
         runner_patch.start()
         self.addCleanup(runner_patch.stop)
         # Existing peer tests use already admitted fixture panes. The shared
@@ -2053,6 +2053,65 @@ def _agent_json(harness, sid, name, status="idle"):
         "agent_session": ({"agent": harness, "kind": "id", "value": sid} if sid else None)}}}
 
 
+class PeerReferenceAccessEvidenceTest(_TmpRootMixin, unittest.TestCase):
+    def test_exact_local_codex_session_uses_declared_read_scope_evidence(self):
+        target = {"harness": "codex", "session_id": "thread-exact", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "1", "argv": ["codex", "--resume"]}
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", target, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_foreground", return_value=foreground), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            evidence = peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "thread-exact", "w1:pX")
+        self.assertEqual(evidence["recipient"], {
+            "harness": "codex", "session_id": "thread-exact", "pane_id": "w1:pX"})
+        self.assertEqual(evidence["local_process"]["pid"], os.getpid())
+        self.assertEqual(evidence["local_process"]["pid_namespace"],
+                         os.readlink(f"/proc/{os.getpid()}/ns/pid"))
+        self.assertEqual(evidence["schema"], "peer-read-access-observation-v1")
+
+    def test_proven_ordinary_codex_recipient_keeps_reference_presentation(self):
+        target = {"harness": "codex", "session_id": "thread-exact", "pane": "w1:pX"}
+        foreground = {"pid": os.getpid(), "start": "1", "argv": ["codex", "--resume"]}
+        body = "[steer] normal supported delivery\n" + "evidence " * 300 + "\nlast condition: retain phase"
+        with mock.patch.object(peer_steward, "_retire_target",
+                               return_value=("idle", target, 0, None)), \
+             mock.patch.object(peer_steward, "_retire_foreground", return_value=foreground), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            evidence = peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "thread-exact", "w1:pX")
+            text, ref = peer_steward.peer_message.prepare_peer_message(
+                body, {"harness": "claude", "session_id": "sender"},
+                {"harness": "codex", "session_id": "thread-exact"},
+                defer=True, reference_evidence=evidence)
+        self.assertLess(len(text.encode("utf-8")), 1024)
+        self.assertNotIn("last condition", text)
+        self.assertEqual(peer_steward.peer_message.read_peer_payload(ref)["body"], body)
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["to"]["session_id"], "thread-exact")
+
+    def test_unknown_sidless_other_runtime_and_changed_session_fail_conservative(self):
+        with mock.patch.object(peer_steward, "_retire_target") as target:
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "fresh-pane", "codex", None, "w1:pX"))
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "claude-pane", "claude", "claude-session", "w1:pX"))
+        target.assert_not_called()
+
+        replies = iter((
+            ("idle", {"harness": "codex", "session_id": "old-thread", "pane": "w1:pX"}, 0, None),
+            ("idle", {"harness": "codex", "session_id": "replacement", "pane": "w1:pX"}, 0, None),
+        ))
+        with mock.patch.object(peer_steward, "_retire_target", side_effect=lambda _target: next(replies)), \
+             mock.patch.object(peer_steward, "_retire_foreground",
+                               return_value={"pid": os.getpid(), "start": "1", "argv": ["codex"]}), \
+             mock.patch.object(peer_steward.peer_message, "_reference_local_process_matches",
+                               return_value=True):
+            self.assertIsNone(peer_steward._peer_reference_access_evidence(
+                "codex-pane", "codex", "old-thread", "w1:pX"))
+
+
 class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
     """F-100c — the steward send is `prompt`: herdr resolves the target's exact session
     id, the sender's registry name rides the record, and the body gets the trailer."""
@@ -2068,7 +2127,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         patch = mock.patch.object(peer_steward, "_read_screen", return_value=empty)
         patch.start()
         self.addCleanup(patch.stop)
-        runner = mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False)
+        runner = mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False)
         runner.start()
         self.addCleanup(runner.stop)
 
@@ -2959,6 +3018,71 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         batches.assert_called_once_with()
 
 
+class NormalProducerRunnerBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.state = self.base / "state"
+        self.jobs = self.base / "dispatch" / "jobs.log"
+        self.env = {"AGENT_PEER_LEDGER_ROOT": str(self.state),
+                    "AGENT_DISPATCH_JOBS": str(self.jobs),
+                    "HOME": str(self.base / "home")}
+        Path(self.env["HOME"]).mkdir()
+        patch = mock.patch.dict(os.environ, self.env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _exact_retire(self):
+        return {"server": "default", "pane": "fixture-pane", "harness": "codex",
+                "session_id": "sid-retire", "name": "retire-target",
+                "foreground": {"pid": 123, "start": "456"}}
+
+    def test_message_and_delay_producers_use_the_shared_binding_helper(self):
+        sender = {"harness": "claude", "session_id": "sid-sender", "name": "sender"}
+        recipient = {"harness": "codex", "session_id": "sid-recipient", "name": "recipient"}
+        message = {"ref": "a" * 32, "body_sha256": "b" * 64,
+                   "from": sender, "to": recipient, "refs": []}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            duty = peer_steward._schedule_message_obligation(message, "recipient", "fixture-pane")
+            self.assertIsNotNone(duty)
+            ensure.assert_called_once_with()
+
+        delay_row = {"ref": "c" * 32, "created": time.time(), "refs": [],
+                     "from": sender, "to": recipient}
+        prepared = {"ref": "d" * 32, "body_sha256": "e" * 64,
+                    "from": recipient, "to": sender, "refs": ["delay-notice:" + delay_row["ref"]]}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure, \
+             mock.patch.object(peer_steward.peer_message, "prepare_peer_message",
+                               return_value=("fixture text", prepared["ref"])), \
+             mock.patch.object(peer_steward.peer_message, "_read_pending",
+                               return_value=prepared):
+            duty = peer_steward._ensure_sender_delay_notice(delay_row)
+            self.assertIsNotNone(duty)
+            self.assertEqual(ensure.call_count, 2)
+
+    def test_retire_and_handoff_retire_producers_use_the_shared_binding_helper(self):
+        exact = self._exact_retire()
+        requester = {"session_id": "sid-requester", "harness": "codex",
+                     "pane": "requester-pane", "server": "default"}
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            _store, duty = peer_steward._retire_request(
+                "retire-target", exact, requester=requester)
+            self.assertEqual(duty["intent"]["identity"], exact)
+            ensure.assert_called_once_with()
+
+        with mock.patch.object(peer_steward.peer_obligations,
+                               "ensure_normal_runner") as ensure:
+            handoff_exact = {**exact, "pane": "handoff-pane"}
+            duty_id = peer_steward.reserve_handoff_retire(
+                "handoff-target", handoff_exact, requester)
+            self.assertTrue(duty_id.startswith("retire-"))
+            self.assertEqual(ensure.call_count, 2)
+
+
 class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
     """Actual 0.8 CLI/screen fixtures: user input survives; exact payload goes once."""
 
@@ -2996,6 +3120,22 @@ class PromptDraftGuardTest(_TmpRootMixin, unittest.TestCase):
 
     def prompt(self, body="peer body"):
         return peer_steward.main(["prompt", "child", body])
+
+    def test_unknown_model_read_scope_keeps_body_file_inline_without_losing_tail(self):
+        body = ("[steer] exact body-file input\r\n" + "line detail with English and 한글 " * 120
+                + "\r\n실행하지 말 것\r\nSTFT 크기 하한 1e-5·위상 유지  \r\n")
+        path = self.tmp_root / "peer-body.txt"
+        path.write_bytes(body.encode("utf-8"))
+
+        self.assertEqual(peer_steward.main(["prompt", "child", "--body-file", str(path)]), 0)
+        self.assertEqual(len(self.messages), 1)
+        wire = self.messages[0]
+        self.assertIn(body, wire)
+        self.assertIn("STFT 크기 하한 1e-5·위상 유지", wire)
+        transfer = peer_steward.peer_message.parse_peer_trailer(
+            wire, {"harness": "claude", "session_id": self.sid}, include_ref=True)
+        self.assertIsNotNone(transfer.get("transfer_ref"))
+        self.assertIsNone(peer_steward.peer_message.read_peer_payload(transfer["transfer_ref"]))
 
     def test_idle_parent_prompt_with_pending_or_unknown_children_accepts_input(self):
         from dispatch_contract import ObservedAttemptLiveness
@@ -5176,7 +5316,10 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                             self.retire(world, clear_existing=False, resume_request_id=duty_id)
                     return stale
                 with mock.patch.object(peer_steward, "_pane_readiness", side_effect=readiness):
-                    self._run_retire_runner(world, crash_phase="checkpoint")
+                    if exits:
+                        self._run_retire_runner(world)
+                    else:
+                        self._run_retire_runner(world, crash_phase="checkpoint")
                 duty = store.get(duty_id)
                 if exits:
                     self.assertEqual((duty["state"], duty["observation"]["phase"]), ("complete", "complete"))
@@ -5254,7 +5397,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
              mock.patch.object(peer_steward, "_retire_process_record", return_value=(record if record is not None else
                               {"start": "800", "group": 4242, "argv": [world.harness]})), \
              mock.patch.object(peer_steward, "_proc_start_ticks", side_effect=lambda pid: "700" if pid == 101 else "800"), \
-             mock.patch.object(peer_steward.peer_obligations, "ensure_runner", return_value=False), \
+             mock.patch.object(peer_steward.peer_obligations, "ensure_normal_runner", return_value=False), \
              mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
              mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
              mock.patch.object(peer_steward.time, "sleep"), \
@@ -6144,7 +6287,12 @@ class ClosedParentNativeHandoverTest(_TmpRootMixin, unittest.TestCase):
         ledger = self.tidy._ledger_path(self.seat).read_bytes()
         row = json.loads(ledger)
         self.assertEqual({b["attempt"] for b in row["bindings"]}, {m["attempt_id"] for _, m in self.rows[:3]})
-        self.assertEqual(len(self.handover.read_snapshot(self.seat.key)["bindings"]), 1)
+        snapshot_bindings = self.handover.read_snapshot(self.seat.key)["bindings"]
+        self.assertEqual(len(snapshot_bindings), 3)
+        expected = {(meta["attempt_id"], meta["parent_sid"]) for _, meta in self.rows[:3]}
+        self.assertEqual({(binding["attempt"], binding["parent"]) for binding in snapshot_bindings}, expected)
+        current = self.handover.current_bindings("opencode", self.SUCCESSOR, self.jobs_path)
+        self.assertTrue(all(binding in current for binding in row["bindings"]))
         self.replay()
         self.assertEqual(self.tidy._ledger_path(self.seat).read_bytes(), ledger)
         self.assertEqual(self.protected(), before)

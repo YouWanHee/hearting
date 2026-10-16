@@ -423,6 +423,17 @@ def materialize_after_terminal_close(jobs: Path, attempt_id: str) -> Path | None
             settlement = settle_owner_completion(jobs, row.status, row.metadata)
             if settlement is not None and settlement.result != "completed":
                 return None
+        # A resultless-death recovery claim is durable controller work. Publish
+        # it before the immutable terminal notice becomes visible to carriers;
+        # the carrier still waits for a launched successor or a settled failure.
+        try:
+            from dispatch_replacement import accept_terminal_delivery_duty
+            accept_terminal_delivery_duty(jobs, attempt_id)
+        except (DispatchContractError, pending_delivery.PendingDeliveryError,
+                OSError, ValueError, RuntimeError) as exc:
+            sys.stderr.write(
+                f"replacement-duty-not-accepted attempt_id={attempt_id} reason={exc}\n"
+            )
         return materialize_pending_delivery(jobs, row.raw.split("\t"))
     except (JoinContractError, pending_delivery.PendingDeliveryError, OSError, ImportError) as exc:
         sys.stderr.write(
@@ -912,7 +923,8 @@ def settle_open_pass(jobs: Path, attempt_id: str) -> bool:
     from route_authority import decide_continuation
     process = attempt_process_quiescence(metadata)
     terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=_row_worktree(row),
-        artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata)
     choice = decide_continuation(action="stage-settlement", status=row.status, metadata=metadata,
         facts={"process": process, "terminal": terminal})
     if not choice.allowed:
@@ -3806,7 +3818,8 @@ def route_completion_evidence(
 
     if terminal is None:
         terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=worktree,
-            artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+            artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"),
+            artifact_binding=metadata)
     from route_authority import decide_continuation
     choice = decision or decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
     if not choice.allowed:
@@ -4071,6 +4084,7 @@ def classify_exact_route_free_review_outcome(
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
         worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata,
     )
     from route_authority import decide_continuation
     choice = decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
@@ -4220,6 +4234,7 @@ def close_finished_child(
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
         worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata,
     )
     if correct_recorded_move and (
         terminal.get("state") != "valid"

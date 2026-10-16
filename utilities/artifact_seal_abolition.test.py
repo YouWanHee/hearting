@@ -1532,6 +1532,135 @@ class B1RefreshTest(B1RefreshBase):
         self.assertEqual(self.refresh(opened)["reason"], "cycle-not-closed")
         self.assertEqual(P.refresh_cycle(self.root, "cyc_" + "5" * 32)["reason"], "cycle-unknown")
 
+    def test_b1_finalize_full_refresh_collects_root_support_without_rewriting_prior_proofs(self):
+        result = self.closed("b1-root-support-full", {"plans/cycle/plan.md": b"plan\n"})
+        cycle = Path(result["cycle_dir"])
+        original = self.manifest_path(result).read_bytes()
+        before = json.loads(original)
+        before_snapshots = {
+            path.name: path.read_bytes()
+            for path in L.manifest_snapshot_dir(self.root, result["cycle_id"]).iterdir()
+        }
+        root_support = cycle / "_internal/reviews/manifest.json"
+        artifact_support = cycle / "artifacts/_internal/reviews/manifest.json"
+        large_binary = cycle / "_internal/reviews/model.bin"
+        for path, data in (
+                (root_support, b'{"root":"first"}\n'),
+                (artifact_support, b'{"artifacts":"same basename"}\n')):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        large_binary.parent.mkdir(parents=True, exist_ok=True)
+        large_binary.write_bytes(bytes(range(256)) * 8192)
+        first = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(first["refreshed"], first)
+        document = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        old_snapshots = {path.name: path.read_bytes()
+                         for path in L.manifest_snapshot_dir(self.root, result["cycle_id"]).iterdir()}
+        for name, raw in before_snapshots.items():
+            self.assertEqual(old_snapshots[name], raw)
+        rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        self.assertEqual(rows["_internal/reviews/manifest.json"]["content_digest"],
+                         "sha256:" + hashlib.sha256(root_support.read_bytes()).hexdigest())
+        self.assertEqual(rows["_internal/reviews/model.bin"]["byte_size"], large_binary.stat().st_size)
+        self.assertNotEqual(rows["_internal/reviews/manifest.json"]["artifact_id"],
+                            rows["artifacts/_internal/reviews/manifest.json"]["artifact_id"])
+        artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+        self.assertEqual(artifacts[rows["_internal/reviews/manifest.json"]["artifact_id"]]["role"], "support")
+        self.assertEqual(document["cycle"], before["cycle"])
+        self.assertEqual(document["routes"], before["routes"])
+        self.assertEqual(L.verify_artifact_revisions(document, cycle), ())
+
+        root_support.write_bytes(b'{"root":"changed"}\n')
+        changed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertTrue(changed["refreshed"], changed)
+        final = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        final_rows = {row["locator"]["path"]: row for row in final["artifact_revisions"]}
+        self.assertEqual(final_rows["_internal/reviews/manifest.json"]["artifact_id"],
+                         rows["_internal/reviews/manifest.json"]["artifact_id"])
+        self.assertNotEqual(final_rows["_internal/reviews/manifest.json"]["artifact_revision_id"],
+                            rows["_internal/reviews/manifest.json"]["artifact_revision_id"])
+        self.assertEqual(L.verify_artifact_revisions(final, cycle), ())
+
+    def test_b1_bounded_refresh_converges_from_prefixless_cursor_across_both_roots(self):
+        self.activate()
+        route, route_file = self.route(slug="b1-root-support-bounded", campaign_key="b1-root-support-bounded")
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code", intensity="direct")
+        first_artifact = self.write_output(result, "plans/cycle/a.md", b"a\n")
+        second_artifact = self.write_output(result, "plans/cycle/b.md", b"b\n")
+        cycle = Path(result["cycle_dir"])
+        root_support = cycle / "_internal/reviews/manifest.json"
+        artifact_support = cycle / "artifacts/_internal/reviews/manifest.json"
+        binary_support = cycle / "_internal/reviews/model.bin"
+        for path, data in (
+                (root_support, b'{"root":"initial"}\n'),
+                (artifact_support, b'{"artifacts":"same basename"}\n')):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        binary_support.parent.mkdir(parents=True, exist_ok=True)
+        binary_support.write_bytes(b"b" * (2 * 1024 * 1024))
+        self.close(route, route_file)
+        P.finalize(self.root, cycle_id=result["cycle_id"])
+        original = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        original_rows = {row["locator"]["path"]: row for row in original["artifact_revisions"]}
+        before_snapshots = {path.name: path.read_bytes()
+                            for path in L.manifest_snapshot_dir(self.root, result["cycle_id"]).iterdir()}
+
+        # A prior bounded refresh persisted a prefixless cursor in artifacts and
+        # had already observed the first file. Resume that state after later edits.
+        old_stat = first_artifact.stat()
+        old_digest = "sha256:" + hashlib.sha256(first_artifact.read_bytes()).hexdigest()
+        P._write_refresh_state(
+            self.root, result["cycle_id"], cursor="plans/cycle/a.md",
+            files={"artifacts/plans/cycle/a.md": [old_stat.st_size, old_stat.st_mtime_ns,
+                                                   old_stat.st_ino, old_digest]},
+            observed_at=1.0,
+        )
+        first_artifact.unlink()
+        second_artifact.write_bytes(b"b modified\n")
+        root_support.write_bytes(b'{"root":"modified"}\n')
+        new_support = cycle / "_internal/reviews/new.txt"
+        new_support.write_bytes(b"new support\n")
+
+        partial = self.refresh(result, budget=P.RefreshBudget(max_walk_entries=1))
+        self.assertFalse(partial["complete"], partial)
+        self.assertTrue(any(row["locator"]["path"] == "_internal/reviews/manifest.json"
+                            for row in json.loads(self.manifest_path(result).read_text())["artifact_revisions"]))
+
+        removed = list(partial.get("changes", {}).get("removed", []))
+        runs = 0
+        while True:
+            runs += 1
+            observed = self.refresh(result, budget=P.RefreshBudget(
+                max_walk_entries=8, max_hash_bytes=1024 * 1024))
+            removed.extend(observed.get("changes", {}).get("removed", []))
+            if observed.get("complete"):
+                break
+            self.assertLess(runs, 40, observed)
+        self.assertIn("artifacts/plans/cycle/a.md", removed)
+        document = json.loads(self.manifest_path(result).read_text(encoding="utf-8"))
+        rows = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        self.assertNotIn("artifacts/plans/cycle/a.md", rows)
+        self.assertEqual(rows["artifacts/plans/cycle/b.md"]["artifact_id"],
+                         original_rows["artifacts/plans/cycle/b.md"]["artifact_id"])
+        self.assertNotEqual(rows["artifacts/plans/cycle/b.md"]["artifact_revision_id"],
+                            original_rows["artifacts/plans/cycle/b.md"]["artifact_revision_id"])
+        self.assertEqual(rows["_internal/reviews/manifest.json"]["artifact_id"],
+                         original_rows["_internal/reviews/manifest.json"]["artifact_id"])
+        self.assertNotEqual(rows["_internal/reviews/manifest.json"]["artifact_revision_id"],
+                            original_rows["_internal/reviews/manifest.json"]["artifact_revision_id"])
+        self.assertEqual(rows["_internal/reviews/new.txt"]["content_digest"],
+                         "sha256:" + hashlib.sha256(new_support.read_bytes()).hexdigest())
+        self.assertEqual(rows["_internal/reviews/model.bin"]["byte_size"], binary_support.stat().st_size)
+        self.assertNotEqual(rows["_internal/reviews/manifest.json"]["artifact_id"],
+                            rows["artifacts/_internal/reviews/manifest.json"]["artifact_id"])
+        self.assertEqual(document["cycle"], original["cycle"])
+        self.assertEqual(document["routes"], original["routes"])
+        snapshots = {path.name: path.read_bytes()
+                     for path in L.manifest_snapshot_dir(self.root, result["cycle_id"]).iterdir()}
+        for name, raw in before_snapshots.items():
+            self.assertEqual(snapshots[name], raw)
+        self.assertEqual(L.verify_artifact_revisions(document, cycle), ())
+
     # -- budget (D-124 "비용 예산") ----------------------------------------
     def test_b1_walk_budget_leaves_a_cursor_and_never_reads_the_rest_as_deleted(self):
         files = {f"plans/cycle/f{i:02d}.md": f"f{i}\n".encode() for i in range(30)}

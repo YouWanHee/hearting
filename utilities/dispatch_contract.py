@@ -6880,7 +6880,7 @@ def _frame_capacity_failures(route: dict, lines: list[str], harnesses: set[str])
         if attempt_process_quiescence(meta, terminal_receipt=True).state != "quiescent":
             continue
         terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
-            artifact_root_metadata=meta.get("artifact_root"))
+            artifact_root_metadata=meta.get("artifact_root"), artifact_binding=meta)
         if terminal.get("failure_class") == "capacity":
             unavailable[harness] = meta["attempt_id"]
     return unavailable
@@ -7774,7 +7774,8 @@ def review_self_disposition_subject(route, node, prior, marker_path, *, jobs, au
         raise ValueError("review-self-disposition-subject-superseded")
     from codex_dispatch_terminal import inspect_terminal_attempt
     terminal = inspect_terminal_attempt(meta.get("log_file"), worktree=fields[3],
-                    artifact_root_metadata=meta.get("artifact_root"), worker_type="review")
+                    artifact_root_metadata=meta.get("artifact_root"), worker_type="review",
+                    artifact_binding=meta)
     if (terminal.get("state") != "valid" or terminal.get("verdict") not in {"PASS", "BLOCKED"}
             or terminal.get("artifact_state") != "readable" or terminal.get("review_verdict_conflict")):
         raise ValueError("review-self-disposition-terminal-unverified")
@@ -8498,7 +8499,8 @@ def observe_terminal_review_failure(
         raise ValueError("terminal-review-not-quiescent")
     terminal = inspect_terminal_attempt(
         metadata.get("log_file"), worktree=fields[3],
-        artifact_root_metadata=metadata.get("artifact_root"), worker_type="review")
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type="review",
+        artifact_binding=metadata)
     if (terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL"
             or terminal.get("artifact_state") != "readable"
             or terminal.get("failure_note") != "completed-review-blocking"

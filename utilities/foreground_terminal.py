@@ -25,6 +25,7 @@ shared:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from codex_dispatch_terminal import ARTIFACT_HINT_KEYS, REVIEW_BLOCKING_NOTE, inspect_terminal_attempt
@@ -71,8 +72,21 @@ def settle_foreground_exit(jobs, attempt_id: str | None, log_path, outcome, *, w
     """
     from dispatch_completion_join import materialize_after_terminal_close
 
+    artifact_binding = None
+    if attempt_id:
+        try:
+            from dispatch_completion_join import exact_attempt_row
+            row = exact_attempt_row(Path(jobs), attempt_id)
+            metadata = row.metadata
+            recorded_log = metadata.get("log_file")
+            if (recorded_log and metadata.get("worker_type") == worker_type
+                    and Path(recorded_log).resolve(strict=False) == Path(log_path).resolve(strict=False)):
+                artifact_binding = metadata
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            artifact_binding = None
     terminal = inspect_terminal_attempt(log_path, worktree=worktree,
-                                        artifact_root_metadata=artifact_root, worker_type=worker_type)
+                                        artifact_root_metadata=artifact_root, worker_type=worker_type,
+                                        artifact_binding=artifact_binding)
     valid = terminal.get("state") == "valid"
     note = terminal.get("failure_note", "") if valid else ""
     if outcome.failure:

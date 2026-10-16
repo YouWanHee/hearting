@@ -2823,6 +2823,20 @@ def _browser_profile(parts: Sequence[str], *, directory: bool = False) -> bool:
     ))
 
 
+def _payload_root(rel: str) -> Optional[str]:
+    """Return the exact legal payload subtree for a non-empty cycle-relative locator."""
+    root, separator, tail = rel.partition("/")
+    return root if separator and tail and root in {"artifacts", "_internal"} else None
+
+
+def _is_cycle_root_support(rel: str) -> bool:
+    return _payload_root(rel) == "_internal"
+
+
+def _payload_inner(rel: str) -> str:
+    return rel[len("artifacts/"):] if rel.startswith("artifacts/") else rel
+
+
 def _outside_inclusion_rule(rel: str) -> bool:
     """§45 D-123's one inclusion rule: what a cycle's manifest never lists.
 
@@ -2881,17 +2895,19 @@ def _output_paths(directory: Path, *, exclude_hidden: bool = False,
             if excluded_symlinks is not None:
                 excluded_symlinks.append(rel)
             continue
-        if rel.startswith("artifacts/") and _outside_inclusion_rule(rel):
+        payload_root = _payload_root(rel)
+        if payload_root is not None and _outside_inclusion_rule(rel):
             if excluded is not None:
                 excluded.append(rel)
             continue
         if not entry.is_file():
             violations.append(f"non-regular-file:{rel}")
             continue
-        if not rel.startswith("artifacts/"):
+        if payload_root is None:
             violations.append(f"file-outside-artifacts:{rel}")
             continue
-        if exclude_hidden and _unmanifestable_reason(rel) is not None:
+        if (exclude_hidden and payload_root == "artifacts"
+                and _unmanifestable_reason(rel) is not None):
             if excluded is not None:
                 excluded.append(rel)
             continue
@@ -3407,7 +3423,10 @@ def _choose_primary(rows: Sequence[Tuple[str, bytes]], primary: Optional[str],
                 f"{primary} (expected a cycle-relative path under artifacts/; cycle outputs: {shown or 'none'})",
             )
         return candidate
-    durable = [rel for rel in names if not _is_support_locator(rel)] or names
+    primary_names = [rel for rel in names if not _is_cycle_root_support(rel)]
+    if not primary_names:
+        return None
+    durable = [rel for rel in primary_names if not _is_support_locator(rel)] or primary_names
     official = official_spec_primary(route or {}, durable)
     if official is not None:
         return official
@@ -3573,13 +3592,15 @@ def build_manifest(
         same = reserved.revision_for(rel, digest) if reserved is not None else None
         arev_id = same.artifact_revision_id if same else allocator.allocate("artifact_revision")
         revision_provenance = provenance(digest, same.recorded_in if same else None)
-        inner = rel[len("artifacts/"):]
+        inner = _payload_inner(rel)
+        root_support = _is_cycle_root_support(rel)
         bundle = (bundle_metadata or {}).get(rel)
         artifacts.append({
             "artifact_id": art_id, "cycle_id": record["cycle_id"],
-            "role": "support" if rel in support_rels else ("primary" if rel == primary_rel else "output"),
-            "type": bundle.get("type") if bundle else _bucket_type(inner),
-            "capability": record["capability"], "title": bundle.get("title", inner) if bundle else inner,
+            "role": "support" if rel in support_rels or root_support else ("primary" if rel == primary_rel else "output"),
+            "type": bundle.get("type") if bundle else ("file" if root_support else _bucket_type(inner)),
+            "capability": record["capability"],
+            "title": bundle.get("title", inner) if bundle else (rel if root_support else inner),
         })
         revisions.append({
             "artifact_revision_id": arev_id, "artifact_id": art_id, "revision_sequence": 1,
@@ -3668,7 +3689,7 @@ def build_manifest(
                 "route_id": record["route_id"], "route_hash": record["route_hash"],
                 "capability": record["capability"], "intensity": record["intensity"],
             })),
-            "outcome_criterion": {"required_artifact_roles": ["primary"] if facts else [], "decision_required": False},
+            "outcome_criterion": {"required_artifact_roles": ["primary"] if primary_rel is not None else [], "decision_required": False},
             "state": cycle_state,
         },
         "artifacts": artifacts, "artifact_revisions": revisions,
@@ -4104,62 +4125,70 @@ def _checkpoint_scan(directory: Path, previous: Mapping[str, Any], limits: Check
     if not artifacts.is_dir() or artifacts.is_symlink():
         return {"skip": "artifacts-dir-missing"}
     excluded = {"hidden": 0, "binary": 0, "oversize": 0, "non-regular": 0, "invalid-locator": 0}
+    payload_roots = [("artifacts", artifacts)]
+    internal = directory / "_internal"
+    if internal.is_symlink():
+        # A support-root link is reported without following its target.
+        excluded["non-regular"] += 1
+    elif internal.is_dir():
+        payload_roots.append(("_internal", internal))
     candidates: List[Tuple[str, str, os.stat_result]] = []
     visited = total = 0
     newest = 0.0
-    for current, dirs, files in os.walk(str(artifacts), followlinks=False):
-        kept_dirs = []
-        for name in sorted(dirs):
-            if name == "raw-results":
-                if os.path.islink(os.path.join(current, name)):
+    for payload_root, top in payload_roots:
+        for current, dirs, files in os.walk(str(top), followlinks=False):
+            kept_dirs = []
+            for name in sorted(dirs):
+                if payload_root == "artifacts" and name == "raw-results":
+                    if os.path.islink(os.path.join(current, name)):
+                        excluded["non-regular"] += 1
+                    continue  # §47 pruning applies only to artifacts raw-results
+                if name.startswith("."):
+                    excluded["hidden"] += 1
+                elif os.path.islink(os.path.join(current, name)):
                     excluded["non-regular"] += 1
-                continue  # prune before any contained file consumes visit or byte limits
-            if name.startswith("."):
-                excluded["hidden"] += 1
-            elif os.path.islink(os.path.join(current, name)):
-                excluded["non-regular"] += 1
-            else:
-                kept_dirs.append(name)
-        dirs[:] = kept_dirs
-        for name in sorted(files):
-            path = os.path.join(current, name)
-            rel = Path(path).relative_to(directory).as_posix()
-            if rel in excluded_paths:
-                continue
-            visited += 1
-            if visited > limits.max_walk_entries:
-                return {"skip": "walk-limit", "visited": visited}
-            try:
-                info = os.lstat(path)
-            except OSError:
-                excluded["non-regular"] += 1
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                excluded["non-regular"] += 1
-                continue
-            newest = max(newest, info.st_mtime)
-            if name.startswith("."):
-                excluded["hidden"] += 1
-                continue
-            if os.path.splitext(name)[1].lower() in CHECKPOINT_EXCLUDED_SUFFIXES:
-                excluded["binary"] += 1
-                continue
-            if info.st_size > limits.max_file_bytes:
-                excluded["oversize"] += 1
-                continue
-            locator = artifact_manifest.validate_locator_path(rel)
-            if not locator.ok:
-                excluded["invalid-locator"] += 1
-                reason = locator.violations[0].code
-                reasons = excluded.setdefault("invalid-locator-reasons", {})
-                reasons[reason] = reasons.get(reason, 0) + 1
-                continue
-            candidates.append((rel, path, info))
-            total += info.st_size
-            if len(candidates) > limits.max_files:
-                return {"skip": "file-count-limit", "files": len(candidates)}
-            if total > limits.max_total_bytes:
-                return {"skip": "byte-size-limit", "bytes": total}
+                else:
+                    kept_dirs.append(name)
+            dirs[:] = kept_dirs
+            for name in sorted(files):
+                path = os.path.join(current, name)
+                rel = Path(path).relative_to(directory).as_posix()
+                if rel in excluded_paths:
+                    continue
+                visited += 1
+                if visited > limits.max_walk_entries:
+                    return {"skip": "walk-limit", "visited": visited}
+                try:
+                    info = os.lstat(path)
+                except OSError:
+                    excluded["non-regular"] += 1
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    excluded["non-regular"] += 1
+                    continue
+                newest = max(newest, info.st_mtime)
+                if name.startswith("."):
+                    excluded["hidden"] += 1
+                    continue
+                if os.path.splitext(name)[1].lower() in CHECKPOINT_EXCLUDED_SUFFIXES:
+                    excluded["binary"] += 1
+                    continue
+                if info.st_size > limits.max_file_bytes:
+                    excluded["oversize"] += 1
+                    continue
+                locator = artifact_manifest.validate_locator_path(rel)
+                if not locator.ok:
+                    excluded["invalid-locator"] += 1
+                    reason = locator.violations[0].code
+                    reasons = excluded.setdefault("invalid-locator-reasons", {})
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    continue
+                candidates.append((rel, path, info))
+                total += info.st_size
+                if len(candidates) > limits.max_files:
+                    return {"skip": "file-count-limit", "files": len(candidates)}
+                if total > limits.max_total_bytes:
+                    return {"skip": "byte-size-limit", "bytes": total}
     facts: List[Tuple[str, str, int]] = []
     stats: Dict[str, List[Any]] = {}
     for rel, path, info in sorted(candidates):
@@ -5863,7 +5892,7 @@ def _scan_cycle_facts(directory: Path, *, excluded: List[str],
     bundle_directories = _manifest_bundle_directories(document) if isinstance(document, Mapping) else set()
     for entry in _walk_files(directory):
         rel = entry.relative_to(directory).as_posix()
-        if rel == artifact_locator.CYCLE_BINDING or not rel.startswith("artifacts/"):
+        if rel == artifact_locator.CYCLE_BINDING or _payload_root(rel) is None:
             continue
         if any(rel.startswith(path + "/") for path in bundle_directories):
             continue
@@ -5956,9 +5985,12 @@ def _refreshed_document(root: Path, record: Mapping[str, Any], document: Mapping
     for rel in changes["added"]:
         digest, size = present[rel]
         artifact_id = allocator.allocate("artifact")
-        inner = rel[len("artifacts/"):]
-        artifacts.append({"artifact_id": artifact_id, "cycle_id": record["cycle_id"], "role": "output",
-                          "type": _bucket_type(inner), "capability": record["capability"], "title": inner})
+        inner = _payload_inner(rel)
+        root_support = _is_cycle_root_support(rel)
+        artifacts.append({"artifact_id": artifact_id, "cycle_id": record["cycle_id"],
+                          "role": "support" if root_support else "output",
+                          "type": "file" if root_support else _bucket_type(inner),
+                          "capability": record["capability"], "title": rel if root_support else inner})
         revisions.append({
             "artifact_revision_id": allocator.allocate("artifact_revision"), "artifact_id": artifact_id,
             "revision_sequence": 1, "content_digest": digest, "byte_size": size, "media_type": _media_type(rel),
@@ -6775,77 +6807,102 @@ def _walk_sorted(top: str, prefix: Tuple[str, ...], after: Optional[Tuple[str, .
 
 def _bounded_scan(directory: Path, *, cursor: Optional[str], known: Mapping[str, Sequence[Any]],
                   budget: RefreshBudget) -> _RefreshScan:
-    """Walk a closed cycle's `artifacts/` with no lock and read what the budget allows.
+    """Walk both exact cycle payload roots without a lock, within one shared budget.
 
-    The same inclusion rule as the close (`_outside_inclusion_rule`, symbolic
-    links by `lstat`).  A file whose fingerprint matches `known` is not read; any
-    other is hashed in chunks, and a file that moves while it is read is left out
-    of this run.  The budget is looked at between entries; the run stops with a
-    cursor naming the last entry it finished."""
+    Resume positions and file facts use full cycle-relative locators. Older
+    prefixless cursors are interpreted as artifacts-relative; invalid cursors
+    restart this observation from the top so they cannot skip support files.
+    §47 bundle pruning remains limited to artifacts raw-results.
+    """
     artifacts = directory / "artifacts"
     if not artifacts.is_dir() or artifacts.is_symlink():
         raise ProducerError("artifacts-dir-missing", str(artifacts))
-    after = tuple(cursor.split("/")) if cursor else None
+    roots = [("artifacts", artifacts)]
+    internal = directory / "_internal"
+    if internal.is_dir() and not internal.is_symlink():
+        roots.append(("_internal", internal))
+
+    after: Optional[Tuple[str, ...]] = None
+    if cursor:
+        candidate = cursor
+        if candidate.split("/", 1)[0] not in {"artifacts", "_internal"}:
+            candidate = "artifacts/" + candidate
+        if artifact_manifest.validate_locator_path(candidate).ok:
+            parts = tuple(candidate.split("/"))
+            if parts[0] in {"artifacts", "_internal"}:
+                after = parts
+    normalized_cursor = "/".join(after) if after else None
     scan = _RefreshScan(from_top=after is None)
     last_parts: Optional[Tuple[str, ...]] = None
     processed = 0
     document = _read_json(directory / "manifest.json")
     bundle_directories = _manifest_bundle_directories(document) if isinstance(document, Mapping) else set()
-    bundle_parts = {tuple(path.removeprefix("artifacts/").split("/")) for path in bundle_directories}
-    for parts, entry, is_dir in _walk_sorted(str(artifacts), (), after, bundle_parts):
-        if processed and budget.walk_exhausted():
-            scan.complete, scan.cursor = False, "/".join(last_parts) if last_parts else cursor
-            return scan
-        budget.walked += 1
-        processed += 1
-        rel = "artifacts/" + "/".join(parts)
-        if parts in bundle_parts:
-            last_parts = parts
+    bundle_parts = {tuple(path.split("/")) for path in bundle_directories}
+    cursor_root = after[0] if after else None
+    root_order = {name: index for index, (name, _top) in enumerate(
+        (("artifacts", artifacts), ("_internal", internal)))}
+    cursor_index = root_order.get(cursor_root, -1) if cursor_root else -1
+
+    for root_name, top in roots:
+        if cursor_index >= 0 and root_order[root_name] < cursor_index:
             continue
-        if entry.is_symlink():
-            scan.excluded_symlinks.append(rel)
-            last_parts = parts
-            continue
-        if is_dir:
-            if _pruned_directory(parts):
-                scan.excluded.append(rel + "/")
-            last_parts = parts
-            continue
-        try:
-            st = entry.stat(follow_symlinks=False)
-        except OSError:
+        root_after = after if cursor_root == root_name else None
+        for parts, entry, is_dir in _walk_sorted(str(top), (root_name,), root_after, bundle_parts):
+            if processed and budget.walk_exhausted():
+                scan.complete = False
+                scan.cursor = "/".join(last_parts) if last_parts else normalized_cursor
+                return scan
+            budget.walked += 1
+            processed += 1
+            rel = "/".join(parts)
+            if parts in bundle_parts:
+                last_parts = parts
+                continue
+            if entry.is_symlink():
+                scan.excluded_symlinks.append(rel)
+                last_parts = parts
+                continue
+            if is_dir:
+                if _pruned_directory(parts):
+                    scan.excluded.append(rel + "/")
+                last_parts = parts
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                scan.visited.add(rel)
+                last_parts = parts
+                continue
+            if not stat.S_ISREG(st.st_mode) or _outside_inclusion_rule(rel) \
+                    or not artifact_manifest.validate_locator_path(rel).ok:
+                scan.excluded.append(rel)
+                last_parts = parts
+                continue
             scan.visited.add(rel)
+            fingerprint = _fingerprint(st)
+            remembered = known.get(rel)
+            if remembered is not None and list(remembered[:3]) == fingerprint:
+                scan.facts[rel] = (remembered[3], st.st_size, fingerprint)
+                last_parts = parts
+                continue
+            if budget.hashed_files and budget.hash_exhausted():
+                scan.visited.discard(rel)
+                scan.complete = False
+                scan.cursor = "/".join(last_parts) if last_parts else normalized_cursor
+                return scan
+            try:
+                digest, size = _stream_file_facts(Path(entry.path))
+                after_stat = os.lstat(entry.path)
+            except (ProducerError, OSError):
+                last_parts = parts
+                continue  # moved while it was read, or not a plain file now: the next run looks again
+            budget.hashed_bytes += size
+            budget.hashed_files += 1
+            if _fingerprint(after_stat) != fingerprint:
+                last_parts = parts
+                continue
+            scan.facts[rel] = (digest, size, fingerprint)
             last_parts = parts
-            continue
-        if not stat.S_ISREG(st.st_mode) or _outside_inclusion_rule(rel) \
-                or not artifact_manifest.validate_locator_path(rel).ok:
-            scan.excluded.append(rel)
-            last_parts = parts
-            continue
-        scan.visited.add(rel)
-        fingerprint = _fingerprint(st)
-        remembered = known.get(rel)
-        if remembered is not None and list(remembered[:3]) == fingerprint:
-            scan.facts[rel] = (remembered[3], st.st_size, fingerprint)
-            last_parts = parts
-            continue
-        if budget.hashed_files and budget.hash_exhausted():
-            scan.visited.discard(rel)
-            scan.complete, scan.cursor = False, "/".join(last_parts) if last_parts else cursor
-            return scan
-        try:
-            digest, size = _stream_file_facts(Path(entry.path))
-            after_stat = os.lstat(entry.path)
-        except (ProducerError, OSError):
-            last_parts = parts
-            continue  # moved while it was read, or not a plain file now: the next run looks again
-        budget.hashed_bytes += size
-        budget.hashed_files += 1
-        if _fingerprint(after_stat) != fingerprint:
-            last_parts = parts
-            continue
-        scan.facts[rel] = (digest, size, fingerprint)
-        last_parts = parts
     return scan
 
 
@@ -7898,6 +7955,14 @@ def _check_shared_base(expected: Optional[str], actual: Optional[str]) -> None:
                             "merge against latest in a new cycle before admission")
 
 
+def _check_requested_base(requested: Optional[str], receipt_base: Optional[str]) -> None:
+    """--base-revision against the source's own base receipt (not the reference's latest)."""
+    if requested != receipt_base:
+        raise ProducerError("shared-base-mismatch",
+                            f"--base-revision={requested or 'none'} but the source's {SPEC_BASE_RECEIPT} "
+                            f"names base={receipt_base or 'none'}; reseed the source from the intended base")
+
+
 def _shared_source_intersects_bundle(directory: Path, document: Mapping[str, Any], source_rel: str) -> bool:
     artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
                  if isinstance(row, Mapping)}
@@ -8175,7 +8240,7 @@ def _spec_admission_base(root: Path, source_path: Path, reference_id: str,
         elif receipt["reference_id"] is not None or receipt["content_digest"] is not None:
             raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
         if base_revision is not None:
-            _check_shared_base(None if base_revision == "none" else base_revision, base)
+            _check_requested_base(None if base_revision == "none" else base_revision, base)
     if base is not None and not artifact_identity.is_well_formed(base, "shared_reference_revision"):
         raise ProducerError("shared-base-invalid", str(base))
     return base
@@ -10607,11 +10672,14 @@ def require_cycle_output(
         return None
     if route_id and not lineage_checked and record.get("route_id") != route_id:
         raise ProducerError("cycle-route-binding-mismatch", f"cycle={record['cycle_id']} route={route_id}")
-    output = cycle_dir(root, record["campaign_id"], record["cycle_id"], record) / "artifacts"
+    directory = cycle_dir(root, record["campaign_id"], record["cycle_id"], record)
+    output = directory / "artifacts"
     try:
-        Path(target).resolve().relative_to(output.resolve())
+        relative = Path(target).resolve().relative_to(directory.resolve()).as_posix()
     except ValueError as exc:
         raise ProducerError("artifact-outside-bound-cycle", f"cycle={record['cycle_id']} output_dir={output}") from exc
+    if _payload_root(relative) is None:
+        raise ProducerError("artifact-outside-bound-cycle", f"cycle={record['cycle_id']} output_dir={output}")
     return output
 
 
@@ -10695,7 +10763,8 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
         manifest_cycle = manifest.get("cycle") if isinstance(manifest, dict) else None
         if cycle_id is None and isinstance(manifest_cycle, dict):
             cycle_id = manifest_cycle.get("cycle_id")
-        if len(parts) <= artifacts_index or parts[artifacts_index] != "artifacts":
+        if (len(parts) <= artifacts_index + 1
+                or parts[artifacts_index] not in {"artifacts", "_internal"}):
             return {**base, "verdict": "deny", "reason": "outside-cycle-artifacts", "layout": "cycle",
                     "cycle_id": cycle_id}
         try:
@@ -10720,7 +10789,8 @@ def check_write(root: Path, target: Path) -> Dict[str, Any]:
             return {**base, "verdict": "deny", "reason": "cycle-unknown", "layout": "cycle", "cycle_id": cycle_id}
         # §45 D-123: a closed cycle takes writes like an open one; only where the
         # path is (above) and which cycle owns it (here) decide.
-        bucket = parts[artifacts_index + 1] if len(parts) > artifacts_index + 2 else None
+        bucket = (parts[artifacts_index + 1]
+                  if parts[artifacts_index] == "artifacts" and len(parts) > artifacts_index + 2 else None)
         return {**base, "verdict": "allow", "reason": "open-cycle-artifacts", "layout": "cycle",
                 "cycle_id": cycle_id, "campaign_id": campaign_id, "bucket": bucket,
                 "output_dir": str(cycle_path / "artifacts")}
@@ -10831,6 +10901,53 @@ def _route_autoclose(root: Path, trigger: str, campaign: Optional[str] = None) -
 
 def _print(payload: Any) -> None:
     print(json.dumps(payload, sort_keys=True))
+
+
+def _route_cli_context(argv: Sequence[str]):
+    values = list(argv)
+    command = values[0] if values else ""
+    if command not in {"begin", "resolve-output"}:
+        return values, None
+    if not (os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_ROUTE_ID")):
+        return values, None
+    def option_value(name):
+        for index, value in enumerate(values):
+            if value == name and index + 1 < len(values):
+                return values[index + 1]
+            if value.startswith(name + "="):
+                return value.split("=", 1)[1]
+        return None
+    explicit_root = option_value("--artifact-root")
+    explicit_route = option_value("--route") if command == "begin" else None
+    try:
+        import artifact_context
+        context = artifact_context.resolve_context(
+            environ=os.environ, route=explicit_route,
+            node_id=option_value("--node"),
+            explicit={"artifact_root": explicit_root} if explicit_root else None,
+        )
+    except Exception as exc:
+        if getattr(exc, "code", None):
+            raise ProducerError(exc.code, getattr(exc, "detail", str(exc))) from exc
+        raise
+    if not context.route or not context.artifact_root:
+        return values, None
+    supplied_node = option_value("--node")
+    env_node = os.environ.get("AGENT_ROUTE_NODE")
+    if supplied_node and env_node and supplied_node != env_node:
+        raise ProducerError("route-node-mismatch", supplied_node)
+    defaults = {"--artifact-root": str(context.artifact_root)}
+    if command == "begin":
+        defaults["--route"] = str(context.artifact_root / ".runtime" / "routes"
+                                  / f"{context.route['route_id']}.json")
+        if context.node_id:
+            defaults["--node"] = context.node_id
+    insertion = 1
+    for flag, value in defaults.items():
+        if option_value(flag) is None:
+            values[insertion:insertion] = [flag, value]
+            insertion += 2
+    return values, context
 
 
 def _checkpoint_cli(args: argparse.Namespace) -> Dict[str, Any]:
@@ -11031,7 +11148,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--bucket", required=True)
     p.add_argument("--cycle-dir")
 
-    args = parser.parse_args(argv)
+    try:
+        prepared_argv, _route_context = _route_cli_context(sys.argv[1:] if argv is None else argv)
+    except ProducerError as exc:
+        _print({"status": "blocked", "reason": exc.code, "detail": exc.detail})
+        return BLOCKED
+    args = parser.parse_args(prepared_argv)
     try:
         if args.command not in {"check-write"}:
             dispatch_terminal_commit.require_current_cleanup("producer-" + args.command)
@@ -11195,7 +11317,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _print(result)
             return OK if result["verdict"] == "allow" else BLOCKED
         elif args.command == "resolve-output":
-            directory, layout = resolve_output_dir(root, args.bucket, cycle_dir_hint=args.cycle_dir)
+            if _route_context and _route_context.node:
+                if args.cycle_dir and Path(args.cycle_dir).resolve(strict=False) != _route_context.cycle_dir:
+                    raise ProducerError("artifact-cycle-binding-mismatch", args.cycle_dir)
+                try:
+                    binding = _route_context.resolve_bucket(args.bucket)
+                except Exception as exc:
+                    raise ProducerError(getattr(exc, "code", "artifact-output-role-missing"), str(exc)) from exc
+                directory, layout = binding.path, "cycle"
+            else:
+                directory, layout = resolve_output_dir(root, args.bucket, cycle_dir_hint=args.cycle_dir)
             result = {"status": "ok", "output_dir": str(directory), "layout": layout}
             if layout == "legacy":
                 fallback = legacy_fallback_state(root)

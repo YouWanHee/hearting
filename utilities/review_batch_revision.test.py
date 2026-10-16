@@ -486,7 +486,11 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
             self.assertEqual(registered['launch_claimed'], '0')
             self.assertEqual(self.owner_operation(lambda: REPLACEMENT.admission(
                 self.jobs, self.jobs.read_text().splitlines(), registered)), record)
-            self.assertEqual(REPLACEMENT.effective_attempts(self.jobs, {self.owner})[0], {successor})
+            # The fixture takes over the already-created row as its active owner.
+            self.fixture_row(successor, status='open', launch_claimed='1', launch_started='1')
+            effective, lineage = REPLACEMENT.effective_attempts(self.jobs, {self.owner})
+            self.assertEqual(effective, {successor})
+            self.assertEqual(lineage[0]['replacement_attempt_id'], successor)
             self.assertEqual(REPLACEMENT.launch_input(self.jobs, self.owner, source), replay)
             self.assertTrue(self.jobs.read_bytes().startswith(original_rows))
             for path, data in original.items():

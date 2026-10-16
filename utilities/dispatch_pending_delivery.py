@@ -399,7 +399,8 @@ def _gateway_consumed(root: Path, recipient_key: str, aid: str) -> bool:
     return aid in _verified_gateway_consumption(json.loads(path.read_text()), recipient_key)
 
 
-def _replacement_disposition(root: Path, recipient_key: str, value: dict) -> str:
+def _replacement_disposition(root: Path, recipient_key: str, value: dict,
+                             jobs: Path | str | None = None) -> str:
     """Original completion is deferred until its proven successor is consumed.
 
     This never treats a replacement claim as a launch or an async emit as ack.
@@ -411,20 +412,57 @@ def _replacement_disposition(root: Path, recipient_key: str, value: dict) -> str
                    for child in receipt.get("children", []))):
         return ""
     raw_jobs = receipt.get("job_registry")
-    if not isinstance(raw_jobs, str):
+    receipt_jobs = None
+    carrier_jobs = None
+    if isinstance(raw_jobs, str) and raw_jobs:
+        try:
+            receipt_path = Path(raw_jobs).expanduser()
+            if receipt_path.is_symlink():
+                return "defer" if jobs is not None else ""
+            receipt_jobs = receipt_path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return "defer" if jobs is not None else ""
+    if jobs is not None:
+        try:
+            carrier_path = Path(jobs).expanduser()
+            if carrier_path.is_symlink():
+                return "defer"
+            carrier_jobs = carrier_path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return "defer"
+        if (carrier_jobs.is_symlink() or not carrier_jobs.is_file()
+                or carrier_jobs.parent != Path(root).resolve()):
+            return "defer"
+    if receipt_jobs is not None and carrier_jobs is not None and receipt_jobs != carrier_jobs:
+        return "defer"
+    selected_jobs = receipt_jobs or carrier_jobs
+    if selected_jobs is None:
         return ""
-    jobs = Path(raw_jobs)
-    if not jobs.is_file() or jobs.is_symlink() or jobs.resolve().parent != Path(root).resolve():
-        return ""
+    if (selected_jobs.is_symlink() or not selected_jobs.is_file()
+            or selected_jobs.parent != Path(root).resolve()):
+        return "defer" if carrier_jobs is not None else ""
     try:
-        from dispatch_replacement import effective_attempts, _rows
+        from dispatch_replacement import effective_attempts, recovery_delivery_state, _rows
         selected = set(value.get("attempt_ids") or [])
-        effective, edges = effective_attempts(jobs, selected)
+        rows = _rows(selected_jobs.read_text().splitlines())
+        if selected and all(
+            aid in rows
+            and rows[aid][1].get("replacement_original_attempt_id")
+            and rows[aid][1].get("launch_started") != "1"
+            for aid in selected
+        ):
+            # A registered successor that never crossed the launch fence is not
+            # a logical-stage result. Keep the source's original failure live.
+            return "superseded"
+        effective, edges = effective_attempts(selected_jobs, selected)
         if not edges:
+            states = [recovery_delivery_state(selected_jobs, aid) for aid in selected]
+            if any(state in {"accepted", "unknown"} for state in states):
+                return "defer"
             return ""
         if all(_gateway_consumed(root, recipient_key, edge["original_attempt_id"]) for edge in edges):
             return "consumed"
-        rows = _rows(jobs.read_text().splitlines())
+        rows = _rows(selected_jobs.read_text().splitlines())
         # Mixed aggregate records require every effective completion to be
         # consumed; a successful sibling never makes a dead leg disappear.
         consumed = True
@@ -452,6 +490,7 @@ def claim(
     require_generation_proof: bool = False,
     live_recipient_generation: tuple[str, str] | None = None,
     expected_state: str = "pending",
+    jobs: Path | str | None = None,
 ) -> dict:
     """CAS ``expected_state -> claimed`` under one flock (SD-111 §10.2:
     read-check-write inside one lock; ``os.replace`` atomicity alone is not
@@ -486,10 +525,12 @@ def claim(
             raise PendingDeliveryError(
                 "pending-delivery-claim-refused", f"state={value['state']}"
             )
-        disposition = _replacement_disposition(root, recipient_key, value)
+        disposition = _replacement_disposition(root, recipient_key, value, jobs=jobs)
         if disposition:
-            if disposition == "consumed":
-                retired = dict(value, state="rejected", expiry_reason="replacement-consumed")
+            if disposition in {"consumed", "superseded"}:
+                reason = ("replacement-consumed" if disposition == "consumed"
+                          else "replacement-successor-not-launched")
+                retired = dict(value, state="rejected", expiry_reason=reason)
                 _write_unlocked(path, retired)
             raise PendingDeliveryError("pending-delivery-claim-refused", "replacement-" + disposition)
         now = time.monotonic_ns()

@@ -1719,7 +1719,7 @@ def reserve_handoff_retire(target, exact, requester):
         if not _handoff_lifetime_valid(exact.get("foreground")):
             raise ValueError("handoff-predecessor-lifetime-unverified")
         store, duty = _retire_request(target, exact, requester=requester)
-    peer_obligations.ensure_runner()
+    peer_obligations.ensure_normal_runner()
     return duty["id"]
 
 
@@ -1743,7 +1743,7 @@ def _retire_request(target, exact, *, requester=None):
         if retry_of:
             intent["retry_of"] = retry_of
         duty = store.create(duty_id, "retire", exact, intent)
-    peer_obligations.ensure_runner()
+    peer_obligations.ensure_normal_runner()
     return store, duty
 
 
@@ -3148,6 +3148,47 @@ def _agent_state(target):
     return state, (pane if pane and pane != "-" else None)
 
 
+def _peer_reference_access_evidence(target, harness, session_id, pane):
+    """Observe the one supported model-read path: this host's exact Codex session.
+
+    Herdr supplies the verified runtime/session binding; its foreground process
+    must also match a live local PID and namespace. The Codex adapter declaration
+    supplies the read-everywhere sandbox contract. Other runtimes and incomplete
+    observations keep the complete body on the inline delivery path.
+    """
+    recipient = {"harness": harness, "session_id": session_id}
+    if (harness != "codex" or not peer_message.usable_session_id(session_id)
+            or not isinstance(pane, str) or not pane
+            or not peer_message._codex_model_read_access(recipient)):
+        return None
+    try:
+        from harness_capabilities import capabilities
+        if capabilities("codex")["session_identity"]["herdr_session_id"] != "verified":
+            return None
+        _state, first, _code, _reason = _retire_target(target)
+        if (first.get("harness") != harness or first.get("session_id") != session_id
+                or first.get("pane") != pane):
+            return None
+        foreground = _retire_foreground(pane, harness)
+        if not isinstance(foreground, dict):
+            return None
+        namespace = os.readlink(f"/proc/{foreground['pid']}/ns/pid")
+        _state, second, _code, _reason = _retire_target(target)
+        if (second.get("harness") != harness or second.get("session_id") != session_id
+                or second.get("pane") != pane):
+            return None
+        evidence = {
+            "schema": "peer-read-access-observation-v1",
+            "observed_at": time.monotonic(),
+            "recipient": {"harness": harness, "session_id": session_id, "pane_id": pane},
+            "local_process": {"pid": foreground["pid"], "start": foreground["start"],
+                              "argv": foreground["argv"], "pid_namespace": namespace},
+        }
+        return evidence if peer_message._reference_access_evidence_valid(evidence, recipient) else None
+    except Exception:
+        return None
+
+
 def _prompt_box_evidence(target):
     """`(evidence, readable)` from `herdr agent explain`.
 
@@ -3554,7 +3595,7 @@ def _schedule_message_obligation(row, target, pane=None, *, delay_notice_for=Non
     try:
         duty = peer_obligations.ObligationStore().create(
             _message_obligation_id(row["ref"] + ("-accept" if handoff_acceptance else "")), "message", identity, intent)
-        peer_obligations.ensure_runner()
+        peer_obligations.ensure_normal_runner()
         return duty
     except (OSError, ValueError, peer_obligations.ObligationError):
         return None
@@ -3576,7 +3617,7 @@ def _ensure_sender_delay_notice(row):
     try:
         existing = peer_obligations.ObligationStore().get(notice_id)
         if existing:
-            peer_obligations.ensure_runner()
+            peer_obligations.ensure_normal_runner()
             return existing
         created = float(row.get("created") or time.time())
         sent_at = datetime.datetime.fromtimestamp(
@@ -3599,7 +3640,7 @@ def _ensure_sender_delay_notice(row):
             _schedule_message_obligation(
                 pending, sender.get("name") or sender.get("session_id"),
                 delay_notice_for=original_ref)
-        peer_obligations.ensure_runner()
+        peer_obligations.ensure_normal_runner()
         return duty
     except (OSError, ValueError, OverflowError, peer_obligations.ObligationError):
         return None
@@ -4043,6 +4084,14 @@ def cmd_obligation_runner(args):
                     store.update(duty["id"], observer_error="observer-unavailable")
                 except Exception:
                     pass
+        if not store.list():
+            return 0
+        service_current = getattr(args, "service_current", None)
+        if service_current:
+            peer_obligations.exec_service_runner(
+                args.lock_fd, store.root.parents[1], service_current,
+                herdr_session=_HERDR_SESSION,
+            )
         time.sleep(delay)
         delay = min(15.0, delay * 1.7)
 
@@ -4068,7 +4117,11 @@ def cmd_ensure_obligations(_args):
                 pane = (duty["intent"].get("requester") or {}).get("pane")
                 if pane and _seat_successor_path(pane).is_file():
                     _resume_retire_obligation(duty, store)
-        peer_obligations.ensure_runner()
+        lifecycle_root = getattr(_args, "lifecycle_root", None)
+        if lifecycle_root is None:
+            peer_obligations.ensure_runner()
+        else:
+            peer_obligations.ensure_normal_runner(lifecycle_root=lifecycle_root)
         dispatch_batch_obligations.ensure_observers()
     except Exception:
         pass
@@ -4154,7 +4207,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     if _herdr_missing():
         return _unavailable("herdr-not-found")
     if args.body_file:
-        with open(args.body_file, encoding="utf-8", errors="replace") as handle:
+        with open(args.body_file, encoding="utf-8", errors="replace", newline="") as handle:
             body = handle.read()
     elif args.body_stdin:
         body = sys.stdin.read()
@@ -4195,6 +4248,11 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
     if target_pane and (not input_reason or pane_bound_defer):
         recipient["pane_id"] = target_pane
     can_persist_sidless = t_harness in {"claude", "codex", "opencode"} and bool(target_pane)
+    reference_evidence = None
+    if (not args.no_trailer
+            and len(body.encode("utf-8")) > peer_message._BODY_REFERENCE_THRESHOLD):
+        reference_evidence = _peer_reference_access_evidence(
+            args.target, t_harness, t_sid, target_pane)
     if not args.no_trailer or (input_reason and can_persist_sidless) or on_prepared is not None:
         try:
             text, transfer_ref = peer_message.prepare_peer_message(
@@ -4202,7 +4260,7 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                 recipient,
                 defer=bool(input_reason) or on_prepared is not None,
                 refs=args.ref, receipt=input_reason or "target-form-open",
-                with_trailer=not args.no_trailer)
+                with_trailer=not args.no_trailer, reference_evidence=reference_evidence)
             if on_prepared is not None:
                 on_prepared(transfer_ref)
         except (OSError, ValueError):
@@ -4260,10 +4318,15 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None):
                 claimed = None
             if pending is None and (not args.no_trailer or can_persist_sidless):
                 try:
+                    reference_evidence = None
+                    if (not args.no_trailer
+                            and len(body.encode("utf-8")) > peer_message._BODY_REFERENCE_THRESHOLD):
+                        reference_evidence = _peer_reference_access_evidence(
+                            args.target, t_harness, t_sid, target_pane)
                     text, transfer_ref = peer_message.prepare_peer_message(
                         body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
                         recipient, defer=True, refs=args.ref, receipt=input_reason,
-                        with_trailer=not args.no_trailer)
+                        with_trailer=not args.no_trailer, reference_evidence=reference_evidence)
                     if on_prepared is not None:
                         on_prepared(transfer_ref)
                     pending = peer_message._read_pending(transfer_ref)
@@ -5102,9 +5165,11 @@ def build_parser():
     p_obligation = sub.add_parser("__obligation-runner", help=argparse.SUPPRESS)
     p_obligation.add_argument("--lock-fd", type=int, required=True)
     p_obligation.add_argument("--state-root", required=True)
+    p_obligation.add_argument("--service-current", default=None, help=argparse.SUPPRESS)
     p_obligation.set_defaults(func=cmd_obligation_runner)
 
     p_recover = sub.add_parser("__ensure-obligations", help=argparse.SUPPRESS)
+    p_recover.add_argument("--lifecycle-root", default=None, help=argparse.SUPPRESS)
     p_recover.set_defaults(func=cmd_ensure_obligations)
 
     p_wait = sub.add_parser("wait")

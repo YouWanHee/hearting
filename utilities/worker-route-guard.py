@@ -15,6 +15,7 @@ SPEC = importlib.util.spec_from_file_location("capability_route", ROOT / "utilit
 ROUTE = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(ROUTE)
 sys.path.insert(0, str(ROOT / "utilities"))
 from hearting_gates import gates_on, same_work_or_refuse
+from artifact_context import scope_values
 
 
 class WorkerRouteError(ValueError):
@@ -50,7 +51,7 @@ def _git_state(cwd: Path) -> dict[str, str]:
 
 
 def _scopes(value: str | None) -> list[str]:
-    return sorted(part for part in (value or "").split(";") if part)
+    return scope_values(value)
 
 
 # topologies.json write_scope vocabulary realized: these are the only scopes that

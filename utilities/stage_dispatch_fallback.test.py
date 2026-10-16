@@ -431,17 +431,14 @@ class FallbackTest(unittest.TestCase):
    argv.extend(["--reviewed-evidence",str(reviewed_evidence)])
   spawned=[]; printed=[]
   from types import SimpleNamespace
-  real_run=subprocess.run
-  def run(cmd,**kwargs):
-   if any(str(part).endswith("/bin/dispatch-headless.py") for part in cmd):
-    spawned.append(cmd)
-    receipt=("check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n" if "--dry-run" in cmd else
-             "check=ok\nregistered=1\nstarted=1\nchild_spawned=1\nattempt_id=att-mocked-child\n")
-    return SimpleNamespace(returncode=0,stdout=receipt,stderr="")
-   return real_run(cmd,**kwargs)
+  def run(_args,cmd):
+   spawned.append(cmd)
+   receipt=("check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n" if "--dry-run" in cmd else
+            "check=ok\nregistered=1\nstarted=1\nchild_spawned=1\nattempt_id=att-mocked-child\n")
+   return SimpleNamespace(returncode=0,stdout=receipt,stderr="")
   with mock.patch.object(sys,"argv",argv), \
        mock.patch("builtins.print",side_effect=lambda *a,**k:printed.append(" ".join(map(str,a)))), \
-       mock.patch("subprocess.run",side_effect=run), \
+       mock.patch.object(F,"run_wrapper",side_effect=run), \
        mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})):
    observation=F.LAUNCH_TUPLE.ReportOnlyObservation()
    try:
@@ -536,29 +533,26 @@ class FallbackTest(unittest.TestCase):
  def test_a_correction_round_keeps_one_identity_across_dry_run_register_and_start(self):
   # The round salt is part of the admission ticket: the row `--register` writes must not move the
   # round its own `--start` derives, and the start must claim that row instead of refusing it as live.
-  with self.dispatch_env():
+  with self.dispatch_env(),self.prior_process_observation({"att-plan-check-round-1"}):
    path=self.route(same_status="supported",intensity="standard")
    route=json.loads(path.read_text())
    self.seed_parent()
    self.seed_review_rounds(route["route_id"],"plan-check",1)
    self.seed_predecessor_markers(path,"plan-check")
    self.seed_plan_marker(route)
-   real_run=subprocess.run
    def act(action):
     seen=[];printed=[]
-    def run(cmd,**kwargs):
-     if any(str(part).endswith("/bin/dispatch-headless.py") for part in cmd):
-      seen.append(cmd)
-      receipt=("check=ok\nregistered=1\nstarted=1\nchild_spawned=1\n" if action=="start"
-               else "check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n")
-      return SimpleNamespace(returncode=0,stdout=receipt,stderr="")
-     return real_run(cmd,**kwargs)
+    def run(_args,cmd):
+     seen.append(cmd)
+     receipt=("check=ok\nregistered=1\nstarted=1\nchild_spawned=1\n" if action=="start"
+              else "check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n")
+     return SimpleNamespace(returncode=0,stdout=receipt,stderr="")
     argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan-check","--slug","fallback-plan-check",
           "--parent","owner","--capability-mode","dev","--worker-mode","qa/plan-review",
           "--model-role","fast reviewer","--jobs",str(self.jobs),"--"+action]
     with mock.patch.object(sys,"argv",argv), \
          mock.patch("builtins.print",side_effect=lambda *a,**k:printed.append(" ".join(map(str,a)))), \
-         mock.patch("subprocess.run",side_effect=run), \
+         mock.patch.object(F,"run_wrapper",side_effect=run), \
          mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})):
      try:
       code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
@@ -633,10 +627,8 @@ class FallbackTest(unittest.TestCase):
    prompt=self.art/"closure-task.md"
    prompt.write_text(f"Check corrected HEAD {new_head}, only x, against {prior_input}.\n")
    prompt_bytes=prompt.read_bytes()
-   commands=[];spawn_claims=[];real_run=subprocess.run
-   def wrapper(command,**kwargs):
-    if not any(str(part).endswith("/bin/dispatch-headless.py") for part in command):
-     return real_run(command,**kwargs)
+   commands=[];spawn_claims=[]
+   def wrapper(_args,command):
     commands.append(command)
     aid=self.arg(command,"--attempt-id")
     metadata={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
@@ -655,7 +647,7 @@ class FallbackTest(unittest.TestCase):
     claimed=DC.claim_attempt_row(self.jobs,aid,row,launch=started)
     if started and claimed:spawn_claims.append(aid)
     return SimpleNamespace(returncode=0,stdout="check=ok\nregistered=1\nstarted="+str(int(started))+"\nchild_spawned="+str(int(started and claimed))+"\n",stderr="")
-   patch=mock.patch.object(F.subprocess,"run",side_effect=wrapper)
+   patch=mock.patch.object(F,"run_wrapper",side_effect=wrapper)
    for action in ("dry-run","register","start"):
     code,output=self.closure_action(path,action,patches=(patch,),prompt=prompt)
     self.assertEqual(code,0,output)
@@ -749,10 +741,8 @@ class FallbackTest(unittest.TestCase):
    original=self.jobs.read_bytes()
    prompt=self.art/"execute-gap-three.md"
    prompt.write_text("Close historical/current conflict and actual DB parity.")
-   commands=[];real_run=subprocess.run
-   def wrapper(command,**kwargs):
-    if not any(str(part).endswith("/bin/dispatch-headless.py") for part in command):
-     return real_run(command,**kwargs)
+   commands=[]
+   def wrapper(command):
     aid=self.arg(command,"--attempt-id")
     candidate={k:v for k,v in meta.items() if k not in
                {"note","failure_class","launch_outcome","automatic_retry_of","replacement_input_digest"}}
@@ -768,12 +758,14 @@ class FallbackTest(unittest.TestCase):
     self.assertTrue(DC.claim_attempt_row(self.jobs,aid,row,launch=started))
     return SimpleNamespace(returncode=0,stdout=("check=ok\nregistered_worker=1\n"
                           f"child_spawned={int(started)}\nattempt_id={aid}\n"),stderr="")
+   def run_wrapper(_args,command):
+    return wrapper(command)
    argv=["stage-dispatch-fallback.py","--route",str(path),"--node","execute","--slug",slug,
          "--parent","owner","--capability-mode","dev","--jobs",str(self.jobs),
          "--prompt-file",str(prompt),"--start"]
    out=io.StringIO()
    with mock.patch.object(sys,"argv",argv),self.compiled_order(), \
-        mock.patch.object(F.subprocess,"run",side_effect=wrapper), \
+        mock.patch.object(F,"run_wrapper",side_effect=run_wrapper), \
         mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})), \
         contextlib.redirect_stdout(out):
     code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
@@ -887,31 +879,34 @@ class FallbackTest(unittest.TestCase):
   self.assertEqual(len(augmented),1,augmented)
   self.assertEqual(augmented[0].read_text(encoding="utf-8"),"BASE PROMPT TEXT\n"+expected_block)
 
- def _producer_revision_entry(self,surface):
-  with self.dispatch_env():
+ def _producer_revision_entry(self,surface,*,gates_enabled):
+  with self.dispatch_env(HEARTING_GATES="on" if gates_enabled else "off"):
    path=self.route(same_status="supported",intensity="standard")
    route=json.loads(path.read_text())
    self.seed_parent()
    evidence=self.seed_plan_marker(route)
-   self.seed_review_rounds(route["route_id"],"plan-check",1)
+   self.seed_bound_review_rounds(route,"plan-check",1,evidence)
    evidence.write_text("Corrected plan v2.\n")
    plan=next(n for n in route["nodes"] if n["id"]=="plan")
    marker_path=R.completion_dir(route["route_id"],jobs=self.jobs)/"plan.json"
-   self.assertEqual(R.gate_currency(route,plan,marker_path).state,"revised-unrecorded")
-   observed=[];real_run=subprocess.run
-   def run(cmd,**kwargs):
-    if any(str(part).endswith("/bin/dispatch-headless.py") for part in cmd):
-     observed.append(cmd)
-     return SimpleNamespace(returncode=0,stdout="check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n",stderr="")
-    return real_run(cmd,**kwargs)
+   self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"revised-unrecorded")
+   observed=[]
+   def run_wrapper(_args,command):
+    observed.append(command)
+    return SimpleNamespace(returncode=0,stdout="check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n",stderr="")
+   def run_node(command,action,lifecycle):
+    observed.append(command)
+    return 0
    if surface=="chain":
     argv=["stage-dispatch-fallback.py","--route",str(path),"--node","plan-check",
           "--slug","revised-plan-check","--parent","owner","--jobs",str(self.jobs),"--dry-run"]
    else:
     argv=["dispatch-node.py","--route",str(path),"--node","plan-check","--adapter","codex",
           "--slug","revised-plan-check","--parent","owner","--jobs",str(self.jobs),"--action","dry-run"]
-   with mock.patch.object(sys,"argv",argv),mock.patch.object(subprocess,"run",side_effect=run), \
-        contextlib.redirect_stdout(io.StringIO()) as output:
+   launcher_patch=(mock.patch.object(F,"run_wrapper",side_effect=run_wrapper)
+                   if surface=="chain" else
+                   mock.patch.object(F.DISPATCH_NODE,"run_launcher",side_effect=run_node))
+   with mock.patch.object(sys,"argv",argv),launcher_patch,contextlib.redirect_stdout(io.StringIO()) as output:
     if surface=="chain":
      code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
     else:
@@ -920,11 +915,41 @@ class FallbackTest(unittest.TestCase):
    self.assertEqual(code,0,output.getvalue())
    self.assertEqual(len(observed),1)
    self.assertEqual(observed[0][observed[0].index("--reviewed-evidence")+1],str(evidence))
-   self.assertEqual(R.gate_currency(route,plan,marker_path).state,"revised-unrecorded")
+   self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"revised-unrecorded")
    self.assertFalse((marker_path.parent/"plan.2.json").exists())
    if surface=="chain": argv[argv.index("--dry-run")]="--start"
    else: argv[argv.index("dry-run")]="start"
-   with mock.patch.object(sys,"argv",argv),mock.patch.object(subprocess,"run",side_effect=run), \
+   launcher_patch=(mock.patch.object(F,"run_wrapper",side_effect=run_wrapper)
+                   if surface=="chain" else
+                   mock.patch.object(F.DISPATCH_NODE,"run_launcher",side_effect=run_node))
+   start_events=[]
+   import hashlib
+   import review_input
+   real_resolve_input=review_input.resolve_input
+   real_publish_revision=F.DISPATCH_NODE.ROUTE.publish_revision_locked
+   def publish_revision(*args,**kwargs):
+    result=real_publish_revision(*args,**kwargs)
+    start_events.append(("producer-revision",result["marker"]))
+    return result
+   def resolve_bound_input(*args,**kwargs):
+    current_marker=json.loads(marker_path.read_text())
+    if gates_enabled:
+     self.assertEqual(current_marker["sequence"],2)
+     self.assertEqual(current_marker["stage_authority"],"revision")
+     self.assertEqual(current_marker["evidence"]["path"],str(evidence.resolve()))
+     self.assertEqual(current_marker["evidence"]["sha256"],
+                      hashlib.sha256(evidence.read_bytes()).hexdigest())
+    else:
+     self.assertEqual(current_marker["sequence"],1)
+     self.assertNotIn("revision",current_marker)
+     self.assertNotEqual(current_marker["evidence"]["sha256"],
+                         hashlib.sha256(evidence.read_bytes()).hexdigest())
+    result=real_resolve_input(*args,**kwargs)
+    start_events.append(("review-input",result["path"]))
+    return result
+   with mock.patch.object(F.DISPATCH_NODE.ROUTE,"publish_revision_locked",side_effect=publish_revision), \
+        mock.patch("review_input.resolve_input",side_effect=resolve_bound_input), \
+        mock.patch.object(sys,"argv",argv),launcher_patch, \
         mock.patch.object(F,"watch_launched_attempt",return_value=("observed",{})), \
         contextlib.redirect_stdout(io.StringIO()) as output:
     if surface=="chain": code=F._dispatch(F.LAUNCH_TUPLE.ReportOnlyObservation())
@@ -932,19 +957,53 @@ class FallbackTest(unittest.TestCase):
      with self.assertRaises(SystemExit) as stopped:F.DISPATCH_NODE.main()
      code=stopped.exception.code
    self.assertEqual(code,0,output.getvalue())
-   self.assertEqual(R.gate_currency(route,plan,marker_path).state,"current")
+   reviewed_inputs=[event[1] for event in start_events if event[0]=="review-input"]
+   self.assertTrue(reviewed_inputs)
+   self.assertEqual(reviewed_inputs,[str(evidence.resolve())]*len(reviewed_inputs))
+   if gates_enabled:
+    event_kinds=[event[0] for event in start_events]
+    self.assertEqual(event_kinds.count("producer-revision"),1)
+    self.assertEqual(event_kinds.count("review-input"),len(reviewed_inputs))
+    self.assertLess(event_kinds.index("producer-revision"),event_kinds.index("review-input"))
+    self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"current")
+    marker=json.loads(marker_path.read_text())
+    self.assertEqual(marker["sequence"],2)
+    self.assertEqual(marker["revision"]["recorded_by"],"runtime-auto")
+    self.assertEqual(marker["evidence"]["path"],str(evidence.resolve()))
+    self.assertEqual(marker["revision"]["evidence_sha256"],marker["evidence"]["sha256"])
+   else:
+    # Gates-off operations keep a live evidence edit as history; they do not
+    # synthesize a revision marker. The real completion gate's history writer
+    # is covered by dispatch_completion_marker.test.py.
+    self.assertEqual(R.gate_currency(route,plan,marker_path).state,"current")
+    self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"revised-unrecorded")
+    marker=json.loads(marker_path.read_text())
+    self.assertEqual(marker["sequence"],1)
+    self.assertNotIn("revision",marker)
+    self.assertEqual([event[0] for event in start_events],
+                     ["review-input"]*len(reviewed_inputs))
+    self.assertNotEqual(marker["evidence"]["sha256"],
+                        hashlib.sha256(evidence.read_bytes()).hexdigest())
    link_path=marker_path.parent/"plan.att-fixture-plan.attempt.json"
    original_link=link_path.read_bytes();link=json.loads(original_link)
    for wrong in (marker_path.parent/"other-node.json",self.art/"plan.json"):
     link["completion_marker"]=str(wrong);link_path.write_text(json.dumps(link))
-    self.assertNotEqual(R.gate_currency(route,plan,marker_path).state,"current")
+    self.assertNotEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"current")
    link_path.write_bytes(original_link)
-   self.assertEqual(R.gate_currency(route,plan,marker_path).state,"current")
-   self.assertEqual(json.loads(marker_path.read_text())["revision"]["recorded_by"],"runtime-auto")
- def test_sd161_chain_auto_revises_producer_before_resolving_review_input(self):
-  self._producer_revision_entry("chain")
- def test_sd161_node_auto_revises_producer_before_resolving_review_input(self):
-  self._producer_revision_entry("node")
+   if gates_enabled:
+    self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"current")
+   else:
+    self.assertEqual(R.gate_currency(route,plan,marker_path).state,"current")
+   if gates_enabled:
+    self.assertEqual(json.loads(marker_path.read_text())["revision"]["recorded_by"],"runtime-auto")
+ def test_sd161_chain_gate_enabled_revises_before_review_input(self):
+  self._producer_revision_entry("chain",gates_enabled=True)
+ def test_sd161_chain_gate_disabled_keeps_evidence_history(self):
+  self._producer_revision_entry("chain",gates_enabled=False)
+ def test_sd161_node_gate_enabled_revises_before_review_input(self):
+  self._producer_revision_entry("node",gates_enabled=True)
+ def test_sd161_node_gate_disabled_keeps_evidence_history(self):
+  self._producer_revision_entry("node",gates_enabled=False)
 
  def test_cross_harness_direct_precedes_inline(self):
   result=self.run_chain(self.route()); self.assertEqual(result.returncode,0,result.stdout+result.stderr)

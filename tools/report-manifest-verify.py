@@ -411,7 +411,17 @@ def verify(path):
  if version==2: return _verify_v2(path)
  raise ValueError("schema_version must be 1 or 2")
 def main():
- p=argparse.ArgumentParser(); p.add_argument("manifest"); p.add_argument("--classification",action="store_true"); a=p.parse_args(); result=verify(a.manifest)
+ argv=list(sys.argv[1:])
+ if not any(not value.startswith("-") for value in argv):
+  utilities=Path(__file__).resolve().parents[1]/"utilities"
+  if str(utilities) not in sys.path: sys.path.insert(0,str(utilities))
+  from artifact_context import resolve_context
+  context=resolve_context(environ=os.environ)
+  if context.route and context.node:
+   binding=context.resolve_output("report-manifest")
+   if binding is None or binding.path is None: raise ValueError("current route has no declared report manifest")
+   argv.insert(0,str(binding.path))
+ p=argparse.ArgumentParser(); p.add_argument("manifest"); p.add_argument("--classification",action="store_true"); a=p.parse_args(argv); result=verify(a.manifest)
  if a.classification: print(result["bundle_classification"])
  else:
   if result["bundle_classification"]=="legacy/unspecified": result.pop("bundle_classification")

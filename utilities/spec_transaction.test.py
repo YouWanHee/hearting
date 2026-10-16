@@ -10,7 +10,8 @@ TX=load("spec_transaction",ROOT/"utilities/spec-transaction.py")
 # Owner finding D1 (2026-09-07): `spec-transaction.py` resolves its spec bucket from
 # AGENT_ARTIFACT_* (not from --artifact-root), so a child inheriting a dispatch
 # environment wrote a LIVE cycle bucket. Every child gets a scrubbed environment.
-HERMETIC_ENV={k:v for k,v in os.environ.items() if not k.startswith("AGENT_ARTIFACT_")}
+HERMETIC_ENV={k:v for k,v in os.environ.items() if not k.startswith((
+ "AGENT_ARTIFACT_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_DISPATCH_"))}
 
 def dispatch(worktree):
  return {"tuples":[{"parent_harness":"codex","parent_transport":"headless","parent_sandbox":"workspace-write","child_harness":"codex","launch_authority":"conductor","status":"supported","probe_source":"fixture","probe_time":"2026-07-16T00:00:00Z","failure_class":"","checked_worktree":str(Path(worktree).resolve()),"failure_scope":"none","codex_command":"ok","retry_on_isolated_worktree":0}],"native_subagent":[]}
@@ -319,9 +320,10 @@ class CycleLayoutTest(unittest.TestCase):
   (self.repo/"README").write_text("x\n"); subprocess.run(["git","-C",str(self.repo),"add","README"],check=True); subprocess.run(["git","-C",str(self.repo),"commit","-qm","init"],check=True)
   self.artifact=self.repo/".agent_reports"; self.artifact.mkdir()
   home=base/"agent-home"; (home/"core").mkdir(parents=True); (home/"core"/"CORE.md").write_text("fixture\n")
-  self._env={k:os.environ.get(k) for k in ("AGENT_HOME","AGENT_DISPATCH_JOBS","AGENT_ARTIFACT_CYCLE_DIR","AGENT_ARTIFACT_ROOT")}
+  self._env={k:v for k,v in os.environ.items() if k=="AGENT_HOME" or k.startswith(("AGENT_DISPATCH_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_ARTIFACT_"))}
   os.environ["AGENT_HOME"]=str(home)
-  for k in ("AGENT_DISPATCH_JOBS","AGENT_ARTIFACT_CYCLE_DIR","AGENT_ARTIFACT_ROOT"): os.environ.pop(k,None)
+  for k in tuple(os.environ):
+   if k.startswith(("AGENT_DISPATCH_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_ARTIFACT_")): os.environ.pop(k,None)
   P.activate(self.artifact,repository_id="repo_"+"a"*32,artifact_root_id="root_"+"b"*32,w7={"campaign_id":"camp_"+"c"*32})
   gate={"spec_read":{"satisfied":True,"source":"fixture"},"drift_verdict":"within-spec","workflow_mode":"tracked","artifact_guard":{"satisfied":True,"source":"fixture"}}
   spec_route=R.compile_route("autopilot-spec","update","strong",self.repo,self.artifact,signals=["shared-contract"],transport="headless",tracking="tracked",tracked_gate_evidence=gate,dispatch_evidence=dispatch(self.repo),slug="spec-tx")
@@ -987,6 +989,25 @@ class CycleLayoutTest(unittest.TestCase):
   rows=[json.loads(l) for l in events.read_text().splitlines()]
   blocked=[r for r in rows if r["status"]=="blocked" and r["reason"]=="legacy-spec-written"]
   self.assertEqual(len(blocked),1); self.assertEqual(blocked[0]["changed"],["prd.md"])
+
+ def test_routed_transaction_defaults_artifact_worktree_route_and_node(self):
+  route=json.loads(self.spec_route.read_text())
+  route_file=Path(self.L.admit_runtime_route(self.artifact,route).route_file)
+  jobs=Path(self._tmp.name)/"route-jobs.log"; jobs.write_text("")
+  begun=self.P.begin(self.artifact,route_file=route_file,capability="autopilot-spec",
+                     intensity="strong",jobs=jobs,require_cycle=True)
+  node=next(row for row in route["nodes"] if row["id"]=="prd-transaction")
+  env={**HERMETIC_ENV,"AGENT_ARTIFACT_ROOT":str(self.artifact),
+       "AGENT_ROUTE_FILE":str(route_file),"AGENT_ROUTE_ID":route["route_id"],
+       "AGENT_ROUTE_NODE":node["id"],"AGENT_DISPATCH_WORKTREE":str(self.repo),
+       "AGENT_DISPATCH_JOBS":str(jobs),**begun["env"]}
+  spec=Path(begun["cycle_dir"])/"artifacts/spec"
+  spec.mkdir(parents=True,exist_ok=True); (spec/"prd.md").write_text("before\n")
+  result=subprocess.run([sys.executable,str(ROOT/"utilities/spec-transaction.py"),"run","--",
+      sys.executable,"-c","from pathlib import Path; import os; Path(os.environ['AGENT_SPEC_ROOT'],'prd.md').write_text('after\\n')"],
+      cwd=self.repo,text=True,capture_output=True,env=env)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  self.assertEqual((spec/"prd.md").read_text(),"after\n")
 
 
 if __name__=="__main__":

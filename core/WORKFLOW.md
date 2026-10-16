@@ -785,6 +785,13 @@ Supply a readable, nonempty artifact from the route's exact open cycle and the
 final summary; the command records terminal proof, closes the route, finalizes
 that cycle and returns a receipt only after rechecking all three. A partial
 transaction remains `finish-pending` and is resumed with the same intent.
+The synthetic `source-scoped` authority does not make unrelated tracked edits
+a finish veto; concrete declared files, directories and path patterns remain
+guarded, with tracked status read again under the finish lock. The returned
+result may report unscoped tracked dirt as an observation, without attributing
+authorship or changing the stored receipt. Finish preserves the worktree and
+index, while its evidence, route/session identity, commit lineage and replay
+checks remain in force.
 
 ```text
 python3 utilities/capability-route.py finish [--route <route.json|rt-id>] --evidence <cycle-local-file> --summary-file <file> [--commit <full-sha>]
