@@ -7955,6 +7955,14 @@ def _check_shared_base(expected: Optional[str], actual: Optional[str]) -> None:
                             "merge against latest in a new cycle before admission")
 
 
+def _check_requested_base(requested: Optional[str], receipt_base: Optional[str]) -> None:
+    """--base-revision against the source's own base receipt (not the reference's latest)."""
+    if requested != receipt_base:
+        raise ProducerError("shared-base-mismatch",
+                            f"--base-revision={requested or 'none'} but the source's {SPEC_BASE_RECEIPT} "
+                            f"names base={receipt_base or 'none'}; reseed the source from the intended base")
+
+
 def _shared_source_intersects_bundle(directory: Path, document: Mapping[str, Any], source_rel: str) -> bool:
     artifacts = {row.get("artifact_id"): row for row in document.get("artifacts", [])
                  if isinstance(row, Mapping)}
@@ -8232,7 +8240,7 @@ def _spec_admission_base(root: Path, source_path: Path, reference_id: str,
         elif receipt["reference_id"] is not None or receipt["content_digest"] is not None:
             raise ProducerError("shared-base-invalid", SPEC_BASE_RECEIPT)
         if base_revision is not None:
-            _check_shared_base(None if base_revision == "none" else base_revision, base)
+            _check_requested_base(None if base_revision == "none" else base_revision, base)
     if base is not None and not artifact_identity.is_well_formed(base, "shared_reference_revision"):
         raise ProducerError("shared-base-invalid", str(base))
     return base
