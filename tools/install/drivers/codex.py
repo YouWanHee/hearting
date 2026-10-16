@@ -20,6 +20,7 @@ import user_model_config
 import safe_fs
 import claude_settings_config
 import codex_launcher
+import herdr_integration
 
 _UTILITIES = str(Path(__file__).resolve().parents[3] / "utilities")
 if _UTILITIES not in sys.path:
@@ -235,6 +236,10 @@ def install(scope="global", plugin=False, dry_run=False):
                 )
             continue
 
+    actions.append(herdr_integration.migrate_hook_file(
+        runtime_home / "hooks.json", RUNTIME, dry_run=dry_run,
+        source_root=paths.agent_home()))
+
     if plugin:
         actions.append(_plugin_action(dry_run))
     # Restore only the launcher recorded by its ownership manifest. The
@@ -248,8 +253,11 @@ def install(scope="global", plugin=False, dry_run=False):
 
 
     manifest_result = None
+    integration_assets = herdr_integration.manifest_assets(
+        RUNTIME, paths.agent_home(), paths.runtime_home(RUNTIME, scope))
     if not dry_run:
-        manifest_result = manifest.record("codex", [], scope=scope)
+        manifest_result = manifest.record("codex", [], scope=scope,
+                                          integration_assets=integration_assets)
 
     return {
         "runtime": "codex",
@@ -266,6 +274,8 @@ def checks(scope="global"):
     agent_home = str(paths.agent_home())
 
     check_list = []
+
+    check_list.append(verifier.check_herdr_integration(RUNTIME, agent_home))
 
     for entry in entries:
         if entry["action"] == "symlink":

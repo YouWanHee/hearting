@@ -17,12 +17,12 @@ One entry point for the parts of ``session-tidy`` that a session touches directl
     session_tidy.py enqueue [--harness H] [--session-id S] [--cwd D] [--no-clear | --no-continue]
         Queue the memory tidy and return at once (one line); the detached runner
         ``session_tidy_runner.py`` does the work and leaves a result notice.  Inside
-        herdr it also books the window's auto-clear and the continue prompt after it
+        herdr it also books the window's auto-clear and continuation after it
         (``session_tidy_clear.py``); ``--no-clear`` keeps the window and cancels a pending
-        booking, ``--no-continue`` clears without typing anything after it.
+        booking, ``--no-continue`` clears without a continuation action.
     session_tidy.py handoff <target> [--harness H] [--session-id S] [--cwd D]
         Deliver this seat's card to a peer session through ``peer-steward.py prompt``
-        and report its typed verdict (``prompted=...``) and exit code on one line.  The
+        and report its structured delivery verdict and exit code on one line. The
         card is marked as handed off: this window is not continued from it.
 
 State lives in ``${XDG_STATE_HOME:-~/.local/state}/hearting/session-tidy/``
@@ -234,6 +234,20 @@ def _digest(*parts: str, size: int = 20) -> str:
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:size]
 
 
+def _endpoint_scope(env=None) -> str:
+    """A pane id is local to its Herdr endpoint; keep named sockets in separate seats."""
+    env = os.environ if env is None else env
+    server = str(env.get("AGENT_HERDR_SESSION") or "").strip()
+    socket_path = str(env.get("HERDR_SOCKET_PATH") or "").strip()
+    if socket_path:
+        # The socket is the concrete endpoint identity shared by direct and
+        # deferred reporters; a configured server name may be absent there.
+        return _digest("herdr-endpoint", "socket", os.path.realpath(socket_path))
+    if not server:
+        return ""                 # retain the original default-server key
+    return _digest("herdr-endpoint", "session", server)
+
+
 # ---------------------------------------------------------------------------
 # Worker check, harness / session identity, seat
 # ---------------------------------------------------------------------------
@@ -335,6 +349,7 @@ class Seat:
     project_key: str = ""
     native: Optional[dict] = None
     sid: str = ""
+    endpoint: str = ""
 
     def as_dict(self) -> dict:
         result = {"kind": self.kind, "key": self.key, "pane": self.pane,
@@ -343,6 +358,8 @@ class Seat:
             result["native"] = self.native
         if self.sid:
             result["sid"] = self.sid
+        if self.endpoint:
+            result["endpoint"] = self.endpoint
         return result
 
 
@@ -350,7 +367,7 @@ def seat_from_dict(data: dict) -> Seat:
     return Seat(str(data.get("kind") or ""), str(data.get("key") or ""),
                 str(data.get("pane") or ""), str(data.get("harness") or ""),
                 str(data.get("project_key") or ""), data.get("native"),
-                str(data.get("sid") or ""))
+                str(data.get("sid") or ""), str(data.get("endpoint") or ""))
 
 
 def seat_for_project(harness: str, project_key: str) -> Seat:
@@ -402,7 +419,9 @@ def _real(path) -> str:
 
 
 def _pane_seat_of(pane: str) -> Seat:
-    return Seat("pane", _digest("pane", pane), pane, "codex", "")
+    endpoint = _endpoint_scope()
+    key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
+    return Seat("pane", key, pane, "codex", "", endpoint=endpoint)
 
 
 def ledger_precedes(seat: Seat, older: str, newer: str, harness: str = "codex") -> bool:
@@ -503,7 +522,9 @@ def resolve_seat(harness: Optional[str], cwd=None, env=None, sid: Optional[str] 
         pane = verified_pane(pane, harness, sid, executable=_herdr_executable(),
                              server=server, socket_path=socket_path)
     if pane:
-        return Seat("pane", _digest("pane", pane), pane, harness or "", "")
+        endpoint = _endpoint_scope(env if live_caller else {})
+        key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
+        return Seat("pane", key, pane, harness or "", "", endpoint=endpoint)
     from session_tidy_native import caller_target
     native = caller_target(harness, env)
     if native:
@@ -692,18 +713,48 @@ def pane_session_aliases(harness: str, sid: str, pane: str, cwd: str) -> list[st
 
 def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:
     """The recorded native start source, not a new or inferred lifecycle event."""
+    return session_start_context(harness, sid, pane).get("session_start_source")
+
+
+def session_start_context(harness: str, sid: str, pane: str) -> dict:
+    """Return the latest native start details for this exact pane seat and session."""
     if harness not in HARNESSES or not sid or not pane:
-        return None
+        return {}
     for row in reversed(_read_ledger_lines(_pane_seat_of(pane))):
-        if row.get("harness") == harness and row.get("sid") == sid and row.get("event") == "start":
-            source = row.get("source")
-            return source if source in {"startup", "resume", "clear", "compact", "fork"} else None
-    return None
+        if row.get("harness") != harness or row.get("sid") != sid:
+            continue
+        if row.get("event") != "start" and not row.get("start_at"):
+            continue
+        source = (row.get("source") if row.get("event") == "start"
+                  else row.get("latest_start_source", row.get("start_source")))
+        context = {}
+        if source in {"startup", "resume", "select", "clear", "compact", "fork"}:
+            context["session_start_source"] = source
+        sequence = row.get("session_seq", row.get("latest_start_seq", row.get("start_seq")))
+        if sequence is None and context.get("session_start_source"):
+            started = (row.get("ts") if row.get("event") == "start"
+                       else row.get("latest_start_at", row.get("start_at")))
+            if isinstance(started, (int, float)) and not isinstance(started, bool) and started > 0:
+                sequence = int(started * 1_000_000)
+        if type(sequence) is int and sequence > 0:
+            context["session_seq"] = sequence
+        transcript = row.get("transcript")
+        if isinstance(transcript, str) and transcript:
+            context["transcript"] = transcript
+        resume_argv = row.get("resume_argv")
+        if source in {"resume", "select"} and isinstance(resume_argv, list) and resume_argv:
+            context["resume_argv"] = resume_argv
+        launch_cwd = row.get("launch_cwd")
+        if isinstance(launch_cwd, str) and launch_cwd:
+            context["launch_cwd"] = launch_cwd
+        return context
+    return {}
 
 
 def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str = "",
                  transcript: str = "", cwd: str = "", now: Optional[float] = None,
                  bump_epoch: bool = False, compact_identity: str = "",
+                 resume_argv=None, launch_cwd: str = "",
                  compact_context: Optional[dict] = None) -> dict:
     """Append one ledger line (caller holds the seat lock). Returns the session row."""
     now = now_epoch() if now is None else now
@@ -717,6 +768,17 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
     entry = {"ts": now, "harness": harness, "sid": sid, "event": event, "epoch": epoch}
     if source:
         entry["source"] = source
+    if event == "start" and source in {"startup", "resume", "select", "clear", "compact", "fork"}:
+        entry["session_seq"] = max(1, int(now * 1_000_000))
+    if event == "start" and source in {"resume", "select"} and isinstance(resume_argv, list):
+        valid = (resume_argv and len(resume_argv) <= 64
+                 and resume_argv[0] in {"claude", "codex", "opencode"}
+                 and sid in resume_argv
+                 and all(isinstance(arg, str) and arg and "\0" not in arg for arg in resume_argv))
+        if valid and sum(len(arg.encode("utf-8", "surrogatepass")) for arg in resume_argv) <= 8192:
+            entry["resume_argv"] = list(resume_argv)
+            if isinstance(launch_cwd, str) and launch_cwd.startswith("/"):
+                entry["launch_cwd"] = launch_cwd
     if transcript:
         entry["transcript"] = transcript
     if cwd:
@@ -771,11 +833,26 @@ def _fold_ledger(seat: Seat) -> None:
         row["first_seen"] = min(row["first_seen"], item.get("first_seen", item.get("ts", 0)))
         row["ts"] = max(row["ts"], item.get("ts", 0))
         row["epoch"] = max(row["epoch"], int(item.get("epoch", 0) or 0))
-        start_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
-        start_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
-        if ("start_at" not in row and start_source in {"startup", "resume", "clear", "compact", "fork"}
-                and isinstance(start_at, (int, float)) and not isinstance(start_at, bool) and start_at > 0):
-            row.update(start_source=start_source, start_at=start_at)
+        origin_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
+        origin_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
+        if (origin_source in {"startup", "resume", "select", "clear", "compact", "fork"}
+                and isinstance(origin_at, (int, float)) and not isinstance(origin_at, bool) and origin_at > 0
+                and (not row.get("start_at") or origin_at < float(row["start_at"]))):
+            row.update(start_source=origin_source, start_at=origin_at)
+
+        latest_source = (item.get("source") if item.get("event") == "start"
+                         else item.get("latest_start_source", item.get("start_source")))
+        latest_at = (item.get("ts") if item.get("event") == "start"
+                     else item.get("latest_start_at", item.get("start_at")))
+        if (latest_source in {"startup", "resume", "select", "clear", "compact", "fork"}
+                and isinstance(latest_at, (int, float)) and not isinstance(latest_at, bool) and latest_at > 0
+                and latest_at >= float(row.get("latest_start_at", 0) or 0)):
+            row.update(latest_start_source=latest_source, latest_start_at=latest_at,
+                       start_seq=item.get("session_seq", item.get("start_seq")))
+            for field in ("resume_argv", "launch_cwd"):
+                row.pop(field, None)
+                if field in item:
+                    row[field] = item[field]
         for field in ("transcript", "cwd"):
             if item.get(field):
                 row[field] = item[field]
@@ -1282,8 +1359,20 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         # compaction; count it once.
         compacting = (event == "compact" or source == "compact") and not (
             prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
+        launch = None
+        if event == "start" and source == "resume":
+            try:
+                tools = str(Path(__file__).resolve().parents[1] / "tools")
+                if tools not in sys.path:
+                    sys.path.insert(0, tools)
+                from fleet.process_identity import current_launch_context
+                launch = current_launch_context(harness, sid)
+            except Exception:
+                launch = None
         row = record_event(seat, harness, sid, event, source=source, transcript=transcript,
-                           cwd=cwd, now=now, bump_epoch=compacting)
+                           cwd=cwd, now=now, bump_epoch=compacting,
+                           resume_argv=(launch or {}).get("argv"),
+                           launch_cwd=(launch or {}).get("cwd") or "")
         sessions[(harness, sid)] = row
         if event == "compact":
             return ""

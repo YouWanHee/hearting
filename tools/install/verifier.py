@@ -74,6 +74,22 @@ def check_file_exists(check_id, path):
     return _check
 
 
+def check_herdr_integration(runtime, source_root):
+    """Verify the pinned Herdr asset markers and real entrypoint registrations."""
+    def _check():
+        try:
+            import herdr_integration
+            results = herdr_integration.source_checks(runtime, Path(source_root))
+        except Exception as exc:
+            return {"id": f"{runtime}.herdr.integration", "ok": False,
+                    "detail": f"integration check failed: {exc}"}
+        failed = [item for item in results if not item.get("ok")]
+        return {"id": f"{runtime}.herdr.integration", "ok": not failed,
+                "detail": "; ".join(item["detail"] for item in failed)
+                if failed else f"pinned Herdr v{herdr_integration.VERSIONS[runtime]} assets and registrations present"}
+    return _check
+
+
 def run(runtime, driver):
     """Run a driver's checks in order for one runtime.
 

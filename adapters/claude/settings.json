@@ -49,16 +49,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh blocked",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 fleet-interaction-state.py set --kind permission",
             "timeout": 10
           }
@@ -66,16 +56,6 @@
       }
     ],
     "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh working",
-            "timeout": 10
-          }
-        ]
-      },
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
@@ -268,27 +248,12 @@
             "timeout": 10
           }
         ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh release",
-            "timeout": 10
-          }
-        ]
       }
     ],
     "SessionStart": [
       {
         "matcher": "*",
         "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh idle",
-            "timeout": 10
-          },
           {
             "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 herdr-session-projection.py",
@@ -331,6 +296,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh session",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
@@ -358,11 +333,6 @@
       {
         "matcher": "*",
         "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh idle",
-            "timeout": 10
-          },
           {
             "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 herdr-session-projection.py",
@@ -395,11 +365,6 @@
       {
         "matcher": "*",
         "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" bash herdr-agent-state.sh working",
-            "timeout": 10
-          },
           {
             "type": "command",
             "command": "sh \"$HOME/.claude/hooks/run-hook.sh\" python3 herdr-session-projection.py",

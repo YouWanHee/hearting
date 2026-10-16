@@ -233,7 +233,11 @@ def read_snapshot(fd, timeout=10):
 
 
 def command(req, request_path, nonce, *, continuing, screen_ready):
-    """One typed command, always through peer-steward's clear/continue entry."""
+    """Use the checked attachment for one command to the exact booked Claude seat.
+
+    Clear and exact-native continuation enter here only through ``peer-steward`` after
+    booking and screen checks. Other continuation targets use the sealed pending-ref carrier.
+    """
     import session_tidy as st
     import session_tidy_clear as clear
     target = (req.get("seat") or {}).get("native")

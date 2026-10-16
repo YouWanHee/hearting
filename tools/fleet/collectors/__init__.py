@@ -420,7 +420,7 @@ def collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_fi
     # match; additive enrichment that never touches liveness or row existence.
     try:
         from . import herdr as _herdr
-        observed = _herdr.enrich(sessions)
+        observed = _herdr.enrich(sessions, wait_timeout=0.0 if fast_first else 0.2)
         if isinstance(observed, dict):
             observations["herdr"] = _observation_health(
                 job_key, "herdr", observed.get("last_error") if not observed.get("complete") else None)
