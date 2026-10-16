@@ -323,11 +323,13 @@ class IdleObserverTests(unittest.TestCase):
             with st.seat_lock(seat.key):
                 current = clear.read_reservation(seat.key)
                 current["continued"]["state"] = "sending"
+                current["continued"]["claim_id"] = "claim-status-only"
                 clear._write_reservation(current)
 
             st.run_hook("claude", "prompt", "sid-B", cwd=str(self.cwd),
                         prompt_text=clear.STATUS_ONLY_TEXT, now=1001)
-            self.assertTrue(clear._finish_continue(seat.key, booking["nonce"], "true"))
+            self.assertTrue(clear._finish_continue(seat.key, booking["nonce"], "true",
+                                                   claim_id="claim-status-only"))
             self.assertEqual(self.observe_claude(sid="sid-B", event_id="status-stop", now=1002),
                              "booking=skipped reason=not-rearmed")
 
