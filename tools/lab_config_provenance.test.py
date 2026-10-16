@@ -4,11 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("provenance", ROOT / "tools/lab-config-provenance.py")
 M = importlib.util.module_from_spec(SPEC); assert SPEC and SPEC.loader; SPEC.loader.exec_module(M)
-CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "AGENT_ARTIFACT_ROOT"}
+CLEAN_ENV = {
+    k: v for k, v in os.environ.items()
+    if k != "AGENT_ARTIFACT_ROOT"
+    and not k.startswith(("AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_DISPATCH_", "AGENT_ARTIFACT_"))
+}
 TOOL = str(ROOT / "tools/lab-config-provenance.py")
 
-def run_cli(*args, env=None):
-    return subprocess.run(["python3", TOOL, *args], env=env or CLEAN_ENV, capture_output=True, text=True)
+def run_cli(*args, env=None, cwd=None):
+    return subprocess.run(["python3", TOOL, *args], env=env or CLEAN_ENV, cwd=cwd,
+                          capture_output=True, text=True)
 
 def seal_cli(repo, config, slug, artifact_root, run_id=None, config_ref=None, env=None):
     args = ["seal", "--repo", str(repo), "--config", config, "--slug", slug, "--artifact-root", str(artifact_root)]
@@ -126,6 +131,81 @@ class TestProvenance(unittest.TestCase):
         snapshot = next(manifest_dir(artifact_root, "demo").glob("*.yaml")); snapshot.write_text("tampered")
         result3 = run_cli("verify", "--manifest", str(manifest))
         self.assertEqual(result3.returncode, 65)
+
+    def test_routed_seal_uses_declared_smoke_support_and_execution_worktree_head(self):
+        spec = importlib.util.spec_from_file_location(
+            "artifact_producer_fixture_for_lab_context", ROOT / "utilities/artifact_producer.test.py")
+        fixture_module = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixture_module)
+        inherited = {key: value for key, value in os.environ.items()
+                     if key.startswith(("AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_DISPATCH_", "AGENT_ARTIFACT_"))}
+        for key in inherited:
+            os.environ.pop(key, None)
+        fixture = fixture_module.ProducerTestBase("runTest")
+        fixture.setUp()
+        runtime_home = fixture._env.get("AGENT_HOME") or str(ROOT)
+        try:
+            os.environ["AGENT_HOME"] = runtime_home
+            source = Path(fixture._tmp.name) / "execution-source"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.email", "fixture@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "Fixture"], check=True)
+            (source / "configs").mkdir()
+            (source / "configs/a.yaml").write_text("route config\n")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "source head"], check=True)
+            source_head = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+
+            subprocess.run(["git", "init", "-q", str(fixture.root)], check=True)
+            subprocess.run(["git", "-C", str(fixture.root), "config", "user.email", "fixture@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(fixture.root), "config", "user.name", "Fixture"], check=True)
+            (fixture.root / "artifact-base.txt").write_text("artifact head\n")
+            subprocess.run(["git", "-C", str(fixture.root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(fixture.root), "commit", "-qm", "artifact head"], check=True)
+            artifact_head = subprocess.check_output(["git", "-C", str(fixture.root), "rev-parse", "HEAD"], text=True).strip()
+            self.assertNotEqual(source_head, artifact_head)
+
+            fixture.activate()
+            dispatch = fixture_module.dispatch_evidence()
+            for row in dispatch["tuples"]:
+                row["checked_worktree"] = str(source)
+            route = fixture_module.R.compile_route(
+                "autopilot-lab", "setup", "standard", cwd=source,
+                artifact_root=fixture.root, predicates=[], transport="headless",
+                tracking="tracked", tracked_gate_evidence=fixture_module.gate_evidence(),
+                dispatch_evidence=dispatch, slug="context-lab")
+            route_binding = fixture_module.L.admit_runtime_route(fixture.root, route)
+            route_file = Path(route_binding.route_file)
+            begun = fixture_module.P.begin(
+                fixture.root, route_file=route_file, capability="autopilot-lab",
+                intensity="standard", require_cycle=True)
+            node = next(row for row in route["nodes"] if row["id"] == "smoke")
+            env = dict(CLEAN_ENV)
+            env.update({
+                "AGENT_HOME": runtime_home,
+                "AGENT_DISPATCH_JOBS": str(fixture.jobs),
+                "AGENT_ARTIFACT_ROOT": str(fixture.root),
+                "AGENT_ROUTE_FILE": str(route_file), "AGENT_ROUTE_ID": route["route_id"],
+                "AGENT_ROUTE_NODE": node["id"], "AGENT_DISPATCH_WORKTREE": str(source),
+                **begun["env"],
+            })
+            result = run_cli("seal", "--config", "configs/a.yaml", "--slug", "demo",
+                             env=env, cwd=source)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads(result.stdout)
+            self.assertEqual(manifest["source_commit"], source_head)
+            self.assertEqual(manifest["source_git_state"], "clean")
+            self.assertFalse(manifest["source_dirty"])
+            expected_dir = Path(begun["cycle_dir"]) / "artifacts/reviews/smoke/experiments/demo/_internal/configs"
+            self.assertEqual(Path(manifest["snapshot_path"]).parent, expected_dir)
+            verify = run_cli("verify", "--manifest", str(expected_dir / f"{manifest['run_id']}.manifest.json"), env=env)
+            self.assertEqual(verify.returncode, 0, verify.stderr)
+        finally:
+            fixture.doCleanups()
+            for key in tuple(os.environ):
+                if key.startswith(("AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_DISPATCH_", "AGENT_ARTIFACT_")):
+                    os.environ.pop(key, None)
+            os.environ.update(inherited)
 
     def test_seal_rerun_does_not_touch_existing_manifest_or_snapshot_bytes(self):
         artifact_root = self._dir()

@@ -21,10 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 CLEAN_ENV = {k: v for k, v in os.environ.items() if not (
     k in {"AGENT_HOME", "AGENT_DISPATCH_JOBS"}
     or k.startswith("AGENT_DISPATCH_") or k.startswith("AGENT_ROUTE_")
-    or k.startswith("AGENT_ARTIFACT_")
+    or k.startswith("AGENT_REVIEW_") or k.startswith("AGENT_ARTIFACT_")
 )}
 CLEAN_ENV["AGENT_HOME"] = str(ROOT)
 CLEAN_ENV["CUDA_VISIBLE_DEVICES"] = ""  # authorization/lifecycle fixtures run CPU payloads
+for _key in tuple(os.environ):
+    if _key.startswith(("AGENT_DISPATCH_", "AGENT_ROUTE_", "AGENT_REVIEW_", "AGENT_ARTIFACT_")):
+        os.environ.pop(_key, None)
 RUNNER = ROOT / "utilities" / "resource-runner.py"
 ROUTER = ROOT / "utilities" / "capability-route.py"
 SMOKE = ROOT / "tools" / "smoke-attestation.py"
@@ -803,7 +806,44 @@ class TestRunner(unittest.TestCase):
         subprocess.run([
             sys.executable, str(SMOKE), "attest", "--input", str(self.repo / "config"),
             "--cwd", str(self.repo), "--output", str(self.attestation), "--", sys.executable, "-c", "pass",
-        ], check=True, stdout=subprocess.DEVNULL)
+        ], check=True, stdout=subprocess.DEVNULL, env=CLEAN_ENV)
+
+    def test_routed_start_defaults_registry_worktree_log_route_and_node(self):
+        import artifact_producer
+        jobs = self.base / "dispatch-jobs.log"
+        jobs.write_text("")
+        artifact_producer.activate(self.artifacts, repository_id="repo_" + "a" * 32,
+                                   artifact_root_id="root_" + "b" * 32)
+        route = artifact_producer.load_route(self.artifacts, self.route)
+        node = next(row for row in route["nodes"] if row.get("id") == "full-run")
+        begun = artifact_producer.begin(self.artifacts, route_file=self.route,
+            capability=route["capability"], intensity=route["effective_intensity"],
+            jobs=jobs, require_cycle=True)
+        env = {**CLEAN_ENV, "AGENT_HOME": str(ROOT),
+            "AGENT_DISPATCH_JOBS": str(jobs), "AGENT_DISPATCH_WORKTREE": str(self.repo),
+            "AGENT_ROUTE_FILE": str(self.route), "AGENT_ROUTE_ID": route["route_id"],
+            "AGENT_ROUTE_NODE": node["id"], "AGENT_ARTIFACT_ROOT": str(self.artifacts),
+            "AGENT_RESOURCE_RUN_INDEX": str(self.index), "AGENT_WORKFLOW_ROOT": str(self.base / "workflow"),
+            **begun["env"]}
+        command = [sys.executable, str(RUNNER), "start", "--run-id", "route-defaults",
+                   "--smoke-attestation", str(self.attestation), "--", sys.executable, "-c", "pass"]
+        result = subprocess.run(command, cwd=self.repo, env=env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = Path(begun["env"]["AGENT_ARTIFACT_OUTPUT_DIR"])
+        registry = output / "resource-runs.json"
+        self.assertTrue(registry.is_file())
+        self.assertIn("route-defaults", json.loads(registry.read_text())["runs"])
+        self.assertTrue((output / "logs/route-defaults.log").is_file())
+        reader = subprocess.run([sys.executable, str(ROOT / "utilities" / "artifact_reader.py"),
+            "resolve", "--cycle", begun["cycle_id"]], cwd=self.repo, env=env,
+            text=True, capture_output=True, timeout=20)
+        self.assertEqual(reader.returncode, 0, reader.stdout + reader.stderr)
+        self.assertTrue(json.loads(reader.stdout))
+        resolved = subprocess.run([sys.executable, str(ROOT / "utilities" / "artifact_producer.py"),
+            "resolve-output", "--bucket", "logs"], cwd=self.repo, env=env,
+            text=True, capture_output=True, timeout=20)
+        self.assertEqual(resolved.returncode, 0, resolved.stdout + resolved.stderr)
+        self.assertEqual(json.loads(resolved.stdout)["output_dir"], str(output / "logs"))
 
     def _stop_started_runs(self):
         try:

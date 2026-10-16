@@ -5,7 +5,8 @@ from pathlib import Path
 P=Path(__file__).with_name("smoke-attestation.py"); S=importlib.util.spec_from_file_location("smoke",P); M=importlib.util.module_from_spec(S); S.loader.exec_module(M)
 ROOT=Path(__file__).resolve().parents[1]
 PROV=ROOT/"tools"/"lab-config-provenance.py"
-CLEAN_ENV={k:v for k,v in os.environ.items() if k!="AGENT_ARTIFACT_ROOT"}
+CLEAN_ENV={k:v for k,v in os.environ.items() if not k.startswith((
+    "AGENT_ARTIFACT_","AGENT_ROUTE_","AGENT_REVIEW_","AGENT_DISPATCH_"))}
 
 def seal(repo, config, slug, artifact_root):
     result=subprocess.run([sys.executable,str(PROV),"seal","--repo",str(repo),"--config",config,
@@ -207,6 +208,56 @@ class TestSmoke(unittest.TestCase):
    with self.assertRaises(ValueError) as ctx:
        M.verify(data)
    self.assertIn("config snapshot row is not bound to an input", str(ctx.exception))
+
+ def test_routed_cli_defaults_and_standalone_required_paths(self):
+  fixture_spec=importlib.util.spec_from_file_location(
+   "artifact_producer_fixture_for_smoke_context",ROOT/"utilities/artifact_producer.test.py")
+  fixture_module=importlib.util.module_from_spec(fixture_spec); fixture_spec.loader.exec_module(fixture_module)
+  fixture=fixture_module.ProducerTestBase("runTest"); fixture.setUp()
+  runtime_home=fixture._env.get("AGENT_HOME") or str(ROOT)
+  try:
+   os.environ["AGENT_HOME"]=runtime_home
+   source=Path(fixture._tmp.name)/"source"; source.mkdir()
+   subprocess.run(["git","init","-q",str(source)],check=True)
+   subprocess.run(["git","-C",str(source),"config","user.email","fixture@example.invalid"],check=True)
+   subprocess.run(["git","-C",str(source),"config","user.name","Fixture"],check=True)
+   (source/"configs").mkdir(); (source/"configs/a.yaml").write_text("config\n")
+   subprocess.run(["git","-C",str(source),"add","."],check=True)
+   subprocess.run(["git","-C",str(source),"commit","-qm","source"],check=True)
+   fixture.activate()
+   dispatch=fixture_module.dispatch_evidence()
+   for row in dispatch["tuples"]: row["checked_worktree"]=str(source)
+   route=fixture_module.R.compile_route("autopilot-lab","setup","standard",cwd=source,
+    artifact_root=fixture.root,predicates=[],transport="headless",tracking="tracked",
+    tracked_gate_evidence=fixture_module.gate_evidence(),dispatch_evidence=dispatch,slug="smoke-cli")
+   route_file=Path(fixture_module.L.admit_runtime_route(fixture.root,route).route_file)
+   begun=fixture_module.P.begin(fixture.root,route_file=route_file,capability="autopilot-lab",
+    intensity="standard",require_cycle=True)
+   node=next(row for row in route["nodes"] if row["id"]=="smoke")
+   env={**CLEAN_ENV,"AGENT_HOME":runtime_home,"AGENT_DISPATCH_JOBS":str(fixture.jobs),
+    "AGENT_ARTIFACT_ROOT":str(fixture.root),"AGENT_ROUTE_FILE":str(route_file),
+    "AGENT_ROUTE_ID":route["route_id"],"AGENT_ROUTE_NODE":node["id"],
+    "AGENT_DISPATCH_WORKTREE":str(source),**begun["env"]}
+   command=[sys.executable,str(P),"attest","--input","configs/a.yaml","--",sys.executable,"-c","pass"]
+   first=subprocess.run(command,cwd=source,env=env,text=True,capture_output=True)
+   self.assertEqual(first.returncode,0,first.stderr)
+   expected=Path(begun["cycle_dir"])/"artifacts/reviews/smoke-attestation.json"
+   self.assertTrue(expected.is_file())
+   explicit=subprocess.run([sys.executable,str(P),"attest","--input","configs/a.yaml",
+    "--cwd",str(source),"--output",str(expected),"--",sys.executable,"-c","pass"],
+    cwd=source,env=env,text=True,capture_output=True)
+   self.assertEqual(explicit.returncode,0,explicit.stderr)
+   missing=subprocess.run([sys.executable,str(P),"attest","--input","configs/a.yaml",
+    "--",sys.executable,"-c","pass"],cwd=source,env=CLEAN_ENV,text=True,capture_output=True)
+   self.assertEqual(missing.returncode,2,missing.stderr)
+   standalone=Path(fixture._tmp.name)/"standalone-smoke.json"
+   standalone_result=subprocess.run([sys.executable,str(P),"attest","--input","configs/a.yaml",
+    "--cwd",str(source),"--output",str(standalone),"--",sys.executable,"-c","pass"],
+    cwd=source,env=CLEAN_ENV,text=True,capture_output=True)
+   self.assertEqual(standalone_result.returncode,0,standalone_result.stderr)
+   self.assertTrue(standalone.is_file())
+  finally:
+   fixture.doCleanups()
 
  def test_T_G4_6_degenerate_source_equals_snapshot_passes_with_one_row(self):
   with tempfile.TemporaryDirectory() as td:

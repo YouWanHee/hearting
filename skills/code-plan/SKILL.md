@@ -17,13 +17,13 @@ metadata:
 
 Use the deepest eligible planning profile selected by the active adapter when cross-file reasoning or call-site analysis would benefit from it.
 
-> **Stage-session entry (`standard+` dispatch, spec/stage-dispatch SD-2)**: Run in-session or as an isolated dispatch-depth-2 stage worker dispatched by the `autopilot-code` conductor. Inputs are the task description and `<artifact-root>/plans/`; never depend on prior-stage conversation. The write class is root `plan.md`, root `checklist.md`, an existing or explicitly requested audience-language companion such as legacy `plan_ko.md`, and `_internal/plan_reviews/`. The stage runs as the `plan/plan-author` unit (the node's unit); independent plan review is the sibling `plan-check` node dispatched by the conductor, not an in-stage delegation.
+> **Stage-session entry (`standard+` dispatch, spec/stage-dispatch SD-2)**: Run in-session or as an isolated dispatch-depth-2 stage worker dispatched by the `autopilot-code` conductor. Inputs are the task and paths supplied by the route; never depend on prior-stage conversation. The stage uses its node's declared outputs and write scope. Independent plan review is the sibling `plan-check` node, not an in-stage delegation.
 
 > **Language rule**: Follow the audience and artifact language contract in [arguments-and-decisions.md#language-rule](../autopilot-code/references/arguments-and-decisions.md). Write the canonical plan in the selected artifact language; do not generate a language mirror merely because the skill source is English or the conversation uses a particular language.
 
 ## Pre-Check
 
-Search `$AGENT_ARTIFACT_OUTPUT_DIR/plans/` for a similar plan and branch on its frontmatter status:
+For standalone planning, search `$AGENT_ARTIFACT_OUTPUT_DIR/plans/` for a similar plan and branch on its frontmatter status:
 
 - `active`: Ask whether to continue the active plan or create a new one. Do not proceed until that genuine choice is resolved.
 - `done` or `failed`: Note it as a reference and create a new plan without pausing.
@@ -39,9 +39,8 @@ Run the `plan/plan-author` unit with this task, adapted only for the selected ar
 Plan mode. Create a new implementation plan.
 
 Task: {$ARGUMENTS}
-Intent: {absolute path of shards/frame/intent.md when the route ran a frame gate — read it first; its Decisions bind the plan}
-Save canonical plan to: $AGENT_ARTIFACT_OUTPUT_DIR/plans/{YYYY-MM-DD}_{short-task-name}/plan.md
-Save execution checklist to: $AGENT_ARTIFACT_OUTPUT_DIR/plans/{YYYY-MM-DD}_{short-task-name}/checklist.md
+Intent: {path supplied by the route when present — its Decisions bind the plan}
+Save canonical plan and checklist to: the plan node's declared outputs
 Artifact language: {selected audience or conversation language}
 Date: {YYYY-MM-DD}
 {If a done/failed/partial plan exists: "Reference previous plan: [path], status: [status]"}
@@ -70,7 +69,7 @@ Add a `slices` block only when the work splits into 2–4 packages that own exac
 
 Derive verification rigor from the caller's `--intensity` and plan risk under [CONVENTIONS §1.1](../../core/CONVENTIONS.md#11-verification-rigor-tiers). Rigor does not select this stage: `code-plan` runs only after the caller chooses a durable `standard+` graph. `direct` skips it; `quick` uses a one-shot worker with an inline micro-plan and plan-check-lite.
 
-Set `{log_dir}` to the directory containing root `plan.md`; for example, `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_task/plan.md` resolves to `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_task/`. Run `mkdir -p {log_dir}/_internal/plan_reviews` before independent review.
+Use the supplied `plan.md` path to locate its sibling checklist and logs. The independent `plan-check` node owns its review output.
 
 | Rigor | Plan-check action | Correction budget |
 |---|---|---|
@@ -83,9 +82,9 @@ Set `{log_dir}` to the directory containing root `plan.md`; for example, `$AGENT
 After the `plan/plan-author` unit returns:
 
 1. Check whether the selected graph requires independent review. Otherwise run an inline plan-check.
-2. When independent review is required, the conductor dispatches the `plan-check` sibling node (unit `qa/plan-review`), which writes `{log_dir}/_internal/plan_reviews/round_{N}.md`. Use bounded separate reviewers only when the owner-worker graph and rigor select them.
+2. When independent review is required, the conductor dispatches the `plan-check` sibling node (unit `qa/plan-review`), which writes its declared review output. Use bounded separate reviewers only when the owner-worker graph and rigor select them.
 3. If blocking issues exist, run **one batched correction** through the `code-refine` boundary: close every 🔴 of `round_{N}.md` together, including the follow-on gaps the review named. Then dispatch the re-review as the next ordinary round — the shared `review_round_cap.round_budget` admits it like any other round, `round_kind=correction`, with no separate "round N+1" special case — carrying a `Round protocol` block naming the round number and `round_{N}.md`; it is a closure check (prior 🔴 closed? delta clean?), not a fresh independent pass. Never redispatch the full `plan` node for a correction. The runtime auto-records the plan's own revision marker (`recorded_by=runtime-auto`) before admitting that round whenever `plan-check`'s last round was a blocking FAIL whose finding basis-verifies against the plan's gate evidence (SD-154 rule 8); when that basis verification cannot run itself, the revision stays unrecorded and `plan-check`'s launch is refused `completion-evidence-revised-unrecorded` with `next_action` naming `capability-route.py revise --route <route> --node plan --evidence <evidence-path> --basis review-findings|user-direction|owner-correction` — run it, or record the revision another way, before redispatching. Budget: at most one correction at standard or the selected thorough/adversarial budget; do not loop solely because rigor is high.
-4. If concerns remain after the budget (unit = **verdict round** — a crashed or capacity-dead round never spends it, and two verdict-less rounds in a row bind the node to `verdictless-bound` instead, per `CONVENTIONS §1.1`), `plan-check` may still admit exactly one further round as a `closure-check` — never a second ordinary correction — when the last blocking round's FAIL is exactly the one a revision names as its answer. Once that is also unavailable, add the remaining concerns to the plan's risk or unresolved section and continue only when the caller can safely own the risk. When the last round still reported blocking findings, write `{log_dir}/_internal/plan_reviews/round_{N}.owner-closure.md` (frontmatter `verdict: closed-by-owner`, `node: plan-check`, `gate: code-plan-check`; body naming every blocking round's attempt id, the `round_{N}.md` it produced, and each finding's disposition) and complete `plan-check` with that record as `--evidence` against the last blocking attempt row; the gate refuses it while budget remains.
+4. If concerns remain after the budget (unit = **verdict round** — a crashed or capacity-dead round never spends it, and two verdict-less rounds in a row bind the node to `verdictless-bound` instead, per `CONVENTIONS §1.1`), `plan-check` may still admit exactly one further round as a `closure-check` — never a second ordinary correction — when the last blocking round's FAIL is exactly the one a revision names as its answer. Once that is also unavailable, add the remaining concerns to the plan's risk or unresolved section and continue only when the caller can safely own the risk. When the last round still reported blocking findings, use the closure evidence path supplied by the route and complete `plan-check` against the last blocking attempt row; the gate refuses it while budget remains.
 
 Record any user-facing pause, including active-plan ambiguity, for the pipeline summary.
 

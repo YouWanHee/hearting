@@ -14,48 +14,50 @@ import artifact_producer as P  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# D-86 enumerated target list (PRD 29.1 / plan Phase S4): exactly the write-describing
-# sentences the enumerated line numbers named, matched by sentence content, not line
-# number. Each fragment must appear verbatim, cycle-relative, in its file.
+# D-86 enumerated write-contract targets, revised for the current standalone and
+# routed cycle semantics. Match the meaning-owning sentence, not historical line
+# numbers or superseded per-capability path recipes.
 CYCLE_RELATIVE_TARGETS = [
     ("capabilities/autopilot-spec.md",
      "Spec work writes to `$AGENT_ARTIFACT_OUTPUT_DIR/spec/`. The canonical current "
      "blueprint is always `$AGENT_ARTIFACT_OUTPUT_DIR/spec/prd.md`."),
     ("capabilities/autopilot-code.md",
-     "Code work normally writes to `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`, "
-     "even when a `spec/` directory exists."),
+     "The standalone default is `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`, "
+     "even when a `spec/` directory exists. Routed stages use their sealed node outputs "
+     "and write scope; `AGENT_ARTIFACT_OUTPUT_DIR` supplies only the cycle base."),
     ("capabilities/autopilot-code.md",
-     "- `standard+`: create or resume `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/`."),
+     "2. **write only inside the open cycle.** Every durable artifact goes under the "
+     "current node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`."),
     ("capabilities/autopilot-research.md",
-     "Research work writes to `$AGENT_ARTIFACT_OUTPUT_DIR/research/<topic>/`."),
+     "The standalone default is `$AGENT_ARTIFACT_OUTPUT_DIR/research/<topic>/`. Routed "
+     "stages use their declared outputs; the cycle output directory is only the base."),
     ("capabilities/autopilot-research.md",
-     "2. Compile and bind the selected route, then resolve or create "
-     "`$AGENT_ARTIFACT_OUTPUT_DIR/research/<topic>/`; if resuming, read `pipeline_state.yaml`."),
+     "1. The launcher prepares the route's cycle and carries its exact context."),
     ("capabilities/autopilot-lab.md",
-     "`$AGENT_ARTIFACT_OUTPUT_DIR/experiments/<slug>/_internal/configs/` — there is no `--out`."),
+     "2. **write only inside the open cycle.** Every durable artifact uses the selected "
+     "node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`."),
     ("capabilities/autopilot-lab.md",
-     "(`$AGENT_ARTIFACT_OUTPUT_DIR/experiments/<slug>/_internal/configs/<run_id>.manifest.json`)"),
+     "Config snapshots and manifests keep the `experiments/<slug>/_internal/configs/` "
+     "suffix beneath that selected subtree."),
     ("capabilities/code-test.md",
-     "evidence only under `$AGENT_ARTIFACT_OUTPUT_DIR/plans/<date>_<slug>/test_logs/` and"),
+     "When invoked from a `standard+` `autopilot-code` stage cycle, write verification "
+     "evidence only to the test node's declared outputs and write scope."),
     ("capabilities/analyze-project.md",
      "writes structured artifacts to `$AGENT_ARTIFACT_OUTPUT_DIR/analysis_project/`. Invoke it"),
     ("skills/code-plan/SKILL.md",
-     "Search `$AGENT_ARTIFACT_OUTPUT_DIR/plans/` for a similar plan and branch on its frontmatter status:"),
+     "For standalone planning, search `$AGENT_ARTIFACT_OUTPUT_DIR/plans/` for a similar "
+     "plan and branch on its frontmatter status:"),
     ("skills/code-plan/SKILL.md",
-     "Save canonical plan to: $AGENT_ARTIFACT_OUTPUT_DIR/plans/{YYYY-MM-DD}_{short-task-name}/plan.md"),
+     "Save canonical plan and checklist to: the plan node's declared outputs"),
     ("skills/code-plan/SKILL.md",
-     "Save execution checklist to: $AGENT_ARTIFACT_OUTPUT_DIR/plans/{YYYY-MM-DD}_{short-task-name}/checklist.md"),
+     "Use the supplied `plan.md` path to locate its sibling checklist and logs."),
     ("skills/code-plan/SKILL.md",
-     "Set `{log_dir}` to the directory containing root `plan.md`; for example, "
-     "`$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_task/plan.md` resolves to "
-     "`$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_task/`."),
+     "The stage uses its node's declared outputs and write scope."),
     ("skills/code-execute/SKILL.md",
      "Example: `$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor_engine/plan.md` → "
      "`$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor_engine/`"),
     ("skills/code-test/SKILL.md",
-     "Plan path: use the task root above `plan/`; for example, "
-     "`$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor/plan.md` → "
-     "`$AGENT_ARTIFACT_OUTPUT_DIR/plans/2026-03-18_refactor/`."),
+     "Write a detailed test log to: the code-test node's declared report output"),
     ("skills/code-report/SKILL.md",
      "5. Update $AGENT_ARTIFACT_OUTPUT_DIR/analysis_project/code/ for successful steps "
      "only when that directory already exists."),
@@ -92,34 +94,69 @@ CYCLE_RELATIVE_TARGETS = [
      "- `$AGENT_ARTIFACT_OUTPUT_DIR/research/<topic>/*` from `autopilot-research`;"),
 ]
 
-CAPABILITY_ENTRY_DOCS = [
-    "capabilities/autopilot-spec.md",
-    "capabilities/autopilot-code.md",
-    "capabilities/autopilot-research.md",
-    "capabilities/autopilot-lab.md",
-    "capabilities/code-test.md",
-    "capabilities/analyze-project.md",
+CAPABILITY_CYCLE_CONTRACTS = [
+    ("capabilities/autopilot-spec.md", (
+        "1. **begin before the first write.** After route compile/bind, depth-0 runs",
+    )),
+    ("capabilities/autopilot-code.md", (
+        "1. **prepare the route's cycle.** Registered frame/owner launch prepares or "
+        "resumes the route's cycle and carries its exact `AGENT_ARTIFACT_*` context.",
+        "2. **write only inside the open cycle.** Every durable artifact goes under the "
+        "current node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`.",
+    )),
+    ("capabilities/autopilot-research.md", (
+        "1. The launcher prepares the route's cycle and carries its exact context.",
+        "2. Routed stages write to their declared outputs and write scope under the "
+        "supplied cycle output directory; the producer owns cycle paths.",
+    )),
+    ("capabilities/autopilot-lab.md", (
+        "1. The launcher prepares the route's cycle and carries its exact context.",
+        "2. **write only inside the open cycle.** Every durable artifact uses the selected "
+        "node's declared outputs under `AGENT_ARTIFACT_OUTPUT_DIR`.",
+    )),
+    ("capabilities/code-test.md", (
+        "When invoked from a `standard+` `autopilot-code` stage cycle, write verification "
+        "evidence only to the test node's declared outputs and write scope.",
+        "the resolver applies the test node's declared outputs and write scope.",
+    )),
+    ("capabilities/analyze-project.md", (
+        "1. **begin before the first write.** After the route is compiled and bound,",
+        "2. **write only inside the open cycle.** Every durable artifact goes under",
+    )),
 ]
 
 # D-86 negative-probe reason tokens: must stay byte-identical (fleet_cutover_gate's
 # negative probe compares them as literal strings).
 REASON_TOKENS = ("legacy-top-level-write-denied", "shared-revision-immutable")
 
-_BEGIN_RE = re.compile(r"\bbegin\b", re.IGNORECASE)
+def _normalized(text):
+    return re.sub(r"\s+", " ", text).strip()
 
 
 class WordingTargetsTest(unittest.TestCase):
     def test_a16_8_listed_docs_use_cycle_relative_expressions(self):
         for rel_path, fragment in CYCLE_RELATIVE_TARGETS:
             content = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-            self.assertIn(fragment, content, f"{rel_path}: missing cycle-relative fragment")
-            self.assertIn("$AGENT_ARTIFACT_OUTPUT_DIR", fragment)
+            self.assertIn(_normalized(fragment), _normalized(content),
+                          f"{rel_path}: missing current artifact-output fragment")
+            self.assertTrue(
+                "$AGENT_ARTIFACT_OUTPUT_DIR" in fragment
+                or "cycle" in fragment.lower()
+                or "declared outputs" in fragment.lower()
+                or "declared report output" in fragment.lower()
+                or "selected subtree" in fragment.lower()
+                or "`plan.md` path" in fragment.lower(),
+                f"{rel_path}: target does not describe a standalone base or routed cycle output",
+            )
             self.assertNotIn("<artifact-root>", fragment)
 
-    def test_a16_8_each_capability_entry_doc_mentions_begin(self):
-        for rel_path in CAPABILITY_ENTRY_DOCS:
+    def test_a16_8_each_capability_entry_doc_describes_its_routed_cycle_lifecycle(self):
+        for rel_path, fragments in CAPABILITY_CYCLE_CONTRACTS:
             content = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-            self.assertTrue(_BEGIN_RE.search(content), f"{rel_path}: no mention of begin")
+            normalized = _normalized(content)
+            for fragment in fragments:
+                self.assertIn(_normalized(fragment), normalized,
+                              f"{rel_path}: missing routed cycle contract: {fragment}")
 
 
 class HintContractTest(unittest.TestCase):

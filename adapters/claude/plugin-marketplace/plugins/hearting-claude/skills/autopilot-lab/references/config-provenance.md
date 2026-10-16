@@ -17,8 +17,10 @@ label; `resolve` always exposes the actually-used `roots` and
 have remapped anything.
 
 Before a full run, resolve a config without root fallback and seal it with
-`tools/lab-config-provenance.py`. The seal copies the exact bytes to a
-directory derived from a required `--artifact-root` and writes a manifest
+`tools/lab-config-provenance.py`. Routed commands take the repository and
+artifact context from dispatch; standalone commands keep explicit `--repo`
+and `--artifact-root` arguments. The seal copies the exact bytes into the
+selected node's declared config-support subtree and writes a manifest
 containing `schema_version` (2), `config_ref`, `run_id`, `source_path`,
 `source_sha256`, `source_commit`, `source_dirty`, `source_git_state`,
 `snapshot_path`, and `snapshot_sha256`. `verify` is fail-closed; retries with
@@ -28,10 +30,12 @@ non-goal (Linux-only harness).
 Example:
 
 ```sh
-python3 tools/lab-config-provenance.py resolve --repo . --ref exp:demo/train.yaml
+python3 tools/lab-config-provenance.py resolve --ref exp:demo/train.yaml
 python3 tools/lab-config-provenance.py run-id --slug demo --config-ref exp:demo/train.yaml --config-sha256 HASH
-python3 tools/lab-config-provenance.py seal --repo . --config exp:demo/train.yaml --slug demo --artifact-root "$ARTIFACT_ROOT"
+python3 tools/lab-config-provenance.py seal --config exp:demo/train.yaml --slug demo
 ```
+
+For a standalone invocation, pass `--repo` and `--artifact-root` explicitly.
 
 `--run-id` is optional on `seal` — omit it to have the tool emit the computed
 run ID; if given, it must match the computed value exactly. `run-id` requires
@@ -60,11 +64,9 @@ hash-named snapshot beside the manifest), the exact `<run_id>.manifest.json`
 filename, and that the slug recovered from that chain, together with
 `config_ref` and `source_sha256`, recomputes the same `run_id`. Move the
 manifest together with its snapshot *and* keep the `experiments/<slug>`
-parents intact. If `experiments` itself is a symlink to a real sibling
-directory, address the manifest via the documented derived path
-(`<artifact-root>/experiments/<slug>/_internal/configs/<run_id>.manifest.json`)
-— the fully-resolved path is rejected, since resolution collapses the
-`experiments` segment that `seal` itself recorded.
+parents intact. The same suffix is accepted beneath the routed config-support
+subtree. Verification accepts historical top-level manifests and preserves the
+manifest's recorded path and bytes.
 
 The smoke attestation now binds both the config snapshot and its source:
 `payload()` verifies the config manifest against the full `verify` contract

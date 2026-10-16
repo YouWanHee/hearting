@@ -5309,8 +5309,12 @@ class RevisedAncestorSuccessorTest(unittest.TestCase):
                     successor["nodes"][0]["completion_gate"],jobs=self._jobs)["passed"])
     D.completion_marker_gate(str(successor_path),"execute","dry-run",
                              Path(self._tmp_home.name),self._jobs)
-    implementation=R.build_continuation_route(successor,resume_from_node="execute",
-       requested_boundary="execute",reason="continue after fresh review",artifact_root=root)
+    with mock.patch.object(
+       D,"attempt_process_quiescence",
+       return_value=D.ProcessQuiescence("quiescent","fixture-owner-ended"),
+    ):
+     implementation=R.build_continuation_route(successor,resume_from_node="execute",
+        requested_boundary="execute",reason="continue after fresh review",artifact_root=root)
     self.assertIsNone(implementation["first_runnable_blocker"])
     self.assertEqual(implementation["ancestor_plan_refresh"],proof)
     self.assertEqual([row["route_id"] for row in R.review_lineage_routes(implementation,"impl-review")],
