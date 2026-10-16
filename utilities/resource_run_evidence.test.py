@@ -42,6 +42,23 @@ class ResourceRunEvidenceTest(unittest.TestCase):
         self.assertFalse((self.base / "run.json").exists())
         self.assertFalse(self.base.exists())
 
+    def test_mapped_output_rejects_symlinked_parent_for_resolution_and_write(self):
+        armed = self.route(mapped=True)
+        sibling = self.base / "parts/autopilot-lab/eval-run"
+        sibling.mkdir(parents=True)
+        sibling_record = sibling / "run.json"
+        original = b'{"owner-document":"leave unchanged"}\n'
+        sibling_record.write_bytes(original)
+        mapped_parent = self.base / "parts/autopilot-lab/full-run"
+        mapped_parent.symlink_to(sibling, target_is_directory=True)
+
+        with self.assertRaisesRegex(ValueError, r"^resource-output-symlink:"):
+            evidence.paths(armed)
+        with self.assertRaisesRegex(ValueError, r"^resource-output-symlink:"):
+            evidence.write(armed, {})
+
+        self.assertEqual(sibling_record.read_bytes(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

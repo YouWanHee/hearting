@@ -25,6 +25,25 @@ def outputs(armed):
     return names
 
 
+def _reject_symlink_components(base, path):
+    """Reject symlinks from the artifact base through an output's parent/leaf."""
+    base = Path(os.path.abspath(base))
+    path = Path(os.path.abspath(path))
+    try:
+        relative = path.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("resource-output-path-escape:" + str(path)) from exc
+    current = base
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("resource-output-symlink:" + str(path))
+
+
 def paths(armed, *, prepare=False):
     base = armed.get("artifact_base")
     if not base:
@@ -63,12 +82,12 @@ def paths(armed, *, prepare=False):
     for path in [runtime, *expected]:
         if not path.resolve().is_relative_to(base.resolve()):
             raise ValueError("resource-output-path-escape:" + str(path))
-        if path.is_symlink():
-            raise ValueError("resource-output-symlink:" + str(path))
+        _reject_symlink_components(base, path)
         if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
             raise ValueError("resource-output-not-regular:" + str(path))
         if prepare:
             path.parent.mkdir(parents=True, exist_ok=True)
+            _reject_symlink_components(base, path)
             # Check an actual create, rather than assuming an access bit grants it.
             fd, probe = tempfile.mkstemp(prefix=".resource-write-", dir=path.parent)
             os.close(fd)
@@ -107,6 +126,7 @@ def write(armed, row, *, preserve=False):
         return {**receipt, "runtime_only": False}
     path = Path(receipt["runtime_output"])
     path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(armed["artifact_base"], path)
     document, preimage = read_document(path)
     # Existing owner documents remain their scientific artifact, byte for byte.
     # The caller has revalidated their exact execution against the runner registry
@@ -143,6 +163,7 @@ def write(armed, row, *, preserve=False):
         _, current = read_document(path)
         if current != preimage:
             raise ValueError("resource-run-document-changed")
+        _reject_symlink_components(armed["artifact_base"], path)
         if preimage is None:
             # Publication never overwrites a file arriving since the observation.
             os.link(temporary, path)

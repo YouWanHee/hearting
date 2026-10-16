@@ -798,17 +798,34 @@ def _lab_run_root(route: Mapping[str, object], node: str) -> Path | None:
         raise ExecutionAccessError("execution-access-compute-inventory-invalid", str(exc)) from exc
 
 
+_TOPOLOGY_REGISTRY_CACHE: dict[str, tuple[object, object]] = {}
+
+
+def _topology_registry():
+    topology_path = (Path(__file__).resolve().parents[1] / "tools" / "capability_topology.py").resolve()
+    key = str(topology_path)
+    cached = _TOPOLOGY_REGISTRY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location("_execution_capability_topology", topology_path)
+    if spec is None or spec.loader is None:
+        return None
+    topology = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(topology)
+    registry = topology.load_registry()
+    cached = (topology, registry)
+    _TOPOLOGY_REGISTRY_CACHE[key] = cached
+    return cached
+
+
 def compute_execution_scope(route: Mapping[str, object], *, node: str | None = None,
                             owner: bool = True) -> bool:
     """Resolve compute access from each sealed node's registered origin stage."""
     try:
-        topology_path = Path(__file__).resolve().parents[1] / "tools" / "capability_topology.py"
-        spec = importlib.util.spec_from_file_location("_execution_capability_topology", topology_path)
-        if spec is None or spec.loader is None:
+        loaded = _topology_registry()
+        if loaded is None:
             return False
-        topology = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(topology)
-        registry = topology.load_registry()
+        topology, registry = loaded
     except (OSError, ValueError, ImportError):
         return False
 
