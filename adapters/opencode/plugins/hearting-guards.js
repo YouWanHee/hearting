@@ -545,6 +545,18 @@ function ownNativePaneOrigin() {
   } catch { return null }
 }
 
+function sameNativePaneContext(ctx) {
+  const origin = paneNativeOrigin
+  if (!origin || origin.state !== "pending" || origin.pid !== process.pid) return false
+  try {
+    const stat = readPaneProc("/proc/self/stat", 4096).toString("utf8")
+    const split = stat.lastIndexOf(") ")
+    const start = stat.slice(split + 2).trim().split(/\s+/)[19]
+    return split >= 0 && String(start) === String(origin.start)
+      && realpathSync(ctx.directory) === origin.directory
+  } catch { return false }
+}
+
 let paneNativeOrigin // undefined means not yet read; null is unsupported, never SDK-filled.
 const paneContexts = new WeakMap()
 let paneOwningContext = null
@@ -560,7 +572,10 @@ function registerPaneContext(ctx) {
     startupRunning: false }
   paneContexts.set(ctx, binding)
   if (ownsOrigin) {
-    if (paneOwningContext) retirePaneContext(paneOwningContext)
+    if (paneOwningContext) {
+      const preserveOrigin = sameNativePaneContext(paneOwningContext) && sameNativePaneContext(ctx)
+      retirePaneContext(paneOwningContext, preserveOrigin)
+    }
     paneOwningContext = ctx
     paneProjectionGeneration++
     binding.generation = paneProjectionGeneration
@@ -569,7 +584,7 @@ function registerPaneContext(ctx) {
   return binding
 }
 
-function retirePaneContext(ctx) {
+function retirePaneContext(ctx, preserveOrigin = false) {
   const binding = paneContexts.get(ctx)
   if (!binding) return
   if (binding.startupTimer !== null) {
@@ -581,7 +596,7 @@ function retirePaneContext(ctx) {
   if (paneOwningContext === ctx) {
     paneProjectionGeneration++
     paneOwningContext = null
-    if (paneNativeOrigin?.state === "pending") paneNativeOrigin.state = "invalidated"
+    if (paneNativeOrigin?.state === "pending" && !preserveOrigin) paneNativeOrigin.state = "invalidated"
   }
   // A live publisher survives disposal. Closing its observer is not child exit.
 }
@@ -1263,13 +1278,102 @@ function reconnectPeerObligations() {
 
 const pendingPeerBusy = new Set()
 const pendingPeerStatus = new Map()
+const pendingPeerTraceAt = new Map()
+
+function pendingPeerTrace(ctx, sid, stage, reason, extra = {}) {
+  const key = `${sid}:${stage}:${reason}`
+  const now = Date.now()
+  if (now < (pendingPeerTraceAt.get(key) || 0)) return
+  if (pendingPeerTraceAt.size >= 256) pendingPeerTraceAt.delete(pendingPeerTraceAt.keys().next().value)
+  pendingPeerTraceAt.set(key, now + 60000)
+  const traceReason = `native-peer-delivery:${stage}:${reason}`
+  peerIdentityLog(ctx, "native-peer-delivery", traceReason, {
+    module: "hearting-native-peer-delivery", diagnostic: traceReason,
+    sessionID: sid, stage, delivery_reason: reason, ...extra,
+  })
+}
+
+function pendingPeerSdkMeta(result, sid) {
+  const hasData = !!result && typeof result === "object" && Object.hasOwn(result, "data")
+  const data = hasData ? result.data : undefined
+  const info = data?.info
+  return {
+    response_ok: result?.response?.ok === true,
+    response_status: Number.isFinite(result?.response?.status) ? result.response.status : null,
+    sdk_error_name: typeof result?.error?.name === "string" ? result.error.name : null,
+    data_present: hasData,
+    data_type: Array.isArray(data) ? "array" : data === null ? "null" : typeof data,
+    data_count: Array.isArray(data) ? data.length : undefined,
+    data_key_count: data && typeof data === "object" && !Array.isArray(data)
+      ? Object.keys(data).length : undefined,
+    message_role: typeof info?.role === "string" ? info.role : undefined,
+    message_session_match: typeof info?.sessionID === "string" ? info.sessionID === sid : undefined,
+    message_id_present: typeof info?.id === "string" && !!info.id,
+    part_types: Array.isArray(data?.parts)
+      ? [...new Set(data.parts.filter((part) => typeof part?.type === "string").map((part) => part.type))]
+      : undefined,
+  }
+}
 
 function pendingPeerRoot(ctx, sid) {
   const origin = paneNativeOrigin
   const binding = paneContexts.get(ctx)
   if (!binding?.active || !binding.ownsOrigin || paneOwningContext !== ctx
-      || !origin || origin.state === "invalidated" || origin.sid !== sid) return false
+      || !origin || origin.state === "invalidated") return false
+  if (origin.sid !== sid && !(origin.bare && tuiSelectionRead(sid))) return false
   try { return realpathSync(ctx.directory) === origin.directory } catch { return false }
+}
+
+function pendingPeerRootBlockReason(ctx, sid) {
+  const origin = paneNativeOrigin
+  const binding = paneContexts.get(ctx)
+  if (!origin) return "origin-unavailable"
+  if (!binding?.active) return "binding-inactive"
+  if (!binding.ownsOrigin) return "binding-not-owner"
+  if (paneOwningContext !== ctx) return "context-not-owner"
+  if (origin.state === "invalidated") return "origin-invalidated"
+  if (origin.sid !== sid) {
+    if (!origin.bare) return "argv-session-mismatch"
+    if (!tuiSelectionRead(sid)) return "tui-selection-mismatch"
+  }
+  try {
+    if (realpathSync(ctx.directory) !== origin.directory) return "directory-mismatch"
+  } catch { return "directory-unavailable" }
+  return "owned"
+}
+
+function pendingPeerSdkData(result) {
+  if (!result || typeof result !== "object" || result.error != null
+      || result.response?.ok !== true || result.response.status !== 200
+      || !Object.hasOwn(result, "data")) return null
+  return result.data
+}
+
+function pendingPeerSdkNoContent(result) {
+  return !!result && typeof result === "object" && result.error == null
+    && result.response?.ok === true && result.response.status === 204
+}
+
+function pendingPeerIsNativeRoot(info, sid, origin) {
+  if (!info || typeof info !== "object" || Array.isArray(info)
+      || info.id !== sid || typeof info.projectID !== "string"
+      || typeof info.directory !== "string" || typeof info.slug !== "string"
+      || typeof info.title !== "string"
+      || typeof info.version !== "string" || !info.time
+      || !Number.isFinite(info.time.created) || !Number.isFinite(info.time.updated)
+      || (info.parentID !== undefined && info.parentID !== null)) return false
+  try { return realpathSync(info.directory) === origin.directory } catch { return false }
+}
+
+function pendingPeerNativeStatusType(statuses, sid) {
+  if (!statuses || typeof statuses !== "object" || Array.isArray(statuses)) return null
+  const valid = (value) => value && typeof value === "object" && !Array.isArray(value)
+    && (value.type === "idle" || value.type === "busy"
+      || (value.type === "retry" && Number.isFinite(value.attempt)
+        && typeof value.message === "string" && Number.isFinite(value.next)))
+  if (!Object.entries(statuses).every(([id, value]) => id && valid(value))) return null
+  const current = statuses[sid]
+  return current === undefined ? "idle" : current.type
 }
 
 function nativeMessageTime(info) {
@@ -1278,42 +1382,111 @@ function nativeMessageTime(info) {
 }
 
 async function pendingPeerDelivery(ctx, sid) {
-  if (!sid || pendingPeerBusy.has(sid) || isWorkerSession()) return "inactive-session"
+  const inFlight = !!sid && pendingPeerBusy.has(sid)
+  const worker = isWorkerSession()
+  if (!sid || inFlight || worker) {
+    if (sid && (paneNativeOrigin?.sid === sid || paneNativeOrigin?.bare)) pendingPeerTrace(ctx, sid, "guard", "inactive-session", {
+      in_flight: inFlight, worker_session: worker,
+    })
+    return "inactive-session"
+  }
   const client = ctx.client?.session
-  if (!pendingPeerRoot(ctx, sid) || pendingPeerStatus.get(sid) === "blocked"
-      || pendingPeerStatus.get(sid) === "working") return "root-or-status-blocked"
+  if (!pendingPeerRoot(ctx, sid)) {
+    const origin = paneNativeOrigin
+    if (origin?.sid === sid || origin?.bare) {
+      const binding = paneContexts.get(ctx)
+      let directoryMatches = false
+      try { directoryMatches = realpathSync(ctx.directory) === origin.directory } catch {}
+      pendingPeerTrace(ctx, sid, "guard", `origin-${pendingPeerRootBlockReason(ctx, sid)}`, {
+        origin_state: origin.state, origin_bare: origin.bare,
+        origin_sid_match: origin.sid === sid,
+        tui_selection_record_valid: origin.bare ? !!tuiSelectionRead(sid) : null,
+        origin_pid_matches_process: origin.pid === process.pid,
+        origin_birth_valid: /^\d+$/.test(String(origin.start || "")),
+        binding_active: !!binding?.active, binding_owns_origin: !!binding?.ownsOrigin,
+        owning_context_match: paneOwningContext === ctx, directory_matches: directoryMatches,
+      })
+    }
+    return "root-or-status-blocked"
+  }
+  if (pendingPeerStatus.get(sid) === "blocked" || pendingPeerStatus.get(sid) === "working") {
+    if (paneNativeOrigin?.sid === sid) pendingPeerTrace(ctx, sid, "guard", "locally-blocked", {
+      local_status: pendingPeerStatus.get(sid),
+    })
+    return "root-or-status-blocked"
+  }
   if (typeof client?.messages !== "function" || typeof client?.prompt !== "function"
       || typeof client?.promptAsync !== "function" || typeof client?.get !== "function"
-      || typeof client?.status !== "function") return "native-api-unavailable"
+      || typeof client?.status !== "function") {
+    if (paneNativeOrigin?.sid === sid) pendingPeerTrace(ctx, sid, "guard", "native-api-unavailable", {
+      has_status: typeof client?.status === "function", has_get: typeof client?.get === "function",
+      has_messages: typeof client?.messages === "function", has_prompt: typeof client?.prompt === "function",
+      has_prompt_async: typeof client?.promptAsync === "function",
+    })
+    return "native-api-unavailable"
+  }
+  const origin = paneNativeOrigin
+  const directory = origin.directory
   pendingPeerBusy.add(sid)
   let timer
-  const bounded = async (call) => {
+  const bounded = async (call, timeoutMs = 1000) => {
     try {
       return await Promise.race([call, new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("peer-context-timeout")), 1000)
+        timer = setTimeout(() => reject(new Error("peer-context-timeout")), timeoutMs)
       })])
     } finally { clearTimeout(timer) }
   }
   try {
-    const status = await bounded(client.status({}))
-    const statusData = sdkResponseData(status)
-    const current = statusData?.[sid] || statusData?.status?.[sid]
-    const currentType = typeof current === "string" ? current : current?.type
+    const rows = pendingPeerCommand(sid)
+    if (!Array.isArray(rows)) {
+      pendingPeerTrace(ctx, sid, "pending", "pending-read-unavailable")
+      return "pending-read-unavailable"
+    }
+    if (!rows.length) {
+      pendingPeerTrace(ctx, sid, "pending", "no-pending-rows")
+      return "no-pending-rows"
+    }
+    pendingPeerTrace(ctx, sid, "pending", "rows-found", { row_count: rows.length })
+    const rootResponse = await bounded(client.get({
+      path: { id: sid }, query: { directory },
+    }))
+    const rootInfo = pendingPeerSdkData(rootResponse)
+    const rootValid = pendingPeerIsNativeRoot(rootInfo, sid, origin)
+    pendingPeerTrace(ctx, sid, "native-root", rootValid ? "verified" : "rejected", {
+      ...pendingPeerSdkMeta(rootResponse, sid),
+      native_id_match: rootInfo?.id === sid,
+      native_directory_match: typeof rootInfo?.directory === "string"
+        && (() => { try { return realpathSync(rootInfo.directory) === origin.directory } catch { return false } })(),
+      parent_field_present: !!rootInfo && Object.hasOwn(rootInfo, "parentID"),
+      parent_type: rootInfo?.parentID === null ? "null" : typeof rootInfo?.parentID,
+      required_fields_present: !!rootInfo && ["id", "projectID", "directory", "slug", "title", "version", "time"]
+        .every((key) => Object.hasOwn(rootInfo, key)),
+    })
+    if (!rootValid) return "not-root-session"
+    if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+    const status = await bounded(client.status({ query: { directory } }))
+    const statusData = pendingPeerSdkData(status)
+    const currentType = pendingPeerNativeStatusType(statusData, sid)
+    pendingPeerTrace(ctx, sid, "native-status", currentType || "unproven", {
+      ...pendingPeerSdkMeta(status, sid),
+      target_present: !!statusData && Object.hasOwn(statusData, sid),
+      status_count: statusData && typeof statusData === "object" ? Object.keys(statusData).length : null,
+      resolved_status: currentType,
+    })
+    if (!currentType) return "session-status-unavailable"
     if (currentType !== "idle") {
       pendingPeerStatus.set(sid, currentType === "blocked" ? "blocked" : "working")
       return "not-idle:" + String(currentType || "unknown")
     }
+    if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
     pendingPeerStatus.set(sid, "idle")
-    const rootInfo = sdkResponseData(await bounded(client.get({
-      path: { id: sid }, query: { directory: baseDir(ctx) },
-    })))
-    if (!rootInfo || rootInfo.id !== sid || rootInfo.parentID !== null) return "not-root-session"
-    const rows = pendingPeerCommand(sid)
-    if (!Array.isArray(rows)) return "pending-read-unavailable"
-    if (!rows.length) return "no-pending-rows"
-    const response = await bounded(client.messages({ path: { id: sid } }))
-    const messages = sdkResponseData(response)
+    const response = await bounded(client.messages({ path: { id: sid }, query: { directory } }))
+    const messages = pendingPeerSdkData(response)
+    pendingPeerTrace(ctx, sid, "native-history", Array.isArray(messages) ? "read" : "unavailable", {
+      ...pendingPeerSdkMeta(response, sid), message_count: Array.isArray(messages) ? messages.length : null,
+    })
     if (!Array.isArray(messages)) return "history-unavailable"
+    if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
     for (const row of rows.slice(0, 3)) {
       if (!row || typeof row.ref !== "string" || !row.ref || typeof row.text !== "string") continue
       const created = Number(row.created) * 1000
@@ -1336,9 +1509,15 @@ async function pendingPeerDelivery(ctx, sid) {
         }
         // Continue the already persisted noReply message by its native ID. The
         // exact text is never submitted a second time after an ambiguous result.
+        if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
         if (!pendingPeerTransition(sid, ["--resuming", row.ref, "--message-id", mid])) continue
-        const resumed = await bounded(client.promptAsync({ path: { id: sid }, body: { messageID: mid } }))
-        if (resumed && resumed.error == null && resumed.response?.ok !== false) {
+        const resumed = await bounded(client.promptAsync({ path: { id: sid }, query: { directory },
+          body: { messageID: mid, parts: [] } }))
+        const acceptedResume = pendingPeerSdkNoContent(resumed)
+        pendingPeerTrace(ctx, sid, "promptAsync-resume", acceptedResume ? "204-accepted" : "not-accepted", {
+          ...pendingPeerSdkMeta(resumed, sid), message_id_present: !!mid, empty_parts: true,
+        })
+        if (acceptedResume) {
           pendingPeerStatus.set(sid, "submitted")
         }
         continue
@@ -1349,41 +1528,74 @@ async function pendingPeerDelivery(ctx, sid) {
       if (claimed.ref !== row.ref) return "claim-ref-mismatch"
       if (claimed.state !== "unverified") return "claim-state-mismatch"
       if (claimed.text !== row.text) return "claim-body-mismatch"
+      if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
       let accepted
+      let persistenceResponseLost = false
       try {
-        accepted = await bounded(client.prompt({ path: { id: sid }, body: {
+        accepted = await bounded(client.prompt({ path: { id: sid }, query: { directory }, body: {
           noReply: true, parts: [{ type: "text", text: claimed.text }],
-        }}))
-      } catch { accepted = null }
-      const saved = sdkResponseData(accepted)
+        }}), 5000)
+      } catch (error) {
+        accepted = null
+        persistenceResponseLost = error?.response?.ok !== false
+        pendingPeerTrace(ctx, sid, "noReply-save", persistenceResponseLost ? "response-lost" : "request-failed", {
+          error_name: typeof error?.name === "string" ? error.name : null,
+          response_status: Number.isFinite(error?.response?.status) ? error.response.status : null,
+          response_ok: error?.response?.ok === true,
+        })
+      }
+      const saved = pendingPeerSdkData(accepted)
       let savedInfo = saved?.info?.sessionID === sid && saved.info.role === "user"
         && typeof saved.info.id === "string" && saved.info.id
         && promptText(saved) === claimed.text ? saved : null
+      pendingPeerTrace(ctx, sid, "noReply-save", savedInfo ? "persisted-response-verified" : "persisted-response-unverified", {
+        ...pendingPeerSdkMeta(accepted, sid),
+        user_session_match: saved?.info?.sessionID === sid,
+        user_role_match: saved?.info?.role === "user",
+        user_id_present: typeof saved?.info?.id === "string" && !!saved.info.id,
+      })
       if (!savedInfo) {
+        if (!persistenceResponseLost) continue
         // A lost response is reconciled from persisted exact history before the
         // same ref can be continued. An unresolved claim is never resubmitted.
         let latest
-        try { latest = sdkResponseData(await bounded(client.messages({ path: { id: sid } }))) } catch { latest = null }
+        try { latest = pendingPeerSdkData(await bounded(client.messages({ path: { id: sid }, query: { directory } }))) } catch { latest = null }
         const reconciled = Array.isArray(latest) ? latest.filter((m) => m?.info?.sessionID === sid
           && m.info.role === "user" && promptText(m) === claimed.text
           && (!claimed.no_trailer || (nativeMessageTime(m.info) > 0
             && nativeMessageTime(m.info) >= Number(claimed.created) * 1000 - 2000))) : []
+        pendingPeerTrace(ctx, sid, "noReply-reconcile", reconciled.length === 1 ? "one-exact-history-match" : "not-exact", {
+          history_response_valid: Array.isArray(latest), match_count: reconciled.length,
+        })
         if (reconciled.length !== 1 || !reconciled[0]?.info?.id) continue
         savedInfo = reconciled[0].info
       }
       const mid = savedInfo.info ? savedInfo.info.id : savedInfo.id
       if (typeof mid !== "string" || !mid) continue
+      if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
       if (pendingPeerTransition(sid, ["--queued", row.ref, "--message-id", mid])) {
         if (pendingPeerTransition(sid, ["--resuming", row.ref, "--message-id", mid])) {
-          const resumed = await bounded(client.promptAsync({ path: { id: sid }, body: { messageID: mid } }))
-          if (resumed && resumed.error == null && resumed.response?.ok !== false) {
+          if (!pendingPeerRoot(ctx, sid)) return "native-origin-changed"
+          const resumed = await bounded(client.promptAsync({ path: { id: sid }, query: { directory },
+            body: { messageID: mid, parts: [] } }))
+          const acceptedResume = pendingPeerSdkNoContent(resumed)
+          pendingPeerTrace(ctx, sid, "promptAsync-resume", acceptedResume ? "204-accepted" : "not-accepted", {
+            ...pendingPeerSdkMeta(resumed, sid), message_id_present: !!mid, empty_parts: true,
+          })
+          if (acceptedResume) {
             pendingPeerStatus.set(sid, "submitted")
           }
         }
       }
     }
     return "processed"
-  } catch { return "delivery-error" /* Inflight/ambiguous payload remains unverified; no resend loop. */ }
+  } catch (error) {
+    pendingPeerTrace(ctx, sid, "delivery", "delivery-error", {
+      error_name: typeof error?.name === "string" ? error.name : null,
+      response_status: Number.isFinite(error?.response?.status) ? error.response.status : null,
+    })
+    return "delivery-error" /* Inflight/ambiguous payload remains unverified; no resend loop. */
+  }
   finally { pendingPeerBusy.delete(sid) }
 }
 
@@ -1642,6 +1854,21 @@ export const AgentHarnessGuards = async (ctx) => {
       if (eventSid) pendingPeerStatus.set(eventSid, "idle")
       observeCompactRuntimeStatus(ctx, eventSid, "idle")
       observePaneCallback(ctx, "session.idle", eventSid)
+      const exactCurrentRoot = eventSid && pendingPeerRoot(ctx, eventSid)
+      if (exactCurrentRoot && paneNativeOrigin?.bare) completionCarrier.env(eventSid)
+      if (eventSid && (exactCurrentRoot || paneNativeOrigin?.bare)) {
+        const binding = paneContexts.get(ctx)
+        pendingPeerTrace(ctx, eventSid, "idle-event", exactCurrentRoot
+          ? "delivery-evaluation-started" : `origin-${pendingPeerRootBlockReason(ctx, eventSid)}`, {
+          origin_bare: paneNativeOrigin?.bare === true,
+          origin_sid_match: paneNativeOrigin?.sid === eventSid,
+          origin_pid_matches_process: paneNativeOrigin?.pid === process.pid,
+          origin_birth_valid: /^\d+$/.test(String(paneNativeOrigin?.start || "")),
+          tui_selection_record_valid: paneNativeOrigin?.bare ? !!tuiSelectionRead(eventSid) : null,
+          binding_active: !!binding?.active, binding_owns_origin: !!binding?.ownsOrigin,
+          owning_context_match: paneOwningContext === ctx,
+        })
+      }
       if (!isWorkerSession()) {
         spawnSummary(eventSid, "final")
         await projectPane(eventSid, ctx)

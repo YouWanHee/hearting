@@ -778,13 +778,18 @@ function fixture(options = {}) {
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout)
 
-    def run_agent_initializer_fixture(self, body, timeout=10, pane_id=True, worker=False, pending_ref=None):
+    def run_agent_initializer_fixture(self, body, timeout=10, pane_id=True, worker=False, pending_ref=None,
+                                      bare_origin=False, selection_sid="ses_A"):
         """Run the actual AgentHarnessGuards initializer with isolated native/runtime edges."""
         source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text()
         origin_start = source.index("function ownNativePaneOrigin() {")
-        origin_end = source.index("\n}\n\nlet paneNativeOrigin", origin_start) + 2
+        origin_end = source.index("\n}\n\nfunction sameNativePaneContext", origin_start) + 2
         source = source[:origin_start] + '''function ownNativePaneOrigin() {
-  return {pid: process.pid, start: "77", sid: "ses_A", bare: false,
+  const bare = process.env.FIXTURE_BARE_NATIVE_ORIGIN === "1"
+  const stat = readFileSync("/proc/self/stat", "utf8")
+  const close = stat.lastIndexOf(") ")
+  const start = stat.slice(close + 2).trim().split(/\\s+/)[19]
+  return {pid: process.pid, start, sid: bare ? null : "ses_A", bare,
     directory: realpathSync(process.cwd()), state: "pending"}
 }''' + source[origin_end:]
         source = source.replace('import { spawnSync, spawn } from "node:child_process"',
@@ -885,6 +890,19 @@ const fireStartupTimer = index => {
   if (!timer || timer.cancelled) throw Error("startup timer missing or cancelled");
   timer.cb();
 };
+if (process.env.FIXTURE_BARE_NATIVE_ORIGIN === "1") {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const directory = path.join(process.env.XDG_STATE_HOME, "hearting", "tui-identity");
+  const stat = fs.readFileSync("/proc/self/stat", "utf8");
+  const close = stat.lastIndexOf(") ");
+  const start = stat.slice(close + 2).trim().split(/\s+/)[19];
+  fs.mkdirSync(directory, {recursive: true});
+  fs.writeFileSync(path.join(directory, `${process.pid}-${start}.json`), JSON.stringify({
+    schema: "hearting-tui-selection-v1", sessionID: process.env.FIXTURE_SELECTION_SID,
+    pid: process.pid, start,
+  }), {mode: 0o600});
+}
 ''' + body
             env = dict(os.environ)
             for key in tuple(env):
@@ -892,7 +910,9 @@ const fireStartupTimer = index => {
                     env.pop(key, None)
             env.pop("OPENCODE_DISPATCH_SLUG", None)
             env.update({"AGENT_HOME": str(ROOT), "AGENT_ARTIFACT_CHECKPOINT": "off",
-                        "FIXTURE_GUARDS": str(module_path)})
+                        "FIXTURE_GUARDS": str(module_path),
+                        "FIXTURE_BARE_NATIVE_ORIGIN": "1" if bare_origin else "0",
+                        "FIXTURE_SELECTION_SID": selection_sid})
             if pending_ref:
                 env["FIXTURE_PENDING_ROW"] = json.dumps(pm._read_pending(pending_ref))
             else:
@@ -912,13 +932,15 @@ const fireStartupTimer = index => {
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout)
 
-    def run_pending_agent_initializer_fixture(self, body, ref=None, timeout=10):
+    def run_pending_agent_initializer_fixture(self, body, ref=None, timeout=10, bare_origin=False,
+                                              selection_sid="ses_A"):
         if ref is None:
             rows = pm.pending_messages({"harness": "opencode", "session_id": "ses_A"})
             if len(rows) != 1:
                 raise AssertionError(f"expected one exact pending OpenCode row, got {len(rows)}")
             ref = rows[0]["ref"]
-        return self.run_agent_initializer_fixture(body, timeout=timeout, pending_ref=ref)
+        return self.run_agent_initializer_fixture(body, timeout=timeout, pending_ref=ref,
+                                                  bare_origin=bare_origin, selection_sid=selection_sid)
 
     def test_opencode_agent_initializer_returns_before_sdk_and_publishes_resume_once(self):
         result = self.run_agent_initializer_fixture(r'''
@@ -1035,7 +1057,7 @@ console.log(JSON.stringify(rows));
             self.assertEqual((row["endpoint"], row["pane"], row["harness"], row["session_id"]),
                              ("default", "fixture-pane", "opencode", "ses_A"))
             self.assertGreater(row["pid"], 1)
-            self.assertEqual(row["pid_start"], "77")
+            self.assertRegex(row["pid_start"], r"^\d+$")
 
     def test_opencode_dispose_cancels_the_initializer_startup_timer(self):
         result = self.run_agent_initializer_fixture(r'''
@@ -1556,30 +1578,37 @@ console.log(JSON.stringify({id: scope.__module.id, hasServer: "server" in scope.
         result = self.run_pending_agent_initializer_fixture(r'''
 const sid = "ses_A", messages = [];
 let status = "idle", saves = 0, resumes = [], statusReads = 0, sessionReads = 0, messageReads = 0;
-const unwrap = data => process.env.FIXTURE_SDK_STYLE === "data" ? data : {data};
+const sdkResult = (data, status = 200) => ({data, error: undefined,
+  response: {ok: true, status}});
+const rootDto = id => ({id, projectID: "project_fixture", directory: process.cwd(), slug: "fixture-root",
+  title: "fixture root", version: "1.19.0", time: {created: Date.now(), updated: Date.now()}});
 const session = {
-  status: async () => {statusReads++;return unwrap({[sid]: {type: status}})},
-  get: async ({path}) => {sessionReads++;return unwrap({id: path.id, parentID: null})},
-  messages: async () => {messageReads++;return unwrap(messages)},
+  status: async ({query}) => {statusReads++;if(query.directory !== process.cwd()) throw Error("status directory mismatch");return sdkResult({})},
+  get: async ({path, query}) => {sessionReads++;if(path.id !== sid || query.directory !== process.cwd()) throw Error("root lookup mismatch");return sdkResult(rootDto(path.id))},
+  messages: async ({query}) => {messageReads++;if(query.directory !== process.cwd()) throw Error("history directory mismatch");return sdkResult(messages)},
   prompt: async args => {
     saves++;
-    if (args.path.id !== sid || args.body.noReply !== true
+    if (args.path.id !== sid || args.query.directory !== process.cwd() || args.body.noReply !== true
         || Object.keys(args.body).sort().join() !== "noReply,parts"
         || args.body.parts[0].text !== FIXTURE_EXPECTED_TEXT) throw Error("noReply save mismatch");
     const row = {info: {id: "native-message-1", role: "user", sessionID: sid,
       time: {created: Date.now()}}, parts: args.body.parts};
     messages.push(row);
-    return unwrap(row);
+    return sdkResult(row);
   },
   promptAsync: async args => {
     resumes.push(args);
-    if (args.path.id !== sid || Object.keys(args.body).join() !== "messageID"
-        || args.body.messageID !== "native-message-1") throw Error("wrong native resume ID");
+    if (args.path.id !== sid || args.query.directory !== process.cwd()
+        || Object.keys(args.body).sort().join() !== "messageID,parts"
+        || args.body.messageID !== "native-message-1" || args.body.parts.length !== 0)
+      throw Error("wrong native resume request");
     status = "busy";
-    return {response: {ok: true}};
+    return sdkResult(undefined, 204);
   },
 };
-const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {session}};
+const carrierLogs = [];
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {session,
+  app: {log: async ({body}) => carrierLogs.push(body)}}};
 const hooks = await AgentHarnessGuards(ctx);
 const bindingBeforeIdle = __fixturePaneState();
 await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
@@ -1597,23 +1626,203 @@ await hooks.event({event: {type: "session.status", properties: {sessionID: sid, 
 await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
 hooks.dispose();
 console.log(JSON.stringify({saves, resumes, queued, messages, bindingBeforeIdle,
-  savesAfterIdle, statusReads, sessionReads, messageReads}));
-'''.replace("FIXTURE_EXPECTED_TEXT", json.dumps(text)))
+  savesAfterIdle, statusReads, sessionReads, messageReads,
+  carrierArmed: carrierLogs.some(row => row.extra?.module === "hearting-completion-carrier"
+    && row.extra.stage === "env" && row.extra.reason === "carrier-armed")}));
+'''.replace("FIXTURE_EXPECTED_TEXT", json.dumps(text)), ref=ref, bare_origin=True)
+        self.assertTrue(result["bindingBeforeIdle"]["bindingOwnsOrigin"], result)
+        self.assertIsNone(result["bindingBeforeIdle"]["originSID"], result)
         self.assertEqual(result["saves"], 1, result)
+        self.assertTrue(result["carrierArmed"], result)
         self.assertEqual(result["savesAfterIdle"], 1, result)
         self.assertEqual(len(result["resumes"]), 1)
-        self.assertEqual(result["resumes"][0]["body"], {"messageID": "native-message-1"})
+        self.assertEqual(result["resumes"][0]["body"], {"messageID": "native-message-1", "parts": []})
         self.assertEqual(result["queued"]["state"], "queued")
         self.assertEqual(result["queued"]["actual_message_id"], "native-message-1")
         self.assertEqual(len(result["messages"]), 2)
+        self.assertEqual(result["messages"][1]["info"]["parentID"], "native-message-1")
         row = pm._read_pending(ref)
         self.assertEqual((row["state"], row["receipt"], row["actual_message_id"]),
                          ("received", "exact-native-history", "native-message-1"))
         self.assertEqual(len([r for r in self.rows() if r.get("transfer_ref") == ref]), 1)
 
-    def test_opencode_data_style_retains_native_history_boundary(self):
-        with mock.patch.dict(os.environ, {"FIXTURE_SDK_STYLE": "data"}):
-            self.test_opencode_native_idle_persists_and_resumes_exact_message_once()
+    def test_opencode_bare_tui_requires_exact_pid_birth_selection_record(self):
+        recipient = {"harness": "opencode", "session_id": "ses_A"}
+        _text, ref = pm.prepare_peer_message("foreign bare TUI selection", self.sender, recipient, defer=True)
+        result = self.run_pending_agent_initializer_fixture(r'''
+const sid = "ses_A";
+let gets = 0, saves = 0, resumes = 0;
+const sdkResult = (data, status = 200) => ({data, error: undefined,
+  response: {ok: true, status}});
+const rootDto = {id: sid, projectID: "project_fixture", directory: process.cwd(), slug: "fixture-root",
+  title: "fixture root", version: "1.19.0", time: {created: 1, updated: 1}};
+const session = {
+  status: async () => sdkResult({}),
+  get: async () => {gets++;return sdkResult(rootDto)},
+  messages: async () => sdkResult([]),
+  prompt: async () => {saves++;return sdkResult(null)},
+  promptAsync: async () => {resumes++;return sdkResult(undefined, 204)},
+};
+const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+hooks.dispose();
+console.log(JSON.stringify({gets, saves, resumes, pane: __fixturePaneState()}));
+''', ref=ref, bare_origin=True, selection_sid="ses_foreign")
+        self.assertEqual((result["gets"], result["saves"], result["resumes"]), (0, 0, 0), result)
+        self.assertEqual(pm._read_pending(ref)["state"], "pending")
+
+    def test_opencode_same_native_origin_context_rebind_preserves_live_owner(self):
+        result = self.run_agent_initializer_fixture(r'''
+const directory = process.cwd();
+const first = await AgentHarnessGuards({directory, worktree: directory, client: {}});
+const firstState = __fixturePaneState();
+const second = await AgentHarnessGuards({directory, worktree: directory, client: {}});
+const secondState = __fixturePaneState();
+first.dispose();
+const afterFirstDispose = __fixturePaneState();
+second.dispose();
+console.log(JSON.stringify({firstState, secondState, afterFirstDispose}));
+''')
+        self.assertEqual(result["firstState"]["originState"], "pending")
+        self.assertEqual(result["secondState"]["originState"], "pending")
+        self.assertTrue(result["secondState"]["bindingOwnsOrigin"])
+        self.assertEqual(result["afterFirstDispose"]["originState"], "pending")
+        self.assertTrue(result["afterFirstDispose"]["bindingOwnsOrigin"])
+
+    def test_opencode_root_and_status_sdk_shapes_fail_closed(self):
+        cases = ("valid-null-parent", "unwrapped-status", "failed-status", "unwrapped-root",
+                 "failed-root", "wrong-id", "wrong-directory", "child", "bad-parent", "malformed")
+        for mode in cases:
+            with self.subTest(mode=mode):
+                _text, ref = pm.prepare_peer_message("root dto shape " + mode, self.sender,
+                    {"harness": "opencode", "session_id": "ses_A"}, defer=True)
+                body = r'''
+const sid = "ses_A", mode = ROOT_MODE, queued = globalThis.__fixturePendingRow;
+let gets = 0, messageReads = 0, saves = 0, resumes = 0;
+const sdkResult = (data, status = 200) => ({data, error: undefined,
+  response: {ok: true, status}});
+const rootDto = id => ({id, projectID: "project_fixture", directory: process.cwd(), slug: "fixture-root",
+  title: "fixture root", version: "1.19.0", time: {created: 1, updated: 1}});
+const messages = mode === "valid-null-parent" && queued ? [
+  {info: {id: "exact-user-message", role: "user", sessionID: sid, time: {created: Date.now()}},
+    parts: [{type: "text", text: queued.text}]},
+  {info: {id: "exact-assistant-message", role: "assistant", sessionID: sid,
+    parentID: "exact-user-message", time: {completed: Date.now()}}, parts: []},
+] : [];
+const session = {
+  status: async () => mode === "unwrapped-status"
+    ? {[sid]: {type: "idle"}}
+    : mode === "failed-status"
+      ? {data: {[sid]: {type: "idle"}}, error: {name: "StatusError"}, response: {ok: false, status: 500}}
+      : sdkResult({}),
+  get: async ({path}) => {
+    gets++;
+    const root = rootDto(mode === "wrong-id" ? "ses_foreign" : path.id);
+    if (mode === "unwrapped-root") return root;
+    if (mode === "failed-root") return {data: root, error: {name: "NotFoundError"}, response: {ok: false, status: 404}};
+    if (mode === "wrong-directory") root.directory += "/foreign";
+    if (mode === "child") root.parentID = "ses_parent";
+    if (mode === "bad-parent") root.parentID = 7;
+    if (mode === "malformed") delete root.time;
+    if (mode === "valid-null-parent") root.parentID = null;
+    return sdkResult(root);
+  },
+  messages: async () => {messageReads++;return sdkResult(messages)},
+  prompt: async () => {saves++;throw Error("invalid root received peer body")},
+  promptAsync: async () => {resumes++;throw Error("invalid root resumed turn")},
+};
+const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+hooks.dispose();
+const pendingReads = globalThis.__fixtureSyncCalls.filter(call =>
+  call.args.some(value => String(value).endsWith("peer-message.py")) && call.args.includes("pending")).length;
+const receivedCall = globalThis.__fixtureSyncCalls.find(call => call.args.includes("--received"));
+const receivedMessageID = receivedCall ? receivedCall.args[receivedCall.args.indexOf("--message-id") + 1] : null;
+console.log(JSON.stringify({gets, messageReads, pendingReads, saves, resumes, receivedMessageID}));
+'''.replace("ROOT_MODE", json.dumps(mode))
+                result = self.run_pending_agent_initializer_fixture(body, ref=ref)
+                self.assertEqual((result["saves"], result["resumes"]), (0, 0), result)
+                self.assertGreaterEqual(result["pendingReads"], 1, result)
+                if mode == "valid-null-parent":
+                    self.assertEqual((result["gets"], result["messageReads"]), (2, 1), result)
+                    self.assertEqual(result["receivedMessageID"], "exact-user-message")
+                else:
+                    self.assertEqual((result["gets"], result["messageReads"]), (2, 0), result)
+                    self.assertEqual(pm._read_pending(ref)["state"], "pending")
+
+    def test_opencode_unwrapped_noReply_result_and_failed_resume_do_not_receive(self):
+        recipient = {"harness": "opencode", "session_id": "ses_A"}
+        for response_mode in ("unwrapped", "failed"):
+            with self.subTest(response_mode=response_mode):
+                _text, ref = pm.prepare_peer_message("unwrapped OpenCode response " + response_mode, self.sender,
+                                                     recipient, defer=True)
+                body = r'''
+const sid = "ses_A", responseMode = RESPONSE_MODE, messages = [];
+let saves = 0, resumes = 0, messageReads = 0;
+const sdkResult = (data, status = 200) => ({data, error: undefined,
+  response: {ok: true, status}});
+const rootDto = id => ({id, projectID: "project_fixture", directory: process.cwd(), slug: "fixture-root",
+  title: "fixture root", version: "1.19.0", time: {created: 1, updated: 1}});
+const session = {
+  status: async () => sdkResult({}),
+  get: async ({path}) => sdkResult(rootDto(path.id)),
+  messages: async () => {messageReads++;return sdkResult(messages)},
+  prompt: async args => {
+    saves++;
+    const row = {info: {id: "native-message-ambiguous", role: "user", sessionID: sid,
+      time: {created: Date.now()}}, parts: args.body.parts};
+    messages.push(row);
+    if (responseMode === "unwrapped") return row;
+    return {data: row, error: {name: "PromptError"}, response: {ok: false, status: 500}};
+  },
+  promptAsync: async () => {resumes++;return {data: undefined, error: undefined,
+    response: {ok: true, status: 204}};},
+};
+const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+hooks.dispose();
+console.log(JSON.stringify({saves, resumes, messageReads}));
+'''.replace("RESPONSE_MODE", json.dumps(response_mode))
+                result = self.run_pending_agent_initializer_fixture(body, ref=ref)
+                self.assertEqual((result["saves"], result["resumes"], result["messageReads"]),
+                                 (1, 0, 1), result)
+                self.assertEqual(pm._read_pending(ref)["state"], "unverified")
+
+        _text, ref = pm.prepare_peer_message("failed OpenCode resume", self.sender, recipient, defer=True)
+        result = self.run_pending_agent_initializer_fixture(r'''
+const sid = "ses_A", messages = [];
+let saves = 0, resumes = 0;
+const sdkResult = (data, status = 200) => ({data, error: undefined,
+  response: {ok: true, status}});
+const rootDto = id => ({id, projectID: "project_fixture", directory: process.cwd(), slug: "fixture-root",
+  title: "fixture root", version: "1.19.0", time: {created: 1, updated: 1}});
+const session = {
+  status: async () => sdkResult({}),
+  get: async ({path}) => sdkResult(rootDto(path.id)),
+  messages: async () => sdkResult(messages),
+  prompt: async args => {
+    saves++;
+    const row = {info: {id: "native-message-resume-failed", role: "user", sessionID: sid,
+      time: {created: Date.now()}}, parts: args.body.parts};
+    messages.push(row);return sdkResult(row);
+  },
+  promptAsync: async args => {
+    resumes++;
+    if (args.body.messageID !== "native-message-resume-failed" || args.body.parts.length !== 0)
+      throw Error("wrong failed-resume request");
+    return {data: undefined, error: {name: "BadRequestError"}, response: {ok: false, status: 400}};
+  },
+};
+const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+hooks.dispose();
+console.log(JSON.stringify({saves, resumes, userID: messages[0]?.info.id}));
+''', ref=ref)
+        self.assertEqual((result["saves"], result["resumes"], result["userID"]),
+                         (1, 1, "native-message-resume-failed"))
+        failed_resume = pm._read_pending(ref)
+        self.assertNotEqual(failed_resume["state"], "received")
+        self.assertEqual(failed_resume["actual_message_id"], "native-message-resume-failed")
 
     def test_opencode_lost_noReply_response_reconciles_exact_history_without_resubmit(self):
         recipient = {"harness": "opencode", "session_id": "ses_A"}
@@ -1621,10 +1830,14 @@ console.log(JSON.stringify({saves, resumes, queued, messages, bindingBeforeIdle,
         result = self.run_pending_agent_initializer_fixture(r'''
 const sid = "ses_A", messages = [];
 let status = "idle", saves = 0, resumes = 0;
+const sdkResult = (data, status = 200) => ({data, error: undefined,
+  response: {ok: true, status}});
+const rootDto = id => ({id, projectID: "project_fixture", directory: process.cwd(), slug: "fixture-root",
+  title: "fixture root", version: "1.19.0", time: {created: Date.now(), updated: Date.now()}});
 const session = {
-  status: async () => ({data: {[sid]: {type: status}}}),
-  get: async ({path}) => ({data: {id: path.id, parentID: null}}),
-  messages: async () => ({data: messages}),
+  status: async () => sdkResult({}),
+  get: async ({path}) => sdkResult(rootDto(path.id)),
+  messages: async () => sdkResult(messages),
   prompt: async args => {
     saves++;
     const row = {info: {id: "saved-before-lost-response", role: "user", sessionID: sid,
@@ -1632,7 +1845,11 @@ const session = {
     messages.push(row);
     throw Error("response-lost-after-persist");
   },
-  promptAsync: async () => { resumes++; status = "busy"; return {response: {ok: true}}; },
+  promptAsync: async args => { resumes++; status = "busy";
+    if (args.body.messageID !== "saved-before-lost-response" || args.body.parts.length !== 0)
+      throw Error("wrong noReply continuation");
+    return sdkResult(undefined, 204);
+  },
 };
 const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
 await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
@@ -1655,17 +1872,25 @@ console.log(JSON.stringify({saves, resumes}));
         result = self.run_pending_agent_initializer_fixture(r'''
 const sid = "ses_A", messages = [];
 let status = "idle", saves = 0, resumes = 0;
+const sdkResult = (data, status = 200) => ({data, error: undefined,
+  response: {ok: true, status}});
+const rootDto = id => ({id, projectID: "project_fixture", directory: process.cwd(), slug: "fixture-root",
+  title: "fixture root", version: "1.19.0", time: {created: Date.now(), updated: Date.now()}});
 const session = {
-  status: async () => ({data: {[sid]: {type: status}}}),
-  get: async ({path}) => ({data: {id: path.id, parentID: path.id === sid ? null : sid}}),
-  messages: async ({path}) => ({data: path.id === sid ? messages : []}),
+  status: async () => sdkResult({}),
+  get: async ({path}) => sdkResult(path.id === sid ? rootDto(path.id) : {...rootDto(path.id), parentID: sid}),
+  messages: async ({path}) => sdkResult(path.id === sid ? messages : []),
   prompt: async args => {
     saves++;
     const row = {info: {id: "native-message-1", role: "user", sessionID: sid,
       time: {created: Date.now()}}, parts: args.body.parts};
-    messages.push(row); return {data: row};
+    messages.push(row); return sdkResult(row);
   },
-  promptAsync: async () => { resumes++; status = "busy"; return {response: {ok: true}}; },
+  promptAsync: async args => { resumes++; status = "busy";
+    if (args.body.messageID !== messages.find(m => m.info.role === "user")?.info.id || args.body.parts.length !== 0)
+      throw Error("wrong native continuation");
+    return sdkResult(undefined, 204);
+  },
 };
 const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
 const fireIdle = async sessionID => {
@@ -1704,9 +1929,12 @@ console.log(JSON.stringify({duplicates, wrongParent, saves, resumes}));
         result = self.run_pending_agent_initializer_fixture(r'''
 let status = "busy", gets = 0, saves = 0;
 const session = {
-  status: async () => ({data: {ses_A: {type: status}, ses_child: {type: status}}}),
-  get: async ({path}) => {gets++;return {data: {id: path.id, parentID: "not-root"}}},
-  messages: async () => ({data: []}),
+  status: async () => ({data: {ses_A: {type: status}, ses_child: {type: status}}, error: undefined,
+    response: {ok: true, status: 200}}),
+  get: async ({path}) => {gets++;return {data: {id: path.id, projectID: "project_fixture",
+    directory: process.cwd(), slug: "fixture-child", title: "child", version: "1.19.0", time: {created: 1, updated: 1},
+    parentID: "not-root"}, error: undefined, response: {ok: true, status: 200}}},
+  messages: async () => ({data: [], error: undefined, response: {ok: true, status: 200}}),
   prompt: async () => {saves++;throw Error("blocked session received peer message")},
   promptAsync: async () => {throw Error("blocked session resumed")},
 };
