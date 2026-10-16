@@ -2677,9 +2677,10 @@ check_opencode_native_plugin_projection() {
   plugin="adapters/opencode/plugins/hearting-guards.js"
   plugin_entries=$(find adapters/opencode/plugins -mindepth 1 -maxdepth 1 ! -name __pycache__ -exec basename {} \; 2>/dev/null || true)
   for entry in $plugin_entries; do
-    if [ "$entry" != "hearting-guards.js" ]; then
-      fail_msg "adapters/opencode/plugins/$entry is not an approved OpenCode plugin projection"
-    fi
+    case "$entry" in
+      hearting-guards.js|herdr-agent-state.js) ;;
+      *) fail_msg "adapters/opencode/plugins/$entry is not an approved OpenCode plugin projection" ;;
+    esac
   done
 
   if [ ! -f "$plugin" ]; then

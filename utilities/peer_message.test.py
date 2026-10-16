@@ -883,6 +883,40 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(peer_message.parse_peer_trailer(text, {
             "harness": "claude", "session_id": "resolved-session"}, include_ref=True))
 
+    def test_opencode_receive_requires_the_queued_native_id_and_is_idempotent(self):
+        recipient = {"harness": "opencode", "session_id": "opencode-root"}
+        _text, ref = peer_message.prepare_peer_message(
+            "이어서해", self.sender, recipient, defer=True, with_trailer=False,
+            receipt="session-tidy-continue")
+        claim = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=ref,
+            queued=None, received=None, message_id=None)
+        with mock.patch("builtins.print"):
+            self.assertEqual(peer_message.cmd_pending(claim), 0)
+        queued = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=None,
+            queued=ref, received=None, message_id="native-message-1")
+        self.assertEqual(peer_message.cmd_pending(queued), 0)
+        resuming = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=None,
+            queued=None, resuming=ref, received=None, message_id="native-message-1")
+        self.assertEqual(peer_message.cmd_pending(resuming), 0)
+        self.assertEqual(peer_message.cmd_pending(resuming), 1)
+        self.assertTrue(peer_message._read_pending(ref)["resume_attempted"])
+        received = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=None, resuming=None,
+            queued=None, received=ref, message_id="foreign-message")
+        self.assertEqual(peer_message.cmd_pending(received), 1)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        received.message_id = "native-message-1"
+        self.assertEqual(peer_message.cmd_pending(received), 0)
+        original = self._ledger_file(self.sender["session_id"]).read_bytes()
+        row = peer_message._read_pending(ref)
+        self.assertEqual((row["state"], row["text"], row["actual_message_id"]),
+                         ("received", None, "native-message-1"))
+        self.assertEqual(peer_message.cmd_pending(received), 0)
+        self.assertEqual(self._ledger_file(self.sender["session_id"]).read_bytes(), original)
+
     def test_actual_receive_once_and_replay_does_not_rewrite_notice(self):
         text, ref = self.pending()
         self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)

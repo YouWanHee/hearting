@@ -46,6 +46,7 @@ shared-utility-deferred	execution_access_diagnose.py
 shared-utility-deferred	governor_identity.py
 shared-utility-deferred	hearting_gates.py
 shared-utility-deferred	herdr_observation.py
+shared-utility-deferred	herdr_opencode_live.py
 shared-utility-deferred	human_gate_observation.py
 shared-utility-deferred	interactive-main-recovery.py
 shared-utility-deferred	memory-store.sh

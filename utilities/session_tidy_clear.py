@@ -21,14 +21,14 @@ the card (the seat's ``prompt_seq``), the card is still the one booked, and
 Anything it cannot decide is "not cleared" plus one result line (``write_notice``); a
 success is silent.  The command is typed at most once and is never repeated.
 
-A confirmed clear is followed by the continue prompt (:data:`CONTINUE_TEXT`, what the user
-used to type by hand): the same helper asks ``peer-steward.py continue`` once, which types it
-into the new session only when that session is the one the clear started, has no message yet,
-is idle, shows no form and an empty input box, no prompt was submitted since the card and the
-card is the booked one and was not handed to a peer.  The booking's ``continued`` record moves
-``pending`` -> ``sending`` (by the steward, right before it types) -> its end, so the prompt is
-typed at most once.  ``enqueue --no-continue`` books the clear alone.  A skip the person caused
-(a prompt of their own, a draft, a new card) is silent; any other miss leaves one result line.
+A confirmed clear is followed by one ``peer-steward.py continue`` request for the exact
+new session. It preserves the booking, claim, card generation, seat, prompt count and expiry.
+An exact-native seat may use its bounded attachment after rechecking the booked process, idle
+state, form and empty input, then writes :data:`CONTINUE_TEXT` once. Other targets keep one
+no-trailer private pending ref bound to the new SID; the runtime's native carrier processes it
+and exact native receipt settles it. Neither path targets an inherited pane, retries a send or
+invents a wake. ``enqueue --no-continue`` books the clear alone. A skip the person caused (a
+prompt of their own, a draft or a new card) is silent; other misses leave one result line.
 
 Test hooks (only inside ``HEARTING_TIDY_TEST_ROOT``, see ``session_tidy_runner``):
 ``HEARTING_TIDY_HERDR`` / ``HEARTING_TIDY_PEER_STEWARD`` stand in for the checked
@@ -65,7 +65,7 @@ OBSERVE_WAIT_SEC = 20.0
 STEWARD_TIMEOUT_SEC = 180.0
 # The built-in command that starts a fresh conversation in each harness.
 CLEAR_COMMAND = {"claude": "/clear", "codex": "/clear", "opencode": "/new"}
-# What the user typed by hand after a clear; the new session continues from the card it received.
+# No-trailer body used by the exact-native attachment or the sealed pending-ref carrier.
 CONTINUE_TEXT = "이어서해"
 CONTINUE_WINDOW_SEC = 120.0
 
@@ -388,7 +388,24 @@ def note_start_locked(seat: "st.Seat", harness: str, sid: str, now: float) -> No
     req = read_reservation(seat.key)
     if not req or req.get("status") not in ("reserved", "unverified") or req.get("harness") != harness:
         return
-    if sid == req.get("sid") or float(req.get("created", 0)) > now:
+    created = float(req.get("created", 0) or 0)
+    if sid == req.get("sid") or created > now:
+        return
+    # A delayed start hook from the cleared conversation can arrive after /new.
+    # The runtime's current exact selection wins; without it, an older seat entry
+    # cannot become the successor just because its callback ran late.
+    try:
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet.process_identity import current_session_identity
+        current_sid = current_session_identity(harness)
+        if current_sid and current_sid != sid:
+            return
+    except Exception:
+        pass
+    previous = st.session_summary(seat).get((harness, sid))
+    if previous and float(previous.get("first_seen", now) or now) < created:
         return
     if (req.get("observed") or {}).get("sid") == sid:
         return
@@ -492,7 +509,7 @@ def claim_clear(path, nonce: Optional[str] = None):
 
 def validate_continue(path, nonce: Optional[str] = None, *, now: Optional[float] = None,
                       _sending_claim: Optional[dict] = None):
-    """``(booking, "")`` when the cleared window may still get the continue prompt, else ``(None, reason)``.
+    """``(booking, "")`` when the cleared window may still continue, else ``(None, reason)``.
 
     Shared by the helper and ``peer-steward.py continue``: the seat's own booking, cleared, its
     continue still ``pending`` and in time, no prompt submitted since the card (``/clear`` itself
@@ -528,8 +545,11 @@ def validate_continue(path, nonce: Optional[str] = None, *, now: Optional[float]
 
 
 def claim_continue(path, nonce: Optional[str] = None):
-    """``pending`` -> ``sending``, once, right before the continue prompt is typed: ``(booking, "")``
-    or ``(None, reason)``.  Everything ``validate_continue`` checks is checked again under the seat lock."""
+    """Claim one continuation before its exact-native write or sealed-ref transfer.
+
+    Returns ``(booking, "")`` or ``(None, reason)``. Everything ``validate_continue`` checks
+    is checked again under the seat lock.
+    """
     req, seat, reason = _booking_at(Path(path))
     if req is None:
         return None, reason
@@ -537,9 +557,76 @@ def claim_continue(path, nonce: Optional[str] = None):
         req, reason = validate_continue(path, nonce)
         if req is None:
             return None, reason
-        req["continued"] = {**req["continued"], "state": "sending", "at": st.now_epoch()}
+        req["continued"] = {**req["continued"], "state": "sending", "at": st.now_epoch(),
+                            "claim_id": secrets.token_hex(12)}
         _write_reservation(req)
     return req, ""
+
+
+
+def bind_continue_transfer(claim, transfer_ref: str) -> bool:
+    """Bind one sealed no-trailer ref to the claim before its native submission."""
+    if (not isinstance(transfer_ref, str) or len(transfer_ref) != 32
+            or any(char not in "0123456789abcdef" for char in transfer_ref)):
+        return False
+    key = claim["seat"]["key"]
+    with st.seat_lock(key):
+        req = read_reservation(key)
+        held = (req or {}).get("continued") if isinstance((req or {}).get("continued"), dict) else {}
+        if (not req or req.get("nonce") != claim.get("nonce")
+                or held.get("state") != "sending"
+                or held.get("claim_id") != (claim.get("continued") or {}).get("claim_id")
+                or req.get("new_session") != claim.get("new_session")):
+            return False
+        if held.get("transfer_ref") not in (None, transfer_ref):
+            return False
+        req["continued"] = {**held, "transfer_ref": transfer_ref}
+        _write_reservation(req)
+    return True
+
+
+def observe_continue_receipt(harness: str, sid: str, transfer_ref: str = "") -> bool:
+    """Settle a booked continue only after exact native history says it was received."""
+    seat = st.resolve_seat(harness, sid=sid)
+    with st.seat_lock(seat.key):
+        req = read_reservation(seat.key)
+        held = (req or {}).get("continued") if isinstance((req or {}).get("continued"), dict) else {}
+        ref = transfer_ref or held.get("transfer_ref")
+        if (not req or req.get("status") != "cleared" or req.get("harness") != harness
+                or req.get("new_session") != sid or held.get("state") not in ("pending", "sending")
+                or not ref or held.get("transfer_ref") != ref):
+            return False
+        nonce = req.get("nonce")
+    try:
+        import importlib.util
+        path = Path(__file__).with_name("peer-message.py")
+        spec = importlib.util.spec_from_file_location("_session_tidy_peer_message", path)
+        peer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer)
+        row = peer._read_pending(ref)
+        if row and row.get("state") != "received" and harness == "codex":
+            peer.deliver_pending_codex(ref, timeout=0.25)
+            row = peer._read_pending(ref)
+    except (OSError, ValueError, ImportError):
+        return False
+    if (not row or row.get("state") != "received"
+            or (row.get("to") or {}).get("harness") != harness
+            or (row.get("to") or {}).get("session_id") != sid):
+        return False
+    with st.seat_lock(seat.key):
+        req = read_reservation(seat.key)
+        held = (req or {}).get("continued") if isinstance((req or {}).get("continued"), dict) else {}
+        if (not req or req.get("nonce") != nonce or req.get("status") != "cleared"
+                or req.get("harness") != harness or req.get("new_session") != sid
+                or held.get("state") not in ("pending", "sending")
+                or held.get("transfer_ref") != ref):
+            return False
+        if st.read_prompt_seq(seat) <= int(req.get("prompt_seq", -1)):
+            return False
+        req["continued"] = {**held, "state": "sent", "reason": "exact-native-history",
+                            "finished": st.now_epoch()}
+        _write_reservation(req)
+    return True
 
 
 def release_unsent_continue(claim):
@@ -668,23 +755,29 @@ def _finish(seat_key: str, nonce: str, outcome: str, reason: str = "", *, observ
     return True
 
 
-def _finish_continue(seat_key: str, nonce: str, outcome: str, reason: str = "") -> bool:
-    """Record how the continue ended -- only while it is still this booking's and open -- and leave
-    one result line for a miss the person did not cause."""
+def _finish_continue(seat_key: str, nonce: str, outcome: str, reason: str = "", *,
+                     claim_id: str = "", transfer_ref: str = "") -> bool:
+    """Settle only this continue claim; queued delivery keeps its exact native ref."""
     with st.seat_lock(seat_key):
         req = read_reservation(seat_key)
         held = (req or {}).get("continued") if isinstance((req or {}).get("continued"), dict) else {}
         if not req or req.get("nonce") != nonce or req.get("status") != "cleared" \
                 or held.get("state") not in ("pending", "sending"):
             return False
+        if claim_id and held.get("claim_id") != claim_id:
+            return False
+        if held.get("state") == "sending" and not claim_id:
+            return False
         if outcome == "queued":
-            if held.get("state") != "pending":
-                return False    # A newer callback's sending claim is never rewound.
             req["continued"] = {**held, "state": "pending", "reason": reason}
+            if transfer_ref:
+                req["continued"]["transfer_ref"] = transfer_ref
             _write_reservation(req)
             return True
-        req["continued"] = {**held, "state": "sent" if outcome == "true" else outcome, "reason": reason,
-                            "finished": st.now_epoch()}
+        req["continued"] = {**held, "state": "sent" if outcome == "true" else outcome,
+                            "reason": reason, "finished": st.now_epoch()}
+        if transfer_ref:
+            req["continued"]["transfer_ref"] = transfer_ref
         _write_reservation(req)
     if outcome != "true" and not (outcome == "skipped" and reason in CONTINUE_QUIET):
         with contextlib.suppress(BaseException):
@@ -692,10 +785,11 @@ def _finish_continue(seat_key: str, nonce: str, outcome: str, reason: str = "") 
                             author_harness=str(req.get("harness") or ""), author_sid=str(req.get("sid") or ""))
     return True
 
-
 def _continue(seat_key: str, nonce: str, continuer: Callable[[Path, str, str], dict]) -> str:
-    """After a confirmed clear: ask ``peer-steward.py continue`` once and record its end.
-    ``continued`` when the prompt went in, else ``cleared`` (the clear itself stands)."""
+    """After a confirmed clear, ask ``peer-steward.py continue`` once and record its result.
+    ``continued`` means the exact native continuation was confirmed; the clear remains valid
+    when continuation is queued, skipped or unverified.
+    """
     path = reservation_path(seat_key)
     req, reason = validate_continue(path, nonce)
     if req is None and reason in ("superseded", "off"):
@@ -705,7 +799,8 @@ def _continue(seat_key: str, nonce: str, continuer: Callable[[Path, str, str], d
     else:
         verdict = continuer(path, nonce, str((req.get("seat") or {}).get("pane") or ""))
     outcome = verdict.get("continued", "failed")
-    _finish_continue(seat_key, nonce, outcome, verdict.get("reason", ""))
+    _finish_continue(seat_key, nonce, outcome, verdict.get("reason", ""),
+                       claim_id=verdict.get("claim_id", ""), transfer_ref=verdict.get("transfer_ref", ""))
     return "continued" if outcome == "true" else "cleared"
 
 
@@ -717,7 +812,7 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
 
     Ordinary tidy keeps its single idle wait. Compact bookings poll in bounded intervals and
     require transcript completion on final validation. Returns ``continued`` only when both
-    the clear and continue prompt were confirmed.
+    the clear and the continuation's exact native delivery were confirmed.
     """
     wait = wait or _herdr_wait_idle
     steward = steward or _run_steward
@@ -790,8 +885,8 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
         _finish(seat_key, nonce, "cleared", observed=verdict.get("new_session", ""))
         return _continue(seat_key, nonce, continuer)
     if outcome == "unverified":
-        # Typed once and never again; give the new conversation's start hook a short bounded
-        # window to show up before calling it unconfirmed.
+        # The clear was written once and never repeated; allow the new conversation's
+        # start hook a short bounded window to show up before calling it unconfirmed.
         deadline = time.monotonic() + _tunable("CLEAR_OBSERVE", OBSERVE_WAIT_SEC)
         while time.monotonic() < deadline:
             held = read_reservation(seat_key)

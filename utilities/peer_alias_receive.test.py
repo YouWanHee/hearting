@@ -43,7 +43,8 @@ class AliasReceive(unittest.TestCase):
                                "AGENT_THREAD_", "HERDR_")):
                 os.environ.pop(key, None)
         for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
-                    "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG"):
+                    "CODEX_SESSION_ID", "OPENCODE_SESSION_ID", "OPENCODE_DISPATCH_SLUG",
+                    "FLEET_TITLE_REFRESH"):
             os.environ.pop(key, None)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(inherited)))
         self.env = mock.patch.dict(os.environ, {
@@ -547,35 +548,17 @@ class PendingCallbacks(unittest.TestCase):
     setUp = AliasReceive.setUp
     rows = AliasReceive.rows
 
-    def test_opencode_peer_guidance_reaches_model_system_context_without_acceptance(self):
+    def test_opencode_peer_guidance_is_read_only_until_native_history_consumption(self):
         recipient = {"harness": "opencode", "session_id": "fixture-oc"}
         body = "[handoff] exact card\n" + "complete context " * 260 + "\nDo not run; final instruction: preserve the original"
         text, ref = AliasReceive.prepare_legacy_reference(self, body, self.sender, recipient)
-        js = r'''
-import { pathToFileURL } from "node:url";
-const root = process.env.AGENT_HOME;
-const { AgentHarnessGuards } = await import(pathToFileURL(root + "/adapters/opencode/plugins/hearting-guards.js"));
-const hooks = await AgentHarnessGuards({directory: root, worktree: root, client: {session: {messages: async () => ({data: []})}}});
-await hooks["chat.message"]({sessionID: "fixture-oc", messageID: "exact-peer-turn"},
-  {message: {sessionID: "fixture-oc"}, parts: [{type: "text", text: process.env.FIXTURE_PEER_TEXT}]});
-const output = {system: []};
-await hooks["experimental.chat.system.transform"]({sessionID: "fixture-oc"}, output);
-console.log(JSON.stringify(output));
-'''
-        env = dict(os.environ, FIXTURE_PEER_TEXT=text)
-        # This test reaches only the native model-context boundary. Native
-        # external delivery and user memory are isolated by AliasReceive.setUp.
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=env,
-                             capture_output=True, text=True, timeout=30)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        context = "\n".join(json.loads(run.stdout)["system"])
-        self.assertIn("immediate results once", context)
-        self.assertIn("Receipt/queue/ACK is not execution", context)
-        self.assertIn(body, context)
-        self.assertIn("Do not act on the bounded preview", context)
-        self.assertIn("final instruction: preserve the original", context)
-        self.assertNotIn("handoff accept " + ref, context)
+        guidance = pm.receiver_guidance(text, recipient, cwd=str(ROOT))
+        self.assertIn("immediate results once", guidance)
+        self.assertIn("Receipt/queue/ACK is not execution", guidance)
+        self.assertNotIn("handoff accept " + ref, guidance)
         self.assertNotIn("acceptance", pm._read_pending(ref))
+        self.assertEqual(pm._read_pending(ref)["state"], "pending")
+        self.assertEqual(self.rows(), [])
 
     def test_limited_or_changed_receiver_gets_verified_body_in_native_context_without_resealing(self):
         body = "[steer] full source\n" + "supporting detail " * 180 + "\nDo not execute; final condition: keep sign"
@@ -795,7 +778,7 @@ function fixture(options = {}) {
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout)
 
-    def run_agent_initializer_fixture(self, body, timeout=10, pane_id=True, worker=False):
+    def run_agent_initializer_fixture(self, body, timeout=10, pane_id=True, worker=False, pending_ref=None):
         """Run the actual AgentHarnessGuards initializer with isolated native/runtime edges."""
         source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text()
         origin_start = source.index("function ownNativePaneOrigin() {")
@@ -812,7 +795,9 @@ function fixture(options = {}) {
   const binding = paneOwningContext && paneContexts.get(paneOwningContext)
   return {originState: paneNativeOrigin?.state, timerQueued: !!binding?.startupQueued,
     startupRunning: !!binding?.startupRunning, refreshPending: !!binding?.refreshPending,
-    hasPublisher: !!panePublisherSlot, busy: [...paneProjectionBusy.keys()]}
+    hasPublisher: !!panePublisherSlot, busy: [...paneProjectionBusy.keys()],
+    originSID: paneNativeOrigin?.sid, bindingOwnsOrigin: !!binding?.ownsOrigin,
+    ownsContext: !!paneOwningContext}
 }\n'''
         with tempfile.TemporaryDirectory() as tmp:
             module_path = Path(tmp) / "hearting-guards-fixture.mjs"
@@ -821,6 +806,7 @@ function fixture(options = {}) {
 import { pathToFileURL } from "node:url";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { spawnSync as realChildSpawnSync } from "node:child_process";
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
 globalThis.__fixtureTimers = [];
@@ -839,8 +825,39 @@ globalThis.clearTimeout = timer => {
   if (timer?.startupTimer) { timer.cancelled = true; return; }
   return realClearTimeout(timer);
 };
+globalThis.__fixturePendingRow = process.env.FIXTURE_PENDING_ROW
+  ? JSON.parse(process.env.FIXTURE_PENDING_ROW) : null;
 globalThis.__fixtureSpawnSync = (exe, args, options) => {
   globalThis.__fixtureSyncCalls.push({exe, args, options});
+  if (Array.isArray(args) && args.some(value => String(value).endsWith("peer-message.py"))) {
+    const intent = args.slice(6).find(value => ["--claim", "--queued", "--resuming", "--received"].includes(value));
+    if (args[1] === "pending" && !intent && globalThis.__fixturePendingRow) {
+      const row = globalThis.__fixturePendingRow;
+      return {status: 0, stdout: JSON.stringify(row.state === "received" ? [] : [row]), stderr: ""};
+    }
+    const result = realChildSpawnSync(exe, args, options);
+    if (result.status === 0 && globalThis.__fixturePendingRow) {
+      if (intent === "--claim") {
+        globalThis.__fixturePendingRow.state = "unverified";
+        globalThis.__fixturePendingRow.receipt = "context-api-inflight";
+      } else if (intent === "--queued") {
+        globalThis.__fixturePendingRow.state = "queued";
+        globalThis.__fixturePendingRow.actual_message_id = args[args.indexOf("--message-id") + 1];
+        globalThis.__fixturePendingRow.receipt = "context-api-accepted";
+      } else if (intent === "--resuming") {
+        globalThis.__fixturePendingRow.resume_attempted = true;
+      } else if (intent === "--received") {
+        globalThis.__fixturePendingRow.state = "received";
+        globalThis.__fixturePendingRow.text = null;
+        globalThis.__fixturePendingRow.receipt = "exact-native-history";
+      }
+      if (intent === "--claim" && result.status === 0) {
+        const claimResult = {status: 0, stdout: JSON.stringify(globalThis.__fixturePendingRow), stderr: ""};
+        return claimResult;
+      }
+    }
+    return result;
+  }
   return {status: 0, stdout: ""};
 };
 globalThis.__fixtureSpawn = (exe, args, options) => {
@@ -876,6 +893,14 @@ const fireStartupTimer = index => {
             env.pop("OPENCODE_DISPATCH_SLUG", None)
             env.update({"AGENT_HOME": str(ROOT), "AGENT_ARTIFACT_CHECKPOINT": "off",
                         "FIXTURE_GUARDS": str(module_path)})
+            if pending_ref:
+                env["FIXTURE_PENDING_ROW"] = json.dumps(pm._read_pending(pending_ref))
+            else:
+                rows = pm.pending_messages({"harness": "opencode", "session_id": "ses_A"})
+                if len(rows) == 1:
+                    env["FIXTURE_PENDING_ROW"] = json.dumps(rows[0])
+                else:
+                    env.pop("FIXTURE_PENDING_ROW", None)
             if pane_id:
                 env["HERDR_PANE_ID"] = "fixture-pane"
             else:
@@ -886,6 +911,14 @@ const fireStartupTimer = index => {
                                  capture_output=True, text=True, timeout=timeout)
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(run.stdout)
+
+    def run_pending_agent_initializer_fixture(self, body, ref=None, timeout=10):
+        if ref is None:
+            rows = pm.pending_messages({"harness": "opencode", "session_id": "ses_A"})
+            if len(rows) != 1:
+                raise AssertionError(f"expected one exact pending OpenCode row, got {len(rows)}")
+            ref = rows[0]["ref"]
+        return self.run_agent_initializer_fixture(body, timeout=timeout, pending_ref=ref)
 
     def test_opencode_agent_initializer_returns_before_sdk_and_publishes_resume_once(self):
         result = self.run_agent_initializer_fixture(r'''
@@ -909,7 +942,7 @@ fireStartupTimer(0);
 await settleTurn(); await settleTurn();
 const args = globalThis.__fixturePublishers.map(child => child.args);
 if (sdkCalls !== 1 || args.length !== 1) throw Error("resume did not publish exactly once");
-if (!args[0].includes("--session-start-source") || !args[0].includes("resume")) throw Error("resume provenance missing");
+if (!args[0].includes("--no-report-session") || args[0].includes("--session-start-source")) throw Error("Herdr owns lifecycle reporting");
 const state = __fixturePaneState();
 hooks.dispose();
 globalThis.__fixturePublishers[0].emit("exit", 0);
@@ -920,8 +953,9 @@ console.log(JSON.stringify({sdkCalls, args, state, prompts, logs: logs.map(row =
         self.assertEqual(result["sdkCalls"], 1)
         self.assertEqual(len(result["args"]), 1)
         args = result["args"][0]
-        self.assertEqual(args[args.index("--session-start-source") + 1], "resume")
-        self.assertEqual(result["state"]["originState"], "spent")
+        self.assertIn("--no-report-session", args)
+        self.assertNotIn("--session-start-source", args)
+        self.assertEqual(result["state"]["originState"], "pending")
         self.assertTrue(result["state"]["hasPublisher"])  # one child held the live slot
         self.assertEqual(result["prompts"], 0)
 
@@ -972,8 +1006,9 @@ console.log(JSON.stringify({sdkCalls, args, waiting, liveState, afterRefresh, pr
         self.assertEqual(result["sdkCalls"], 2)
         self.assertEqual(len(result["args"]), 2)
         first, second = result["args"]
-        self.assertEqual(first[first.index("--session-start-source") + 1], "resume")
-        self.assertNotIn("--session-start-source", second)
+        self.assertIn("--no-report-session", first)
+        self.assertIn("--no-report-session", second)
+        self.assertNotIn("--session-start-source", first + second)
         self.assertEqual(result["waiting"]["busy"], ["ses_A"])
         self.assertFalse(result["waiting"]["refreshPending"])
         self.assertTrue(result["liveState"]["refreshPending"])
@@ -1103,7 +1138,7 @@ console.log(JSON.stringify({before, gets, commands: f.commands, unavailable: una
         self.assertEqual(result["before"], [0, 0])
         self.assertEqual(result["gets"], 1)
         self.assertEqual(result["commands"], [["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
-                                              "--seq", "1000001", "--session-start-source", "resume"]])
+                                              "--no-report-session"]])
         self.assertEqual(result["unavailable"], [])
         self.assertEqual(result["reads"], ["/proc/self/cmdline", "/proc/self/stat"])
 
@@ -1121,10 +1156,9 @@ for (const response of [{data: {id: "ses_A"}}, {id: "ses_A", parentID: null},
 }
 console.log(JSON.stringify(commands));
 ''')
-        startup = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
-                   "--seq", "1000001", "--session-start-source", "resume"]
-        metadata = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
-        self.assertEqual(result, [startup, startup] + [metadata] * 6)
+        metadata = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode",
+                    "--session-id", "ses_A", "--no-report-session"]
+        self.assertEqual(result, [metadata] * 8)
 
     def test_opencode_normal_tool_retry_retains_actual_sdk_identity_and_observes_timeout(self):
         result = self.run_pane_projection_fixture(r'''
@@ -1145,7 +1179,7 @@ console.log(JSON.stringify({gets, commands: f.commands, sdk}));
         self.assertEqual(result["commands"], [
             ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"],
             ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A",
-             "--seq", "1000001", "--session-start-source", "resume"]])
+             "--no-report-session"]])
         self.assertEqual(result["sdk"], [["sdk-timeout", False], ["verified", True]])
 
     def test_opencode_spent_startup_and_child_slot_survive_reload_and_observer_timeout(self):
@@ -1165,8 +1199,8 @@ console.log(JSON.stringify({whileAlive, commands: f.commands,
 ''')
         self.assertEqual(result["whileAlive"], 1)
         prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
-        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
-            prefix + ["--seq", "1000002"], prefix + ["--seq", "1000003"], prefix + ["--no-report-session"]])
+        self.assertEqual(result["commands"], [prefix + ["--no-report-session"],
+            prefix + ["--no-report-session"], prefix + ["--no-report-session"], prefix + ["--no-report-session"]])
         self.assertTrue(result["timeout"])
 
     def test_opencode_disposed_pending_origin_never_rearms_or_spawns_from_late_sdk(self):
@@ -1201,10 +1235,10 @@ await noPid.scope.projectPane("ses_A", other);
 console.log(JSON.stringify({commands: f.commands, noPid: noPid.commands}));
 ''')
         prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
-        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
-            prefix + ["--seq", "1000002", "--session-start-source", "resume"], prefix + ["--seq", "1000003"]])
-        self.assertEqual(result["noPid"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
-            prefix + ["--seq", "1000002", "--session-start-source", "resume"]])
+        self.assertEqual(result["commands"], [prefix + ["--no-report-session"],
+            prefix + ["--no-report-session"], prefix + ["--no-report-session"]])
+        self.assertEqual(result["noPid"], [prefix + ["--no-report-session"],
+            prefix + ["--no-report-session"]])
 
     def test_opencode_spawn_error_fallback_uses_same_invocation_once_and_preserves_errno(self):
         result = self.run_pane_projection_fixture(r'''
@@ -1222,8 +1256,8 @@ console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs,
  thrown: {commands: thrown.commands, sync: thrown.sync, logs: thrown.logs}}));
 ''')
         prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
-        startup = prefix + ["--seq", "1000001", "--session-start-source", "resume"]
-        refresh = prefix + ["--seq", "1000002"]
+        startup = prefix + ["--no-report-session"]
+        refresh = prefix + ["--no-report-session"]
         for record in [result, result["thrown"]]:
             self.assertEqual(record["commands"], [startup, refresh])
             self.assertEqual(len(record["sync"]), 1)
@@ -1316,8 +1350,8 @@ console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs}));
 '''.replace("%%OBSERVATION%%", json.dumps(observation)).replace("%%LIVE%%", str(live))
         result = self.run_pane_projection_fixture(body)
         startup = [helper, "--harness", "opencode", "--session-id", "ses_A",
-                   "--seq", "1000001", "--session-start-source", "resume"]
-        refresh = [helper, "--harness", "opencode", "--session-id", "ses_A", "--seq", "1000002"]
+                   "--no-report-session"]
+        refresh = [helper, "--harness", "opencode", "--session-id", "ses_A", "--no-report-session"]
         self.assertEqual(result["commands"], [startup, refresh])
         self.assertEqual(len(result["sync"]), 1)
         attempt = result["sync"][0]
@@ -1349,8 +1383,8 @@ console.log(JSON.stringify({commands: f.commands, sync: f.sync, logs: f.logs}));
 '''.replace("%%LIVE%%", str(live)).replace("%%HELPER%%", helper).replace("%%OTHER%%", str(other))
         result = self.run_pane_projection_fixture(body)
         prefix = [helper, "--harness", "opencode", "--session-id", "ses_A"]
-        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "resume"],
-            prefix + ["--seq", "1000002", "--session-start-source", "resume"]])
+        self.assertEqual(result["commands"], [prefix + ["--no-report-session"],
+            prefix + ["--no-report-session"]])
         self.assertEqual(len(result["sync"]), 1)
         attempt = result["sync"][0]
         self.assertEqual(attempt["args"], result["commands"][0])
@@ -1387,7 +1421,7 @@ await new Promise(resolve => setImmediate(resolve)); f.exit(0);
 console.log(JSON.stringify({commands: f.commands, logs: f.logs}));
 '''.replace("%%STATE%%", str(self.state)))
         prefix = ["fixture-root/tools/fleet/herdr_projection.py", "--harness", "opencode", "--session-id", "ses_A"]
-        self.assertEqual(result["commands"], [prefix + ["--seq", "1000001", "--session-start-source", "startup"]])
+        self.assertEqual(result["commands"], [prefix + ["--no-report-session"]])
         finished = [row["extra"] for row in result["logs"] if row["extra"]["reason"] == "report-attempts-finished"]
         self.assertEqual(len(finished), 1)
         self.assertEqual((finished[0]["sessionReport"], finished[0]["metadataReport"]), ("exit0", "exit0"))
@@ -1516,80 +1550,181 @@ console.log(JSON.stringify({id: scope.__module.id, hasServer: "server" in scope.
         self.assertIsNone(result["cleared"])
         self.assertEqual(sorted(result["unsubscribed"]), sorted(result["subscribed"]))
 
-    def test_opencode_persisted_context_and_completed_turn_ack_once(self):
-        js = r'''
-import { pathToFileURL } from "node:url";
-const root = process.env.AGENT_HOME;
-const { AgentHarnessGuards } = await import(pathToFileURL(root + "/adapters/opencode/plugins/hearting-guards.js"));
-const sid = "fixture-oc";
-let messages = [], calls = 0;
-const unwrap = (data) => process.env.FIXTURE_SDK_STYLE === "data" ? data : {data};
-const ctx = { directory: root, worktree: root, client: { session: {
-  messages: async () => unwrap(messages),
-  prompt: async (args) => {
-    calls++;
-    if (args.body.noReply !== true || Object.keys(args.body).sort().join() !== "noReply,parts") throw Error("unsafe request");
-    const row = {info: {id: "fixture-message-" + calls, role: "user", sessionID: sid}, parts: args.body.parts};
+    def test_opencode_native_idle_persists_and_resumes_exact_message_once(self):
+        recipient = {"harness": "opencode", "session_id": "ses_A"}
+        text, ref = pm.prepare_peer_message("native OpenCode body", self.sender, recipient, defer=True)
+        result = self.run_pending_agent_initializer_fixture(r'''
+const sid = "ses_A", messages = [];
+let status = "idle", saves = 0, resumes = [], statusReads = 0, sessionReads = 0, messageReads = 0;
+const unwrap = data => process.env.FIXTURE_SDK_STYLE === "data" ? data : {data};
+const session = {
+  status: async () => {statusReads++;return unwrap({[sid]: {type: status}})},
+  get: async ({path}) => {sessionReads++;return unwrap({id: path.id, parentID: null})},
+  messages: async () => {messageReads++;return unwrap(messages)},
+  prompt: async args => {
+    saves++;
+    if (args.path.id !== sid || args.body.noReply !== true
+        || Object.keys(args.body).sort().join() !== "noReply,parts"
+        || args.body.parts[0].text !== FIXTURE_EXPECTED_TEXT) throw Error("noReply save mismatch");
+    const row = {info: {id: "native-message-1", role: "user", sessionID: sid,
+      time: {created: Date.now()}}, parts: args.body.parts};
     messages.push(row);
     return unwrap(row);
   },
-}}};
+  promptAsync: async args => {
+    resumes.push(args);
+    if (args.path.id !== sid || Object.keys(args.body).join() !== "messageID"
+        || args.body.messageID !== "native-message-1") throw Error("wrong native resume ID");
+    status = "busy";
+    return {response: {ok: true}};
+  },
+};
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {session}};
 const hooks = await AgentHarnessGuards(ctx);
-const tool = () => hooks["tool.execute.after"]({sessionID: sid, tool: "fixture-noop", args: {}}, {});
-await Promise.all([tool(), tool()]);
-await tool();
-console.log(JSON.stringify({stage: "queued", calls, messages}));
-messages.push({info: {id: "assistant", sessionID: sid, role: "assistant", parentID: messages[0]?.info.id,
-  time: {completed: 100}}, parts: []});
-await tool();
-await new Promise(resolve => setTimeout(resolve, 300));
-await tool();
-console.log(JSON.stringify({stage: "received", calls}));
-'''
-        recipient = {"harness": "opencode", "session_id": "fixture-oc"}
-        text, ref = pm.prepare_peer_message("original pending\u3000peer body", self.sender, recipient, defer=True)
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
-                             capture_output=True, text=True, timeout=10)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        stages = [json.loads(line) for line in run.stdout.splitlines()]
-        self.assertEqual(stages[0]["calls"], 1)
-        self.assertEqual(stages[0]["messages"][0]["parts"], [{"type": "text", "text": text}])
-        self.assertEqual(stages[1]["calls"], 1)
-        self.assertEqual(pm._read_pending(ref)["state"], "received")
+const bindingBeforeIdle = __fixturePaneState();
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+const savesAfterIdle = saves;
+const queued = JSON.parse(__fixtureSpawnSync("python3", [process.env.AGENT_HOME + "/utilities/peer-message.py",
+  "pending", "--to-harness", "opencode", "--to-session-id", sid], {encoding: "utf8"}).stdout)[0];
+await hooks.event({event: {type: "session.status", properties: {sessionID: sid, status: {type: "busy"}}}});
+await hooks.event({event: {type: "question.asked", properties: {sessionID: sid}}});
+await hooks.event({event: {type: "permission.asked", properties: {sessionID: sid}}});
+await hooks["tool.execute.after"]({sessionID: sid, tool: "fixture-noop", args: {}}, {output: ""});
+messages.push({info: {id: "assistant-1", sessionID: sid, role: "assistant",
+  parentID: "native-message-1", time: {completed: Date.now()}}, parts: []});
+status = "idle";
+await hooks.event({event: {type: "session.status", properties: {sessionID: sid, status: {type: "idle"}}}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+hooks.dispose();
+console.log(JSON.stringify({saves, resumes, queued, messages, bindingBeforeIdle,
+  savesAfterIdle, statusReads, sessionReads, messageReads}));
+'''.replace("FIXTURE_EXPECTED_TEXT", json.dumps(text)))
+        self.assertEqual(result["saves"], 1, result)
+        self.assertEqual(result["savesAfterIdle"], 1, result)
+        self.assertEqual(len(result["resumes"]), 1)
+        self.assertEqual(result["resumes"][0]["body"], {"messageID": "native-message-1"})
+        self.assertEqual(result["queued"]["state"], "queued")
+        self.assertEqual(result["queued"]["actual_message_id"], "native-message-1")
+        self.assertEqual(len(result["messages"]), 2)
+        row = pm._read_pending(ref)
+        self.assertEqual((row["state"], row["receipt"], row["actual_message_id"]),
+                         ("received", "exact-native-history", "native-message-1"))
         self.assertEqual(len([r for r in self.rows() if r.get("transfer_ref") == ref]), 1)
 
-    def test_opencode_data_style_retains_persisted_vs_completed_parent_boundary(self):
+    def test_opencode_data_style_retains_native_history_boundary(self):
         with mock.patch.dict(os.environ, {"FIXTURE_SDK_STYLE": "data"}):
-            self.test_opencode_persisted_context_and_completed_turn_ack_once()
+            self.test_opencode_native_idle_persists_and_resumes_exact_message_once()
 
-    def test_opencode_lost_response_foreign_history_never_blindly_resends(self):
-        js = r'''
-import { pathToFileURL } from "node:url";
-const root = process.env.AGENT_HOME;
-const { AgentHarnessGuards } = await import(pathToFileURL(root + "/adapters/opencode/plugins/hearting-guards.js"));
-const sid = "fixture-oc";
-let messages = [], calls = 0;
-const hooks = await AgentHarnessGuards({directory: root, worktree: root, client: {session: {
+    def test_opencode_lost_noReply_response_reconciles_exact_history_without_resubmit(self):
+        recipient = {"harness": "opencode", "session_id": "ses_A"}
+        _text, ref = pm.prepare_peer_message("lost OpenCode response", self.sender, recipient, defer=True)
+        result = self.run_pending_agent_initializer_fixture(r'''
+const sid = "ses_A", messages = [];
+let status = "idle", saves = 0, resumes = 0;
+const session = {
+  status: async () => ({data: {[sid]: {type: status}}}),
+  get: async ({path}) => ({data: {id: path.id, parentID: null}}),
   messages: async () => ({data: messages}),
-  prompt: async (args) => {
-    calls++;
-    messages.push({info: {id: "persisted", role: "user", sessionID: "foreign-fork"}, parts: args.body.parts});
+  prompt: async args => {
+    saves++;
+    const row = {info: {id: "saved-before-lost-response", role: "user", sessionID: sid,
+      time: {created: Date.now()}}, parts: args.body.parts};
+    messages.push(row);
     throw Error("response-lost-after-persist");
   },
-}}});
-const tool = () => hooks["tool.execute.after"]({sessionID: sid, tool: "fixture-noop", args: {}}, {});
-await tool(); await tool(); await tool();
-console.log(JSON.stringify({calls}));
-'''
-        recipient = {"harness": "opencode", "session_id": "fixture-oc"}
-        text, ref = pm.prepare_peer_message("original body", self.sender, recipient, defer=True)
-        run = subprocess.run(["node", "--input-type=module", "-e", js], env=dict(os.environ),
-                             capture_output=True, text=True, timeout=10)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(json.loads(run.stdout)["calls"], 1)
-        self.assertEqual(pm._read_pending(ref)["state"], "unverified")
-        self.assertEqual(pm._read_pending(ref)["text"], text)
-        self.assertEqual(self.rows(), [])
+  promptAsync: async () => { resumes++; status = "busy"; return {response: {ok: true}}; },
+};
+const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+messages.push({info: {id: "assistant-1", sessionID: sid, role: "assistant",
+  parentID: "saved-before-lost-response", time: {completed: Date.now()}}, parts: []});
+status = "idle";
+await hooks.event({event: {type: "session.status", properties: {sessionID: sid, status: {type: "idle"}}}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: sid}}});
+hooks.dispose();
+console.log(JSON.stringify({saves, resumes}));
+''')
+        self.assertEqual((result["saves"], result["resumes"]), (1, 1))
+        row = pm._read_pending(ref)
+        self.assertEqual((row["state"], row["actual_message_id"], row["receipt"]),
+                         ("received", "saved-before-lost-response", "exact-native-history"))
+
+    def test_opencode_duplicate_history_wrong_parent_and_sid_swap_never_fabricate_receipt(self):
+        recipient = {"harness": "opencode", "session_id": "ses_A"}
+        text, ref = pm.prepare_peer_message("duplicate-bound OpenCode body", self.sender, recipient, defer=True)
+        result = self.run_pending_agent_initializer_fixture(r'''
+const sid = "ses_A", messages = [];
+let status = "idle", saves = 0, resumes = 0;
+const session = {
+  status: async () => ({data: {[sid]: {type: status}}}),
+  get: async ({path}) => ({data: {id: path.id, parentID: path.id === sid ? null : sid}}),
+  messages: async ({path}) => ({data: path.id === sid ? messages : []}),
+  prompt: async args => {
+    saves++;
+    const row = {info: {id: "native-message-1", role: "user", sessionID: sid,
+      time: {created: Date.now()}}, parts: args.body.parts};
+    messages.push(row); return {data: row};
+  },
+  promptAsync: async () => { resumes++; status = "busy"; return {response: {ok: true}}; },
+};
+const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
+const fireIdle = async sessionID => {
+  status = "idle";
+  await hooks.event({event: {type: "session.status", properties: {sessionID, status: {type: "idle"}}}});
+  await hooks.event({event: {type: "session.idle", properties: {sessionID}}});
+};
+const duplicate = {info: {id: "old-duplicate", role: "user", sessionID: sid,
+  time: {created: Date.now()}}, parts: [{type: "text", text: FIXTURE_EXPECTED_TEXT}]};
+messages.push(duplicate, {...duplicate, info: {...duplicate.info, id: "second-duplicate"}});
+await fireIdle(sid);
+const duplicates = {saves, resumes};
+messages.length = 0;
+await fireIdle(sid);
+const savedID = messages[0]?.info.id;
+messages.push({info: {id: "wrong-parent", sessionID: sid, role: "assistant",
+  parentID: "foreign-message", time: {completed: Date.now()}}, parts: []});
+await fireIdle(sid);
+const wrongParent = {saves, resumes};
+messages.pop();
+messages.push({info: {id: "assistant-1", sessionID: sid, role: "assistant",
+  parentID: savedID, time: {completed: Date.now()}}, parts: []});
+await fireIdle(sid);
+await fireIdle("ses_child");
+hooks.dispose();
+console.log(JSON.stringify({duplicates, wrongParent, saves, resumes}));
+'''.replace("FIXTURE_EXPECTED_TEXT", json.dumps(text)))
+        self.assertEqual(result["duplicates"], {"saves": 0, "resumes": 0})
+        self.assertEqual(result["wrongParent"], {"saves": 1, "resumes": 1})
+        self.assertEqual((result["saves"], result["resumes"]), (1, 1))
+        self.assertEqual(pm._read_pending(ref)["state"], "received")
+
+    def test_opencode_busy_questions_permissions_and_nonroot_sid_do_not_receive_prompt(self):
+        recipient = {"harness": "opencode", "session_id": "ses_A"}
+        _text, ref = pm.prepare_peer_message("busy OpenCode body", self.sender, recipient, defer=True)
+        result = self.run_pending_agent_initializer_fixture(r'''
+let status = "busy", gets = 0, saves = 0;
+const session = {
+  status: async () => ({data: {ses_A: {type: status}, ses_child: {type: status}}}),
+  get: async ({path}) => {gets++;return {data: {id: path.id, parentID: "not-root"}}},
+  messages: async () => ({data: []}),
+  prompt: async () => {saves++;throw Error("blocked session received peer message")},
+  promptAsync: async () => {throw Error("blocked session resumed")},
+};
+const hooks = await AgentHarnessGuards({directory: process.cwd(), worktree: process.cwd(), client: {session}});
+await hooks.event({event: {type: "session.status", properties: {sessionID: "ses_A", status: {type: "busy"}}}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses_A"}}});
+await hooks.event({event: {type: "question.asked", properties: {sessionID: "ses_A"}}});
+await hooks.event({event: {type: "permission.asked", properties: {sessionID: "ses_A"}}});
+await hooks["tool.execute.after"]({sessionID: "ses_A", tool: "fixture", args: {}}, {output: ""});
+status = "idle";
+await hooks.event({event: {type: "session.status", properties: {sessionID: "ses_A", status: {type: "idle"}}}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses_child"}}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses_A"}}});
+hooks.dispose();
+console.log(JSON.stringify({gets, saves}));
+''')
+        self.assertEqual(result["saves"], 0)
+        self.assertEqual(pm._read_pending(ref)["state"], "pending")
 
     def test_claude_actual_prompt_observes_ref_once_without_output_ack(self):
         recipient = {"harness": "claude", "session_id": "recipient-a"}

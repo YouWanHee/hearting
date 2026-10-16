@@ -1,0 +1,100 @@
+#!/bin/sh
+# installed by herdr
+# managed by herdr; reinstalling or updating the integration overwrites this file.
+# add custom hooks beside this file instead of editing it.
+# HERDR_INTEGRATION_ID=codex
+# HERDR_INTEGRATION_VERSION=10
+
+set -eu
+action="${1:-}"
+[ "$action" = session ] || exit 0
+hook_input_file="$(mktemp "${TMPDIR:-/tmp}/herdr-codex-hook.XXXXXX")" || exit 0
+trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
+cat >"$hook_input_file" 2>/dev/null || true
+
+[ -n "${HERDR_SOCKET_PATH:-}" ] || exit 0
+[ -n "${HERDR_PANE_ID:-}" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+
+HERDR_HOOK_INPUT_FILE="$hook_input_file" HERDR_HOOK_SCRIPT="$0" python3 - <<'PY'
+import json
+import os
+import random
+import socket
+import sys
+import time
+from pathlib import Path
+
+try:
+    with open(os.environ["HERDR_HOOK_INPUT_FILE"], encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception:
+    payload = {}
+if not isinstance(payload, dict):
+    raise SystemExit(0)
+event = str(payload.get("hook_event_name") or "")
+if event and event != "SessionStart":
+    raise SystemExit(0)
+session_id = payload.get("session_id")
+transcript = payload.get("transcript_path")
+if not isinstance(session_id, str) or not session_id:
+    raise SystemExit(0)
+if not isinstance(transcript, str) or not transcript.strip():
+    raise SystemExit(0)
+if os.environ.get("CODEX_THREAD_ID") and os.environ["CODEX_THREAD_ID"] != session_id:
+    raise SystemExit(0)
+
+pane_id = os.environ.get("HERDR_PANE_ID")
+socket_path = os.environ.get("HERDR_SOCKET_PATH")
+source = "herdr:codex"
+root = Path(os.environ.get("HERDR_HOOK_SCRIPT", __file__)).resolve().parents[3]
+tools = root / "tools"
+try:
+    sys.path.insert(0, str(tools))
+    from fleet.herdr_projection import may_report
+    if not may_report("codex", session_id, pane_id=pane_id):
+        raise SystemExit(0)
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(0)
+
+params = {
+    "pane_id": pane_id,
+    "source": source,
+    "agent": "codex",
+    "seq": time.time_ns(),
+    "agent_session_id": session_id,
+}
+params["agent_session_path"] = transcript
+start_source = payload.get("source") if event == "SessionStart" else None
+if isinstance(start_source, str) and start_source in {"startup", "resume", "clear", "compact", "fork"}:
+    params["session_start_source"] = start_source
+    if start_source == "resume":
+        try:
+            from fleet.process_identity import current_launch_context
+            launch = current_launch_context("codex", session_id)
+            resume_argv = (launch or {}).get("argv")
+            if (isinstance(resume_argv, list) and resume_argv and resume_argv[0] == "codex"
+                    and session_id in resume_argv):
+                params["resume_argv"] = resume_argv
+        except Exception:
+            pass
+request = {
+    "id": f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}",
+    "method": "pane.report_agent_session",
+    "params": params,
+}
+try:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(0.5)
+    client.connect(socket_path)
+    client.sendall((json.dumps(request) + "\n").encode())
+    try:
+        client.recv(4096)
+    except Exception:
+        pass
+    client.close()
+except Exception:
+    pass
+PY

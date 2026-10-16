@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -159,6 +160,27 @@ class OpenCodeReportTest(unittest.TestCase):
         with unittest.mock.patch.object(hp, "runtime_identity", return_value=("opencode", None)), \
                 unittest.mock.patch.object(hp, "verified_pane", return_value="fixture-pane"):
             self.assertTrue(hp.may_report("opencode", "ses_other", worker=False))
+
+
+class LaunchContextTest(unittest.TestCase):
+    def test_argv_and_cwd_are_returned_only_for_a_stable_proven_session_birth(self):
+        found = SimpleNamespace(confidence=P.PROVEN, session_id=SID)
+        with unittest.mock.patch.object(P, "_proc_stat", side_effect=[(1, "123"), (1, "123")]), \
+                unittest.mock.patch.object(P, "process_identity", return_value=found), \
+                unittest.mock.patch.object(P, "_proc_argv", return_value=["opencode", "--session", SID]), \
+                unittest.mock.patch.object(P.os, "readlink", return_value="/sandbox/project"):
+            context = P.launch_context(4321, "opencode", SID)
+        self.assertEqual(context, {"pid": 4321, "proc_start": "123", "harness": "opencode",
+                                  "session_id": SID, "argv": ["opencode", "--session", SID],
+                                  "cwd": "/sandbox/project"})
+
+    def test_pid_reuse_or_session_change_discards_launcher_context(self):
+        found = SimpleNamespace(confidence=P.PROVEN, session_id=SID)
+        with unittest.mock.patch.object(P, "_proc_stat", side_effect=[(1, "123"), (1, "124")]), \
+                unittest.mock.patch.object(P, "process_identity", return_value=found), \
+                unittest.mock.patch.object(P, "_proc_argv", return_value=["opencode", "--session", SID]), \
+                unittest.mock.patch.object(P.os, "readlink", return_value="/sandbox/project"):
+            self.assertIsNone(P.launch_context(4321, "opencode", SID))
 
 
 if __name__ == "__main__":

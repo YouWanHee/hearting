@@ -126,6 +126,12 @@ _OPENCODE_FIXED_SYMLINKS = [
     ("agent-agents", "opencode_setting/opencode-agents"),
     ("agent-commands", "opencode_setting/opencode-commands"),
     ("plugins/hearting-guards.js", "opencode_setting/opencode-plugins/hearting-guards.js"),
+    ("plugins/herdr-agent-state.js", "adapters/opencode/plugins/herdr-agent-state.js"),
+    ("tui/hearting-tui-identity.ts", "adapters/opencode/tui/hearting-tui-identity.ts"),
+    ("tui/herdr-tui-session.js", "adapters/opencode/tui/herdr-tui-session.js"),
+    ("tui/herdr-opencode/tui.js", "adapters/opencode/tui/herdr-opencode/tui.js"),
+    ("tui/hearting-owned-tui.json", "adapters/opencode/tui/owned-tui.json"),
+    ("tui/hearting-owned-cli.json", "adapters/opencode/tui/owned-cli.json"),
 ]
 
 _OPENCODE_TABLE = (

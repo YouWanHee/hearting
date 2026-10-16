@@ -2004,16 +2004,20 @@ guard/CLI outcomes with bounded metadata only. A returned publisher command, inc
 exit 0, is an attempt observation; it does not prove identity publication or receipt.
 Neither environment/pane labels nor a queued/persisted message prove receipt.
 
-**Runtime table** (herdr-unified). Native peer messaging is not extended to Codex; the common
-control lever across Claude and Codex depth-0 sessions is the herdr agent API (`herdr
-agent start|prompt|read|wait`), because `ListAgents` never surfaces a Codex session
-(`SendMessage` cannot reach it) and herdr panes are not raw tmux panes:
+**Runtime table** (herdr-unified). Peer transfers use private sealed refs; transport
+acceptance and actual receipt are separate facts:
 
-| Runtime | Watched side (wait target) | Steward side (wake) | Send (secondary) | Receive | Ledger | Status |
-|---|---|---|---|---|---|---|
-| Claude | `herdr agent wait <target>` — measured | detached `watch` + `PostToolUse(Bash)` `asyncRewake` hook `peer-steward-rewake.py` (exit 2 wakes) — **spec-only** until a live-session measurement; backgrounding `wait` is not a completion path. Hook death or session restart falls back to the next prompt's un-acked-receipt sweep | `peer-steward.py prompt` (herdr, F-100c primary) · native `SendMessage` — reaches inline mid-turn (measured), lost to approval wait/expiry when idle (measured) → secondary | `<cross-session-message>` injection · herdr prompt with the `(peer-from: …)` trailer | `PostToolUse(SendMessage)` hook + `UserPromptSubmit` hook (`notice` for both envelopes; un-acked watch receipts swept) + `peer-steward.py` record | watched measured · send/receive measured · steward wake spec-only |
-| Codex | `herdr agent wait <target>` — measured (idle matches immediately); `--until working/idle --timeout` can time out after completion — read the pane instead | detached `watch` + next-turn receipt pull; no wake carrier — unknown (no capability claim before measurement, P-7) | `peer-steward.py prompt` (herdr, F-100c) — native path retired (`codex queue` / gateway `steer` op not implemented) | herdr prompt with the `(peer-from: …)` trailer → `userprompt-lifecycle.py` writes the `notice` | `peer-steward.py` record + Codex hook `notice` | send/receive measured / steward wake unknown |
-| OpenCode | `herdr agent wait <target>` — unknown (pending P-6) | unknown | `peer-steward.py prompt` (herdr, F-100c) | herdr prompt with the `(peer-from: …)` trailer → `hearting-guards.js` `chat.message` writes the `notice` | `peer-steward.py` record + plugin `notice` | send measured / receive pending live measurement / steward unknown |
+| Runtime | Transport and acceptance | Exact native receipt | Wake and limits |
+|---|---|---|---|
+| Claude | `peer-steward.py prompt` stores/reuses a ref bound to sender, recipient session and body digest; existing hook context carries the sealed message. | The exact receiving callback acknowledges the bound ref. Context output alone is not receipt. | Plain interactive TUI has no supported wake; its pending ref remains for the next native callback. No pane send or composer read. |
+| Codex | The current exact thread/client queue accepts one sealed ref and returns its `client_message_id`. | The exact message in the bound thread history confirms consumption. | Uses the existing queue and hook path; no pane typing or transcript inference. |
+| OpenCode | The plugin saves one `noReply` user message through its current client at the exact selected root SID. Its native ID marks it queued. | Only an error-free completed assistant message whose `parentID` is that ID in the same SID marks it received. | On a verified idle root, `promptAsync` continues the persisted message by ID. Busy, question, permission, child, ambiguous history or SID change cannot consume it. |
+
+Queue acceptance never means delivery or consumption. A pending retry of the same
+sender/recipient/body reuses its ref; a changed body or recipient session gets a
+separate transfer. Lost responses reconcile against exact native history before a
+resume. Ambiguity never submits the body again. Native callbacks preserve pending
+refs when the runtime has no supported wake.
 
 Identity on the ledger (F-100c): every steward record carries `to.session_id` resolved
 through `herdr agent get` (Claude UUID, Codex thread id; herdr reports no id for
@@ -2115,48 +2119,32 @@ name-only targets continue to resolve through the common metadata join. A repeat
 observation that learns the SID completes the same name/pane entry, rather than
 leaving an extra anonymous target.
 
-**Prompt submission is verified, never assumed.** `peer-steward.py prompt`
-prints `prompted=true` only after the submission was observed, and every other verdict is typed:
-`failed` (exit 1), `queued` (exit 3, our text still sits in the target's input), `unverified`
-(exit 5, nothing could be observed) — never `true` from herdr's exit code alone. Before any send the
-visible pane is scanned for a selection/permission form (AskUserQuestion, permission prompt) in
-every state. A `blocked` target, an open form, a user draft or an unreadable input
-box receives no keyboard input. Claude/OpenCode input is read again immediately
-before submission; Codex's existing native queue branch does not type into the box. Its
-undelivered message is retained as a bounded private runtime payload tied to the
-existing immutable transfer ref, sender, exact recipient session and body digest;
-the public ledger continues to store only digest/summary. A still-pending retry
-of that same sender/recipient/body reuses the ref. A fork, changed SID or different
-body has a separate transfer. Queue acceptance is `queued`, ambiguous transport is
-`unverified`, and neither is delivery or consumption. Only exact native history
-or the existing receiver's observation of the bound ref acknowledges receipt.
-Normal idle/receive callbacks and the next steward prompt retry unsent rows only
-when the input box is readable and empty, preserving the exact recipient and claim.
-Session-tidy's unsent continue stays in its existing booking until that same idle
-callback, and is cancelled by newer user input or a changed card as before.
-Callback stdout/system context alone is not an ack.
-An unavailable transport or callback without an actual ack keeps the payload
-pending and reports that limitation, without a watcher, forced key or new gate
-(text typed into an open form would be lost and the Enter would answer the form). A target that is not working is sent with `herdr agent prompt --wait --until working`
-(bound clamped to herdr's 5000 ms stall floor) and counts only once its state flips (`agent_prompt_stalled` →
-`failed reason=agent-prompt-stalled`). A working target, or a herdr `timeout`, is settled by
-`_verify_after_send`: the target transcript first (`verify=transcript-arrival`, Claude only),
-then the prompt box — but only when `herdr agent explain` actually read it
-(`region=prompt_box_body`; a working Claude pane is explained by its terminal title and an
-OpenCode pane by `rule: none`, neither is a box read → `verify=prompt-box-unavailable`,
-`unverified`); our own first line still in a read box is `queued`. Verification
-never retries Enter: that could submit a user's newer draft. Already accepted or
-ambiguous submissions are not resent.
-A dim `❯ …` line in an *empty* box is Claude Code's prompt suggestion, not unsubmitted text;
-the target transcript settles it. `--no-verify`
-keeps the legacy exit-code report; `--wait-idle-ms N` defers a send to a working/blocked target.
-**Every pane prompt goes through this wrapper.** herdr's own server log records `cli:agent:prompt` with
-no target pane and no caller, so the wrapper writes one ledger row per send whatever the outcome: `to.pane`
-(the resolved herdr pane), `to.session_id`, `from.session_id`, `ts`, `body_sha256`, and the verdict as
-`delivery.receipt` (`prompted=… state_before=… verify=… herdr_rc=… ms=… reason=…`). Harness code and a
-session's own Bash never call `herdr agent prompt`, `herdr pane send-text`, `send-keys` or `pane run`
-directly (`peer_steward.test.py` asserts it).
+**Peer submission is reference-based, never inferred from transport status.**
+`peer-steward.py prompt` seals a private transfer ref for the exact sender, recipient
+session and body digest. It does not inspect or send a target's composer. Codex uses
+the exact thread queue and `client_message_id`; OpenCode saves a `noReply` message
+through the current plugin client, then resumes only that persisted ID on an idle,
+verified root session. Claude uses its existing hook context and exact receiving
+callback. On a plain interactive Claude TUI without a supported wake carrier, the
+ref stays pending until the next native callback. A queued ref is not a receipt;
+only exact bound native history or the receiver callback can mark it received.
 
+A lost native response is reconciled from exact persisted history before continuing
+the same ref. Duplicate or ambiguous matches are left pending without resubmitting
+the body. OpenCode additionally requires the exact selected root SID, native idle
+status and a completed assistant child of the persisted message; busy, question,
+permission, child sessions, errors and SID changes do not receive an extra turn.
+Callback stdout/system context alone is not an acknowledgement. Session-tidy
+continue preserves its booking, generation, seat, prompt-count and exact-new-session
+checks. A supported Claude exact-native seat uses its private attachment after
+checking the booked process, form and empty input; other targets use the sealed
+no-trailer ref through their native carrier. Both address only the exact new SID,
+send once and keep pending refs until exact native receipt. Neither invents a wake
+or falls back to an inherited pane prompt.
+
+Clear and retire retain their checked foreground/form/draft and successor safety.
+They are the remaining pane commands; peer and continue submission no longer use
+`herdr agent prompt`, a composer read, a transcript-arrival guess or a keystroke.
 Same-behavior guarantees are still not claimed: the watched-side herdr realization is
 measured for both Claude and Codex, and **no runtime's steward-side wake is measured** —
 the Claude carrier becomes `measured` only after a live-session capture, not before. The
@@ -2233,11 +2221,25 @@ receipts distinguish native acceptance (`queued`) from exact receiver
 consumption (`received`). OpenCode native status is usable for 15 seconds only
 when its session, pane, foreground PID birth, and PID namespace still match.
 
+Pane-scoped session history is keyed by the concrete Herdr socket when one is
+known, not by pane label alone. The OpenCode TUI selection record carries its
+native sequence and observed start source for the Python CLI projection and
+the state-plugin socket projection. Resume argv is copied as the original
+array only when the current native SID and foreground PID birth prove that
+launcher; absent transcript, cwd, model, permission, or argv evidence stays
+omitted. The stored argv restores a session and grants no execution or owner
+authority. Clear checks OpenCode's current process-bound selection before
+using the pane record, and an older delayed start callback cannot replace a
+later session on that seat.
+
 Watch observers settle their existing duty on an exact pane exit/close, a
 complete successful census proving that pane absent, or a completed retire.
 The terminal receipt is written under the existing watch lock before observer
 exit, and ensure/reconnect checks that receipt before starting a process. A
 transport error, timeout, incomplete census, or unknown identity keeps the
-observation pending. The Herdr 0.9.5 API schema exposes pane exit/close events
-and snapshots but no event sequence or `events_lost` field, so reconnect
-discards cached state and requires a new complete snapshot.
+observation pending. The Herdr 0.9.5 API exposes pane exit/close events and
+session snapshots, but no public event sequence or replay cursor. `events_lost`
+is an unrestricted `error.code` in the API error envelope, not an event variant.
+On that error, disconnect, or protocol fault, invalidate the endpoint view,
+resubscribe, and require one successful complete snapshot before using cached
+pane state again.

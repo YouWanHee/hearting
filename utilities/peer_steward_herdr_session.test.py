@@ -13,9 +13,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 STEWARD = ROOT / "utilities/peer-steward.py"
+sys.path.insert(0, str(ROOT / "utilities"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 FAKE_HERDR = """#!/usr/bin/env python3
 import json, os, sys
@@ -78,14 +81,15 @@ class HerdrSessionTargeting(unittest.TestCase):
         module._close_pane("w1:p3")
         module._herdr_prompt("w1:p3", "hello", wait=False, timeout_ms=1000)
         module._form_open("w1:p3")
-        module._prompt_box_evidence("w1:p3")
+        module._blocking_screen_for_target("w1:p3", "codex")
+        module._bottom_form_tokens("w1:p3")
         lines = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertGreaterEqual(len(lines), 5, lines)
         for argv in lines:
             self.assertEqual(argv[:2], ["--session", "fourth"], argv)
         self.assertEqual({tuple(argv[2:4]) for argv in lines},
                          {("pane", "get"), ("pane", "close"), ("agent", "prompt"),
-                          ("agent", "read"), ("agent", "explain"), ("agent", "get")})
+                          ("agent", "read"), ("agent", "get")})
 
     def test_no_herdr_invocation_bypasses_the_session_helper(self):
         # A bare `["herdr", ...]` argv literal can only reach the default server.
@@ -99,6 +103,48 @@ class HerdrSessionTargeting(unittest.TestCase):
             capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.addCleanup(os.environ.pop, "AGENT_HERDR_SESSION", None)
+
+    def test_identical_pane_ids_on_named_endpoints_get_distinct_seats(self):
+        import session_tidy
+        with unittest.mock.patch.dict(os.environ, {
+            "AGENT_HERDR_SESSION": "left", "HERDR_SOCKET_PATH": "/tmp/herdr-left.sock"}):
+            left = session_tidy._pane_seat_of("shared:p1")
+        with unittest.mock.patch.dict(os.environ, {
+            "AGENT_HERDR_SESSION": "right", "HERDR_SOCKET_PATH": "/tmp/herdr-right.sock"}):
+            right = session_tidy._pane_seat_of("shared:p1")
+        self.assertNotEqual(left.key, right.key)
+        self.assertNotEqual(left.endpoint, right.endpoint)
+
+    def test_opencode_clear_requires_the_current_native_selection(self):
+        module = self.load("fourth")
+        req = {"seat": {"pane": "w1:p3"}, "harness": "opencode", "sid": "booked-sid"}
+        agent = {"pane": "w1:p3", "harness": "opencode", "session_id": "stale-herdr-sid"}
+        with unittest.mock.patch.object(module, "_interpret_payload",
+                                        return_value=("idle", agent, 0, None)), \
+                unittest.mock.patch.object(module, "_process_session", return_value="current-sid"):
+            reason, _agent, _lines = module._clear_look("oc-live", req)
+        self.assertEqual(reason, "target-changed")
+
+        with unittest.mock.patch.object(module, "_interpret_payload",
+                                        return_value=("idle", agent, 0, None)), \
+                unittest.mock.patch.object(module, "_process_session", return_value="booked-sid"), \
+                unittest.mock.patch.object(module, "_read_screen", return_value=[]), \
+                unittest.mock.patch.object(module, "_screen_ready", return_value=None):
+            reason, _agent, _lines = module._clear_look("oc-live", req)
+        self.assertIsNone(reason)
+
+    def test_delayed_old_start_cannot_replace_the_booked_successor(self):
+        import session_tidy as st
+        import session_tidy_clear as clear
+        seat = st.Seat("pane", "seat", "w1:p3", "opencode")
+        req = {"status": "reserved", "harness": "opencode", "sid": "booked-sid",
+               "created": 100.0}
+        with unittest.mock.patch.object(clear, "read_reservation", return_value=req), \
+                unittest.mock.patch("fleet.process_identity.current_session_identity",
+                                    return_value="current-sid"), \
+                unittest.mock.patch.object(clear, "_write_reservation") as write:
+            clear.note_start_locked(seat, "opencode", "delayed-old-sid", 110.0)
+        write.assert_not_called()
 
 
 if __name__ == "__main__":

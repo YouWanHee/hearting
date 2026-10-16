@@ -549,7 +549,6 @@ let paneNativeOrigin // undefined means not yet read; null is unsupported, never
 const paneContexts = new WeakMap()
 let paneOwningContext = null
 let panePublisherSlot = null
-let paneReportSequence = Date.now() * 1000
 
 function registerPaneContext(ctx) {
   if (paneContexts.has(ctx)) return paneContexts.get(ctx)
@@ -870,17 +869,11 @@ async function projectPane(sid, ctx, retry = false) {
       peerIdentityLog(ctx, "publisher", "publisher-stale-selection", { sessionID: sid })
       return
     }
-    const reportSession = verified && paneNativeOrigin.state !== "invalidated"
-    const startup = reportSession && paneNativeOrigin.state === "pending"
-    const startSource = startup ? (paneNativeOrigin.bare ? "startup" : "resume") : null
-    // A pruned import-time release must not take both publisher paths down:
-    // resolve the live root/helper here so async and sync share one target.
+    // Herdr v13 owns session identity and lifecycle. Hearting validates the
+    // exact native selection and refreshes display metadata only.
     const target = resolvePublisherTarget()
-    const args = [target.helper, "--harness", "opencode", "--session-id", sid]
-    if (reportSession) {
-      args.push("--seq", String(++paneReportSequence))
-      if (startSource) args.push("--session-start-source", startSource)
-    } else args.push("--no-report-session")
+    const args = [target.helper, "--harness", "opencode", "--session-id", sid,
+      "--no-report-session"]
     const slot = { child: null }
     panePublisherSlot = slot // Reserve before spawn, including synchronous reentrancy.
     const options = { cwd: target.root, env: { ...process.env, AGENT_HOME: target.root },
@@ -899,11 +892,10 @@ async function projectPane(sid, ctx, retry = false) {
         return
       }
       try {
-        // Same executable, argv, sequence and environment; no startup replay with
-        // a newer sequence. The synchronous child is bounded and owns this slot.
+        // Same executable, argv and environment. The synchronous child is
+        // bounded and owns this slot.
         const result = spawnSync("python3", args, { ...options, encoding: "utf8",
           timeout: 10000, killSignal: "SIGKILL", maxBuffer: 1024 })
-        if (startup && Number.isInteger(result.pid) && result.pid > 0) paneNativeOrigin.state = "spent"
         if (result.error) {
           peerIdentityLog(ctx, "publisher", "publisher-sync-fallback-error", {
             sessionID: sid, ...publisherErrorFields(result.error) })
@@ -937,7 +929,6 @@ async function projectPane(sid, ctx, retry = false) {
     }
     slot.child = child
     const created = Number.isInteger(child.pid) && child.pid > 0
-    if (startup && created) paneNativeOrigin.state = "spent"
     child.on("spawn", () => {
       launched = true
       peerIdentityLog(ctx, "publisher", "publisher-path-success", { sessionID: sid, publisherPath: "async" })
@@ -946,7 +937,7 @@ async function projectPane(sid, ctx, retry = false) {
     child.on("close", () => releasePanePublisher(slot))
     observePanePublisher(child, ctx, sid, generation, fallback)
     peerIdentityLog(ctx, "publisher", "publisher-spawned", { sessionID: sid,
-      nativeStartupAttempt: startup && created })
+      sessionLifecycle: "herdr-v13", metadataOnly: true, publisherCreated: created })
     child.unref()
   } catch (error) {
     peerIdentityLog(ctx, "publisher", "publisher-spawn-error", { sessionID: sid, ...publisherErrorFields(error) })
@@ -1171,7 +1162,12 @@ function createCompletionCarrier(ctx) {
       if (!sid || !available()) return null
       sessions.add(sid)
       if (!timer) {
-        timer = setInterval(() => { for (const id of sessions) deliver(id).catch(() => {}) }, CARRIER_INTERVAL_MS)
+        timer = setInterval(() => {
+          for (const id of sessions) {
+            deliver(id).catch(() => {})
+            if (status.get(id) === "idle") pendingPeerDelivery(ctx, id).catch(() => {})
+          }
+        }, CARRIER_INTERVAL_MS)
         timer.unref?.()
       }
       log("env", sid, "carrier-armed")
@@ -1240,8 +1236,17 @@ function pendingPeerCommand(sid, options = []) {
     "pending", "--to-harness", "opencode", "--to-session-id", sid, ...options], {
     cwd: root, env: { ...process.env, AGENT_HOME: root }, encoding: "utf8", timeout: 1500,
   })
-  if (result.error || result.status !== 0) return null
+  if (result.status !== 0) return null
   try { return JSON.parse(result.stdout || "null") } catch { return null }
+}
+
+function pendingPeerTransition(sid, options) {
+  if (!sid) return false
+  const result = spawnSync("python3", [path.join(root, "utilities", "peer-message.py"),
+    "pending", "--to-harness", "opencode", "--to-session-id", sid, ...options], {
+    cwd: root, env: { ...process.env, AGENT_HOME: root }, encoding: "utf8", timeout: 1500,
+  })
+  return result.status === 0
 }
 
 function reconnectPeerObligations() {
@@ -1257,10 +1262,29 @@ function reconnectPeerObligations() {
 }
 
 const pendingPeerBusy = new Set()
+const pendingPeerStatus = new Map()
+
+function pendingPeerRoot(ctx, sid) {
+  const origin = paneNativeOrigin
+  const binding = paneContexts.get(ctx)
+  if (!binding?.active || !binding.ownsOrigin || paneOwningContext !== ctx
+      || !origin || origin.state === "invalidated" || origin.sid !== sid) return false
+  try { return realpathSync(ctx.directory) === origin.directory } catch { return false }
+}
+
+function nativeMessageTime(info) {
+  const value = Number(info?.time?.created)
+  return Number.isFinite(value) && value > 0 ? (value < 1e12 ? value * 1000 : value) : 0
+}
+
 async function pendingPeerDelivery(ctx, sid) {
-  if (!sid || pendingPeerBusy.has(sid) || isWorkerSession()) return
+  if (!sid || pendingPeerBusy.has(sid) || isWorkerSession()) return "inactive-session"
   const client = ctx.client?.session
-  if (typeof client?.messages !== "function" || typeof client?.prompt !== "function") return
+  if (!pendingPeerRoot(ctx, sid) || pendingPeerStatus.get(sid) === "blocked"
+      || pendingPeerStatus.get(sid) === "working") return "root-or-status-blocked"
+  if (typeof client?.messages !== "function" || typeof client?.prompt !== "function"
+      || typeof client?.promptAsync !== "function" || typeof client?.get !== "function"
+      || typeof client?.status !== "function") return "native-api-unavailable"
   pendingPeerBusy.add(sid)
   let timer
   const bounded = async (call) => {
@@ -1271,14 +1295,32 @@ async function pendingPeerDelivery(ctx, sid) {
     } finally { clearTimeout(timer) }
   }
   try {
+    const status = await bounded(client.status({}))
+    const statusData = sdkResponseData(status)
+    const current = statusData?.[sid] || statusData?.status?.[sid]
+    const currentType = typeof current === "string" ? current : current?.type
+    if (currentType !== "idle") {
+      pendingPeerStatus.set(sid, currentType === "blocked" ? "blocked" : "working")
+      return "not-idle:" + String(currentType || "unknown")
+    }
+    pendingPeerStatus.set(sid, "idle")
+    const rootInfo = sdkResponseData(await bounded(client.get({
+      path: { id: sid }, query: { directory: baseDir(ctx) },
+    })))
+    if (!rootInfo || rootInfo.id !== sid || rootInfo.parentID !== null) return "not-root-session"
     const rows = pendingPeerCommand(sid)
-    if (!Array.isArray(rows) || !rows.length) return
+    if (!Array.isArray(rows)) return "pending-read-unavailable"
+    if (!rows.length) return "no-pending-rows"
     const response = await bounded(client.messages({ path: { id: sid } }))
     const messages = sdkResponseData(response)
-    if (!Array.isArray(messages)) return
+    if (!Array.isArray(messages)) return "history-unavailable"
     for (const row of rows.slice(0, 3)) {
+      if (!row || typeof row.ref !== "string" || !row.ref || typeof row.text !== "string") continue
+      const created = Number(row.created) * 1000
       const matches = messages.filter((m) => m?.info?.sessionID === sid && m.info.role === "user"
-        && promptText(m) === row.text)
+        && promptText(m) === row.text
+        && (!row.no_trailer || (nativeMessageTime(m.info) > 0
+          && nativeMessageTime(m.info) >= created - 2000)))
       if (matches.length > 1) continue // Ambiguous history is never an exact receipt.
       if (matches.length === 1) {
         const mid = matches[0].info.id
@@ -1286,29 +1328,62 @@ async function pendingPeerDelivery(ctx, sid) {
         const consumed = messages.some((m) => m?.info?.sessionID === sid && m.info.role === "assistant"
           && m.info.parentID === mid && typeof m.info.time?.completed === "number" && !m.info.error)
         if (consumed) {
-          // Ack uses actual persisted history, independent of callback output.
-          spawnSync("python3", [path.join(root, "utilities", "peer-message.py"), "receive",
-            "--to-harness", "opencode", "--to-session-id", sid,
-            "--from-project", path.basename(baseDir(ctx))], {
-            cwd: root, env: { ...process.env, AGENT_HOME: root },
-            input: row.text, encoding: "utf8", timeout: 1500,
-          })
+          pendingPeerCommand(sid, ["--received", row.ref, "--message-id", mid])
+          continue
         }
-        continue // Existing persisted text must never be inserted a second time.
+        if (!row.actual_message_id) {
+          if (!pendingPeerTransition(sid, ["--queued", row.ref, "--message-id", mid])) continue
+        }
+        // Continue the already persisted noReply message by its native ID. The
+        // exact text is never submitted a second time after an ambiguous result.
+        if (!pendingPeerTransition(sid, ["--resuming", row.ref, "--message-id", mid])) continue
+        const resumed = await bounded(client.promptAsync({ path: { id: sid }, body: { messageID: mid } }))
+        if (resumed && resumed.error == null && resumed.response?.ok !== false) {
+          pendingPeerStatus.set(sid, "submitted")
+        }
+        continue
       }
+      if (row.state !== "pending") continue
       const claimed = pendingPeerCommand(sid, ["--claim", row.ref])
-      if (!claimed) continue
-      const accepted = await bounded(client.prompt({ path: { id: sid }, body: {
-        noReply: true, parts: [{ type: "text", text: claimed.text }],
-      }}))
-      const message = sdkResponseData(accepted)
-      if (message?.info?.sessionID === sid && message.info.role === "user"
-          && typeof message.info.id === "string" && message.info.id
-          && promptText(message) === claimed.text) {
-        pendingPeerCommand(sid, ["--queued", claimed.ref, "--message-id", message.info.id])
+      if (!claimed) return "claim-unavailable"
+      if (claimed.ref !== row.ref) return "claim-ref-mismatch"
+      if (claimed.state !== "unverified") return "claim-state-mismatch"
+      if (claimed.text !== row.text) return "claim-body-mismatch"
+      let accepted
+      try {
+        accepted = await bounded(client.prompt({ path: { id: sid }, body: {
+          noReply: true, parts: [{ type: "text", text: claimed.text }],
+        }}))
+      } catch { accepted = null }
+      const saved = sdkResponseData(accepted)
+      let savedInfo = saved?.info?.sessionID === sid && saved.info.role === "user"
+        && typeof saved.info.id === "string" && saved.info.id
+        && promptText(saved) === claimed.text ? saved : null
+      if (!savedInfo) {
+        // A lost response is reconciled from persisted exact history before the
+        // same ref can be continued. An unresolved claim is never resubmitted.
+        let latest
+        try { latest = sdkResponseData(await bounded(client.messages({ path: { id: sid } }))) } catch { latest = null }
+        const reconciled = Array.isArray(latest) ? latest.filter((m) => m?.info?.sessionID === sid
+          && m.info.role === "user" && promptText(m) === claimed.text
+          && (!claimed.no_trailer || (nativeMessageTime(m.info) > 0
+            && nativeMessageTime(m.info) >= Number(claimed.created) * 1000 - 2000))) : []
+        if (reconciled.length !== 1 || !reconciled[0]?.info?.id) continue
+        savedInfo = reconciled[0].info
+      }
+      const mid = savedInfo.info ? savedInfo.info.id : savedInfo.id
+      if (typeof mid !== "string" || !mid) continue
+      if (pendingPeerTransition(sid, ["--queued", row.ref, "--message-id", mid])) {
+        if (pendingPeerTransition(sid, ["--resuming", row.ref, "--message-id", mid])) {
+          const resumed = await bounded(client.promptAsync({ path: { id: sid }, body: { messageID: mid } }))
+          if (resumed && resumed.error == null && resumed.response?.ok !== false) {
+            pendingPeerStatus.set(sid, "submitted")
+          }
+        }
       }
     }
-  } catch { /* Inflight/ambiguous payload remains unverified; no resend loop. */ }
+    return "processed"
+  } catch { return "delivery-error" /* Inflight/ambiguous payload remains unverified; no resend loop. */ }
   finally { pendingPeerBusy.delete(sid) }
 }
 
@@ -1548,17 +1623,23 @@ export const AgentHarnessGuards = async (ctx) => {
     if (event && event.type === "session.status") {
       const statusSid = event.properties?.sessionID || ""
       const statusType = event.properties?.status?.type || ""
+      if (statusSid && statusType) pendingPeerStatus.set(statusSid, String(statusType).toLowerCase())
       completionCarrier.status(statusSid, statusType)
       observeCompactRuntimeStatus(ctx, statusSid, statusType)
     }
     if (event && ["question.asked", "permission.asked"].includes(event.type)) {
-      observeCompactRuntimeStatus(ctx, event.properties?.sessionID || "", "blocked")
+      const sid = event.properties?.sessionID || ""
+      if (sid) { pendingPeerStatus.set(sid, "blocked"); completionCarrier.status(sid, "blocked") }
+      observeCompactRuntimeStatus(ctx, sid, "blocked")
     }
     if (event && ["question.replied", "question.rejected", "permission.replied"].includes(event.type)) {
-      observeCompactRuntimeStatus(ctx, event.properties?.sessionID || "", "working")
+      const sid = event.properties?.sessionID || ""
+      if (sid) { pendingPeerStatus.set(sid, "working"); completionCarrier.status(sid, "working") }
+      observeCompactRuntimeStatus(ctx, sid, "working")
     }
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""
+      if (eventSid) pendingPeerStatus.set(eventSid, "idle")
       observeCompactRuntimeStatus(ctx, eventSid, "idle")
       observePaneCallback(ctx, "session.idle", eventSid)
       if (!isWorkerSession()) {
@@ -1589,6 +1670,7 @@ export const AgentHarnessGuards = async (ctx) => {
         paneProjectionRetryAt.delete(sid)
         compactStatusUntil.delete(sid)
         runtimeStatusBySession.delete(sid)
+        pendingPeerStatus.delete(sid)
         invalidatePaneOrigin(sid)
       }
     }
@@ -1752,7 +1834,6 @@ export const AgentHarnessGuards = async (ctx) => {
       if (isDesignHtml(file)) runPreflight("design", [file])
     }
     await projectPane(input.sessionID || "", ctx, true)
-    await pendingPeerDelivery(ctx, input.sessionID || "")
     if (!isWorkerSession() && input.sessionID && typeof output?.output === "string") {
       // The shared sender notice uses this existing model-context boundary.
       // OpenCode's body delivery remains on the native API above.

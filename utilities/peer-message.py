@@ -31,7 +31,7 @@ from dispatch_contract import resolve_dispatch_state_root, stable_state_root  # 
 _KINDS = ("watch", "steer", "handoff", "gate-relay", "notice")
 _SURFACES = (
     "claude-native", "herdr", "codex-queue", "codex-gateway-steer",
-    "opencode-unknown", "manual-paste",
+    "opencode-native", "opencode-unknown", "manual-paste",
 )
 _STATUSES = ("sent", "delivered", "received", "failed", "unknown")
 _SUMMARY_MAX = 200
@@ -948,11 +948,12 @@ def deliver_pending_codex(ref, *, timeout=1.0):
         row = _read_pending(ref)
         if not row:
             return {"status": "unsupported", "reason": "peer-pending-missing"}
+        recipient = pending_delivery_recipient(row)
         if row["state"] == "received":
+            _observe_continue_receipt(recipient or {}, ref)
             return {"status": "received", "reason": "exact-peer-ref"}
         if _registered_delivery_settled(row):
             return {"status": "not-required", "reason": "dispatch-notice-consumed"}
-        recipient = pending_delivery_recipient(row)
         if not _valid_transfer_sender(row["from"]) or not recipient:
             return {"status": "unverified", "reason": "peer-endpoint-unverified"}
         if recipient["harness"] != "codex":
@@ -1013,6 +1014,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             received = dict(current, state="received", text=None, rpc_claim=None, receipt="exact-native-history")
             _save_pending(received)
             _ack_registered_delivery(received)
+            _observe_continue_receipt(recipient, ref)
             return {"status": "received", "reason": "exact-native-history"}
         _save_pending(dict(current, state="queued", rpc_claim=None, receipt="native-queue-accepted"))
         return {"status": "queued", "reason": "native-queue-accepted"}
@@ -1363,6 +1365,17 @@ def cmd_receive(args):
     return rc
 
 
+def _observe_continue_receipt(recipient, ref=""):
+    harness, sid = recipient.get("harness"), recipient.get("session_id")
+    if harness not in {"claude", "codex", "opencode"} or not sid:
+        return False
+    try:
+        import session_tidy_clear
+        return session_tidy_clear.observe_continue_receipt(harness, sid, ref)
+    except Exception:
+        return False
+
+
 def retry_receiver_idle(recipient, *, peer=True):
     """Use an existing native callback; never add a watcher or trust an inherited pane."""
     pane = os.environ.get("HERDR_PANE_ID")
@@ -1410,10 +1423,15 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
                 break
             if any(row["to"].get(k) != recipient[k] for k in ("harness", "session_id")):
                 continue
-            # Validate the immutable seal and recipient before publishing context.
-            parsed = parse_peer_trailer(row.get("text"), recipient, include_ref=True)
-            if not parsed or parsed.get("transfer_ref") != row["ref"]:
-                continue
+            # The sole no-trailer context is the booked session-tidy continue;
+            # ordinary peer bodies still require their exact sealed trailer.
+            if row.get("no_trailer"):
+                if row.get("receipt") != "session-tidy-continue":
+                    continue
+            else:
+                parsed = parse_peer_trailer(row.get("text"), recipient, include_ref=True)
+                if not parsed or parsed.get("transfer_ref") != row["ref"]:
+                    continue
             try:
                 claimed = claim_pending_herdr(row["ref"], recipient, receipt="hook-context-inflight")
             except BlockingIOError:
@@ -1477,29 +1495,69 @@ def cmd_context(args):
 
 def cmd_pending(args):
     recipient = {"harness": args.to_harness, "session_id": args.to_session_id}
-    if not args.claim and not args.queued:
-        # OpenCode's existing idle/receive pull retries its unsent tidy booking.
-        # Its native peer transport still owns the returned message rows.
-        retry_receiver_idle(recipient, peer=False)
+    received_ref = getattr(args, "received", None)
+    claim_ref = getattr(args, "claim", None)
+    queued_ref = getattr(args, "queued", None)
+    resuming_ref = getattr(args, "resuming", None)
+    if not claim_ref and not queued_ref and not resuming_ref and not received_ref:
+        # The OpenCode idle callback itself owns delivery. Listing is side-effect
+        # free so it does not recursively start another continuation decision.
         print(json.dumps(pending_messages(recipient)[:5], ensure_ascii=False))
         return 0
-    with pending_lock(args.claim or args.queued):
-        row = _read_pending(args.claim or args.queued)
+    ref = claim_ref or queued_ref or resuming_ref or received_ref
+    with pending_lock(ref):
+        row = _read_pending(ref)
         if not row or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id")):
             return 1
-        if args.queued:
+        if queued_ref:
             if not isinstance(args.message_id, str) or not args.message_id.strip():
                 return 1
             if row["state"] == "received":
                 return 0
             _save_pending(dict(row, state="queued", receipt="context-api-accepted", actual_message_id=args.message_id))
             return 0
+        if resuming_ref:
+            message_id = getattr(args, "message_id", None)
+            if (not isinstance(message_id, str) or not message_id.strip()
+                    or row["state"] != "queued" or row.get("actual_message_id") != message_id
+                    or row.get("resume_attempted")):
+                return 1
+            _save_pending(dict(row, resume_attempted=True, resume_attempted_at=time.time()))
+            return 0
+        if received_ref:
+            message_id = getattr(args, "message_id", None)
+            if not isinstance(message_id, str) or not message_id.strip():
+                return 1
+            if row["state"] == "received":
+                return 0 if row.get("actual_message_id") == message_id else 1
+            if row["state"] != "queued" or row.get("actual_message_id") != message_id:
+                return 1
+            if not _peer_notice_exists(ref, recipient):
+                rc = cmd_record(argparse.Namespace(
+                    from_harness=row["from"].get("harness") or "unknown",
+                    from_session_id=row["from"].get("session_id") or "",
+                    from_name=row["from"].get("name"), from_project="",
+                    to_harness=recipient["harness"], to_session_id=recipient["session_id"],
+                    to_name=None, kind="notice", surface="opencode-native",
+                    status="received", receipt="exact-native-history",
+                    ref=[ref, *row.get("refs", [])], transfer_ref=ref,
+                    body_file=None, body_stdin=False))
+                if rc:
+                    return rc
+            received = dict(row, state="received", text=None, rpc_claim=None,
+                            receipt="exact-native-history", received_at=time.time())
+            _save_pending(received)
+            _ack_registered_delivery(received)
+            _observe_continue_receipt(recipient, ref)
+            retry_receiver_idle(recipient, peer=False)
+            return 0
         if row["state"] != "pending":
             print("null")
             return 0
         # A failed/expired callback cannot acknowledge or blindly repeat this claim.
-        _save_pending(dict(row, state="unverified", receipt="context-api-inflight"))
-        print(json.dumps(row, ensure_ascii=False))
+        claimed = dict(row, state="unverified", receipt="context-api-inflight")
+        _save_pending(claimed)
+        print(json.dumps(claimed, ensure_ascii=False))
         return 0
 
 
@@ -2050,6 +2108,8 @@ def main(argv=None):
     intent = p_pending.add_mutually_exclusive_group()
     intent.add_argument("--claim")
     intent.add_argument("--queued")
+    intent.add_argument("--resuming")
+    intent.add_argument("--received")
     p_pending.add_argument("--message-id")
     p_pending.set_defaults(func=cmd_pending)
 

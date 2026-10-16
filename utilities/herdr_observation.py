@@ -8,15 +8,28 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from typing import Callable
+
+
+HERDR_API_PROTOCOL = 22
+_API_LINE_LIMIT = 16 * 1024 * 1024
+_PANE_SUBSCRIPTIONS = (
+    {"type": "pane.created"}, {"type": "pane.updated"},
+    {"type": "pane.closed"}, {"type": "pane.exited"},
+    {"type": "pane.agent_detected"}, {"type": "pane.agent_status_changed"},
+)
 
 
 def endpoint_name(session: str | None = None) -> str:
@@ -84,12 +97,15 @@ class ObservationSnapshot:
     complete: bool = False
     panes: dict[str, dict] = field(default_factory=dict)
     terminal: dict[str, str] = field(default_factory=dict)
+    revision: int = 0
+    pane_revisions: dict[str, int] = field(default_factory=dict)
 
     def reconnect(self) -> None:
         self.generation += 1
         self.complete = False
         self.panes.clear()
         self.terminal.clear()
+        self.pane_revisions.clear()
 
     def replace_snapshot(self, endpoint: str, panes) -> bool:
         if endpoint_name(endpoint) != self.endpoint or not isinstance(panes, list):
@@ -105,6 +121,8 @@ class ObservationSnapshot:
         self.generation += 1
         self.panes = replacement
         self.terminal = {}
+        self.pane_revisions = {pane_id: 0 for pane_id in replacement}
+        self.revision += 1
         self.complete = True
         return True
 
@@ -112,34 +130,360 @@ class ObservationSnapshot:
         if endpoint_name(endpoint) != self.endpoint or not self.complete:
             return False
         if not isinstance(envelope, dict):
+            self.reconnect()
+            return False
+        error = envelope.get("error")
+        if error is not None:
+            self.reconnect()
             return False
         data = envelope.get("data")
         event = envelope.get("event")
         if not isinstance(data, dict):
+            self.reconnect()
             return False
         event = event or data.get("type")
+        pane = data.get("pane")
         pane_id = data.get("pane_id")
+        if pane_id is None and isinstance(pane, dict):
+            pane_id = pane.get("pane_id")
         if not isinstance(pane_id, str) or not pane_id:
+            self.reconnect()
             return False
         if event in {"pane_closed", "pane.closed"}:
             self.panes.pop(pane_id, None)
             self.terminal[pane_id] = "pane-closed"
+            self.revision += 1
+            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
             return True
         if event in {"pane_exited", "pane.exited"}:
             self.panes.pop(pane_id, None)
             self.terminal[pane_id] = "pane-exited"
+            self.revision += 1
+            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
             return True
-        pane = data.get("pane")
         if event in {"pane_created", "pane.updated", "pane_updated", "pane.created"}:
             if not isinstance(pane, dict) or pane.get("pane_id") != pane_id:
-                self.complete = False
+                self.reconnect()
                 return False
             self.panes[pane_id] = dict(pane)
             self.terminal.pop(pane_id, None)
-        return True
+            self.revision += 1
+            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
+            return True
+        if event in {"pane_agent_status_changed", "pane.agent_status_changed"}:
+            status = data.get("agent_status")
+            if pane_id not in self.panes or status not in {
+                    None, "idle", "working", "blocked", "done", "unknown"}:
+                self.reconnect()
+                return False
+            updated = dict(self.panes[pane_id])
+            updated["agent_status"] = status
+            self.panes[pane_id] = updated
+            self.revision += 1
+            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
+            return True
+        # Agent status/detection events do not carry the full pane session
+        # identity. A fresh snapshot is required before this endpoint can again
+        # provide a complete view.
+        self.reconnect()
+        return False
 
     def confirms_absence(self, pane_id: str) -> bool:
         return self.complete and pane_id not in self.panes
+
+
+@dataclass(frozen=True)
+class ObservationView:
+    endpoint: str
+    socket_path: str
+    generation: int
+    revision: int
+    panes: tuple[dict, ...]
+    pane_revisions: dict[str, int]
+    terminal: dict[str, str]
+    agents: tuple[dict, ...]
+    observed_at: float
+    complete: bool = True
+
+
+def socket_path_for_endpoint(session: str | None = None, environ=None) -> str | None:
+    """Return only an explicitly inherited endpoint socket; never guess paths."""
+    env = os.environ if environ is None else environ
+    value = env.get("HERDR_SOCKET_PATH")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    requested = endpoint_name(session)
+    configured = env.get("AGENT_HERDR_SESSION") or env.get("HERDR_SESSION")
+    if configured and endpoint_name(configured) != requested:
+        return None
+    if session is not None and not configured and requested != endpoint_name():
+        return None
+    return value.strip()
+
+
+def _api_id():
+    return "hearting-observation:" + uuid.uuid4().hex
+
+
+def _receive_line(sock, buffer: bytearray, deadline: float) -> bytes:
+    while True:
+        marker = buffer.find(b"\n")
+        if marker >= 0:
+            line = bytes(buffer[:marker]).rstrip(b"\r")
+            del buffer[:marker + 1]
+            if not line or len(line) > _API_LINE_LIMIT:
+                raise ValueError("herdr-api-empty-or-oversized-line")
+            return line
+        if len(buffer) > _API_LINE_LIMIT:
+            raise ValueError("herdr-api-line-too-large")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("herdr-api-timeout")
+        readable, _, _ = select.select([sock], [], [], remaining)
+        if not readable:
+            raise TimeoutError("herdr-api-timeout")
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("herdr-api-disconnected")
+        buffer.extend(chunk)
+
+
+def _decode_line(line: bytes):
+    try:
+        value = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("herdr-api-malformed-json") from exc
+    if not isinstance(value, dict):
+        raise ValueError("herdr-api-malformed-envelope")
+    return value
+
+
+def _request_once(socket_path: str, method: str, params: dict, *, timeout: float,
+                  connector=None):
+    request_id = _api_id()
+    request = {"id": request_id, "method": method, "params": params}
+    client = (connector or socket.socket)(socket.AF_UNIX, socket.SOCK_STREAM)
+    buffer = bytearray()
+    try:
+        client.settimeout(timeout)
+        client.connect(socket_path)
+        client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+        response = _decode_line(_receive_line(client, buffer, time.monotonic() + timeout))
+        if response.get("id") != request_id:
+            raise ValueError("herdr-api-response-id-mismatch")
+        return response
+    finally:
+        client.close()
+
+
+class ObservationTransport:
+    """One endpoint-local subscribe-before-snapshot connection.
+
+    The server has no public event sequence or replay guarantee. A disconnect,
+    malformed envelope, protocol mismatch, or `events_lost` error invalidates
+    this view; one bounded re-subscribe plus successful snapshot restores it.
+    """
+
+    def __init__(self, endpoint: str | None = None, socket_path: str | None = None,
+                 *, timeout: float = 0.35, connector=None):
+        self.endpoint = endpoint_name(endpoint)
+        self.socket_path = socket_path or socket_path_for_endpoint(endpoint)
+        self.timeout = max(0.05, min(float(timeout), 2.0))
+        self._connector = connector or socket.socket
+        self._socket = None
+        self._buffer = bytearray()
+        self._state = ObservationSnapshot(self.endpoint)
+        self._agents: tuple[dict, ...] = ()
+        self._observed_at = 0.0
+        self._lock = threading.RLock()
+
+    def close(self):
+        with self._lock:
+            self._close_socket()
+            self._state.reconnect()
+
+    def _close_socket(self):
+        client, self._socket = self._socket, None
+        self._buffer.clear()
+        if client is not None:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def _subscribe(self):
+        if not self.socket_path:
+            return False
+        client = self._connector(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.settimeout(self.timeout)
+            client.connect(self.socket_path)
+            request_id = _api_id()
+            request = {"id": request_id, "method": "events.subscribe",
+                       "params": {"subscriptions": list(_PANE_SUBSCRIPTIONS)}}
+            client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            response = _decode_line(_receive_line(
+                client, self._buffer, time.monotonic() + self.timeout))
+            if response.get("id") != request_id or "error" in response:
+                raise ValueError("herdr-subscribe-rejected")
+            self._socket = client
+            return True
+        except (OSError, ValueError, TimeoutError, ConnectionError):
+            client.close()
+            self._buffer.clear()
+            return False
+
+    def _read_snapshot(self):
+        if not self.socket_path:
+            return False
+        try:
+            response = _request_once(self.socket_path, "session.snapshot", {},
+                                     timeout=self.timeout, connector=self._connector)
+        except (OSError, ValueError, TimeoutError, ConnectionError):
+            return False
+        if "error" in response:
+            return False
+        result = response.get("result")
+        snapshot = result.get("snapshot") if isinstance(result, dict) else None
+        if (not isinstance(result, dict) or result.get("type") != "session_snapshot"
+                or not isinstance(snapshot, dict)
+                or snapshot.get("protocol") != HERDR_API_PROTOCOL
+                or not isinstance(snapshot.get("panes"), list)
+                or not isinstance(snapshot.get("agents"), list)):
+            return False
+        if not self._state.replace_snapshot(self.endpoint, snapshot["panes"]):
+            return False
+        self._agents = tuple(dict(agent) for agent in snapshot["agents"]
+                              if isinstance(agent, dict))
+        self._observed_at = time.monotonic()
+        return True
+
+    def _drain_events(self):
+        if self._socket is None:
+            return False
+        try:
+            while True:
+                marker = self._buffer.find(b"\n")
+                if marker < 0:
+                    readable, _, _ = select.select([self._socket], [], [], 0)
+                    if not readable:
+                        return True
+                    chunk = self._socket.recv(65536)
+                    if not chunk:
+                        raise ConnectionError("herdr-api-disconnected")
+                    self._buffer.extend(chunk)
+                    if len(self._buffer) > _API_LINE_LIMIT:
+                        raise ValueError("herdr-api-line-too-large")
+                    continue
+                line = bytes(self._buffer[:marker]).rstrip(b"\r")
+                del self._buffer[:marker + 1]
+                envelope = _decode_line(line)
+                if "error" in envelope:
+                    # Includes `error.code == events_lost`; no event enum or
+                    # sequence number is inferred from that server error.
+                    self._state.reconnect()
+                    return False
+                if not self._state.apply_event(self.endpoint, envelope):
+                    return False
+                self._observed_at = time.monotonic()
+        except (OSError, ValueError, TimeoutError, ConnectionError):
+            self._state.reconnect()
+            return False
+
+    def _synchronize(self):
+        # One initial attempt plus one recovery attempt. A broken endpoint never
+        # traps Fleet's basic process/resource scan in reconnect backoff.
+        for _attempt in range(2):
+            self._close_socket()
+            self._state.reconnect()
+            if not self._subscribe():
+                continue
+            if not self._read_snapshot():
+                self._close_socket()
+                continue
+            if self._drain_events() and self._state.complete:
+                return True
+        self._close_socket()
+        self._state.reconnect()
+        return False
+
+    def observe(self) -> ObservationView | None:
+        with self._lock:
+            if self._socket is None or not self._state.complete:
+                if not self._synchronize():
+                    return None
+            elif not self._drain_events():
+                if not self._synchronize():
+                    return None
+            if not self._state.complete:
+                return None
+            return self._view()
+
+    def resnapshot(self) -> ObservationView | None:
+        """Take a fresh snapshot on the live subscription after terminal evidence."""
+        with self._lock:
+            if self._socket is None or not self._state.complete:
+                return self.observe()
+            if not self._read_snapshot() or not self._drain_events():
+                if not self._synchronize():
+                    return None
+            if not self._state.complete:
+                return None
+            return self._view()
+
+    def _view(self) -> ObservationView:
+        return ObservationView(
+            endpoint=self.endpoint, socket_path=self.socket_path or "",
+            generation=self._state.generation,
+            revision=self._state.revision,
+            panes=tuple(dict(row) for row in self._state.panes.values()),
+            pane_revisions=dict(self._state.pane_revisions),
+            terminal=dict(self._state.terminal),
+            agents=tuple(dict(row) for row in self._agents),
+            observed_at=self._observed_at,
+        )
+
+    def wait_for_event(self, pane_id: str, timeout: float,
+                       event_types=None) -> dict | None:
+        """Wait once for an event on this exact endpoint and pane lifetime."""
+        allowed = set(event_types or (
+            "pane.closed", "pane.exited", "pane.updated",
+            "pane.agent_detected", "pane.agent_status_changed",
+            "pane_closed", "pane_exited", "pane_updated",
+            "pane_agent_detected", "pane_agent_status_changed",
+        ))
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._lock:
+            if self._socket is None or not self._state.complete:
+                return None
+            while True:
+                try:
+                    envelope = _decode_line(_receive_line(self._socket, self._buffer, deadline))
+                except TimeoutError:
+                    return None
+                except (OSError, ValueError, ConnectionError):
+                    self._state.reconnect()
+                    return None
+                data = envelope.get("data")
+                event = envelope.get("event") or (
+                    data.get("type") if isinstance(data, dict) else None)
+                current_pane = data.get("pane_id") if isinstance(data, dict) else None
+                pane = data.get("pane") if isinstance(data, dict) else None
+                if current_pane is None and isinstance(pane, dict):
+                    current_pane = pane.get("pane_id")
+                matches = current_pane == pane_id and event in allowed
+                if "error" in envelope:
+                    self._state.reconnect()
+                    return None
+                applied = self._state.apply_event(self.endpoint, envelope)
+                if not applied:
+                    self._state.reconnect()
+                    if matches:
+                        return envelope
+                    return None
+                self._observed_at = time.monotonic()
+                if matches:
+                    return envelope
 
 
 def _native_status_path(endpoint: str, pane_id: str, harness: str, session_id: str) -> Path:
