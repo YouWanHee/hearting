@@ -10580,6 +10580,12 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
             compute_host_pump.stop(join_timeout=1.0)
         if install_pump is not None:
             install_pump.stop(join_timeout=0.1)
+        close_observation = getattr(collect_all, "close", None)
+        if callable(close_observation):
+            try:
+                close_observation()
+            except Exception:
+                pass
 
 
 def _stderr_log_path():

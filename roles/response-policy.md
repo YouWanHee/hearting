@@ -164,6 +164,12 @@ an unnecessary question just to make the UI more visible.
 
 ### Follow-through
 
+- **Peer delivery evidence** — distinguish prepared, queued, received, and
+  completed work. Native acceptance supports `queued`; only an exact receiver
+  reference or native message-consumption record supports `received`. An
+  ambiguous reply preserves the existing reference and delivery owner. Do not
+  infer completion or acceptance from either receipt.
+
 - **Verified completion close** — the user-facing main agent emits the
   post-execution card from `core/WORKFLOW.md §0.5` only after satisfying its
   synchronous wait/poll, harvest, authorized-integration, and final-verification

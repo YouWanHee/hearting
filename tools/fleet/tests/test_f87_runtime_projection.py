@@ -200,18 +200,19 @@ class RuntimeProjectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             _, rows = self.project(root, sid, title="A title")
-            self.assertEqual(rows, [["pane","report-agent-session","pane-7","--source","herdr:codex","--agent","codex","--agent-session-id",sid], ["pane","report-metadata","pane-7","--source","herdr:codex","--display-agent",agent,"--title",agent + " A title"]])
+            self.assertEqual(rows, [["pane","report-metadata","pane-7","--source","herdr:codex","--display-agent",agent,"--title",agent + " A title"]])
+            self.assertNotIn("report-agent-session", [row[1] for row in rows])
             _, rows = self.project(root, sid, title="{")
             # No summary is not "no header": the number still has to reach the pane.
-            self.assertEqual(rows[1][rows[1].index("--title") + 1], agent)
+            self.assertEqual(rows[0][rows[0].index("--title") + 1], agent)
             _, rows = self.project(root, sid, title="가" * 60)
-            projected = rows[1][rows[1].index("--title") + 1]
+            projected = rows[0][rows[0].index("--title") + 1]
             # Identity first and whole; the summary is what yields to the budget.
             self.assertTrue(projected.startswith(agent + " "), projected)
             self.assertTrue(projected.endswith("…"), projected)
             for mode in ("nonzero", "timeout"):
                 _, rows = self.project(root, sid, mode=mode)
-                self.assertEqual(len(rows), 2)
+                self.assertEqual(len(rows), 1)
             before = root / "codex/config.toml"
             self.assertFalse(before.exists())
             _, rows = self.project(root, sid, worker=True)
@@ -236,21 +237,21 @@ class RuntimeProjectionTest(unittest.TestCase):
             # A personal formatter renames the middle harness word only: the `[tag]` badge
             # and the steward mark are hearting's, composed OUTSIDE the formatter result,
             # so a formatter cannot quietly delete the two things that identify a session.
-            self.assertEqual(rows[1][6:],
+            self.assertEqual(rows[0][6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Session summary" % minted_tag(sid)])
 
             formatter.write_text("#!/usr/bin/env python3\nprint('{')\n")
             formatter.chmod(formatter.stat().st_mode | stat.S_IXUSR)
             _, rows = self.project(root, sid, title="Fallback", formatter=formatter)
-            self.assertEqual(rows[1][6:],
+            self.assertEqual(rows[0][6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Fallback" % minted_tag(sid)])
 
             formatter.write_text("#!/usr/bin/env python3\nimport time;time.sleep(.5)\n")
             formatter.chmod(formatter.stat().st_mode | stat.S_IXUSR)
             _, rows = self.project(root, sid, title="Timeout", formatter=formatter)
-            self.assertEqual(rows[1][6:],
+            self.assertEqual(rows[0][6:],
                              ["[%s] codex" % minted_tag(sid), "--title",
                               "[%s] codex Timeout" % minted_tag(sid)])
 
@@ -278,7 +279,7 @@ class RuntimeProjectionTest(unittest.TestCase):
                     self.assertIn(expected, self.statusline(root, sid, title).stdout)
                 else:
                     _, rows = self.project(root, sid, title=title)
-                    self.assertEqual(rows[1][-1], "[%s] codex %s" % (minted_tag(sid), title))
+                    self.assertEqual(rows[0][-1], "[%s] codex %s" % (minted_tag(sid), title))
 
     def test_pane_header_order_is_number_then_steward_then_harness(self):
         """User-fixed format `[번호] (⚑) 하네스 요약` (2026-09-09; ⚑ moved before the harness
@@ -296,8 +297,8 @@ class RuntimeProjectionTest(unittest.TestCase):
         self.assertEqual(agent, "[3a] ⚑ codex")
         self.assertLess(len(title), 80)
 
-    def test_claude_hook_reports_current_session_and_metadata_together(self):
-        """The common publisher repairs native ID continuity and paints its header."""
+    def test_claude_display_hook_publishes_metadata_without_duplicate_session_lifecycle(self):
+        """The native SessionStart integration owns lifecycle; Hearting paints metadata."""
         with tempfile.TemporaryDirectory() as td:
             root, sid = Path(td), "abcdefgh-claude"
             sidecar = root / "titles/claude" / (sid + ".json")
@@ -306,11 +307,9 @@ class RuntimeProjectionTest(unittest.TestCase):
             result, rows = self.claude_hook(root, sid)
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
-            self.assertEqual([row[1] for row in rows], ["report-agent-session", "report-metadata"])
-            self.assertEqual(rows[0][4:], ["herdr:claude", "--agent", "claude",
-                                         "--agent-session-id", sid])
-            self.assertEqual(rows[1][4:], ["herdr:claude", "--display-agent", "claude",
-                                           "--title", "claude Claude pane title"])
+            self.assertEqual([row[1] for row in rows], ["report-metadata"])
+            self.assertEqual(rows[0][4:], ["herdr:claude", "--display-agent", "claude",
+                                          "--title", "claude Claude pane title"])
 
     def test_claude_hook_skips_a_registered_worker(self):
         with tempfile.TemporaryDirectory() as td:
@@ -340,11 +339,13 @@ class RuntimeProjectionTest(unittest.TestCase):
                                        worker=True)
                 self.assertEqual(rows, [], harness)
 
-    def test_codex_prompt_hook_with_a_fake_session_never_reaches_the_live_pane(self):
+    def test_codex_prompt_hook_never_reports_a_fake_session_and_projects_only_current_metadata(self):
         """The 2026-09-24 leak: `portable-guards.test.sh` fed `directpromptsid` to the Codex
         prompt hook while inheriting the pane's HERDR_*, and a live header read
         `[0d] codex`. The hook's process is not that session's runtime, so nothing is sent
-        — neither the header nor `report-agent-session`. Asserted in every case, whatever
+        for a fake session. The active native SessionStart hook owns session reporting;
+        this prompt hook may publish metadata only for the exact current thread. Asserted
+        in every case, whatever
         runtime happens to run this suite: a Codex hook gets no `CODEX_THREAD_ID`
         (measured 2026-09-25), and when one is set it proves nothing either."""
         hook = ROOT / "adapters/codex/hooks/userprompt-lifecycle.py"
@@ -379,7 +380,8 @@ class RuntimeProjectionTest(unittest.TestCase):
                                env=env, capture_output=True, timeout=90, check=True)
                 case = (session, thread, held)
                 if reported:
-                    self.assertIn("report-agent-session", log.read_text(), case)
+                    rows = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertEqual([row[1] for row in rows], ["report-metadata"], case)
                 else:
                     self.assertEqual(log.read_text(), "", case)
 
@@ -816,6 +818,45 @@ class ProjectionObservationTest(unittest.TestCase):
                 self.assertEqual(commands[-1], ["/fixture/herdr", "pane", "report-metadata", "fixture-pane",
                     "--source", "herdr:opencode", "--display-agent", "opencode", "--title", "opencode title"])
                 self.assertEqual(observation["session_report"], "exit0" if report_session else "skipped")
+
+    def test_absolute_native_resume_argv_is_canonicalized_only_at_wire_boundary(self):
+        from tools.fleet import herdr_projection as hp
+        for harness in ("claude", "codex", "opencode"):
+            sid = "ses_A"
+            argv = [f"/home/user/.local/bin/{harness}", "--color", "always",
+                    "--resume", sid, "--model", "fixture", "--setting-sources", "user"]
+            with self.subTest(harness=harness):
+                lifecycle = hp._session_lifecycle(harness, 1000001, "resume", argv, session_id=sid)
+                self.assertEqual(lifecycle["resume_argv"], [harness, *argv[1:]])
+                self.assertEqual(argv[0], f"/home/user/.local/bin/{harness}")
+                self.assertNotIn("resume_argv", hp._session_lifecycle(
+                    harness, 1000002, "clear", argv, session_id=sid))
+        self.assertNotIn("resume_argv", hp._session_lifecycle(
+            "claude", 1000001, "resume", ["/usr/bin/env", "claude", "--resume", "ses_A"],
+            session_id="ses_A"))
+        self.assertNotIn("resume_argv", hp._session_lifecycle(
+            "claude", 1000001, "resume", ["/opt/claude", "--resume", "other-session"],
+            session_id="ses_A"))
+
+    def test_python_opencode_lifecycle_keeps_only_the_process_bound_selection_argv(self):
+        from fleet import process_identity
+        from fleet import herdr_projection as hp
+        from fleet.collectors import opencode
+        sid = "ses_A"
+        argv = ["/home/user/.local/bin/opencode", "--resume", sid, "--model", "fixture"]
+        selection = {"value": {"sessionID": sid, "sessionSeq": 1000001,
+                               "sessionStartSource": "resume"}}
+        launch = {"pid": 4321, "proc_start": "123", "argv": argv}
+        with unittest.mock.patch.object(process_identity, "current_launch_context", return_value=launch), \
+                unittest.mock.patch.object(opencode, "_tui_selection_record", return_value=selection):
+            lifecycle = hp._native_opencode_lifecycle(sid)
+        self.assertEqual(lifecycle["resume_argv"], argv)
+        self.assertEqual(lifecycle["session_seq"], 1000001)
+
+        selection["value"]["sessionID"] = "ses_other"
+        with unittest.mock.patch.object(process_identity, "current_launch_context", return_value=launch), \
+                unittest.mock.patch.object(opencode, "_tui_selection_record", return_value=selection):
+            self.assertEqual(hp._native_opencode_lifecycle(sid), {})
 
     def test_invalid_bootstrap_fields_never_promote_or_bypass_original_guard(self):
         from tools.fleet import herdr_projection as hp

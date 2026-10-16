@@ -219,7 +219,7 @@ Additional code-entry gates:
    app-neutral receipt contract; otherwise record
    `skipped/extension-unavailable` without changing code-cycle completion.
 
-If Git fails to create an index lock, preserve that failure and its partial
+If Git reports an index-lock error, preserve that failure and its partial
 state; attach only the shared read-only diagnosis in core/OPERATIONS.md §5.9.
 Do not remove the lock or rerun Git automatically.
 

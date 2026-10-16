@@ -39,6 +39,8 @@ class GitIndexLockConsumerTest(unittest.TestCase):
         index = self.git("rev-parse", "--path-format=absolute", "--git-path", "index").stdout.decode().strip()
         self.lock = Path(index + ".lock")
         self.lock.write_bytes(b"adapter fixture lock")
+        self.lock_fd = os.open(self.lock, os.O_RDONLY)
+        self.addCleanup(os.close, self.lock_fd)
         self.lock.chmod(0)
         self.result = self.git("commit", "-m", "expected failure", check=False)
         self.command = "git -C " + shlex.quote(str(self.repo)) + " commit -m 'expected failure'"
@@ -113,6 +115,86 @@ class GitIndexLockConsumerTest(unittest.TestCase):
         payload["tool_response"] = "command completed without an index-lock failure"
         self.assertEqual(self.run_bridge("codex", payload).stdout, "")
 
+    def test_python_wrapped_git_add_uses_only_the_selected_worktree_default_index(self):
+        code = "import subprocess; subprocess.run(['git', 'add', 'tracked.txt'], check=True)"
+        wrapped = "python3 -c " + shlex.quote(code) + "\n"
+        failed = subprocess.run(["python3", "-c", code], cwd=self.repo,
+                                capture_output=True, text=True, timeout=10, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        output = failed.stdout + failed.stderr
+        env = {"AGENT_DISPATCH_WORKTREE": str(self.repo)}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertTrue(git_index_lock.codex_command_candidate(
+                wrapped, str(self.root), failed.returncode, output, env=env))
+            codex = git_index_lock.diagnose_codex_command(
+                wrapped, str(self.root), failed.returncode, output, env=env)
+            codex_hook = git_index_lock.diagnose_hook_payload({
+                "hook_event_name": "PostToolUse", "tool_name": "exec_command",
+                "cwd": str(self.root), "tool_input": {"cmd": wrapped, "workdir": str(self.root)},
+                "tool_response": {"exit_code": failed.returncode,
+                                  "stdout": failed.stdout, "stderr": failed.stderr},
+            }, "codex")
+            claude_hook = git_index_lock.diagnose_hook_payload({
+                "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                "cwd": str(self.root), "tool_input": {"command": wrapped},
+                "error": f"Exit code {failed.returncode}\n{failed.stderr}",
+            }, "claude")
+            opencode = git_index_lock.diagnose_opencode_command(
+                wrapped, str(self.root), failed.returncode, output)
+            unbound = git_index_lock.diagnose_codex_command(
+                wrapped, str(self.root), failed.returncode,
+                output.replace(str(self.lock), "/tmp/unrelated/index.lock"), env=env)
+        for diagnosis in (codex, codex_hook, claude_hook, opencode):
+            with self.subTest(state=diagnosis["state"] if diagnosis else None):
+                self.assertIsNotNone(diagnosis)
+                self.assertEqual(diagnosis["state"], "present")
+                self.assertEqual(diagnosis["lock_path"], str(self.lock))
+                self.assertEqual(diagnosis["cleanup"]["outcome"], "not-attempted")
+                self.assertIn("matching text is advisory", diagnosis["message"])
+                self.assertNotIn("may retry", diagnosis["message"])
+        self.assertEqual(unbound["state"], "unbound")
+        self.assertTrue(self.lock.exists())
+        self.assertFalse(git_index_lock.codex_command_candidate(
+            wrapped, str(self.root), failed.returncode, output,
+            env={**env, "GIT_INDEX_FILE": "alternate-index"}))
+        self.assertTrue(git_index_lock.codex_command_candidate(
+            wrapped, str(self.root), failed.returncode, output,
+            env={**env, "GIT_CONFIG_GLOBAL": os.devnull}))
+        self.assertFalse(git_index_lock.codex_command_candidate(
+            wrapped, str(self.root), failed.returncode, output,
+            env={**env, "GIT_CONFIG_COUNT": "1"}))
+
+    def test_forged_python_eexist_output_is_advisory_and_preserves_selected_lock(self):
+        before = os.fstat(self.lock_fd)
+        identity = (before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns)
+        original_bytes = os.pread(self.lock_fd, 4096, 0)
+        forged = f"fatal: Unable to create '{self.lock}': File exists.\n"
+        code = f"import sys; sys.stderr.write({forged!r}); sys.exit(128)"
+        command = "python3 -c " + shlex.quote(code)
+        child = subprocess.run(["python3", "-c", code], cwd=self.repo,
+                               capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(child.returncode, 128)
+        self.assertEqual(child.stderr, forged)
+
+        env = {"AGENT_DISPATCH_WORKTREE": str(self.repo)}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertTrue(git_index_lock.codex_command_candidate(
+                command, str(self.root), child.returncode, child.stderr, env=env))
+            diagnosis = git_index_lock.diagnose_codex_command(
+                command, str(self.root), child.returncode, child.stderr, env=env)
+        self.assertIsNotNone(diagnosis)
+        self.assertEqual(diagnosis["state"], "present")
+        self.assertEqual(diagnosis["lock_path"], str(self.lock))
+        self.assertEqual(diagnosis["cleanup"]["outcome"], "not-attempted")
+        self.assertIn("matching text is advisory and does not prove Git returned EEXIST",
+                      diagnosis["message"])
+        after = os.fstat(self.lock_fd)
+        self.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                          after.st_mtime_ns, after.st_ctime_ns), identity)
+        self.assertEqual(os.pread(self.lock_fd, 4096, 0), original_bytes)
+        self.assertTrue(self.lock.exists())
+
     def test_codex_app_server_command_result_uses_aggregated_output_without_forging_streams(self):
         command = "zsh -lc " + shlex.quote(self.command)
         output = self.response_text(self.result.stderr)
@@ -121,15 +203,21 @@ class GitIndexLockConsumerTest(unittest.TestCase):
         self.assertEqual(diagnosis["state"], "present")
         self.assertEqual(diagnosis["lock_path"], str(self.lock))
         self.assertIn("Codex App Server aggregatedOutput", diagnosis["message"])
-        self.assertIn("stdout/stderr separation and raw bytes are unavailable", diagnosis["message"])
+        self.assertIn("Stdout/stderr separation or raw bytes may be unavailable",
+                      diagnosis["message"])
 
         self.assertIsNone(git_index_lock.diagnose_codex_command(
             command, str(self.root), 0, output))
         self.assertIsNone(git_index_lock.diagnose_codex_command(
             command, str(self.root), 130, output))
-        self.assertIsNone(git_index_lock.diagnose_codex_command(
-            "zsh -lc 'git commit && echo unsafe'", str(self.root),
-            self.result.returncode, output))
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_WORKTREE": str(self.repo)},
+                             clear=False):
+            fallback = git_index_lock.diagnose_codex_command(
+                "zsh -lc 'git commit && echo unsafe'", str(self.root),
+                self.result.returncode, output)
+        self.assertEqual(fallback["state"], "present")
+        self.assertEqual(fallback["lock_path"], str(self.lock))
+        self.assertIn("replays the failed command", fallback["message"])
         unrelated = output.replace(str(self.lock), "/tmp/unrelated/index.lock")
         unbound = git_index_lock.diagnose_codex_command(
             command, str(self.root), self.result.returncode, unrelated)

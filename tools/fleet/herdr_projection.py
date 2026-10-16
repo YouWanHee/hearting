@@ -531,21 +531,60 @@ def _await_tui_and_project(session_id: str, report_session: bool, *,
         lock.close()
 
 
-def _session_lifecycle(harness, session_seq, session_start_source):
+def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=None, *, session_id=None):
     """Optional native bootstrap fields; never infer a source or widen a guard."""
-    if session_seq is None and session_start_source is None:
+    from .process_identity import native_resume_wire_argv
+
+    if session_seq is None and session_start_source is None and resume_argv is None:
         return {}
     max_seq = 9007199254740991 if harness == "opencode" else 18446744073709551615
     if (harness not in HARNESSES or type(session_seq) is not int
             or not 0 < session_seq <= max_seq
-            or session_start_source not in (None, "startup", "resume", "clear", "compact", "fork")):
+            or session_start_source not in (None, "startup", "resume", "select", "clear", "compact", "fork")):
         return None
-    return dict(session_seq=session_seq, session_start_source=session_start_source)
+    result = dict(session_seq=session_seq, session_start_source=session_start_source)
+    if resume_argv is not None:
+        wire_argv = (native_resume_wire_argv(resume_argv, harness, session_id)
+                     if session_start_source in {"resume", "select"}
+                     and isinstance(session_id, str) and session_id else None)
+        if wire_argv is None:
+            result.pop("resume_argv", None)
+        else:
+            result["resume_argv"] = wire_argv
+    return result
+
+
+def _native_opencode_lifecycle(session_id):
+    """Read lifecycle metadata only from this proven TUI's PID/birth selection record."""
+    try:
+        from fleet.process_identity import current_launch_context, is_native_resume_argv
+        from fleet.collectors import opencode
+        launch = current_launch_context("opencode", session_id)
+        if not launch:
+            return {}
+        record = opencode._tui_selection_record(launch["pid"], launch["proc_start"])
+        value = (record or {}).get("value") if isinstance(record, dict) else None
+        if not isinstance(value, dict) or value.get("sessionID") != session_id:
+            return {}
+        result = {}
+        sequence = value.get("sessionSeq")
+        source = value.get("sessionStartSource")
+        if type(sequence) is int and 0 < sequence <= 9007199254740991:
+            result["session_seq"] = sequence
+        if source in ("startup", "resume", "select", "clear", "compact", "fork"):
+            result["session_start_source"] = source
+        argv = launch.get("argv")
+        if (result.get("session_start_source") in {"resume", "select"}
+                and is_native_resume_argv(argv, "opencode", session_id)):
+            result["resume_argv"] = argv
+        return result
+    except Exception:
+        return {}
 
 
 def project(harness: str, session_id: str, *, pane_id=None, worker=None,
             report_session=True, observation=None, session_seq=None,
-            session_start_source=None) -> bool:
+            session_start_source=None, resume_argv=None) -> bool:
     """Report this session's pane metadata to herdr. Always returns True (fail-soft)."""
     harness = str(harness or "").lower()
     pane = pane_id or os.environ.get("HERDR_PANE_ID", "")
@@ -584,12 +623,28 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
             if utilities not in sys.path:
                 sys.path.insert(0, utilities)
             import session_tidy
-            session_start_source = session_tidy.session_start_source(harness, session_id, pane)
-            if session_start_source:
+            context = session_tidy.session_start_context(harness, session_id, pane)
+            session_seq = context.get("session_seq")
+            session_start_source = context.get("session_start_source")
+            resume_argv = context.get("resume_argv")
+            if harness == "opencode":
+                native = _native_opencode_lifecycle(session_id)
+                session_seq = native.get("session_seq", session_seq)
+                session_start_source = native.get("session_start_source", session_start_source)
+                resume_argv = native.get("resume_argv", resume_argv)
+            if session_start_source and session_seq is None:
                 session_seq = time.time_ns() if harness != "opencode" else time.time_ns() // 1000
+            if session_start_source == "resume" and resume_argv is None:
+                from fleet.process_identity import current_launch_context
+                from fleet.process_identity import is_native_resume_argv
+                launch = current_launch_context(harness, session_id)
+                argv = (launch or {}).get("argv")
+                if is_native_resume_argv(argv, harness, session_id):
+                    resume_argv = argv
         except Exception:
             session_start_source = None
-    lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv,
+                                   session_id=session_id)
     if lifecycle is None:
         report_session, lifecycle = False, {}
     if harness == "codex" and not may_report(harness, session_id, worker=worker, pane_id=pane):
@@ -637,7 +692,7 @@ def _metadata_command(herdr, harness, session_id, pane):
 
 
 def _report(harness: str, session_id: str, pane: str, report_session: bool,
-            observation=None, session_seq=None, session_start_source=None,
+            observation=None, session_seq=None, session_start_source=None, resume_argv=None,
             _proof=None) -> None:
     herdr = shutil.which("herdr")
     if not herdr:
@@ -645,7 +700,8 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
             observation["reason"] = "herdr-unavailable"
         return
     source = "herdr:%s" % harness
-    lifecycle = _session_lifecycle(harness, session_seq, session_start_source)
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv,
+                                   session_id=session_id)
     if lifecycle is None:
         report_session = False
     def current():
@@ -664,6 +720,8 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
             session_command += ["--seq", str(session_seq)]
         if session_start_source is not None:
             session_command += ["--session-start-source", session_start_source]
+        if lifecycle.get("resume_argv"):
+            session_command += ["--", *lifecycle["resume_argv"]]
         # Publish the exact native identity before the number resolver observes
         # this new pane. Otherwise its first metadata report still uses the hash.
         _send_projection(session_command, observation)
