@@ -912,7 +912,8 @@ def settle_open_pass(jobs: Path, attempt_id: str) -> bool:
     from route_authority import decide_continuation
     process = attempt_process_quiescence(metadata)
     terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=_row_worktree(row),
-        artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata)
     choice = decide_continuation(action="stage-settlement", status=row.status, metadata=metadata,
         facts={"process": process, "terminal": terminal})
     if not choice.allowed:
@@ -3806,7 +3807,8 @@ def route_completion_evidence(
 
     if terminal is None:
         terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=worktree,
-            artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+            artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"),
+            artifact_binding=metadata)
     from route_authority import decide_continuation
     choice = decision or decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
     if not choice.allowed:
@@ -4071,6 +4073,7 @@ def classify_exact_route_free_review_outcome(
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
         worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata,
     )
     from route_authority import decide_continuation
     choice = decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
@@ -4220,6 +4223,7 @@ def close_finished_child(
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
         worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata,
     )
     if correct_recorded_move and (
         terminal.get("state") != "valid"

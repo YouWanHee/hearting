@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe, exact-attempt inspection of a Codex dispatch JSONL terminal handoff.
+"""Safe, exact-attempt inspection of shared dispatch JSONL terminal handoffs.
 
 The compatibility parser returns the historical internal dictionary.  The
 structured inspector and CLI expose only closed decision enums, bounded
@@ -12,6 +12,7 @@ import argparse
 import base64
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 import re
 import subprocess
@@ -485,7 +486,8 @@ def _primary_worktree(worktree: Path) -> Path | None:
 
 
 def _resolve_safe_root(
-    worktree: str | Path | None, artifact_root_metadata: str | Path | None
+    worktree: str | Path | None, artifact_root_metadata: str | Path | None, *,
+    use_metadata_root: bool = False,
 ) -> tuple[Path | None, str]:
     if worktree is None:
         return None, "worktree-missing"
@@ -499,7 +501,8 @@ def _resolve_safe_root(
     if not worktree_resolved.is_dir():
         return None, "worktree-unavailable"
 
-    override = os.environ.get("AGENT_ARTIFACT_ROOT")
+    override = (str(artifact_root_metadata) if use_metadata_root and artifact_root_metadata
+                else os.environ.get("AGENT_ARTIFACT_ROOT"))
     if override:
         override_path = Path(override)
         if not override_path.is_absolute() or _has_control(override):
@@ -512,12 +515,16 @@ def _resolve_safe_root(
             return None, "artifact-root-symlink-escaped"
 
     try:
+        child_env = os.environ.copy()
+        if use_metadata_root and artifact_root_metadata:
+            child_env["AGENT_ARTIFACT_ROOT"] = str(artifact_root_metadata)
         resolved = subprocess.run(
             [str(ROOT / "utilities" / "artifact-root.sh"), str(worktree_resolved)],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=child_env,
         )
     except OSError:
         return None, "artifact-root-resolver-failed"
@@ -665,7 +672,9 @@ def same_tail_artifact(candidate: Path, root: Path) -> Path | None:
     return next(iter(found)) if len(found) == 1 else None
 
 
-def relative_artifact(artifact: str, root: Path, worktree: str | Path | None) -> dict[str, object]:
+def relative_artifact(
+    artifact: str, root: Path, worktree: str | Path | None, *, bound_output: Path | None = None,
+) -> dict[str, object]:
     """Where a relative ``artifact:`` value points: the artifact root first, then the worktree.
 
     Returns ``{"path": <resolved in-root path> | None, "reason", "tried", "artifact_state"}``.
@@ -677,7 +686,8 @@ def relative_artifact(artifact: str, root: Path, worktree: str | Path | None) ->
     was looked at so the next attempt can report the right one.
     """
     relative = Path(artifact)
-    tried = [root / relative] + ([Path(worktree) / relative] if worktree else [])
+    tried = ([bound_output] if bound_output is not None else []) + [root / relative] + (
+        [Path(worktree) / relative] if worktree else [])
     if any(part in {"", ".", ".."} for part in relative.parts):
         return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "outside-root"}
     found: list[Path] = []
@@ -700,6 +710,44 @@ def relative_artifact(artifact: str, root: Path, worktree: str | Path | None) ->
     if outside:
         return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "outside-root"}
     return {"path": None, "reason": "artifact-outside-root", "tried": tried, "artifact_state": "missing"}
+
+
+def _bound_terminal_output(
+    artifact: str, binding: Mapping[str, object] | None, *, root: Path,
+    worktree: str | Path | None,
+) -> tuple[Path | None, str | None]:
+    """Use only the attempt's sealed route and producer binding for cycle paths."""
+    if not isinstance(binding, Mapping):
+        return None, None
+    route_file = binding.get("route_file")
+    route_id = binding.get("route_id")
+    route_hash = binding.get("route_hash")
+    node_id = binding.get("route_node")
+    attempt_id = binding.get("attempt_id")
+    worker_type = binding.get("worker_type")
+    parent_attempt = binding.get("parent_attempt_id")
+    producer_attempt_id = (attempt_id if worker_type == "owner" else parent_attempt)
+    if not all(isinstance(value, str) and value for value in
+               (route_file, route_id, route_hash, node_id, attempt_id, producer_attempt_id)):
+        return None, None
+    try:
+        from artifact_context import ArtifactContextError, resolve_context
+        context = resolve_context(
+            environ={}, route=str(route_file), node_id=str(node_id),
+            parent_attempt_id=str(producer_attempt_id),
+            explicit={"artifact_root": str(root), "source_worktree": str(worktree) if worktree else None},
+            require_producer_binding=True,
+        )
+        if (not context.route or context.route.get("route_id") != route_id
+                or context.route.get("route_hash") != route_hash
+                or context.node_id != node_id):
+            return None, None
+        return context.resolve_terminal_artifact(artifact), None
+    except ArtifactContextError as exc:
+        if exc.code in {"artifact-terminal-output-symlink", "artifact-output-outside-root",
+                        "artifact-output-outside-node-scope"}:
+            return None, exc.code
+        return None, None
 
 
 ARTIFACT_HINT_KEYS = ("artifact_base_root_b64", "artifact_candidates_b64")
@@ -751,10 +799,13 @@ def inspect_terminal_attempt(
     artifact_root_metadata: str | Path | None,
     include_failure_detail: bool = False,
     worker_type: str | None = None,
+    artifact_binding: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Return the normalized, root-bound result for one exact attempt log.
 
-    ``worker_type`` is the registry row's `worker_type`; passing `review` lets a
+    ``artifact_binding`` is the exact attempt row when the caller has it; it
+    supplies the sealed route/node/producer context for declared cycle-relative
+    artifacts. ``worker_type`` is the registry row's `worker_type`; passing `review` lets a
     FAIL handoff with a readable in-root artifact carry ``failure_note``
     ``completed-review-blocking`` (a finished review) instead of
     ``dead-worker-fail`` (a dead worker). Callers that do not know the worker
@@ -765,7 +816,8 @@ def inspect_terminal_attempt(
     if parsed["state"] != "valid":
         return parsed
 
-    root, root_reason = _resolve_safe_root(worktree, artifact_root_metadata)
+    root, root_reason = _resolve_safe_root(
+        worktree, artifact_root_metadata, use_metadata_root=artifact_binding is not None)
     if root is None:
         return _result(
             4,
@@ -793,8 +845,20 @@ def inspect_terminal_attempt(
                 reason="artifact-outside-root",
             )
         if not candidate.is_absolute():
-            # A relative path is read against the artifact root, then the worktree.
-            relative = relative_artifact(artifact, root, worktree)
+            # A route-bound node may name its exact declared cycle output. The
+            # exact attempt metadata supplies the sealed context; inherited
+            # process environment never participates in this post-exit lookup.
+            bound_output, bound_error = _bound_terminal_output(
+                artifact, artifact_binding, root=root, worktree=worktree)
+            if bound_error:
+                return _result(
+                    3, "invalid", str(parsed["source"]), "-", "outside-root",
+                    "contract-violation", reason="artifact-outside-root",
+                    **artifact_hint(root, [root / candidate]),
+                )
+            # Preserve the established root/worktree-relative compatibility
+            # paths, including its refusal when more than one target exists.
+            relative = relative_artifact(artifact, root, worktree, bound_output=bound_output)
             if relative["path"] is None:
                 return _result(
                     3, "invalid", str(parsed["source"]), "-", str(relative["artifact_state"]),
@@ -994,6 +1058,7 @@ def carrier_terminal_note(
     worktree: str | Path | None,
     artifact_root_metadata: str | Path | None,
     worker_type: str | None,
+    artifact_binding: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, str] | None, dict[str, str]]:
     """The one terminal classification every post-hoc carrier shares.
 
@@ -1017,6 +1082,7 @@ def carrier_terminal_note(
             worktree=worktree,
             artifact_root_metadata=artifact_root_metadata,
             worker_type=REVIEW_WORKER_TYPE,
+            artifact_binding=artifact_binding,
         )
         if review_blocking_handoff(view, REVIEW_WORKER_TYPE):
             compat = {**compat, "failure_note": REVIEW_BLOCKING_NOTE}

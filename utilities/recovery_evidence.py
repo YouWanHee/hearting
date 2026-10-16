@@ -54,6 +54,7 @@ logs have no terminal result; inaccessible evidence remains unknown.
             worktree=worktree or metadata.get("worktree"),
             artifact_root_metadata=artifact_root or metadata.get("artifact_root"),
             worker_type=metadata.get("worker_type"),
+            artifact_binding=metadata,
         )
     if process is None:
         from dispatch_contract import attempt_process_quiescence

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Focused regressions for exact route context and typed output selection."""
+import base64
+import importlib.util
+import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +12,14 @@ from unittest import mock
 
 import artifact_context as C
 import artifact_producer as P
+import dispatch_terminal_commit as T
+import dispatch_completion_join as JOIN
+import codex_dispatch_terminal as terminal
+
+_PRODUCER_FIXTURE_SPEC = importlib.util.spec_from_file_location(
+    "producer_fixture_for_terminal_artifact_context", Path(__file__).with_name("artifact_producer.test.py"))
+PRODUCER_FIXTURE = importlib.util.module_from_spec(_PRODUCER_FIXTURE_SPEC)
+_PRODUCER_FIXTURE_SPEC.loader.exec_module(PRODUCER_FIXTURE)
 
 
 class ArtifactContextTest(unittest.TestCase):
@@ -169,6 +181,232 @@ class ArtifactContextTest(unittest.TestCase):
     def test_source_provenance_without_git_uses_existing_unknown_state(self):
         state, commit = C.source_git_state(self.base)
         self.assertEqual((state, commit), ("unknown-no-git", None))
+
+
+class BoundTerminalArtifactTest(PRODUCER_FIXTURE.ProducerTestBase):
+    """Exercise issued cycle outputs through the shared terminal and reconcile path."""
+
+    def setUp(self):
+        super().setUp()
+        self.source = Path(self._tmp.name) / "source-worktree"
+        self.source.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.source)], check=True)
+        subprocess.run(["git", "-C", str(self.source), "config", "user.email",
+                        "fixture@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.source), "config", "user.name", "Fixture"], check=True)
+        (self.source / "README.md").write_text("fixture\n", encoding="utf-8")
+        (self.source / ".gitignore").write_text(".agent_reports/\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.source), "add", "README.md", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(self.source), "commit", "-qm", "fixture"], check=True)
+        self.root = self.source / ".agent_reports"
+        self.root.mkdir()
+        self.activate()
+        gate = PRODUCER_FIXTURE.gate_evidence()
+        gate["spec_read"]["source"] = "fixture-terminal-envelope"
+        dispatch = PRODUCER_FIXTURE.dispatch_evidence()
+        for item in dispatch["tuples"]:
+            item["checked_worktree"] = str(self.source.resolve())
+        self.route = PRODUCER_FIXTURE.R.compile_route(
+            "autopilot-code", "dev", "standard", predicates=[], transport="headless",
+            dispatch_evidence=dispatch, cwd=self.source,
+            artifact_root=self.root, tracking="tracked", tracked_gate_evidence=gate,
+            slug="terminal-envelope-fixture", campaign_key=None, parent_cycle_id=None,
+        )
+        route_binding = PRODUCER_FIXTURE.L.admit_runtime_route(self.root, self.route)
+        self.route_file = Path(route_binding.route_file)
+        self.cycle = P.begin(self.root, route_file=self.route_file, capability="autopilot-code",
+                             intensity="standard", require_cycle=True)
+        self.output = (Path(self.cycle["cycle_dir"]) / "artifacts"
+                       / "shards/frame/direction-brief.md")
+        self.output.parent.mkdir(parents=True)
+        self.output.write_text("Frame direction\n", encoding="utf-8")
+        frame = next(node for node in self.route["nodes"] if node.get("id") == "frame")
+        self.assertIn("shards/frame/direction-brief.md", frame.get("outputs", []))
+        self.assertIn("shards/frame/**", frame.get("write_scope", []))
+        identity = PRODUCER_FIXTURE.L.read_root_identity(self.root)
+        binding = {
+            "schema_version": 1, "contract": T.CONTRACT,
+            "owner_attempt_id": "att-owner-frame-fixture",
+            "route_file": str(self.route_file.resolve()),
+            "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+            "artifact_root": str(self.root.resolve()),
+            "root_identity": {"repository_id": identity.repository_id,
+                              "artifact_root_id": identity.artifact_root_id},
+            "campaign_id": self.cycle["campaign_id"], "cycle_id": self.cycle["cycle_id"],
+            "producer_id": self.cycle["producer_id"],
+        }
+        binding_path = T.producer_binding_path(self.root, self.route["route_id"],
+                                               "att-owner-frame-fixture")
+        binding_path.parent.mkdir(parents=True)
+        binding_path.write_text(json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n",
+                                encoding="utf-8")
+        self.binding = {
+            "attempt_id": "att-frame-fixture", "parent_attempt_id": "att-owner-frame-fixture",
+            "worker_type": "frame", "route_file": str(self.route_file.resolve()),
+            "route_id": self.route["route_id"], "route_hash": self.route["route_hash"],
+            "route_node": "frame", "artifact_root": str(self.root.resolve()),
+        }
+        other_gate = PRODUCER_FIXTURE.gate_evidence()
+        other_gate["spec_read"]["source"] = "fixture-other-terminal-envelope"
+        other_dispatch = PRODUCER_FIXTURE.dispatch_evidence()
+        for item in other_dispatch["tuples"]:
+            item["checked_worktree"] = str(self.source.resolve())
+        self.other_route = PRODUCER_FIXTURE.R.compile_route(
+            "autopilot-code", "dev", "standard", predicates=[], transport="headless",
+            dispatch_evidence=other_dispatch, cwd=self.source,
+            artifact_root=self.root, tracking="tracked", tracked_gate_evidence=other_gate,
+            slug="other-terminal-envelope-fixture", campaign_key=None, parent_cycle_id=None,
+        )
+        other_route_binding = PRODUCER_FIXTURE.L.admit_runtime_route(self.root, self.other_route)
+        self.other_route_file = Path(other_route_binding.route_file)
+        self.other_cycle = P.begin(
+            self.root, route_file=self.other_route_file, capability="autopilot-code",
+            intensity="standard", require_cycle=True,
+        )
+        other_owner = "att-owner-other-route"
+        other_binding_path = T.producer_binding_path(
+            self.root, self.other_route["route_id"], other_owner)
+        other_binding_path.parent.mkdir(parents=True)
+        other_binding_path.write_text(json.dumps({
+            **binding, "owner_attempt_id": other_owner,
+            "route_file": str(self.other_route_file.resolve()),
+            "route_id": self.other_route["route_id"],
+            "route_hash": self.other_route["route_hash"],
+            "campaign_id": self.other_cycle["campaign_id"],
+            "cycle_id": self.other_cycle["cycle_id"],
+            "producer_id": self.other_cycle["producer_id"],
+        }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+    def _log(self, harness, artifact, suffix):
+        envelope = f"artifact: {artifact}\nverdict: PASS\nblocker: none"
+        rows = {
+            "codex": [
+                {"type": "turn.started"},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": envelope}},
+                {"type": "turn.completed"},
+            ],
+            "claude": [{"type": "result", "subtype": "success", "is_error": False,
+                        "result": envelope}],
+            "opencode": [
+                {"type": "text", "part": {"type": "text", "text": envelope}},
+                {"type": "step_finish", "part": {"type": "step-finish", "reason": "stop"}},
+            ],
+        }[harness]
+        path = Path(self._tmp.name) / f"{harness}-{suffix}.jsonl"
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _decoded(encoded):
+        return Path(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+
+    def _inspect(self, artifact, *, binding=None, harness="codex", suffix="case"):
+        log = self._log(harness, artifact, suffix)
+        return terminal.inspect_terminal_attempt(
+            log, worktree=self.source, artifact_root_metadata=self.root,
+            artifact_binding=self.binding if binding is None else binding,
+        )
+
+    def test_three_harness_logs_reconcile_the_exact_cycle_relative_frame_output(self):
+        reconciled = None
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness), mock.patch.dict(os.environ, {}, clear=True):
+                log = self._log(harness, "shards/frame/direction-brief.md", "relative")
+                metadata = {**self.binding, "log_file": str(log), "artifact_root": str(self.root),
+                            "worker_type": "stage", "harness": harness}
+                artifact, reason = JOIN.route_completion_evidence(metadata, worktree=str(self.source))
+                self.assertEqual((artifact, reason), (str(self.output), ""))
+                reconciled = artifact
+
+        frame = next(node for node in self.route["nodes"] if node.get("id") == "frame")
+        row_metadata = {
+            **self.binding, "attempt_schema_version": "2",
+            "dispatch_depth": str(frame["dispatch_depth"]), "transport": "headless",
+            "execution_surface": "registered-headless", "registered_worker": "1",
+            "fallback_hop": "same-harness-headless", "worker_type": "frame",
+            "harness": "codex", "artifact_root": str(self.root.resolve()),
+        }
+        pipe = ",".join(f"{key}={value}" for key, value in row_metadata.items())
+        self.jobs.write_text("\t".join([
+            "2026-10-16T00:00:00Z", "open", str(self.source), str(self.source), "frame", pipe,
+        ]) + "\n", encoding="utf-8")
+        marker, row = PRODUCER_FIXTURE.R.complete_node(
+            self.route, frame, "frame", Path(reconciled), jobs=self.jobs,
+            attempt_id=self.binding["attempt_id"],
+        )
+        self.assertEqual(row["status"], "closed")
+        self.assertEqual(marker["evidence"]["path"], str(self.output))
+
+    def test_ambient_context_cannot_replace_the_attempt_binding_on_reinspection(self):
+        for env in (
+            {},
+            {"AGENT_ARTIFACT_ROOT": str(Path(self._tmp.name) / "other-root"),
+             "AGENT_ROUTE_FILE": str(Path(self._tmp.name) / "other-route.json"),
+             "AGENT_ROUTE_ID": "rt-unrelated", "AGENT_ROUTE_NODE": "research",
+             "AGENT_ARTIFACT_CYCLE_ID": "cyc_" + "f" * 32,
+             "AGENT_ARTIFACT_OUTPUT_DIR": str(Path(self._tmp.name) / "other-output")},
+        ):
+            with self.subTest(env=bool(env)), mock.patch.dict(os.environ, env, clear=True):
+                result = self._inspect("shards/frame/direction-brief.md", suffix="ambient")
+                self.assertEqual((result["state"], self._decoded(result["artifact_path_b64"])),
+                                 ("valid", self.output))
+
+    def test_absolute_and_legacy_root_relative_handoffs_keep_their_existing_base(self):
+        absolute = self._inspect(str(self.output), suffix="absolute")
+        self.assertEqual((absolute["state"], self._decoded(absolute["artifact_path_b64"])),
+                         ("valid", self.output))
+        legacy = self.root / "target-artifact.md"
+        legacy.write_text("authorized existing target\n", encoding="utf-8")
+        relative = self._inspect("target-artifact.md", suffix="target")
+        self.assertEqual((relative["state"], self._decoded(relative["artifact_path_b64"])),
+                         ("valid", legacy))
+
+    def test_wrong_owner_cycle_and_node_scope_do_not_select_the_cycle_output(self):
+        wrong_owner = {**self.binding, "parent_attempt_id": "att-owner-other-route"}
+        wrong_cycle = {**self.binding, "parent_attempt_id": "att-owner-frame-fixture"}
+        path = T.producer_binding_path(self.root, self.route["route_id"], "att-owner-frame-fixture")
+        original = json.loads(path.read_text(encoding="utf-8"))
+        changed = {**original, "campaign_id": self.other_cycle["campaign_id"],
+                   "cycle_id": self.other_cycle["cycle_id"],
+                   "producer_id": self.other_cycle["producer_id"]}
+        path.write_text(json.dumps(changed, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="utf-8")
+        try:
+            cycle_result = self._inspect("shards/frame/direction-brief.md", binding=wrong_cycle,
+                                         suffix="wrong-cycle")
+        finally:
+            path.write_text(json.dumps(original, sort_keys=True, separators=(",", ":")) + "\n",
+                            encoding="utf-8")
+        owner_result = self._inspect("shards/frame/direction-brief.md", binding=wrong_owner,
+                                     suffix="wrong-owner")
+        wrong_scope = {**self.binding, "route_node": "plan"}
+        scope_result = self._inspect("shards/frame/direction-brief.md", binding=wrong_scope,
+                                     suffix="wrong-scope")
+        for result in (cycle_result, owner_result, scope_result):
+            self.assertEqual((result["state"], result["reason"]),
+                             ("invalid", "artifact-outside-root"))
+
+    def test_traversal_symlink_escape_and_ambiguous_legacy_output_remain_refused(self):
+        traversal = self._inspect("../outside.md", suffix="traversal")
+        self.assertEqual((traversal["state"], traversal["reason"]),
+                         ("invalid", "artifact-outside-root"))
+
+        self.output.unlink()
+        outside = Path(self._tmp.name) / "outside.md"
+        outside.write_text("outside\n", encoding="utf-8")
+        self.output.symlink_to(outside)
+        symlink = self._inspect("shards/frame/direction-brief.md", suffix="symlink")
+        self.assertEqual((symlink["state"], symlink["reason"]),
+                         ("invalid", "artifact-outside-root"))
+        self.output.unlink()
+        self.output.write_text("Frame direction\n", encoding="utf-8")
+
+        duplicate = self.root / "shards/frame/direction-brief.md"
+        duplicate.parent.mkdir(parents=True)
+        duplicate.write_text("legacy duplicate\n", encoding="utf-8")
+        ambiguous = self._inspect("shards/frame/direction-brief.md", suffix="ambiguous")
+        self.assertEqual((ambiguous["state"], ambiguous["artifact_state"]),
+                         ("invalid", "unchecked"))
 
 
 if __name__ == "__main__":

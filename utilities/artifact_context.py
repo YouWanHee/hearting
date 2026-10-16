@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve route-bound artifact outputs and source worktrees from sealed records.
+"""Resolve route-bound outputs, terminal artifacts and source worktrees.
 
 This module contains no persistent state and adds no command-line interface.  It
 joins the existing route, producer, parent-attempt, and review bindings so
@@ -191,6 +191,56 @@ class ArtifactContext:
             raise ArtifactContextError("artifact-output-outside-node-scope", bucket)
         return OutputBinding("bucket:" + bucket, "artifact", matches[0], self.output_dir / bucket)
 
+    def resolve_terminal_artifact(self, relative: str) -> Path | None:
+        """Resolve a terminal handoff only when it names this node's declared output.
+
+        A terminal `artifact:` value may be cycle-relative. That interpretation is
+        deliberately narrower than general artifact selection: both the node's
+        output declaration and write scope must authorize the relative path.
+        Logical outputs such as `revised-artifact` remain targets and are handled
+        by the caller's existing root/worktree compatibility rules.
+        """
+        if not self.route or not self.node or not self.output_dir or not self.artifact_root:
+            return None
+        relative = _safe_relative(relative)
+        parts = PurePosixPath(relative).parts
+        declarations = [value for value in self.outputs if not is_semantic_output(value)]
+        if (not scope_matches(relative, self.write_scope)
+                or not any(_path_pattern_matches(parts, _scope_parts(value)) for value in declarations)):
+            return None
+
+        root = self.artifact_root.resolve(strict=False)
+        output_dir = self.output_dir
+        if not output_dir.is_absolute():
+            raise ArtifactContextError("artifact-output-not-absolute", str(output_dir))
+        lexical_output = Path(os.path.abspath(output_dir))
+        try:
+            output_relative = lexical_output.relative_to(root)
+        except ValueError as exc:
+            raise ArtifactContextError("artifact-output-outside-root", str(output_dir)) from exc
+        cursor = root
+        for component in output_relative.parts:
+            cursor = cursor / component
+            if cursor.is_symlink():
+                raise ArtifactContextError("artifact-terminal-output-symlink", str(cursor))
+        resolved_output = output_dir.resolve(strict=False)
+        if resolved_output != lexical_output or resolved_output != root / output_relative:
+            raise ArtifactContextError("artifact-terminal-output-symlink", str(output_dir))
+
+        candidate = resolved_output.joinpath(*parts)
+        cursor = resolved_output
+        for component in parts:
+            cursor = cursor / component
+            if cursor.is_symlink():
+                raise ArtifactContextError("artifact-terminal-output-symlink", str(cursor))
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(resolved_output)
+            resolved.relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise ArtifactContextError("artifact-output-outside-node-scope", str(candidate)) from exc
+        return resolved
+
 
 def is_semantic_output(value: str) -> bool:
     """Use topology's existing semantic vocabulary without treating it as a path."""
@@ -250,7 +300,7 @@ def render_outputs(output_dir: str | Path | None, outputs) -> list[str]:
 def resolve_context(
     *, environ: Mapping[str, str] | None = None, route=None,
     node_id: str | None = None, parent_attempt_id: str | None = None,
-    explicit: Mapping[str, Any] | None = None,
+    explicit: Mapping[str, Any] | None = None, require_producer_binding: bool = False,
 ) -> ArtifactContext:
     """Resolve the exact route cycle and source worktree from existing bindings.
 
@@ -349,6 +399,13 @@ def resolve_context(
                 owner_attempt_id=str(owner_attempt),
             )
             bound = loaded.binding or {}
+            if (require_producer_binding
+                    and (bound.get("route_id") != route_data.get("route_id")
+                         or bound.get("route_hash") != route_data.get("route_hash"))):
+                raise ArtifactContextError("producer-binding-route-mismatch", "route identity")
+            if require_producer_binding and route_path is not None and bound.get("route_file"):
+                if Path(str(bound["route_file"])).resolve(strict=False) != route_path.resolve(strict=False):
+                    raise ArtifactContextError("producer-binding-route-mismatch", "route file")
             campaign_id, cycle_id = bound.get("campaign_id"), bound.get("cycle_id")
             candidate = producer.read_cycle_record(root, str(cycle_id or ""))
             if not candidate or candidate.get("campaign_id") != campaign_id:
@@ -361,8 +418,13 @@ def resolve_context(
         except ArtifactContextError:
             raise
         except Exception as exc:
+            if getattr(exc, "code", "") == "producer-binding-required" and require_producer_binding:
+                raise ArtifactContextError("producer-binding-required", str(exc)) from exc
             if getattr(exc, "code", "") not in {"producer-binding-required"}:
                 raise ArtifactContextError(getattr(exc, "code", "producer-binding-invalid"), str(exc)) from exc
+
+    if require_producer_binding and binding_source != "producer-binding":
+        raise ArtifactContextError("producer-binding-required", str(owner_attempt or "owner-attempt"))
 
     if cycle_record is None and binding_source != "review-binding":
         try:

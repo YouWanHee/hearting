@@ -780,7 +780,10 @@ symbol tokens the compiler never substitutes). Standalone design anchors at
 byproducts (research shards, review shards) anchor at `spec/_internal/`
 (or `spec/<component>/_internal/` for a component spec). A parallel leg's
 suffix (e.g. `-alternative`) may only appear as a subdirectory inside the
-owning anchor, never by escaping it.
+owning anchor, never by escaping it. A terminal `artifact:` path from a routed
+node uses that same cycle output base only when the exact attempt, route, node,
+and producer binding authorize the declared output; absolute and existing
+artifact-root/worktree-relative handoffs retain their normal checks.
 
 route lifecycle records live in a single hidden runtime location:
 `<artifact-root>/.runtime/routes/<route_id>.json`, with the sole terminal

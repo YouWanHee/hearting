@@ -852,6 +852,7 @@ def _terminal_owner_for_revised_ancestor(route, jobs):
     terminal=inspect_terminal_attempt(
         meta.get("log_file"),worktree=route["cwd"],
         artifact_root_metadata=route["artifact_root"],worker_type="owner",
+        artifact_binding=meta,
     )
     if (terminal.get("state")!="valid" or terminal.get("verdict") not in {"FAIL","BLOCKED"}
             or terminal.get("artifact_state")!="readable"
@@ -6056,7 +6057,8 @@ def _owner_terminal_observation(route,node,*,jobs=None):
         except DispatchContractError as exc:
             return {**absent(exc.reason),"gate_detail":exc.detail}
         terminal=inspect_terminal_attempt(meta.get("log_file"),worktree=route["cwd"],
-                                          artifact_root_metadata=route["artifact_root"],worker_type="owner")
+                                          artifact_root_metadata=route["artifact_root"],worker_type="owner",
+                                          artifact_binding=meta)
         if terminal.get("state")!="valid" or terminal.get("verdict")!="PASS" or terminal.get("artifact_state")!="readable":
             return absent("owner-terminal-evidence-unverified")
         def decoded(value):
@@ -7990,7 +7992,8 @@ def _review_input_revision_plan(route, node_id, evidence, *, answers, author_att
     if ROUTE_IDENTITY.registered_node_identity(selected, node) != (source["route_id"], source["route_hash"], node_id):
         raise ValueError("review-input-revision-source-route-mismatch")
     terminal = inspect_terminal_attempt(selected.get("log_file"), worktree=route["cwd"],
-        artifact_root_metadata=selected.get("artifact_root") or route["artifact_root"], worker_type="review")
+        artifact_root_metadata=selected.get("artifact_root") or route["artifact_root"], worker_type="review",
+        artifact_binding=selected)
     if terminal.get("state") != "valid" or terminal.get("verdict") != "FAIL" or terminal.get("artifact_state") != "readable":
         raise ValueError("review-input-revision-verdict-unproven")
     from dispatch_contract import attempt_process_quiescence
@@ -8970,6 +8973,7 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
         worktree=route["cwd"],
         artifact_root_metadata=row_metadata.get("artifact_root") or route.get("artifact_root"),
         worker_type="review",
+        artifact_binding=row_metadata,
     )
     if (
         terminal.get("state")!="valid"
@@ -9384,6 +9388,7 @@ def _placed_artifact_false_negative(route, node, fields, metadata, evidence, lin
     terminal = inspect_terminal_attempt(
         metadata["log_file"], worktree=fields[3],
         artifact_root_metadata=metadata.get("artifact_root"),
+        artifact_binding=metadata,
     )
     if (terminal.get("state") != "valid" or terminal.get("source") != "exact-turn-completed"
             or terminal.get("terminal_event") != "turn.completed"

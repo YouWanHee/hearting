@@ -255,7 +255,8 @@ def launch_input(jobs, aid, meta):
 def terminal_observation(fields, meta):
     from codex_dispatch_terminal import inspect_terminal_attempt
     return inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
-                                    artifact_root_metadata=meta.get('artifact_root'))
+                                    artifact_root_metadata=meta.get('artifact_root'),
+                                    artifact_binding=meta)
 
 
 def _terminal_absent(fields, meta, *, capacity=False, runtime=False):
@@ -339,7 +340,7 @@ def _blocked_handoff(fields, meta):
         from codex_dispatch_terminal import inspect_terminal_attempt
         result = inspect_terminal_attempt(meta.get('log_file'), worktree=fields[3],
                                           artifact_root_metadata=meta.get('artifact_root'),
-                                          worker_type='owner')
+                                          worker_type='owner', artifact_binding=meta)
         encoded = result.get('artifact_path_b64') if result.get('artifact_state') == 'readable' else None
         if not encoded:
             return None

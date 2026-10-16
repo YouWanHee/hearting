@@ -1333,7 +1333,8 @@ def _owner_report(route, metadata):
     try:
         from codex_dispatch_terminal import inspect_terminal_attempt
         terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=route.get("cwd"),
-                                            artifact_root_metadata=route.get("artifact_root"), worker_type="owner")
+                                            artifact_root_metadata=route.get("artifact_root"), worker_type="owner",
+                                            artifact_binding=metadata)
         if (terminal.get("state") != "valid" or terminal.get("artifact_state") != "readable"
                 or not terminal.get("artifact_path_b64")):
             return None

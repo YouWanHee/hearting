@@ -257,6 +257,7 @@ def main(argv: list[str]) -> int:
             worktree=fields[3],
             artifact_root_metadata=metadata.get("artifact_root"),
             include_failure_detail=args.failure_detail,
+            artifact_binding=metadata,
         )
         terminal_results[attempt_id] = result
         if args.failure_detail and not (

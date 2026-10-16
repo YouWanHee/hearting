@@ -374,6 +374,7 @@ def main(argv: list[str]) -> int:
                     metadata.get("log_file"),
                     worktree=worktree,
                     artifact_root_metadata=metadata.get("artifact_root"),
+                    artifact_binding=metadata,
                 )
             common = observed_attempt_liveness(
                 status,

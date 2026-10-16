@@ -680,7 +680,7 @@ def _exact_owner_handoff(jobs: Path, attempt: str, route: Mapping[str, Any]) -> 
         from codex_dispatch_terminal import inspect_terminal_attempt
         inspected = inspect_terminal_attempt(
             log_file, worktree=fields[3], artifact_root_metadata=route.get("artifact_root"),
-            worker_type="owner")
+            worker_type="owner", artifact_binding=meta)
         if (inspected.get("state") != "valid" or inspected.get("verdict") != "PASS"
                 or inspected.get("artifact_state") != "readable"):
             return None

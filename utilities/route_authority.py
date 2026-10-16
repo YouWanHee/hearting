@@ -1653,7 +1653,8 @@ def _blocked_round_items(route, metadata):
     try:
         terminal = inspect_terminal_attempt(
             metadata.get("log_file"), worktree=metadata.get("cwd") or route.get("cwd"),
-            artifact_root_metadata=metadata.get("artifact_root") or route.get("artifact_root"))
+            artifact_root_metadata=metadata.get("artifact_root") or route.get("artifact_root"),
+            artifact_binding=metadata)
         encoded = terminal.get("artifact_path_b64")
         if not encoded:
             return None
