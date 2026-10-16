@@ -16,6 +16,7 @@ from unittest import mock
 import worker_bootstrap as W
 import dispatch_terminal_commit as T
 import artifact_producer as AP
+import dispatch_contract as DC
 import route_identity
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -292,6 +293,8 @@ class NodeScopeTest(unittest.TestCase):
                 "effective_intensity": "standard",
                 "artifact_root": str(artifact_root),
                 "cwd": str(child_worktree),
+                "slug": "child-review-binding",
+                "slug_truncated": False,
                 "nodes": [
                     {"id": "parent", "outputs": ["parent-report.md"],
                      "write_scope": ["parent/**"]},
@@ -304,14 +307,42 @@ class NodeScopeTest(unittest.TestCase):
             route_file = root / "sealed-child-route.json"
             route_file.write_text(json.dumps(route), encoding="utf-8")
 
-            cycle_dir = artifact_root / "campaigns" / "camp-exact" / "cyc-exact"
-            cycle = {
-                "campaign_id": "camp-exact", "cycle_id": "cyc-exact",
-                "producer_id": "prod-exact", "route_id": route["route_id"],
-            }
-            review_output = str(cycle_dir / "artifacts" / "review.md")
             jobs = root / "jobs.log"
             jobs.write_text("", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}, clear=True):
+                cycle = AP.begin(
+                    artifact_root, route_file=route_file, capability="autopilot-code",
+                    intensity="standard", require_cycle=True,
+                )
+            cycle_record = AP.read_cycle_record(artifact_root, cycle["cycle_id"])
+            self.assertEqual(cycle_record["route_id"], route["route_id"])
+            self.assertEqual(cycle_record["route_hash"], route["route_hash"])
+            self.assertEqual(cycle_record["producer_id"], cycle["producer_id"])
+            cycle_dir = AP.cycle_dir(
+                artifact_root, cycle["campaign_id"], cycle["cycle_id"], cycle_record)
+            review_output_path = cycle_dir / "artifacts" / "plans" / "registered-review.md"
+            review_output_path.parent.mkdir(parents=True, exist_ok=True)
+            review_output_path.write_text("registered review fixture\n", encoding="utf-8")
+            review_binding = AP.prepare_review_output_binding(
+                artifact_root, cycle_id=cycle["cycle_id"], producer_id=cycle["producer_id"],
+                attempt_id="att-child-review", review_output=review_output_path,
+                capability="autopilot-code", unit="qa/code-review", worktree=child_worktree,
+            )
+            review_output = review_binding["output_path"]
+            review_metadata = (
+                "attempt_schema_version=2,attempt_id=att-child-review,dispatch_depth=1,"
+                "transport=headless,execution_surface=registered-headless,registered_worker=1,"
+                "worker_type=review,unit=qa/code-review,capability=autopilot-code,"
+                f"artifact_root={artifact_root},worktree={child_worktree},"
+                f"review_cycle_id={cycle['cycle_id']},review_producer_id={cycle['producer_id']},"
+                f"review_output_locator_b64={review_binding['locator_b64']},"
+                f"review_output_digest={review_binding['digest']}"
+            )
+            jobs.write_text(
+                f"2026-10-16T00:00:00Z\topen\t{child_worktree}\t{child_worktree}\t"
+                f"review\t{review_metadata}\n",
+                encoding="utf-8",
+            )
             parent_env = {
                 "AGENT_ARTIFACT_ROOT": str(artifact_root),
                 "AGENT_ARTIFACT_CAMPAIGN_ID": cycle["campaign_id"],
@@ -323,6 +354,7 @@ class NodeScopeTest(unittest.TestCase):
                 "AGENT_DISPATCH_ATTEMPT_ID": "att-parent-review",
                 "AGENT_DISPATCH_PARENT_ATTEMPT_ID": "att-grandparent",
                 "AGENT_DISPATCH_WORKTREE": str(parent_worktree),
+                "AGENT_DISPATCH_UNIT": "qa/code-review",
                 "AGENT_REVIEW_OUTPUT": review_output,
                 "AGENT_REVIEW_CYCLE_ID": cycle["cycle_id"],
                 "AGENT_REVIEW_PRODUCER_ID": cycle["producer_id"],
@@ -335,34 +367,71 @@ class NodeScopeTest(unittest.TestCase):
                 artifact_root=str(artifact_root), route_node="child", worktree=str(child_worktree),
                 parent_attempt_id="att-grandparent", attempt_id="att-child-review",
             )
-            validated = {}
+            observed_bindings = []
 
-            def validate_review_binding(_jobs, **kwargs):
-                validated.update(kwargs)
-                return {
-                    "output_path": review_output, "cycle_id": cycle["cycle_id"],
-                    "producer_id": cycle["producer_id"],
-                }
+            production_validator = DC.validate_review_output_binding
+
+            def validate_review_binding(jobs_path, **kwargs):
+                result = production_validator(jobs_path, **kwargs)
+                observed_bindings.append((dict(kwargs), result))
+                return result
 
             for worker_type in ("stage", "frame"):
                 args.worker_type = worker_type
                 with self.subTest(worker_type=worker_type), \
-                     mock.patch.object(AP, "read_cycle_record", return_value=cycle), \
-                     mock.patch.object(AP, "cycle_dir", return_value=cycle_dir), \
-                     mock.patch("dispatch_contract.validate_review_output_binding",
-                                side_effect=validate_review_binding) as review_validator:
+                     mock.patch.object(AP, "load_route", wraps=AP.load_route) as route_loader, \
+                     mock.patch.object(DC, "validate_review_output_binding",
+                                       side_effect=validate_review_binding) as review_validator:
                     prompt = W.assignment_prompt(args, "prepare the child", parent_env)
 
                 self.assertIn(str(cycle_dir / "artifacts" / "dev_logs" / "child.md"), prompt)
                 self.assertNotIn("parent-report.md", prompt)
+                self.assertEqual(len(observed_bindings), 1)
+                validated, actual_binding = observed_bindings.pop()
                 self.assertEqual(validated["attempt_id"], "att-child-review")
                 self.assertEqual(validated["output_path"], review_output)
                 self.assertEqual(validated["cycle_id"], cycle["cycle_id"])
                 self.assertEqual(validated["producer_id"], cycle["producer_id"])
+                self.assertEqual(validated["capability"], "autopilot-code")
+                self.assertEqual(validated["unit"], "qa/code-review")
                 self.assertEqual(Path(validated["worktree"]), child_worktree)
                 self.assertEqual(Path(validated["artifact_root"]), artifact_root)
+                self.assertEqual(actual_binding["attempt_id"], "att-child-review")
+                self.assertEqual(actual_binding["output_path"], review_output)
+                self.assertEqual(actual_binding["cycle_id"], cycle["cycle_id"])
+                self.assertEqual(actual_binding["producer_id"], cycle["producer_id"])
+                self.assertEqual(actual_binding["worktree"], str(child_worktree))
+                self.assertEqual(actual_binding["artifact_root"], str(artifact_root))
+                self.assertEqual(actual_binding["digest"], review_binding["digest"])
+                self.assertEqual(actual_binding["_registry_status"], "open")
                 review_validator.assert_called_once()
+                route_loader.assert_called()
+                self.assertTrue(any(
+                    call.args[0] == artifact_root
+                    and call.args[1] == route_file
+                    and call.kwargs.get("expected_identity") == route
+                    for call in route_loader.call_args_list
+                ), "scope resolution must use the production loader for the sealed route")
                 self.assertEqual(parent_env, original_env)
+
+            with self.assertRaises(DC.DispatchContractError) as wrong_attempt:
+                production_validator(
+                    jobs, attempt_id="att-unregistered-review", output_path=review_output,
+                    cycle_id=cycle["cycle_id"], producer_id=cycle["producer_id"],
+                    capability="autopilot-code", unit="qa/code-review",
+                    worktree=child_worktree, artifact_root=artifact_root,
+                )
+            self.assertEqual(wrong_attempt.exception.reason, "review-attempt-not-unique")
+
+            with self.assertRaises(DC.DispatchContractError) as wrong_output:
+                production_validator(
+                    jobs, attempt_id="att-child-review",
+                    output_path=cycle_dir / "artifacts" / "plans" / "other-review.md",
+                    cycle_id=cycle["cycle_id"], producer_id=cycle["producer_id"],
+                    capability="autopilot-code", unit="qa/code-review",
+                    worktree=child_worktree, artifact_root=artifact_root,
+                )
+            self.assertEqual(wrong_output.exception.reason, "review-binding-locator-mismatch")
 
     def test_code_one_shot_owns_approved_cycle_deliverables_and_source_is_not_an_artifact(self):
         node = {"id": "one-shot", "kind": "capability-owner", "unit": "_kernel/owner",
