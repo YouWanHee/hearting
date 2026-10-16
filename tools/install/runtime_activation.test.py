@@ -1701,5 +1701,37 @@ class OpencodeTuiSeedTest(unittest.TestCase):
             self.assertEqual((home / "tui.json").read_text(encoding="utf-8"), edited)
 
 
+
+class HerdrIntegrationAdoptionTest(unittest.TestCase):
+    def _write(self, path, *lines):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_only_herdrs_own_file_for_the_same_integration_is_adopted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = self._write(root / "src/herdr-agent-state.js", "// installed by herdr",
+                                 "// HERDR_INTEGRATION_ID=opencode", "// HERDR_INTEGRATION_VERSION=13")
+            dest = self._write(root / "home/plugins/herdr-agent-state.js", "// installed by herdr",
+                               "// managed by herdr; reinstalling or updating the integration overwrites this file.",
+                               "// HERDR_INTEGRATION_ID=opencode", "// HERDR_INTEGRATION_VERSION=9")
+            activation._safe_existing_dest(dest, "copy", set(), [], source)
+            refused = {
+                "other integration": ("// installed by herdr", "// HERDR_INTEGRATION_ID=opencode-tui"),
+                "user file": ("// my own plugin", "// HERDR_INTEGRATION_ID=opencode"),
+            }
+            for name, lines in refused.items():
+                with self.subTest(name):
+                    self._write(dest, *lines)
+                    with self.assertRaisesRegex(activation.ActivationError, "destination collision"):
+                        activation._safe_existing_dest(dest, "copy", set(), [], source)
+            self._write(dest, "// installed by herdr", "// HERDR_INTEGRATION_ID=opencode")
+            plain = self._write(root / "src/plain.js", "// HERDR_INTEGRATION_ID=opencode")
+            for name, src in (("source without herdr header", plain), ("no source", None)):
+                with self.subTest(name):
+                    with self.assertRaisesRegex(activation.ActivationError, "destination collision"):
+                        activation._safe_existing_dest(dest, "copy", set(), [], src)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
