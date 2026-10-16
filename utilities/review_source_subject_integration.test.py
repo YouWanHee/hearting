@@ -334,6 +334,27 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         self.assertEqual(admission.budget.verdict_rounds, 1)
         self.assertEqual(admission.budget.round_kind, "closure-check")
 
+    def test_same_content_revision_after_two_passes_keeps_public_admission_exhausted(self):
+        self.current_smoke_markers("A-cap")
+        _first_meta, first = self.complete_review("att-review-A-cap-1")
+        _second_meta, second = self.complete_review("att-review-A-cap-2")
+        digest_before = SUBJECT.observe(self.route, self.review_node, worktree=self.repo)["digest"]
+
+        revision = self.revise_execute(
+            "att-execute-A-same-content-after-cap",
+            "revised upstream evidence without source changes",
+        )
+        self.complete_node("smoke", "att-smoke-A-after-same-content-revision", "smoke A after revision")
+        digest_after = SUBJECT.observe(self.route, self.review_node, worktree=self.repo)["digest"]
+
+        self.assertEqual(digest_after, digest_before)
+        self.assertIn("impl-review", revision["tombstoned"])
+        self.assertEqual(self.currency(first).state, "current")
+        self.assertEqual(self.currency(second).state, "current")
+        budget = self.admission().budget
+        self.assertEqual((budget.state, budget.verdict_rounds, budget.cap), ("exhausted", 2, 2))
+        self.assertNotEqual(budget.round_kind, "closure-check")
+
     def test_marker_currency_rejects_registry_and_manifest_binding_tamper(self):
         self.current_smoke_markers("A")
         metadata, marker = self.complete_review("att-review-bound")

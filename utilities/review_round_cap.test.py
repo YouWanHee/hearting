@@ -21,6 +21,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 import review_round_cap as CAP  # noqa: E402
+import route_authority as AUTH  # noqa: E402
 
 
 def route(effective_intensity="standard", cap=None):
@@ -145,6 +146,44 @@ class RoundBudgetTest(unittest.TestCase):
             self.assertEqual(CAP.round_budget(route(), review_node(), rows + [later],
                                              revisions=reopened + [{'supersedes': ['att-review-3']}]).state,
                              'exhausted')
+
+    def test_source_bound_revision_closure_stays_inside_its_subject_cap(self):
+        node = {"id": "impl-review", "kind": "review-worker", "unit": "qa/code-review",
+                "completion_gate": "code-impl-review"}
+        facts = {"source_subject_digest": "subject-A"}
+        for note, failure_class, revision_key in (
+                ("completed-marker", "pass", "supersedes"),
+                ("completed-review-blocking", "fail", "answers")):
+            rows = [row("done", note, failure_class=failure_class, extra={
+                "attempt_id": f"att-{note}-{number}", "review_subject_digest": "subject-A"})
+                for number in (1, 2)]
+            decision = AUTH.decide_continuation(
+                route(cap=2), action="round", node=node, rows=rows,
+                revisions=[{revision_key: [rows[-1][1]["attempt_id"]]}], facts=facts,
+            )
+            self.assertEqual((decision.budget.state, decision.budget.verdict_rounds), ("exhausted", 2))
+            self.assertFalse(decision.budget.closure_check_used)
+
+        one_pass = [row("done", "completed-marker", extra={
+            "attempt_id": "att-subject-A-pass-1", "review_subject_digest": "subject-A"})]
+        within_cap = AUTH.decide_continuation(
+            route(cap=2), action="round", node=node, rows=one_pass,
+            revisions=[{"supersedes": ["att-subject-A-pass-1"]}], facts=facts,
+        ).budget
+        self.assertEqual((within_cap.state, within_cap.round_kind, within_cap.verdict_rounds),
+                         ("admit", "closure-check", 1))
+
+    def test_legacy_non_source_review_and_test_keep_cap_plus_one_closure(self):
+        for node, worker_type in ((review_node(), "review"), (stage_node(), "test")):
+            rows = [row("done", "completed-marker", worker_type=worker_type,
+                        extra={"attempt_id": f"att-legacy-{worker_type}-{number}"})
+                    for number in (1, 2)]
+            budget = AUTH.decide_continuation(
+                route(cap=2), action="round", node=node, rows=rows,
+                revisions=[{"supersedes": [rows[-1][1]["attempt_id"]]}],
+            ).budget
+            self.assertEqual((budget.state, budget.round_kind, budget.verdict_rounds),
+                             ("admit", "closure-check", 2))
 
     def test_sd161_parallel_review_legs_keep_capped_identity_without_broadening_other_nodes(self):
         for node_id in CAP.ROUND_CAPPED_NODE_IDS:
