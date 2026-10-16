@@ -407,7 +407,7 @@ def _auto_record_revisions(route, node, jobs, rows, *, owner_attempt_id, record=
   marker_path = directory / f"{dep}.json"
   if not marker_path.is_file():
    continue
-  currency = ROUTE.gate_currency(route, dep_node, marker_path)
+  currency = ROUTE.gate_currency(route, dep_node, marker_path, jobs=jobs)
   if currency.state != "revised-unrecorded":
    continue  # condition (1): only a revised-but-unrecorded upstream qualifies.
   try:

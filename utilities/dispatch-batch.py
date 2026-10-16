@@ -1800,7 +1800,7 @@ def existing_leg_result(
         if (
             isinstance(node, dict)
             and isinstance(marker, dict)
-            and completion_marker_is_current(route, node, marker_path, marker)
+            and completion_marker_is_current(route, node, marker_path, marker, jobs=jobs)
         ):
             readiness = completion_attempt_readiness(
                 route, node, marker, jobs, registry_lines=lines

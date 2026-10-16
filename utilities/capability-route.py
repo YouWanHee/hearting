@@ -745,7 +745,7 @@ def _continuation_reused_evidence(route, node):
         marker=json.loads(marker_bytes)
     except (OSError,ValueError) as exc:
         raise ValueError(f"continuation-source-node-unverified:{node_id}:marker") from exc
-    if not completion_marker_is_current(route,node,marker_path,marker):
+    if not completion_marker_is_current(route,node,marker_path,marker,jobs=jobs):
         raise ValueError(
             f"continuation-source-node-unverified:{node_id}:attempt-link"
         )
@@ -7254,7 +7254,7 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
     # A surviving old link must never resurrect a superseded canonical head.
     if not canonical.is_file() or json.loads(canonical.read_text()) != marker:
         raise ValueError("review-self-disposition-not-current")
-    if gate_currency(route, node, canonical, marker, observe=True).state != "current":
+    if gate_currency(route, node, canonical, marker, observe=True, jobs=jobs).state != "current":
         raise ValueError("review-self-disposition-integrity-invalid")
     origin_path = directory / f"{node['id']}.{marker['sequence']}.json"
     authority_basis = {}
@@ -7306,7 +7306,9 @@ def _review_self_disposition_locked(route, node, marker, evidence, *, review_cla
     # Recheck evidence at the commit boundary. Before it, old canonical stays;
     # after it, append-only origin/successor history is never rolled back.
     head = json.loads(canonical.read_text(encoding="utf-8"))
-    if head != marker or gate_currency(route, node, canonical, head, observe=True).state != "current":
+    if head != marker or gate_currency(
+        route, node, canonical, head, observe=True, jobs=jobs,
+    ).state != "current":
         raise ValueError("review-self-disposition-origin-drift")
     atomic_write(canonical, successor)
     return successor
@@ -7763,7 +7765,7 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
     # (M7/`test_ac5_owner_merge_arbitration_transaction`: a join can pass here
     # before its attempt-link file exists) -- read only `evidence_currency`,
     # never the fuller `gate_currency` that also proves the link.
-    currency = evidence_currency(route, node, path, marker)
+    currency = evidence_currency(route, node, path, marker, jobs=jobs)
     if currency.state == "superseded":
         return {"passed": False, "reason": currency.reason}
     if currency.state == "revised-unrecorded":
@@ -7782,7 +7784,7 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
     # ordinary registered-worker path below, which `owner_closure_shape` being
     # non-None for it does not change.
     if owner_closure_shape(marker) == "continuation":
-        if not completion_marker_is_current(route, node, path, marker):
+        if not completion_marker_is_current(route, node, path, marker, jobs=jobs):
             return {"passed": False, "reason": "owner-closure-proof-not-current"}
         if exact_terminal:
             registry = Path(jobs) if jobs is not None else _continuation_source_jobs(route)
@@ -7805,7 +7807,7 @@ def _marker_identity_row(route, node, node_id, gate, *, jobs=None, exact_termina
         if completion_conflict_attempt(marker, lines):
             return {"passed": False, "reason": "terminal-evidence-conflict"}
     if exact_terminal:
-        if jobs is None or not completion_marker_is_current(route, node, path, marker):
+        if jobs is None or not completion_marker_is_current(route, node, path, marker, jobs=jobs):
             return {"passed": False, "reason": "completion-marker-not-current"}
         try:
             lines = Path(jobs).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -8138,7 +8140,10 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         # is nothing to revise, a distinct fact from a dependent gate
         # finding no marker for an unstarted node.
         raise ValueError("revision-target-marker-absent")
-    currency = gate_currency(route, node, canonical_path, marker, allow_source_transition=True)
+    currency = gate_currency(
+        route, node, canonical_path, marker,
+        allow_source_transition=True, jobs=jobs,
+    )
     if currency.state not in ("current", "revised-unrecorded"):
         # `superseded`, `completion-evidence-unreadable`, or any
         # `integrity-broken:*` -- every one of these is a kept refusal
@@ -8256,7 +8261,9 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
                     and downstream_subject.get("digest") == revised_subject.get("digest")
                     and downstream_subject.get("epoch") == revised_subject.get("epoch")):
                 downstream_currency = gate_currency(
-                    route, downstream_node, downstream_canonical, downstream_marker, observe=True)
+                    route, downstream_node, downstream_canonical, downstream_marker,
+                    observe=True, jobs=jobs,
+                )
                 if downstream_currency.state == "current":
                     continue
         downstream_sequence = _next_marker_sequence(directory, downstream_id)
@@ -9067,7 +9074,7 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
                     and _registered_marker_fence(route,node,{"attempt_id":own},lines) is None)
         if existing.get("state")=="superseded-by-upstream-revision":
             from dispatch_contract import gate_currency
-            currency=gate_currency(route,node,canonical,existing,observe=True)
+            currency=gate_currency(route,node,canonical,existing,observe=True,jobs=jobs)
             if currency.state!="superseded":
                 refuse("canonical-marker-unproven",currency.reason)
             latest_blocking=next((metadata.get("attempt_id") for status,metadata in reversed(terminated)
@@ -9406,7 +9413,7 @@ def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
         for dependency in node.get("depends_on", []):
             predecessor = next(n for n in route["nodes"] if n["id"] == dependency)
             path = completion_dir(route["route_id"], jobs=jobs) / f"{dependency}.json"
-            if not completion_marker_is_current(route, predecessor, path):
+            if not completion_marker_is_current(route, predecessor, path, jobs=jobs):
                 raise ValueError(f"owner-closure-dependency-unproven:{dependency}")
             marker = json.loads(path.read_text(encoding="utf-8"))
             ready = completion_attempt_readiness(route, predecessor, marker, jobs, registry_lines=lines)

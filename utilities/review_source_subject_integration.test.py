@@ -101,6 +101,44 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(["git", "-C", str(self.repo), *args], text=True).strip()
 
+    def select_custom_registry(self):
+        custom = self.state / "route-registry.log"
+        self.jobs.rename(custom)
+        self.jobs = custom
+        os.environ["AGENT_DISPATCH_JOBS"] = str(custom)
+
+        # Build the ordinary sealed tuple, then seal the exact custom filename
+        # accepted by root-explicit and inherited registry selection.
+        launch = ROUTE_WRITER.launch_compatibility_tuple(
+            artifact_root=self.artifact_root, jobs=custom, cwd=self.repo,
+        )
+        jobs_identity = launch["jobs_path"]
+        jobs_identity["path"] = str(custom.resolve())
+        jobs_identity["binding_digest"] = ROUTE_WRITER._sha256_record({
+            "kind": "jobs_path", "path": str(custom.resolve()),
+            "release_id": jobs_identity["release_id"],
+            "content_digest": jobs_identity["content_digest"],
+        })
+        self.route["launch_compatibility_tuple"] = {
+            "contract_version": 1, **launch,
+        }
+        self.route["route_hash"] = route_hash(self.route)
+        self.route["route_id"] = route_id_from_hash(self.route["route_hash"])
+        self.review_node = self.route["nodes"][2]
+        self.route_file.write_text(json.dumps(self.route, sort_keys=True), encoding="utf-8")
+
+        missing_ambient = self.base / "ambient-missing" / "jobs.log"
+        explicit = DC.resolve_global_registry(
+            self.agent_home, str(custom), 1, "start",
+            environ={"AGENT_DISPATCH_JOBS": str(missing_ambient), "HOME": str(self.stable_home)},
+        )
+        inherited = DC.resolve_global_registry(
+            self.agent_home, None, 2, "start",
+            environ={"AGENT_DISPATCH_JOBS": str(custom), "HOME": str(self.stable_home)},
+        )
+        self.assertEqual((explicit.path, explicit.source), (custom.resolve(), "root-explicit"))
+        self.assertEqual((inherited.path, inherited.source), (custom.resolve(), "inherited-env"))
+
     def get_node(self, node_id):
         return next(item for item in self.route["nodes"] if item["id"] == node_id)
 
@@ -408,6 +446,96 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
                          "currency must only read the route-bound registry")
         self.assertEqual((missing_result.state, conflicting_result.state), ("current", "current"),
                          (missing_result, conflicting_result))
+
+    def test_custom_selected_registry_currency_and_continuation_ignore_ambient_jobs(self):
+        self.select_custom_registry()
+        self.current_smoke_markers("custom-registry")
+        metadata, marker = self.complete_review("att-review-custom-registry")
+        marker_path = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs) / "impl-review.json"
+        sealed_before = self.jobs.read_bytes()
+
+        missing_ambient = self.base / "ambient-custom-missing" / "jobs.log"
+        os.environ["AGENT_DISPATCH_JOBS"] = str(missing_ambient)
+        direct_missing = DC.gate_currency(
+            self.route, self.review_node, marker_path, marker, observe=True,
+        )
+        continuation_missing = ROUTE_WRITER._continuation_reused_evidence(
+            self.route, self.review_node,
+        )
+
+        conflicting_ambient = self.base / "ambient-custom-conflicting" / "jobs.log"
+        conflicting_ambient.parent.mkdir(parents=True)
+        fields = next(
+            line.split("\t") for line in sealed_before.decode().splitlines()
+            if DC.parse_registry_metadata(line.split("\t")[5]).get("attempt_id") == metadata["attempt_id"]
+        )
+        conflicting_row = DC.parse_registry_metadata(fields[5])
+        conflicting_row["review_subject_binding_digest"] = "0" * 64
+        fields[5] = ",".join(f"{key}={value}" for key, value in sorted(conflicting_row.items()))
+        conflicting_bytes = ("\t".join(fields) + "\n").encode("utf-8")
+        conflicting_ambient.write_bytes(conflicting_bytes)
+        os.environ["AGENT_DISPATCH_JOBS"] = str(conflicting_ambient)
+        direct_conflict = DC.gate_currency(
+            self.route, self.review_node, marker_path, marker, observe=True,
+        )
+        continuation_conflict = ROUTE_WRITER._continuation_reused_evidence(
+            self.route, self.review_node,
+        )
+
+        self.assertEqual(direct_missing.state, "current", direct_missing)
+        self.assertEqual(direct_conflict.state, "current", direct_conflict)
+        self.assertEqual(continuation_missing[0]["node_id"], "impl-review")
+        self.assertEqual(continuation_conflict[0]["node_id"], "impl-review")
+        self.assertFalse(missing_ambient.exists())
+        self.assertEqual(conflicting_ambient.read_bytes(), conflicting_bytes)
+        self.assertEqual(self.jobs.read_bytes(), sealed_before)
+
+        # The selected registry remains authoritative when it is damaged.
+        self.jobs.unlink()
+        missing_selected = DC.gate_currency(
+            self.route, self.review_node, marker_path, marker, observe=True,
+        )
+        self.jobs.write_bytes(sealed_before)
+        self.assertEqual(missing_selected.reason, "completion-review-source-registry-missing")
+
+        self.jobs.write_text("", encoding="utf-8")
+        absent_row = DC.gate_currency(
+            self.route, self.review_node, marker_path, marker, observe=True,
+        )
+        self.jobs.write_bytes(sealed_before)
+        self.assertEqual(absent_row.reason, "completion-review-source-row-not-exact")
+        self.jobs.write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(
+            ValueError, "completion-review-source-row-not-exact",
+        ):
+            ROUTE_WRITER._continuation_reused_evidence(self.route, self.review_node)
+        self.jobs.write_bytes(sealed_before)
+
+        lines = self.jobs.read_text(encoding="utf-8").splitlines()
+        changed = []
+        for line in lines:
+            row = line.split("\t")
+            values = DC.parse_registry_metadata(row[5]) if len(row) == 6 else {}
+            if values.get("attempt_id") == metadata["attempt_id"]:
+                values["route_hash"] = "sha256:" + "0" * 64
+                row[5] = ",".join(f"{key}={value}" for key, value in sorted(values.items()))
+                line = "\t".join(row)
+            changed.append(line)
+        self.jobs.write_text("\n".join(changed) + "\n", encoding="utf-8")
+        wrong_record = DC.gate_currency(
+            self.route, self.review_node, marker_path, marker, observe=True,
+        )
+        self.jobs.write_bytes(sealed_before)
+        self.assertEqual(wrong_record.reason, "completion-review-source-row-binding-mismatch")
+
+        binding_path = SUBJECT.binding_path(self.jobs, metadata["attempt_id"])
+        binding_bytes = binding_path.read_bytes()
+        binding_path.write_text("{}\n", encoding="utf-8")
+        corrupt_binding = DC.gate_currency(
+            self.route, self.review_node, marker_path, marker, observe=True,
+        )
+        binding_path.write_bytes(binding_bytes)
+        self.assertEqual(corrupt_binding.reason, "completion-review-source-binding-missing")
 
     def test_public_complete_node_binds_registered_review_source(self):
         self.current_smoke_markers("public-completion")

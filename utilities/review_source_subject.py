@@ -623,7 +623,35 @@ def marker_subject(route: dict, node: dict, *, attempt_id: str | None = None,
             "manifest_sha256": _sha(_canonical(current["manifest"]))}
 
 
-def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str | Path) -> tuple[str, str] | None:
+def _currency_registry_path(route: dict, completion_dir: str | Path,
+                            jobs: str | Path | None) -> Path:
+    """Use the consumer's registry, or resolve the route's sealed selection.
+
+    Older markers without a usable route tuple keep their colocated jobs.log
+    fallback. When a sealed path has moved, the shared dangling-registry
+    resolver handles its migration alias before that legacy fallback.
+    """
+    if jobs is not None:
+        return Path(jobs).expanduser().resolve(strict=False)
+
+    launch = route.get("launch_compatibility_tuple") or {}
+    jobs_identity = launch.get("jobs_path") or {}
+    sealed = jobs_identity.get("path") if isinstance(jobs_identity, dict) else None
+    if isinstance(sealed, str) and sealed and Path(sealed).is_absolute():
+        from dispatch_contract import resolve_dangling_registry
+
+        resolution = resolve_dangling_registry(sealed)
+        if resolution.status in {"exact", "aliased"} and resolution.jobs_path is not None:
+            return resolution.jobs_path
+
+    # The marker directory is already resolved by its consumer. Legacy
+    # migration places markers and the canonical jobs.log together there.
+    state_root = Path(completion_dir).expanduser().resolve(strict=False).parent.parent
+    return state_root / "jobs.log"
+
+
+def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str | Path,
+                    *, jobs: str | Path | None = None) -> tuple[str, str] | None:
     """Current source identity for a marker, or None for routes outside this contract."""
     # Other scoped markers contribute source generations to the append-only
     # epoch history, but only implementation reviews consume that source as
@@ -650,11 +678,9 @@ def marker_currency(route: dict, node: dict, marker: dict, completion_dir: str |
         binding_digest = subject.get("binding_digest")
         if not attempt_id or not binding_digest:
             return "superseded", "completion-review-source-binding-unknown"
-        # The caller selected this completion directory from the source route's
-        # resolved registry. Keep exact-row and binding lookup on that same root;
-        # ambient process selection must not redirect currency to another jobs.log.
-        state_root = Path(completion_dir).resolve().parent.parent
-        jobs_path = (state_root / "jobs.log").resolve()
+        # Stay with the resolved consumer path or the route's sealed selection;
+        # ambient process state must never redirect exact-row or binding lookup.
+        jobs_path = _currency_registry_path(route, completion_dir, jobs)
         exact_rows = []
         try:
             for line in jobs_path.read_text(encoding="utf-8", errors="replace").splitlines():

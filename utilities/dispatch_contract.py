@@ -6800,7 +6800,7 @@ def raise_preview_gate_for_node(route_file, route_node, jobs, agent_home, *, in_
              for r in dispatch_state_roots(Path(agent_home), Path(jobs))]
     marker_path = next(p for p in paths if p.is_file())
     marker = json.loads(marker_path.read_text())
-    if not completion_marker_is_current(route, predecessor, marker_path, marker):
+    if not completion_marker_is_current(route, predecessor, marker_path, marker, jobs=jobs):
         raise ValueError("preview-marker-unverified")
     ready = completion_attempt_readiness(route, predecessor, marker, Path(jobs))
     if ready.state != "ready":
@@ -7133,8 +7133,8 @@ def completion_marker_gate(
         # tests mock it directly); `gate_currency` only runs -- and only
         # distinguishes "revised-unrecorded" from a harder failure -- once
         # that boolean says not-current.
-        if not completion_marker_is_current(route, dep_node, marker_path, marker):
-            currency = gate_currency(route, dep_node, marker_path, marker)
+        if not completion_marker_is_current(route, dep_node, marker_path, marker, jobs=jobs):
+            currency = gate_currency(route, dep_node, marker_path, marker, jobs=jobs)
             if currency.state == "revised-unrecorded":
                 if action == "dry-run" and dep in planned_revision_nodes:
                     # Round admission proved the same review basis that the
@@ -8192,6 +8192,7 @@ def evidence_currency(
     marker_path: Path,
     marker: dict[str, object] | None = None,
     *, observe: bool = False, check_source: bool = True,
+    jobs: str | Path | None = None,
 ) -> GateCurrency:
     """The schema/identity/tombstone/evidence-digest half of `gate_currency`.
 
@@ -8231,7 +8232,9 @@ def evidence_currency(
         same_work_or_refuse("completion-evidence-superseded", str(detail))
     if check_source:
         from review_source_subject import marker_currency as source_marker_currency
-        source_currency = source_marker_currency(route, node, marker, marker_path.parent)
+        source_currency = source_marker_currency(
+            route, node, marker, marker_path.parent, jobs=jobs,
+        )
         if source_currency is not None:
             state, reason = source_currency
             if state != "current":
@@ -8297,6 +8300,7 @@ def gate_currency(
     marker_path: Path,
     marker: dict[str, object] | None = None,
     *, observe: bool = False, allow_source_transition: bool = False,
+    jobs: str | Path | None = None,
 ) -> GateCurrency:
     """Prove one completion marker current, superseded, or needing `revise`.
 
@@ -8316,11 +8320,16 @@ def gate_currency(
         marker = marker or json.loads(marker_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return GateCurrency("integrity-broken:history-conflict", "completion-marker-unreadable")
-    base = evidence_currency(route, node, marker_path, marker, observe=observe, check_source=False)
+    base = evidence_currency(
+        route, node, marker_path, marker, observe=observe, check_source=False,
+        jobs=jobs,
+    )
     provenance = _marker_provenance_currency(route, node, marker_path, marker, base, observe=observe)
     if (not allow_source_transition and provenance.state in {"current", "revised-unrecorded"}):
         from review_source_subject import marker_currency as source_marker_currency
-        source_currency = source_marker_currency(route, node, marker, marker_path.parent)
+        source_currency = source_marker_currency(
+            route, node, marker, marker_path.parent, jobs=jobs,
+        )
         if source_currency is not None:
             state, reason = source_currency
             if state != "current":
@@ -8550,14 +8559,16 @@ def completion_marker_is_current(
     node: dict[str, object],
     marker_path: Path,
     marker: dict[str, object] | None = None,
+    *, jobs: str | Path | None = None,
 ) -> bool:
     """Prove one schema-v2 marker and its immutable history/attempt linkage.
 
     One-line delegate (SD-154 rule 5): `gate_currency` is the only place that
-    recomputes an evidence sha256 or walks the revision chain; this keeps its
-    ten existing boolean call sites unchanged.
+    recomputes an evidence sha256 or walks the revision chain. Callers that
+    already resolved a registry can pin source currency to that exact path;
+    callers using the legacy shape remain compatible.
     """
-    return gate_currency(route, node, marker_path, marker).state == "current"
+    return gate_currency(route, node, marker_path, marker, jobs=jobs).state == "current"
 
 
 def completion_conflict_attempt(marker: Mapping[str, object], registry_lines: list[str]) -> str:
