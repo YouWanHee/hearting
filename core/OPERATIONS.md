@@ -2232,14 +2232,18 @@ authority. Clear checks OpenCode's current process-bound selection before
 using the pane record, and an older delayed start callback cannot replace a
 later session on that seat.
 
-Watch observers settle their existing duty on an exact pane exit/close, a
-complete successful census proving that pane absent, or a completed retire.
-The terminal receipt is written under the existing watch lock before observer
-exit, and ensure/reconnect checks that receipt before starting a process. A
-transport error, timeout, incomplete census, or unknown identity keeps the
-observation pending. The Herdr 0.9.5 API exposes pane exit/close events and
-session snapshots, but no public event sequence or replay cursor. `events_lost`
-is an unrestricted `error.code` in the API error envelope, not an event variant.
-On that error, disconnect, or protocol fault, invalidate the endpoint view,
-resubscribe, and require one successful complete snapshot before using cached
-pane state again.
+Watch observers settle their existing duty only after a complete snapshot on
+the exact endpoint confirms pane absence or a changed session identity, or
+after a completed retire. Pane events are wake and invalidation evidence; they
+do not directly establish pane status or terminal state. The terminal receipt
+is written under the existing watch lock before observer exit, and
+ensure/reconnect checks that receipt before starting a process. A transport
+error, timeout, incomplete census, or unknown identity keeps the observation
+pending. The Herdr 0.9.5 API exposes pane events and session snapshots, but no
+public event sequence or replay cursor. `events_lost` is an unrestricted
+`error.code` in the API error envelope, not an event variant. After an event,
+drain the subscription and publish only a fresh complete snapshot. If event
+traffic overlaps snapshot acquisition, discard that candidate and retry once;
+continued overlap leaves the endpoint unknown. On `events_lost`, disconnect,
+or protocol fault, invalidate the endpoint view, resubscribe, and require a
+successful complete snapshot before using cached pane state again.

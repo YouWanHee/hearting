@@ -1797,6 +1797,11 @@ class WatchTerminalReconcileTest(unittest.TestCase):
                              "agent_session": {"value": "sid-old"}}])
         self.assertIsNone(peer_steward._watch_terminal_from_view(
             initial, expected, "named", reused))
+        new_expected = {"harness": "codex", "session_id": "sid-new", "pane": "w1:p9"}
+        new_occupant = Transport([{"pane_id": "w1:p9", "agent": "codex",
+                                   "agent_session": {"value": "sid-new"}}])
+        self.assertIsNone(peer_steward._watch_terminal_from_view(
+            initial, new_expected, "named", new_occupant))
         absent = Transport([])
         self.assertEqual(peer_steward._watch_terminal_from_view(
             initial, expected, "named", absent), "pane-closed")
@@ -2913,7 +2918,9 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.book(harness="opencode", sid="ses_A")
         world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
                             home_after=OPENCODE_HOME)
-        rc, line = self.clear_cmd(world)
+        with mock.patch.object(peer_steward, "_process_session",
+                               side_effect=lambda *_args: None if world.sent else "ses_A"):
+            rc, line = self.clear_cmd(world)
         self.assertEqual((rc, "cleared=true" in line), (0, True), line)
         self.assertEqual(world.typed(), [["herdr", "agent", "prompt", "w1:pX", "/new"]])
         for after, expect in ((OPENCODE_HOME_BLANK, "cleared=true"), (OPENCODE_EMPTY, "cleared=unverified"),
@@ -2922,7 +2929,9 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
                 self.book(harness="opencode", sid="ses_A")
                 world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
                                     home_after=after)
-                with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
+                with mock.patch.object(peer_steward, "_process_session",
+                                       side_effect=lambda *_args: None if world.sent else "ses_A"), \
+                     mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 1):
                     rc, line = self.clear_cmd(world)
                 self.assertIn(expect, line)
                 self.assertEqual(len(world.typed()), 1, line)
@@ -2931,14 +2940,18 @@ class ClearTest(_TmpRootMixin, unittest.TestCase):
         self.book(harness="opencode", sid="ses_A")
         world = _ClearWorld(harness="opencode", sid="ses_A", screens=[OPENCODE_EMPTY], new_sid=None,
                             home_after=OPENCODE_EMPTY)
-        with mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 3):
+        with mock.patch.object(peer_steward, "_process_session",
+                               side_effect=lambda *_args: None if world.sent else "ses_A"), \
+             mock.patch.object(peer_steward, "_CLEAR_OBSERVE_ROUNDS", 3):
             rc, line = self.clear_cmd(world)
         self.assertIn("cleared=unverified", line)
         self.assertEqual(len([c for c in world.calls if c[:3] == ["herdr", "pane", "wait-output"]]), 2)
         for screen, reason in ((OPENCODE_DRAFT, "draft"), (NO_BOX, "draft-unknown")):
             self.book(harness="opencode", sid="ses_A")
             world = _ClearWorld(harness="opencode", sid="ses_A", screens=[screen], new_sid=None)
-            rc, line = self.clear_cmd(world)
+            with mock.patch.object(peer_steward, "_process_session",
+                                   side_effect=lambda *_args: None if world.sent else "ses_A"):
+                rc, line = self.clear_cmd(world)
             self.assertEqual((rc, f"reason={reason}" in line, world.typed()), (3, True, []), line)
 
     # -- doubt is "not cleared": zero input ---------------------------------------------------
@@ -4975,18 +4988,26 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
             with self.subTest(harness=harness):
                 world = _RetireWorld(harness=harness, exits=False)
                 if harness == "opencode":
+                    transports = []
+
                     class EventTransport:
                         def __init__(self, *_args, **_kwargs):
-                            pass
+                            self._state = SimpleNamespace(complete=True)
+                            self.snapshot_count = 0
+                            transports.append(self)
 
                         def observe(self):
-                            return SimpleNamespace(endpoint="default", complete=True)
+                            return SimpleNamespace(endpoint="default", complete=True, panes=())
+
+                        def resnapshot(self):
+                            self.snapshot_count += 1
+                            return SimpleNamespace(endpoint="default", complete=True, panes=())
 
                         def wait_for_event(self, pane_id, _timeout, event_types=None):
                             self.assert_target = pane_id
                             self.assert_types = event_types
                             world.exits = True
-                            return {"event": "pane.updated", "data": {"pane_id": pane_id}}
+                            return {"event": "pane.closed", "data": {"pane_id": pane_id}}
 
                         def close(self):
                             pass
@@ -5001,6 +5022,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                 if harness == "opencode":
                     self.assertEqual(rc, 0)
                     self.assertIn("retired=true reason=normal-exit", line)
+                    self.assertEqual(transports[0].snapshot_count, 1)
                     self.assertEqual(world.actions(), [
                         ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
                         ["herdr", "pane", "close", "w1:pOld"],

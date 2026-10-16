@@ -1,8 +1,8 @@
 """Conservative normalization for Herdr 0.9.x pane observations.
 
 Herdr remains optional. A failed command is unknown; only a successful,
-well-shaped pane census can confirm absence. Event envelopes are applied only
-to a snapshot from the same endpoint and connection generation.
+well-shaped pane census can confirm absence. Pane events invalidate the
+endpoint view and wake a fresh snapshot; their unsequenced deltas are not state.
 """
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ from typing import Callable
 
 HERDR_API_PROTOCOL = 22
 _API_LINE_LIMIT = 16 * 1024 * 1024
+_SNAPSHOT_OVERLAP_ATTEMPTS = 2
+_EVENT_DRAIN_FRAME_LIMIT = 256
 _PANE_SUBSCRIPTIONS = (
     {"type": "pane.created"}, {"type": "pane.updated"},
     {"type": "pane.closed"}, {"type": "pane.exited"},
@@ -127,13 +129,18 @@ class ObservationSnapshot:
         return True
 
     def apply_event(self, endpoint: str, envelope: dict) -> bool:
-        if endpoint_name(endpoint) != self.endpoint or not self.complete:
+        """Invalidate this view when a valid pane event arrives.
+
+        Protocol 22 exposes no sequence shared with ``session.snapshot``. The
+        event is therefore only evidence that a new census is needed; its pane
+        delta must never be applied to the current snapshot.
+        """
+        if endpoint_name(endpoint) != self.endpoint:
             return False
         if not isinstance(envelope, dict):
             self.reconnect()
             return False
-        error = envelope.get("error")
-        if error is not None:
+        if "error" in envelope:
             self.reconnect()
             return False
         data = envelope.get("data")
@@ -149,44 +156,23 @@ class ObservationSnapshot:
         if not isinstance(pane_id, str) or not pane_id:
             self.reconnect()
             return False
-        if event in {"pane_closed", "pane.closed"}:
-            self.panes.pop(pane_id, None)
-            self.terminal[pane_id] = "pane-closed"
-            self.revision += 1
-            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
-            return True
-        if event in {"pane_exited", "pane.exited"}:
-            self.panes.pop(pane_id, None)
-            self.terminal[pane_id] = "pane-exited"
-            self.revision += 1
-            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
-            return True
-        if event in {"pane_created", "pane.updated", "pane_updated", "pane.created"}:
+        if event in {"pane_created", "pane.created", "pane_updated", "pane.updated"}:
             if not isinstance(pane, dict) or pane.get("pane_id") != pane_id:
                 self.reconnect()
                 return False
-            self.panes[pane_id] = dict(pane)
-            self.terminal.pop(pane_id, None)
-            self.revision += 1
-            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
-            return True
-        if event in {"pane_agent_status_changed", "pane.agent_status_changed"}:
+        elif event in {"pane_agent_status_changed", "pane.agent_status_changed"}:
             status = data.get("agent_status")
-            if pane_id not in self.panes or status not in {
+            if status not in {
                     None, "idle", "working", "blocked", "done", "unknown"}:
                 self.reconnect()
                 return False
-            updated = dict(self.panes[pane_id])
-            updated["agent_status"] = status
-            self.panes[pane_id] = updated
-            self.revision += 1
-            self.pane_revisions[pane_id] = self.pane_revisions.get(pane_id, 0) + 1
-            return True
-        # Agent status/detection events do not carry the full pane session
-        # identity. A fresh snapshot is required before this endpoint can again
-        # provide a complete view.
+        elif event not in {
+                "pane_closed", "pane.closed", "pane_exited", "pane.exited",
+                "pane_agent_detected", "pane.agent_detected"}:
+            self.reconnect()
+            return False
         self.reconnect()
-        return False
+        return True
 
     def confirms_absence(self, pane_id: str) -> bool:
         return self.complete and pane_id not in self.panes
@@ -279,9 +265,10 @@ def _request_once(socket_path: str, method: str, params: dict, *, timeout: float
 class ObservationTransport:
     """One endpoint-local subscribe-before-snapshot connection.
 
-    The server has no public event sequence or replay guarantee. A disconnect,
-    malformed envelope, protocol mismatch, or `events_lost` error invalidates
-    this view; one bounded re-subscribe plus successful snapshot restores it.
+    The server has no public event sequence or replay guarantee. Events only
+    invalidate a candidate/current view. A snapshot is published only when no
+    event overlaps its acquisition; bounded overlap or transport uncertainty
+    leaves the endpoint unknown.
     """
 
     def __init__(self, endpoint: str | None = None, socket_path: str | None = None,
@@ -335,14 +322,14 @@ class ObservationTransport:
 
     def _read_snapshot(self):
         if not self.socket_path:
-            return False
+            return None
         try:
             response = _request_once(self.socket_path, "session.snapshot", {},
                                      timeout=self.timeout, connector=self._connector)
         except (OSError, ValueError, TimeoutError, ConnectionError):
-            return False
+            return None
         if "error" in response:
-            return False
+            return None
         result = response.get("result")
         snapshot = result.get("snapshot") if isinstance(result, dict) else None
         if (not isinstance(result, dict) or result.get("type") != "session_snapshot"
@@ -350,24 +337,32 @@ class ObservationTransport:
                 or snapshot.get("protocol") != HERDR_API_PROTOCOL
                 or not isinstance(snapshot.get("panes"), list)
                 or not isinstance(snapshot.get("agents"), list)):
-            return False
-        if not self._state.replace_snapshot(self.endpoint, snapshot["panes"]):
-            return False
-        self._agents = tuple(dict(agent) for agent in snapshot["agents"]
-                              if isinstance(agent, dict))
-        self._observed_at = time.monotonic()
-        return True
+            return None
+        agents = tuple(dict(agent) for agent in snapshot["agents"]
+                        if isinstance(agent, dict))
+        return snapshot["panes"], agents
 
     def _drain_events(self):
         if self._socket is None:
-            return False
+            return False, False
+        saw_event = False
+        frames = 0
+        deadline = time.monotonic() + self.timeout
         try:
             while True:
+                if frames >= _EVENT_DRAIN_FRAME_LIMIT or time.monotonic() >= deadline:
+                    self._state.reconnect()
+                    return False, saw_event
                 marker = self._buffer.find(b"\n")
                 if marker < 0:
+                    if self._buffer:
+                        # A partial frame may complete after the candidate
+                        # snapshot. Keep that candidate out of the published
+                        # view until the frame is resolved.
+                        saw_event = True
                     readable, _, _ = select.select([self._socket], [], [], 0)
                     if not readable:
-                        return True
+                        return True, saw_event
                     chunk = self._socket.recv(65536)
                     if not chunk:
                         raise ConnectionError("herdr-api-disconnected")
@@ -382,13 +377,50 @@ class ObservationTransport:
                     # Includes `error.code == events_lost`; no event enum or
                     # sequence number is inferred from that server error.
                     self._state.reconnect()
-                    return False
+                    return False, saw_event
                 if not self._state.apply_event(self.endpoint, envelope):
-                    return False
-                self._observed_at = time.monotonic()
+                    self._state.reconnect()
+                    return False, saw_event
+                saw_event = True
+                frames += 1
         except (OSError, ValueError, TimeoutError, ConnectionError):
             self._state.reconnect()
+            return False, saw_event
+
+    def _consistent_snapshot(self):
+        """Publish a snapshot only after a quiet, bounded acquisition window."""
+        if self._socket is None:
+            self._state.reconnect()
             return False
+        for _attempt in range(_SNAPSHOT_OVERLAP_ATTEMPTS):
+            healthy, _prior_events = self._drain_events()
+            if not healthy:
+                self._close_socket()
+                self._state.reconnect()
+                return False
+            candidate = self._read_snapshot()
+            if candidate is None:
+                self._close_socket()
+                self._state.reconnect()
+                return False
+            healthy, overlapped = self._drain_events()
+            if not healthy:
+                self._close_socket()
+                self._state.reconnect()
+                return False
+            if overlapped:
+                self._state.reconnect()
+                continue
+            panes, agents = candidate
+            if not self._state.replace_snapshot(self.endpoint, panes):
+                self._close_socket()
+                return False
+            self._agents = agents
+            self._observed_at = time.monotonic()
+            return True
+        self._close_socket()
+        self._state.reconnect()
+        return False
 
     def _synchronize(self):
         # One initial attempt plus one recovery attempt. A broken endpoint never
@@ -398,36 +430,39 @@ class ObservationTransport:
             self._state.reconnect()
             if not self._subscribe():
                 continue
-            if not self._read_snapshot():
-                self._close_socket()
-                continue
-            if self._drain_events() and self._state.complete:
+            if self._consistent_snapshot():
                 return True
+            else:
+                self._close_socket()
         self._close_socket()
         self._state.reconnect()
         return False
 
     def observe(self) -> ObservationView | None:
         with self._lock:
-            if self._socket is None or not self._state.complete:
+            if self._socket is None:
                 if not self._synchronize():
                     return None
-            elif not self._drain_events():
-                if not self._synchronize():
+            elif not self._state.complete:
+                if not self._consistent_snapshot():
+                    return None
+            else:
+                healthy, saw_event = self._drain_events()
+                if not healthy:
+                    if not self._synchronize():
+                        return None
+                elif saw_event and not self._consistent_snapshot():
                     return None
             if not self._state.complete:
                 return None
             return self._view()
 
     def resnapshot(self) -> ObservationView | None:
-        """Take a fresh snapshot on the live subscription after terminal evidence."""
+        """Take a fresh snapshot on the live subscription with overlap checks."""
         with self._lock:
-            if self._socket is None or not self._state.complete:
+            if self._socket is None:
                 return self.observe()
-            if not self._read_snapshot() or not self._drain_events():
-                if not self._synchronize():
-                    return None
-            if not self._state.complete:
+            if not self._consistent_snapshot():
                 return None
             return self._view()
 
@@ -462,6 +497,7 @@ class ObservationTransport:
                 except TimeoutError:
                     return None
                 except (OSError, ValueError, ConnectionError):
+                    self._close_socket()
                     self._state.reconnect()
                     return None
                 data = envelope.get("data")
@@ -473,15 +509,13 @@ class ObservationTransport:
                     current_pane = pane.get("pane_id")
                 matches = current_pane == pane_id and event in allowed
                 if "error" in envelope:
+                    self._close_socket()
                     self._state.reconnect()
                     return None
-                applied = self._state.apply_event(self.endpoint, envelope)
-                if not applied:
+                if not self._state.apply_event(self.endpoint, envelope):
+                    self._close_socket()
                     self._state.reconnect()
-                    if matches:
-                        return envelope
                     return None
-                self._observed_at = time.monotonic()
                 if matches:
                     return envelope
 
