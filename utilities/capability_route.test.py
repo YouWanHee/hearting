@@ -2641,7 +2641,7 @@ class TestContinuation(unittest.TestCase):
    "parent_sandbox":R.WRAPPER_PARENT_SANDBOXES["codex"][0],
    "child_harness":"codex","launch_authority":"conductor","status":"supported",
    "probe_source":"continuation-fixture","probe_time":"2026-08-25T00:00:00Z",
-   "failure_class":"","checked_worktree":str((worktree or R.ROOT).resolve()),
+   "failure_class":"","checked_worktree":str(Path(worktree or R.ROOT).resolve()),
    "failure_scope":"none","codex_command":"ok","retry_on_isolated_worktree":0,
   }
   return {"tuples":[row],"native_subagent":[{
@@ -2649,19 +2649,27 @@ class TestContinuation(unittest.TestCase):
    "execution_surface":"codex-native-subagent","registered_worker":False,
    "status":"supported","check_source":"continuation-fixture",
   }]}
+ def _source_fixture(self):
+  if not hasattr(self,"_source_fixture_root"):
+   source_tmp=tempfile.TemporaryDirectory(prefix="continuation-source-")
+   self.addCleanup(source_tmp.cleanup)
+   self._source_fixture_root=self._git_repo(source_tmp.name)
+  return self._source_fixture_root
  def _source(self,artifact_root,cwd=None,slug=None,**selection):
+  source_cwd=Path(cwd) if cwd is not None else self._source_fixture()
   gate={
    "spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
    "drift_verdict":"within-spec","workflow_mode":"tracked",
    "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"},
   }
   route=R.compile_route(
-   "autopilot-code","dev","strong",cwd or R.ROOT,artifact_root,
+   "autopilot-code","dev","strong",source_cwd,artifact_root,
    predicates=[],signals=["shared-contract"],transport="headless",
    tracking="tracked",tracked_gate_evidence=gate,
-   dispatch_evidence=self._dispatch(cwd),
+   dispatch_evidence=self._dispatch(source_cwd),
    slug=slug, **selection,
   )
+  self.assertEqual(route["source_commit"],self._git_head(source_cwd))
   route["runtime_lineage"]={
    "runtime":"codex","thread_id":"thread-source",
    "node_turn_ids":{
@@ -2764,7 +2772,7 @@ class TestContinuation(unittest.TestCase):
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    original=R.canonical(source)
    original_evidence=json.loads(json.dumps(source["dispatch_evidence"]))
-   fresh=self._dispatch()
+   fresh=self._dispatch(source["cwd"])
    fresh["tuples"][0]["parent_sandbox"]="danger-full-access"
    fresh["tuples"][0]["probe_time"]="2026-10-04T07:11:57Z"
    retained=self._build(source)
@@ -2779,7 +2787,7 @@ class TestContinuation(unittest.TestCase):
    for node in changed["nodes"]:
     if node.get("dispatch_depth")==2:
      self.assertEqual(node["fallback_hops"][0]["candidates"][0]["parent_sandbox"],"danger-full-access")
-   R.verify_route(changed,R.ROOT)
+   R.verify_route(changed,source["cwd"])
    R.write_once(R.canonical_route_path(artifact,source["route_id"]),source)
    output=R.canonical_route_path(artifact,changed["route_id"])
    R.publish_continuation_route(changed,source,output)
@@ -2964,7 +2972,7 @@ class TestContinuation(unittest.TestCase):
     self.assertIsNone(continuation["requested_boundary_blocker"])
     reused=next(row for row in continuation["reused_nodes"] if row["node_id"]=="plan")
     self.assertEqual(reused["output_evidence_digest"],R.evidence_digest(evidence["plan"]))
-    R.verify_route(continuation,R.ROOT)
+    R.verify_route(continuation,source["cwd"])
     output=R.canonical_route_path(root/"artifacts",continuation["route_id"])
     R.publish_continuation_route(continuation,source,output)
     self.assertTrue(output.is_file())
@@ -2977,7 +2985,7 @@ class TestContinuation(unittest.TestCase):
    continuation=self._build(source)
    self.assertEqual(continuation["slug"],"cycle-a")
    self.assertFalse(continuation["slug_truncated"])
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
  def test_campaign_selection_survives_continuation(self):
   with tempfile.TemporaryDirectory() as tmp:
    source=self._source(Path(tmp)/"artifacts",slug="Cycle A",
@@ -2986,7 +2994,7 @@ class TestContinuation(unittest.TestCase):
    continuation=self._build(source)
    self.assertEqual(continuation["campaign_key"],source["campaign_key"])
    self.assertEqual(continuation["parent_cycle_id"],source["parent_cycle_id"])
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
  def test_at1_reuses_exact_prefix_and_publishes_suffix_only(self):
   from unittest import mock
   with tempfile.TemporaryDirectory() as tmp:
@@ -3020,7 +3028,7 @@ class TestContinuation(unittest.TestCase):
    self._assert_no_alias_key(continuation)
    self.assertTrue(continuation["source_route_supersession"]["source_verdict_preserved"])
    self.assertEqual(len(continuation["supersession_edges"]),1)
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
    output=R.canonical_route_path(artifact,continuation["route_id"])
    R.publish_continuation_route(continuation,source,output)
    self.assertTrue(output.is_file())
@@ -3267,10 +3275,10 @@ class TestContinuation(unittest.TestCase):
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    continuation=self._build(source)
    self.assertEqual(continuation["selection_pins"],source["selection_pins"])
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
    continuation["selection_pins"]["owner"]["harness"]="gemini"
    with self.assertRaisesRegex(ValueError,"invalid selection_pins.owner.harness"):
-    R.verify_route(continuation,R.ROOT)
+    R.verify_route(continuation,source["cwd"])
 
  def test_recorded_pin_changes_ride_a_continuation_with_completed_prefix_preserved(self):
   import route_authority as AUTH
@@ -3288,7 +3296,7 @@ class TestContinuation(unittest.TestCase):
    self.assertTrue(continuation["reused_nodes"])
    self.assertTrue(all(row["new_attempt_count"]==0 for row in continuation["reused_nodes"]))
    self.assertEqual(json.dumps(source,sort_keys=True),before)
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
 
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:
@@ -3511,6 +3519,7 @@ class TestContinuation(unittest.TestCase):
    root=Path(tmp); artifact=root/"artifacts"; jobs=root/"state"/"jobs.log"
    jobs.parent.mkdir(parents=True)
    attempt="att-real-owner-lifecycle"
+   source_root=self._source_fixture()
    owner_meta=",".join((
     "attempt_schema_version=2","worker_type=owner","unit=_kernel/owner",
     "dispatch_depth=1","registered_worker=1",
@@ -3519,7 +3528,7 @@ class TestContinuation(unittest.TestCase):
     "parent_sid=launch-parent","owner_harness=codex",f"attempt_id={attempt}",
    ))
    owner_row="\t".join((
-    "2099-01-01T00:00:00Z","open",str(R.ROOT),str(R.ROOT),"owner",owner_meta,
+    "2099-01-01T00:00:00Z","open",str(source_root),str(source_root),"owner",owner_meta,
    ))
    jobs.write_text(owner_row+"\n",encoding="utf-8")
    lifecycle_env={
@@ -3541,11 +3550,11 @@ class TestContinuation(unittest.TestCase):
      f"route_hash={route['route_hash']}","capability=autopilot-code",
      "capability_mode=dev",f"artifact_root={artifact}","launch_started=1",
     ))
-    return "\t".join(("2099-01-01T00:00:00Z","open",str(R.ROOT),str(R.ROOT),
+    return "\t".join(("2099-01-01T00:00:00Z","open",str(route["cwd"]),str(route["cwd"]),
                        f"child-{suffix}",meta))+"\n"
 
    with mock.patch.dict(os.environ,lifecycle_env,clear=False):
-    source=self._source(artifact)
+    source=self._source(artifact,cwd=source_root)
     source_path=R.canonical_route_path(artifact,source["route_id"])
     R.write_once(source_path,source)
     attached=O.publish_owner_route_attachment_from_environment(
@@ -4337,7 +4346,7 @@ class TestContinuation(unittest.TestCase):
       "capability=autopilot-code,capability_mode=dev,intensity=strong,artifact_root=%s,"
       "owner_harness=codex,parent_sid=thread-source,"
       "attempt_id=att-cli-owner,owner_route_file=%s,owner_route_id=%s,owner_route_hash=%s\n"
-      % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]))
+      % (source["cwd"], source["cwd"], source["artifact_root"], source_path, source["route_id"], source["route_hash"]))
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
                 "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
@@ -4378,7 +4387,7 @@ class TestContinuation(unittest.TestCase):
      handle.write(
       "2099-01-01T00:00:00Z\topen\trepo\t%s\tstage\t"
       "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
-      "worker_type=stage,unit=dev/backend,attempt_id=att-cli-stage\n" % R.ROOT)
+      "worker_type=stage,unit=dev/backend,attempt_id=att-cli-stage\n" % source["cwd"])
     env=os.environ.copy(); env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-stage"
     env["AGENT_DISPATCH_DEPTH"]="2"
     env["AGENT_DISPATCH_REGISTERED_WORKER"]="1"
@@ -4415,7 +4424,7 @@ class TestContinuation(unittest.TestCase):
       "capability=autopilot-code,capability_mode=dev,intensity=strong,artifact_root=%s,"
       "owner_harness=codex,parent_sid=thread-source,attempt_id=att-cli-replay,"
       "owner_route_file=%s,owner_route_id=%s,owner_route_hash=%s\n"
-      % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]))
+      % (source["cwd"], source["cwd"], source["artifact_root"], source_path, source["route_id"], source["route_hash"]))
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
                 "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
