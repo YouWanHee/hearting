@@ -1309,7 +1309,9 @@ class Containment(Fixture):
     def test_registry_resolution_failures_stay_best_effort(self):
         loop = self.root / "jobs-loop"
         loop.symlink_to(loop)
-        self.assertEqual(R.sweep(loop, force=True)["removed"], 0)
+        # Python 3.12 raises on a symlink loop; 3.13 leaves it unresolved.
+        # Either way nothing escapes and nothing is removed.
+        self.assertEqual(R.sweep(loop, force=True).get("removed", 0), 0)
         self.assertFalse(R.note_view(loop, str(self.root / "homes/codex/shared")))
         with mock.patch.object(Path, "resolve", side_effect=OSError("resolution failed")):
             self.assertIn("skipped", R.sweep(self.jobs, force=True))
