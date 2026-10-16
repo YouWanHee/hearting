@@ -971,7 +971,7 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertIn(str(lock), advisory)
         self.assertIn("Ownership: unknown", advisory)
         self.assertIn("Codex App Server aggregatedOutput", advisory)
-        self.assertIn("stdout/stderr separation and raw bytes are unavailable", advisory)
+        self.assertIn("Stdout/stderr separation or raw bytes may be unavailable", advisory)
 
         events = [json.loads(line) for line in result.stdout.splitlines()]
         feedback = [row for row in events

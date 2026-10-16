@@ -157,6 +157,12 @@ class GitIndexLockConsumerTest(unittest.TestCase):
         self.assertFalse(git_index_lock.codex_command_candidate(
             wrapped, str(self.root), failed.returncode, output,
             env={**env, "GIT_INDEX_FILE": "alternate-index"}))
+        self.assertTrue(git_index_lock.codex_command_candidate(
+            wrapped, str(self.root), failed.returncode, output,
+            env={**env, "GIT_CONFIG_GLOBAL": os.devnull}))
+        self.assertFalse(git_index_lock.codex_command_candidate(
+            wrapped, str(self.root), failed.returncode, output,
+            env={**env, "GIT_CONFIG_COUNT": "1"}))
 
     def test_forged_python_eexist_output_is_advisory_and_preserves_selected_lock(self):
         before = os.fstat(self.lock_fd)

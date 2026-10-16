@@ -32,6 +32,7 @@ _GIT_ENV_PATHS = {
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_CEILING_DIRECTORIES",
 }
+_GIT_CONFIG_FILE_SELECTORS = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
 _RESPONSE_CODES = ("exit_code", "exitCode", "returncode", "code")
 
 
@@ -518,7 +519,10 @@ def _fallback_worktree_context(cwd: str, env: dict[str, str] | None = None):
     source = os.environ if env is None else env
     if any(source.get(key) for key in _GIT_ENV_PATHS):
         return None
-    if any(key.startswith("GIT_CONFIG_") and value for key, value in source.items()):
+    # GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM only pick config files, like ~/.gitconfig;
+    # injected settings (GIT_CONFIG_COUNT/KEY_n/VALUE_n/PARAMETERS) stay unsupported.
+    if any(key.startswith("GIT_CONFIG_") and key not in _GIT_CONFIG_FILE_SELECTORS and value
+           for key, value in source.items()):
         return None
     dispatched = source.get("AGENT_DISPATCH_WORKTREE")
     if dispatched:
