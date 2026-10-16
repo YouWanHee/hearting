@@ -495,8 +495,14 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
         if not jobs_path or not Path(jobs_path).is_file():
             continue
         try:
-            refreshed.extend(binding for binding, _status in _handover_candidates(harness, old, jobs_path)
-                             if _logical_key(binding) in selected_keys)
+            # Only attempts the snapshot does not bind yet are asked about: the bound ones are
+            # kept anyway, and each answer may verify a whole route inside this start hook.
+            jobs_key = _jobs_key(jobs_path)
+            bound = {str(b.get("attempt") or "") for b in snapshot_bindings
+                     if _jobs_key(b.get("jobs") or "") == jobs_key}
+            fresh = {aid: row for aid, row in latest_rows(jobs_path).items()
+                     if aid not in bound and (jobs_key, *route_identity(row[1])) in selected_keys}
+            refreshed.extend(binding for binding, _status in _handover_candidates(harness, old, jobs_path, rows=fresh))
         except Exception:  # noqa: BLE001 - the original snapshot remains a safe fallback
             continue
     bindings = _deduplicate_bindings([*bindings, *refreshed])
@@ -613,15 +619,28 @@ def resume_line(seat, harness: str, sid: str) -> str:
         if not rows:
             return ""
         wanted = [b for r in rows for b in r.get("bindings") or () if isinstance(b, dict)]
+        # Each registry is read once and each logical job looked at once: the card hook has
+        # seconds, and a handover carries one binding per attempt of the same job.
+        registries: dict = {}
+        looked: set = set()
         shown: dict = {}
         for b in wanted:
             jobs = b.get("jobs")
-            if not jobs or not Path(jobs).is_file():
+            identity = (b.get("route"), b.get("hash"), b.get("node"))
+            if not jobs or (jobs, identity) in looked or not Path(jobs).is_file():
                 continue
-            for aid, (status, meta) in latest_rows(jobs).items():
-                if not eligible_row(meta) or not _binds([b], jobs, meta) or not owns(meta, sid, jobs):
+            looked.add((jobs, identity))
+            if jobs not in registries:
+                grouped: dict = {}
+                if _jobs_key(jobs) == jobs:            # a binding names its registry by resolved path
+                    for status, meta in latest_rows(jobs).values():
+                        if eligible_row(meta):
+                            grouped.setdefault(route_identity(meta), []).append((status, meta))
+                registries[jobs] = grouped
+            for status, meta in registries[jobs].get(identity, ()):
+                if status not in OPEN_ROW_STATUSES and status != "done":
                     continue
-                if status not in OPEN_ROW_STATUSES and not (status == "done" and _delivery_open(jobs, meta)):
+                if not owns(meta, sid, jobs) or (status == "done" and not _delivery_open(jobs, meta)):
                     continue
                 shown.setdefault((jobs, route_identity(meta)[0]), meta.get("route_file", ""))
         parts = []
