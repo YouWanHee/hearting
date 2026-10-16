@@ -209,7 +209,7 @@ class PromptTest(_BaseTest):
         }
         proc = self._run("prompt", payload)
         context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("ACK are not execution", context)
+        self.assertIn("Receipt/queue/ACK is not execution", context)
 
     def test_prompt_guidance_receives_exact_claude_payload_identity(self):
         from types import SimpleNamespace
@@ -431,7 +431,7 @@ class SweepTest(_BaseTest):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         context = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("send acceptance before processing", context)
+        self.assertIn("immediate results once", context)
         self.assertNotIn("undelivered watch receipts", context)
         notices_after = [r for r in self._all_records() if r["kind"] == "notice"]
         # exactly one new notice: the cross-session-message record. The broken
@@ -470,8 +470,8 @@ class F100cTrailerAndNameTest(_BaseTest):
         self.assertEqual(rec["from"]["session_id"], "thread-9")
         self.assertEqual(rec["from"]["name"], "f100-codex")
         self.assertEqual(rec["summary"], "herdr steer received")
-        self.assertIn(b"send acceptance before processing", result.stdout)
-        self.assertIn(b"ACK are not execution", result.stdout)
+        self.assertIn(b"immediate results once", result.stdout)
+        self.assertIn(b"Receipt/queue/ACK is not execution", result.stdout)
 
     def test_plain_prompt_still_writes_nothing(self):
         self._run("prompt", {"session_id": "sid-recv", "cwd": "/tmp/proj", "prompt": "peer-from: x"})

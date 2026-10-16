@@ -1919,11 +1919,44 @@ JSON object per line, schema `peer_message_v1`: `schema_version=1`, a 16-hex `me
 full message), `body_sha256` (sha256 of the complete body, never itself stored),
 `delivery{surface,status,receipt}`, `refs[]`. No field carries the message body.
 An undelivered transfer withheld for a form, a user draft or an unreadable input
-box retains its bounded body in the private
-runtime `peer-messages/pending/` directory (0700, payload/lock files 0600).
-It is bound to the immutable transfer ref, actual sender/recipient and digest,
-not a public ledger field. Receipt removes the private body and retains the ref
-for replay deduplication; unknown, stale or ambiguous identities keep their binding.
+box retains its bounded wire text in the private runtime
+`peer-messages/pending/` directory (0700, files 0600). A long message sent by
+reference also has one immutable UTF-8 payload at
+`peer-messages/payloads/<transfer-ref>.txt` (directory 0700, file 0600). The
+transfer and pending row bind its ref, byte count, raw digest, normalized source
+digest, and presentation mode; the payload path follows the validated transfer
+ref, and message text cannot supply it. The public ledger
+keeps only its existing bounded summary and digest. A bounded envelope carries
+a preview, the absolute payload path, a read-the-whole-file instruction, and the
+usual sender/ref trailer; the preview is not the execution request.
+
+Reference presentation is prepared only for an exact Codex session whose
+existing herdr identity, live foreground PID/namespace, and adapter OS-sandbox
+read-everywhere contract agree. The native queue checks the Codex contract again
+at submission. Unknown, stale, unresolved, contradictory, and other-runtime
+evidence keeps the complete body inline; SID-less panes remain inline until
+session binding. Helper file reads and model-readable access are separate
+observations.
+
+Queued and ambiguous envelopes retain their original wire body, digest, and
+identity. When queue submission or a receiver callback cannot establish current
+access, the existing Codex callback supplies the verified source through native
+context. A runtime/session mismatch gets recovery context for the existing owner
+continuation and an execution prohibition for that mismatched session. If the
+helper cannot verify the source, the callback prohibits preview-only action,
+keeps the existing continuation responsible, and records no original
+consumption. Transport receipts remain distinct from model reading, work
+execution, and typed handoff acceptance.
+
+The raw payload preserves UTF-8 bytes, including line endings and trailing
+whitespace. The normalized `source_sha256` remains the existing retry key
+(`body.rstrip("\n")`); `body_sha256` covers the actual wire envelope and
+trailer. Rows without a body-reference descriptor remain valid version-1
+inline rows. An exact receipt clears pending wire text but does not remove the
+payload: receipt proves delivery, not that the receiver read the file. Retain
+payloads through receipt and handoff settlement; this checkout has no safe
+payload garbage-collection boundary, so automatic removal is not implied.
+Unknown, stale or ambiguous identities keep their original binding.
 An external shell may have no sender session: `unknown`/empty and null sender
 fields mean an unattributed sender, not an invalid message. Its sealed ref/body
 and exact known recipient still govern delivery and receipt. Legacy unsent rows
@@ -1938,8 +1971,9 @@ The same recipient binding and idempotent receive record apply.
 Existing receiver callbacks also carry deferred messages while the recipient
 is working: Claude uses hook context, Codex its native queue, and OpenCode its
 native context API. They never type into a form or user draft. Hook context
-emission is queued delivery, not confirmed receipt; it retains the private body
-until the ordinary exact-ref receive path observes it. Existing callbacks warn
+emission is queued delivery, not confirmed receipt; it retains pending wire text
+until the ordinary exact-ref receive path observes it. A referenced original
+remains in the private payload store after that receipt. Existing callbacks warn
 the original sender once when a transfer remains without confirmed receipt for an
 hour. The notice attempt is claimed before output; ambiguous output is retained
 without automatic repeat. No additional watcher, model turn, approval or
@@ -2181,7 +2215,11 @@ cards have no accept command or successor authority. A confirmed same-seat clear
 uses the existing seat handover automatically. Explicit acceptance schedules the
 retained reply and normal predecessor retire reservation using the original exact
 identities. Delivery is receipt, not acceptance.
-For a new actionable peer request, send an acceptance reply before processing;
-an informational/no-reply notice needs no reply. Completion reception requires
-actual approved result review/follow-through this turn or its registered
-continuation; ACK and consumed are receipt facts only.
+For an actionable peer request that can be completed now, reply once with the
+result. For work that will wait or take sustained effort, send one short receipt and
+continue through the existing registered continuation. Informational/no-reply
+notices need no reply. Put the condition, result, and any required decision or
+blocker first; keep PID, start, exit, digest, and path detail in existing
+evidence. Completion reception requires actual approved result
+review/follow-through this turn or its registered continuation; ACK and
+consumed are receipt facts only.
