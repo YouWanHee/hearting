@@ -670,18 +670,21 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
 
     def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
+        import dispatch_lifecycle as L
         seen=[]
         def slow(command,**kwargs):
             seen.append((command,kwargs['timeout']))
             raise subprocess.TimeoutExpired(command,kwargs['timeout'],output='waiting on disk',stderr=b'')
-        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None), \
+             mock.patch.object(L,'reconcile_launch_lifecycle',return_value=SimpleNamespace(effective='detached')):
             first=R.advance(self.jobs,'att-source',run=slow)
         self.assertEqual(first['reason'],'replacement-launch-timeout')
         self.assertIn('waiting on disk',first['launcher_diagnostic'])
         self.assertEqual(seen[0][1],R.LAUNCHER_TIMEOUT_SECONDS)
         self.write({**self.meta,'attempt_id':first['attempt_id'],'replacement_original_attempt_id':'att-source',
                     'note':'registered','launch_claimed':'0'},'open',append=True)
-        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None):
+        with mock.patch.object(R,'_authorized'),mock.patch('dispatch_replacement_batch.command',return_value=None), \
+             mock.patch.object(L,'reconcile_launch_lifecycle',return_value=SimpleNamespace(effective='detached')):
             R.advance(self.jobs,'att-source',run=slow)
         self.assertEqual(seen[1][0][seen[1][0].index('--attempt-id')+1],first['attempt_id'])
 
