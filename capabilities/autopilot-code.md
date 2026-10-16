@@ -214,11 +214,15 @@ Additional code-entry gates:
    app-neutral receipt contract; otherwise record
    `skipped/extension-unavailable` without changing code-cycle completion.
 
-If Git fails to create an index lock, preserve that failure and its partial
-state; use the context-bound diagnosis and narrowly limited NFSv3 residual-lock
-cleanup in core/OPERATIONS.md §5.9. Only a confirmed removal advises the acting
-agent to retry the same command. The helper never retries Git or replays an
-arbitrary shell or Python command.
+If Git reports an index-lock error, preserve the original failure and partial
+state. The shared bounded diagnosis in core/OPERATIONS.md §5.9 observes only the
+exact selected index lock and never mutates or retries it. Mode, size,
+timestamps, or NFS cache age cannot establish that an outstanding CREATE or
+post-create SETATTR has completed. Python or multiline wrapper text is advisory
+and does not prove Git returned EEXIST. The dispatchers continue to apply the
+shared `git_optional_locks_env()` as the final child-environment override,
+setting `GIT_OPTIONAL_LOCKS=0` for optional refresh behavior; mandatory Git
+locking for `add` and `commit` remains enabled.
 
 ## Mode-Specific Semantics
 

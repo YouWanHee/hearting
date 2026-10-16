@@ -59,13 +59,14 @@ into an integration worktree. Registered owners and workers retain their
 runtime terminal path. Stage-dispatch §13.61 and artifact-path-contract §43
 govern the proof and the cycle's completion record; a finalized cycle's files stay editable (artifact-path-contract §45).
 
-An index-lock EEXIST diagnosis is attached only after the original Git
-failure, through the shared bounded helper in core/OPERATIONS.md §5.9. It may
-remove only a context-bound NFSv3 residual that passes the complete freshness,
-identity, mode, size, and timestamp predicate there. Keep the original result
-and partial state; the helper never replays the original command. After feedback
-confirms removal, the acting agent may retry that same command. Unparsed wrapper
-failures require exact binding to the selected worktree's default index.
+An index-lock error may receive the shared bounded, read-only diagnosis in
+`core/OPERATIONS.md` §5.9. It binds the reported path to the selected Git index
+and observes only that lock. Python or multiline wrapper text is advisory and
+does not prove Git returned EEXIST. Mode, size, timestamps, or NFS cache age do
+not prove that an outstanding CREATE or post-create SETATTR has completed. The
+helper never renames, unlinks, quarantines, restores, chmods, retries, or replays
+a failed command. Keep the original failure and partial state. Git's mandatory
+locking for `add` and `commit` remains enabled.
 
 ## Role Requirements
 
