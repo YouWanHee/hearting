@@ -22,6 +22,93 @@ from fleet.model import DispatchJob
 
 
 class OpenCodeContextPluginTest(unittest.TestCase):
+    def test_idle_observer_is_detached_before_summary_checkpoint_and_peer_consumers(self):
+        source = (ROOT / "adapters/opencode/plugins/hearting-guards.js").read_text(encoding="utf-8")
+        helper_start = source.index("function spawnIdleObserver(")
+        helper_end = source.index("\n}", helper_start) + 2
+        helper = source[helper_start:helper_end]
+        event_start = source.index('if (event && event.type === "session.idle")')
+        event_end = source.index('if (event && event.type === "session.deleted")', event_start)
+        idle = source[event_start:event_end]
+
+        self.assertIn('spawn("python3"', helper)
+        self.assertIn("detached: true", helper)
+        self.assertIn("child.stdin.end", helper)
+        self.assertIn("child.unref()", helper)
+        self.assertIn("isWorkerSession()", helper)
+        self.assertNotIn("spawnSync", idle)
+        self.assertIn("spawnIdleObserver(eventSid, baseDir(ctx))", idle)
+        self.assertLess(idle.index("spawnIdleObserver"), idle.index('spawnSummary(eventSid, "final")'))
+        self.assertLess(idle.index('spawnSummary(eventSid, "final")'), idle.index("spawnCheckpoint(eventSid)"))
+        self.assertIn("pendingPeerDelivery(ctx, eventSid)", idle)
+        self.assertIn("completionCarrier.idle(eventSid).catch", idle)
+
+    def test_held_idle_observer_does_not_hold_the_opencode_event_consumer(self):
+        with tempfile.TemporaryDirectory(prefix="opencode-held-idle-") as raw:
+            root = Path(raw)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            observer_started = root / "observer-started"
+            observer_pid = root / "observer.pid"
+            summary_started = root / "summary-started"
+            checkpoint_started = root / "checkpoint-started"
+            release = root / "release"
+            fake_python = fake_bin / "python3"
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *session_tidy_idle.py*) echo $$ > \"$OBSERVER_PID_FILE\"; touch \"$OBSERVER_STARTED\"; "
+                "while [ ! -e \"$OBSERVER_RELEASE\" ]; do /bin/sleep 0.02; done ;;\n"
+                "  *session_summary_trigger.py*) touch \"$SUMMARY_STARTED\" ;;\n"
+                "  *artifact_checkpoint_trigger.py*) touch \"$CHECKPOINT_STARTED\" ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
+            script = f'''import {{ AgentHarnessGuards }} from {json.dumps(plugin.as_uri())};
+const hooks = await AgentHarnessGuards({{ directory: process.cwd(), worktree: process.cwd(), client: {{}} }});
+const started = performance.now();
+await hooks.event({{ event: {{ type: "session.idle", properties: {{ sessionID: "sid-held-observer" }} }} }});
+console.log(JSON.stringify({{ elapsed_ms: performance.now() - started }}));
+'''
+            env = {
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "HOME": str(root),
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_DATA_HOME": str(root / "data"),
+                "XDG_STATE_HOME": str(root / "state"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "AGENT_HOME": str(ROOT),
+                "OPENCODE_VERSION": "1.19.0",
+                "OBSERVER_PID_FILE": str(observer_pid),
+                "OBSERVER_STARTED": str(observer_started),
+                "SUMMARY_STARTED": str(summary_started),
+                "CHECKPOINT_STARTED": str(checkpoint_started),
+                "OBSERVER_RELEASE": str(release),
+            }
+            try:
+                run = subprocess.run([NODE, "--input-type=module", "-e", script], cwd=ROOT,
+                                     env=env, text=True, capture_output=True, timeout=2)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                deadline = time.monotonic() + 0.75
+                while time.monotonic() < deadline and not (observer_started.exists() and summary_started.exists()):
+                    time.sleep(0.01)
+                self.assertTrue(observer_started.exists(), "observer child did not start")
+                self.assertTrue(summary_started.exists(), "summary waited for the held observer")
+                self.assertFalse(release.exists(), "fixture observer unexpectedly exited before release")
+            finally:
+                release.touch()
+                if observer_pid.exists():
+                    pid = int(observer_pid.read_text(encoding="utf-8").strip())
+                    deadline = time.monotonic() + 0.75
+                    while time.monotonic() < deadline:
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            break
+                        time.sleep(0.01)
+
     def test_real_plugin_config_hook_caps_only_loaded_provider_and_hides_auth_values(self):
         with tempfile.TemporaryDirectory(prefix="opencode-context-hook-") as raw:
             home = Path(raw)

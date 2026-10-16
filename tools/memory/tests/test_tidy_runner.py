@@ -28,6 +28,7 @@ import sys
 import textwrap
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -385,6 +386,71 @@ class RunnerCase(unittest.TestCase):
 
 
 class EnqueueTest(RunnerCase):
+
+    def test_operation_identity_reuses_queue_row_and_recovers_runner_launch_failure(self):
+        operation = "compact-event-identity"
+        with self.iso.patched_environ({"HERDR_PANE_ID": ""}):
+            seat = st.resolve_seat("claude", str(self.cwd), sid="sid-A")
+            with mock.patch.object(runner, "start_detached", side_effect=[OSError("launch"), 4242]) as start:
+                first = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                            operation_id=operation, start=False)
+                failed = runner._start_queued(first)
+                self.assertEqual(failed["id"], first["id"])
+                self.assertEqual(failed["status"], "queued")
+                self.assertEqual(failed["runner_start_error"], "OSError")
+
+                resumed = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                              operation_id=operation)
+                self.assertEqual(resumed["id"], first["id"])
+                self.assertEqual(resumed["runner_pid"], 4242)
+                self.assertEqual(start.call_count, 2)
+                self.assertEqual(len([item for item in runner.list_items()
+                                      if item.get("operation_id") == operation]), 1)
+
+                resumed["status"] = "notified"
+                runner.write_item(resumed)
+                terminal = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                               operation_id=operation)
+                self.assertEqual((terminal["id"], terminal["status"]), (first["id"], "notified"))
+                self.assertEqual(start.call_count, 2)
+
+    def test_interrupted_apply_stage_restarts_under_the_same_qid_and_batch(self):
+        with self.iso.patched_environ(self.env()):
+            seat = st.resolve_seat("claude", str(self.cwd), os.environ)
+            qid = runner.operation_queue_id("compact-interrupted-operation")
+            item = {"schema": runner.SCHEMA, "id": qid, "created": runner._now(),
+                    "status": "applying", "updated": runner._now(), "seat": seat.as_dict(),
+                    "harness": "claude", "sid": "sid-A", "cwd": str(self.cwd),
+                    "transcript": "", "operation_id": "compact-interrupted-operation",
+                    "batch": qid, "attempts": 1, "runner_pid": 99999999, "runner_pid_start": "1"}
+            runner.write_item(item)
+            with mock.patch.object(runner, "start_detached", return_value=4242) as launch:
+                resumed = runner._start_queued(item)
+            self.assertEqual(resumed["id"], qid)
+            launch.assert_called_once_with(qid)
+
+            applied = []
+            bundle = SimpleNamespace(empty=False, unreadable=[], exchange=self.iso.root / "exchange")
+            with mock.patch.object(runner, "assemble", return_value=bundle), \
+                    mock.patch.object(runner, "prepare_exchange", return_value=str(self.iso.root / "exchange")), \
+                    mock.patch.object(runner, "dispatch_worker", return_value={"attempt_id": "attempt"}), \
+                    mock.patch.object(runner, "wait_worker"), \
+                    mock.patch.object(runner, "validate_actions"), \
+                    mock.patch.object(runner, "apply_actions", side_effect=lambda row, run_dir, _bundle:
+                                      applied.append((row["id"], run_dir.name)) or "applied"), \
+                    mock.patch.object(runner, "advance_watermarks"), \
+                    mock.patch.object(runner, "publish_memory"), \
+                    mock.patch.object(runner, "notify"), \
+                    mock.patch.object(runner, "coverage_note", return_value=""), \
+                    mock.patch.object(runner, "remove_exchange"):
+                runner.process_item(resumed)
+            self.assertEqual(applied, [(qid, qid)], runner.read_item(qid))
+            self.assertEqual(runner.read_item(qid)["status"], "notified")
+            self.assertEqual(runner.read_item(qid)["batch"], qid)
+            with mock.patch.object(runner, "start_detached") as launch:
+                runner._start_queued(runner.read_item(qid))
+            launch.assert_not_called()
+            self.assertEqual(applied, [(qid, qid)])
 
     def test_enqueue_returns_one_line_at_once_and_the_tidy_finishes_on_its_own(self):
         shutil.copy(FIXTURES / "claude-choice.jsonl", self.projects / f"{CHOICE_SID}.jsonl")

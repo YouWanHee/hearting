@@ -465,4 +465,4 @@ extra flag is needed. The shared placement contract is `core/OPERATIONS.md §5.1
 
 ## Runtime compaction tidy
 
-The existing `PostCompact` remains queue-only for Codex's OpenAI remote-V2 compaction: hooks receive no plaintext summary or summary-instruction override, so automatic card saving and clear are unavailable. This does not change Codex's existing explicit manual tidy clear/continue flow. Workers are skipped.
+Codex `PostCompact` may join the existing tidy clear flow only for an explicitly automatic event with a verified main pane and transcript-confirmed turn completion. Because remote-V2 supplies no usable summary, the bounded helper sends one claim-bound request to that exact idle pane; the main session writes a real card and enqueues the matching operation before snapshot or clear. Uncertain sends, changed input/target, manual or unknown compaction, workers, and unsupported seats remain queue-only. Codex uses its verified pane transport; this adds no native attachment path. Compact-origin continuation keeps its existing behavior.
