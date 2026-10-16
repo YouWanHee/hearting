@@ -315,6 +315,69 @@ class InterimManifestTest(CheckpointTestBase):
         self.assertEqual(sorted(os.listdir(self.result["cycle_dir"])), [".cycle.json", "artifacts"])
         self.assertEqual(self.state()["last_status"], "emitted")
 
+    def test_cycle_root_support_checkpoint_and_finalize_preserve_identity_and_bundle_scope(self):
+        cycle = Path(self.result["cycle_dir"])
+        root_support = cycle / "_internal/reviews/manifest.json"
+        artifact_support = cycle / "artifacts/_internal/reviews/manifest.json"
+        support_raw = cycle / "_internal/raw-results/summary.json"
+        binary_support = cycle / "_internal/reviews/weights.bin"
+        oversized_support = cycle / "_internal/reviews/large.md"
+        for path, data in (
+                (root_support, b'{"version":1}\n'),
+                (artifact_support, b'{"artifact-side":true}\n'),
+                (support_raw, b'{"files":2}\n'),
+                (binary_support, b"binary support")):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        with oversized_support.open("wb") as stream:
+            stream.truncate(P.CheckpointLimits().max_file_bytes + 1)
+        self.write_output(self.result, "raw-results/inside.txt", b"bundle bytes\n")
+        primary = self.write_output(self.result, "documents/final_report.md", b"report\n")
+
+        emitted = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(emitted["status"], "emitted", emitted)
+        interim = self.interim()
+        interim_rows = _ids_by_path(interim)
+        self.assertIn("_internal/reviews/manifest.json", interim_rows)
+        self.assertIn("artifacts/_internal/reviews/manifest.json", interim_rows)
+        self.assertIn("_internal/raw-results/summary.json", interim_rows)
+        self.assertNotIn("_internal/reviews/weights.bin", interim_rows)
+        self.assertNotIn("_internal/reviews/large.md", interim_rows)
+        self.assertNotIn("artifacts/raw-results/inside.txt", interim_rows)
+        self.assertNotEqual(interim_rows["_internal/reviews/manifest.json"][0],
+                            interim_rows["artifacts/_internal/reviews/manifest.json"][0])
+        self.assertEqual(interim_rows["_internal/reviews/manifest.json"][3], "support")
+        unchanged = P.checkpoint(self.root, cycle_id=self.cycle_id)
+        self.assertEqual(unchanged["status"], "unchanged", unchanged)
+        before = _ids_by_path(self.interim())
+
+        root_support.write_bytes(b'{"version":2,"changed":true}\n')
+        sealed, document = self.seal(primary="documents/final_report.md")
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        sealed_rows = _ids_by_path(document)
+        old = before["_internal/reviews/manifest.json"]
+        new = sealed_rows["_internal/reviews/manifest.json"]
+        self.assertEqual(new[0], old[0])
+        self.assertNotEqual(new[1], old[1])
+        self.assertEqual(new[2], "sha256:" + hashlib.sha256(root_support.read_bytes()).hexdigest())
+        self.assertEqual(new[3], "support")
+        self.assertEqual(sealed_rows["artifacts/_internal/reviews/manifest.json"][0],
+                         before["artifacts/_internal/reviews/manifest.json"][0])
+        self.assertEqual(sealed_rows["_internal/raw-results/summary.json"][3], "support")
+        self.assertEqual(sealed_rows["_internal/reviews/weights.bin"][3], "support")
+        self.assertEqual(sealed_rows["_internal/reviews/large.md"][3], "support")
+        self.assertEqual(sealed_rows["_internal/reviews/large.md"][2],
+                         "sha256:" + hashlib.sha256(oversized_support.read_bytes()).hexdigest())
+        artifacts = {row["artifact_id"]: row for row in document["artifacts"]}
+        bundles = [row for row in document["artifact_revisions"]
+                   if artifacts[row["artifact_id"]]["type"] == "directory-bundle"]
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual(artifacts[bundles[0]["artifact_id"]]["title"], "raw-results")
+        self.assertEqual(primary.read_bytes(), b"report\n")
+        self.assertEqual(root_support.read_bytes(), b'{"version":2,"changed":true}\n')
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+        self.assertEqual(P._output_placements(self.root, P.read_cycle_record(self.root, self.cycle_id)), [])
+
     def test_ids_are_stable_and_revisions_follow_content(self):
         self.write_output(self.result, "plans/cycle/plan.md", b"v1\n")
         self.write_output(self.result, "plans/cycle/notes.md", b"notes\n")
