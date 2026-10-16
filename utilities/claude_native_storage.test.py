@@ -190,6 +190,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
                           'old-worker-before', 'old-worker-after', 'main-login',
                           'legacy-cas-worker', 'legacy-cas-main',
                           'builder-binding', 'split-legacy-child',
+                          'post-lock-a', 'post-lock-c',
                           'session-first', 'session-resume', 'late-cas-worker',
                           'main-before', 'worker-a', 'worker-b', 'main-after'):
                 if label in text:
@@ -231,6 +232,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
                 'old-worker-before': '1', 'old-worker-after': '1', 'main-login': '2',
                 'legacy-cas-worker': '2', 'legacy-cas-main': '2',
                 'builder-binding': '1', 'split-legacy-child': '2',
+                'post-lock-a': '1', 'post-lock-c': '1',
                 'session-first': '1', 'session-resume': '1',
                 'worker-a': '1', 'worker-b': '1', 'main-after': '1',
             }.get(label)
@@ -567,6 +569,25 @@ def _reread_after_lock_contention(trace_text, lock_path):
             lock_path in line and ('mkdir(' in line or 'mkdirat(' in line)
             and '= 0' in line for line in lines[first_wait + 1:]),
     }
+
+
+def _lock_mkdir_lines(trace_text, lock_paths):
+    return [line for line in trace_text.splitlines()
+            if any(f'"{path}"' in line for path in lock_paths)
+            and ('mkdir(' in line or 'mkdirat(' in line)]
+
+
+def _wait_for_pending_lock_mkdir(harness, alias, lock_paths, timeout=15):
+    """Wait until strace has printed a delayed lock mkdir that has not returned."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        lines = _lock_mkdir_lines(_trace_text(harness, alias), lock_paths)
+        if any(' = ' not in line for line in lines):
+            return
+        if lines:
+            raise RuntimeError(f'{alias} completed its lock mkdir before the pause')
+        time.sleep(0.03)
+    raise RuntimeError(f'{alias} did not reach the native refresh lock')
 
 
 def _wait_for_lock_contention(harness, alias, lock_path, timeout=12):
@@ -1022,6 +1043,96 @@ def _native_child(cli, root):
             'worker_b_lock_paths': _observed_lock_paths(trace_b_text),
         }
 
+        # Pause worker C inside its first native refresh-lock mkdir, after it
+        # has read the expired credential and decided to refresh. While C is
+        # held at that syscall entry, actual CLI A refreshes and releases the
+        # same lock. C then acquires the lock successfully and must reread the
+        # canonical file under it and use A's token without a second refresh.
+        harness.state.reset('post-lock-reread')
+        reread_home = root / 'post-lock-home'
+        reread_store = root / 'post-lock-auth'
+        reread_config_a = reread_home / 'worker-a-config'
+        reread_config_c = reread_home / 'worker-c-config'
+        reread_credential = _write_credential(reread_store, expires_at=0)
+        for path in (reread_config_a, reread_config_c):
+            _write_settings(path)
+        reread_locks = [str(reread_store / '.oauth_refresh.lock'),
+                        str(reread_store.resolve()) + '.lock']
+        pause_us = 10_000_000
+        trace_c = root / 'trace-post-lock-c'
+        command_c = [
+            '/usr/bin/strace', '-ff', '-qq', '-e', 'trace=%file,execve',
+            '-P', reread_locks[0], '-P', reread_locks[1],
+            '-P', str(reread_credential), '-P', harness.cli,
+            '-e', f'inject=mkdir,mkdirat:delay_enter={pause_us}:when=1',
+            '-s', '200', '-o', str(trace_c), harness.cli,
+            '-p', 'post-lock-c', '--output-format', 'text', '--model', MODEL,
+            '--setting-sources', 'user', '--no-session-persistence',
+        ]
+        env_c = _native_env(reread_home, reread_config_c, str(reread_store),
+                            harness.proxy_url, harness.ca_cert, root)
+        proc_c = subprocess.Popen(
+            command_c, cwd=str(root), env=env_c, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            start_new_session=True)
+        harness.processes.append(proc_c)
+        _wait_for_pending_lock_mkdir(harness, 'post-lock-c', reread_locks)
+        if harness.state.refresh_count != 0:
+            raise RuntimeError('worker C refreshed before reaching the native lock')
+        trace_a_reread, _ = harness.run_cli(
+            'post-lock-a', 'post-lock-a', reread_home, reread_config_a,
+            str(reread_store), write_settings=False)
+        if harness.state.refresh_count != 1:
+            raise RuntimeError('worker A did not perform exactly one refresh')
+        if json.loads(reread_credential.read_text())['claudeAiOauth'][
+                'accessToken'] != 'synthetic-access-1':
+            raise RuntimeError('worker A did not publish the refreshed credential')
+        pending = _lock_mkdir_lines(_trace_text(harness, 'post-lock-c'), reread_locks)
+        if not any(' = ' not in line for line in pending):
+            raise RuntimeError('worker C left its paused lock mkdir before A finished')
+        out_c, _ = proc_c.communicate(timeout=40)
+        if proc_c.returncode != 0:
+            raise RuntimeError(f'worker C failed: {_clean_text(out_c[-1200:])}')
+        trace_c_text = _trace_text(harness, 'post-lock-c')
+        c_lines = trace_c_text.splitlines()
+        delayed = [index for index, line in enumerate(c_lines)
+                   if line in _lock_mkdir_lines(trace_c_text, reread_locks)
+                   and '(DELAYED)' in line]
+        if len(delayed) < 1 or not all(
+                ' = 0 (DELAYED)' in c_lines[index] for index in delayed):
+            raise RuntimeError('worker C did not acquire the lock after its pause')
+        contended = [line for line in _lock_mkdir_lines(trace_c_text, reread_locks)
+                     if 'EEXIST' in line]
+        if contended:
+            raise RuntimeError('worker C contended instead of acquiring the free lock')
+        rereads = [index for index, line in enumerate(c_lines)
+                   if '.credentials.json' in line and 'openat(' in line
+                   and index > delayed[0]]
+        if not rereads:
+            raise RuntimeError('worker C did not reread credentials after acquiring the lock')
+        c_generations = [event['access_generation'] for event in harness.state.events
+                         if event.get('event') == 'message' and
+                         event.get('prompt') == 'post-lock-c']
+        if not c_generations or set(c_generations) != {'1'}:
+            raise RuntimeError('worker C did not use the token reread under the lock')
+        if harness.state.refresh_count != 1:
+            raise RuntimeError('worker C issued a duplicate refresh after the lock reread')
+        if (reread_config_a / '.credentials.json').exists() or \
+                (reread_config_c / '.credentials.json').exists():
+            raise RuntimeError('a worker config home received a credential file')
+        summary['scenarios']['post_lock_reread'] = {
+            'actual_cli_pids': {
+                'worker_a': harness.cli_pid(trace_a_reread, prompt='post-lock-a'),
+                'worker_c': harness.cli_pid(trace_c, prompt='post-lock-c'),
+            },
+            'worker_c_paused_at_lock_mkdir_us': pause_us,
+            'worker_a_refreshed_while_c_paused': True,
+            'successful_reacquire_then_reread': True,
+            'worker_c_lock_contention': False,
+            'worker_c_access_generations': sorted(set(c_generations)),
+            'refresh_requests': harness.state.refresh_count,
+        }
+
         # Keep a legacy worker alive across a main login. Its old environment
         # still resolves the masked directory, and its native rename has already
         # detached its credential file from the main store.
@@ -1218,6 +1329,9 @@ class NativeClaudeStorage(unittest.TestCase):
             self.assertTrue(summary['scenarios']['shared_store_race']['same_main_process_before_after'])
             self.assertTrue(summary['scenarios']['shared_store_race']['settings_env_overrode_decoy'])
             self.assertEqual(summary['scenarios']['shared_store_race']['refresh_requests'], 1)
+            self.assertTrue(summary['scenarios']['post_lock_reread'][
+                'successful_reacquire_then_reread'])
+            self.assertEqual(summary['scenarios']['post_lock_reread']['refresh_requests'], 1)
             self.assertTrue(summary['scenarios']['old_running_worker_transition'][
                 'main_login_not_overwritten'])
             self.assertTrue(summary['scenarios']['old_running_worker_transition'][

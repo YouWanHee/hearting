@@ -31,7 +31,9 @@ main store without supported identity and ordering evidence. Such a file stays
 in place and is never used as an authentication source: when a marked legacy
 Claude worker has no recorded main-store origin or intact credential link, new
 launches from it use the source config home its builder recorded in that
-worker's launch environment, or the default `HOME/.claude` store. A legacy
+worker's launch environment, or the default `HOME/.claude` store; a legacy
+worker built from a separate custom-account config is resolved only through
+that recorded environment. A legacy
 process already running on a split file keeps its stale token until it exits.
 Account metadata projection follows Claude Code's resolved global config file
 and copies only `oauthAccount` into the masked child config. Existing processes
