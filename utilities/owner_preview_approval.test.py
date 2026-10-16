@@ -27,6 +27,12 @@ PF = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(PF)
 R, P, L, D, nested = PF.R, PF.P, PF.L, PF.D, PF.nested
 
+# Completing nodes here must not launch detached open-cycle checkpoints into
+# fixture roots, including from CLI subprocesses this suite spawns. Such a child
+# inherits the owner's attempt tag, so a `release` that checks owner quiescence
+# while it is still running reports `owner-process-unverifiable`.
+os.environ.setdefault("AGENT_ARTIFACT_CHECKPOINT", "off")
+
 
 NATIVE_OWNER_RESULT = {
     "claude": lambda text: [{"type": "result", "subtype": "success", "is_error": False, "result": text}],
