@@ -134,6 +134,7 @@ class IdleObserverTests(unittest.TestCase):
             self.assertEqual(booking["idle"]["provider"], "unknown")
 
     def test_transport_claim_and_prompt_arrival_are_required_for_idle_enqueue(self):
+        import session_tidy_runner as runner
         with self.iso.patched_environ(self.extra), mock.patch.object(clear, "herdr_command", return_value="fake"), \
              mock.patch.object(clear, "_start_helper", return_value=12345):
             self.assertEqual(self.observe_claude(), "booking=scheduled")
@@ -152,13 +153,15 @@ class IdleObserverTests(unittest.TestCase):
                 with st.seat_lock(seat.key):
                     st.write_card(seat, "claude", "sid-A", "진행 중: 카드", cwd=str(self.cwd),
                                   prompt_seq=sequence, now=4242)
+                queue = runner.enqueue_item(seat, "claude", "sid-A", str(self.cwd),
+                                            operation_id=context["identity"], start=False)
                 result = clear._accept_idle_enqueue(seat, "claude", "sid-A", str(self.cwd), context,
-                                                   operation_id=context["identity"], queue_id="tidy-idle-test",
+                                                   operation_id=context["identity"], queue_id=queue["id"],
                                                    lock_wait=None)
                 self.assertEqual(result, "clear=scheduled")
                 accepted = clear.read_reservation(seat.key)
                 self.assertEqual((accepted["idle_request"]["state"], accepted["queue_id"],
-                                  accepted["followup_kind"]), ("accepted", "tidy-idle-test", "status-only"))
+                                  accepted["followup_kind"]), ("accepted", queue["id"], "status-only"))
 
     def test_fake_clock_runs_one_idle_cycle_and_rearms_only_after_user_input(self):
         import dispatch_seat_handover as handover

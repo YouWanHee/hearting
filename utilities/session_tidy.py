@@ -605,7 +605,8 @@ def session_start_source(harness: str, sid: str, pane: str) -> Optional[str]:
 
 def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str = "",
                  transcript: str = "", cwd: str = "", now: Optional[float] = None,
-                 bump_epoch: bool = False, compact_identity: str = "") -> dict:
+                 bump_epoch: bool = False, compact_identity: str = "",
+                 compact_context: Optional[dict] = None) -> dict:
     """Append one ledger line (caller holds the seat lock). Returns the session row."""
     now = now_epoch() if now is None else now
     summary = session_summary(seat).get((harness, sid))
@@ -624,6 +625,18 @@ def record_event(seat: Seat, harness: str, sid: str, event: str, *, source: str 
         entry["cwd"] = cwd
     if event == "compact" and compact_identity:
         entry["compact_identity"] = compact_identity
+    if event == "compact" and compact_context:
+        limits = {"identity": 64, "trigger": 8, "transcript": 440, "transcript_identity": 64,
+                  "turn_id": 96, "summary_id": 96, "parent_id": 96, "tail_start_id": 96,
+                  "compaction_part_id": 96}
+        compact = {key: _cut_bytes(str(compact_context[key]), limit)[0]
+                   for key, limit in limits.items() if compact_context.get(key) is not None}
+        for key in ("boundary_offset", "prompt_seq", "card_generation"):
+            value = compact_context.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                compact[key] = value
+        compact["card_request_required"] = compact_context.get("card_request_required") is True
+        entry["compact"] = compact
     if summary is None:
         entry["first_seen"] = now
     path = _ledger_path(seat)
@@ -1138,10 +1151,14 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
             req = session_tidy_clear.read_reservation(seat.key)
             if req and req.get("harness") == harness and req.get("sid") == sid:
                 session_tidy_clear.reconcile_pending(seat)
+            else:
+                reconcile_compact_frontier(harness, sid, cwd, env=env, now=now)
     if event in ("start", "prompt"):
         with contextlib.suppress(BaseException):
             import session_tidy_runner
             session_tidy_runner.reconcile_queued(seat, harness, sid)
+            if event == "start":
+                session_tidy_runner.reconcile_reservation_queue(seat)
     with seat_lock(seat.key):
         if reread:
             saved = read_json(_reread_path(harness, sid))
@@ -1281,135 +1298,284 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         return text
 
 
+def _compact_booking_result(booked: str) -> str:
+    """Keep compact-stage outcomes bounded and observable across the hook bridge."""
+    fields = str(booked or "").split()
+    outcome = fields[0] if fields else "clear=pending"
+    reason = next((field.split("=", 1)[1] for field in fields[1:] if field.startswith("reason=")), "")
+    if outcome == "clear=scheduled":
+        return "booking=scheduled" + (f" reason={reason}" if reason else "")
+    if outcome == "clear=pending":
+        return "booking=pending" + (f" reason={reason or 'unfinished'}")
+    if outcome == "clear=completed":
+        return "booking=completed" + (f" reason={reason or 'terminal'}")
+    if outcome == "clear=off":
+        return "booking=off"
+    if outcome == "clear=manual":
+        return "booking=manual" + (f" reason={reason or 'outside-herdr'}")
+    if outcome == "clear=skipped":
+        return "booking=skipped" + (f" reason={reason or 'ineligible'}")
+    return "booking=pending reason=unrecognized-outcome"
+
+
 def _run_compact_after(harness: str, sid: str, summary: str, *, cwd: str, transcript: str,
                        compact_context: Optional[dict], env, now: Optional[float]) -> str:
-    """Record one completed main compaction, save its summary as the seat card, then queue the tidy.
-
-    Only a session's own seat (pane or native) takes the card. The completed summary always
-    queues memory tidying where the existing main-session path permits it. An automatic clear
-    booking requires a successfully persisted nonempty card, an explicit auto trigger, and a
-    supported Claude/OpenCode seat; all other compactions remain queue-only.
-    """
+    """Record one compact event and preserve its card → queue → clear progress."""
     now = now_epoch() if now is None else now
+    started = time.monotonic()
     seat = resolve_seat(harness, cwd or None, env, sid, "compact")
     prior_hint = (session_summary(seat).get((harness, sid)) or {}).get("transcript", "")
     transcript = transcript or prior_hint
     context = dict(compact_context or {})
     context["trigger"] = context.get("trigger") if context.get("trigger") in ("auto", "manual") else "unknown"
     context["transcript"] = transcript or str(context.get("transcript") or "")
+    if not context["transcript"] and harness in ("codex", "opencode"):
+        with contextlib.suppress(BaseException):
+            import tidy_transcripts
+            found = tidy_transcripts.locate_transcript(harness, sid)
+            context["transcript"] = str(found or "")
     if harness == "opencode" and not context["transcript"]:
         with contextlib.suppress(BaseException):
             import tidy_transcripts
             context["transcript"] = str(tidy_transcripts.opencode_db_path())
     context["source"] = context["transcript"]
-    if harness == "claude" and context["transcript"] and "boundary_offset" not in context:
+    if harness in ("claude", "codex") and context["transcript"] and "boundary_offset" not in context:
         with contextlib.suppress(OSError):
             path = Path(context["transcript"])
             info = path.stat()
             if path.is_file() and not path.is_symlink() and stat.S_ISREG(info.st_mode):
                 context["boundary_offset"] = int(info.st_size)
                 context["transcript_identity"] = f"{info.st_dev}:{info.st_ino}"
+    codex_auto = harness == "codex" and context["trigger"] == "auto"
+    if codex_auto:
+        context["card_request_required"] = True
+        if not context.get("transcript") or not isinstance(context.get("boundary_offset"), int)                 or not context.get("transcript_identity"):
+            context["card_request_required"] = False
+            context["turn_evidence_reason"] = "transcript-unavailable"
+        if not any(context.get(key) for key in
+                   ("turn_id", "summary_id", "compaction_part_id", "event_id")):
+            context["card_request_required"] = False
+            context["turn_evidence_reason"] = "turn-identity-unknown"
+    context["prompt_seq"] = read_prompt_seq(seat)
+    previous = read_latest_card(seat)
+    context["card_generation"] = int((previous or {}).get("generation", 0) or 0)
     identity_fields = [harness, sid, context.get("trigger", "unknown"), context.get("summary_id", ""),
-                       context.get("parent_id", ""), context.get("tail_start_id", ""), context.get("compaction_part_id", ""),
-                       context.get("transcript", ""),
+                       context.get("parent_id", ""), context.get("tail_start_id", ""),
+                       context.get("compaction_part_id", ""), context.get("event_id", ""),
+                       context.get("turn_id", ""), context.get("transcript", ""),
                        hashlib.sha256(_normalize_body(summary).encode("utf-8")).hexdigest()]
     context["identity"] = hashlib.sha256("\0".join(map(str, identity_fields)).encode("utf-8")).hexdigest()
-    started = time.monotonic()
+    body = _normalize_body(summary)
     prior = None
     persisted = False
-    duplicate = False
     card_duplicate = False
-    booking_snapshot_known = False
+    ledger_event = None
+    record_error = ""
+    preserve_idle = False
+    compact_request_in_progress = False
     expected_booking_nonce: Optional[str] = None
     inherit_continue_off = False
-    body = _normalize_body(summary)
-    with contextlib.suppress(BaseException):
+    try:
         with seat_lock(seat.key, wait=COMPACT_LOCK_WAIT_SEC):
             prior = session_summary(seat).get((harness, sid))
-            previous_card = read_latest_card(seat)
-            previous_compact = (previous_card or {}).get("compact")
-            card_duplicate = bool(previous_compact and previous_compact.get("identity") == context["identity"])
+            previous = read_latest_card(seat)
             matching_events = [row for row in _read_ledger_lines(seat)
                                if row.get("event") == "compact" and row.get("harness") == harness
                                and row.get("sid") == sid and row.get("compact_identity") == context["identity"]]
             ledger_event = max(matching_events, key=lambda row: float(row.get("ts", 0) or 0), default=None)
-            ledger_duplicate = ledger_event is not None
-            duplicate = card_duplicate or ledger_duplicate
-            newer_card = bool(ledger_event and previous_card
-                              and float(previous_card.get("authored_at_epoch", 0) or 0)
-                              >= float(ledger_event.get("ts", 0) or 0))
-            try:
-                import session_tidy_clear as clear
-                held = clear.read_reservation(seat.key)
-                booking_snapshot_known = True
-                if held and held.get("status") == "reserved":
-                    expected_booking_nonce = str(held.get("nonce") or "")
-                    prior_generation = int((previous_card or {}).get("generation", 0) or 0)
-                    old_claim = held.get("clear_claim") if isinstance(held.get("clear_claim"), dict) else {}
-                    inherit_continue_off = bool(
-                        held.get("harness") == harness and held.get("sid") == sid
-                        and float(held.get("deadline", 0) or 0) >= now
-                        and int(held.get("prompt_seq", -1)) == read_prompt_seq(seat)
-                        and int(held.get("card_generation", -1)) == prior_generation
-                        and held.get("continue_off")
-                        and old_claim.get("state") != "sending"
-                    )
-                else:
-                    expected_booking_nonce = ""
-            except BaseException:
-                booking_snapshot_known = False
-            with contextlib.suppress(BaseException):
-                # SessionStart(source=compact) may have counted this compaction already.
-                if not duplicate:
-                    compacting = not (prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
-                    record_event(seat, harness, sid, "compact", source="compact",
-                                 transcript=transcript or (prior or {}).get("transcript", ""),
-                                 cwd=cwd, now=now, bump_epoch=compacting,
-                                 compact_identity=context["identity"])
-            if body and not card_duplicate and not newer_card and seat.kind in COMPACT_CARD_SEAT_KINDS:
-                with contextlib.suppress(BaseException):
+            if ledger_event and isinstance(ledger_event.get("compact"), dict):
+                saved = ledger_event["compact"]
+                for key in ("prompt_seq", "card_generation", "boundary_offset", "transcript_identity",
+                            "transcript", "turn_id", "summary_id", "parent_id", "tail_start_id",
+                            "compaction_part_id", "event_id", "card_request_required"):
+                    if key in saved:
+                        context[key] = saved[key]
+            compact_meta = (previous or {}).get("compact")
+            card_duplicate = bool(compact_meta and compact_meta.get("identity") == context["identity"])
+            newer_card = bool(ledger_event and previous
+                              and float(previous.get("authored_at_epoch", 0) or 0)
+                              >= float(ledger_event.get("ts", 0) or 0)
+                              and not card_duplicate)
+            import session_tidy_clear as clear
+            held = clear.read_reservation(seat.key)
+            same_session = bool(held and (held.get("harness"), held.get("sid")) == (harness, sid))
+            if held and held.get("status") == "reserved":
+                expected_booking_nonce = str(held.get("nonce") or "")
+                prior_generation = int((previous or {}).get("generation", 0) or 0)
+                old_claim = held.get("clear_claim") if isinstance(held.get("clear_claim"), dict) else {}
+                inherit_continue_off = bool(
+                    same_session and float(held.get("deadline", 0) or 0) >= now
+                    and int(held.get("prompt_seq", -1)) == read_prompt_seq(seat)
+                    and int(held.get("card_generation", -1)) == prior_generation
+                    and held.get("continue_off") and old_claim.get("state") != "sending")
+            preserve_idle = bool(same_session and held.get("origin") == "idle"
+                                 and held.get("status") in ("reserved", "cleared")
+                                 and held.get("followup_kind") == "status-only"
+                                 and (held.get("status") == "reserved"
+                                      or not clear.idle_clear_armed(seat, harness, sid)))
+            compact_request_in_progress = bool(same_session and held.get("origin") == "compact"
+                                               and held.get("status") == "reserved"
+                                               and (held.get("compact") or {}).get("card_request_required"))
+            if not ledger_event:
+                compacting = not (prior and now - prior["last_compact_at"] < COMPACT_DEDUPE_SEC)
+                record_event(seat, harness, sid, "compact", source="compact",
+                             transcript=context["transcript"] or (prior or {}).get("transcript", ""),
+                             cwd=cwd, now=now, bump_epoch=compacting,
+                             compact_identity=context["identity"], compact_context=context)
+            if not preserve_idle and not compact_request_in_progress and not codex_auto \
+                    and body and not card_duplicate and not newer_card and seat.kind in COMPACT_CARD_SEAT_KINDS:
+                try:
                     card = write_card(seat, harness, sid, body, cwd=cwd, now=now,
                                       prompt_seq=read_prompt_seq(seat), origin="runtime-compact",
                                       compact_context=context)
-                    json_card = read_latest_card(seat)
-                    persisted = bool(card and json_card
-                                     and json_card.get("generation") == card.get("generation")
-                                     and (json_card.get("compact") or {}).get("identity") == context["identity"]
+                    saved_card = read_latest_card(seat)
+                    persisted = bool(card and saved_card
+                                     and saved_card.get("generation") == card.get("generation")
+                                     and (saved_card.get("compact") or {}).get("identity") == context["identity"]
                                      and card_text_path(seat).is_file())
+                except BaseException as exc:  # noqa: BLE001 - keep memory queueable, report no clear
+                    record_error = f"card-write-{type(exc).__name__}"
             elif card_duplicate:
-                persisted = bool(previous_card and previous_card.get("compact", {}).get("identity") == context["identity"]
+                persisted = bool(previous and (previous.get("compact") or {}).get("identity") == context["identity"]
                                  and card_text_path(seat).is_file())
             with contextlib.suppress(BaseException):
                 reread_path = _reread_path(harness, sid)
                 _reject_symlink(reread_path)
                 with contextlib.suppress(FileNotFoundError):
                     reread_path.unlink()
-    outcome = ""
-    with contextlib.suppress(BaseException):
-        import session_tidy_runner as runner
+    except BaseException as exc:  # noqa: BLE001 - retain memory work but do not claim clear acceptance
+        try:
+            import session_tidy_runner as runner
+            item = runner.enqueue_item(seat, harness, sid, cwd, context["transcript"],
+                                       operation_id=context["identity"], start=False)
+            item = runner._start_queued(item)
+            detail = f" runner-start={str(item.get('runner_start_error'))[:40]}" \
+                if item.get("runner_start_error") else ""
+            return f"booking=pending reason=compact-state-{type(exc).__name__}" + detail
+        except BaseException as queue_exc:  # noqa: BLE001
+            return (f"booking=pending reason=compact-state-{type(exc).__name__} "
+                    f"queue-write={type(queue_exc).__name__}")
+
+    if preserve_idle:
+        return "booking=skipped reason=idle-origin-preserved"
+    if compact_request_in_progress and not (ledger_event and
+            ledger_event.get("compact_identity") == context["identity"]):
+        return "booking=pending reason=card-request-in-progress"
+
+    import session_tidy_runner as runner
+    import session_tidy_clear as clear
+    operation_id = context["identity"]
+    transcript_path = str(context.get("transcript") or (prior or {}).get("transcript", ""))
+    if codex_auto:
+        if not context.get("card_request_required") or seat.kind != "pane" or not seat.pane:
+            try:
+                runner.enqueue_item(seat, harness, sid, cwd, transcript_path, operation_id=operation_id)
+            except BaseException as exc:  # noqa: BLE001
+                return f"booking=pending reason=queue-write-{type(exc).__name__}"
+            return f"booking=queue-only reason={context.get('turn_evidence_reason') or 'exact-pane-unavailable'}"
+        try:
+            wait = max(0.0, min(COMPACT_LOCK_WAIT_SEC, started + COMPACT_HOOK_BUDGET_SEC - time.monotonic()))
+            booked = clear.schedule_compact_card_request(seat, harness, sid, cwd, context,
+                                                          now=now, lock_wait=wait)
+            return _compact_booking_result(booked)
+        except BaseException as exc:  # noqa: BLE001
+            return f"booking=pending reason=reservation-write-{type(exc).__name__}"
+
+    idle_clear_armed = clear.idle_clear_armed(seat, harness, sid)
+    if context.get("trigger") != "auto":
+        reason = "trigger-manual" if context.get("trigger") == "manual" else "trigger-unknown"
+    elif not body:
+        reason = "empty-summary"
+    elif not persisted:
+        reason = record_error or "card-not-persisted"
+    elif harness not in ("claude", "opencode") or seat.kind not in COMPACT_CARD_SEAT_KINDS:
+        reason = "compact-seat-ineligible"
+    elif not idle_clear_armed:
+        reason = "idle-not-rearmed"
+    else:
+        reason = ""
+    if reason:
+        try:
+            item = runner.enqueue_item(seat, harness, sid, cwd, transcript_path,
+                                       operation_id=operation_id, start=False)
+            started_item = runner._start_queued(item)
+            launch_error = started_item.get("runner_start_error")
+            return f"booking=queue-only reason={reason}" + (
+                f" runner-start={str(launch_error)[:48]}" if launch_error else "")
+        except BaseException as exc:  # noqa: BLE001
+            return f"booking=pending reason=queue-write-{type(exc).__name__}"
+    try:
+        item, booked = _enqueue_tidy(seat, harness, sid, cwd, transcript_path,
+                                     compact_context=context,
+                                     bounded_until=started + COMPACT_HOOK_BUDGET_SEC,
+                                     expected_booking_nonce=expected_booking_nonce,
+                                     compact_started_at=now,
+                                     inherit_continue_off=inherit_continue_off,
+                                     operation_id=operation_id, runner=runner)
+        launch_error = item.get("runner_start_error") if isinstance(item, dict) else ""
+        outcome = _compact_booking_result(booked)
+        return outcome + (f" runner-start={str(launch_error)[:40]}"
+                          if launch_error else "")
+    except BaseException as exc:  # noqa: BLE001 - queue/reservation intent may already be durable
+        return f"booking=pending reason=enqueue-{type(exc).__name__}"
+
+
+def reconcile_compact_frontier(harness: str, sid: str, cwd: str = "", *, env=None,
+                               now: Optional[float] = None) -> str:
+    """Resume one automatic compact event from its seat ledger/card and stable queue identity."""
+    env = os.environ if env is None else env
+    if is_worker(env) or harness not in HARNESSES or not sid:
+        return ""
+    seat = resolve_seat(harness, cwd or None, env, sid, "compact")
+    events = [row for row in _read_ledger_lines(seat)
+              if row.get("event") == "compact" and row.get("harness") == harness
+              and row.get("sid") == sid and row.get("compact_identity")]
+    event = max(events, key=lambda row: float(row.get("ts", 0) or 0), default=None)
+    compact = (event or {}).get("compact") if isinstance((event or {}).get("compact"), dict) else {}
+    identity = str((event or {}).get("compact_identity") or compact.get("identity") or "")
+    if not event or not identity or compact.get("trigger") != "auto":
+        return ""
+    try:
         import session_tidy_clear as clear
-        idle_clear_armed = clear.idle_clear_armed(seat, harness, sid)
-        compact_clear = bool(persisted and context.get("trigger") == "auto"
-                             and harness in ("claude", "opencode")
-                             and seat.kind in COMPACT_CARD_SEAT_KINDS and booking_snapshot_known
-                             and idle_clear_armed)
-        transcript_path = transcript or (prior or {}).get("transcript", "")
-        if compact_clear:
-            _item, booked = _enqueue_tidy(seat, harness, sid, cwd, transcript_path,
-                                          compact_context=context, bounded_until=started + COMPACT_HOOK_BUDGET_SEC,
-                                          expected_booking_nonce=expected_booking_nonce,
-                                          compact_started_at=now,
-                                          inherit_continue_off=inherit_continue_off,
-                                          operation_id=context["identity"],
-                                          runner=runner)
-            if booked.startswith("clear=scheduled"):
-                outcome = "booking=scheduled"
-            elif booked.startswith("clear=pending"):
-                outcome = "booking=pending"
-        else:
-            runner.enqueue_item(seat, harness, sid, cwd, transcript_path,
-                                operation_id=context["identity"])
-    return outcome
+        held = clear.read_reservation(seat.key)
+        if held and (held.get("compact") or {}).get("identity") == identity:
+            if held.get("status") == "reserved":
+                import session_tidy_runner as runner
+                runner.reconcile_reservation_queue(seat)
+                return "booking=scheduled" if clear.reconcile_pending(seat) else "booking=pending reason=helper-reconcile"
+            if read_prompt_seq(seat) == int(compact.get("prompt_seq", -1)):
+                return f"booking=completed reason={held.get('status') or 'terminal'}"
+            return ""
+        if held and held.get("status") == "reserved":
+            return "booking=pending reason=booking-pending"
+        if int(compact.get("prompt_seq", -1)) != read_prompt_seq(seat):
+            return "booking=skipped reason=new-input"
+        current_card = read_latest_card(seat)
+        generation = int((current_card or {}).get("generation", 0) or 0)
+        card_request_required = compact.get("card_request_required") is True
+        if card_request_required and generation != int(compact.get("card_generation", generation)):
+            return "booking=skipped reason=card-changed"
+        context = dict(compact)
+        context["identity"] = identity
+        context["trigger"] = "auto"
+        context["transcript"] = str(context.get("transcript") or event.get("transcript") or "")
+        context["card_request_required"] = card_request_required
+        if context["card_request_required"]:
+            booked = clear.schedule_compact_card_request(
+                seat, harness, sid, cwd or str(event.get("cwd") or ""), context, now=now)
+            return _compact_booking_result(booked)
+        if (not current_card or (current_card.get("compact") or {}).get("identity") != identity
+                or (current_card.get("author") or {}).get("harness") != harness
+                or (current_card.get("author") or {}).get("sid") != sid):
+            return "booking=skipped reason=card-changed"
+        import session_tidy_runner as runner
+        _item, booked = _enqueue_tidy(seat, harness, sid, cwd or str(event.get("cwd") or ""),
+                                      context["transcript"], compact_context=context,
+                                      compact_started_at=float(event.get("ts", 0) or 0),
+                                      operation_id=identity, runner=runner)
+        return _compact_booking_result(booked)
+    except BaseException as exc:  # noqa: BLE001 - retain a bounded recovery result
+        return f"booking=pending reason=reconcile-{type(exc).__name__}"
 
 
 # ---------------------------------------------------------------------------
@@ -1532,8 +1698,8 @@ def _enqueue_tidy(seat: Seat, harness: str, sid: str, cwd: str, transcript: str 
                                             inherit_continue_off=inherit_continue_off,
                                             operation_id=operation_id, queue_id=item.get("id"),
                                             idle_context=idle_context)
-    except BaseException as exc:  # noqa: BLE001 - tidy is queued; the window is left alone
-        booked = f"clear=manual reason=internal-{type(exc).__name__} hint={clear.CLEAR_COMMAND.get(harness, '/clear')}"
+    except BaseException as exc:  # noqa: BLE001 - retain the accepted queue and its unfinished booking
+        booked = f"clear=pending reason=reservation-write-{type(exc).__name__}"
     item = runner._start_queued(item)
     return item, booked
 
@@ -1598,7 +1764,7 @@ def cmd_hook(args) -> int:
                 if isinstance(payload.get("prompt"), str):
                     prompt_text = payload["prompt"]
                 for key in ("trigger", "summary_id", "parent_id", "tail_start_id", "compaction_part_id",
-                            "status", "observed_at"):
+                            "turn_id", "event_id", "status", "observed_at"):
                     value = payload.get(key)
                     if isinstance(value, (str, int, float)) and not isinstance(value, bool):
                         compact_context[key] = value
@@ -1609,11 +1775,12 @@ def cmd_hook(args) -> int:
                           cwd=args.cwd or os.getcwd(), reread=args.reread, emit=_emit_stdout,
                           phase=args.phase, compact_summary=summary, compact_context=compact_context,
                           prompt_text=prompt_text)
-        if (args.event == "compact" and args.phase == "after" and result in ("booking=scheduled", "booking=pending")) \
+        if (args.event == "compact" and args.phase == "after" and result.startswith("booking=")) \
                 or (args.event == "runtime-status" and result == "booking=pending"):
             _emit_stdout(result)
-    except BaseException:  # noqa: BLE001 - a hook is silent on every failure
-        pass
+    except BaseException as exc:  # noqa: BLE001 - keep compact failure visible without prompt text
+        if args.event == "compact" and args.phase == "after" and not is_worker():
+            _emit_stdout(f"booking=pending reason=hook-{type(exc).__name__}")
     return 0
 
 

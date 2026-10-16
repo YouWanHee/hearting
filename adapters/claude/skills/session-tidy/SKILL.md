@@ -27,15 +27,18 @@ The card's fixed injection header carries this guidance even when its body is cl
 or memory references accompany it; late memory-only injections and peer handoff
 messages do not carry it.
 
-Runtime compaction queues memory tidying for the main session. Only a nonempty automatic
-Claude/OpenCode summary successfully saved to its own verified herdr pane/native seat can
-use the existing handover snapshot → clear → `이어서해` flow. The helper waits up to three
-hours for transcript evidence that the compacted turn actually ended; idle alone is not
-enough. The card keeps the full summary, a bounded recent conversation tail and the source
-transcript path. Manual/unknown compaction, empty or failed cards, project/outside-herdr
-seats, workers/sub-sessions, and Codex remote-V2 compaction never auto-clear. Codex remains
-queue-only for automatic compaction; its existing manual tidy behavior is unchanged. Do not
-enqueue a duplicate tidy for the same compaction; invoke this Skill for separate work.
+Runtime compaction queues memory tidying for the main session. A nonempty automatic
+Claude/OpenCode summary saved to its own verified seat can use the existing handover
+snapshot → clear → `이어서해` flow after transcript evidence confirms turn completion. For
+explicitly automatic Codex remote-V2 compaction, the same helper waits for that exact main
+turn to end, then sends one claim-bound request through the verified pane so the main
+session writes a real card and enqueues the matching operation. No empty or fabricated
+summary is used. The helper requires matching card and durable queue evidence before clear.
+Compact-origin flow keeps its existing continuation; idle-origin flow remains status-only
+even if compaction occurs during it. Manual/unknown compaction, failed cards, project or
+outside-herdr seats, workers/sub-sessions, changed input/target/card, and uncertain sends
+never auto-clear. Do not enqueue a duplicate tidy for the same compaction; invoke this Skill
+for separate work.
 
 An idle tidy is separate from compaction and manual tidy. It is eligible only after a real
 main-session turn-end/idle signal with known latest-request context tokens at or above the

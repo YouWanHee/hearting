@@ -323,16 +323,21 @@ def observe_idle_event(harness: str, sid: str, cwd: str, *, event_id: str, provi
 
 def validate_idle_request(path, nonce: Optional[str] = None, *, now: Optional[float] = None,
                           _sending_claim: Optional[dict] = None):
-    """Validate the due idle card request before the one main-session prompt."""
+    """Validate one idle or compact-origin card request before its main-session prompt."""
     now = st.now_epoch() if now is None else now
     req, seat, reason = _booking_at(Path(path))
     if req is None:
         return None, reason
-    if (nonce and req.get("nonce") != nonce) or req.get("status") != "reserved" or req.get("origin") != "idle":
+    compact = req.get("compact") if isinstance(req.get("compact"), dict) else {}
+    compact_request = req.get("origin") == "compact" and compact.get("card_request_required") is True
+    if ((nonce and req.get("nonce") != nonce) or req.get("status") != "reserved"
+            or (req.get("origin") != "idle" and not compact_request)):
         return None, "superseded"
     idle = req.get("idle") if isinstance(req.get("idle"), dict) else {}
-    if now < float(idle.get("due_at", 0) or 0):
+    if req.get("origin") == "idle" and now < float(idle.get("due_at", 0) or 0):
         return None, "not-due"
+    if compact_request and compact.get("turn_end_observed") is not True:
+        return None, "turn-not-ended"
     if now > float(req.get("deadline", 0) or 0):
         return None, "expired"
     if st.read_prompt_seq(seat) != int(req.get("prompt_seq", -1)):
@@ -350,6 +355,12 @@ def validate_idle_request(path, nonce: Optional[str] = None, *, now: Optional[fl
 
 def idle_card_request_text(req: dict) -> str:
     nonce = str(req.get("nonce") or "")
+    if req.get("origin") == "compact":
+        return ("자동 압축 뒤 카드 작성 요청입니다. 지금까지의 이 대화만 바탕으로 기존 session-tidy 안내에 따라 "
+                "진행 중, 기다리는 결정, 다음 할 일, 관련 경로를 사용자의 언어로 짧게 작성하고 기존 card/enqueue를 "
+                "실행해 이 압축 건의 기억 정리를 접수하세요. 빈 요약을 만들거나 다음 작업을 시작하지 마세요. "
+                "이 요청이 끝나면 창 비우기와 이어서하기는 예약된 기존 절차가 처리합니다. "
+                f"요청 식별자: {nonce}")
     return ("자동 유휴 정리 요청입니다. 지금까지의 이 대화만 바탕으로 session-tidy 카드의 "
             "진행 중, 기다리는 결정, 다음 할 일, 관련 경로를 사용자의 언어로 짧게 작성하세요. "
             "현재 session-tidy 안내에 따라 기존 card 작성 명령과 enqueue를 실행해 기억 정리를 접수하세요. "
@@ -393,6 +404,9 @@ def finish_idle_card_request(claim: dict, *, accepted: bool, reason: str = "") -
     with st.seat_lock(key):
         req = read_reservation(key)
         held = (req or {}).get("idle_request") if isinstance((req or {}).get("idle_request"), dict) else {}
+        if (req and req.get("nonce") == claim.get("nonce") and held.get("state") == "accepted"
+                and held.get("token") == (claim.get("idle_request") or {}).get("token")):
+            return accepted
         if not req or req.get("nonce") != claim.get("nonce") or held.get("state") not in ("sending", "arrived"):
             return False
         if accepted and held.get("state") == "arrived":
@@ -412,7 +426,11 @@ def observe_prompt_locked(seat: "st.Seat", harness: str, sid: str, prompt: str, 
     if not req or req.get("status") not in ("reserved", "cleared"):
         return False
     request = req.get("idle_request") if isinstance(req.get("idle_request"), dict) else {}
-    if (req.get("status") == "reserved" and req.get("origin") == "idle"
+    compact = req.get("compact") if isinstance(req.get("compact"), dict) else {}
+    card_request = (req.get("origin") == "idle"
+                    or (req.get("origin") == "compact" and compact.get("card_request_required") is True
+                        and compact.get("turn_end_observed") is True))
+    if (req.get("status") == "reserved" and card_request
             and request.get("state") == "sending" and req.get("harness") == harness and req.get("sid") == sid
             and sequence == int(req.get("prompt_seq", -1)) + 1
             and now - float(request.get("at", 0) or 0) <= STEWARD_TIMEOUT_SEC
@@ -449,9 +467,12 @@ def note_real_prompt_locked(seat: "st.Seat", harness: str, sid: str, sequence: i
     req = read_reservation(seat.key)
     if not req:
         return
-    if req.get("status") == "reserved" and req.get("origin") == "idle":
+    compact = req.get("compact") if isinstance(req.get("compact"), dict) else {}
+    if (req.get("status") == "reserved" and req.get("origin") in ("idle", "compact")
+            and req.get("harness") == harness and req.get("sid") == sid):
         req.update(status="cancelled", reason="new-input", finished=now)
-        req["cancelled"] = {"at": now, "identity": (req.get("idle") or {}).get("identity")}
+        req["cancelled"] = {"at": now, "identity": (req.get("idle") or {}).get("identity")
+                             or compact.get("identity") or req.get("event_identity")}
         _write_reservation(req)
         return
     continued = req.get("continued") if isinstance(req.get("continued"), dict) else {}
@@ -469,13 +490,19 @@ def idle_context_for_enqueue(seat: "st.Seat", harness: str, sid: str) -> Optiona
     req = read_reservation(seat.key)
     request = (req or {}).get("idle_request") if isinstance((req or {}).get("idle_request"), dict) else {}
     arrival = request.get("arrival") if isinstance(request.get("arrival"), dict) else {}
-    if (not req or req.get("status") != "reserved" or req.get("origin") != "idle"
+    compact = (req or {}).get("compact") if isinstance((req or {}).get("compact"), dict) else {}
+    accepted_origin = (req or {}).get("origin") == "idle" or (
+        (req or {}).get("origin") == "compact" and compact.get("card_request_required") is True
+        and compact.get("turn_end_observed") is True)
+    if (not req or req.get("status") != "reserved" or not accepted_origin
             or req.get("harness") != harness or req.get("sid") != sid
             or request.get("state") not in ("arrived", "sent")
             or arrival.get("sid") != sid or st.read_prompt_seq(seat) != int(arrival.get("prompt_seq", -1))):
         return None
-    return {"nonce": req["nonce"], "identity": (req.get("idle") or {}).get("identity"),
-            "arrival_seq": int(arrival.get("prompt_seq", -1))}
+    identity = ((req.get("idle") or {}).get("identity") if req.get("origin") == "idle"
+                else (req.get("compact") or {}).get("identity"))
+    return {"nonce": req["nonce"], "identity": identity,
+            "origin": req.get("origin"), "arrival_seq": int(arrival.get("prompt_seq", -1))}
 
 
 def idle_clear_armed(seat: "st.Seat", harness: str, sid: str) -> bool:
@@ -491,29 +518,46 @@ def idle_clear_armed(seat: "st.Seat", harness: str, sid: str) -> bool:
 
 def _accept_idle_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, idle_context: dict,
                          *, operation_id: Optional[str], queue_id: Optional[str],
-                         lock_wait: Optional[float]) -> str:
+                         lock_wait: Optional[float], no_continue: bool = False) -> str:
     try:
         with st.seat_lock(seat.key, wait=lock_wait):
             req = read_reservation(seat.key)
             request = (req or {}).get("idle_request") if isinstance((req or {}).get("idle_request"), dict) else {}
             arrival = request.get("arrival") if isinstance(request.get("arrival"), dict) else {}
+            compact = (req or {}).get("compact") if isinstance((req or {}).get("compact"), dict) else {}
+            origin = (req or {}).get("origin")
+            expected_identity = ((req.get("idle") or {}).get("identity") if origin == "idle"
+                                 else compact.get("identity"))
+            if not queue_id or not operation_id or operation_id != expected_identity:
+                return "clear=skipped reason=queue-operation-mismatch"
+            import session_tidy_runner as runner
+            queued = runner.read_item(queue_id)
             card = st.read_latest_card(seat)
             if (not req or req.get("nonce") != idle_context.get("nonce") or req.get("status") != "reserved"
-                    or req.get("origin") != "idle" or req.get("harness") != harness or req.get("sid") != sid
+                    or origin not in ("idle", "compact") or req.get("harness") != harness or req.get("sid") != sid
                     or st.now_epoch() > float(req.get("deadline", 0) or 0)
                     or request.get("state") not in ("arrived", "sent") or arrival.get("sid") != sid
                     or int(arrival.get("prompt_seq", -1)) != int(idle_context.get("arrival_seq", -2))
                     or st.read_prompt_seq(seat) != int(idle_context.get("arrival_seq", -1))
+                    or (origin == "compact" and (compact.get("card_request_required") is not True
+                                                    or compact.get("turn_end_observed") is not True))
                     or not card or (card.get("author") or {}).get("harness") != harness
                     or (card.get("author") or {}).get("sid") != sid
                     or int(card.get("prompt_seq", -1)) != st.read_prompt_seq(seat)
-                    or int(card.get("generation", 0) or 0) <= int(req.get("card_generation", 0) or 0)):
+                    or int(card.get("generation", 0) or 0) <= int(req.get("card_generation", 0) or 0)
+                    or not queued or queued.get("operation_id") != operation_id
+                    or (queued.get("seat") or {}).get("key") != seat.key
+                    or (queued.get("harness"), queued.get("sid")) != (harness, sid)
+                    or int(queued.get("card_generation", -1)) != int(card.get("generation", 0) or 0)):
                 return "clear=skipped reason=idle-card-not-accepted"
             req.update(card_generation=int(card["generation"]), prompt_seq=st.read_prompt_seq(seat),
                        queue_id=queue_id, operation_id=operation_id or (req.get("idle") or {}).get("identity"),
-                       memory_state="queued", snapshot_state="pending", followup_kind="status-only",
-                       continue_off=False, cwd=cwd)
-            req["idle_request"] = {**request, "state": "accepted", "accepted_at": st.now_epoch()}
+                       memory_state="queued", snapshot_state="pending",
+                       followup_kind="status-only" if origin == "idle" else "continue",
+                       continue_off=bool(req.get("continue_off") or no_continue),
+                       cwd=cwd)
+            req["idle_request"] = {**request, "state": "accepted", "accepted_at": st.now_epoch(),
+                                    "card_generation": int(card["generation"]), "queue_id": queue_id}
             _write_reservation(req)
             nonce = str(req["nonce"])
     except (OSError, TimeoutError, st.StateError):
@@ -549,6 +593,70 @@ def _start_helper(seat_key: str, nonce: str) -> int:
     return proc.pid
 
 
+def schedule_compact_card_request(seat: "st.Seat", harness: str, sid: str, cwd: str,
+                                 compact_context: dict, *, now: Optional[float] = None,
+                                 lock_wait: Optional[float] = None) -> str:
+    """Durably book Codex's automatic post-compaction main-card request."""
+    now = st.now_epoch() if now is None else now
+    identity = str(compact_context.get("identity") or "")
+    transcript = str(compact_context.get("transcript") or "")
+    boundary = compact_context.get("boundary_offset")
+    if (harness != "codex" or compact_context.get("trigger") != "auto"
+            or compact_context.get("card_request_required") is not True
+            or not identity or seat.kind != "pane" or not seat.pane
+            or not transcript or isinstance(boundary, bool) or not isinstance(boundary, int)
+            or boundary < 0 or not herdr_command()):
+        return "clear=skipped reason=compact-ineligible"
+    import session_tidy_runner as runner
+    operation_id = identity
+    queue_id = runner.operation_queue_id(operation_id)
+    try:
+        with st.seat_lock(seat.key, wait=lock_wait):
+            existing = read_reservation(seat.key)
+            if existing and (existing.get("compact") or {}).get("identity") == identity:
+                if existing.get("status") == "cancelled":
+                    return "clear=off"
+                if existing.get("status") == "reserved":
+                    if (existing.get("harness"), existing.get("sid")) != (harness, sid):
+                        return "clear=skipped reason=booking-target-changed"
+                    nonce = str(existing.get("nonce") or "")
+                else:
+                    return f"clear=completed reason={existing.get('status') or 'terminal'}"
+            else:
+                if existing and existing.get("status") == "reserved":
+                    return "clear=skipped reason=booking-pending"
+                if existing and existing.get("status") == "unverified":
+                    return "clear=skipped reason=booking-uncertain"
+                sequence = st.read_prompt_seq(seat)
+                if sequence != int(compact_context.get("prompt_seq", sequence)):
+                    return "clear=skipped reason=new-input"
+                card = st.read_latest_card(seat)
+                generation = int(card.get("generation", 0) or 0) if card else 0
+                if generation != int(compact_context.get("card_generation", generation)):
+                    return "clear=skipped reason=card-changed"
+                nonce = secrets.token_hex(8)
+                metadata = {key: compact_context.get(key) for key in
+                            ("identity", "trigger", "transcript", "transcript_identity", "boundary_offset",
+                             "turn_id", "summary_id", "parent_id", "tail_start_id", "compaction_part_id",
+                             "card_request_required") if compact_context.get(key) is not None}
+                metadata["turn_end_observed"] = False
+                booking = {
+                    "schema": SCHEMA, "nonce": nonce, "status": "reserved", "created": now,
+                    "deadline": now + COMPACT_CLEAR_DEADLINE_SEC, "seat": seat.as_dict(),
+                    "harness": harness, "sid": sid, "cwd": cwd, "card_generation": generation,
+                    "prompt_seq": sequence, "continue_off": False, "origin": "compact",
+                    "compact": metadata, "event_identity": identity, "operation_id": operation_id,
+                    "queue_id": queue_id, "memory_state": "awaiting-card", "snapshot_state": "deferred",
+                }
+                _write_reservation(booking)
+    except (OSError, TimeoutError, st.StateError) as exc:
+        return f"clear=pending reason=reservation-lock-unavailable-{type(exc).__name__}"
+    except BaseException as exc:  # noqa: BLE001 - preserve a bounded reason for the hook
+        return f"clear=pending reason=reservation-write-{type(exc).__name__}"
+    started, reason = _ensure_helper(seat.key, nonce, lock_wait=lock_wait)
+    return "clear=scheduled" if started else f"clear=pending reason={reason}"
+
+
 def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, opt_out: bool = False,
                          no_continue: bool = False, now: Optional[float] = None,
                          compact_context: Optional[dict] = None,
@@ -574,7 +682,8 @@ def schedule_for_enqueue(seat: "st.Seat", harness: str, sid: str, cwd: str, *, o
             cancel(seat)
             return "clear=off"
         return _accept_idle_enqueue(seat, harness, sid, cwd, idle_context,
-                                    operation_id=operation_id, queue_id=queue_id, lock_wait=lock_wait)
+                                    operation_id=operation_id, queue_id=queue_id, lock_wait=lock_wait,
+                                    no_continue=no_continue)
     compact = None
     if compact_context is not None:
         card = st.read_latest_card(seat)
@@ -874,7 +983,9 @@ def validate_request(path, nonce: Optional[str] = None, *, now: Optional[float] 
             and ((req.get("idle_request") or {}).get("state") != "accepted"):
         return None, "idle-card-not-accepted"
     if req.get("origin") == "compact" and require_ready:
-        observation = compact_observation(req)
+        compact = req.get("compact") if isinstance(req.get("compact"), dict) else {}
+        observation = ({"state": "ready"} if compact.get("card_request_required") is True
+                       and compact.get("turn_end_observed") is True else compact_observation(req))
         if observation.get("state") != "ready":
             return None, "compact-unknown" if observation.get("state") == "unknown" else "compact-pending"
     return req, ""
@@ -1135,6 +1246,25 @@ def _wait_idle_card_acceptance(seat_key: str, nonce: str, sleep: Callable[[float
         if not held or held.get("nonce") != nonce or held.get("status") != "reserved":
             return "superseded"
         request = held.get("idle_request") if isinstance(held.get("idle_request"), dict) else {}
+        if request.get("state") in ("arrived", "sent"):
+            arrival = request.get("arrival") if isinstance(request.get("arrival"), dict) else {}
+            identity = ((held.get("idle") or {}).get("identity") if held.get("origin") == "idle"
+                        else (held.get("compact") or {}).get("identity"))
+            seat = st.seat_from_dict(held.get("seat") or {})
+            operation_id = str(held.get("operation_id") or identity or "")
+            queue_id = str(held.get("queue_id") or "")
+            with contextlib.suppress(BaseException):
+                import session_tidy_runner as runner
+                if not queue_id:
+                    queue_id = runner.operation_queue_id(operation_id)
+            context = {"nonce": nonce, "identity": identity, "origin": held.get("origin"),
+                       "arrival_seq": int(arrival.get("prompt_seq", -1))}
+            with contextlib.suppress(BaseException):
+                _accept_idle_enqueue(seat, str(held.get("harness") or ""), str(held.get("sid") or ""),
+                                     str(held.get("cwd") or ""), context,
+                                     operation_id=operation_id, queue_id=queue_id, lock_wait=0.05)
+            held = read_reservation(seat_key) or held
+        request = held.get("idle_request") if isinstance(held.get("idle_request"), dict) else {}
         now = st.now_epoch()
         if now > float(held.get("deadline", 0) or 0):
             return "skipped" if _finish(seat_key, nonce, "skipped", "idle-card-not-accepted") else "superseded"
@@ -1210,6 +1340,85 @@ def _idle_due_and_request(seat_key: str, nonce: str, sleep: Callable[[float], No
             else "superseded")
 
 
+def _compact_turn_end_and_request(seat_key: str, nonce: str, sleep: Callable[[float], None]) -> str:
+    """Wait for this Codex compact turn, then make one claim-bound main-card request."""
+    path = reservation_path(seat_key)
+    while True:
+        req = read_reservation(seat_key)
+        if not req or req.get("nonce") != nonce or req.get("status") != "reserved":
+            return "superseded"
+        compact = req.get("compact") if isinstance(req.get("compact"), dict) else {}
+        request = req.get("idle_request") if isinstance(req.get("idle_request"), dict) else {}
+        if request.get("state") in ("sending", "arrived", "sent", "accepted"):
+            accepted = _wait_idle_card_acceptance(seat_key, nonce, sleep)
+            if accepted == "unverified":
+                return "unverified" if _finish(seat_key, nonce, "unverified", "arrival-not-observed") else "superseded"
+            return accepted
+        if request.get("state") == "unverified":
+            return "unverified" if _finish(seat_key, nonce, "unverified", "arrival-not-observed") else "superseded"
+        now = st.now_epoch()
+        remaining = float(req.get("deadline", 0) or 0) - now
+        if remaining <= 0:
+            return "skipped" if _finish(seat_key, nonce, "skipped", "compact-timeout") else "superseded"
+        checked, reason = validate_request(path, nonce, require_ready=False)
+        if checked is None:
+            if reason == "superseded":
+                return "superseded"
+            return "skipped" if _finish(seat_key, nonce, "skipped", reason) else "superseded"
+        if compact.get("turn_end_observed") is not True:
+            observation = compact_observation(req)
+            if observation.get("state") != "ready":
+                sleep(min(COMPACT_POLL_SEC, remaining))
+                continue
+            try:
+                with st.seat_lock(seat_key):
+                    held = read_reservation(seat_key)
+                    if not held or held.get("nonce") != nonce or held.get("status") != "reserved":
+                        return "superseded"
+                    current = held.get("compact") if isinstance(held.get("compact"), dict) else {}
+                    current["turn_end_observed"] = True
+                    current["turn_end_evidence"] = {
+                        "source": str(observation.get("source") or "")[:440],
+                        "boundary_offset": int(observation.get("boundary", current.get("boundary_offset", 0)) or 0),
+                        "observed_at": st.now_epoch(),
+                        "turn_id": str(observation.get("turn_id") or "")[:96],
+                    }
+                    held["compact"] = current
+                    _write_reservation(held)
+                    req = held
+            except (OSError, TimeoutError, st.StateError):
+                sleep(min(COMPACT_POLL_SEC, remaining))
+                continue
+        checked, reason = validate_idle_request(path, nonce)
+        if checked is None:
+            if reason in ("not-due", "turn-not-ended"):
+                sleep(min(COMPACT_POLL_SEC, remaining))
+                continue
+            if reason == "superseded":
+                return "superseded"
+            return "skipped" if _finish(seat_key, nonce, "skipped", reason) else "superseded"
+        seat = checked.get("seat") or {}
+        target = str(seat.get("pane") or "")
+        verdict = _run_idle_card_request(path, nonce, target)
+        if verdict.get("accepted") != "true":
+            held = read_reservation(seat_key) or {}
+            current_request = held.get("idle_request") if isinstance(held.get("idle_request"), dict) else {}
+            if current_request.get("state") in ("sending", "arrived", "sent", "accepted"):
+                return "pending"
+            if current_request.get("state") == "unverified":
+                return "unverified" if _finish(
+                    seat_key, nonce, "unverified", current_request.get("reason") or verdict.get("reason")) else "superseded"
+            if verdict.get("accepted") == "queued":
+                sleep(min(5.0, remaining))
+                continue
+            reason = verdict.get("reason") or "idle-card-not-accepted"
+            return "skipped" if _finish(seat_key, nonce, "skipped", reason) else "superseded"
+        accepted = _wait_idle_card_acceptance(seat_key, nonce, sleep)
+        if accepted == "accepted":
+            return accepted
+        return accepted
+
+
 def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int], str]] = None,
                steward: Optional[Callable[[Path, str, str], dict]] = None,
                continuer: Optional[Callable[[Path, str, str], dict]] = None,
@@ -1252,6 +1461,11 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
         if accepted != "accepted":
             return accepted
         req = read_reservation(seat_key) or req
+    if req.get("origin") == "compact" and (req.get("compact") or {}).get("card_request_required") is True:
+        accepted = _compact_turn_end_and_request(seat_key, nonce, sleep)
+        if accepted != "accepted":
+            return accepted
+        req = read_reservation(seat_key) or req
     if req.get("origin") == "compact":
         while True:
             req, reason = validate_request(path, nonce, require_ready=False)
@@ -1272,17 +1486,29 @@ def run_helper(seat_key: str, nonce: str, *, wait: Optional[Callable[[str, int],
             else:
                 state = wait(pane, timeout_ms)
             if state in ("idle", "done"):
-                observation = compact_observation(req)
+                compact = req.get("compact") if isinstance(req.get("compact"), dict) else {}
+                observation = ({"state": "ready"} if compact.get("card_request_required") is True
+                               and compact.get("turn_end_observed") is True else compact_observation(req))
                 if observation.get("state") == "ready":
-                    _refresh_compact_card(req, observation)
-                    refreshed = read_reservation(seat_key) or {}
-                    if refreshed.get("snapshot_state") != "ready":
-                        remaining = float(refreshed.get("deadline", 0) or 0) - st.now_epoch()
-                        if remaining <= 0:
-                            return "skipped" if _finish(
-                                seat_key, nonce, "skipped", "snapshot-unavailable") else "superseded"
-                        sleep(min(COMPACT_POLL_SEC, remaining))
-                        continue
+                    if compact.get("card_request_required") is True:
+                        refreshed = read_reservation(seat_key) or {}
+                        if refreshed.get("snapshot_state") != "ready" and not _prepare_handover_snapshot(refreshed):
+                            remaining = float(refreshed.get("deadline", 0) or 0) - st.now_epoch()
+                            if remaining <= 0:
+                                return "skipped" if _finish(
+                                    seat_key, nonce, "skipped", "snapshot-unavailable") else "superseded"
+                            sleep(min(COMPACT_POLL_SEC, remaining))
+                            continue
+                    else:
+                        _refresh_compact_card(req, observation)
+                        refreshed = read_reservation(seat_key) or {}
+                        if refreshed.get("snapshot_state") != "ready":
+                            remaining = float(refreshed.get("deadline", 0) or 0) - st.now_epoch()
+                            if remaining <= 0:
+                                return "skipped" if _finish(
+                                    seat_key, nonce, "skipped", "snapshot-unavailable") else "superseded"
+                            sleep(min(COMPACT_POLL_SEC, remaining))
+                            continue
                     req, reason = validate_request(path, nonce)
                     if req is not None:
                         break

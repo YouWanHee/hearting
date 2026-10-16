@@ -83,7 +83,7 @@ class CompactHookTest(unittest.TestCase):
         result = st.run_hook("claude", "compact", "sid-main", phase="after",
                              compact_summary="summary\x00\n\tkept", cwd=str(self.cwd),
                              env=self.env, now=1000)
-        self.assertEqual(result, "")
+        self.assertEqual(result, "booking=queue-only reason=trigger-unknown")
         self.assertEqual(self.enqueue_mock.call_count, 1)
         self.assertEqual(self.enqueue_mock.call_args.args[1:4], ("claude", "sid-main", str(self.cwd)))
         ledger = list((self.state / "hearting/session-tidy/sessions").glob("*.jsonl"))
@@ -311,7 +311,7 @@ class CompactHookTest(unittest.TestCase):
                  mock.patch("sys.stdin", io.StringIO('{"summary":"summary"}')), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(st.cmd_hook(args), 0)
-                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(output.getvalue(), "booking=pending reason=compact-state-BlockingIOError\n")
         self.assertEqual(self.enqueue_mock.call_count, 1)
         self.assertEqual(self.enqueue_mock.call_args.args[-1], "payload.jsonl")
         self.assertIsNone(st.read_latest_card(self.seat))
@@ -381,14 +381,17 @@ class CompactHookTest(unittest.TestCase):
             result = invoke(harness, payload)
             self.assertEqual((result.returncode, result.stdout), (0, ""))
 
-    def test_runtime_bridge_after_forwards_payload_and_prints_nothing(self):
+    def test_runtime_bridge_after_forwards_payload_and_keeps_a_bounded_booking_reason(self):
         fake_home = self.root / "fake-tidy-home"
         (fake_home / "utilities").mkdir(parents=True)
         capture = self.root / "tidy-calls.jsonl"
         (fake_home / "utilities/session_tidy.py").write_text(
             "import json,sys\n"
-            f"open({str(capture)!r}, 'a').write(json.dumps({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}) + '\\n')\n"
-            "print('ignored after output')\n", encoding="utf-8")
+            "argv=sys.argv[1:]; body=sys.stdin.read()\n"
+            f"open({str(capture)!r}, 'a').write(json.dumps({{'argv': argv, 'stdin': body}}) + '\\n')\n"
+            "if '--phase' in argv and argv[argv.index('--phase')+1] == 'after' and json.loads(body or '{}').get('trigger') == 'manual':\n"
+            " print('booking=skipped reason=trigger-manual')\n"
+            "else: print('ignored after output')\n", encoding="utf-8")
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("AGENT_", "MEM_", "CODEX_", "OPENCODE_", "FLEET_"))}
         env.update({"AGENT_HOME": str(fake_home), "XDG_STATE_HOME": str(self.state),
@@ -397,14 +400,16 @@ class CompactHookTest(unittest.TestCase):
         payloads = {
             "claude": {"session_id": "sid-c", "cwd": str(self.cwd), "transcript_path": "c.jsonl",
                        "compact_summary": "claude summary"},
-            "codex": {"session_id": "sid-x", "cwd": str(self.cwd), "transcript_path": "x.jsonl"},
+            "codex": {"session_id": "sid-x", "cwd": str(self.cwd), "transcript_path": "x.jsonl",
+                      "trigger": "manual"},
             "opencode": {"sessionID": "sid-o", "cwd": str(self.cwd), "summary": "opencode summary"},
         }
         for harness, payload in payloads.items():
             result = subprocess.run([sys.executable, str(bridge), "compact-after", "--harness", harness],
                                     input=json.dumps(payload), env=env, text=True,
                                     capture_output=True, timeout=8)
-            self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+            expected_status = "booking=skipped reason=trigger-manual\n" if harness == "codex" else ""
+            self.assertEqual((result.returncode, result.stdout), (0, expected_status), result.stderr)
         calls = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(calls), 3)
         expected = {
@@ -427,6 +432,8 @@ class CompactHookTest(unittest.TestCase):
             expected_input = {"summary": summary}
             if transcript:
                 expected_input["transcript"] = transcript
+            if harness == "codex":
+                expected_input["trigger"] = "manual"
             self.assertEqual(json.loads(call["stdin"]), expected_input)
 
     def test_main_wrapper_discards_partial_output_and_fails_open_on_timeout(self):
@@ -437,6 +444,8 @@ class CompactHookTest(unittest.TestCase):
         helper.write_text(
             "import os,sys,time\n"
             "print('partial ledger output', flush=True)\n"
+            "if sys.argv[1:2] == ['compact-after'] and os.environ.get('FAKE_COMPACT_MODE') == 'reason':\n"
+            " print('booking=skipped reason=trigger-manual', flush=True); raise SystemExit(0)\n"
             "if os.environ.get('FAKE_COMPACT_MODE') == 'timeout': time.sleep(8)\n"
             "raise SystemExit(2 if os.environ.get('AGENT_DISPATCH_STAGE_AUTHORITY') == '0' else 1)\n",
             encoding="utf-8")
@@ -453,6 +462,11 @@ class CompactHookTest(unittest.TestCase):
                                env={**env, "FAKE_COMPACT_MODE": "timeout"}, text=True,
                                input="{}", capture_output=True, timeout=8)
         self.assertEqual((timed.returncode, timed.stdout), (0, ""))
+        reason = subprocess.run([sys.executable, str(wrapper), "compact-after", "--harness", "claude"],
+                                env={**env, "FAKE_COMPACT_MODE": "reason"}, text=True,
+                                input="{}", capture_output=True, timeout=8)
+        self.assertEqual((reason.returncode, reason.stdout), (0, ""))
+        self.assertIn("booking=skipped reason=trigger-manual", reason.stderr)
         sub = subprocess.run([sys.executable, str(wrapper), "compact-after", "--harness", "claude"],
                              env={**env, "AGENT_DISPATCH_STAGE_AUTHORITY": "0"}, text=True,
                              input="{}", capture_output=True, timeout=8)

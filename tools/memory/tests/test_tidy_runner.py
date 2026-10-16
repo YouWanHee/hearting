@@ -28,6 +28,7 @@ import sys
 import textwrap
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -412,6 +413,44 @@ class EnqueueTest(RunnerCase):
                                                operation_id=operation)
                 self.assertEqual((terminal["id"], terminal["status"]), (first["id"], "notified"))
                 self.assertEqual(start.call_count, 2)
+
+    def test_interrupted_apply_stage_restarts_under_the_same_qid_and_batch(self):
+        with self.iso.patched_environ(self.env()):
+            seat = st.resolve_seat("claude", str(self.cwd), os.environ)
+            qid = runner.operation_queue_id("compact-interrupted-operation")
+            item = {"schema": runner.SCHEMA, "id": qid, "created": runner._now(),
+                    "status": "applying", "updated": runner._now(), "seat": seat.as_dict(),
+                    "harness": "claude", "sid": "sid-A", "cwd": str(self.cwd),
+                    "transcript": "", "operation_id": "compact-interrupted-operation",
+                    "batch": qid, "attempts": 1, "runner_pid": 99999999, "runner_pid_start": "1"}
+            runner.write_item(item)
+            with mock.patch.object(runner, "start_detached", return_value=4242) as launch:
+                resumed = runner._start_queued(item)
+            self.assertEqual(resumed["id"], qid)
+            launch.assert_called_once_with(qid)
+
+            applied = []
+            bundle = SimpleNamespace(empty=False, unreadable=[], exchange=self.iso.root / "exchange")
+            with mock.patch.object(runner, "assemble", return_value=bundle), \
+                    mock.patch.object(runner, "prepare_exchange", return_value=str(self.iso.root / "exchange")), \
+                    mock.patch.object(runner, "dispatch_worker", return_value={"attempt_id": "attempt"}), \
+                    mock.patch.object(runner, "wait_worker"), \
+                    mock.patch.object(runner, "validate_actions"), \
+                    mock.patch.object(runner, "apply_actions", side_effect=lambda row, run_dir, _bundle:
+                                      applied.append((row["id"], run_dir.name)) or "applied"), \
+                    mock.patch.object(runner, "advance_watermarks"), \
+                    mock.patch.object(runner, "publish_memory"), \
+                    mock.patch.object(runner, "notify"), \
+                    mock.patch.object(runner, "coverage_note", return_value=""), \
+                    mock.patch.object(runner, "remove_exchange"):
+                runner.process_item(resumed)
+            self.assertEqual(applied, [(qid, qid)], runner.read_item(qid))
+            self.assertEqual(runner.read_item(qid)["status"], "notified")
+            self.assertEqual(runner.read_item(qid)["batch"], qid)
+            with mock.patch.object(runner, "start_detached") as launch:
+                runner._start_queued(runner.read_item(qid))
+            launch.assert_not_called()
+            self.assertEqual(applied, [(qid, qid)])
 
     def test_enqueue_returns_one_line_at_once_and_the_tidy_finishes_on_its_own(self):
         shutil.copy(FIXTURES / "claude-choice.jsonl", self.projects / f"{CHOICE_SID}.jsonl")

@@ -162,6 +162,11 @@ def observe_payload(harness: str, payload: dict, *, now: float | None = None) ->
     if is_worker() or os.environ.get("AGENT_SESSION_ROLE", "").lower() in {
             "owner", "worker", "auxiliary", "reviewer"}:
         return "booking=skipped reason=worker"
+    from session_tidy import reconcile_compact_frontier
+    compact_result = reconcile_compact_frontier(harness, sid, cwd, now=now)
+    if compact_result and compact_result not in ("booking=skipped reason=new-input",
+                                                  "booking=skipped reason=card-changed"):
+        return compact_result
     tokens, provider, model = _tokens_and_provider(harness, payload, sid, transcript)
     tokens = _safe_tokens(tokens) if tokens is not None else None
     if tokens is None:

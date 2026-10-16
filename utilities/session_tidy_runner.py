@@ -237,9 +237,15 @@ def _existing_operation(operation_id: str) -> Optional[dict]:
     return min(matches, key=lambda item: (float(item.get("created", 0) or 0), item["id"])) if matches else None
 
 
+def operation_queue_id(operation_id: str) -> str:
+    """Return the stable queue identity shared with a compact reservation."""
+    digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:32]
+    return f"tidy-op-{digest}"
+
+
 def _start_queued(item: dict) -> dict:
-    """Best-effort launch; the durable queued item remains discoverable after a failure."""
-    if item.get("status") != "queued":
+    """Best-effort launch; unfinished stages resume under the same queue/batch identity."""
+    if item.get("status") not in UNFINISHED:
         return item
     pid = item.get("runner_pid")
     started = str(item.get("runner_pid_start") or "")
@@ -283,8 +289,7 @@ def enqueue_item(seat: "st.Seat", harness: str, sid: str, cwd: str, transcript: 
             return _start_queued(existing) if start else existing
     queue_seat = dataclasses.replace(seat, harness=harness, sid=sid) if seat.kind == "project" else seat
     if queue_id is None and operation_id:
-        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:32]
-        queue_id = f"tidy-op-{digest}"
+        queue_id = operation_queue_id(operation_id)
     if queue_id:
         existing = read_item(queue_id)
         if existing:
@@ -311,7 +316,7 @@ def reconcile_queued(seat: "st.Seat", harness: str, sid: str) -> int:
     """Restart durable queued rows for this exact session after an earlier launch miss."""
     resumed = 0
     for item in list_items():
-        if item.get("status") != "queued" or (item.get("harness"), item.get("sid")) != (harness, sid):
+        if item.get("status") not in UNFINISHED or (item.get("harness"), item.get("sid")) != (harness, sid):
             continue
         if (item.get("seat") or {}).get("key") != seat.key:
             continue
@@ -320,6 +325,26 @@ def reconcile_queued(seat: "st.Seat", harness: str, sid: str) -> int:
         if before and not started.get("runner_start_error"):
             resumed += 1
     return resumed
+
+
+def reconcile_reservation_queue(seat: "st.Seat") -> bool:
+    """Restart the accepted queued operation carried by this seat's clear reservation."""
+    try:
+        import session_tidy_clear as clear
+        req = clear.read_reservation(seat.key)
+    except BaseException:
+        return False
+    if not req or (req.get("seat") or {}).get("key") != seat.key:
+        return False
+    qid = str(req.get("queue_id") or "")
+    item = read_item(qid) if qid else None
+    if (not item or (item.get("seat") or {}).get("key") != seat.key
+            or item.get("operation_id") != req.get("operation_id")
+            or (item.get("harness"), item.get("sid")) != (req.get("harness"), req.get("sid"))):
+        return False
+    before = str(item.get("runner_start_error") or "")
+    started = _start_queued(item)
+    return bool(before and not started.get("runner_start_error"))
 
 
 def start_detached(qid: str) -> int:
@@ -1040,7 +1065,9 @@ def _with_coverage(line: str, note: str) -> str:
 
 def process_item(item: dict) -> None:
     attempts = int(item.get("attempts", 0))
-    batch = item["id"] if attempts == 0 else f"{item['id']}-r{attempts}"
+    # An interrupted operation keeps the same tidy-apply batch. The apply journal and
+    # source keys then make replay after an unknown completion idempotent.
+    batch = str(item.get("batch") or item["id"])
     item["attempts"] = attempts + 1
     run_dir = st.ensure_dir(_runs_dir() / batch)
     set_status(item, "assembling", batch=batch)
