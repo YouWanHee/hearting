@@ -2223,3 +2223,21 @@ blocker first; keep PID, start, exit, digest, and path detail in existing
 evidence. Completion reception requires actual approved result
 review/follow-through this turn or its registered continuation; ACK and
 consumed are receipt facts only.
+
+Herdr integration state is session-scoped corroboration. Native session identity
+and exact foreground PID birth bind sends and retire; a stale Herdr `working`
+state cannot veto retirement by itself, while live foreground work, registered
+children, native busy state, an open form, or an unreadable draft still protect
+the target. Unknown process or namespace evidence remains unresolved. Peer
+receipts distinguish native acceptance (`queued`) from exact receiver
+consumption (`received`). OpenCode native status is usable for 15 seconds only
+when its session, pane, foreground PID birth, and PID namespace still match.
+
+Watch observers settle their existing duty on an exact pane exit/close, a
+complete successful census proving that pane absent, or a completed retire.
+The terminal receipt is written under the existing watch lock before observer
+exit, and ensure/reconnect checks that receipt before starting a process. A
+transport error, timeout, incomplete census, or unknown identity keeps the
+observation pending. The Herdr 0.9.5 API schema exposes pane exit/close events
+and snapshots but no event sequence or `events_lost` field, so reconnect
+discards cached state and requires a new complete snapshot.

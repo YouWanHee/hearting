@@ -771,3 +771,38 @@ group, process, and JSON views use the same authoritative current owner generati
 ### 8.19. Declared runtime requirements and lifecycle evidence under SD-97
 
 a node may declare only registry-known `runtime_requirements`. `loopback-listen` means localhost bind while outbound network remains denied; a runtime that exposes only a broad network boolean reports `loopback-only-unsupported` and uses the checked main/inline handoff rather than widening outbound access. Every registered row records the requested launch lifecycle plus bounded selector evidence (source, NSpid width, and PID-1 class) so an intermittent nested-sandbox lifetime failure is diagnosable without transcript inspection.
+
+## 9. Native interaction and optional Herdr observation
+
+Herdr is an optional pane observer. Native session identity and the exact live
+foreground process lifetime (PID plus birth identity) bind interaction and
+retirement. A pane label is a lookup hint. Herdr's displayed turn state is
+corroborating evidence and can be stale; a stale `working` value alone does
+not prove a live turn, and a live PID alone does not prove idle. Registered
+work, native runtime status, foreground ownership, and user form/draft safety
+keep their existing authority.
+
+Peer delivery records have separate `pending`, `queued`, and `received`
+meanings. Native transport acceptance records `queued`. Only the exact
+receiver's consumption evidence records `received`; completion and acceptance
+remain separate duties. A transport timeout or ambiguous reply retains the
+same transfer reference and its existing owner.
+
+For Herdr observation, the endpoint is part of identity and cache keys. A
+subscription is established before its snapshot is applied. A successful,
+complete snapshot may confirm pane absence; failed, partial, or timed-out
+reads leave absence unknown. Apply events in arrival order within the live
+connection, and discard cached state and take a fresh snapshot after a lost or
+replaced connection. When the server protocol does not expose sequence or loss
+markers, consumers do not claim gap-free ordering across reconnects.
+
+OpenCode native turn status may resolve stale Herdr corroboration only when the
+event matches the exact session, pane, foreground PID birth, and PID namespace,
+and was observed within 15 seconds. Missing, stale, or mismatched status stays
+unknown for retire decisions.
+
+An exact pane exit, exact closed-pane event, complete absence census, or
+completed retire settles the existing watch duty before its observer exits.
+Terminal receipts prevent lifecycle reconciliation from recreating observers.
+Pane closure, agent release, goal completion, and successful work are distinct
+outcomes.

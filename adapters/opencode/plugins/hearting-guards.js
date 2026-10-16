@@ -297,6 +297,7 @@ function observeCompactRuntimeStatus(ctx, sid, status) {
   if (!normalized) return
   const observedAt = Date.now()
   runtimeStatusBySession.set(sid, { status: normalized, observedAt })
+  recordNativeTurnStatus(sid, normalized)
   const until = compactStatusUntil.get(sid) || 0
   if (until <= observedAt) {
     compactStatusUntil.delete(sid)
@@ -306,6 +307,29 @@ function observeCompactRuntimeStatus(ctx, sid, status) {
     sessionID: sid, cwd: baseDir(ctx), status: normalized, observed_at: observedAt,
   })
   if (result !== "booking=pending") compactStatusUntil.delete(sid)
+}
+
+function recordNativeTurnStatus(sid, status) {
+  const pane = process.env.HERDR_PANE_ID || ""
+  const endpoint = process.env.AGENT_HERDR_SESSION || "default"
+  const origin = paneNativeOrigin
+  if (!origin || origin.state === "invalidated" || origin.sid !== sid) return
+  const identity = contextPolicyProcess()
+  if (!pane || !identity || !Number.isInteger(identity.pid) || identity.pid <= 1
+      || !/^\d+$/.test(String(identity.start || ""))) return
+  const lower = String(status || "").toLowerCase()
+  const normalized = lower === "idle" ? "idle"
+    : ["active", "busy", "pending", "retry", "running", "streaming", "working"].includes(lower) ? "working"
+      : lower === "blocked" ? "blocked" : "unknown"
+  try {
+    spawnSync("python3", [path.join(root, "utilities", "herdr_observation.py"), "record-native-turn"], {
+      cwd: root, env: { ...process.env, AGENT_HOME: root },
+      input: JSON.stringify({ endpoint, pane, harness: "opencode", session_id: sid,
+        pid: identity.pid, pid_start: String(identity.start), status: normalized,
+        observed_at: Date.now() / 1000 }),
+      encoding: "utf8", timeout: 750, killSignal: "SIGKILL",
+    })
+  } catch {}
 }
 
 async function currentCompactRuntimeStatus(ctx, sid) {
@@ -1526,6 +1550,12 @@ export const AgentHarnessGuards = async (ctx) => {
       const statusType = event.properties?.status?.type || ""
       completionCarrier.status(statusSid, statusType)
       observeCompactRuntimeStatus(ctx, statusSid, statusType)
+    }
+    if (event && ["question.asked", "permission.asked"].includes(event.type)) {
+      observeCompactRuntimeStatus(ctx, event.properties?.sessionID || "", "blocked")
+    }
+    if (event && ["question.replied", "question.rejected", "permission.replied"].includes(event.type)) {
+      observeCompactRuntimeStatus(ctx, event.properties?.sessionID || "", "working")
     }
     if (event && event.type === "session.idle") {
       const eventSid = (event.properties && event.properties.sessionID) || ""

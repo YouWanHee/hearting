@@ -1083,6 +1083,9 @@ if log:
         fh.write(" ".join(argv) + " window=" + os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move") + "\n")
 
 mode = os.environ.get("FAKE_HERDR_MODE", "idle")
+mode_file = os.environ.get("FAKE_HERDR_MODE_FILE")
+if mode_file and os.path.exists(mode_file):
+    mode = open(mode_file, encoding="utf-8").read().strip() or mode
 target = argv[2] if len(argv) > 2 else "-"
 info = {"id": "cli:agent:wait", "result": {"agent": {
     "agent": "claude", "agent_session": {"value": "sid-fake"},
@@ -1102,6 +1105,12 @@ def fail(code):
     sys.exit(1)
 
 verb = argv[1] if len(argv) > 1 else ""
+if argv[:2] == ["pane", "list"]:
+    if mode == "pane-list-error":
+        fail("server_unavailable")
+    print(json.dumps({"result": {"panes": json.loads(os.environ.get(
+        "FAKE_HERDR_PANES", '[{"pane_id":"w1:p9"}]'))}}))
+    sys.exit(0)
 if verb == "process-info":
     print(json.dumps({"result": {"process_info": {
         "pane_id": argv[-1], "shell_pid": os.getppid(),
@@ -1111,7 +1120,7 @@ if verb == "process-info":
 if verb == "get" and mode == "hang-get":
     with open(os.environ["FAKE_HERDR_FIFO"], "r") as fh:   # wedged socket
         fh.read()
-if mode == "not-found":
+if mode == "not-found" and verb in {"get", "wait"}:
     fail("agent_not_found")
 if verb == "get":
     print(json.dumps(info)); sys.exit(0)
@@ -1128,6 +1137,10 @@ if verb == "wait":
         fifo = os.environ["FAKE_HERDR_FIFO"]
         with open(fifo, "r") as fh:   # blocks until the test writes: an event, not a poll
             fh.read()
+        if mode_file and os.path.exists(mode_file):
+            mode = open(mode_file, encoding="utf-8").read().strip() or mode
+        if mode == "not-found":
+            fail("agent_not_found")
     print(json.dumps(info)); sys.exit(0)
 print(json.dumps(info)); sys.exit(0)
 '''
@@ -1689,6 +1702,66 @@ class WatcherReceiptTest(_WatchMixin, unittest.TestCase):
         self.assertFalse((self.watch_root / f"{watch_id}.receipt.json").exists())
         self._release()
         self.assertEqual(self._wait_for_receipt(watch_id)["state"], "idle")
+
+    def test_agent_not_found_and_complete_pane_absence_settle_terminal_receipt(self):
+        env = self._env("held")
+        mode_file = self.tmp_root / "herdr-mode"
+        env["FAKE_HERDR_MODE_FILE"] = str(mode_file)
+        env["FAKE_HERDR_PANES"] = "[]"
+        armed = self._run("watch", "peer-a", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stderr)
+        fields = self._fields(armed.stdout)
+        self._wait_for_lock(fields["watch_id"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if "agent wait" in self.calllog.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("watcher did not enter the bounded native wait")
+        mode_file.write_text("not-found", encoding="utf-8")
+        self._release()
+        receipt = self._wait_for_receipt(fields["watch_id"])
+        self.assertEqual(receipt["state"], "pane-exited")
+        self.assertEqual(receipt["reason"], "pane-absent")
+        self.assertEqual(peer_steward._JOIN_EXIT[receipt["state"]], 2)
+        self.assertFalse(any(row["kind"] == "notice" and
+                             row["delivery"]["status"] == "received"
+                             for row in self._all_records()))
+        before = len(self.calllog.read_text(encoding="utf-8").splitlines())
+        for _ in range(2):
+            self.assertEqual(self._run("__ensure-obligations", env=env).returncode, 0)
+        after = len(self.calllog.read_text(encoding="utf-8").splitlines())
+        self.assertEqual(after, before, "a terminal receipt must prevent observer resurrection")
+
+    def test_completed_retire_requests_terminal_receipt_under_existing_watch_lock(self):
+        self.watch_root.mkdir(parents=True, exist_ok=True)
+        watch_id = "closed-pane-watch"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "peer-a",
+               "server": "named", "armed_ts": "then", "agent": {
+                   "harness": "opencode", "session_id": "sid-9", "name": "peer-a",
+                   "pane": "w1:p9"}, "steward": {}, "watcher": {}, "refs": []}
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        lock_fd = peer_steward._open_lock(paths.lock)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            matched = peer_steward._request_watch_terminal({
+                "server": "named", "pane": "w1:p9", "harness": "opencode",
+                "session_id": "sid-9", "foreground": None,
+            }, "completed-retire")
+            self.assertEqual(matched, 1)
+            self.assertFalse(paths.receipt.exists())
+            self.assertEqual(json.loads(paths.observation.read_text())["state"], "terminal_pending")
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertTrue(peer_steward._settle_terminal_watch_if_unobserved(
+            watch_id, arm, self.watch_root))
+        receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("pane-exited", "completed-retire"))
+        self.assertFalse(paths.observation.exists())
 
 
 class JoinTest(_WatchMixin, unittest.TestCase):
@@ -5208,6 +5281,61 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                                     "execution_attempts_for_processes", return_value=())
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_exact_opencode_native_status_overrides_stale_herdr_state(self):
+        world = _RetireWorld(harness="opencode", status="working")
+        native = {"status": "idle"}
+        with mock.patch.object(peer_steward.herdr_observation, "read_native_status",
+                               return_value=native) as read_status:
+            rc, line = self.retire(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("retired=true reason=normal-exit", line)
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-keys", "w1:pOld", "ctrl+d"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+        self.assertTrue(any(call.args[0:4] == ("default", "w1:pOld", "opencode", "old-sid")
+                            and call.args[4:] == (4242, "800")
+                            for call in read_status.call_args_list))
+
+    def test_exact_opencode_native_busy_status_overrides_stale_herdr_idle(self):
+        world = _RetireWorld(harness="opencode", status="idle")
+        with mock.patch.object(peer_steward.herdr_observation, "read_native_status",
+                               return_value={"status": "working"}):
+            rc, line = self.retire(world)
+        self.assertEqual(rc, 0, line)
+        self.assertIn("reason=agent-working-opencode-session-status", line)
+        self.assertIn("pending=true", line)
+        self.assertEqual(world.actions(), [])
+
+    def test_normal_retire_requests_the_exact_watch_terminal_receipt(self):
+        root = peer_steward._watch_root()
+        root.mkdir(parents=True, exist_ok=True)
+        watch_id = "retire-watch"
+        arm = {"schema_version": 1, "watch_id": watch_id, "target": "old",
+               "server": "default", "armed_ts": "then", "agent": {
+                   "harness": "opencode", "session_id": "old-sid", "name": "old",
+                   "pane": "w1:pOld"}, "foreground_identity": {"pid": 4242, "start": "800"},
+               "steward": {}, "watcher": {}, "refs": []}
+        paths = peer_steward._watch_paths(watch_id, root)
+        paths.arm.write_text(json.dumps(arm), encoding="utf-8")
+        lock_fd = peer_steward._open_lock(paths.lock)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with mock.patch.object(peer_steward.herdr_observation, "read_native_status",
+                                   return_value={"status": "idle"}):
+                rc, line = self.retire(_RetireWorld(harness="opencode", status="working"))
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(json.loads(paths.observation.read_text())["state"], "terminal_pending")
+            self.assertFalse(paths.receipt.exists())
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        self.assertTrue(peer_steward._settle_terminal_watch_if_unobserved(
+            watch_id, arm, root))
+        receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("pane-exited", "completed-retire"))
 
     def test_current_runner_leaves_retire_untouched_while_legacy_runner_is_live(self):
         world = _RetireWorld(status="working")

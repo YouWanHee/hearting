@@ -51,6 +51,7 @@ from dispatch_contract import process_start_ticks  # noqa: E402
 from parent_next_directive import steward_fields  # noqa: E402
 import peer_obligations  # noqa: E402
 import dispatch_batch_obligations  # noqa: E402
+import herdr_observation  # noqa: E402
 
 _DEFAULTS_SPEC = importlib.util.spec_from_file_location(
     "dispatch_defaults", str(_UTILITIES_DIR / "dispatch-defaults.py")
@@ -1646,6 +1647,28 @@ def _retire_target(target):
                 "name": target, "pane": "-"}, 4, "herdr-protocol-error")
 
 
+def _native_opencode_turn(ident):
+    """Read a fresh OpenCode status event bound to this exact foreground birth."""
+    if (not isinstance(ident, dict) or ident.get("harness") != "opencode"
+            or any(not isinstance(ident.get(key), str) or ident[key] in {"", "-"}
+                   for key in ("pane", "session_id"))):
+        return None
+    foreground = _retire_foreground(ident["pane"], "opencode", strict=False)
+    if not isinstance(foreground, dict):
+        return None
+    return herdr_observation.read_native_status(
+        ident.get("server") or _HERDR_SESSION or "default", ident["pane"],
+        "opencode", ident["session_id"], foreground["pid"], foreground["start"],
+    )
+
+
+def _effective_retire_state(state, ident):
+    native = _native_opencode_turn(ident)
+    if isinstance(native, dict) and native.get("status") in {"idle", "working", "blocked"}:
+        return native["status"], "opencode-session-status"
+    return state, "herdr-corroboration"
+
+
 def _retire_request_identity(ident, foreground):
     exact = {"server": _HERDR_SESSION or "default", "pane": ident["pane"],
              "harness": ident["harness"], "session_id": ident["session_id"],
@@ -1689,6 +1712,7 @@ def _complete_gone_retire(store, duty):
                            observation={"phase": "complete", "reason": "target-already-gone"})
     if settled.get("state") == "complete":
         ident = (duty.get("intent") or {}).get("identity") or {}
+        _request_watch_terminal(ident, "target-already-gone")
         print(f"retired=true reason=target-already-gone agent={ident.get('harness', '-')} "
               f"name={ident.get('name', '-')} pane={ident.get('pane', '-')}"
               + (f" handover={handover}" if handover else ""))
@@ -1790,6 +1814,7 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
         store.update(duty["id"], state="complete", result="normal-exit",
                      delivery="completed", cleanup="complete",
                      observation={"phase": "complete", "reason": "normal-exit"})
+        _request_watch_terminal({**ident, "server": server}, "completed-retire")
         _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
                 to_session_id=ident["session_id"], to_pane=pane,
                 summary_text=f"[retire] {ident['name']} normal-exit",
@@ -1812,6 +1837,7 @@ def _resume_retire_obligation(duty, store):
     if duty.get("state") == "complete":
         if duty.get("result") in {"normal-exit", "target-already-gone"}:
             _retire_handover(duty)
+            _request_watch_terminal(ident, "completed-retire")
         return
     if duty.get("state") == "cancelled":
         return
@@ -1910,6 +1936,13 @@ def cmd_retire(args):
                 store.update(duty["id"], state="unknown" if reason.endswith("unknown") else "pending",
                              expected_phases={observation.get("phase", "waiting")},
                              observation={**observation, "reason": reason})
+        if retired:
+            _request_watch_terminal({
+                "server": _HERDR_SESSION or "default", "pane": ident.get("pane"),
+                "harness": ident.get("harness"), "session_id": ident.get("session_id"),
+                "foreground": duty.get("intent", {}).get("identity", {}).get("foreground")
+                    if duty else None,
+            }, "completed-retire")
         _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
                 to_session_id=ident["session_id"], to_pane=ident["pane"],
                 summary_text=summary, receipt=receipt,
@@ -1989,8 +2022,9 @@ def cmd_retire(args):
             or (booked.get("session_id") != "-"
                 and booked.get("session_id") != ident["session_id"])):
         return finish("target-changed", pending=True)
-    if reason or state not in {"idle", "done"}:
-        return finish(reason or f"agent-{state}", pending=True)
+    retire_state, state_source = _effective_retire_state(state, ident)
+    if reason or retire_state not in {"idle", "done"}:
+        return finish(reason or f"agent-{retire_state}-{state_source}", pending=True)
     readiness = _pane_readiness(target, state, expected_harness=harness,
                                 expected_sid=ident["session_id"])
     if readiness.state != "ready":
@@ -2001,6 +2035,7 @@ def cmd_retire(args):
     if identity != _retire_booked_foreground(duty):
         return finish("foreground-changed", pending=True)
     state2, ident2, _, _ = _retire_target(target)
+    state2, _state2_source = _effective_retire_state(state2, ident2)
     if state2 not in ("idle", "done") or ident2 != ident:
         return finish("target-changed", pending=True)
     if _retire_foreground(pane, harness) != identity:
@@ -2185,8 +2220,8 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
 # ---------------------------------------------------------------------------
 
 _WATCH_SCHEMA = 1
-_WATCH_STATES = _AGENT_STATES + ("timeout", "agent-not-found", "herdr-unavailable")
-_JOIN_EXIT = {"timeout": 3, "agent-not-found": 2, "herdr-unavailable": 4}
+_WATCH_STATES = _AGENT_STATES + ("timeout", "agent-not-found", "herdr-unavailable", "pane-exited")
+_JOIN_EXIT = {"timeout": 3, "agent-not-found": 2, "herdr-unavailable": 4, "pane-exited": 2}
 _WATCH_OBSERVER_TIMEOUT_MS = 30_000
 _WATCH_BACKOFF_MAX_SECONDS = 15.0
 
@@ -2222,6 +2257,106 @@ def _watch_paths(watch_id, root=None):
         ack=root / f"{watch_id}.ack.json",
         observation=root / f"{watch_id}.observation.json",
     )
+
+
+def _write_terminal_watch_receipt(watch_id, arm, reason, *, watcher=None):
+    """Settle one exact watch after its observer has the watch lock."""
+    paths = _watch_paths(watch_id)
+    if paths.receipt.exists():
+        return _read_json(paths.receipt)
+    agent = dict((arm or {}).get("agent") or {})
+    receipt = {
+        "schema_version": _WATCH_SCHEMA, "watch_id": watch_id,
+        "target": (arm or {}).get("target", "-"),
+        "server": (arm or {}).get("server") or "default",
+        "steward": (arm or {}).get("steward") or {},
+        "armed_ts": (arm or {}).get("armed_ts", ""), "done_ts": _utc_now(),
+        "state": "pane-exited", "agent": agent,
+        "herdr_exit": _LAST_HERDR_EXIT if _LAST_HERDR_EXIT is not None else -1,
+        "watcher": watcher or {"pid": os.getpid(), "pid_start": process_start_ticks(os.getpid()) or ""},
+        "rearmed_from": (arm or {}).get("rearmed_from"),
+        "refs": list((arm or {}).get("refs") or []),
+        "observer_generation": (arm or {}).get("observer_generation", 1),
+        "reason": reason,
+    }
+    _write_json_atomic(paths.receipt, receipt)
+    try:
+        paths.observation.unlink()
+    except FileNotFoundError:
+        pass
+    return receipt
+
+
+def _terminal_watch_request(paths, expected, server):
+    observation = _read_json(paths.observation)
+    if (not isinstance(observation, dict) or observation.get("state") != "terminal_pending"
+            or (observation.get("server") or "default") != server):
+        return None
+    requested = observation.get("agent") or {}
+    if any(requested.get(key) != expected.get(key)
+           for key in ("harness", "session_id", "pane")):
+        return None
+    return str(observation.get("reason") or "completed-retire")
+
+
+def _settle_terminal_watch_if_unobserved(watch_id, arm, root=None):
+    paths = _watch_paths(watch_id, root)
+    if paths.receipt.exists():
+        return True
+    expected = dict((arm or {}).get("agent") or {})
+    server = (arm or {}).get("server") or "default"
+    reason = _terminal_watch_request(paths, expected, server)
+    if reason is None:
+        return False
+    fd = _open_lock(paths.lock)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        if paths.receipt.exists():
+            return True
+        _write_terminal_watch_receipt(watch_id, arm, reason)
+        return True
+    finally:
+        os.close(fd)
+
+
+def _request_watch_terminal(identity, reason):
+    """Ask matching observers to settle on their next bounded wake."""
+    if not isinstance(identity, dict):
+        return 0
+    server = identity.get("server") or "default"
+    pane, harness, sid = identity.get("pane"), identity.get("harness"), identity.get("session_id")
+    if not all(isinstance(value, str) and value and value != "-"
+               for value in (pane, harness, sid)):
+        return 0
+    root = _watch_root()
+    count = 0
+    for watch_id, arm in _watch_entries(root):
+        if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
+            continue
+        agent = arm.get("agent") or {}
+        if ((arm.get("server") or "default") != server
+                or any(agent.get(key) != value for key, value in (
+                    ("pane", pane), ("harness", harness), ("session_id", sid)))):
+            continue
+        saved = arm.get("foreground_identity")
+        foreground = identity.get("foreground")
+        if (isinstance(saved, dict) and isinstance(foreground, dict)
+                and (saved.get("pid"), saved.get("start")) !=
+                    (foreground.get("pid"), foreground.get("start"))):
+            continue
+        paths = _watch_paths(watch_id, root)
+        _write_json_atomic(paths.observation, {
+            "schema_version": _WATCH_SCHEMA, "watch_id": watch_id,
+            "state": "terminal_pending", "reason": reason, "server": server,
+            "agent": {key: agent.get(key, "-") for key in ("harness", "session_id", "pane")},
+            "observed_ts": _utc_now(),
+        })
+        _settle_terminal_watch_if_unobserved(watch_id, arm, root)
+        count += 1
+    return count
 
 
 def _new_watch_id(steward_sid, target, armed_ts, nonce):
@@ -2525,6 +2660,10 @@ def cmd_watch(args):
                 print(_already_armed_line(existing_id, existing_arm, existing_paths))
                 return 0
 
+        foreground = _retire_foreground(agent["pane"], agent["harness"], strict=False)
+        foreground_identity = ({key: foreground.get(key) for key in
+                                ("pid", "start", "shell_pid", "shell_start")}
+                               if isinstance(foreground, dict) else None)
         armed_ts = _utc_now()
         watch_id = _new_watch_id(steward_sid, target, armed_ts, os.urandom(8).hex())
         paths = _watch_paths(watch_id, root)
@@ -2586,6 +2725,7 @@ def cmd_watch(args):
             "rearmed_from": getattr(args, "rearmed_from", None) or None,
             "rearm_count": int(args.rearm_count or 0),
             "observer_generation": 1,
+            "foreground_identity": foreground_identity,
         }
         _write_json_atomic(paths.arm, arm)
         # Acceptance and the stable claim precede the observer side effect.
@@ -2638,6 +2778,7 @@ def cmd_watch(args):
             "rearmed_from": getattr(args, "rearmed_from", None) or None,
             "rearm_count": int(args.rearm_count or 0),
             "observer_generation": 1,
+            "foreground_identity": foreground_identity,
         }
         _write_json_atomic(paths.arm, arm)
 
@@ -2719,19 +2860,54 @@ def cmd_watch_run(args):
         "session_id": getattr(args, "expected_session_id", "-"),
         "pane": getattr(args, "expected_pane", "-"),
     }
+    arm = _read_json(paths.arm) or {}
+    terminal_reason = None
+    expected_agent = dict(arm.get("agent") or {
+        "harness": expected["harness"], "session_id": expected["session_id"],
+        "name": args.target, "pane": expected["pane"],
+    })
     checkpoint_ms = args.timeout if args.timeout is not None else _WATCH_OBSERVER_TIMEOUT_MS
     checkpoint_ms = min(600_000, max(500, int(checkpoint_ms)))
     backoff = 1.0
     unbound = expected["session_id"] == "-"
     while True:
+        terminal_reason = _terminal_watch_request(paths, expected, server)
+        if terminal_reason:
+            state, agent = "pane-exited", expected_agent
+            break
         resolved, current, _code, reason = _interpret_payload(_run_herdr_get(args.target), args.target)
+        if resolved == "agent-not-found" and reason is None:
+            census = herdr_observation.pane_census(session=server)
+            if herdr_observation.confirms_absence(
+                    census, expected["pane"], endpoint=server):
+                terminal_reason = "pane-absent"
+                state, agent = "pane-exited", expected_agent
+                break
         exact = (reason is None and resolved not in {"agent-not-found", "herdr-unavailable"}
                  and _watch_identity_matches(expected, current))
+        if (reason is None and expected.get("session_id") not in {None, "", "-"}
+                and current.get("harness") == expected.get("harness")
+                and current.get("pane") == expected.get("pane")
+                and current.get("session_id") not in {None, "", "-", expected["session_id"]}):
+            terminal_reason = "session-replaced"
+            state, agent = "pane-exited", expected_agent
+            break
         if unbound and expected["session_id"] != "-":
             unbound = not _persist_watch_session(args, paths, server, expected["session_id"])
         if exact:
             payload = _run_herdr_wait(args.target, args.until, checkpoint_ms)
             state, agent, _code, reason = _interpret_payload(payload, args.target)
+            terminal_reason = _terminal_watch_request(paths, expected, server)
+            if terminal_reason:
+                state, agent = "pane-exited", expected_agent
+                break
+            if state == "agent-not-found" and reason is None:
+                census = herdr_observation.pane_census(session=server)
+                if herdr_observation.confirms_absence(
+                        census, expected["pane"], endpoint=server):
+                    terminal_reason = "pane-absent"
+                    state, agent = "pane-exited", expected_agent
+                    break
             if (reason is None and state not in {"timeout", "agent-not-found", "herdr-unavailable"}
                     and _watch_identity_matches(expected, agent)):
                 if state in {"idle", "done"}:
@@ -2759,6 +2935,11 @@ def cmd_watch_run(args):
         backoff = min(_WATCH_BACKOFF_MAX_SECONDS, backoff * 1.7)
 
     pid = os.getpid()
+    if terminal_reason:
+        _write_terminal_watch_receipt(args.watch_id, arm, terminal_reason,
+                                      watcher={"pid": os.getpid(),
+                                               "pid_start": process_start_ticks(os.getpid()) or ""})
+        os._exit(0)
     receipt = {
         "schema_version": _WATCH_SCHEMA,
         "watch_id": args.watch_id,
@@ -2925,6 +3106,8 @@ def _spawn_watch_observer(watch_id, arm):
     paths = _watch_paths(watch_id)
     if paths.receipt.exists() or _watcher_present(arm):
         return True
+    if _settle_terminal_watch_if_unobserved(watch_id, arm):
+        return True
     agent = arm.get("agent") or {}
     if (any(not isinstance(agent.get(key), str) or agent.get(key) in {"", "-"}
             for key in ("harness", "pane"))
@@ -3002,6 +3185,8 @@ def _ensure_watch_observers():
     root = _watch_root()
     for watch_id, arm in _watch_entries(root):
         if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
+            continue
+        if _settle_terminal_watch_if_unobserved(watch_id, arm, root):
             continue
         if not _watcher_present(arm):
             _spawn_watch_observer(watch_id, arm)
@@ -3502,6 +3687,14 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
             proven = _proven_session(info["foreground_processes"], harness)
             if proven:
                 sid, expected_sid = proven, None
+        native_source = "herdr-corroboration"
+        native_turn = observed_state
+        native = _native_opencode_turn({"server": _HERDR_SESSION or "default",
+                                        "pane": pane, "harness": harness,
+                                        "session_id": sid})
+        if isinstance(native, dict) and native.get("status") in {"idle", "working", "blocked"}:
+            native_turn = native["status"]
+            native_source = "opencode-session-status"
         unbound = sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict)
         shell_start = (_proc_start_ticks(info.get("shell_pid"))
                        if isinstance(info, dict) else None)
@@ -3526,9 +3719,10 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
         return peer_obligations.pane_readiness(
             server=_HERDR_SESSION or "default", pane=pane or "",
             harness=harness or "", session_id="" if unbound else sid or "", pid_birth=birth,
-            identity_verified=exact, native_turn=observed_state,
+            identity_verified=exact, native_turn=native_turn,
             bound_work=bound, bindings_state=binding_state,
-            provenance=(("target", target), ("observed_state", observed_state)),
+            provenance=(("target", target), ("observed_state", observed_state),
+                        ("native_status_source", native_source)),
             purpose=purpose,
         )
     except Exception:

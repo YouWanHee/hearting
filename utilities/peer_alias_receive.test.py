@@ -980,6 +980,28 @@ console.log(JSON.stringify({sdkCalls, args, waiting, liveState, afterRefresh, pr
         self.assertFalse(result["afterRefresh"]["refreshPending"])
         self.assertEqual(result["prompts"], 0)
 
+    def test_opencode_native_status_events_publish_exact_pane_session_and_process_birth(self):
+        result = self.run_agent_initializer_fixture(r'''
+const ctx = {directory: process.cwd(), worktree: process.cwd(), client: {
+  app: {log: async () => {}}, session: {get: async () => ({data: {id: "ses_A"}})},
+}};
+const hooks = await AgentHarnessGuards(ctx);
+await hooks.event({event: {type: "session.status", properties: {
+  sessionID: "ses_A", status: {type: "busy"}}}});
+await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses_A"}}});
+const rows = globalThis.__fixtureSyncCalls
+  .filter(call => call.args[0].endsWith("herdr_observation.py"))
+  .map(call => JSON.parse(call.options.input));
+hooks.dispose();
+console.log(JSON.stringify(rows));
+''')
+        self.assertEqual([row["status"] for row in result], ["working", "idle"])
+        for row in result:
+            self.assertEqual((row["endpoint"], row["pane"], row["harness"], row["session_id"]),
+                             ("default", "fixture-pane", "opencode", "ses_A"))
+            self.assertGreater(row["pid"], 1)
+            self.assertEqual(row["pid_start"], "77")
+
     def test_opencode_dispose_cancels_the_initializer_startup_timer(self):
         result = self.run_agent_initializer_fixture(r'''
 let sdkCalls = 0;

@@ -73,21 +73,17 @@ def list_agents(runner=subprocess.run, which=shutil.which):
 
 def list_panes(runner=subprocess.run, which=shutil.which):
     """``[pane dict, ...]`` from ``herdr pane list``; ``None`` on any failure."""
-    if which("herdr") is None:
-        return None
+    import sys
+    from pathlib import Path
+    utilities = str(Path(__file__).resolve().parents[3] / "utilities")
+    if utilities not in sys.path:
+        sys.path.insert(0, utilities)
     try:
-        proc = runner(["herdr", "pane", "list"], capture_output=True, text=True,
-                      timeout=_TIMEOUT_S)
-        payload = json.loads(proc.stdout or "")
+        import herdr_observation
+        census = herdr_observation.pane_census(runner=runner, which=which)
+        return list(census.panes) if census is not None else None
     except Exception:
         return None
-    if getattr(proc, "returncode", 1) != 0:
-        return None
-    result = payload.get("result") if isinstance(payload, dict) else None
-    panes = result.get("panes") if isinstance(result, dict) else None
-    if not isinstance(panes, list):
-        return None
-    return [p for p in panes if isinstance(p, dict)]
 
 
 class PaneEvidence(tuple):
