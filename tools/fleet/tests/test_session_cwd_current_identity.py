@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "utilities"))
 from fleet import model, process_identity, session_cwd
-from fleet.collectors import claude, codex, opencode, procscan
+from fleet.collectors import claude, codex, herdr, opencode, procscan
 from fleet.model import Session
 
 
@@ -53,6 +53,24 @@ class NativeCurrentTest(unittest.TestCase):
                 mock.patch.object(procscan, "_comm_of", return_value="fixture"), \
                 mock.patch.object(procscan, "_read_cwd", return_value=("/home/user", False)):
             return process_identity.process_identity(self.pid, "claude")
+
+    def test_one_shot_claude_identity_waits_for_bounded_exact_pane_observation(self):
+        pane = {"pane_id": "w1:p1", "agent": "claude", "cwd": "/repo",
+                "agent_session": {"agent": "claude", "value": "current"}}
+
+        def bind_observed_pane(selected, bindings):
+            self.assertEqual(selected, [pane])
+            bindings[self.pid] = {"w1:p1"}
+            return herdr.PaneEvidence((), complete=True)
+
+        with mock.patch.object(procscan, "read_proc_start", return_value=self.start), \
+                mock.patch.object(procscan, "_comm_of", return_value="claude"), \
+                mock.patch.object(procscan, "_read_cwd", return_value=("/repo", False)), \
+                mock.patch.object(herdr, "list_panes", return_value=[pane]) as list_panes, \
+                mock.patch.object(herdr, "pane_evidence", side_effect=bind_observed_pane):
+            self.assertEqual(claude.session_id_of_process(self.pid, str(self.home)), "current")
+
+        list_panes.assert_called_once_with(wait_timeout=0.75)
 
     def test_resume_ignores_both_empty_and_messaged_previous_taps(self):
         identity = self.identity()

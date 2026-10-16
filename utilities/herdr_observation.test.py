@@ -45,6 +45,7 @@ class _MemorySocket:
 
     def close(self):
         self.closed = True
+        self.server.disconnect_client(self)
 
 
 class PaneCensusTest(unittest.TestCase):
@@ -115,6 +116,23 @@ class EventReducerTest(unittest.TestCase):
         self.assertEqual(self.state.terminal, {})
 
 
+_PROTOCOL22_GLOBAL_PANE_SUBSCRIPTIONS = {
+    "pane.created", "pane.updated", "pane.closed", "pane.exited",
+    "pane.agent_detected",
+}
+
+
+def _protocol22_subscription_valid(subscription):
+    if not isinstance(subscription, dict):
+        return False
+    event = subscription.get("type")
+    if event in _PROTOCOL22_GLOBAL_PANE_SUBSCRIPTIONS:
+        return True
+    return (event == "pane.agent_status_changed"
+            and isinstance(subscription.get("pane_id"), str)
+            and bool(subscription["pane_id"]))
+
+
 class _HerdrApiFixture:
     def __init__(self, path, *, panes=None, protocol=22, interleave=None,
                  repeat_interleave=False):
@@ -126,6 +144,8 @@ class _HerdrApiFixture:
         self.methods = []
         self.errors = []
         self.subscribers = []
+        self.subscriptions_by_client = {}
+        self.subscription_requests = []
         self.lock = threading.Lock()
         self.stopping = False
 
@@ -139,9 +159,23 @@ class _HerdrApiFixture:
             with self.lock:
                 self.methods.append(method)
             if method == "events.subscribe":
+                params = request.get("params")
+                subscriptions = (params.get("subscriptions")
+                                 if isinstance(params, dict) else None)
+                valid = (isinstance(subscriptions, list) and bool(subscriptions)
+                         and all(_protocol22_subscription_valid(item)
+                                 for item in subscriptions))
                 with self.lock:
-                    self.subscribers.append(client)
-                response = {"id": request["id"], "result": {"type": "ok"}}
+                    self.subscription_requests.append(subscriptions)
+                    if valid:
+                        self.subscribers.append(client)
+                        self.subscriptions_by_client[client] = subscriptions
+                if valid:
+                    response = {"id": request["id"], "result": {"type": "ok"}}
+                else:
+                    response = {"id": request["id"], "error": {
+                        "code": "invalid_request",
+                        "message": "invalid protocol 22 pane subscription"}}
                 client.feed((json.dumps(response) + "\n").encode())
                 return
             if method == "session.snapshot":
@@ -162,10 +196,40 @@ class _HerdrApiFixture:
 
     def publish(self, envelope):
         data = envelope if isinstance(envelope, bytes) else (json.dumps(envelope) + "\n").encode()
+        try:
+            value = json.loads(data.decode().splitlines()[0])
+        except (UnicodeDecodeError, ValueError, IndexError):
+            value = None
+        payload = value.get("data") if isinstance(value, dict) else None
+        event = (value.get("event") or (payload.get("type")
+                 if isinstance(payload, dict) else None)) if isinstance(value, dict) else None
+        if isinstance(event, str) and "." not in event and "_" in event:
+            prefix, suffix = event.split("_", 1)
+            event = prefix + "." + suffix
+        pane_id = payload.get("pane_id") if isinstance(payload, dict) else None
+        pane = payload.get("pane") if isinstance(payload, dict) else None
+        if pane_id is None and isinstance(pane, dict):
+            pane_id = pane.get("pane_id")
         with self.lock:
-            subscribers = list(self.subscribers)
-        for subscriber in subscribers:
+            subscribers = [(client, self.subscriptions_by_client.get(client, []))
+                           for client in self.subscribers]
+        for subscriber, subscriptions in subscribers:
+            if value is None or (isinstance(value, dict) and "error" in value):
+                matches = True
+            else:
+                matches = any(
+                    item.get("type") == event
+                    and (event != "pane.agent_status_changed"
+                         or item.get("pane_id") == pane_id)
+                    for item in subscriptions if isinstance(item, dict))
+            if not matches:
+                continue
             subscriber.feed(data)
+
+    def disconnect_client(self, client):
+        with self.lock:
+            self.subscribers = [row for row in self.subscribers if row is not client]
+            self.subscriptions_by_client.pop(client, None)
 
     def disconnect_subscribers(self):
         with self.lock:
@@ -203,10 +267,54 @@ class ObservationTransportTest(unittest.TestCase):
         self.addCleanup(transport.close)
         return server, transport
 
-    def test_stale_status_overlapping_newer_snapshot_cannot_regress_to_working(self):
-        event = {"event": "pane.agent_status_changed", "data": {
+    def test_protocol22_fixture_rejects_status_subscription_without_exact_pane(self):
+        server = _HerdrApiFixture(self.socket_path)
+        self.addCleanup(server.close)
+        client = server.connect(socket.AF_UNIX, socket.SOCK_STREAM)
+        request = {"id": "invalid-status-subscription", "method": "events.subscribe",
+                   "params": {"subscriptions": [
+                       {"type": "pane.agent_status_changed"}]}}
+        server.request(client, (json.dumps(request) + "\n").encode())
+        response = json.loads(client.recv(4096).splitlines()[0])
+        self.assertEqual(response["error"]["code"], "invalid_request")
+        self.assertEqual(server.subscribers, [])
+
+    def test_source_uses_valid_protocol22_endpoint_subscriptions(self):
+        server, transport = self.start()
+        view = transport.observe()
+        self.assertIsNotNone(view, server.errors)
+        globals_only = list(observation._PANE_SUBSCRIPTIONS)
+        exact_pane_status = globals_only + [{
+            "type": "pane.agent_status_changed", "pane_id": "w1:p9"}]
+        self.assertEqual(server.subscription_requests, [globals_only, exact_pane_status])
+        self.assertNotIn("pane.agent_status_changed", {
+            item["type"] for item in server.subscription_requests[0]})
+        self.assertEqual(server.subscription_requests[1][-1]["pane_id"], "w1:p9")
+
+    def test_exact_pane_status_event_invalidates_and_refreshes_the_snapshot(self):
+        server, transport = self.start(panes=[{
+            "pane_id": "w1:p9", "agent": "claude", "agent_status": "idle"}])
+        first = transport.observe()
+        self.assertIsNotNone(first, server.errors)
+        self.assertEqual(first.panes[0]["agent_status"], "idle")
+        self.assertEqual(server.subscription_requests[-1][-1], {
+            "type": "pane.agent_status_changed", "pane_id": "w1:p9"})
+
+        server.panes = [{
+            "pane_id": "w1:p9", "agent": "claude", "agent_status": "working"}]
+        server.publish({"event": "pane.agent_status_changed", "data": {
             "type": "pane_agent_status_changed", "pane_id": "w1:p9",
-            "agent_status": "working"}}
+            "agent_status": "working"}})
+        current = transport.observe()
+        self.assertIsNotNone(current, server.errors)
+        self.assertEqual(current.panes[0]["agent_status"], "working")
+        self.assertGreater(current.generation, first.generation)
+
+    def test_stale_status_overlapping_newer_snapshot_cannot_regress_to_working(self):
+        event = {"event": "pane.updated", "data": {
+            "type": "pane_updated", "pane_id": "w1:p9",
+            "pane": {"pane_id": "w1:p9", "agent": "codex",
+                     "agent_status": "working"}}}
         server, transport = self.start(
             panes=[{"pane_id": "w1:p9", "agent": "codex", "agent_status": "idle"}],
             interleave=event)
@@ -237,9 +345,10 @@ class ObservationTransportTest(unittest.TestCase):
         first = transport.observe()
         self.assertIsNotNone(first, server.errors)
         server.panes = [{"pane_id": "w1:p9", "agent": "codex", "agent_status": "idle"}]
-        server.publish({"event": "pane.agent_status_changed", "data": {
-            "type": "pane_agent_status_changed", "pane_id": "w1:p9",
-            "agent_status": "working"}})
+        server.publish({"event": "pane.updated", "data": {
+            "type": "pane_updated", "pane_id": "w1:p9",
+            "pane": {"pane_id": "w1:p9", "agent": "codex",
+                     "agent_status": "idle"}}})
         current = transport.observe()
         self.assertIsNotNone(current, server.errors)
         self.assertEqual(current.panes[0]["agent_status"], "idle")
@@ -251,14 +360,15 @@ class ObservationTransportTest(unittest.TestCase):
         first = transport.observe()
         self.assertIsNotNone(first, server.errors)
         server.panes = [{"pane_id": "w1:p9", "agent": "codex", "agent_status": "idle"}]
-        server.interleave = {"event": "pane.agent_status_changed", "data": {
-            "type": "pane_agent_status_changed", "pane_id": "w1:p9",
-            "agent_status": "working"}}
+        server.interleave = {"event": "pane.updated", "data": {
+            "type": "pane_updated", "pane_id": "w1:p9",
+            "pane": {"pane_id": "w1:p9", "agent": "codex",
+                     "agent_status": "working"}}}
         current = transport.resnapshot()
         self.assertIsNotNone(current, server.errors)
         self.assertEqual(current.panes[0]["agent_status"], "idle")
         self.assertGreater(current.generation, first.generation)
-        self.assertEqual(server.methods.count("session.snapshot"), 3)
+        self.assertEqual(server.methods.count("session.snapshot"), 4)
 
     def test_event_wait_is_only_a_wake_and_fresh_snapshot_proves_absence(self):
         server, transport = self.start()
@@ -289,8 +399,10 @@ class ObservationTransportTest(unittest.TestCase):
         server, transport = self.start()
         original_recv = _MemorySocket.recv
         original_readable = _MemorySocket.readable
-        event = (json.dumps({"event": "pane.agent_status_changed", "data": {
-            "pane_id": "w1:p9", "agent_status": "working"}}) + "\n").encode()
+        event = (json.dumps({"event": "pane.updated", "data": {
+            "pane_id": "w1:p9", "pane": {"pane_id": "w1:p9",
+                                             "agent": "codex",
+                                             "agent_status": "working"}}}) + "\n").encode()
         reads = 0
 
         def flooding_recv(sock, size):
@@ -349,8 +461,8 @@ class ObservationTransportTest(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertTrue(second.complete)
         self.assertEqual(second.panes[0]["pane_id"], "w1:p9")
-        self.assertEqual(server.methods.count("events.subscribe"), 2)
-        self.assertEqual(server.methods.count("session.snapshot"), 2)
+        self.assertEqual(server.methods.count("events.subscribe"), 3)
+        self.assertEqual(server.methods.count("session.snapshot"), 3)
 
     def test_malformed_event_invalidates_and_reconnects_without_confirming_absence(self):
         server, transport = self.start()
@@ -360,7 +472,7 @@ class ObservationTransportTest(unittest.TestCase):
         self.assertIsNotNone(view)
         self.assertTrue(view.complete)
         self.assertEqual(view.panes[0]["pane_id"], "w1:p9")
-        self.assertEqual(server.methods.count("events.subscribe"), 2)
+        self.assertEqual(server.methods.count("events.subscribe"), 3)
 
     def test_disconnect_invalidates_and_reconnects_to_a_complete_snapshot(self):
         server, transport = self.start()
@@ -370,8 +482,8 @@ class ObservationTransportTest(unittest.TestCase):
         self.assertIsNotNone(view)
         self.assertTrue(view.complete)
         self.assertEqual(view.panes[0]["pane_id"], "w1:p9")
-        self.assertEqual(server.methods.count("events.subscribe"), 2)
-        self.assertEqual(server.methods.count("session.snapshot"), 2)
+        self.assertEqual(server.methods.count("events.subscribe"), 3)
+        self.assertEqual(server.methods.count("session.snapshot"), 3)
 
     def test_disconnect_during_resnapshot_recovers_on_the_next_observation(self):
         server, transport = self.start()
@@ -382,7 +494,7 @@ class ObservationTransportTest(unittest.TestCase):
         recovered = transport.observe()
         self.assertIsNotNone(recovered, server.errors)
         self.assertEqual(recovered.panes[0]["pane_id"], "w1:p9")
-        self.assertEqual(server.methods.count("events.subscribe"), 2)
+        self.assertEqual(server.methods.count("events.subscribe"), 3)
 
     def test_events_lost_while_waiting_resubscribes_before_recovering(self):
         server, transport = self.start()
@@ -394,8 +506,8 @@ class ObservationTransportTest(unittest.TestCase):
         recovered = transport.observe()
         self.assertIsNotNone(recovered, server.errors)
         self.assertEqual(recovered.panes[0]["pane_id"], "w1:p9")
-        self.assertEqual(server.methods.count("events.subscribe"), 2)
-        self.assertEqual(server.methods.count("session.snapshot"), 2)
+        self.assertEqual(server.methods.count("events.subscribe"), 3)
+        self.assertEqual(server.methods.count("session.snapshot"), 3)
 
     def test_protocol_mismatch_is_unknown_and_never_publishes_partial_snapshot(self):
         _server, transport = self.start(protocol=21)

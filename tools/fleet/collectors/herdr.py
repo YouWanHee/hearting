@@ -31,6 +31,7 @@ from concurrent.futures import wait
 from ..refresh import background_read
 
 _TIMEOUT_S = 2.0
+_OBSERVATION_WAIT_MAX_S = 0.75
 _OBSERVATION_LOCK = threading.RLock()
 _OBSERVATION_TRANSPORTS = {}
 _OBSERVATION_FUTURES = {}
@@ -81,7 +82,8 @@ def observation_view(session=None, *, refresh=False, wait_timeout=0.0):
                     return None
                 elif wait_timeout > 0:
                     try:
-                        completed = future.result(timeout=min(0.2, float(wait_timeout)))
+                        completed = future.result(timeout=min(
+                            _OBSERVATION_WAIT_MAX_S, float(wait_timeout)))
                     except TimeoutError:
                         return None
                     except Exception:
@@ -95,7 +97,8 @@ def observation_view(session=None, *, refresh=False, wait_timeout=0.0):
             _OBSERVATION_FUTURES[key] = future
             if wait_timeout > 0:
                 try:
-                    completed = future.result(timeout=min(0.2, float(wait_timeout)))
+                    completed = future.result(timeout=min(
+                        _OBSERVATION_WAIT_MAX_S, float(wait_timeout)))
                 except TimeoutError:
                     return None
                 except Exception:
@@ -188,12 +191,13 @@ def list_agents(runner=subprocess.run, which=shutil.which):
     return [a for a in agents if isinstance(a, dict)]
 
 
-def list_panes(runner=subprocess.run, which=shutil.which):
+def list_panes(runner=subprocess.run, which=shutil.which, *, wait_timeout=0.0):
     """``[pane dict, ...]`` from ``herdr pane list``; ``None`` on any failure."""
     try:
         observation = _observation_module()
         if runner is subprocess.run and which is shutil.which:
-            view = observation_view()
+            view = (observation_view(wait_timeout=wait_timeout)
+                    if wait_timeout > 0 else observation_view())
             if view is not None:
                 return [dict(pane) for pane in view.panes]
             if observation.socket_path_for_endpoint():

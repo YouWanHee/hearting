@@ -27,10 +27,13 @@ HERDR_API_PROTOCOL = 22
 _API_LINE_LIMIT = 16 * 1024 * 1024
 _SNAPSHOT_OVERLAP_ATTEMPTS = 2
 _EVENT_DRAIN_FRAME_LIMIT = 256
+# Protocol 22 permits these endpoint-wide pane subscriptions. The
+# pane.agent_status_changed variant also requires an exact pane_id and must
+# only be added after a real pane has appeared in a snapshot.
 _PANE_SUBSCRIPTIONS = (
     {"type": "pane.created"}, {"type": "pane.updated"},
     {"type": "pane.closed"}, {"type": "pane.exited"},
-    {"type": "pane.agent_detected"}, {"type": "pane.agent_status_changed"},
+    {"type": "pane.agent_detected"},
 )
 
 
@@ -280,6 +283,7 @@ class ObservationTransport:
         self._socket = None
         self._buffer = bytearray()
         self._state = ObservationSnapshot(self.endpoint)
+        self._status_pane_ids: set[str] = set()
         self._agents: tuple[dict, ...] = ()
         self._observed_at = 0.0
         self._lock = threading.RLock()
@@ -306,8 +310,12 @@ class ObservationTransport:
             client.settimeout(self.timeout)
             client.connect(self.socket_path)
             request_id = _api_id()
+            subscriptions = list(_PANE_SUBSCRIPTIONS)
+            subscriptions.extend(
+                {"type": "pane.agent_status_changed", "pane_id": pane_id}
+                for pane_id in sorted(self._status_pane_ids))
             request = {"id": request_id, "method": "events.subscribe",
-                       "params": {"subscriptions": list(_PANE_SUBSCRIPTIONS)}}
+                       "params": {"subscriptions": subscriptions}}
             client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
             response = _decode_line(_receive_line(
                 client, self._buffer, time.monotonic() + self.timeout))
@@ -403,6 +411,25 @@ class ObservationTransport:
                 self._close_socket()
                 self._state.reconnect()
                 return False
+            panes, agents = candidate
+            status_pane_ids = {
+                pane["pane_id"] for pane in panes
+                if (isinstance(pane, dict) and pane.get("agent")
+                    and isinstance(pane.get("pane_id"), str)
+                    and pane["pane_id"])
+            }
+            if status_pane_ids != self._status_pane_ids:
+                # Protocol 22 requires an exact pane_id for status changes.
+                # Bind only IDs present on this snapshot, then discard it and
+                # take a new snapshot under the complete subscription set.
+                self._status_pane_ids = status_pane_ids
+                self._close_socket()
+                self._state.reconnect()
+                if not self._subscribe():
+                    self._close_socket()
+                    self._state.reconnect()
+                    return False
+                continue
             healthy, overlapped = self._drain_events()
             if not healthy:
                 self._close_socket()
@@ -411,7 +438,6 @@ class ObservationTransport:
             if overlapped:
                 self._state.reconnect()
                 continue
-            panes, agents = candidate
             if not self._state.replace_snapshot(self.endpoint, panes):
                 self._close_socket()
                 return False
