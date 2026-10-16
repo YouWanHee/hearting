@@ -189,7 +189,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             for label in ('legacy-worker', 'empty-override', 'relative-override',
                           'old-worker-before', 'old-worker-after', 'main-login',
                           'legacy-cas-worker', 'legacy-cas-main',
-                          'builder-binding',
+                          'builder-binding', 'split-legacy-child',
                           'session-first', 'session-resume', 'late-cas-worker',
                           'main-before', 'worker-a', 'worker-b', 'main-after'):
                 if label in text:
@@ -230,7 +230,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
                 'relative-override': '1', 'main-before': '0',
                 'old-worker-before': '1', 'old-worker-after': '1', 'main-login': '2',
                 'legacy-cas-worker': '2', 'legacy-cas-main': '2',
-                'builder-binding': '1',
+                'builder-binding': '1', 'split-legacy-child': '2',
                 'session-first': '1', 'session-resume': '1',
                 'worker-a': '1', 'worker-b': '1', 'main-after': '1',
             }.get(label)
@@ -1082,6 +1082,62 @@ def _native_child(cli, root):
             'generation_labels': old_generations,
         }
 
+        # A new launch from that split legacy worker must use the main store.
+        # Mark the old home as the legacy builder did and build the child from
+        # the old worker's own launch environment into a reused home that still
+        # holds an expired split credential. Both split files stay untouched.
+        harness.state.reset('split-legacy-parent-new-launch')
+        (old_worker_config / 'worker-home.json').write_text(json.dumps({
+            'harness': 'claude', 'worker_type': 'owner'}), encoding='utf-8')
+        old_worker_split = (old_worker_config / '.credentials.json').read_bytes()
+        main_before_child = old_main_credential.read_bytes()
+        reused_home = root / 'split-reused-worker-home'
+        reused_split_path = _write_credential(
+            reused_home, access_generation=1, refresh_generation=1, expires_at=0)
+        (reused_home / 'worker-home.json').write_text(
+            json.dumps({'harness': 'claude'}), encoding='utf-8')
+        reused_split = reused_split_path.read_bytes()
+        legacy_parent_env = {
+            'HOME': str(old_home),
+            'CLAUDE_CONFIG_DIR': str(old_worker_config),
+            'HEARTING_WORKER_HOME': str(old_worker_config),
+            'HEARTING_MODEL_CONFIG_HOME': str(old_main_config),
+            'AGENT_DISPATCH_JOBS': str(root / 'dispatch/jobs.log'),
+        }
+        child_env = worker_runtime_home.prepare_worker_home(
+            Path(__file__).resolve().parents[1], 'claude', 'stage',
+            'split-legacy-child', env=legacy_parent_env, destination=reused_home)
+        if child_env.get(SECURE_ENV) != str(old_main_config.resolve()):
+            raise RuntimeError('split legacy parent did not bind its new child to main')
+        child_config = Path(child_env['CLAUDE_CONFIG_DIR'])
+        trace, _ = harness.run_cli(
+            'split-legacy-child', 'split-legacy-child', old_home, child_config,
+            child_env[SECURE_ENV], injected_env=child_env, write_settings=False)
+        child_generations = [event['access_generation'] for event in harness.state.events
+                             if event.get('event') == 'message' and
+                             event.get('prompt') == 'split-legacy-child']
+        if not child_generations or set(child_generations) != {'2'}:
+            raise RuntimeError('new child did not use the main store generation')
+        if harness.state.refresh_count != 0:
+            raise RuntimeError('new child refreshed from a split credential')
+        if (old_worker_config / '.credentials.json').read_bytes() != old_worker_split or \
+                reused_split_path.read_bytes() != reused_split:
+            raise RuntimeError('split worker credentials were not preserved')
+        if old_main_credential.read_bytes() != main_before_child:
+            raise RuntimeError('new child changed the valid main credential')
+        if old_worker['proc'].poll() is not None:
+            raise RuntimeError('old split worker did not keep running')
+        summary['scenarios']['split_legacy_parent_new_launch'] = {
+            'actual_cli_pid': harness.cli_pid(trace, prompt='split-legacy-child'),
+            'binding': 'legacy-parent-source-main',
+            'child_used_main_store': True,
+            'child_access_generations': sorted(set(child_generations)),
+            'refresh_requests': harness.state.refresh_count,
+            'split_files_preserved': True,
+            'main_unchanged': True,
+            'old_split_worker_running': True,
+        }
+
         # The proxy never opens an upstream socket; every event is fixture-only.
         events = list(harness.state.events)
         summary['request_events'] = events
@@ -1168,6 +1224,10 @@ class NativeClaudeStorage(unittest.TestCase):
                 'old_worker_remained_alive'])
             self.assertFalse(summary['scenarios']['old_running_worker_transition'][
                 'old_process_environment_rebound'])
+            self.assertTrue(summary['scenarios']['split_legacy_parent_new_launch'][
+                'child_used_main_store'])
+            self.assertTrue(summary['scenarios']['split_legacy_parent_new_launch'][
+                'split_files_preserved'])
             self.assertTrue({'platform.claude.com', 'api.anthropic.com'}.issubset(
                 set(summary['only_fixture_hosts'])))
             self.assertEqual(summary['blocked_nonfixture_attempts'], [])

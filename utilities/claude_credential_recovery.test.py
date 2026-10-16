@@ -56,33 +56,83 @@ class ClaudeCredentialRecovery(unittest.TestCase):
         self.assertEqual(resolve_storage_binding(
             {'HOME': str(self.root / 'user')}, worker, cwd=self.cwd), str(store.resolve()))
 
-    def test_legacy_candidate_uses_local_cohort_store_without_promotion(self):
-        main = self.root / 'main'
-        main.mkdir()
-        main_file = main / '.credentials.json'
+    def test_intact_link_to_default_home_keeps_native_empty_binding(self):
+        home = self.root / 'user'
+        (home / '.claude').mkdir(parents=True)
+        (home / '.claude' / '.credentials.json').write_text('{"test":"synthetic"}')
+        worker = self.root / 'legacy-worker'
+        worker.mkdir()
+        (worker / 'worker-home.json').write_text(json.dumps({'harness': 'claude'}))
+        (worker / '.credentials.json').symlink_to(home / '.claude' / '.credentials.json')
+        self.assertEqual(resolve_storage_binding(
+            {'HOME': str(home)}, worker, cwd=self.cwd), '')
+
+    def test_split_legacy_candidate_is_preserved_and_new_launch_uses_main(self):
+        home = self.root / 'user'
+        default_main = home / '.claude'
+        default_main.mkdir(parents=True)
+        main_file = default_main / '.credentials.json'
         main_file.write_bytes(b'{"synthetic":"new-main"}')
+        custom_main = self.root / 'custom-main'
+        custom_main.mkdir()
         worker = self.root / 'legacy-worker'
         worker.mkdir()
         (worker / 'worker-home.json').write_text(json.dumps({'harness': 'claude'}))
         candidate = worker / '.credentials.json'
         candidate.write_bytes(b'{"synthetic":"opaque-worker-token"}')
-        before = candidate.read_bytes()
-        main_before = main_file.read_bytes()
-        self.assertEqual(resolve_storage_binding(
-            {'HOME': str(self.root / 'user')}, worker, cwd=self.cwd),
-            str(worker.resolve()))
-        self.assertEqual(candidate.read_bytes(), before)
-        self.assertEqual(main_file.read_bytes(), main_before)
-
         empty_worker = self.root / 'legacy-worker-without-credentials'
         empty_worker.mkdir()
-        (empty_worker / 'worker-home.json').write_text(
-            json.dumps({'harness': 'claude'}))
-        self.assertEqual(resolve_storage_binding(
-            {'HOME': str(self.root / 'user')}, empty_worker, cwd=self.cwd),
-            str(empty_worker.resolve()))
-        self.assertFalse((empty_worker / '.credentials.json').exists())
+        (empty_worker / 'worker-home.json').write_text(json.dumps({'harness': 'claude'}))
+        before = candidate.read_bytes()
+        main_before = main_file.read_bytes()
+
+        def paired(config, source):
+            return {'HOME': str(home), 'HEARTING_WORKER_HOME': str(config),
+                    'HEARTING_MODEL_CONFIG_HOME': str(source)}
+
+        for config in (worker, empty_worker):
+            with self.subTest(config=config.name):
+                # Without the builder's paired launch environment, follow the
+                # legacy builder's HOME/.claude fallback.
+                self.assertEqual(resolve_storage_binding(
+                    {'HOME': str(home)}, config, cwd=self.cwd), '')
+                self.assertEqual(resolve_storage_binding(
+                    paired(config, default_main), config, cwd=self.cwd), '')
+                self.assertEqual(resolve_storage_binding(
+                    paired(config, custom_main), config, cwd=self.cwd),
+                    str(custom_main.resolve()))
+                # An environment paired with another worker home is not this
+                # worker's lineage.
+                self.assertEqual(resolve_storage_binding(
+                    paired(self.root / 'other-worker', custom_main), config,
+                    cwd=self.cwd), '')
+        self.assertEqual(candidate.read_bytes(), before)
         self.assertEqual(main_file.read_bytes(), main_before)
+        self.assertFalse((empty_worker / '.credentials.json').exists())
+
+    def test_legacy_source_worker_resolves_its_own_lineage_once(self):
+        home = self.root / 'user'
+        store = self.root / 'store'
+        store.mkdir()
+        (store / '.credentials.json').write_text('{"test":"synthetic"}')
+        linked_parent = self.root / 'linked-parent'
+        linked_parent.mkdir()
+        (linked_parent / 'worker-home.json').write_text(json.dumps({'harness': 'claude'}))
+        (linked_parent / '.credentials.json').symlink_to(store / '.credentials.json')
+        split_parent = self.root / 'split-parent'
+        split_parent.mkdir()
+        (split_parent / 'worker-home.json').write_text(json.dumps({'harness': 'claude'}))
+        (split_parent / '.credentials.json').write_text('{"synthetic":"split"}')
+        worker = self.root / 'legacy-worker'
+        worker.mkdir()
+        (worker / 'worker-home.json').write_text(json.dumps({'harness': 'claude'}))
+        (worker / '.credentials.json').write_text('{"synthetic":"split-child"}')
+        for parent, expected in ((linked_parent, str(store.resolve())), (split_parent, '')):
+            with self.subTest(parent=parent.name):
+                self.assertEqual(resolve_storage_binding(
+                    {'HOME': str(home), 'HEARTING_WORKER_HOME': str(worker),
+                     'HEARTING_MODEL_CONFIG_HOME': str(parent)}, worker,
+                    cwd=self.cwd), expected)
 
     def test_new_worker_metadata_propagates_binding_across_nested_launches(self):
         worker = self.root / 'worker'

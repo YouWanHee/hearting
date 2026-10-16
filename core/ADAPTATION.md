@@ -27,13 +27,12 @@ runtime's shared native credential store and refresh lock. The shared builder
 preserves explicit secure-storage overrides, including an empty value. A
 legacy credential file found only in a worker home is not proof that it belongs
 to the current account or is newer than the main login; it must not replace the
-main store without supported identity and ordering evidence. When a marked
-legacy Claude worker has no recorded main-store origin or intact credential
-link, the builder keeps its selected config directory as a local cohort store
-for nested launches. This preserves that parent worker's authentication without
-copying, deleting, or promoting its candidate; an absent credential remains
-absent and does not select another account. Local cohort continuity does not
-resolve convergence of a unique newer worker token into the main store.
+main store without supported identity and ordering evidence. Such a file stays
+in place and is never used as an authentication source: when a marked legacy
+Claude worker has no recorded main-store origin or intact credential link, new
+launches from it use the source config home its builder recorded in that
+worker's launch environment, or the default `HOME/.claude` store. A legacy
+process already running on a split file keeps its stale token until it exits.
 Account metadata projection follows Claude Code's resolved global config file
 and copies only `oauthAccount` into the masked child config. Existing processes
 retain the environment they started with, so transition limits are reported

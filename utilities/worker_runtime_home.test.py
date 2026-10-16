@@ -267,7 +267,7 @@ class WorkerHomes(unittest.TestCase):
         self.assertNotEqual(child['CLAUDE_CONFIG_DIR'], first['CLAUDE_CONFIG_DIR'])
         self.assertEqual(child[SECURE_STORAGE_ENV], binding)
 
-    def test_claude_legacy_links_and_regular_candidates_keep_selected_store(self):
+    def test_claude_legacy_links_and_split_candidates_use_main_store(self):
         canonical = self.base / 'legacy-canonical'
         canonical.mkdir()
         (canonical / '.credentials.json').write_text('{"synthetic":"canonical"}')
@@ -308,7 +308,9 @@ class WorkerHomes(unittest.TestCase):
         regular = prepare_worker_home(
             ROOT, 'claude', 'stage', 'legacy-opaque-candidate', env=env,
             destination=regular_destination)
-        self.assertEqual(regular[SECURE_STORAGE_ENV], str(legacy_regular_home.resolve()))
+        # The split file is not this child's auth source: without a paired
+        # legacy launch environment, the builder's HOME/.claude main is used.
+        self.assertEqual(regular[SECURE_STORAGE_ENV], '')
         self.assertNotEqual(regular['CLAUDE_CONFIG_DIR'], str(legacy_regular_home))
         self.assertFalse((regular_destination / '.credentials.json').exists())
         self.assertEqual(candidate.read_bytes(), before)
@@ -316,7 +318,24 @@ class WorkerHomes(unittest.TestCase):
         self.assertEqual(json.loads((regular_destination / 'settings.json').read_text())[
                          'permissions'], {'deny': ['Read(secret)']})
         self.assertEqual(json.loads((regular_destination / 'worker-home.json').read_text())[
-                         'claude_secure_storage_dir'], str(legacy_regular_home.resolve()))
+                         'claude_secure_storage_dir'], '')
+
+        # A legacy parent's own launch environment names its source main.
+        custom_main = self.base / 'legacy-custom-main'
+        custom_main.mkdir()
+        for label, source, expected in (
+                ('default', legacy_main_home / '.claude', ''),
+                ('custom', custom_main, str(custom_main.resolve()))):
+            with self.subTest(paired_source=label):
+                paired = prepare_worker_home(
+                    ROOT, 'claude', 'stage', 'legacy-paired-' + label,
+                    env={**env, 'HEARTING_WORKER_HOME': str(legacy_regular_home),
+                         'HEARTING_MODEL_CONFIG_HOME': str(source)},
+                    destination=self.base / ('new-paired-home-' + label))
+                self.assertEqual(paired[SECURE_STORAGE_ENV], expected)
+                self.assertEqual(candidate.read_bytes(), before)
+                self.assertEqual(main_candidate.read_bytes(), main_before)
+                self.assertFalse((custom_main / '.credentials.json').exists())
 
         occupied_destination = self.base / 'occupied-regular-home'
         occupied_destination.mkdir()
@@ -326,7 +345,7 @@ class WorkerHomes(unittest.TestCase):
         occupied = prepare_worker_home(
             ROOT, 'claude', 'stage', 'legacy-opaque-candidate-occupied', env=env,
             destination=occupied_destination)
-        self.assertEqual(occupied[SECURE_STORAGE_ENV], str(legacy_regular_home.resolve()))
+        self.assertEqual(occupied[SECURE_STORAGE_ENV], '')
         self.assertEqual(destination_candidate.read_bytes(), destination_before)
         self.assertEqual(candidate.read_bytes(), before)
         self.assertEqual(main_candidate.read_bytes(), main_before)
@@ -335,7 +354,7 @@ class WorkerHomes(unittest.TestCase):
         nested = prepare_worker_home(
             ROOT, 'claude', 'review', 'nested-legacy-opaque-candidate',
             env={**env, **regular}, destination=nested_destination)
-        self.assertEqual(nested[SECURE_STORAGE_ENV], str(legacy_regular_home.resolve()))
+        self.assertEqual(nested[SECURE_STORAGE_ENV], '')
         self.assertNotEqual(nested['CLAUDE_CONFIG_DIR'], regular['CLAUDE_CONFIG_DIR'])
         self.assertFalse((nested_destination / '.credentials.json').exists())
         self.assertEqual(candidate.read_bytes(), before)
@@ -349,7 +368,7 @@ class WorkerHomes(unittest.TestCase):
             ROOT, 'claude', 'stage', 'legacy-no-credential',
             env={**env, 'CLAUDE_CONFIG_DIR': str(empty_legacy_home)},
             destination=empty_destination)
-        self.assertEqual(empty[SECURE_STORAGE_ENV], str(empty_legacy_home.resolve()))
+        self.assertEqual(empty[SECURE_STORAGE_ENV], '')
         self.assertFalse((empty_legacy_home / '.credentials.json').exists())
         self.assertFalse((empty_destination / '.credentials.json').exists())
         self.assertEqual(main_candidate.read_bytes(), main_before)
