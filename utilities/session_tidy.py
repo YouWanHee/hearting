@@ -627,13 +627,15 @@ def session_start_context(harness: str, sid: str, pane: str) -> dict:
             continue
         if row.get("event") != "start" and not row.get("start_at"):
             continue
-        source = row.get("source") if row.get("event") == "start" else row.get("start_source")
+        source = (row.get("source") if row.get("event") == "start"
+                  else row.get("latest_start_source", row.get("start_source")))
         context = {}
         if source in {"startup", "resume", "select", "clear", "compact", "fork"}:
             context["session_start_source"] = source
-        sequence = row.get("session_seq", row.get("start_seq"))
+        sequence = row.get("session_seq", row.get("latest_start_seq", row.get("start_seq")))
         if sequence is None and context.get("session_start_source"):
-            started = row.get("ts", row.get("start_at"))
+            started = (row.get("ts") if row.get("event") == "start"
+                       else row.get("latest_start_at", row.get("start_at")))
             if isinstance(started, (int, float)) and not isinstance(started, bool) and started > 0:
                 sequence = int(started * 1_000_000)
         if type(sequence) is int and sequence > 0:
@@ -716,14 +718,24 @@ def _fold_ledger(seat: Seat) -> None:
         row["first_seen"] = min(row["first_seen"], item.get("first_seen", item.get("ts", 0)))
         row["ts"] = max(row["ts"], item.get("ts", 0))
         row["epoch"] = max(row["epoch"], int(item.get("epoch", 0) or 0))
-        start_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
-        start_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
-        if (start_source in {"startup", "resume", "select", "clear", "compact", "fork"}
-                and isinstance(start_at, (int, float)) and not isinstance(start_at, bool) and start_at > 0
-                and start_at >= float(row.get("start_at", 0) or 0)):
-            row.update(start_source=start_source, start_at=start_at,
+        origin_source = item.get("source") if item.get("event") == "start" else item.get("start_source")
+        origin_at = item.get("ts") if item.get("event") == "start" else item.get("start_at")
+        if (origin_source in {"startup", "resume", "select", "clear", "compact", "fork"}
+                and isinstance(origin_at, (int, float)) and not isinstance(origin_at, bool) and origin_at > 0
+                and (not row.get("start_at") or origin_at < float(row["start_at"]))):
+            row.update(start_source=origin_source, start_at=origin_at)
+
+        latest_source = (item.get("source") if item.get("event") == "start"
+                         else item.get("latest_start_source", item.get("start_source")))
+        latest_at = (item.get("ts") if item.get("event") == "start"
+                     else item.get("latest_start_at", item.get("start_at")))
+        if (latest_source in {"startup", "resume", "select", "clear", "compact", "fork"}
+                and isinstance(latest_at, (int, float)) and not isinstance(latest_at, bool) and latest_at > 0
+                and latest_at >= float(row.get("latest_start_at", 0) or 0)):
+            row.update(latest_start_source=latest_source, latest_start_at=latest_at,
                        start_seq=item.get("session_seq", item.get("start_seq")))
             for field in ("resume_argv", "launch_cwd"):
+                row.pop(field, None)
                 if field in item:
                     row[field] = item[field]
         for field in ("transcript", "cwd"):

@@ -19,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import herdr_integration as herdr  # noqa: E402
+import fixture_env  # noqa: E402
 
 
 class PinnedSourceTest(unittest.TestCase):
@@ -42,7 +43,7 @@ class PinnedSourceTest(unittest.TestCase):
                     {"type": "command", "command": "user-prompt"},
                 ]}]},
             }), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"HOME": tmp}):
+            with fixture_env.patched_environment(tmp, ROOT):
                 result = herdr.migrate_hook_file(path, "claude", source_root=ROOT)
             self.assertEqual(result["status"], "updated")
             self.assertEqual(result["managed_config"], {
@@ -52,7 +53,7 @@ class PinnedSourceTest(unittest.TestCase):
             self.assertEqual(migrated["statusLine"], {"command": "user-status"})
             self.assertEqual(migrated["hooks"]["UserPromptSubmit"][0]["hooks"], [
                 {"type": "command", "command": "user-prompt"}])
-            with mock.patch.dict(os.environ, {"HOME": tmp}):
+            with fixture_env.patched_environment(tmp, ROOT):
                 removed = herdr.remove_managed_hook_file(path, result["managed_config"])
             self.assertTrue(removed)
             restored = json.loads(path.read_text(encoding="utf-8"))
@@ -69,7 +70,7 @@ class PinnedSourceTest(unittest.TestCase):
                 {"type": "command", "command":
                  'sh "$HOME/.claude/hooks/run-hook.sh" bash herdr-agent-state.sh working'},
             ]}]}}), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"HOME": tmp}):
+            with fixture_env.patched_environment(tmp, ROOT):
                 result = herdr.migrate_hook_file(path, "claude", source_root=root)
             self.assertEqual(result["status"], "updated")
             self.assertIsNone(result["managed_config"])
@@ -154,7 +155,7 @@ class JsoncRegistrationTest(unittest.TestCase):
   "theme": "user-theme",
 }
 ''', encoding="utf-8")
-            with mock.patch.dict(os.environ, {"HOME": tmp}):
+            with fixture_env.patched_environment(tmp, ROOT):
                 result = herdr.migrate_opencode_configs(home, ROOT)
             self.assertTrue(all(item["status"] in {"updated", "unchanged"}
                                 for item in result["actions"]), result["actions"])
@@ -169,7 +170,7 @@ class JsoncRegistrationTest(unittest.TestCase):
             cli_data = json.loads(cli.read_text(encoding="utf-8"))
             self.assertIn(herdr.OPENCODE_TUI_V2, cli_data["plugins"])
             self.assertIn(herdr.OPENCODE_IDENTITY, cli_data["plugins"])
-            with mock.patch.dict(os.environ, {"HOME": tmp}):
+            with fixture_env.patched_environment(tmp, ROOT):
                 removed = herdr.remove_opencode_configs(home, result["managed_config"])
             self.assertIn(str(tui), removed)
             self.assertIn(str(cli), removed)
@@ -192,7 +193,8 @@ class JsoncRegistrationTest(unittest.TestCase):
 
 
 class NativeSessionReporterFixtureTest(unittest.TestCase):
-    def _run_hook(self, harness, payload, *, allowed, launch_argv):
+    def _run_hook(self, harness, payload, *, allowed, launch_argv, extra_env=None,
+                  expect_report=True):
         with tempfile.TemporaryDirectory(prefix="herdr-session-hook-") as tmp:
             root = Path(tmp)
             tools = root / "tools" / "fleet"
@@ -203,7 +205,10 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 "def may_report(harness, session_id, pane_id=None):\n"
                 "    return (os.environ.get('REPORTER_FIXTURE_ALLOW') == '1' and "
                 "os.environ.get('REPORTER_FIXTURE_SESSION') == session_id and "
-                "pane_id == 'pane-fixture')\n",
+                "pane_id == 'pane-fixture' and "
+                "os.environ.get('AGENT_SESSION_ROLE') != 'worker' and "
+                "os.environ.get('AGENT_DISPATCH_CHILD') != '1' and "
+                "not os.environ.get('AGENT_DISPATCH_DEPTH'))\n",
                 encoding="utf-8",
             )
             (tools / "process_identity.py").write_text(
@@ -227,13 +232,17 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(socket_path)
             listener.listen(1)
-            listener.settimeout(2)
+            listener.settimeout(1)
             received = []
 
             def serve_once():
-                connection, _ = listener.accept()
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    return
                 with connection:
-                    line = connection.makefile("rb").readline()
+                    with connection.makefile("rb") as stream:
+                        line = stream.readline()
                     received.append(json.loads(line))
                     connection.sendall(b'{"result":{}}\n')
 
@@ -242,7 +251,7 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 server = threading.Thread(target=serve_once, daemon=True)
                 server.start()
             env = {
-                **os.environ,
+                **fixture_env.build_environment(root, ROOT),
                 "AGENT_HOME": str(root),
                 "HERDR_ENV": "1",
                 "HERDR_SOCKET_PATH": socket_path,
@@ -252,14 +261,19 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
                 "REPORTER_LAUNCH_HARNESS": harness,
                 "REPORTER_LAUNCH_ARGV": json.dumps(launch_argv),
             }
+            for marker in ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                           "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "MEM_DISTILL"):
+                env.pop(marker, None)
             if harness == "codex":
                 env["CODEX_THREAD_ID"] = payload["session_id"]
+            env.update(extra_env or {})
             result = subprocess.run(["sh", str(script), "session"], input=json.dumps(payload),
                                     text=True, capture_output=True, env=env, timeout=5, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             if server is not None:
                 server.join(2)
                 self.assertFalse(server.is_alive(), "native hook did not connect to Herdr")
+                self.assertEqual(bool(received), expect_report)
             else:
                 with self.assertRaises(socket.timeout):
                     listener.accept()
@@ -269,19 +283,38 @@ class NativeSessionReporterFixtureTest(unittest.TestCase):
     def test_native_hooks_forward_transcript_source_resume_argv_and_nanosecond_sequence(self):
         for harness, launch in (("claude", ["claude", "--resume", "ses-A"]),
                                 ("codex", ["codex", "--resume", "ses-A"])):
-            with self.subTest(harness=harness):
-                request = self._run_hook(harness, {
+            for source in ("startup", "resume", "clear", "compact", "fork"):
+                with self.subTest(harness=harness, source=source):
+                    request = self._run_hook(harness, {
+                        "hook_event_name": "SessionStart", "session_id": "ses-A",
+                        "transcript_path": "/fixture/transcript.jsonl", "source": source,
+                    }, allowed=True, launch_argv=launch)
+                    self.assertEqual(request["method"], "pane.report_agent_session")
+                    params = request["params"]
+                    self.assertEqual(params["agent"], harness)
+                    self.assertEqual(params["agent_session_id"], "ses-A")
+                    self.assertEqual(params["agent_session_path"], "/fixture/transcript.jsonl")
+                    self.assertEqual(params["session_start_source"], source)
+                    if source == "resume":
+                        self.assertEqual(params["resume_argv"], launch)
+                    else:
+                        self.assertNotIn("resume_argv", params)
+                    self.assertGreater(params["seq"], 10**18)
+
+    def test_native_session_reporters_refuse_worker_and_mismatched_codex_identity(self):
+        for harness, launch in (("claude", ["claude", "--resume", "ses-A"]),
+                                ("codex", ["codex", "--resume", "ses-A"])):
+            with self.subTest(harness=harness, case="worker"):
+                self.assertIsNone(self._run_hook(harness, {
                     "hook_event_name": "SessionStart", "session_id": "ses-A",
                     "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
-                }, allowed=True, launch_argv=launch)
-                self.assertEqual(request["method"], "pane.report_agent_session")
-                params = request["params"]
-                self.assertEqual(params["agent"], harness)
-                self.assertEqual(params["agent_session_id"], "ses-A")
-                self.assertEqual(params["agent_session_path"], "/fixture/transcript.jsonl")
-                self.assertEqual(params["session_start_source"], "resume")
-                self.assertEqual(params["resume_argv"], launch)
-                self.assertGreater(params["seq"], 10**18)
+                }, allowed=True, launch_argv=launch,
+                    extra_env={"AGENT_SESSION_ROLE": "worker"}, expect_report=False))
+        self.assertIsNone(self._run_hook("codex", {
+            "hook_event_name": "SessionStart", "session_id": "ses-A",
+            "transcript_path": "/fixture/transcript.jsonl", "source": "resume",
+        }, allowed=True, launch_argv=["codex", "--resume", "ses-A"],
+            extra_env={"CODEX_THREAD_ID": "other-session"}, expect_report=False))
 
     def test_native_hooks_respect_report_guard_and_omit_unproven_resume_argv(self):
         for harness, launch in (("claude", ["claude", "--resume", "ses-A"]),
@@ -360,7 +393,8 @@ console.log("Claude/Codex session hooks and OpenCode v1/v2 assets registered");
             result = subprocess.run(
                 ["node", "--input-type=module", "-e", script],
                 cwd=ROOT,
-                env={**os.environ, "HEARTING_TEST_ROOT": str(ROOT),
+                env={**fixture_env.build_environment(asset_root, ROOT),
+                     "HEARTING_TEST_ROOT": str(ROOT),
                      "HEARTING_TEST_ASSET_ROOT": str(asset_root)},
                 text=True,
                 capture_output=True,
@@ -446,7 +480,8 @@ console.log(JSON.stringify({valid, mismatched}));
                             asset_root / "tui/herdr-tui-session.js")
             result = subprocess.run(
                 ["node", "--input-type=module", "-e", script], cwd=ROOT,
-                env={**os.environ, "HEARTING_TEST_ASSET_ROOT": str(asset_root)},
+                env={**fixture_env.build_environment(asset_root, ROOT),
+                     "HEARTING_TEST_ASSET_ROOT": str(asset_root)},
                 text=True, capture_output=True, timeout=15, check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)

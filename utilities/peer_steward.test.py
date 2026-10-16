@@ -3344,13 +3344,18 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
     def test_continue_requires_exact_new_sid_and_idle_without_screen_reads(self):
         self.cleared()
         req = self.booking()
-        for sid, state, expected in (("sid-B", "idle", None),
-                                     ("old-sid", "idle", "target-changed"),
-                                     ("sid-B", "blocked", "not-idle-blocked")):
+        info = {"pane_id": self.seat_obj.pane, "shell_pid": 101,
+                "foreground_process_group_id": 202,
+                "foreground_processes": [{"pid": 202, "argv": ["claude"]}]}
+        for sid, native_sid, state, expected in (("sid-B", "sid-B", "idle", None),
+                                                 ("sid-B", "old-sid", "idle", "target-changed"),
+                                                 ("sid-B", "sid-B", "blocked", "not-idle-blocked")):
             ident = {"harness": "claude", "session_id": sid, "pane": self.seat_obj.pane, "name": "child"}
             with self.subTest(sid=sid, state=state), \
                  mock.patch.object(peer_steward, "_retire_target",
                                    return_value=(state, ident, 0, None)), \
+                 mock.patch.object(peer_steward, "_retire_pane_info", return_value=info), \
+                 mock.patch.object(peer_steward, "_continue_native_session", return_value=native_sid), \
                  mock.patch.object(peer_steward, "_pane_readiness",
                                    return_value=type("Ready", (), {"state": "ready", "reason": ""})()), \
                  mock.patch.object(peer_steward, "_read_screen", side_effect=AssertionError("composer read")):

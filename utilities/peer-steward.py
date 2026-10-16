@@ -1607,8 +1607,8 @@ def _retire_pane_info(pane, timeout=5):
         return None
 
 
-def _retire_foreground(pane, harness, *, strict=True):
-    info = _retire_pane_info(pane)
+def _retire_foreground(pane, harness, *, strict=True, info=None):
+    info = _retire_pane_info(pane) if info is None else info
     if info is None or (strict and len(info["foreground_processes"]) != 1):
         return None
     leaders = [item for item in info["foreground_processes"]
@@ -1665,13 +1665,13 @@ def _retire_target(target):
                 "name": target, "pane": "-"}, 4, "herdr-protocol-error")
 
 
-def _native_opencode_turn(ident):
+def _native_opencode_turn(ident, *, foreground=None):
     """Read a fresh OpenCode status event bound to this exact foreground birth."""
     if (not isinstance(ident, dict) or ident.get("harness") != "opencode"
             or any(not isinstance(ident.get(key), str) or ident[key] in {"", "-"}
                    for key in ("pane", "session_id"))):
         return None
-    foreground = _retire_foreground(ident["pane"], "opencode", strict=False)
+    foreground = foreground or _retire_foreground(ident["pane"], "opencode", strict=False)
     if not isinstance(foreground, dict):
         return None
     return herdr_observation.read_native_status(
@@ -3676,7 +3676,8 @@ def _bottom_form_tokens(target, window=15):
 
 
 def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, expected_pane=None,
-                    purpose="completion"):
+                    purpose="completion", target_observation=None, pane_info=None,
+                    native_session_id=None):
     """Use the shared projection with exact native identity and registered bindings.
 
     Before a harness's first input herdr reports no session. The session the
@@ -3685,18 +3686,30 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
     is exact by pane and shell birth: nothing can be bound to it, so its native
     turn decides. A caller holding a session still needs it."""
     try:
-        observed_state, ident, _code, _reason = _retire_target(target)
+        if target_observation is None:
+            observed_state, ident, _code, _reason = _retire_target(target)
+        else:
+            observed_state, ident = target_observation
         harness, sid, pane = ident.get("harness"), ident.get("session_id"), ident.get("pane")
-        info = _retire_pane_info(pane) if pane and pane != "-" else None
+        info = (pane_info if pane_info is not None else
+                _retire_pane_info(pane) if pane and pane != "-" else None)
         if sid == "-" and expected_sid in {None, "-"} and isinstance(info, dict):
             proven = _proven_session(info["foreground_processes"], harness)
             if proven:
                 sid, expected_sid = proven, None
+        if isinstance(native_session_id, str) and peer_message.usable_session_id(native_session_id):
+            sid = native_session_id
+        foreground = (_retire_foreground(pane, harness, strict=False, info=info)
+                      if native_session_id is not None and isinstance(info, dict) else None)
         native_source = "herdr-corroboration"
         native_turn = observed_state
-        native = _native_opencode_turn({"server": _HERDR_SESSION or "default",
-                                        "pane": pane, "harness": harness,
-                                        "session_id": sid})
+        if native_session_id is not None:
+            native_source = "native-foreground-identity"
+        native_ident = {"server": _HERDR_SESSION or "default",
+                        "pane": pane, "harness": harness, "session_id": sid}
+        native = (_native_opencode_turn(native_ident) if native_session_id is None else
+                  _native_opencode_turn(native_ident, foreground=foreground)
+                  if foreground is not None else None)
         if isinstance(native, dict) and native.get("status") in {"idle", "working", "blocked"}:
             native_turn = native["status"]
             native_source = "opencode-session-status"
@@ -3711,6 +3724,7 @@ def _pane_readiness(target, state, *, expected_harness=None, expected_sid=None, 
             and (unbound or (isinstance(sid, str) and sid and sid != "-"))
             and isinstance(pane, str) and pane and pane != "-"
             and bool(birth)
+            and (native_session_id is None or foreground is not None)
             and (expected_harness is None or harness == expected_harness)
             and (expected_sid is None or sid == expected_sid)
             and (expected_pane is None or pane == expected_pane)
@@ -4535,6 +4549,33 @@ def _process_session(pane, harness):
     return _proven_session(processes, harness)
 
 
+def _continue_native_session(pane, harness, *, process_info):
+    """Resolve the exact foreground TUI session for the continue action boundary."""
+    if not isinstance(process_info, dict) or process_info.get("pane_id") != pane:
+        return None
+    foreground = _retire_foreground(pane, harness, strict=False, info=process_info)
+    if not foreground:
+        return None
+    if harness == "codex":
+        try:
+            from pane_ownership import current_codex_thread
+            session_id = current_codex_thread(
+                pane, foreground["pid"], executable=shutil.which("herdr"),
+                server=_HERDR_SESSION)
+        except Exception:
+            return None
+    else:
+        session_id = _proven_session([{"pid": foreground["pid"]}], harness)
+    if not peer_message.usable_session_id(session_id):
+        return None
+    latest = _retire_process_record(foreground["pid"])
+    if not latest or latest.get("start") != foreground.get("start"):
+        return None
+    if harness != "codex" and _proven_session([{"pid": foreground["pid"]}], harness) != session_id:
+        return None
+    return session_id
+
+
 def _proven_session(processes, harness):
     """The session one of these foreground processes proves (`fleet.process_identity`), or None."""
     try:
@@ -4863,18 +4904,27 @@ def _continue_look(target, req):
     if reason or state in ("agent-not-found", "timeout", "unknown"):
         return reason or state
     pane = (req.get("seat") or {}).get("pane")
-    sid = peer_message.usable_session_id(ident.get("session_id"))
     if (ident.get("harness") != harness or not pane or ident.get("pane") != pane):
         return "target-changed"
-    if not new or new == "-" or sid != new:
-        return "new-session-unknown" if not new or new == "-" else "target-changed"
+    if not new or new == "-":
+        return "new-session-unknown"
     if state not in ("idle", "done"):
         return f"not-idle-{state}"
     card = _continue_card_reason(req)
     if card:
         return card
+    info = _retire_pane_info(pane)
+    if not isinstance(info, dict):
+        return "target-identity-unknown"
+    native_sid = _continue_native_session(pane, harness, process_info=info)
+    if not peer_message.usable_session_id(native_sid):
+        return "new-session-unknown"
+    if native_sid != new:
+        return "target-changed"
     readiness = _pane_readiness(target, state, expected_harness=harness,
-                                expected_sid=new, expected_pane=pane, purpose="completion")
+                                expected_sid=new, expected_pane=pane, purpose="completion",
+                                target_observation=(state, ident), pane_info=info,
+                                native_session_id=native_sid)
     if readiness.state != "ready":
         return readiness.reason or "target-identity-unknown"
     return None

@@ -246,12 +246,37 @@ class CurrentSessionTest(unittest.TestCase):
                 mock.patch("fleet.gitinfo.resolve_gitdir", side_effect=lambda cwd: (None, cwd)):
             session_tidy._fold_ledger(seat)
             rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "compact",
-                          "cwd": self.cwd, "ts": 4},
+                          "session_seq": 400, "cwd": self.cwd, "ts": 4},
                          {"harness": "claude", "sid": "current", "event": "prompt", "cwd": self.cwd, "ts": 5}])
             session_tidy._fold_ledger(seat)
             current = next(row for row in rows if row["sid"] == "current" and row["event"] == "summary")
             self.assertEqual((current["start_source"], current["start_at"]), ("clear", 2))
             edges = process_identity.pane_session_successors("claude", "wB:p3N", self.cwd)
+            rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "resume",
+                          "session_seq": 600, "resume_argv": ["claude", "--resume", "current"],
+                          "launch_cwd": "/new-cwd", "transcript": "/transcript/current.jsonl",
+                          "cwd": "/new-cwd", "ts": 6},
+                         {"harness": "claude", "sid": "current", "event": "prompt",
+                          "cwd": "/new-cwd", "ts": 7}])
+            session_tidy._fold_ledger(seat)
+            current = next(row for row in rows if row["sid"] == "current" and row["event"] == "summary")
+            self.assertEqual((current["start_source"], current["start_at"]), ("clear", 2))
+            context = session_tidy.session_start_context("claude", "current", "wB:p3N")
+            self.assertEqual(context, {"session_start_source": "resume", "session_seq": 600,
+                                      "resume_argv": ["claude", "--resume", "current"],
+                                      "launch_cwd": "/new-cwd",
+                                      "transcript": "/transcript/current.jsonl"})
+            # A later resume without proven launch context must not inherit an
+            # earlier launch's argv or cwd merely because the SID is unchanged.
+            rows.extend([{"harness": "claude", "sid": "current", "event": "start", "source": "resume",
+                          "session_seq": 800, "cwd": self.cwd, "ts": 8},
+                         {"harness": "claude", "sid": "current", "event": "prompt",
+                          "cwd": self.cwd, "ts": 9}])
+            session_tidy._fold_ledger(seat)
+            context = session_tidy.session_start_context("claude", "current", "wB:p3N")
+            self.assertEqual((context["session_start_source"], context["session_seq"]), ("resume", 800))
+            self.assertNotIn("resume_argv", context)
+            self.assertNotIn("launch_cwd", context)
         sid, _ = process_identity.resolve_session_claims({"registry": "old", "pane": "current"}, edges)
         self.assertEqual(sid, "current")
 
