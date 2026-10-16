@@ -7313,6 +7313,14 @@ def write_completion_marker(
         route_hash=route["route_hash"],
         owner_override=owner_override, owner_chain=owner_chain,
     )
+    from review_source_subject import SourceSubjectError, marker_subject
+    try:
+        source_subject = marker_subject(
+            route, node, attempt_id=attempt_id, attempt_metadata=attempt_metadata,
+            jobs=jobs, worktree=route.get("cwd"), completion_dir=directory,
+        )
+    except SourceSubjectError as exc:
+        raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
     replayed=_completion_marker_replay(
         route,node,node_id,evidence,axes,directory,
         repair=expected_evidence_sha256 is None,
@@ -7391,10 +7399,20 @@ def write_completion_marker(
                     if metadata.get("attempt_id") == attempt_id and metadata.get("review_input_digest"):
                         reviewed_input = review_input.read_binding(jobs, metadata)
                         break
+            if source_subject is not None and node.get("kind") == "review-worker" and jobs is not None:
+                from review_source_subject import read_binding as read_review_subject
+                bound_rows = []
+                for status, metadata in rows:
+                    binding = read_review_subject(jobs, metadata, required=False)
+                    bound_rows.append((status, metadata if binding is None else {
+                        **metadata, "_review_subject_digest": binding["subject_digest"]
+                    }))
+                rows = bound_rows
             revisions=_dependency_revisions(route,node,jobs,reviewed_input=reviewed_input)
         round_census=REVIEW_ROUND_CAP.marker_round_census(
             route,node,rows,site=site,revisions=revisions,
             independently_reviewed=review_identity.get("review_independence")=="independent",
+            source_subject_digest=(source_subject or {}).get("digest"),
         )
     if REVIEW_ROUND_CAP.is_round_capped_node(node) and site == "inline":
         ROUTE_AUTHORITY.require_continuation(ROUTE_AUTHORITY.decide_continuation(
@@ -7420,6 +7438,8 @@ def write_completion_marker(
         "evidence":{"path":str(evidence),"sha256":sha},
         "sequence":sequence,
     }
+    if source_subject is not None:
+        marker["source_subject"] = source_subject
     from datetime import datetime, timezone
     marker["completed_at"]=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     while True:
@@ -8090,7 +8110,7 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
         # is nothing to revise, a distinct fact from a dependent gate
         # finding no marker for an unstarted node.
         raise ValueError("revision-target-marker-absent")
-    currency = gate_currency(route, node, canonical_path, marker)
+    currency = gate_currency(route, node, canonical_path, marker, allow_source_transition=True)
     if currency.state not in ("current", "revised-unrecorded"):
         # `superseded`, `completion-evidence-unreadable`, or any
         # `integrity-broken:*` -- every one of these is a kept refusal
@@ -8160,6 +8180,21 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
     new_marker["evidence"] = {"path": str(evidence_path), "sha256": evidence_sha}
     new_marker["sequence"] = new_sequence
     new_marker["revision"] = revision_record
+    from review_source_subject import SourceSubjectError, marker_subject
+    try:
+        revised_subject = marker_subject(
+            route, node, attempt_id=author_attempt_id, jobs=jobs,
+            worktree=route.get("cwd"), completion_dir=directory,
+        )
+    except SourceSubjectError as exc:
+        raise ValueError(f"{exc.reason}:{exc.detail}" if exc.detail else exc.reason) from exc
+    if revised_subject is not None:
+        new_marker["source_subject"] = revised_subject
+    previous_subject = marker.get("source_subject")
+    source_changed = bool(revised_subject is not None and (
+        not isinstance(previous_subject, dict)
+        or previous_subject.get("digest") != revised_subject.get("digest")
+    ))
     # SD-153 rule 5: a revision over a capped node gets its OWN fresh
     # census (site="revision") -- the prior marker's census (if any)
     # described a different write and must not survive the copy above.
@@ -8185,6 +8220,17 @@ def _producer_revision_plan(route, node_id, evidence, *, basis, answers=(), dire
             continue
         if downstream_marker.get("state") == "superseded-by-upstream-revision":
             continue
+        if source_changed and revised_subject is not None:
+            downstream_node = next((candidate for candidate in route.get("nodes", [])
+                                    if candidate.get("id") == downstream_id), None)
+            downstream_subject = downstream_marker.get("source_subject")
+            if (downstream_node is not None and isinstance(downstream_subject, dict)
+                    and downstream_subject.get("digest") == revised_subject.get("digest")
+                    and downstream_subject.get("epoch") == revised_subject.get("epoch")):
+                downstream_currency = gate_currency(
+                    route, downstream_node, downstream_canonical, downstream_marker, observe=True)
+                if downstream_currency.state == "current":
+                    continue
         downstream_sequence = _next_marker_sequence(directory, downstream_id)
         tombstone_marker = dict(downstream_marker)
         tombstone_marker["sequence"] = downstream_sequence
@@ -8937,10 +8983,43 @@ def _owner_closure_eligibility(route, node, node_id, evidence, row_metadata, lin
                f"kind={node.get('kind') or '-'};worker_type={row_metadata.get('worker_type') or '-'}")
     if rounds is None:
         rounds=_review_round_rows(lines,route["route_id"],node_id,jobs=jobs)
-    choice = ROUTE_AUTHORITY.decide_continuation(route, action="owner-closure", node=node, rows=rounds)
+    source_subject_digest = None
+    from review_source_subject import SourceSubjectError, is_implementation_review, observe, read_binding, source_epoch
+    if is_implementation_review(route, node):
+        try:
+            binding = read_binding(jobs, row_metadata, required=False) if jobs else None
+            current = observe(route, node, worktree=route.get("cwd"))
+            epoch = source_epoch(route, node, current["digest"], completion_dir(route["route_id"], jobs=jobs))
+        except (SourceSubjectError, OSError, ValueError) as exc:
+            refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
+        if binding is None:
+            refuse("source-subject-unknown", row_metadata.get("attempt_id", ""))
+        if (binding["subject_digest"] != current["digest"]
+                or binding["source_epoch"] != epoch):
+            refuse("source-subject-stale", row_metadata.get("attempt_id", ""))
+        source_subject_digest = binding["subject_digest"]
+        bound_rounds = []
+        for status, metadata in rounds:
+            try:
+                row_binding = read_binding(jobs, metadata, required=False)
+            except SourceSubjectError as exc:
+                refuse("source-subject-unverifiable", getattr(exc, "reason", str(exc)))
+            bound_rounds.append((status, metadata if row_binding is None else {
+                **metadata, "_review_subject_digest": row_binding["subject_digest"]
+            }))
+        rounds = bound_rounds
+    choice = ROUTE_AUTHORITY.decide_continuation(route, action="owner-closure", node=node, rows=rounds,
+        facts=({"source_subject_digest": source_subject_digest}
+               if source_subject_digest is not None else None))
     ROUTE_AUTHORITY.require_continuation(choice)
     budget = choice.budget
-    terminated=[(status,metadata) for status,metadata in rounds if status not in _LIVE_ROW_STATUSES]
+    closure_rounds = rounds
+    if source_subject_digest is not None:
+        closure_rounds = [(status, metadata) for status, metadata in rounds
+                          if metadata.get("_review_subject_digest") == source_subject_digest
+                          or metadata.get("review_subject_digest") == source_subject_digest]
+    terminated=[(status,metadata) for status,metadata in closure_rounds
+                if status not in _LIVE_ROW_STATUSES]
     max_round=budget.cap
     own=row_metadata.get("attempt_id")
     canonical=completion_dir(route["route_id"])/f"{node_id}.json"
@@ -9270,6 +9349,7 @@ def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
                                      rounds=rounds, check_canonical=_same_route, jobs=jobs)
     reviews = []
     seen = set()
+    blocking_attempts = set(facts.get("blocking_attempts") or ())
     for row_status, meta in rounds:
         identity = meta.get("attempt_id")
         parent = route_by_id[meta.get("route_id") or meta.get("route")]
@@ -9285,7 +9365,8 @@ def continuation_owner_closure_plan(route, node, evidence, jobs, attempt_id, *,
             process = attempt_process_quiescence(meta, terminal_receipt=True)
             if process.state != "quiescent":
                 raise ValueError(f"owner-closure-round-{process.state}:{identity}:{process.reason}")
-        if row_status == "done" and meta.get("note") == REVIEW_BLOCKING_NOTE:
+        if (identity in blocking_attempts and row_status == "done"
+                and meta.get("note") == REVIEW_BLOCKING_NOTE):
             reviewed = _owner_closure_eligibility(parent, node, node["id"], evidence, meta, lines,
                                                  rounds=rounds, check_canonical=False)
             encoded = reviewed["review_artifact_b64"]

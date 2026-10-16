@@ -642,6 +642,21 @@ def append_job(jobs: Path, args: argparse.Namespace, *, harness: str, runtime_sa
     from review_input import registration_fragment
     pipe += commit_policy.registry_fragment(args)
     pipe += registration_fragment(args)
+    if args.route_file and args.route_node and args.attempt_id:
+        from review_source_subject import SourceSubjectError, is_implementation_review, observe
+        try:
+            route = json.loads(Path(args.route_file).read_text(encoding="utf-8"))
+            node = next((item for item in route.get("nodes", [])
+                         if item.get("id") == args.route_node), None)
+            if node is not None and is_implementation_review(route, node):
+                observed = observe(route, node, worktree=args.worktree)
+                expected = os.environ.get("AGENT_REVIEW_SOURCE_SUBJECT_DIGEST")
+                if expected and observed["digest"] != expected:
+                    raise SourceSubjectError("review-source-admission-subject-changed", args.attempt_id)
+        except SourceSubjectError as exc:
+            raise DispatchContractError(exc.reason, exc.detail) from exc
+        except (OSError, ValueError, StopIteration) as exc:
+            raise DispatchContractError("review-source-route-unavailable", str(exc)) from exc
     from dispatch_replacement import seal_launch_input
     if replacement_sandbox is not None:
         args.replacement_runtime_sandbox = replacement_sandbox

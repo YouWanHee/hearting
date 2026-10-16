@@ -7066,6 +7066,9 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
   meta=dict(axes,attempt_id="att-review-self",worker_type="review",harness=harness,
    route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],route_file=str(path),
    parent_attempt_id="att-owner",artifact_root=str(artifact),log_file=str(log))
+  from review_source_subject import is_implementation_review, seal_attempt
+  if is_implementation_review(route,node):
+   meta.update(seal_attempt(self.jobs,route,node,meta["attempt_id"],worktree=repo))
   # Publish the original completion from a finite, already reaped lifecycle.
   # Its real launch identity lets the normal terminal writer preserve the
   # full cleanup proof before a later CLI observer becomes unobservable.

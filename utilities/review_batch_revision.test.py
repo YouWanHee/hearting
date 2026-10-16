@@ -742,6 +742,11 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.fixture_row(target, note='dead-invalid-envelope', failure_class='contract')
         fields, meta = REPLACEMENT._rows(self.jobs.read_text().splitlines())[target]
         meta = {**meta, 'attempt_id': 'att-fixture-verdictless-2', 'note': 'dead-missing-result'}
+        # This synthetic physical observation has no immutable source binding;
+        # it must remain legacy-unknown rather than borrowing the original
+        # attempt's exact subject digest under a different attempt id.
+        meta.pop('review_subject_digest', None)
+        meta.pop('review_subject_binding_digest', None)
         # This extra physical fixture record never had a native launch claim.
         meta.update(launch_claimed='0', launch_started='0', launch_outcome='never-launched')
         for key in ('pid', 'pid_start', 'pgid', 'log_file', 'completion_marker'):

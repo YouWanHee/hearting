@@ -10,6 +10,7 @@ FAIL/blocking review) does not spend the exhaustion budget by itself; two of
 them in a row bind the node to the sealed fallback chain's remaining
 unregistered hop instead (`VERDICTLESS_BOUND`).
 """
+import base64
 import importlib.util
 import sys
 import tempfile
@@ -260,33 +261,72 @@ class RoundBudgetTest(unittest.TestCase):
         exhausted = CAP.round_budget(
             route("standard", cap=1), review_node(), [row("done", "completed-review-blocking")]
         )
-        self.assertEqual(exhausted.next_action, "owner-closure")
+        self.assertEqual(exhausted.next_action, "owner-report")
 
 
 class RecoveryFieldsTest(unittest.TestCase):
     def test_owner_closed_review_does_not_repeat_its_completion_commands(self):
         r = {**route(), 'route_id': 'rt-test', 'route_hash': 'sha256:test'}
         node = review_node()
+        r['nodes'] = [node]
         with tempfile.TemporaryDirectory() as directory, mock.patch(
                 'route_lineage.verified_route_lineage', return_value=[r]):
-            jobs = Path(directory)/'jobs.log'
             r['artifact_root'] = directory
-            for note in ('completed-review-blocking', 'completed-marker'):
-                metadata = {'route_id': 'rt-test', 'route_hash': 'sha256:test', 'route_node': node['id'],
-                            'attempt_id': 'att-review-2', 'worker_type': 'review', 'note': note,
-                            'failure_class': 'fail', 'review_gate_closure': 'owner-closure',
-                            'review_independence': 'owner-overridden'}
-                jobs.write_text('now\tdone\twt\troot\ttask\t' + ','.join(
-                    f'{key}={value}' for key, value in metadata.items()) + '\n')
-                fields = CAP.recovery_fields('review-worker', route=r, node=node, jobs=jobs,
-                                             route_file=Path(directory)/'route.json')
+            jobs = Path(directory)/'jobs.log'
+            review_artifact = Path(directory)/'review.md'
+            review_artifact.write_text('review findings', encoding='utf-8')
+            encoded = base64.urlsafe_b64encode(str(review_artifact).encode()).decode().rstrip('=')
+            for latest_note in ('completed-review-blocking', 'completed-marker'):
+                rows = []
+                for index, note in enumerate(('completed-review-blocking', latest_note), 1):
+                    metadata = {'route_id': 'rt-test', 'route_hash': 'sha256:test',
+                                'route_node': node['id'], 'attempt_id': f'att-review-{index}',
+                                'worker_type': 'review', 'note': note,
+                                'failure_class': 'fail' if note == 'completed-review-blocking' else 'pass',
+                                'review_artifact_b64': encoded}
+                    if note == 'completed-marker':
+                        metadata.update(review_gate_closure='owner-closure',
+                                        review_independence='owner-overridden')
+                    rows.append('now\tdone\twt\troot\ttask\t' + ','.join(
+                        f'{key}={value}' for key, value in metadata.items()))
+                jobs.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+                with mock.patch('dispatch_contract.observe_terminal_review_failure', return_value={}):
+                    fields = CAP.recovery_fields('review-worker', route=r, node=node, jobs=jobs,
+                                                 route_file=Path(directory)/'route.json')
+                expected = latest_note == 'completed-review-blocking'
+                if expected:
+                    self.assertEqual(fields['next_action'], 'owner-closure')
+                else:
+                    self.assertNotIn('next_action', fields)
                 for key in ('recovery_complete_command', 'recovery_check_command'):
-                    self.assertEqual(key in fields, note == 'completed-review-blocking')
+                    self.assertEqual(key in fields, expected)
 
-    def test_exhausted_review_worker_points_at_owner_closure(self):
+    def test_all_pass_exhaustion_has_no_owner_closure_surface(self):
         fields = CAP.recovery_fields("review-worker")
-        self.assertEqual(fields["recovery_surface"], "capability-route complete")
-        self.assertEqual(fields["required_action"], "resolve-review-findings")
+        self.assertEqual(fields["recovery_surface"], "owner-report")
+        self.assertEqual(fields["required_action"], "report-unresolved-verification")
+        self.assertNotIn("next_action", fields)
+
+    def test_blocking_review_without_sealed_artifact_does_not_advertise_closure(self):
+        r = {**route(), 'route_id': 'rt-no-artifact', 'route_hash': 'sha256:no-artifact'}
+        node = review_node()
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+                'route_lineage.verified_route_lineage', return_value=[r]):
+            r['artifact_root'] = directory
+            jobs = Path(directory)/'jobs.log'
+            rows = []
+            for index in (1, 2):
+                metadata = {'route_id': r['route_id'], 'route_hash': r['route_hash'],
+                            'route_node': node['id'], 'attempt_id': f'att-review-{index}',
+                            'worker_type': 'review', 'note': 'completed-review-blocking'}
+                rows.append('now\tdone\twt\troot\ttask\t' + ','.join(
+                    f'{key}={value}' for key, value in metadata.items()))
+            jobs.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+            fields = CAP.recovery_fields('review-worker', route=r, node=node, jobs=jobs,
+                                         route_file=Path(directory)/'route.json')
+            self.assertEqual(fields['recovery_surface'], 'owner-report')
+            self.assertNotIn('recovery_complete_command', fields)
+            self.assertNotIn('recovery_check_command', fields)
 
     def test_exhausted_non_review_names_existing_inline_completion(self):
         fields = CAP.recovery_fields("pipeline-stage")

@@ -20,6 +20,11 @@ import review_input as R
 
 class ReviewInputTest(unittest.TestCase):
     def setUp(self):
+        # Refusal assertions exercise the opt-in integrity fence explicitly;
+        # gate-off continuation has its own tests that set `off` locally.
+        gates = mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'})
+        gates.start()
+        self.addCleanup(gates.stop)
         import opencode_context_window
         from fixtures.opencode_native_context import launch_context
         native = mock.patch.object(opencode_context_window, "prepare_launch_context", side_effect=launch_context)

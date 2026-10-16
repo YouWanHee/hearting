@@ -156,7 +156,7 @@ def _attempt_action(status: str, metadata: Mapping[str, str]) -> str:
 def _round_action(state, node_kind):
     review = node_kind == "review-worker"
     return {"admit": "dispatch", "blocked-live": "wait", "blocked-unsettled": "wait",
-            "exhausted": "owner-closure" if review else "report",
+            "exhausted": "owner-report" if review else "report",
             "verdictless-bound": "native-subagent" if review else "owner-inline"}[state]
 
 
@@ -555,13 +555,36 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                     census.append((fields, meta))
             history = [(f[1], m) for f, m in _ROUND.logical_round_records(census, jobs=jobs)]
             worker = candidate.get("worker_type") or ("review" if candidate.get("kind") == "review-worker" else "test")
-            if not history or not _ROUND.last_verdict_blocking(history, worker):
+            source_digest = None
+            current_history = history
+            if candidate.get("kind") == "review-worker":
+                from review_source_subject import SourceSubjectError, annotate_rows, is_implementation_review, observe
+                if is_implementation_review(route, candidate):
+                    try:
+                        source_digest = observe(route, candidate, worktree=route.get("cwd"))["digest"]
+                        current_history = [(status, metadata) for status, metadata in
+                            annotate_rows(jobs, history)
+                            if metadata.get("_review_subject_digest") == source_digest
+                            or metadata.get("review_subject_digest") == source_digest]
+                    except SourceSubjectError as exc:
+                        # This is an owner fix handoff, not a current-PASS or
+                        # fresh-review admission. Preserve legacy failure
+                        # answers when an old fixture/worktree has no Git tree.
+                        if exc.reason not in {"review-source-git-unavailable",
+                                              "review-source-worktree-unavailable"}:
+                            raise
+                        source_digest = None
+                        current_history = history
+            if not current_history or not _ROUND.last_verdict_blocking(current_history, worker):
                 continue
-            last = next(m for st, m in reversed(history) if _ROUND.classify_round_row(st, m,
+            last = next(m for st, m in reversed(current_history) if _ROUND.classify_round_row(st, m,
                         worker_type=m.get("worker_type") or worker) == "verdict")
             failed = last.get("attempt_id", "")
             choice = decide_continuation(route, action="round", node=candidate, rows=history,
-                                         revisions=[{"answers": [failed]}])
+                jobs=jobs if source_digest is not None else None,
+                revisions=[{"answers": [failed]}],
+                facts=({"source_subject_digest": source_digest}
+                       if source_digest is not None else None))
             if failed and choice.budget.round_kind == "closure-check":
                 answers.append(failed)
             elif owner_closure_shape(last) != "registered-review":
@@ -585,7 +608,31 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                 raise
         worker_type = node.get("worker_type") or ("review" if node.get("kind") == "review-worker" else "test")
         kinds = [_ROUND.classify_round_row(s, m, worker_type=m.get("worker_type") or worker_type) for s, m in rows]
-        verdicts = [i for i, kind in enumerate(kinds) if kind == "verdict"]
+        source_digest = facts.get("source_subject_digest")
+        source_aware = False
+        budget_rows = rows
+        budget_kinds = kinds
+        if node.get("kind") == "review-worker":
+            from review_source_subject import annotate_rows, is_implementation_review, observe
+            if is_implementation_review(route, node):
+                if source_digest is None and jobs is not None:
+                    source_digest = observe(route, node, worktree=route.get("cwd"))["digest"]
+                    rows = annotate_rows(jobs, rows)
+                    kinds = [_ROUND.classify_round_row(s, m,
+                        worker_type=m.get("worker_type") or worker_type) for s, m in rows]
+                if source_digest is not None:
+                    source_aware = True
+                    budget_rows = [(status, meta) for status, meta in rows
+                                   if meta.get("_review_subject_digest") == source_digest
+                                   or meta.get("review_subject_digest") == source_digest]
+                    budget_kinds = [_ROUND.classify_round_row(s, m,
+                        worker_type=m.get("worker_type") or worker_type) for s, m in budget_rows]
+        verdicts = [i for i, kind in enumerate(budget_kinds) if kind == "verdict"]
+        subject_attempts = {m.get("attempt_id") for _status, m in budget_rows if m.get("attempt_id")}
+        budget_revisions = [revision for revision in revisions if any(
+            attempt in subject_attempts
+            for attempt in (*tuple(revision.get("answers") or ()), *tuple(revision.get("supersedes") or ()))
+        )] if source_aware else revisions
         streak = 0
         for kind in reversed(kinds):
             if kind != "verdict-less":
@@ -598,16 +645,20 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                  "exhausted" if len(verdicts) >= cap else "admit")
         # A FAIL a revision answers, or a verdict whose marker an upstream
         # revision tombstoned, gets its one check within the cap + 1 ceiling.
-        last_id = rows[verdicts[-1]][1].get("attempt_id") if verdicts else None
+        last_row = budget_rows[verdicts[-1]] if verdicts else None
+        last_id = last_row[1].get("attempt_id") if last_row else None
         closure = bool(state in {"admit", "exhausted"} and len(verdicts) < cap + 1 and last_id and (
-            (_ROUND._last_round_blocking_verdict([rows[verdicts[-1]]], worker_type) and
-             any(last_id in (r.get("answers") or ()) for r in revisions)) or
-            any(last_id in (r.get("supersedes") or ()) for r in revisions)))
+            (_ROUND._last_round_blocking_verdict([last_row], worker_type) and
+             any(last_id in (r.get("answers") or ()) for r in budget_revisions)) or
+            any(last_id in (r.get("supersedes") or ()) for r in budget_revisions)))
         if closure:
             state = "admit"
+        round_kind = ("closure-check" if closure else
+                      "correction" if verdicts else "first" if source_aware else
+                      "correction" if rows else "first")
         budget = _ROUND.RoundBudget(len(verdicts), counted, kinds.count("verdict-less"), cap, state,
             len(rows) + 1, len(rows) + 1 if rows else 0,
-            "closure-check" if closure else "correction" if rows else "first",
+            round_kind,
             _round_action(state, node.get("kind")), closure, counted < streak)
     state = budget.state
     if action == "marker":
