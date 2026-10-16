@@ -14,6 +14,7 @@ from unittest.mock import patch
 import worker_runtime_home
 from worker_runtime_home import prepare_worker_home, codex_worker_arguments, claude_worker_arguments
 from worker_bootstrap import render_worker_bootstrap
+from claude_credential_recovery import SECURE_STORAGE_ENV
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,6 +41,7 @@ class WorkerHomes(unittest.TestCase):
         before = {p.name: p.read_bytes() for p in self.source.iterdir() if p.is_file()}
         for typ in ('owner', 'stage', 'review', 'support', 'frame'):
             env = prepare_worker_home(ROOT, 'codex', typ, typ, env=self.env)
+            self.assertNotIn(SECURE_STORAGE_ENV, env)
             self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
             self.assertEqual(env['HEARTING_MODEL_CONFIG_HOME'], str(self.source))
             home = Path(env['CODEX_HOME'])
@@ -64,6 +66,7 @@ class WorkerHomes(unittest.TestCase):
                     'enabledPlugins': {'plugin@market': True}, 'autoMemoryEnabled': True}
         (self.source / 'settings.json').write_text(json.dumps(settings))
         (self.source / '.credentials.json').write_text('{}')
+        credential_bytes = (self.source / '.credentials.json').read_bytes()
         account = {'accountUuid': 'user-account', 'organizationUuid': 'user-org'}
         (self.source / '.claude.json').write_text(json.dumps({'oauthAccount': account, 'mcpServers': {'main': {}}}))
         self.env['CLAUDE_CONFIG_DIR'] = str(self.source)
@@ -76,11 +79,163 @@ class WorkerHomes(unittest.TestCase):
             self.assertEqual(actual[key], settings[key])
         self.assertEqual(actual['enabledPlugins'], {'plugin@market': False})
         self.assertFalse(actual['autoMemoryEnabled'])
-        self.assertEqual((home / '.credentials.json').resolve(), (self.source / '.credentials.json').resolve())
+        self.assertEqual(env[SECURE_STORAGE_ENV], str(self.source.resolve()))
+        self.assertFalse((home / '.credentials.json').exists())
+        self.assertEqual((self.source / '.credentials.json').read_bytes(), credential_bytes)
+        self.assertEqual(json.loads((home / 'worker-home.json').read_text())[
+                         'claude_secure_storage_dir'], str(self.source.resolve()))
         self.assertEqual((home / 'hooks/user-guard.py').resolve(), (self.source / 'hooks/user-guard.py').resolve())
         self.assertEqual(json.loads((home / '.claude.json').read_text()), {'oauthAccount': account})
         self.assertIn('--strict-mcp-config', claude_worker_arguments(env))
         self.assertNotIn('--bare', claude_worker_arguments(env))
+
+    def test_claude_binding_covers_worker_types_and_cross_harness_descendants(self):
+        source = self.base / 'main-claude-config'
+        source.mkdir()
+        (source / '.credentials.json').write_text('{"synthetic":"main"}')
+        (source / 'settings.json').write_text(json.dumps({
+            'permissions': {'deny': ['Read(secret)']}, 'env': {'USER_GUARD': '1'}}))
+        env = {**self.env, 'HOME': str(self.base / 'user-home'),
+               'CLAUDE_CONFIG_DIR': str(source)}
+        expected = str(source.resolve())
+        first = None
+        for worker_type in ('owner', 'stage', 'review', 'support', 'frame'):
+            with self.subTest(worker_type=worker_type):
+                values = prepare_worker_home(
+                    ROOT, 'claude', worker_type, 'all-types-' + worker_type, env=env)
+                self.assertEqual(values[SECURE_STORAGE_ENV], expected)
+                worker_config = Path(values['CLAUDE_CONFIG_DIR'])
+                self.assertFalse((worker_config / '.credentials.json').exists())
+                self.assertEqual(json.loads((worker_config / 'settings.json').read_text())[
+                                 'permissions'], {'deny': ['Read(secret)']})
+                if worker_type == 'owner':
+                    first = values
+
+        codex_source = self.base / 'cross-codex-config'
+        codex_source.mkdir()
+        for name, content in (('auth.json', '{}'), ('config.toml', '')):
+            (codex_source / name).write_text(content)
+        codex_before = {name: (codex_source / name).read_bytes()
+                        for name in ('auth.json', 'config.toml')}
+        codex_parent = {**env, **first, 'CODEX_HOME': str(codex_source)}
+        codex = prepare_worker_home(ROOT, 'codex', 'review', 'claude-through-codex',
+                                    env=codex_parent)
+        self.assertNotIn(SECURE_STORAGE_ENV, codex)
+        through_codex = {**codex_parent, **codex}
+        nested_codex = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'nested-after-codex', env=through_codex)
+        self.assertEqual(nested_codex[SECURE_STORAGE_ENV], expected)
+        self.assertEqual({name: (codex_source / name).read_bytes()
+                          for name in ('auth.json', 'config.toml')}, codex_before)
+
+        opencode_source = self.base / 'cross-opencode-config'
+        opencode_source.mkdir()
+        opencode_config = opencode_source / 'opencode.json'
+        opencode_config.write_text(json.dumps({'provider': {'fixture': {'name': 'test'}}}))
+        opencode_before = opencode_config.read_bytes()
+        opencode_parent = {**env, **first,
+                           'OPENCODE_CONFIG_DIR': str(opencode_source),
+                           'XDG_CONFIG_HOME': str(self.base / 'xdg-config')}
+        opencode = prepare_worker_home(
+            ROOT, 'opencode', 'review', 'claude-through-opencode', env=opencode_parent)
+        self.assertNotIn(SECURE_STORAGE_ENV, opencode)
+        through_opencode = {**opencode_parent, **opencode}
+        nested_opencode = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'nested-after-opencode', env=through_opencode)
+        self.assertEqual(nested_opencode[SECURE_STORAGE_ENV], expected)
+        self.assertEqual(opencode_config.read_bytes(), opencode_before)
+
+    def test_claude_secure_storage_override_values_and_config_fallback_are_preserved(self):
+        home = self.base / 'worker-home'
+        config = self.base / 'main-config'
+        env = {**self.env, 'HOME': str(self.base / 'user-home'),
+               'CLAUDE_CONFIG_DIR': str(config)}
+        for value, expected in (
+                ('', ''),
+                (str(self.base / 'custom-auth'), str(self.base / 'custom-auth')),
+                ('relative-auth', str((Path.cwd() / 'relative-auth').resolve()))):
+            with self.subTest(value=value):
+                result = prepare_worker_home(
+                    ROOT, 'claude', 'stage', 'override-' + repr(value),
+                    env={**env, SECURE_STORAGE_ENV: value},
+                    destination=home / ('empty' if value == '' else str(abs(hash(value)))))
+                self.assertEqual(result[SECURE_STORAGE_ENV], expected)
+
+        default_env = {**self.env, 'HOME': str(self.base / 'alternate-home')}
+        default_env.pop('CLAUDE_CONFIG_DIR', None)
+        default = prepare_worker_home(ROOT, 'claude', 'review', 'default-auth',
+                                      env=default_env, destination=home / 'default')
+        self.assertEqual(default[SECURE_STORAGE_ENV], '')
+
+        missing_custom = self.base / 'missing-account-config'
+        custom = prepare_worker_home(
+            ROOT, 'claude', 'support', 'missing-custom-auth',
+            env={**self.env, 'HOME': str(self.base / 'alternate-home'),
+                 'CLAUDE_CONFIG_DIR': str(missing_custom)},
+            destination=home / 'missing-custom')
+        self.assertEqual(custom[SECURE_STORAGE_ENV], str(missing_custom.resolve()))
+        self.assertFalse((Path(custom['CLAUDE_CONFIG_DIR']) / '.credentials.json').exists())
+
+    def test_claude_settings_env_precedence_is_normalized_and_nested_store_is_stable(self):
+        config = self.base / 'main-config'
+        config.mkdir()
+        (config / 'settings.json').write_text(json.dumps({
+            'env': {SECURE_STORAGE_ENV: 'settings-auth', 'USER_GUARD': '1'},
+            'permissions': {'deny': ['Read(secret)']}}))
+        env = {**self.env, 'CLAUDE_CONFIG_DIR': str(config),
+               SECURE_STORAGE_ENV: str(self.base / 'inherited-auth')}
+        first = prepare_worker_home(ROOT, 'claude', 'stage', 'settings-precedence', env=env)
+        binding = str((Path.cwd() / 'settings-auth').resolve())
+        self.assertEqual(first[SECURE_STORAGE_ENV], binding)
+        first_home = Path(first['CLAUDE_CONFIG_DIR'])
+        generated = json.loads((first_home / 'settings.json').read_text())
+        self.assertEqual(generated['env'][SECURE_STORAGE_ENV], binding)
+        self.assertEqual(generated['env']['USER_GUARD'], '1')
+        self.assertEqual(generated['permissions'], {'deny': ['Read(secret)']})
+
+        child = prepare_worker_home(
+            ROOT, 'claude', 'review', 'nested-settings-store', env={**env, **first})
+        self.assertNotEqual(child['CLAUDE_CONFIG_DIR'], first['CLAUDE_CONFIG_DIR'])
+        self.assertEqual(child[SECURE_STORAGE_ENV], binding)
+
+    def test_claude_legacy_symlink_resolves_to_store_but_regular_candidate_stays(self):
+        canonical = self.base / 'legacy-canonical'
+        canonical.mkdir()
+        (canonical / '.credentials.json').write_text('{"synthetic":"canonical"}')
+        legacy_link_home = self.base / 'legacy-link-home'
+        legacy_link_home.mkdir()
+        (legacy_link_home / 'worker-home.json').write_text('{"harness":"claude"}')
+        (legacy_link_home / '.credentials.json').symlink_to(canonical / '.credentials.json')
+        linked_destination = self.base / 'new-linked-home'
+        linked_destination.mkdir()
+        (linked_destination / '.credentials.json').symlink_to(
+            canonical / '.credentials.json')
+        linked = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'legacy-intact-link',
+            env={**self.env, 'CLAUDE_CONFIG_DIR': str(legacy_link_home)},
+            destination=linked_destination)
+        self.assertEqual(linked[SECURE_STORAGE_ENV], str(canonical.resolve()))
+        self.assertTrue((legacy_link_home / '.credentials.json').is_symlink())
+        self.assertFalse((linked_destination / '.credentials.json').exists())
+
+        legacy_regular_home = self.base / 'legacy-regular-home'
+        legacy_regular_home.mkdir()
+        candidate = legacy_regular_home / '.credentials.json'
+        candidate.write_text('{"synthetic":"opaque-candidate"}')
+        before = candidate.read_bytes()
+        (legacy_regular_home / 'worker-home.json').write_text('{"harness":"claude"}')
+        regular_destination = self.base / 'new-regular-home'
+        regular_destination.mkdir()
+        destination_candidate = regular_destination / '.credentials.json'
+        destination_candidate.write_bytes(b'{"synthetic":"sole-destination-candidate"}')
+        destination_before = destination_candidate.read_bytes()
+        unresolved = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'legacy-opaque-candidate',
+            env={**self.env, 'CLAUDE_CONFIG_DIR': str(legacy_regular_home)},
+            destination=regular_destination)
+        self.assertNotIn(SECURE_STORAGE_ENV, unresolved)
+        self.assertEqual(candidate.read_bytes(), before)
+        self.assertEqual(destination_candidate.read_bytes(), destination_before)
 
     def test_codex_hook_alias_preserves_user_decisions_and_rereads_them_on_resume(self):
         hooks = self.source / 'hooks.json'
@@ -134,6 +289,7 @@ class WorkerHomes(unittest.TestCase):
         before = source.read_bytes()
         for typ in ('owner', 'stage', 'review', 'support', 'frame'):
             env = prepare_worker_home(ROOT, 'opencode', typ, 'snapshot-' + typ, env=self.env)
+            self.assertNotIn(SECURE_STORAGE_ENV, env)
             actual = json.loads((Path(env['OPENCODE_CONFIG_DIR']) / 'opencode.json').read_text())
             self.assertFalse(actual['snapshot'])
             inline = json.loads(env['OPENCODE_CONFIG_CONTENT'])

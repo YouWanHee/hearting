@@ -539,7 +539,8 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         overrides.append('skills.config=[' + ','.join('{path=' + json.dumps(path) + ',enabled=false}' for path in sorted(disabled)) + ']')
         values.update(CODEX_HOME=str(home), HEARTING_CODEX_WORKER_OVERRIDES=json.dumps(overrides))
     elif harness == 'claude':
-        source = Path(env.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').expanduser()
+        source = Path(env.get('CLAUDE_CONFIG_DIR') or Path(home_env) / '.claude')
+        source = source.resolve(strict=False)
         # Capacity identity lives separately from credentials/settings. Keep
         # its account metadata without inheriting global MCP/onboarding state.
         account = read_json(source / '.claude.json').get('oauthAccount')
@@ -551,8 +552,31 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         settings['autoMemoryEnabled'] = False
         settings.pop('extraKnownMarketplaces', None)
         settings.pop('statusLine', None)
+        utilities_dir = agent_home / 'utilities'
+        if str(utilities_dir) not in sys.path:
+            sys.path.insert(0, str(utilities_dir))
+        from claude_credential_recovery import resolve_storage_binding
+
+        settings_env = settings.get('env') if isinstance(settings.get('env'), dict) else {}
+        secure_storage = resolve_storage_binding(
+            env, source, settings_env=settings_env, cwd=Path.cwd())
+        if secure_storage is not None:
+            values['CLAUDE_SECURESTORAGE_CONFIG_DIR'] = secure_storage
+            # Settings env is applied over the inherited launch environment by
+            # Claude. Resolve a relative user value once against this launch's
+            # caller directory so later nested launches keep the same store.
+            if 'CLAUDE_SECURESTORAGE_CONFIG_DIR' in settings_env:
+                settings['env']['CLAUDE_SECURESTORAGE_CONFIG_DIR'] = secure_storage
+            storage_dir = (Path(secure_storage) if secure_storage else
+                           Path(home_env) / '.claude').resolve(strict=False)
+            old_link = home / '.credentials.json'
+            if (old_link.is_symlink() and
+                    old_link.resolve(strict=False) ==
+                    (storage_dir / '.credentials.json').resolve(strict=False)):
+                # Remove only the old generated link to this exact native store.
+                # Regular files and links to any other target remain candidates.
+                old_link.unlink()
         write_json(home / 'settings.json', settings)
-        symlink(first_existing(source / '.credentials.json', Path.home() / '.claude/.credentials.json') or source / '.credentials.json', home / '.credentials.json')
         # Project/local settings and managed policy still load normally. The
         # copied user settings retain all user guard hooks and permission rules.
         values['CLAUDE_CONFIG_DIR'] = str(home)
@@ -597,8 +621,11 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         symlink(home, runtime / 'config/opencode')
         values.update(OPENCODE_CONFIG_DIR=str(home), OPENCODE_DISABLE_CLAUDE_CODE_PROMPT='1',
                       OPENCODE_DISABLE_CLAUDE_CODE_SKILLS='1')
-    write_json(home / 'worker-home.json', {'harness': harness, 'worker_type': worker_type,
-                                         'source': str(agent_home), 'profile': profile})
+    metadata = {'harness': harness, 'worker_type': worker_type,
+                'source': str(agent_home), 'profile': profile}
+    if harness == 'claude':
+        metadata['claude_secure_storage_dir'] = secure_storage
+    write_json(home / 'worker-home.json', metadata)
     return values
 
 

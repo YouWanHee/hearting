@@ -20,6 +20,17 @@ Every file in this repo must fall into one category.
 | Continuity state | Cross-project agent worklog/notes data that survives sessions but is not harness source. | `<agent-notes-root>/cards`, `_layer2`, `_triage`, `digests`, `oncall`, `study` | Never committed to this repo; may be versioned in a separate notes/data repo |
 | Local board app state | Worklog-board local app workspace, generated output, DB/cache, dispatch logs, and worktrees. | `<worklog-board-app>/.cache`, `.next`, `.dispatch`, `.env*`, `node_modules`, `<worklog-board-app>-wt/` | Never committed to this repo |
 
+For registered Claude workers, configuration and authentication have separate
+owners: the masked `CLAUDE_CONFIG_DIR` keeps worker settings isolated, while
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` points each same-account process at the
+runtime's shared native credential store and refresh lock. The shared builder
+preserves explicit secure-storage overrides, including an empty value. A
+legacy credential file found only in a worker home is not proof that it belongs
+to the current account or is newer than the main login; it must not replace the
+shared store without supported identity and ordering evidence. Existing
+processes retain the environment they started with, so transition limits are
+reported from observed runtime behavior.
+
 Project files and adapter runtime state need not share a filesystem. If a
 child runtime requires user-owned state but the project filesystem maps
 runtime directories to a different UID, its adapter uses the existing canonical
