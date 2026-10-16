@@ -236,8 +236,10 @@ def sweep_deliver(
         claim_owner = (
             f"session-sweep:{recipient_kind}:{os.getpid()}:{time.monotonic_ns()}"
         )
+        receipt = current.get("receipt") or {}
+        standalone_notice = receipt.get("kind") == "notice"
         jobs = record_jobs(root, current)
-        if jobs is None and not (current.get("receipt") or {}).get("job_registry"):
+        if jobs is None and not receipt.get("job_registry") and not standalone_notice:
             continue
         try:
             record = pending_delivery.claim(
