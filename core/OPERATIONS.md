@@ -107,32 +107,31 @@ echo "state: branch=$br head=$head base=$def dirty=$(git status --porcelain 2>/d
 
 #### Git index-lock failure diagnosis
 
-After an index-lock error, the existing failure path may attach the shared,
-bounded, read-only diagnosis. It resolves the expected index path from the Git
-context and observes only that index's lock. It preserves the original stdout,
-stderr, return code or signal, and partial Git state. Python or multiline
-wrappers may receive an advisory observation only when the reported path binds
-to the selected worktree's default index; matching text does not establish that
-Git returned EEXIST. An unbound path, unsupported context, permission error, or
-observation timeout leaves the original failure intact and never inspects a
-path quoted by untrusted output.
+Dispatched worker children run with `GIT_OPTIONAL_LOCKS=0`
+(`git_optional_locks_env()`, applied after every nested environment merge), so
+read-only `status` and `diff` skip the optional index lock. `add` and `commit`
+keep Git's mandatory locking.
 
-A present lock may be described by its file kind, mode, size, and modification
-time. A mode/size/timestamp pattern, NFSv3 mount information, or elapsed cache
-grace cannot establish that an outstanding client CREATE or post-create
-SETATTR has finished. These observations are advisory. The helper never changes
-any lock: it does not rename, unlink, quarantine, restore, chmod, or retry it,
-and it never replays the failed command. Git's mandatory index locking for
-`add` and `commit` remains enabled. The shared `git_optional_locks_env()`
-continues to set `GIT_OPTIONAL_LOCKS=0` in the final dispatch child environment
-for optional refresh behavior; it does not disable mandatory lock creation.
+After an index-lock error, the existing failure path may attach the shared
+read-only diagnosis. It resolves the expected lock path from the failed
+invocation's Git context, observes only that path with lstat, and preserves the
+original stdout, stderr, return code or signal, and partial Git state. Python or
+multiline wrapper text is used only when the reported path binds to the selected
+worktree's default index, and matching text does not prove Git returned EEXIST.
+An unbound path, unsupported context, permission error, or observation timeout
+leaves the original failure intact and does not inspect a path quoted by
+untrusted output.
 
-Git context lookup and file observation run inside one bounded diagnostic
-process group under the shared two-second wall-clock deadline. On expiry, the
-caller signals only that group and returns without an unbounded wait; the failed
-Git writer receives no signal. A process held in an uninterruptible kernel wait
-may outlive that signal. A timeout leaves ownership unknown and says nothing
-about whether a pending NFS client operation may later complete. See
+The diagnosis is advisory. A present lock, its age, size, mode, timestamps, NFS
+cache age, or a process not found locally cannot establish that it is stale: on
+NFS an outstanding CREATE or post-create SETATTR can look the same. The helper
+does not delete, rename, chmod, choose another index, retry Git, or replay the
+failed command. Git context lookup and file observation run inside one newly
+created diagnostic process group under a shared two-second wall-clock deadline.
+On expiry, the caller signals only that group and returns without an unbounded
+wait; the failed Git writer receives no signal. A process held in an
+uninterruptible kernel wait may outlive that signal, so a timeout preserves the
+original failure without promising kernel cancellation. See
 `utilities/git_index_lock.py` for the single implementation used by source
 consumers and runtime adapters.
 
@@ -141,10 +140,9 @@ the shared bridge; Codex's text-only Bash PostToolUse lacks terminal status and
 effective cwd, so it remains raw and has no Bash registration. The structured
 Codex App Server path uses exact active-thread/turn command results with known
 terminal status, valid nonzero exit, supported command, absolute cwd, and
-matching lock-error output, but the text remains advisory. OpenCode 1.19 uses
-`metadata.exit`, combined `output`, and `args.workdir` resolved from plugin
-`ctx.directory` (or that directory when omitted); separate streams and raw
-bytes are unavailable, so matching text remains advisory there too.
+matching lock-error output. OpenCode 1.19 uses `metadata.exit`, combined
+`output`, and `args.workdir` resolved from plugin `ctx.directory` (or that
+directory when omitted); separate streams and raw bytes are unavailable.
 
 ### §5.9a. Immutable Runtime Activation and Session Pinning
 
