@@ -72,11 +72,10 @@ if isinstance(start_source, str) and start_source in {"startup", "resume", "clea
     params["session_start_source"] = start_source
     if start_source == "resume":
         try:
-            from fleet.process_identity import current_launch_context
+            from fleet.process_identity import current_launch_context, is_native_resume_argv
             launch = current_launch_context("codex", session_id)
             resume_argv = (launch or {}).get("argv")
-            if (isinstance(resume_argv, list) and resume_argv and resume_argv[0] == "codex"
-                    and session_id in resume_argv):
+            if is_native_resume_argv(resume_argv, "codex", session_id):
                 params["resume_argv"] = resume_argv
         except Exception:
             pass

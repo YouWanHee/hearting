@@ -531,8 +531,10 @@ def _await_tui_and_project(session_id: str, report_session: bool, *,
         lock.close()
 
 
-def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=None):
+def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=None, *, session_id=None):
     """Optional native bootstrap fields; never infer a source or widen a guard."""
+    from .process_identity import is_native_resume_argv
+
     if session_seq is None and session_start_source is None and resume_argv is None:
         return {}
     max_seq = 9007199254740991 if harness == "opencode" else 18446744073709551615
@@ -543,10 +545,8 @@ def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=N
     result = dict(session_seq=session_seq, session_start_source=session_start_source)
     if resume_argv is not None:
         if (session_start_source not in {"resume", "select"} or not isinstance(resume_argv, list)
-                or not resume_argv or len(resume_argv) > 64
-                or resume_argv[0] != harness
-                or any(not isinstance(arg, str) or not arg or "\0" in arg for arg in resume_argv)
-                or sum(len(arg.encode("utf-8", "surrogatepass")) for arg in resume_argv) > 8192):
+                or not isinstance(session_id, str) or not session_id
+                or not is_native_resume_argv(resume_argv, harness, session_id)):
             result.pop("resume_argv", None)
         else:
             result["resume_argv"] = list(resume_argv)
@@ -556,7 +556,7 @@ def _session_lifecycle(harness, session_seq, session_start_source, resume_argv=N
 def _native_opencode_lifecycle(session_id):
     """Read lifecycle metadata only from this proven TUI's PID/birth selection record."""
     try:
-        from fleet.process_identity import current_launch_context
+        from fleet.process_identity import current_launch_context, is_native_resume_argv
         from fleet.collectors import opencode
         launch = current_launch_context("opencode", session_id)
         if not launch:
@@ -573,8 +573,8 @@ def _native_opencode_lifecycle(session_id):
         if source in ("startup", "resume", "select", "clear", "compact", "fork"):
             result["session_start_source"] = source
         argv = launch.get("argv")
-        if (result.get("session_start_source") in {"resume", "select"} and isinstance(argv, list)
-                and argv and argv[0] == "opencode" and session_id in argv):
+        if (result.get("session_start_source") in {"resume", "select"}
+                and is_native_resume_argv(argv, "opencode", session_id)):
             result["resume_argv"] = argv
         return result
     except Exception:
@@ -635,13 +635,15 @@ def project(harness: str, session_id: str, *, pane_id=None, worker=None,
                 session_seq = time.time_ns() if harness != "opencode" else time.time_ns() // 1000
             if session_start_source == "resume" and resume_argv is None:
                 from fleet.process_identity import current_launch_context
+                from fleet.process_identity import is_native_resume_argv
                 launch = current_launch_context(harness, session_id)
                 argv = (launch or {}).get("argv")
-                if isinstance(argv, list) and argv and argv[0] == harness and session_id in argv:
+                if is_native_resume_argv(argv, harness, session_id):
                     resume_argv = argv
         except Exception:
             session_start_source = None
-    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv)
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv,
+                                   session_id=session_id)
     if lifecycle is None:
         report_session, lifecycle = False, {}
     if harness == "codex" and not may_report(harness, session_id, worker=worker, pane_id=pane):
@@ -697,7 +699,8 @@ def _report(harness: str, session_id: str, pane: str, report_session: bool,
             observation["reason"] = "herdr-unavailable"
         return
     source = "herdr:%s" % harness
-    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv)
+    lifecycle = _session_lifecycle(harness, session_seq, session_start_source, resume_argv,
+                                   session_id=session_id)
     if lifecycle is None:
         report_session = False
     def current():

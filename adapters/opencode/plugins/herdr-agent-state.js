@@ -99,6 +99,17 @@ function stateFromSessionStatus(status) {
     : undefined;
 }
 
+function isNativeResumeArgv(argv, sessionID) {
+  if (!Array.isArray(argv) || argv.length === 0 || argv.length > 64) return false;
+  if (argv.some((arg) => typeof arg !== "string" || !arg || arg.includes("\0"))) return false;
+  if (argv.reduce((bytes, arg) => bytes + Buffer.byteLength(arg, "utf8"), 0) > 8192) return false;
+  const executable = argv[0];
+  if (executable !== AGENT && !(path.isAbsolute(executable) && path.basename(executable) === AGENT)) {
+    return false;
+  }
+  return argv.includes(sessionID);
+}
+
 function request(method, params) {
   const pending = requestChain.then(() => requestOnce(method, params));
   requestChain = pending.catch(() => {});
@@ -174,8 +185,8 @@ function nativeSessionLifecycle(sessionID) {
       result.session_start_source = record.sessionStartSource;
     }
     const argv = process.argv;
-    if (["resume", "select"].includes(result.session_start_source) && Array.isArray(argv)
-        && argv[0] === "opencode" && argv.includes(sessionID)) {
+    if (["resume", "select"].includes(result.session_start_source)
+        && isNativeResumeArgv(argv, sessionID)) {
       result.resume_argv = argv.slice();
     }
     return result;

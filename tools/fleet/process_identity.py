@@ -256,6 +256,26 @@ def _proc_argv(pid, *, max_bytes=32768):
     return argv
 
 
+def is_native_resume_argv(argv, harness, session_id=None):
+    """Validate a native launcher's original resume argv without rewriting it.
+
+    An absolute launcher path is accepted only by basename; callers must still
+    obtain the argv from the process-bound native session identity below.
+    """
+    if (harness not in {"claude", "codex", "opencode"} or not isinstance(argv, list)
+            or not argv or len(argv) > 64):
+        return False
+    if any(not isinstance(arg, str) or not arg or "\0" in arg for arg in argv):
+        return False
+    if sum(len(arg.encode("utf-8", "surrogatepass")) for arg in argv) > 8192:
+        return False
+    executable = argv[0]
+    if not (executable == harness or
+            os.path.isabs(executable) and os.path.basename(executable) == harness):
+        return False
+    return session_id is None or isinstance(session_id, str) and session_id in argv
+
+
 def launch_context(pid, harness, session_id):
     """Read argv and cwd only while the exact native session and PID birth agree."""
     if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1

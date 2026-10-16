@@ -819,6 +819,44 @@ class ProjectionObservationTest(unittest.TestCase):
                     "--source", "herdr:opencode", "--display-agent", "opencode", "--title", "opencode title"])
                 self.assertEqual(observation["session_report"], "exit0" if report_session else "skipped")
 
+    def test_absolute_native_resume_argv_is_serialized_without_reconstruction(self):
+        from tools.fleet import herdr_projection as hp
+        for harness in ("claude", "codex", "opencode"):
+            sid = "ses_A"
+            argv = [f"/home/user/.local/bin/{harness}", "--color", "always",
+                    "--resume", sid, "--model", "fixture", "--setting-sources", "user"]
+            with self.subTest(harness=harness):
+                lifecycle = hp._session_lifecycle(harness, 1000001, "resume", argv, session_id=sid)
+                self.assertEqual(lifecycle["resume_argv"], argv)
+                self.assertNotIn("resume_argv", hp._session_lifecycle(
+                    harness, 1000002, "clear", argv, session_id=sid))
+        self.assertNotIn("resume_argv", hp._session_lifecycle(
+            "claude", 1000001, "resume", ["/usr/bin/env", "claude", "--resume", "ses_A"],
+            session_id="ses_A"))
+        self.assertNotIn("resume_argv", hp._session_lifecycle(
+            "claude", 1000001, "resume", ["/opt/claude", "--resume", "other-session"],
+            session_id="ses_A"))
+
+    def test_python_opencode_lifecycle_keeps_only_the_process_bound_selection_argv(self):
+        from fleet import process_identity
+        from fleet import herdr_projection as hp
+        from fleet.collectors import opencode
+        sid = "ses_A"
+        argv = ["/home/user/.local/bin/opencode", "--resume", sid, "--model", "fixture"]
+        selection = {"value": {"sessionID": sid, "sessionSeq": 1000001,
+                               "sessionStartSource": "resume"}}
+        launch = {"pid": 4321, "proc_start": "123", "argv": argv}
+        with unittest.mock.patch.object(process_identity, "current_launch_context", return_value=launch), \
+                unittest.mock.patch.object(opencode, "_tui_selection_record", return_value=selection):
+            lifecycle = hp._native_opencode_lifecycle(sid)
+        self.assertEqual(lifecycle["resume_argv"], argv)
+        self.assertEqual(lifecycle["session_seq"], 1000001)
+
+        selection["value"]["sessionID"] = "ses_other"
+        with unittest.mock.patch.object(process_identity, "current_launch_context", return_value=launch), \
+                unittest.mock.patch.object(opencode, "_tui_selection_record", return_value=selection):
+            self.assertEqual(hp._native_opencode_lifecycle(sid), {})
+
     def test_invalid_bootstrap_fields_never_promote_or_bypass_original_guard(self):
         from tools.fleet import herdr_projection as hp
         cases = [(True, "startup"), (0, "startup"), (-1, None), (9007199254740992, None),
