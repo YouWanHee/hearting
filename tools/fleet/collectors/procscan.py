@@ -149,7 +149,8 @@ def codex_effective_cwd(argv, observed_cwd, launch_cwd=None):
     if not tokens or os.path.basename(str(tokens[0])) != "codex":
         return observed_cwd
     target = None
-    # Keep this list in step with the installed root-level `codex --help`.
+    # Keep this list in step with the installed root-level `codex --help`, plus
+    # the hidden `--yolo` alias that help does not list.
     # Values must be consumed as argv tokens: a model/config/image value can
     # itself resemble an option and must never be reinterpreted as one.
     value_options = {
@@ -160,7 +161,7 @@ def codex_effective_cwd(argv, observed_cwd, launch_cwd=None):
     }
     flag_options = {
         "--oss", "--strict-config", "--approve-for-me",
-        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-approvals-and-sandbox", "--yolo",
         "--dangerously-bypass-hook-trust", "--worktree", "--no-alt-screen",
         "--no-daemon", "--search", "--help", "-h", "--version", "-V",
     }
