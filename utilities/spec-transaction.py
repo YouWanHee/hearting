@@ -538,16 +538,57 @@ def main():
     run.add_argument("--events")
     run.add_argument("--require-snapshot",action="store_true",help=argparse.SUPPRESS)
     run.add_argument("transaction",nargs=argparse.REMAINDER)
-    args=parser.parse_args()
+    raw_argv=list(sys.argv[1:])
+    if raw_argv and raw_argv[0]=="run" and (os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_ROUTE_ID")):
+        flags=("--artifact-root","--worktree","--route","--node")
+        missing=[flag for flag in flags if not any(item==flag or item.startswith(flag+"=") for item in raw_argv)]
+        if missing:
+            explicit_root=None
+            for index,item in enumerate(raw_argv):
+                if item=="--artifact-root" and index+1<len(raw_argv): explicit_root=raw_argv[index+1]
+                elif item.startswith("--artifact-root="): explicit_root=item.split("=",1)[1]
+            try:
+                context=__import__("artifact_context").resolve_context(
+                    environ=os.environ,explicit={"artifact_root":explicit_root} if explicit_root else None)
+            except ValueError as exc:
+                emit({"status":"blocked","reason":getattr(exc,"code","artifact-context-invalid"),"detail":str(exc)},
+                     next((raw_argv[i+1] for i,item in enumerate(raw_argv[:-1]) if item=="--events"),None))
+                return 65
+            if context.route and context.node and context.artifact_root:
+                defaults={"--artifact-root":str(context.artifact_root),
+                    "--worktree":str(context.source_worktree or ""),
+                    "--route":str(context.artifact_root/".runtime"/"routes"/f"{context.route['route_id']}.json"),
+                    "--node":str(context.node_id or "")}
+                insertion=1
+                for flag in flags:
+                    if flag in missing and defaults[flag]:
+                        raw_argv[insertion:insertion]=[flag,defaults[flag]]; insertion+=2
+    args=parser.parse_args(raw_argv)
     command=args.transaction[1:] if args.transaction[:1]==["--"] else args.transaction
     if not command: parser.error("transaction command required after --")
     artifact=Path(args.artifact_root).resolve(); worktree=Path(args.worktree)
+    import artifact_context
+    context=None
+    if os.environ.get("AGENT_ROUTE_FILE") or os.environ.get("AGENT_ROUTE_ID"):
+        try:
+            context=artifact_context.resolve_context(environ=os.environ,route=args.route,node_id=args.node,
+                explicit={"artifact_root":artifact,"source_worktree":worktree})
+        except ValueError as exc:
+            emit({"status":"blocked","reason":getattr(exc,"code","artifact-context-invalid"),"detail":str(exc),"artifact_root":str(artifact)},args.events); return 65
     # W7C: the spec bucket lives under the open producer cycle once the
     # cutover is active (AGENT_ARTIFACT_CYCLE_DIR); the legacy top-level
     # `spec/` is only reachable during the compatibility window.
-    try: spec_base,spec_layout=PRODUCER.resolve_output_dir(artifact,"spec")
-    except PRODUCER.ProducerError as exc:
-        emit({"status":"blocked","reason":exc.code,"detail":exc.detail,"artifact_root":str(artifact)},args.events); return 65
+    if context and context.route and context.node:
+        if not context.output_dir:
+            emit({"status":"blocked","reason":"artifact-cycle-unbound","route_id":context.route.get("route_id")},args.events); return 65
+        if not any(scope=="spec" or scope=="spec/**" or scope.startswith("spec/")
+                   for scope in context.write_scope):
+            emit({"status":"blocked","reason":"route-node-scope-mismatch","route_id":context.route.get("route_id")},args.events); return 65
+        spec_base=context.output_dir/"spec"; spec_layout="cycle"
+    else:
+        try: spec_base,spec_layout=PRODUCER.resolve_output_dir(artifact,"spec")
+        except PRODUCER.ProducerError as exc:
+            emit({"status":"blocked","reason":exc.code,"detail":exc.detail,"artifact_root":str(artifact)},args.events); return 65
     spec_base=spec_base.resolve()
     spec_root=(Path(args.spec_root).expanduser() if args.spec_root else spec_base)
     # A relative component root is relative to the resolved spec bucket, which

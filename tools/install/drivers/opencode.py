@@ -19,6 +19,7 @@ import manifest
 import verifier
 import user_model_config
 import safe_fs
+import herdr_integration
 
 RUNTIME = "opencode"
 
@@ -327,11 +328,17 @@ def install(scope="global", plugin=False, dry_run=False):
                 )
             continue
 
+    registration = herdr_integration.migrate_opencode_configs(
+        paths.runtime_home(RUNTIME, scope), paths.agent_home(), dry_run=dry_run)
+    actions.extend(registration["actions"])
     blocked = blocked or any(a.get("status") == "blocked" for a in actions)
 
     manifest_result = None
+    integration_assets = herdr_integration.manifest_assets(
+        RUNTIME, paths.agent_home(), paths.runtime_home(RUNTIME, scope))
     if not dry_run and not blocked:
-        manifest_result = manifest.record("opencode", [], scope=scope)
+        manifest_result = manifest.record("opencode", [], scope=scope,
+                                          integration_assets=integration_assets)
 
     return {
         "runtime": "opencode",
@@ -344,8 +351,11 @@ def install(scope="global", plugin=False, dry_run=False):
 def checks(scope="global"):
     """Return core-projection and preflight checks for ``verify``."""
     entries = projector.plan(["opencode"], scope=scope)["opencode"]
+    agent_home = str(paths.agent_home())
 
     check_list = []
+
+    check_list.append(verifier.check_herdr_integration(RUNTIME, agent_home))
 
     for entry in entries:
         action = entry["action"]

@@ -34,19 +34,15 @@ class _TmpRootMixin:
         self._old_environ = dict(os.environ)
         os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs_path)
         os.environ["AGENT_PEER_LEDGER_ROOT"] = str(self.tmp_root / "peer-state")
-        # C-9 made `_iter_records` (list/status) read through `steward_marker_roots()`,
-        # whose "fleet-reader" branch always adds `stable_state_root(os.environ)`
-        # (dispatch_state_roots) AND every installed runtime's own root
-        # (_runtime_ledger_roots: ~/.codex, ~/.claude, ~/.config/opencode) as read
-        # candidates. Without isolating HOME too, those candidates fall through to
-        # this machine's real per-user roots and a list/status assertion here would
-        # see live records (CODEX_HOME/CLAUDE_CONFIG_DIR are unset in the real
-        # environment, so overriding HOME alone covers all three).
+        # C-9 makes `_iter_records` include dispatch and installed-runtime roots.
+        # Isolate each root explicitly so list/status assertions cannot read live
+        # peer records from this machine.
         os.environ["HOME"] = str(self.tmp_root / "home")
-        os.environ.pop("XDG_STATE_HOME", None)
-        os.environ.pop("HARNESS_STATE_ROOT", None)
-        os.environ.pop("CODEX_HOME", None)
-        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ["XDG_STATE_HOME"] = str(self.tmp_root / "xdg-state")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp_root / "xdg-config")
+        os.environ["HARNESS_STATE_ROOT"] = str(self.tmp_root / "harness-state")
+        os.environ["CODEX_HOME"] = str(self.tmp_root / "home" / ".codex")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.tmp_root / "home" / ".claude")
         os.environ.pop("AGENT_HOME", None)
         self.addCleanup(self._restore_environ)
 
@@ -665,7 +661,8 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     sender = {"harness": "codex", "session_id": "sender", "name": "original"}
     recipient = {"harness": "codex", "session_id": "recipient"}
 
-    def prepare_reference(self, body, recipient=None, **kwargs):
+    def prepare_reference(self, body, recipient=None, sender=None, **kwargs):
+        sender = sender or self.sender
         recipient = recipient or self.recipient
         evidence = {
             "schema": "peer-read-access-observation-v1",
@@ -677,10 +674,47 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         }
         with mock.patch.object(peer_message, "_reference_local_process_matches", return_value=True):
             return peer_message.prepare_peer_message(
-                body, self.sender, recipient, reference_evidence=evidence, **kwargs)
+                body, sender, recipient, reference_evidence=evidence, **kwargs)
 
     def pending(self, body="original peer body", **kwargs):
         return self.prepare_reference(body, defer=True, **kwargs)
+
+    def test_recipient_scan_only_checks_settlement_for_exact_receiver_or_sender(self):
+        _text, wanted = self.pending()
+        _text, foreign = self.pending("foreign", recipient={
+            "harness": "claude", "session_id": "another-recipient"}, sender={
+                "harness": "claude", "session_id": "foreign-sender"})
+        seen = []
+
+        def settled(row, **_kwargs):
+            seen.append(row["ref"])
+            return False
+
+        with mock.patch.object(peer_message, "_registered_delivery_settled", side_effect=settled):
+            rows = list(peer_message._pending_rows(recipient=self.recipient))
+        self.assertEqual([row["ref"] for row in rows], [wanted])
+        self.assertEqual(seen, [wanted])
+
+        seen.clear()
+        with mock.patch.object(peer_message, "_registered_delivery_settled", side_effect=settled):
+            rows = list(peer_message._pending_rows(sender=self.sender))
+        self.assertEqual([row["ref"] for row in rows], [wanted])
+        self.assertEqual(seen, [wanted])
+        self.assertNotEqual(wanted, foreign)
+
+    def test_filtered_scan_still_quarantines_malformed_foreign_rows(self):
+        _text, wanted = self.pending()
+        outside = self.tmp_root / "outside"
+        outside.write_bytes(b"foreign")
+        malformed = peer_message._pending_dir() / ("f" * 32 + ".json")
+        malformed.symlink_to(outside)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            rows = list(peer_message._pending_rows(recipient=self.recipient))
+        self.assertEqual([row["ref"] for row in rows], [wanted])
+        self.assertIn("peer-pending-invalid", errors.getvalue())
+        quarantine = malformed.parent.parent / "quarantine"
+        self.assertEqual(len(list(quarantine.rglob(malformed.name))), 1)
 
     def test_production_read_scope_source_is_codex_adapter_contract_only(self):
         self.assertTrue(peer_message._codex_model_read_access(self.recipient))
@@ -883,11 +917,80 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(peer_message.parse_peer_trailer(text, {
             "harness": "claude", "session_id": "resolved-session"}, include_ref=True))
 
+    def test_exact_claude_prompt_claim_can_be_queued_but_only_receiver_ref_acks(self):
+        recipient = {"harness": "claude", "session_id": "claude-target"}
+        text, ref = peer_message.prepare_peer_message(
+            "one guarded native prompt", self.sender, recipient, defer=True)
+        claimed = peer_message.claim_pending_herdr(ref, recipient)
+        self.assertIsNotNone(claimed)
+        foreign_claim = dict(claimed["rpc_claim"], token="different-claim")
+        self.assertFalse(peer_message.mark_pending_prompt_queued(ref, foreign_claim))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+
+        self.assertTrue(peer_message.mark_pending_prompt_queued(ref, claimed["rpc_claim"]))
+        queued = peer_message._read_pending(ref)
+        self.assertEqual((queued["state"], queued["receipt"], queued["text"]),
+                         ("queued", "claude-pty-prompt-submitted", text))
+        self.assertIsNone(queued.get("rpc_claim"))
+        self.assertEqual(peer_message.receive_peer_message(text, recipient), 0)
+        received = peer_message._read_pending(ref)
+        self.assertEqual((received["state"], received["receipt"]),
+                         ("received", "exact-peer-ref"))
+
+    def test_claude_prompt_queue_transition_rejects_no_trailer_and_other_receipts(self):
+        recipient = {"harness": "claude", "session_id": "claude-target"}
+        _text, ref = peer_message.prepare_peer_message(
+            "no trailer", self.sender, recipient, defer=True, with_trailer=False)
+        claimed = peer_message.claim_pending_herdr(ref, recipient)
+        self.assertIsNotNone(claimed)
+        self.assertFalse(peer_message.mark_pending_prompt_queued(ref, claimed["rpc_claim"]))
+        self.assertFalse(peer_message.mark_pending_prompt_queued(
+            ref, claimed["rpc_claim"], receipt="invented-receive"))
+        self.assertEqual(peer_message._read_pending(ref)["state"], "unverified")
+
+    def test_opencode_receive_requires_the_queued_native_id_and_is_idempotent(self):
+        recipient = {"harness": "opencode", "session_id": "opencode-root"}
+        _text, ref = peer_message.prepare_peer_message(
+            "이어서해", self.sender, recipient, defer=True, with_trailer=False,
+            receipt="session-tidy-continue")
+        claim = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=ref,
+            queued=None, received=None, message_id=None)
+        with mock.patch("builtins.print"):
+            self.assertEqual(peer_message.cmd_pending(claim), 0)
+        queued = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=None,
+            queued=ref, received=None, message_id="native-message-1")
+        self.assertEqual(peer_message.cmd_pending(queued), 0)
+        resuming = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=None,
+            queued=None, resuming=ref, received=None, message_id="native-message-1")
+        self.assertEqual(peer_message.cmd_pending(resuming), 0)
+        self.assertEqual(peer_message.cmd_pending(resuming), 1)
+        self.assertTrue(peer_message._read_pending(ref)["resume_attempted"])
+        received = peer_message.argparse.Namespace(
+            to_harness="opencode", to_session_id="opencode-root", claim=None, resuming=None,
+            queued=None, received=ref, message_id="foreign-message")
+        self.assertEqual(peer_message.cmd_pending(received), 1)
+        self.assertEqual(peer_message._read_pending(ref)["state"], "queued")
+        received.message_id = "native-message-1"
+        self.assertEqual(peer_message.cmd_pending(received), 0)
+        original = self._ledger_file(self.sender["session_id"]).read_bytes()
+        row = peer_message._read_pending(ref)
+        self.assertEqual((row["state"], row["text"], row["actual_message_id"]),
+                         ("received", None, "native-message-1"))
+        self.assertEqual(peer_message.cmd_pending(received), 0)
+        self.assertEqual(self._ledger_file(self.sender["session_id"]).read_bytes(), original)
+
     def test_actual_receive_once_and_replay_does_not_rewrite_notice(self):
         text, ref = self.pending()
         self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
         original = self._ledger_file("sender").read_bytes()
-        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        received = peer_message._read_pending(ref)
+        with mock.patch.object(peer_message, "_ack_registered_delivery",
+                               wraps=peer_message._ack_registered_delivery) as repair_ack:
+            self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+            repair_ack.assert_called_once_with(received)
         self.assertEqual(self._ledger_file("sender").read_bytes(), original)
         self.assertEqual(peer_message._read_pending(ref)["state"], "received")
         self.assertIsNone(peer_message._read_pending(ref)["text"])
@@ -1179,6 +1282,17 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [ref])
         self.assertEqual(errors.getvalue(), "")
 
+    def test_scan_skips_received_rows_without_verifying_them(self):
+        # Delivered history piles up; verifying every row on each prompt cost seconds.
+        text, received_ref = self.pending("delivered body")
+        self.assertEqual(peer_message.receive_peer_message(text, self.recipient), 0)
+        _text, open_ref = self.pending("still open body")
+        real = peer_message._read_transfer_record
+        with mock.patch.object(peer_message, "_read_transfer_record", side_effect=real) as reads:
+            self.assertEqual([r["ref"] for r in peer_message.pending_messages(self.recipient)], [open_ref])
+        self.assertEqual([c.args[0] for c in reads.call_args_list], [open_ref])
+        self.assertEqual(peer_message._read_pending(received_ref)["state"], "received")
+
     def test_every_quarantined_row_is_diagnosed_once_in_a_batch(self):
         _text, healthy_ref = self.pending()
         originals = {}
@@ -1246,11 +1360,14 @@ class PendingPeerTest(_TmpRootMixin, unittest.TestCase):
     def test_exact_native_history_ack_once_after_queued_and_replay(self):
         import codex_queue_delivery as queue
         _text, ref = self.pending()
-        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "consumed"}) as send:
+        with mock.patch.object(queue, "send_at_least_once", return_value={"status": "consumed"}) as send, \
+                mock.patch.object(peer_message, "_ack_registered_delivery",
+                                  wraps=peer_message._ack_registered_delivery) as repair_ack:
             self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "received")
             original = self._ledger_file("sender").read_bytes()
             self.assertEqual(peer_message.deliver_pending_codex(ref)["status"], "received")
             self.assertEqual(send.call_count, 1)
+            self.assertEqual(repair_ack.call_count, 2)
         self.assertEqual(self._ledger_file("sender").read_bytes(), original)
 
     def test_stale_or_unsupported_callback_retains_pending(self):

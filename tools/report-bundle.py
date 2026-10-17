@@ -427,7 +427,18 @@ def parser():
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] in {"publish", "status", "read"}:
+        supplied_source = any(item == "--source" or item.startswith("--source=") for item in values)
+        if not supplied_source:
+            from artifact_context import ArtifactContextError, resolve_context
+            context = resolve_context(environ=os.environ)
+            if context.route and context.node:
+                binding = context.resolve_output("report-source")
+                if binding is None or binding.path is None:
+                    raise BundleError("current route has no declared report source")
+                values[1:1] = ["--source", str(binding.path)]
+    args = parser().parse_args(values)
     if args.command == "root":
         root = resolve_root(optional=args.optional)
         if root is not None: print(root)

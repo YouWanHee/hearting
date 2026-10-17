@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SD-56 fixtures: completion marker canonical write + start-time gate."""
 import contextlib
+import base64
 import copy
 import importlib.util
 import io
@@ -189,6 +190,8 @@ class CompletionMarkerTest(unittest.TestCase):
             "AGENT_ARTIFACT_CHECKPOINT": "off",
         }
         env.pop("AGENT_DISPATCH_JOBS", None)
+        env.pop("AGENT_DISPATCH_ATTEMPT_ID", None)
+        env.pop("AGENT_REVIEW_SOURCE_SUBJECT_DIGEST", None)
         env.pop("XDG_STATE_HOME", None)
         env.pop("HARNESS_STATE_ROOT", None)
         # A depth-1 owner session that launched this test process exports
@@ -205,6 +208,9 @@ class CompletionMarkerTest(unittest.TestCase):
     def wrapper_command(self, harness, action, route_path, route, node_id):
         wrapper, _ = ADAPTERS[harness]
         node = next(n for n in route["nodes"] if n["id"] == node_id)
+        checked = next((row for row in route.get("dispatch_evidence", {}).get("tuples", [])
+                        if row.get("parent_harness") == harness
+                        and row.get("child_harness") == harness), {})
         return wrapper + [
             f"--{action}", "--worktree", str(self.repo), "--slug", f"{harness}-{node_id}",
             "--capability", "autopilot-code", "--capability-mode", route["capability_mode"],
@@ -212,7 +218,9 @@ class CompletionMarkerTest(unittest.TestCase):
             "--intensity", route["effective_intensity"], "--dispatch-depth", "2", "--parent", "owner",
             "--worker-role", "code-" + node_id, "--owner", "autopilot-code",
             "--jobs", str(self.jobs), "--log-dir", str(self.logs),
-            "--parent-harness", harness, "--parent-transport", "headless", "--parent-sandbox", "fixture",
+            "--parent-harness", harness,
+            "--parent-transport", checked.get("parent_transport", "headless"),
+            "--parent-sandbox", checked.get("parent_sandbox", "fixture"),
             "--launch-authority", "conductor", "--nested-eligibility", "supported",
             "--eligibility-source", f"{harness}-fixture", "--fallback-ordinal", "1",
             "--route-file", str(route_path), "--route-id", route["route_id"],
@@ -561,22 +569,22 @@ class CompletionMarkerTest(unittest.TestCase):
 
         for action in ("start", "dry-run"):
             with self.subTest(action=action):
-                command = self.wrapper_command("claude", action, route_path, route, "execute")
-                refused = subprocess.run(command, text=True, capture_output=True, env=self.base_env())
-                self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-                self.assertIn("reason=completion-evidence-superseded", refused.stdout)
-                self.assertIn("detail=plan-check:superseded-by=plan@2", refused.stdout)
-                self.assertIn("child_spawned=0", refused.stdout)
-                self.assertIn("next_action=rerun dependency node plan-check", refused.stdout)
+                with mock.patch.dict(os.environ,
+                    {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
+                    with self.assertRaises(D.DispatchContractError) as refused:
+                        D.completion_marker_gate(str(route_path), "execute", action,
+                                                 self.agent_home, self.jobs)
+                self.assertEqual(refused.exception.reason, "completion-evidence-superseded")
+                self.assertEqual(refused.exception.detail, "plan-check:superseded-by=plan@2")
+                self.assertIn("rerun dependency node plan-check", refused.exception.next_action)
+                self.assertIn("upstream revision plan@2", refused.exception.next_action)
         (canonical_dir / "plan-check.json").unlink()
-        missing = subprocess.run(
-            self.wrapper_command("claude", "start", route_path, route, "execute"),
-            text=True, capture_output=True, env=self.base_env(),
-        )
-        self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
-        self.assertIn("reason=completion-marker-missing", missing.stdout)
-        self.assertIn("detail=plan-check", missing.stdout)
-        self.assertIn("child_spawned=0", missing.stdout)
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
+            with self.assertRaises(D.DispatchContractError) as missing:
+                D.completion_marker_gate(str(route_path), "execute", "start",
+                                         self.agent_home, self.jobs)
+        self.assertEqual(missing.exception.reason, "completion-marker-missing")
+        self.assertEqual(missing.exception.detail, "plan-check")
 
     def test_a_sd154_5_integrity_refusals_publish_nothing(self):
         """A-SD154-5: kept refusals publish zero new markers."""
@@ -858,7 +866,7 @@ class CompletionMarkerTest(unittest.TestCase):
         blocking round as its `answers` -- once, idempotently.
         """
         route, plan_check_node = self._a_sd154_10_fixture("route-a10.json")
-        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
             admission = DISPATCH_NODE.admit_round(
                 route, plan_check_node, self.jobs, owner_attempt_id="att-owner-1",
             )
@@ -885,7 +893,7 @@ class CompletionMarkerTest(unittest.TestCase):
         plan_marker_path = canonical_dir / "plan.json"
         before_marker = plan_marker_path.read_bytes()
         before_jobs = self.jobs.read_bytes()
-        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
             admission = DISPATCH_NODE.admit_round(
                 route, plan_check_node, self.jobs, owner_attempt_id="att-owner-dry",
                 record_auto_revisions=False,
@@ -914,7 +922,7 @@ class CompletionMarkerTest(unittest.TestCase):
         canonical_dir = self.stable_dispatch / "completion" / route["route_id"]
         marker = canonical_dir / "plan.json"
         before_marker, before_jobs = marker.read_bytes(), self.jobs.read_bytes()
-        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
             admission = DISPATCH_NODE.admit_round(
                 route, plan_check_node, self.jobs, owner_attempt_id="att-owner-dry",
                 record_auto_revisions=False,
@@ -977,7 +985,7 @@ class CompletionMarkerTest(unittest.TestCase):
         dispatch_batch = _load("a_sd154_10_parity_dispatch_batch", "utilities/dispatch-batch.py")
         stage_fallback = _load("a_sd154_10_parity_stage_fallback", "utilities/stage-dispatch-fallback.py")
 
-        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
             first = dispatch_node.admit_round(
                 route, plan_check_node, self.jobs, owner_attempt_id="att-owner-parity",
             )
@@ -1635,6 +1643,8 @@ class CompletionMarkerTest(unittest.TestCase):
         extra = self._REVIEW_ROW
         if note is not None:
             extra = extra.replace("note=completed-review-blocking", f"note={note}")
+        review_artifact = base64.urlsafe_b64encode(str(review.resolve()).encode()).decode().rstrip("=")
+        extra += f",review_artifact_b64={review_artifact}"
         extra += f",log_file={log},artifact_root={self.artifact}"
         self.write_row("done", f"plan-check-r{round_no}", attempt_id, extra, node_id="plan-check")
         self._reap_real_process(attempt_id)
@@ -2456,7 +2466,9 @@ class CompletionMarkerTest(unittest.TestCase):
         evidence.write_text("v1")
         self.review_blocking_row("att-input-r1", 1, directory=output)
         self.sd161_bind_row(route, "att-input-r1", evidence)
-        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True), \
+                mock.patch.object(D, "attempt_process_quiescence",
+                                  return_value=D.ProcessQuiescence("quiescent", "fixture")):
             def revise(path=evidence, answers=("att-input-r1",), author=owner):
                 return ROUTE.publish_review_input_revision(route, node["id"], path,
                     answers=answers, author_attempt_id=author, jobs=self.jobs)
@@ -2541,7 +2553,7 @@ class CompletionMarkerTest(unittest.TestCase):
 
     def test_continuation_closure_rejects_sibling_wrong_cycle_and_forged_lineage(self):
         source, route, path, node, memo, reviews = self.continuation_closure_fixture()
-        with mock.patch.dict(os.environ, self.base_env(), clear=True):
+        with mock.patch.dict(os.environ, {**self.base_env(), "HEARTING_GATES": "on"}, clear=True):
             # D-120: `old_memo` sits under the *source's* cycle dir, and that
             # cycle is exactly the one the continuation's `begin` rebound into
             # (verified lineage) -- so this is no longer "wrong cycle", it is

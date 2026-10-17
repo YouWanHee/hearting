@@ -587,8 +587,13 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
         source = source.resolve(strict=False)
         # Capacity identity lives separately from credentials/settings. Keep
         # its account metadata without inheriting global MCP/onboarding state.
-        account = read_json(claude_global_config_file(
-            env, cwd=Path.cwd())).get('oauthAccount')
+        # The account copy is optional: a config that cannot be read or parsed
+        # leaves the launch unscoped instead of failing it.
+        try:
+            config = read_json(claude_global_config_file(env, cwd=Path.cwd()))
+        except (OSError, ValueError):
+            config = {}
+        account = config.get('oauthAccount') if isinstance(config, dict) else None
         if account:
             write_json(home / '.claude.json', {'oauthAccount': account})
         symlink(source / 'hooks', home / 'hooks')

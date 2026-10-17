@@ -203,21 +203,27 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
 
     def test_resealed_profile_width_role_and_registry_tampering_still_fails(self):
         _,_,original = self.fixture('strong')
+        original['unit_catalog_digest'] = R.unit_catalog_digest()
+        self.reseal(original)
         for field,value in [('model_profile','light'),('parallel_leg_count',3),('role','invented reviewer')]:
             with self.subTest(field=field):
                 route = copy.deepcopy(original)
                 node = next(n for n in route['nodes'] if n.get('parallel_group')=='impl-review')
                 node[field] = value; self.reseal(route)
                 aid,row = self._row(route,node)
-                with self.assertRaises(ValueError):
-                    D.claim_attempt_row(self.jobs,aid,row,
-                        mutation_precheck=lambda lines: R.verify_route(route))
+                with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+                    with self.assertRaises(ValueError):
+                        D.claim_attempt_row(self.jobs,aid,row,
+                            mutation_precheck=lambda lines: R.verify_route(route))
         route = copy.deepcopy(original); route['registry_digest']='sha256:'+'0'*64; self.reseal(route)
-        with self.assertRaisesRegex(ValueError,'registry'): R.verify_route(route)
+        with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+            with self.assertRaisesRegex(ValueError,'registry'): R.verify_route(route)
         self.assertEqual(self.jobs.read_text(),'')
 
     def test_exact_registry_bridge_does_not_accept_other_registry_or_unit_catalog_drift(self):
         _,_,route = self.fixture('strong')
+        route['unit_catalog_digest'] = R.unit_catalog_digest()
+        self.reseal(route)
         registry = R.TOPO.load_registry()
         for mutation in ('role','width','model_profile','unrelated'):
             changed = copy.deepcopy(registry)
@@ -228,19 +234,25 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
                 changed['fixture_unrelated_change'] = True
             else:
                 recipe['standard_plus']['nodes'][0][mutation] = 'unexpected'
-            with self.subTest(mutation=mutation), mock.patch.object(R.TOPO,'load_registry',return_value=changed):
+            with self.subTest(mutation=mutation), \
+                    mock.patch.object(R.TOPO,'load_registry',return_value=changed), \
+                    mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
                 with self.assertRaisesRegex(ValueError,'registry'): R.verify_route(route)
-        with mock.patch.object(R,'unit_catalog_digest',return_value='sha256:'+'e'*64):
+        with mock.patch.object(R,'unit_catalog_digest',return_value='sha256:'+'e'*64), \
+                mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
             with self.assertRaisesRegex(ValueError,'registry|unit.catalog'): R.verify_route(route)
         self.assertEqual(self.jobs.read_text(),'')
 
     def test_legacy_payload_cannot_claim_new_persona_contract_to_bypass_digest(self):
         _,_,original = self.fixture('standard')
+        original['unit_catalog_digest'] = R.unit_catalog_digest()
+        self.reseal(original)
         for version in (1,2,True):
             with self.subTest(version=version):
                 route=copy.deepcopy(original); route['persona_independence_contract_version']=version
                 self.reseal(route)
-                with self.assertRaises(ValueError): R.verify_route(route)
+                with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
+                    with self.assertRaises(ValueError): R.verify_route(route)
 
 
 if __name__ == '__main__':

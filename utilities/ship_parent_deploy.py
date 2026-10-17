@@ -9,6 +9,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import fnmatch
 import hashlib
 import json
 import math
@@ -159,6 +160,23 @@ def command(value):
     return {"argv": argv, "cwd": str(cwd.resolve()), "timeout_seconds": timeout, "inputs": files}
 
 
+def listed_inputs(cmd):
+    """Hashed files other than those argv names: what the command reads, not the command."""
+    named = {str((Path(a) if Path(a).is_absolute() else Path(cmd["cwd"]) / a).absolute()) for a in cmd["argv"]}
+    return {path: sha for path, sha in cmd["inputs"].items() if path not in named}
+
+
+def unchanged_inputs_since(previous, value):
+    """The earliest preparation that observed the same listed inputs, for a command-only change."""
+    if previous is None or any(previous.get(k) != v for k, v in value.items() if k != "command"):
+        return None
+    listed = listed_inputs(value["command"])
+    if not listed or listed_inputs(previous["command"]) != listed:
+        return None  # No observation, or a changed input: every review starts again.
+    return previous.get("inputs_unchanged_since") or {
+        "prepared_at": previous["prepared_at"], "prior_review_attempts": previous["prior_review_attempts"]}
+
+
 def record_path(route):
     from artifact_producer import route_cycle_for, cycle_dir, require_cycle_output, ProducerError
     root = Path(route["artifact_root"])
@@ -192,6 +210,7 @@ def prepare(jobs, attempt, command_file):
                  "route_hash": route["route_hash"], "route_file": str(route_file.resolve()), "owner_attempt_id": attempt,
                  "parent_session_id": meta["parent_sid"], "command": cmd,
                  "deploy_record": str(record_path(route)), "node_id": node["id"]}
+        previous = None
         if request_path.exists():
             previous, _ = load_request(request_path)
             # An ordinary owner replacement keeps exactly this request.
@@ -205,12 +224,17 @@ def prepare(jobs, attempt, command_file):
         if unchanged:
             value["prepared_at"] = previous["prepared_at"]
             value["prior_review_attempts"] = previous["prior_review_attempts"]
+            if "inputs_unchanged_since" in previous:
+                value["inputs_unchanged_since"] = previous["inputs_unchanged_since"]
         else:
             # The existing registry lock orders request publication before new
             # review registration. A changed request cannot consume a review
             # that was already registered, even within the same timestamp second.
+            since = unchanged_inputs_since(previous, value)
             value["prepared_at"] = datetime.now(timezone.utc).isoformat()
             value["prior_review_attempts"] = review_attempts(route, jobs)
+            if since is not None:
+                value["inputs_unchanged_since"] = since
         value["request_digest"] = digest(value)
         value["parent_availability"] = availability
         write(request_path, value)
@@ -244,6 +268,33 @@ def review_attempts(route, jobs):
     return sorted(set(result))
 
 
+def command_reviewers(route, node, review_ids):
+    """Reviews that judge the deploy command.
+
+    These hand their verdict to deploy, hold the same gate (a plan's readiness
+    stage) or are their realized legs. If deploy names no such verdict, every
+    review judges the command.
+    """
+    nodes = {n["id"]: n for n in route["nodes"]}
+    wanted = node.get("inputs") or []
+    direct = {i for i in review_ids if any(fnmatch.fnmatchcase(out, name) or fnmatch.fnmatchcase(name, out)
+                                           for out in nodes[i].get("outputs") or [] for name in wanted)}
+    if not direct:
+        return set(review_ids)
+    gates = {nodes[i].get("completion_gate") for i in direct}
+    result = direct | {i for i in review_ids if nodes[i].get("completion_gate") in gates}
+    for group in route.get("parallel_groups", []):
+        if result & set(group.get("members", [])):
+            result |= set(group["members"])
+    return result | {i for i in review_ids if nodes[i].get("parallel_anchor") in result}
+
+
+def registered_after(began, attempt_id, preparation):
+    prepared = datetime.fromisoformat(preparation["prepared_at"])
+    return (began.tzinfo is not None and attempt_id not in preparation["prior_review_attempts"]
+            and began >= prepared.replace(microsecond=0))
+
+
 def reviews(route, node, jobs, request=None):
     cr = DC._route_module()
     missing = cr.owner_terminal_prerequisites(route, node, Path(jobs))
@@ -253,6 +304,7 @@ def reviews(route, node, jobs, request=None):
     pending = list(node.get("depends_on", []))
     nodes = {n["id"]: n for n in route["nodes"]}
     seen = set()
+    review_ids = []
     while pending:
         node_id = pending.pop()
         if node_id in seen:
@@ -264,22 +316,30 @@ def reviews(route, node, jobs, request=None):
             if n["id"] in group.get("members", []):
                 pending.extend(group["members"])
         if n.get("kind") == "review-worker":
-            row = cr._marker_identity_row(route, n, n["id"], n.get("completion_gate"),
-                                          jobs=Path(jobs), exact_terminal=True)
-            if not row.get("passed") or row.get("review_independence") == "owner-overridden":
-                raise ValueError("parent-deploy-independent-review-required:" + n["id"])
-            marker = read(cr.completion_dir(route["route_id"], jobs=Path(jobs)) / (n["id"] + ".json"))
-            reviewer = exact_attempt_row(Path(jobs), row.get("attempt_id", ""))
-            if (reviewer.metadata.get("worker_type") == "owner"
-                    or marker.get("review_independence") != "independent"):
-                raise ValueError("parent-deploy-independent-review-required:" + n["id"])
-            if request is not None:
-                began = datetime.fromisoformat(reviewer.raw.split("\t")[0].replace("Z", "+00:00"))
-                prepared = datetime.fromisoformat(request["prepared_at"])
-                if (began.tzinfo is None or row["attempt_id"] in request["prior_review_attempts"]
-                        or began < prepared.replace(microsecond=0)):
+            review_ids.append(node_id)
+    judges_command = command_reviewers(route, node, review_ids)
+    for node_id in review_ids:
+        n = nodes[node_id]
+        row = cr._marker_identity_row(route, n, n["id"], n.get("completion_gate"),
+                                      jobs=Path(jobs), exact_terminal=True)
+        if not row.get("passed") or row.get("review_independence") == "owner-overridden":
+            raise ValueError("parent-deploy-independent-review-required:" + n["id"])
+        marker = read(cr.completion_dir(route["route_id"], jobs=Path(jobs)) / (n["id"] + ".json"))
+        reviewer = exact_attempt_row(Path(jobs), row.get("attempt_id", ""))
+        if (reviewer.metadata.get("worker_type") == "owner"
+                or marker.get("review_independence") != "independent"):
+            raise ValueError("parent-deploy-independent-review-required:" + n["id"])
+        if request is not None:
+            began = datetime.fromisoformat(reviewer.raw.split("\t")[0].replace("Z", "+00:00"))
+            if not registered_after(began, row["attempt_id"], request):
+                # Only a review that does not judge the command keeps its PASS,
+                # and only while the inputs observed before it are unchanged.
+                since = request.get("inputs_unchanged_since")
+                if (n["id"] in judges_command or since is None
+                        or not registered_after(began, row["attempt_id"], since)):
                     raise ValueError("parent-deploy-review-precedes-request:" + n["id"])
-            proof[n["id"]] = row
+                row = {**row, "inputs_unchanged_since": since["prepared_at"]}
+        proof[n["id"]] = row
     for key, row in cr.terminal_gate_observation(route, jobs=Path(jobs), exact_terminal=True).items():
         if key.startswith("parallel_group:"):
             if not row.get("passed"):

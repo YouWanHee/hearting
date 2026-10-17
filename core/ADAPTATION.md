@@ -640,12 +640,13 @@ Peer input uses the same policy with an input purpose: a parent's idle native
 turn can receive messages while its registered children continue. Only work
 executed by that pane withholds input; exact foreground attempt tags distinguish
 execution from parent or handover bindings. Completion watches and retire keep
-all bindings. After installation, the existing reconnect callback resumes accepted
-message duties with the activated code and keeps retrying after a form or draft clears,
-even while a legacy runner holds its lock. One current runner uses a stable lock;
-the sealed transfer claim and receipt still prevent duplicate submission. Retire
-processing also holds the legacy runner lock, so the two generations cannot perform
-session cleanup together. No runner is interrupted to reconnect message delivery.
+all bindings. After installation, the existing reconnect path keeps sealed message refs bound
+to their exact recipient until that runtime's native callback can process them. It
+does not inspect a composer or retry a pane send after a draft or form changes. The
+native carrier records queue acceptance separately from exact receipt; its transfer
+claim and idempotent ref prevent duplicate submission. Retire processing still holds
+the legacy runner lock, so the two generations cannot perform session cleanup
+together. No runner is interrupted to reconnect message delivery.
 Non-completion conditions such as working retain their native watch meaning.
 Duplicate watch requests resolve the current server/pane/harness/session before
 reusing a duty; a new session gets a separate duty while the old one is preserved.
@@ -669,9 +670,11 @@ reads notices without a claim or acknowledgement and reconnects the existing
 peer courier, using the adapter's declared carrier and exact receiving session.
 Claude SessionStart, Codex SessionStart and OpenCode session creation use that
 same rule. A real prompt or accepted native turn acknowledges the notice.
-The courier follows confirmed session handover, retains messages behind drafts
-or forms, and never relaunches a missing parent or types into a shell pane.
-Unreceived notices stay visible in Fleet until a recipient processes them.
+The courier follows confirmed session handover and retains every unreceived
+sealed ref for the exact target session. Native carriers decide when that session
+can take a turn; OpenCode waits through busy, question and permission states. The
+courier never reads a composer, relaunches a missing parent or types into a shell
+pane. Unreceived refs stay visible in Fleet until the recipient processes them.
 
 A registered headless owner yields after registering a batch; its runtime supervisor joins the exact `parent_attempt_id` batch outside the model and resumes the same owned session once with a bounded typed receipt. A registered Claude owner keeps one realtime stream-input process for the route and submits the next receipt immediately after each non-terminal join; when a freshly verified terminal marker closes every declared terminal gate, the supervisor skips the redundant final owner turn and closes the stream before terminal row reconciliation. An explicit custom-command fallback retains per-turn `--resume`. A Claude interactive parent may instead arm one native `asyncRewake` PostToolUse hook from a successful exact owner-start receipt, or from a successful exact steward watch armed in the same session (`utilities/peer-steward.py watch`, SD-122 §13.37.2-(10)); either way the hook owns exactly one arming event, verifies it against the session that produced it, and never widens to another attempt or watch. It re-reads the exact current row and sealed completion evidence before rendering: every terminal receipt — success or attention — exits two, because Claude Code wakes an idle session for an `asyncRewake` hook only on exit code 2 and delivers exit-0 output no earlier than the next user interaction (corrected 2026-08-29; success additionally carries its structured notification on stdout). A launcher-managed interactive Codex session places one owner-only gateway between remote TUI and App Server. The harness installer may make this checked entry transparent for interactive commands, but plugin or hook loading after process entry is not equivalent. That gateway atomically serializes manual input with an exact completion receipt, uses `turn/start` only while idle and `turn/steer` only for a steerable active turn, and durably suppresses duplicate sealed-batch delivery. The sidecar is prelaunched before the child spawn claim, connects only to the private control socket, never subscribes upstream, never sees or answers approvals, and submits no raw child output. A send followed by an unclassified disconnect is `sent-ambiguous` and is not retried. Outside those checked entries, hooks must not simulate wake by blocking Stop, parking every tool, or injecting a synthetic user turn; the parent remains conversational and uses a disclosed finite fallback. Legacy receipts may be consumed only by exact terminal typed harvest. Runtime-native subagents are a separate surface.
 
@@ -782,3 +785,61 @@ group, process, and JSON views use the same authoritative current owner generati
 ### 8.19. Declared runtime requirements and lifecycle evidence under SD-97
 
 a node may declare only registry-known `runtime_requirements`. `loopback-listen` means localhost bind while outbound network remains denied; a runtime that exposes only a broad network boolean reports `loopback-only-unsupported` and uses the checked main/inline handoff rather than widening outbound access. Every registered row records the requested launch lifecycle plus bounded selector evidence (source, NSpid width, and PID-1 class) so an intermittent nested-sandbox lifetime failure is diagnosable without transcript inspection.
+
+## 9. Native interaction and optional Herdr observation
+
+Herdr is an optional pane observer. Native session identity and the exact live
+foreground process lifetime (PID plus birth identity) bind interaction and
+retirement. A pane label is a lookup hint. Herdr's displayed turn state is
+corroborating evidence and can be stale; a stale `working` value alone does
+not prove a live turn, and a live PID alone does not prove idle. Registered
+work, native runtime status, foreground ownership, and user form/draft safety
+keep their existing authority.
+
+Peer delivery records have separate `pending`, `queued`, and `received`
+meanings. Native transport acceptance records `queued`. Only the exact
+receiver's consumption evidence records `received`; completion and acceptance
+remain separate duties. A transport timeout or ambiguous reply retains the
+same transfer reference and its existing owner.
+
+The peer-delivery support matrix is transport-specific: `Claude plain TUI:
+idle -> existing steward prompt delivery; busy -> callback`; Codex uses its
+exact native per-thread queue, and OpenCode uses its native plugin callback.
+Claude's idle prompt path requires the exact native SID, pane, foreground PID
+birth and namespace, native `idle` state, ready registered-work state, no open
+form or question, and an empty visible composer. A dim prompt suggestion is
+empty. Busy, blocked, unknown, form-open, nonempty-draft, or unreadable targets
+stay on the existing callback path and receive no PTY input. Prompt submission
+is only `queued`; the exact receiver ref remains the only peer-delivery receipt.
+
+For Herdr observation, the endpoint is part of identity and cache keys. A
+subscription is established before its snapshot is applied. A successful,
+complete snapshot may confirm pane absence; failed, partial, or timed-out
+reads leave absence unknown. Apply events in arrival order within the live
+connection, and discard cached state and take a fresh snapshot after a lost or
+replaced connection. When the server protocol does not expose sequence or loss
+markers, consumers do not claim gap-free ordering across reconnects.
+
+Lifecycle reports retain a native start source and sequence when the runtime
+provides them. A resume command is the original launcher argument array, read
+only from a process whose PID birth and current native session both match; it
+is restoration data, not authorization, parent/GPU identity, or work ownership.
+Transcript, cwd, model, and permission fields are omitted when their exact
+runtime source is unavailable. Reports through the CLI and socket use the same
+native sequence/source pair when both have it. Pane seats include the concrete
+Herdr endpoint so equal pane labels on separate servers do not share a seat.
+
+For clear and continue, the current native session selection takes precedence
+over a lagging Herdr pane record. A delayed callback for an older session cannot
+claim the cleared seat after the process has selected its successor.
+
+OpenCode native turn status may resolve stale Herdr corroboration only when the
+event matches the exact session, pane, foreground PID birth, and PID namespace,
+and was observed within 15 seconds. Missing, stale, or mismatched status stays
+unknown for retire decisions.
+
+An exact pane exit, exact closed-pane event, complete absence census, or
+completed retire settles the existing watch duty before its observer exits.
+Terminal receipts prevent lifecycle reconciliation from recreating observers.
+Pane closure, agent release, goal completion, and successful work are distinct
+outcomes.

@@ -423,6 +423,17 @@ def materialize_after_terminal_close(jobs: Path, attempt_id: str) -> Path | None
             settlement = settle_owner_completion(jobs, row.status, row.metadata)
             if settlement is not None and settlement.result != "completed":
                 return None
+        # A resultless-death recovery claim is durable controller work. Publish
+        # it before the immutable terminal notice becomes visible to carriers;
+        # the carrier still waits for a launched successor or a settled failure.
+        try:
+            from dispatch_replacement import accept_terminal_delivery_duty
+            accept_terminal_delivery_duty(jobs, attempt_id)
+        except (DispatchContractError, pending_delivery.PendingDeliveryError,
+                OSError, ValueError, RuntimeError) as exc:
+            sys.stderr.write(
+                f"replacement-duty-not-accepted attempt_id={attempt_id} reason={exc}\n"
+            )
         return materialize_pending_delivery(jobs, row.raw.split("\t"))
     except (JoinContractError, pending_delivery.PendingDeliveryError, OSError, ImportError) as exc:
         sys.stderr.write(
@@ -912,7 +923,8 @@ def settle_open_pass(jobs: Path, attempt_id: str) -> bool:
     from route_authority import decide_continuation
     process = attempt_process_quiescence(metadata)
     terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=_row_worktree(row),
-        artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+        artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata)
     choice = decide_continuation(action="stage-settlement", status=row.status, metadata=metadata,
         facts={"process": process, "terminal": terminal})
     if not choice.allowed:
@@ -2884,11 +2896,13 @@ def exact_attempt_row(jobs: Path, attempt_id: str) -> ChildRow:
     return matches[0]
 
 
-def current_attempt_row(jobs: Path, attempt_id: str) -> ChildRow | None:
+def current_attempt_row(jobs: Path, attempt_id: str, *, read_context=None) -> ChildRow | None:
     """Return the latest exact registry row for one attempt identity."""
 
     if not _safe_identity(attempt_id):
         raise JoinContractError("attempt-id-invalid")
+    if read_context is not None:
+        return read_context.current_attempt_row(jobs, attempt_id)
     try:
         lines = registry_lines(jobs)
     except FileNotFoundError:
@@ -2896,7 +2910,12 @@ def current_attempt_row(jobs: Path, attempt_id: str) -> ChildRow | None:
     except OSError as exc:
         raise JoinContractError("registry-unreadable") from exc
     found: ChildRow | None = None
+    # A row of this attempt always carries this text; skipping the others before
+    # parsing keeps a lookup cheap on a registry of thousands of rows.
+    needle = "attempt_id=" + attempt_id
     for order, line in enumerate(lines):
+        if needle not in line:
+            continue
         fields = line.split("\t")
         if len(fields) != 6:
             continue
@@ -3806,7 +3825,8 @@ def route_completion_evidence(
 
     if terminal is None:
         terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=worktree,
-            artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"))
+            artifact_root_metadata=metadata.get("artifact_root"), worker_type=metadata.get("worker_type"),
+            artifact_binding=metadata)
     from route_authority import decide_continuation
     choice = decision or decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
     if not choice.allowed:
@@ -4071,6 +4091,7 @@ def classify_exact_route_free_review_outcome(
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
         worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata,
     )
     from route_authority import decide_continuation
     choice = decide_continuation(action="terminal-evidence", metadata=metadata, facts={"terminal": terminal})
@@ -4220,6 +4241,7 @@ def close_finished_child(
         worktree=_row_worktree(row),
         artifact_root_metadata=metadata.get("artifact_root"),
         worker_type=metadata.get("worker_type"),
+        artifact_binding=metadata,
     )
     if correct_recorded_move and (
         terminal.get("state") != "valid"

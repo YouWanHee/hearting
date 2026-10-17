@@ -2641,7 +2641,7 @@ class TestContinuation(unittest.TestCase):
    "parent_sandbox":R.WRAPPER_PARENT_SANDBOXES["codex"][0],
    "child_harness":"codex","launch_authority":"conductor","status":"supported",
    "probe_source":"continuation-fixture","probe_time":"2026-08-25T00:00:00Z",
-   "failure_class":"","checked_worktree":str((worktree or R.ROOT).resolve()),
+   "failure_class":"","checked_worktree":str(Path(worktree or R.ROOT).resolve()),
    "failure_scope":"none","codex_command":"ok","retry_on_isolated_worktree":0,
   }
   return {"tuples":[row],"native_subagent":[{
@@ -2649,19 +2649,27 @@ class TestContinuation(unittest.TestCase):
    "execution_surface":"codex-native-subagent","registered_worker":False,
    "status":"supported","check_source":"continuation-fixture",
   }]}
+ def _source_fixture(self):
+  if not hasattr(self,"_source_fixture_root"):
+   source_tmp=tempfile.TemporaryDirectory(prefix="continuation-source-")
+   self.addCleanup(source_tmp.cleanup)
+   self._source_fixture_root=self._git_repo(source_tmp.name)
+  return self._source_fixture_root
  def _source(self,artifact_root,cwd=None,slug=None,**selection):
+  source_cwd=Path(cwd) if cwd is not None else self._source_fixture()
   gate={
    "spec_read":{"satisfied":True,"source":"canonical-prd-sha256"},
    "drift_verdict":"within-spec","workflow_mode":"tracked",
    "artifact_guard":{"satisfied":True,"source":"conductor-prechecked"},
   }
   route=R.compile_route(
-   "autopilot-code","dev","strong",cwd or R.ROOT,artifact_root,
+   "autopilot-code","dev","strong",source_cwd,artifact_root,
    predicates=[],signals=["shared-contract"],transport="headless",
    tracking="tracked",tracked_gate_evidence=gate,
-   dispatch_evidence=self._dispatch(cwd),
+   dispatch_evidence=self._dispatch(source_cwd),
    slug=slug, **selection,
   )
+  self.assertEqual(route["source_commit"],self._git_head(source_cwd))
   route["runtime_lineage"]={
    "runtime":"codex","thread_id":"thread-source",
    "node_turn_ids":{
@@ -2676,16 +2684,29 @@ class TestContinuation(unittest.TestCase):
   evidence=Path(evidence_root)/f"{node['id']}.md"
   evidence.parent.mkdir(parents=True,exist_ok=True)
   evidence.write_text(f"{node['id']} exact output\n",encoding="utf-8")
+  jobs=Path(route["launch_compatibility_tuple"]["jobs_path"]["path"])
   metadata={
    "attempt_schema_version":2,"dispatch_depth":node["dispatch_depth"],
    "transport":"headless","execution_surface":"registered-headless",
    "registered_worker":"1","fallback_hop":"same-harness-headless",
+   "attempt_id":attempt_id,"route_id":route["route_id"],
+   "route_hash":route["route_hash"],"route_node":node["id"],
   }
-  R.complete_node(
-   route,node,node["id"],evidence,attempt_id=attempt_id,
-   explicit_attempt_metadata=metadata,
-  )
-  jobs=Path(route["launch_compatibility_tuple"]["jobs_path"]["path"])
+  from review_source_subject import is_implementation_review,seal_attempt
+  if is_implementation_review(route,node):
+   metadata.update(seal_attempt(jobs,route,node,attempt_id,worktree=route["cwd"]))
+   # This fixture models a settled completion, not the child lifecycle. Use
+   # the common marker writer with the exact source binding; the matching
+   # terminal row is attached below for continuation's exact-link checks.
+   R._publish_completion_locked(
+    route,node,node["id"],evidence,attempt_id=attempt_id,
+    attempt_metadata=metadata,jobs=jobs,
+   )
+  else:
+   R.complete_node(
+    route,node,node["id"],evidence,attempt_id=attempt_id,
+    explicit_attempt_metadata=metadata,
+   )
   link_path=R._attempt_completion_path(
    route,node["id"],attempt_id,jobs=jobs
   )
@@ -2696,18 +2717,24 @@ class TestContinuation(unittest.TestCase):
    "last_turn_id":f"turn-{node['id']}",
   })
   R.atomic_write(link_path,link)
-  # A completed node has a registry row: production cannot reach a completion
-  # marker without one. Fixtures that skipped this were the only reason the
-  # rebind ever saw a missing registry, which B2 now (correctly) declines.
-  self._write_attempt_row(jobs,route["route_id"],node["id"],attempt_id)
+  # Preserve the exact route/source identity in the synthetic terminal row;
+  # source-bound review currency reads this row and its write-once sidecar.
+  self._write_attempt_row(
+   jobs,route["route_id"],node["id"],attempt_id,
+   extra_metadata={"route_hash":route["route_hash"],
+                   **{key:value for key,value in metadata.items()
+                      if key.startswith("review_subject_")}},
+  )
   return evidence
- def _complete_prefix(self,route,resume_from,evidence_root,skip=()):
+ def _complete_prefix(self,route,resume_from,evidence_root,skip=(),attempt_namespace=None):
   evidence={}
   for node in route["nodes"][:next(
       index for index,row in enumerate(route["nodes"]) if row["id"]==resume_from
   )]:
    if node["id"] in skip: continue
-   evidence[node["id"]]=self._complete_node(route,node,evidence_root)
+   attempt_id=(f"att-continuation-{node['id']}-{attempt_namespace}"
+               if attempt_namespace else None)
+   evidence[node["id"]]=self._complete_node(route,node,evidence_root,attempt_id=attempt_id)
   # A reused human-gate predecessor proves more than source completion. Seal a
   # real raise+proceed pair in the fixture ledger, matching production.
   prefix_ids={node["id"] for node in route["nodes"][:next(
@@ -2745,7 +2772,7 @@ class TestContinuation(unittest.TestCase):
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    original=R.canonical(source)
    original_evidence=json.loads(json.dumps(source["dispatch_evidence"]))
-   fresh=self._dispatch()
+   fresh=self._dispatch(source["cwd"])
    fresh["tuples"][0]["parent_sandbox"]="danger-full-access"
    fresh["tuples"][0]["probe_time"]="2026-10-04T07:11:57Z"
    retained=self._build(source)
@@ -2760,7 +2787,7 @@ class TestContinuation(unittest.TestCase):
    for node in changed["nodes"]:
     if node.get("dispatch_depth")==2:
      self.assertEqual(node["fallback_hops"][0]["candidates"][0]["parent_sandbox"],"danger-full-access")
-   R.verify_route(changed,R.ROOT)
+   R.verify_route(changed,source["cwd"])
    R.write_once(R.canonical_route_path(artifact,source["route_id"]),source)
    output=R.canonical_route_path(artifact,changed["route_id"])
    R.publish_continuation_route(changed,source,output)
@@ -2945,7 +2972,7 @@ class TestContinuation(unittest.TestCase):
     self.assertIsNone(continuation["requested_boundary_blocker"])
     reused=next(row for row in continuation["reused_nodes"] if row["node_id"]=="plan")
     self.assertEqual(reused["output_evidence_digest"],R.evidence_digest(evidence["plan"]))
-    R.verify_route(continuation,R.ROOT)
+    R.verify_route(continuation,source["cwd"])
     output=R.canonical_route_path(root/"artifacts",continuation["route_id"])
     R.publish_continuation_route(continuation,source,output)
     self.assertTrue(output.is_file())
@@ -2958,7 +2985,7 @@ class TestContinuation(unittest.TestCase):
    continuation=self._build(source)
    self.assertEqual(continuation["slug"],"cycle-a")
    self.assertFalse(continuation["slug_truncated"])
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
  def test_campaign_selection_survives_continuation(self):
   with tempfile.TemporaryDirectory() as tmp:
    source=self._source(Path(tmp)/"artifacts",slug="Cycle A",
@@ -2967,7 +2994,7 @@ class TestContinuation(unittest.TestCase):
    continuation=self._build(source)
    self.assertEqual(continuation["campaign_key"],source["campaign_key"])
    self.assertEqual(continuation["parent_cycle_id"],source["parent_cycle_id"])
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
  def test_at1_reuses_exact_prefix_and_publishes_suffix_only(self):
   from unittest import mock
   with tempfile.TemporaryDirectory() as tmp:
@@ -3001,11 +3028,91 @@ class TestContinuation(unittest.TestCase):
    self._assert_no_alias_key(continuation)
    self.assertTrue(continuation["source_route_supersession"]["source_verdict_preserved"])
    self.assertEqual(len(continuation["supersession_edges"]),1)
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
    output=R.canonical_route_path(artifact,continuation["route_id"])
    R.publish_continuation_route(continuation,source,output)
    self.assertTrue(output.is_file())
    self.assertFalse(R.completion_dir(continuation["route_id"]).exists())
+ def test_legacy_source_unbound_review_pass_resumes_at_fresh_review(self):
+  from review_source_subject import binding_path,is_implementation_review
+  with tempfile.TemporaryDirectory() as tmp:
+   repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact,cwd=repo)
+   reviews=[node for node in source["nodes"] if is_implementation_review(source,node)]
+   self.assertTrue(reviews)
+   review_ids={node["id"] for node in reviews}
+   self._complete_prefix(source,"test",Path(tmp)/"evidence",skip=review_ids)
+   jobs=Path(source["launch_compatibility_tuple"]["jobs_path"]["path"])
+   for node in reviews:
+    attempt=f"att-legacy-{node['id']}"
+    evidence=Path(tmp)/"legacy"/f"{node['id']}.md"
+    evidence.parent.mkdir(parents=True,exist_ok=True)
+    evidence.write_text("legacy PASS without source binding\n",encoding="utf-8")
+    metadata={
+     "attempt_schema_version":2,"dispatch_depth":node["dispatch_depth"],
+     "transport":"headless","execution_surface":"registered-headless",
+     "registered_worker":"1","fallback_hop":"same-harness-headless",
+     "attempt_id":attempt,"route_id":source["route_id"],
+     "route_hash":source["route_hash"],"route_node":node["id"],
+     "launch_head":self._git_head(repo),
+    }
+    # A jobs-less publication preserves the legacy unknown subject shape while
+    # still creating the historical marker, history file, and attempt link.
+    R._publish_completion_locked(source,node,node["id"],evidence,
+     attempt_id=attempt,attempt_metadata=metadata)
+    link_path=R._attempt_completion_path(source,node["id"],attempt,jobs=jobs)
+    link=json.loads(link_path.read_text(encoding="utf-8"))
+    link.update({"verdict":"PASS","quiescence_proof_digest":"sha256:"+"a"*64,
+                 "last_turn_id":f"turn-{node['id']}"})
+    R.atomic_write(link_path,link)
+    self._write_attempt_row(jobs,source["route_id"],node["id"],attempt,
+     extra_metadata={**{key:str(value) for key,value in metadata.items()},
+      "worker_type":"review","note":"completed-marker","failure_class":"pass"})
+    marker=json.loads((R.completion_dir(source["route_id"],jobs=jobs)/f"{node['id']}.json").read_text())
+    self.assertNotIn("source_subject",marker)
+    self.assertFalse(binding_path(jobs,attempt).exists())
+   continuation=self._build(source)
+   self.assertEqual(continuation["first_runnable_node"],reviews[0]["id"])
+   self.assertIsNone(continuation["first_runnable_blocker"])
+   boundary=next(i for i,node in enumerate(source["nodes"]) if node["id"]==reviews[0]["id"])
+   self.assertEqual([row["node_id"] for row in continuation["reused_nodes"]],
+                    [node["id"] for node in source["nodes"][:boundary]])
+   self.assertEqual([row["node_id"] for row in continuation["new_nodes"]],
+                    [node["id"] for node in source["nodes"][boundary:]])
+   self.assertEqual(continuation["source_commit"],self._git_head(repo))
+   R.verify_route(continuation)
+ def test_stale_source_review_resumes_at_fresh_review_after_B(self):
+  from review_source_subject import is_implementation_review,marker_currency,observe
+  import subprocess
+  with tempfile.TemporaryDirectory() as tmp:
+   repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
+   source=self._source(artifact,cwd=repo)
+   self._complete_prefix(source,"test",Path(tmp)/"evidence-A")
+   review=next(node for node in source["nodes"] if is_implementation_review(source,node))
+   jobs=Path(source["launch_compatibility_tuple"]["jobs_path"]["path"])
+   marker_path=R.completion_dir(source["route_id"],jobs=jobs)/f"{review['id']}.json"
+   old_marker=json.loads(marker_path.read_text(encoding="utf-8"))
+   (repo/"x").write_text("source B\n",encoding="utf-8")
+   subprocess.run(["git","-C",str(repo),"add","x"],check=True)
+   subprocess.run(["git","-C",str(repo),"commit","-qm","source B"],check=True)
+   execute=next(node for node in source["nodes"] if node["id"]=="execute")
+   self._complete_node(source,execute,Path(tmp)/"evidence-B","att-source-B-execute")
+   self.assertEqual(marker_currency(source,review,old_marker,marker_path.parent),
+                    ("superseded","completion-review-source-stale"))
+   continuation=self._build(source)
+   self.assertEqual(continuation["first_runnable_node"],review["id"])
+   self.assertIsNone(continuation["first_runnable_blocker"])
+   self.assertEqual(continuation["source_commit"],self._git_head(repo))
+   self.assertEqual(continuation["source_commit_rebind"]["inherited_source_commit"],
+                    source["source_commit"])
+   self.assertEqual(continuation["source_commit_rebind"]["rebound_source_commit"],
+                    self._git_head(repo))
+   self.assertNotEqual(old_marker["source_subject"]["digest"],
+                       observe(source,review,worktree=repo)["digest"])
+   self.assertEqual([row["node_id"] for row in continuation["new_nodes"]],
+                    [node["id"] for node in source["nodes"]
+                     [next(i for i,row in enumerate(source["nodes"]) if row["id"]==review["id"]):]])
+   R.verify_route(continuation)
  def test_continuation_drops_a_binding_whose_entry_node_was_cut(self):
   with tempfile.TemporaryDirectory() as tmp:
    source=self._source(Path(tmp)/"artifacts")
@@ -3168,10 +3275,10 @@ class TestContinuation(unittest.TestCase):
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
    continuation=self._build(source)
    self.assertEqual(continuation["selection_pins"],source["selection_pins"])
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
    continuation["selection_pins"]["owner"]["harness"]="gemini"
    with self.assertRaisesRegex(ValueError,"invalid selection_pins.owner.harness"):
-    R.verify_route(continuation,R.ROOT)
+    R.verify_route(continuation,source["cwd"])
 
  def test_recorded_pin_changes_ride_a_continuation_with_completed_prefix_preserved(self):
   import route_authority as AUTH
@@ -3189,7 +3296,7 @@ class TestContinuation(unittest.TestCase):
    self.assertTrue(continuation["reused_nodes"])
    self.assertTrue(all(row["new_attempt_count"]==0 for row in continuation["reused_nodes"]))
    self.assertEqual(json.dumps(source,sort_keys=True),before)
-   R.verify_route(continuation,R.ROOT)
+   R.verify_route(continuation,source["cwd"])
 
  def test_at2_boundary_and_first_runnable_blockers_are_disjoint(self):
   with tempfile.TemporaryDirectory() as tmp:
@@ -3205,7 +3312,7 @@ class TestContinuation(unittest.TestCase):
 
    source=self._source(Path(tmp)/"artifacts-first")
    self._complete_prefix(
-    source,"test",Path(tmp)/"evidence-first",skip={"execute"})
+    source,"test",Path(tmp)/"evidence-first",skip={"execute"},attempt_namespace="second-route")
    first=self._build(source)
    self.assertIsNone(first["requested_boundary_blocker"])
    self.assertIn("continuation-source-node-unverified:execute",first["first_runnable_blocker"])
@@ -3220,7 +3327,7 @@ class TestContinuation(unittest.TestCase):
    with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
     source=self._source(Path(tmp)/f"artifacts-{mutation}")
     evidence=self._complete_prefix(
-     source,"test",Path(tmp)/f"evidence-{mutation}")
+     source,"test",Path(tmp)/f"evidence-{mutation}",attempt_namespace=mutation)
     continuation=self._build(source)
     if mutation=="marker":
      jobs=Path(source["launch_compatibility_tuple"]["jobs_path"]["path"])
@@ -3412,6 +3519,7 @@ class TestContinuation(unittest.TestCase):
    root=Path(tmp); artifact=root/"artifacts"; jobs=root/"state"/"jobs.log"
    jobs.parent.mkdir(parents=True)
    attempt="att-real-owner-lifecycle"
+   source_root=self._source_fixture()
    owner_meta=",".join((
     "attempt_schema_version=2","worker_type=owner","unit=_kernel/owner",
     "dispatch_depth=1","registered_worker=1",
@@ -3420,7 +3528,7 @@ class TestContinuation(unittest.TestCase):
     "parent_sid=launch-parent","owner_harness=codex",f"attempt_id={attempt}",
    ))
    owner_row="\t".join((
-    "2099-01-01T00:00:00Z","open",str(R.ROOT),str(R.ROOT),"owner",owner_meta,
+    "2099-01-01T00:00:00Z","open",str(source_root),str(source_root),"owner",owner_meta,
    ))
    jobs.write_text(owner_row+"\n",encoding="utf-8")
    lifecycle_env={
@@ -3442,11 +3550,11 @@ class TestContinuation(unittest.TestCase):
      f"route_hash={route['route_hash']}","capability=autopilot-code",
      "capability_mode=dev",f"artifact_root={artifact}","launch_started=1",
     ))
-    return "\t".join(("2099-01-01T00:00:00Z","open",str(R.ROOT),str(R.ROOT),
+    return "\t".join(("2099-01-01T00:00:00Z","open",str(route["cwd"]),str(route["cwd"]),
                        f"child-{suffix}",meta))+"\n"
 
    with mock.patch.dict(os.environ,lifecycle_env,clear=False):
-    source=self._source(artifact)
+    source=self._source(artifact,cwd=source_root)
     source_path=R.canonical_route_path(artifact,source["route_id"])
     R.write_once(source_path,source)
     attached=O.publish_owner_route_attachment_from_environment(
@@ -3627,7 +3735,10 @@ class TestContinuation(unittest.TestCase):
     source=self._source(artifact,cwd=repo)
     pinned=source["source_commit"]; self.assertEqual(pinned,self._git_head(repo))
     self._complete_prefix(source,"plan",Path(tmp)/"evidence")
-    (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-qam","fast-forward"],check=True)
+    docs=repo/"docs"; docs.mkdir()
+    (docs/"fast-forward.md").write_text("documentation-only fast-forward\n")
+    subprocess.run(["git","-C",str(repo),"add","docs/fast-forward.md"],check=True)
+    subprocess.run(["git","-C",str(repo),"commit","-qm","fast-forward"],check=True)
     head=self._git_head(repo); self.assertNotEqual(head,pinned)
     source_path=Path(tmp)/"source-route.json"
     source_path.write_text(json.dumps(source),encoding="utf-8")
@@ -3962,7 +4073,7 @@ class TestContinuation(unittest.TestCase):
         if f"route_node={node_id}," not in line+"," ]
   jobs.write_text("".join(f"{line}\n" for line in kept),encoding="utf-8")
 
- def _write_attempt_row(self,jobs,route_id,node_id,attempt_id,status="done"):
+ def _write_attempt_row(self,jobs,route_id,node_id,attempt_id,status="done",extra_metadata=None):
   # A fixture registry is a tmpdir registry. A route built without
   # AGENT_DISPATCH_JOBS pointed at one seals the *canonical* jobs path, and
   # appending there writes fake attempt rows into the operator's live registry
@@ -3975,7 +4086,9 @@ class TestContinuation(unittest.TestCase):
     "Set AGENT_DISPATCH_JOBS to a path under the test's TemporaryDirectory "
     "before building the route."
    )
-  meta=f"route_id={route_id},route_node={node_id},attempt_id={attempt_id}"
+  values={"route_id":route_id,"route_node":node_id,"attempt_id":attempt_id,
+          **(extra_metadata or {})}
+  meta=",".join(f"{key}={value}" for key,value in sorted(values.items()))
   jobs.parent.mkdir(parents=True,exist_ok=True)
   with jobs.open("a",encoding="utf-8") as handle:
    handle.write("\t".join(["2026-09-04T00:00:00Z",status,"repo","worktree","slug",meta])+"\n")
@@ -4187,7 +4300,10 @@ class TestContinuation(unittest.TestCase):
    repo=self._git_repo(tmp); artifact=Path(tmp)/"artifacts"
    source=self._source(artifact,cwd=repo)
    self._complete_prefix(source,"test",Path(tmp)/"evidence")
-   (repo/"x").write_text("b"); subprocess.run(["git","-C",str(repo),"commit","-qam","fast-forward"],check=True)
+   docs=repo/"docs"; docs.mkdir()
+   (docs/"fast-forward.md").write_text("documentation-only fast-forward\n")
+   subprocess.run(["git","-C",str(repo),"add","docs/fast-forward.md"],check=True)
+   subprocess.run(["git","-C",str(repo),"commit","-qm","fast-forward"],check=True)
    continuation=self._build(source)
    self.assertEqual(continuation["source_commit"],self._git_head(repo))
    R.verify_route(continuation)
@@ -4208,8 +4324,9 @@ class TestContinuation(unittest.TestCase):
    # descend from the pin and is legitimately a rebind, not a divergence.
    subprocess.run(["git","-C",str(repo),"reset","-q","--hard",source["source_commit"]],check=True)
    subprocess.run(["git","-C",str(repo),"commit","--amend","-qm","rewritten"],check=True)
-   with self.assertRaisesRegex(ValueError,"continuation-source-commit-diverged"):
-    self._build(source)
+   with mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}):
+    with self.assertRaisesRegex(ValueError,"continuation-source-commit-diverged"):
+     self._build(source)
 
  def test_continuation_cli_requires_exact_registered_depth1_owner(self):
   import subprocess,sys
@@ -4220,15 +4337,16 @@ class TestContinuation(unittest.TestCase):
    try:
     source=self._source(artifact); self._complete_prefix(source,"test",Path(tmp)/"evidence")
     source_path=Path(tmp)/"source-route.json"; source_path.write_text(json.dumps(source),encoding="utf-8")
-    jobs.parent.mkdir(parents=True, exist_ok=True); jobs.write_text(
-     "2099-01-01T00:00:00Z\topen\t%s\t%s\towner\t"
-     "attempt_schema_version=2,worker_type=owner,unit=_kernel/owner,"
-     "dispatch_depth=1,registered_worker=1,execution_surface=registered-headless,"
-     "capability=autopilot-code,capability_mode=dev,intensity=strong,artifact_root=%s,"
-     "owner_harness=codex,"
-     "parent_sid=thread-source,"
-     "attempt_id=att-cli-owner,owner_route_file=%s,owner_route_id=%s,owner_route_hash=%s\n"
-     % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]), encoding="utf-8")
+    jobs.parent.mkdir(parents=True, exist_ok=True)
+    with jobs.open("a",encoding="utf-8") as handle:
+     handle.write(
+      "2099-01-01T00:00:00Z\topen\t%s\t%s\towner\t"
+      "attempt_schema_version=2,worker_type=owner,unit=_kernel/owner,"
+      "dispatch_depth=1,registered_worker=1,execution_surface=registered-headless,"
+      "capability=autopilot-code,capability_mode=dev,intensity=strong,artifact_root=%s,"
+      "owner_harness=codex,parent_sid=thread-source,"
+      "attempt_id=att-cli-owner,owner_route_file=%s,owner_route_id=%s,owner_route_hash=%s\n"
+      % (source["cwd"], source["cwd"], source["artifact_root"], source_path, source["route_id"], source["route_hash"]))
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
                 "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
@@ -4264,11 +4382,12 @@ class TestContinuation(unittest.TestCase):
    try:
     source=self._source(artifact); self._complete_prefix(source,"test",Path(tmp)/"evidence")
     source_path=Path(tmp)/"source-route.json"; source_path.write_text(json.dumps(source),encoding="utf-8")
-    jobs.parent.mkdir(parents=True, exist_ok=True); jobs.write_text(
-     "2099-01-01T00:00:00Z\topen\trepo\t%s\tstage\t"
-     "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
-     "worker_type=stage,unit=dev/backend,attempt_id=att-cli-stage\n" % R.ROOT,
-     encoding="utf-8")
+    jobs.parent.mkdir(parents=True, exist_ok=True)
+    with jobs.open("a",encoding="utf-8") as handle:
+     handle.write(
+      "2099-01-01T00:00:00Z\topen\trepo\t%s\tstage\t"
+      "attempt_schema_version=2,dispatch_depth=2,registered_worker=1,"
+      "worker_type=stage,unit=dev/backend,attempt_id=att-cli-stage\n" % source["cwd"])
     env=os.environ.copy(); env["AGENT_DISPATCH_ATTEMPT_ID"]="att-cli-stage"
     env["AGENT_DISPATCH_DEPTH"]="2"
     env["AGENT_DISPATCH_REGISTERED_WORKER"]="1"
@@ -4296,16 +4415,16 @@ class TestContinuation(unittest.TestCase):
    try:
     source=self._source(artifact); self._complete_prefix(source,"test",Path(tmp)/"evidence")
     source_path=Path(tmp)/"source-route.json"; source_path.write_text(json.dumps(source),encoding="utf-8")
-    jobs.parent.mkdir(parents=True, exist_ok=True); jobs.write_text(
-     "2099-01-01T00:00:00Z\topen\t%s\t%s\towner\t"
-     "attempt_schema_version=2,worker_type=owner,unit=_kernel/owner,"
-     "dispatch_depth=1,registered_worker=1,execution_surface=registered-headless,"
-     "capability=autopilot-code,capability_mode=dev,intensity=strong,artifact_root=%s,"
-     "owner_harness=codex,"
-     "parent_sid=thread-source,"
-     "attempt_id=att-cli-replay,"
-     "owner_route_file=%s,owner_route_id=%s,owner_route_hash=%s\n"
-     % (R.ROOT, R.ROOT, source["artifact_root"], source_path, source["route_id"], source["route_hash"]), encoding="utf-8")
+    jobs.parent.mkdir(parents=True, exist_ok=True)
+    with jobs.open("a",encoding="utf-8") as handle:
+     handle.write(
+      "2099-01-01T00:00:00Z\topen\t%s\t%s\towner\t"
+      "attempt_schema_version=2,worker_type=owner,unit=_kernel/owner,"
+      "dispatch_depth=1,registered_worker=1,execution_surface=registered-headless,"
+      "capability=autopilot-code,capability_mode=dev,intensity=strong,artifact_root=%s,"
+      "owner_harness=codex,parent_sid=thread-source,attempt_id=att-cli-replay,"
+      "owner_route_file=%s,owner_route_id=%s,owner_route_hash=%s\n"
+      % (source["cwd"], source["cwd"], source["artifact_root"], source_path, source["route_id"], source["route_hash"]))
     env=os.environ.copy()
     for key in ("AGENT_DISPATCH_OWNER_HARNESS","AGENT_DISPATCH_CURRENT_HARNESS",
                 "AGENT_DISPATCH_WORKER_TYPE","AGENT_DISPATCH_DEPTH",
@@ -4402,18 +4521,16 @@ class TestContinuation(unittest.TestCase):
   R._LAUNCH_ROOT_IDENTITY_CACHE.clear()
   R._LAUNCH_CONTENT_DIGEST_CACHE.clear()
   R._LAUNCH_SOURCE_REVISION_CACHE.clear()
-  # `_git_commit()` shells out to `git rev-parse HEAD` and silently falls
-  # back to the literal string "unversioned" on any nonzero exit -- which is
-  # exactly what happens under a sandboxed HOME with no global gitconfig
-  # (git's "detected dubious ownership" safe.directory check, reproduced
-  # directly: `env -i PATH="$PATH" git -C <this worktree> rev-parse HEAD`
-  # exits 128). `source_commit` feeds route_hash, so this must be frozen too.
+  # Source-subject observation and source-commit continuation checks need a
+  # real Git checkout. Give the fixture a deterministic commit, then seal that
+  # exact head while compiling so source currency and first-parent validation
+  # both exercise their normal paths.
   previous_owner_attempt=os.environ.pop("AGENT_DISPATCH_ATTEMPT_ID",None)
   try:
    with mock.patch("datetime.datetime",_FrozenDatetime), \
         mock.patch.object(R,"_launch_source_revision",lambda path:"golden-fixed-revision"), \
         mock.patch.object(R,"_launch_content_digest",lambda path:"sha256:"+"0"*64), \
-        mock.patch.object(R,"_git_commit",lambda cwd:"golden-fixed-commit"):
+        mock.patch.object(R,"_git_commit",lambda cwd:fixture_head):
     # write_completion_marker() stamps a real wall clock into `completed_at`
     # (frozen above), and launch_compatibility_tuple() seals the *current
     # uncommitted git diff* of the whole worktree into release_id/
@@ -4427,8 +4544,19 @@ class TestContinuation(unittest.TestCase):
     # `cwd` is hashed into route identity (route_hash -> continuation_id);
     # the checkout path (R.ROOT) would bind the golden to one worktree, so
     # compile from a fixed cwd under the fixture root instead.
-    (root/"cwd").mkdir(parents=True,exist_ok=True)
-    source=self._source(root/"artifacts",cwd=root/"cwd")
+    cwd=root/"cwd"; cwd.mkdir(parents=True,exist_ok=True)
+    subprocess.run(["git","-C",str(cwd),"init","-q"],check=True)
+    subprocess.run(["git","-C",str(cwd),"config","user.email","fixture@example.com"],check=True)
+    subprocess.run(["git","-C",str(cwd),"config","user.name","Fixture"],check=True)
+    (cwd/"source.py").write_text("fixture_source = True\n",encoding="utf-8")
+    subprocess.run(["git","-C",str(cwd),"add","source.py"],check=True)
+    commit_env={**os.environ,"GIT_AUTHOR_DATE":"2026-08-29T00:00:00Z",
+                "GIT_COMMITTER_DATE":"2026-08-29T00:00:00Z"}
+    subprocess.run(["git","-C",str(cwd),"commit","-qm","fixture source"],
+                   check=True,env=commit_env)
+    fixture_head=subprocess.run(["git","-C",str(cwd),"rev-parse","HEAD"],
+                                check=True,text=True,capture_output=True).stdout.strip()
+    source=self._source(root/"artifacts",cwd=cwd)
     self._complete_prefix(source,"test",root/"evidence")
     continuation=self._build(source)
   finally:
@@ -5309,8 +5437,12 @@ class RevisedAncestorSuccessorTest(unittest.TestCase):
                     successor["nodes"][0]["completion_gate"],jobs=self._jobs)["passed"])
     D.completion_marker_gate(str(successor_path),"execute","dry-run",
                              Path(self._tmp_home.name),self._jobs)
-    implementation=R.build_continuation_route(successor,resume_from_node="execute",
-       requested_boundary="execute",reason="continue after fresh review",artifact_root=root)
+    with mock.patch.object(
+       D,"attempt_process_quiescence",
+       return_value=D.ProcessQuiescence("quiescent","fixture-owner-ended"),
+    ):
+     implementation=R.build_continuation_route(successor,resume_from_node="execute",
+        requested_boundary="execute",reason="continue after fresh review",artifact_root=root)
     self.assertIsNone(implementation["first_runnable_blocker"])
     self.assertEqual(implementation["ancestor_plan_refresh"],proof)
     self.assertEqual([row["route_id"] for row in R.review_lineage_routes(implementation,"impl-review")],
@@ -7062,6 +7194,9 @@ class HistoricalReviewSelfDispositionTest(InlineStageCompletionRecipeTest):
   meta=dict(axes,attempt_id="att-review-self",worker_type="review",harness=harness,
    route_id=route["route_id"],route_hash=route["route_hash"],route_node=node["id"],route_file=str(path),
    parent_attempt_id="att-owner",artifact_root=str(artifact),log_file=str(log))
+  from review_source_subject import is_implementation_review, seal_attempt
+  if is_implementation_review(route,node):
+   meta.update(seal_attempt(self.jobs,route,node,meta["attempt_id"],worktree=repo))
   # Publish the original completion from a finite, already reaped lifecycle.
   # Its real launch identity lets the normal terminal writer preserve the
   # full cleanup proof before a later CLI observer becomes unobservable.

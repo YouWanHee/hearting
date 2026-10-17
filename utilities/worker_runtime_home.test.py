@@ -158,6 +158,17 @@ class WorkerHomes(unittest.TestCase):
             (Path(values['CLAUDE_CONFIG_DIR']) / '.claude.json').read_text()),
             {'oauthAccount': legacy_account})
 
+    def test_claude_unreadable_global_config_leaves_the_launch_unscoped(self):
+        cli_home = self.base / 'rewriting-home'
+        (cli_home / '.claude').mkdir(parents=True)
+        for label, text in (('torn', '{"oauthAccount": '), ('non-object', '[]')):
+            with self.subTest(config=label):
+                (cli_home / '.claude.json').write_text(text)
+                values = prepare_worker_home(
+                    ROOT, 'claude', 'owner', 'unreadable-config-' + label,
+                    env={**self.env, 'HOME': str(cli_home)})
+                self.assertFalse((Path(values['CLAUDE_CONFIG_DIR']) / '.claude.json').exists())
+
     def test_claude_binding_covers_worker_types_and_cross_harness_descendants(self):
         source = self.base / 'main-claude-config'
         source.mkdir()

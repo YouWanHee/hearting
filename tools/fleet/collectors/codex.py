@@ -1352,24 +1352,9 @@ def _daemon_thread_origins(environ):
             pass
 
 
-def _tcp_listener_snapshot(port):
-    """Return the exact IPv4 LISTEN inode and same-UID owner sets, or unknown."""
-    inodes = set()
-    try:
-        with open("/proc/net/tcp", encoding="ascii", errors="strict") as handle:
-            rows = handle.read().splitlines()[1:]
-    except (OSError, UnicodeError):
-        return None
-    for row in rows:
-        fields = row.split()
-        try:
-            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
-                inodes.add(fields[9])
-        except (IndexError, ValueError):
-            return None
-    if not inodes:
-        return frozenset(), frozenset()
-    owners = set()
+def _socket_owners_by_inode():
+    """Map each socket inode to the same-UID PIDs holding it, or unknown."""
+    owners = {}
     try:
         pids = [name for name in os.listdir("/proc") if name.isdigit()]
     except OSError:
@@ -1389,9 +1374,8 @@ def _tcp_listener_snapshot(port):
                     link = os.readlink("%s/%s" % (fd_dir, fd))
                 except FileNotFoundError:
                     continue
-                if link.startswith("socket:[") and link[8:-1] in inodes:
-                    owners.add(int(raw_pid))
-                    break
+                if link.startswith("socket:["):
+                    owners.setdefault(link[8:-1], set()).add(int(raw_pid))
         except (FileNotFoundError, PermissionError):
             # Gone, or a same-UID process whose fd table is closed to us (user
             # systemd, privsep sshd, sandboxed children). It cannot be proven an
@@ -1399,6 +1383,42 @@ def _tcp_listener_snapshot(port):
             continue
         except OSError:
             return None
+    return owners
+
+
+def _tcp_listener_snapshot(port, scan=None):
+    """Return the exact IPv4 LISTEN inode and same-UID owner sets, or unknown.
+
+    ``scan`` is one observation's shared fd-table read: the ports a caller
+    snapshots together reuse a single walk of every process instead of one walk
+    per port. A caller re-observing passes a fresh one.
+    """
+    inodes = set()
+    try:
+        with open("/proc/net/tcp", encoding="ascii", errors="strict") as handle:
+            rows = handle.read().splitlines()[1:]
+    except (OSError, UnicodeError):
+        return None
+    for row in rows:
+        fields = row.split()
+        try:
+            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add(fields[9])
+        except (IndexError, ValueError):
+            return None
+    if not inodes:
+        return frozenset(), frozenset()
+    if scan is not None and "owners" in scan:
+        by_inode = scan["owners"]
+    else:
+        by_inode = _socket_owners_by_inode()
+        if scan is not None:
+            scan["owners"] = by_inode
+    if by_inode is None:
+        return None
+    owners = set()
+    for inode in inodes:
+        owners |= by_inode.get(inode, set())
     return frozenset(inodes), frozenset(owners)
 
 
@@ -1409,8 +1429,8 @@ def _daemon_endpoint_current(origins):
         return False
 
 
-def _listener_unchanged(port, observed):
-    current = _tcp_listener_snapshot(port)
+def _listener_unchanged(port, observed, scan=None):
+    current = _tcp_listener_snapshot(port, scan)
     return current is not None and current == observed
 
 
@@ -1443,12 +1463,13 @@ def _daemon_session_for_process(pid, environ=None):
         return None
     listeners = {}
     candidates = set()
+    scan = {}
     for thread_id, (port, source) in origins.items():
         if not port or not source or source == "subagent":
             continue
         observed = listeners.get(port)
         if observed is None:
-            observed = _tcp_listener_snapshot(port)
+            observed = _tcp_listener_snapshot(port, scan)
             if observed is None:
                 _invalidate_origins(origins)
                 return None
@@ -1458,8 +1479,9 @@ def _daemon_session_for_process(pid, environ=None):
             candidates.add(thread_id)
     if len(candidates) != 1:
         return None
+    recheck = {}
     if (not _daemon_endpoint_current(origins)
-            or any(not _listener_unchanged(port, observed)
+            or any(not _listener_unchanged(port, observed, recheck)
                    for port, observed in listeners.items())
             or procscan.read_proc_start(pid) != start):
         _invalidate_origins(origins)

@@ -283,6 +283,23 @@ invalid. Absolute/escaping paths and out-of-payload files remain invalid. Cycle 
 Invalid paths identify the locator and reason before payload reads or manifest
 publication.
 
+A payload directory may opt itself and its descendants out of new candidate
+collection with any one of three independent markers: a regular, no-follow
+`CACHEDIR.TAG` whose first 43 bytes are exactly
+`Signature: 8a477f597d28d172789f06886806bc55`; a regular, no-follow
+`pyvenv.cfg` of any contents; or a regular, no-follow `.gitignore` whose entire
+contents are exactly `*`, `*\n`, or `*\r\n`. Marker checks apply only to the
+exact cycle payload roots `artifacts/` and `_internal/` and directories below
+them; a marker in a repository, artifact-root, or cycle-root ancestor has no
+effect. The marked directory is pruned before descending into it, reading its
+payload, or validating descendant locators. Marker symlinks and special files
+are not markers, and their targets are not followed. A marked tree changes only
+the current candidate set: existing manifest rows remain unchanged under
+§45 D-123, actual file removal continues to follow D-124, and completion proof
+continues to describe the recorded close under D-127. Candidate bundle search
+uses this rule; validation of already-published bundle descriptors retains its
+recorded coverage behavior.
+
 **Cycle payload buckets.** The top-level table above closes only the names
 directly under the artifact root. Inside a cycle, the first segment below
 `artifacts/` is the bucket, and this table closes the bucket names: it lists
@@ -537,12 +554,19 @@ under those same locks and uses ordinary atomic rename, as producer admission do
 ## 4. Workflow Invariants
 
 Transport deaths have no cumulative automatic replacement count limit. The
-existing controller may replace each settled, proven-dead attempt with one
-successor per exact predecessor. It preserves original results, completed
-stages, review ceilings, runtime pins and normal backoff. Live or unknown
-processes, unsettled cleanup, readable FAIL or BLOCKED, and human decisions
-retain their existing handling. A route paused only by the old replacement
-count resumes through its ordinary `start` surface.
+existing controller may replace each settled, resultless, proven-dead attempt
+with one stable successor per exact predecessor. A join carries one bounded
+original-to-final projection while the registry retains every verified edge.
+Carriers use their verified jobs path when the sealed terminal receipt
+intentionally has an empty `job_registry`; a registered or merely claimed
+successor is not execution or consumption. Intermediate failure stays pending
+while a launched successor owns the result, and the final result or inability
+to continue follows the existing delivery path. Original rows and receipts,
+completed stages, review ceilings, runtime pins, live or unknown work,
+unsettled cleanup, semantic FAIL or BLOCKED, and human decisions retain their
+existing handling. Automatic replacement currently follows the existing
+controller timing; no per-generation delay is persisted. A route paused only
+by the old replacement count resumes through its ordinary `start` surface.
 
 Artifacts move forward in one direction:
 

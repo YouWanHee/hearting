@@ -354,8 +354,9 @@ def codex_tui_pane_endpoint(session_id, *, pane_hint=None, executable=None):
             record = _process(owner_pid)
             if kind != "codex" or service or not record or _registered_worker(owner_pid):
                 continue
-            if _native_session(owner_pid, "codex") != session_id:
-                continue
+            # The pane and endpoint checks read only the environment; the session
+            # proof walks every process's fd table, so only the frontends they
+            # leave reach it, inside _loader_verified_pane.
             owner_env = procscan.read_environ(owner_pid)
             pane = str(owner_env.get("HERDR_PANE_ID") or "").strip()
             if not pane or pane_hint and pane != pane_hint:

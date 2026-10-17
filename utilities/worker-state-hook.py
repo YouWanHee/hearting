@@ -72,7 +72,8 @@ def _main_compact(action: str, harness: str, payload: dict) -> int:
         command.extend(("--transcript", transcript))
     compact_summary = payload.get("compact_summary") or payload.get("compactSummary") or payload.get("summary") or ""
     compact_context = {}
-    for key in ("trigger", "summary_id", "parent_id", "tail_start_id", "compaction_part_id", "status", "observed_at"):
+    for key in ("trigger", "summary_id", "parent_id", "tail_start_id", "compaction_part_id",
+                "turn_id", "event_id", "status", "observed_at"):
         value = payload.get(key)
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):
             compact_context[key] = value
@@ -82,15 +83,25 @@ def _main_compact(action: str, harness: str, payload: dict) -> int:
         body = compact_context if runtime_status else {"summary": compact_summary, **compact_context}
         result = subprocess.run(command, input=json.dumps(body), text=True,
                                 capture_output=True, check=False, timeout=4, env=env)
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired:
+        if action == "compact-after":
+            print("booking=pending reason=compact-hook-timeout")
+        return 0
+    except OSError:
+        if action == "compact-after":
+            print("booking=pending reason=compact-hook-unavailable")
         return 0
     if result.returncode == 0 and action == "compact-before" and harness in ("claude", "opencode"):
         sys.stdout.write(result.stdout or "")
         sys.stdout.flush()
-    elif result.returncode == 0 and action == "compact-after" \
-            and (result.stdout or "").strip() == "booking=scheduled":
-        # Internal OpenCode plugin signal only; the Claude hook wrapper discards after output.
-        sys.stdout.write("booking=scheduled\n")
+    elif result.returncode == 0 and action == "compact-after":
+        status = next((line.strip() for line in (result.stdout or "").splitlines()
+                       if line.strip().startswith("booking=")), "")
+        if status:
+            # Runtime adapters consume this internal status; hook wrappers keep it out of prompt input.
+            sys.stdout.write(status + "\n")
+    elif result.returncode != 0 and action == "compact-after":
+        print(f"booking=pending reason=compact-hook-exit-{result.returncode}")
     elif result.returncode == 0 and action == "runtime-status" \
             and (result.stdout or "").strip() == "booking=pending":
         sys.stdout.write("booking=pending\n")
@@ -122,7 +133,9 @@ def main() -> int:
             if not isinstance(payload, dict):
                 payload = {}
             return _main_compact(args.action, args.harness, payload)
-        except BaseException:
+        except BaseException as exc:
+            if args.action == "compact-after":
+                print(f"booking=pending reason=bridge-{type(exc).__name__}")
             return 0
     return 0
 

@@ -47,6 +47,8 @@ from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "utilities") not in sys.path:
+    sys.path.insert(0, str(ROOT / "utilities"))
 DEFAULT_TIMEOUT = 600
 DEFAULT_JOBS = 4
 
@@ -1798,6 +1800,31 @@ def run_profile(
 
 def main(argv: list[str]) -> int:
     args = build_arg_parser().parse_args(argv)
+    import artifact_context
+    context = artifact_context.resolve_context(environ=os.environ)
+    mode_flags = {"--census", "--report-only", "--fingerprint", "--fingerprint-explain",
+                  "--compare-baseline", "--verify-shards"}
+    route_test = (context.route and context.node
+                  and context.route.get("capability") == "autopilot-code"
+                  and (context.node_id in {"test", "verification"}
+                       or context.node.get("completion_gate") == "code-test"))
+    if route_test:
+        # Explicit routed paths remain subject to the same declared node scope.
+        for role, value in (("test-report", args.report), ("test-diagnostics", args.diagnostics_dir)):
+            if value is not None:
+                context.resolve_output(role, explicit=value)
+        if not mode_flags.intersection(argv):
+            if "--root" not in argv and not any(value.startswith("--root=") for value in argv):
+                if context.source_worktree:
+                    args.root = context.source_worktree
+            if args.report is None:
+                binding = context.resolve_output("test-report")
+                if binding and binding.path:
+                    args.report = binding.path
+            if args.diagnostics_dir is None:
+                binding = context.resolve_output("test-diagnostics")
+                if binding and binding.path:
+                    args.diagnostics_dir = binding.path
 
     if args.compare_baseline:
         if not args.base_report or not args.head_report:

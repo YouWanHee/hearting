@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated regressions for the shared, read-only Git index-lock diagnosis."""
+"""Isolated regressions for bounded, read-only Git index-lock diagnosis."""
 from __future__ import annotations
 
 import base64
@@ -7,6 +7,8 @@ import importlib.util
 import os
 from pathlib import Path
 import subprocess
+import stat
+import threading
 import tempfile
 import time
 import unittest
@@ -123,6 +125,9 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         self.assertEqual(diagnosis["lock_path"], str(lock))
         self.assertEqual(diagnosis["observation"]["mode"], "0o0")
         self.assertIn("Ownership: unknown", diagnosis["message"])
+        self.assertEqual(diagnosis["cleanup"], {
+            "outcome": "not-attempted", "reason": "read-only-diagnosis"})
+        self.assertIn("Lock mutation: none", diagnosis["message"])
         self.assertEqual(self.fd_bytes(lock_fd), b"")
         self.assertEqual(lock.stat().st_mode & 0o777, 0)
         self.assertEqual(self.path_identity(lock), lock_identity)
@@ -320,6 +325,107 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
                 self.assertEqual(self.git_state(), after_failure_before_diagnosis)
                 self.assertEqual(self.fd_bytes(lock_fd), b"")
 
+    def test_metadata_signature_is_advisory_and_never_retries(self):
+        result, lock, *_ = self.fail_commit()
+        lock_fd = self.lock_fds[-1]
+        identity = self.fd_identity(lock_fd)
+        observation = {"state": "present", "kind": "regular-file", "mode": "0o0",
+                       "size": 0, "mtime_ns": 1}
+        runner = mock.Mock(return_value={"index": str(lock)[:-5], "cwd": str(self.repo)})
+        diagnosis = self.diagnose(
+            result, observer=lambda _path, _timeout: observation, git_runner=runner)
+        self.assertEqual(diagnosis["cleanup"], {
+            "outcome": "not-attempted", "reason": "read-only-diagnosis"})
+        self.assertIn("Ownership: unknown", diagnosis["message"])
+        self.assertIn("outstanding NFS client operation", diagnosis["message"])
+        self.assertIn("Lock mutation: none", diagnosis["message"])
+        self.assertNotIn("may retry", diagnosis["message"])
+        self.assertEqual(self.fd_identity(lock_fd), identity)
+        self.assertEqual(self.fd_bytes(lock_fd), b"")
+        self.assertTrue(lock.exists())
+        runner.assert_called_once()
+
+    def test_pending_nfs_create_setattr_candidate_stays_canonical_while_setattr_resumes(self):
+        result, lock, *_ = self.fail_commit()
+        lock_fd = self.lock_fds[-1]
+        before = os.fstat(lock_fd)
+        identity = (before.st_dev, before.st_ino)
+        original_bytes = os.pread(lock_fd, 4096, 0)
+        self.assertEqual(before.st_mode & 0o777, 0)
+        self.assertEqual(original_bytes, b"")
+
+        now_ns = time.time_ns()
+        candidate_observation = {
+            "state": "present", "kind": "regular-file", "mode": "0o0", "size": 0,
+            "dev_major": os.major(before.st_dev), "dev_minor": os.minor(before.st_dev),
+            "ino": before.st_ino, "mtime_ns": now_ns - 25 * 60 * 60 * 1_000_000_000,
+            "ctime_ns": now_ns - 300 * 1_000_000_000,
+            "nfs_v3": True, "cache_grace_seconds": 120,
+        }
+        self.assertGreaterEqual(candidate_observation["ctime_ns"] -
+                                candidate_observation["mtime_ns"],
+                                24 * 60 * 60 * 1_000_000_000)
+        self.assertGreaterEqual(now_ns - candidate_observation["ctime_ns"],
+                                candidate_observation["cache_grace_seconds"] * 1_000_000_000)
+
+        ready = threading.Event()
+        resume = threading.Event()
+        completed = threading.Event()
+        operation_errors = []
+
+        def delayed_post_create_setattr():
+            ready.set()
+            if not resume.wait(2):
+                operation_errors.append("delayed SETATTR was not resumed")
+                completed.set()
+                return
+            try:
+                os.fchmod(lock_fd, 0o640)
+            except OSError as exc:
+                operation_errors.append(exc)
+            finally:
+                completed.set()
+
+        delayed_operation = threading.Thread(
+            target=delayed_post_create_setattr, name="simulated-nfs-post-create-setattr")
+        delayed_operation.start()
+        try:
+            self.assertTrue(ready.wait(1))
+            with mock.patch.object(git_index_lock.os, "rename") as rename, \
+                    mock.patch.object(git_index_lock.os, "unlink") as unlink, \
+                    mock.patch.object(git_index_lock.os, "mkdir") as quarantine:
+                diagnosis = self.diagnose(
+                    result, observer=lambda _path, _timeout: candidate_observation,
+                    git_runner=lambda *_args: {
+                        "index": str(lock)[:-5], "logical_lock": str(lock),
+                        "cwd": str(self.repo),
+                    })
+                self.assertEqual(diagnosis["state"], "present")
+                self.assertEqual(diagnosis["observation"]["mode"], "0o0")
+                self.assertEqual(diagnosis["observation"]["ino"], before.st_ino)
+                self.assertEqual(diagnosis["observation"]["cache_grace_seconds"], 120)
+                self.assertEqual(diagnosis["cleanup"]["outcome"], "not-attempted")
+                self.assertEqual((os.lstat(lock).st_dev, os.lstat(lock).st_ino), identity)
+                self.assertEqual(os.pread(lock_fd, 4096, 0), original_bytes)
+
+                # Resume the operation through the already-open file handle while
+                # the canonical directory entry is still being observed.
+                resume.set()
+                self.assertTrue(completed.wait(1))
+                self.assertEqual(operation_errors, [])
+                rename.assert_not_called()
+                unlink.assert_not_called()
+                quarantine.assert_not_called()
+
+                after = os.lstat(lock)
+                self.assertEqual((after.st_dev, after.st_ino), identity)
+                self.assertEqual(after.st_mode & 0o777, 0o640)
+                self.assertEqual(os.pread(lock_fd, 4096, 0), original_bytes)
+        finally:
+            resume.set()
+            delayed_operation.join(timeout=1)
+            self.assertFalse(delayed_operation.is_alive())
+
     def test_success_signal_permission_other_lock_and_unrecognized_locale_are_not_reclassified(self):
         result, lock, *_ = self.fail_commit()
         argv = ["git", "-C", str(self.repo), "commit"]
@@ -387,6 +493,7 @@ class GitIndexLockDiagnosisTest(unittest.TestCase):
         self.assertEqual(diagnosis["state"], "unavailable")
         self.assertEqual(diagnosis["observation"]["reason"], "diagnostic-timeout")
         self.assertLess(elapsed, git_index_lock.DIAGNOSIS_BUDGET_SECONDS + 0.75)
+        self.assertNotIn("no file was changed", diagnosis["message"].lower())
         self.assertEqual(self.fd_bytes(lock_fd), b"")
         self.assertEqual(lock.stat().st_mode & 0o777, 0)
 

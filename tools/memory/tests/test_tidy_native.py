@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -63,6 +64,9 @@ class NativeCase(unittest.TestCase):
              mock.patch.object(clear, "herdr_command", return_value=None):
             self.assertEqual(clear.schedule_for_enqueue(self.seat, "claude", "session-A", self.cwd), "clear=scheduled")
         req = clear.read_reservation(self.seat.key)
+        with st.seat_lock(self.seat.key):
+            req["snapshot_state"] = "ready"  # the command tests start after helper snapshot preparation
+            clear._write_reservation(req)
         path = clear.reservation_path(self.seat.key)
         if continuing:
             clear._finish(self.seat.key, req["nonce"], "cleared", observed="session-B")
@@ -92,6 +96,9 @@ class NativeCase(unittest.TestCase):
         with mock.patch.object(clear, "_start_helper", return_value=os.getpid()):
             clear.schedule_for_enqueue(self.seat, "claude", "session-A", self.cwd, compact_context=context)
         req = clear.read_reservation(self.seat.key)
+        with st.seat_lock(self.seat.key):
+            req["snapshot_state"] = "ready"  # these are peer-command checks after compact evidence is ready
+            clear._write_reservation(req)
         return req, clear.reservation_path(self.seat.key), transcript
 
 
@@ -238,6 +245,65 @@ class NativeCommandTest(NativeCase):
         result = self.run_command(req, path)
         self.assertEqual((result["cleared"], result["new_session"]), ("true", "session-B"))
         self.write.assert_called_once()
+
+    def test_idle_card_request_uses_the_exact_attachment_and_claims_one_prompt(self):
+        req, path = self.book()
+        now = time.time()
+        with st.seat_lock(self.seat.key):
+            held = clear.read_reservation(self.seat.key)
+            held.update(origin="idle", followup_kind="status-only", snapshot_state="ready",
+                        idle={"identity": "idle-event", "due_at": now - 1, "tokens": 200000,
+                              "min_tokens": 200000})
+            clear._write_reservation(held)
+        req = clear.read_reservation(self.seat.key)
+        self.prepare_transport()
+
+        def submitted(fd, data):
+            self.assertEqual(fd, 99)
+            self.assertIn("자동 유휴 정리 요청".encode("utf-8"), data)
+            current = clear.read_reservation(self.seat.key)
+            with st.seat_lock(self.seat.key):
+                current["idle_request"] = {**current["idle_request"], "state": "arrived",
+                                           "arrival": {"harness": "claude", "sid": "session-A",
+                                                       "at": time.time(), "prompt_seq": 0}}
+                clear._write_reservation(current)
+            return len(data)
+
+        self.write.side_effect = submitted
+        result = native.idle_card_request(req, path, req["nonce"], screen_ready=lambda *_: None)
+        self.assertEqual(result["accepted"], "true")
+        self.write.assert_called_once()
+        held = clear.read_reservation(self.seat.key)
+        self.assertEqual(held["idle_request"]["state"], "sent")
+
+    def test_idle_card_request_native_transport_uses_the_bound_job_once(self):
+        req, path = self.book()
+        now = time.time()
+        with st.seat_lock(self.seat.key):
+            held = clear.read_reservation(self.seat.key)
+            held.update(origin="idle", followup_kind="status-only", snapshot_state="ready",
+                        idle={"identity": "idle-native", "due_at": now - 1, "tokens": 200000,
+                              "min_tokens": 200000})
+            clear._write_reservation(held)
+        req = clear.read_reservation(self.seat.key)
+        self.prepare_transport()
+
+        def submitted(fd, data):
+            self.assertEqual(fd, 99)
+            self.assertIn("자동 유휴 정리 요청".encode("utf-8"), data)
+            current = clear.read_reservation(self.seat.key)
+            with st.seat_lock(self.seat.key):
+                current["idle_request"] = {**current["idle_request"], "state": "arrived",
+                                           "arrival": {"harness": "claude", "sid": "session-A",
+                                                       "at": time.time(), "prompt_seq": 0}}
+                clear._write_reservation(current)
+            return len(data)
+
+        self.write.side_effect = submitted
+        result = native.idle_card_request(req, path, req["nonce"], screen_ready=lambda *_: None)
+        self.assertEqual(result["accepted"], "true")
+        self.write.assert_called_once()
+        self.assertEqual(clear.read_reservation(self.seat.key)["idle_request"]["state"], "sent")
 
     def test_draft_and_form_never_send(self):
         req, path = self.book(); self.prepare_transport()

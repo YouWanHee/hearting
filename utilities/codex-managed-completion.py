@@ -166,6 +166,7 @@ class NoticeWatcher:
                 lease_seconds=300.0 if queue_socket else 30.0,
                 require_generation_proof=True,
                 live_recipient_generation=(self.recipient, str(self.epoch)),
+                jobs=self.args.jobs,
             )
             notice_receipt.validate_pending_record(
                 claimed, jobs=self.args.jobs,
@@ -262,7 +263,8 @@ class NoticeWatcher:
                             self.root, self.recipient, record["delivery_id"],
                             claim_owner=self.owner, lease_seconds=30.0,
                             require_generation_proof=True,
-                            live_recipient_generation=(self.recipient, str(self.epoch)))
+                            live_recipient_generation=(self.recipient, str(self.epoch)),
+                            jobs=self.args.jobs)
                     elif "claimed" in locals():
                         resolved = claimed
                     else:
@@ -766,7 +768,8 @@ def _native_queue_delivery_once(
             if record["state"] in {"claimed", "sent-ambiguous"}:
                 pending_delivery.reclaim(root, args.thread_id, delivery_id, now_ns=time.monotonic_ns())
             pending_delivery.claim(root, args.thread_id, delivery_id,
-                                   claim_owner=claim_owner, lease_seconds=60.0)
+                                   claim_owner=claim_owner, lease_seconds=60.0,
+                                   jobs=args.jobs)
             claimed.append(delivery_id)
         if target != args.thread_id and codex_queue_delivery._known_consumed(
                 path, args.thread_id, client_message_id, timeout=5.0) is not None:

@@ -12,6 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from dispatch_contract import EXECUTION_SURFACES, FALLBACK_HOPS, WRAPPER_TRANSPORTS  # noqa: E402
+from artifact_context import SEMANTIC_OUTPUTS, is_semantic_output  # noqa: E402
 
 import model_profile as PROFILE
 from owner_write_advisory import worktree_mutating_scope  # noqa: E402
@@ -221,21 +222,8 @@ def _parallel_path(path, suffix):
     return f"{head}{sep}{name}.{suffix}{dot}{ext}"
 
 
-SEMANTIC_OUTPUTS = frozenset({
-    "applied-artifact", "apply-log", "components", "config",
-    "diff-preview", "evidence-map", "experiment-artifact",
-    "experiment-scaffold", "final-artifact", "render",
-    "research-artifact", "revised-artifact", "ship-checklist",
-    "snapshot", "source-diff", "strategy", "summary-stats",
-    "tokens", "version-snapshot",
-})
-
-
 def _is_semantic_output(output):
-    return output in SEMANTIC_OUTPUTS or any(
-        re.fullmatch(re.escape(token) + r"-[a-z0-9]+(?:-[a-z0-9]+)*", output)
-        for token in SEMANTIC_OUTPUTS
-    )
+    return is_semantic_output(output)
 
 
 def _output_within_scope(output, scope):
@@ -1433,7 +1421,7 @@ def _validate_producer_lifecycle(registry):
 PART_ID_RE = re.compile(r"^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$")
 PART_ROW_KEYS = frozenset({
     "summary", "shareable", "hosts", "start_approval", "unit_choices",
-    "input_names", "optional_inputs", "optional",
+    "input_names", "optional_inputs", "optional", "execution_needs",
 })
 PART_SHAREABLE_KINDS = ("map-worker", "pipeline-stage", "review-worker", "resource-runner")
 PART_ANCHOR_BY_KIND = {"map-worker": "map_anchor", "review-worker": "review_anchor"}
@@ -1656,6 +1644,12 @@ def _validate_part_catalog(registry, owner_profile):
             raise TopologyError(f"invalid part id {part_id!r}")
         if not isinstance(row, dict) or set(row) - PART_ROW_KEYS:
             raise TopologyError(f"part {part_id}: unknown catalog fields {sorted(set(row) - PART_ROW_KEYS)}")
+        execution_needs = row.get("execution_needs", [])
+        if (not isinstance(execution_needs, list)
+                or any(not isinstance(item, str) for item in execution_needs)
+                or len(execution_needs) != len(set(execution_needs))
+                or not set(execution_needs) <= {"compute-hosts"}):
+            raise TopologyError(f"part {part_id}: invalid execution_needs")
         summary = row.get("summary")
         if not isinstance(summary, str) or not summary.strip() or "\n" in summary:
             raise TopologyError(f"part {part_id}: a one-line summary is required")

@@ -262,7 +262,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                 node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
                 share=getattr(args, "share", False), jobs=jobs, run_id=args.run_id)
         output_receipt = RUN_EVIDENCE.paths({"artifact_base": artifacts["AGENT_ARTIFACT_OUTPUT_DIR"],
-            "declared_outputs": node.get("outputs", ["run.json"])}, prepare=True)
+            "declared_outputs": node.get("outputs", ["run.json"]),
+            "route_file": str(route_file), "route_id": route.get("route_id"),
+            "route_hash": route.get("route_hash"), "node": args.node}, prepare=True)
         ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
         runtime = ledger.root / "resource"
         runtime.mkdir(parents=True, exist_ok=True)
@@ -473,6 +475,53 @@ def main(argv=None, *, controller=None):
 
 
 def _main(argv=None, *, controller=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "start":
+        import artifact_context
+        context = artifact_context.resolve_context(environ=os.environ)
+        if context.route and context.node:
+            def option_value(name):
+                try:
+                    return raw_argv[raw_argv.index(name) + 1]
+                except (ValueError, IndexError):
+                    return next((part[len(name) + 1:] for part in raw_argv
+                                 if part.startswith(name + "=")), None)
+
+            divider = raw_argv.index("--") if "--" in raw_argv else len(raw_argv)
+            if option_value("--registry") is None:
+                if not context.output_dir:
+                    fail("artifact-cycle-unbound")
+                from resource_run_registry import route_registry_path
+                raw_argv[0:0] = ["--registry", str(route_registry_path(context.output_dir))]
+                divider += 2
+            defaults = {}
+            if option_value("--cwd") is None:
+                defaults["--cwd"] = str(context.source_worktree or "")
+            elif context.source_worktree and Path(option_value("--cwd")).expanduser().resolve(strict=False) != context.source_worktree:
+                fail("source-worktree-route-mismatch")
+            route_path = (context.artifact_root / ".runtime" / "routes"
+                          / f"{context.route['route_id']}.json")
+            if option_value("--route") is None:
+                defaults["--route"] = str(route_path)
+            else:
+                import artifact_producer
+                supplied = artifact_producer.resolve_route_argument(context.artifact_root, Path(option_value("--route")))
+                if Path(supplied).resolve(strict=False) != route_path.resolve(strict=False):
+                    fail("route-binding-mismatch")
+            if option_value("--node") is None:
+                defaults["--node"] = context.node_id or ""
+            elif option_value("--node") != context.node_id:
+                fail("route-node-mismatch")
+            run_id = option_value("--run-id")
+            if run_id and option_value("--log") is None:
+                binding = context.resolve_output("resource-log", leaf=f"logs/{run_id}.log")
+                defaults["--log"] = str(binding.path)
+            elif option_value("--log") is not None:
+                context.resolve_output("resource-log", explicit=option_value("--log"))
+            for flag, value in defaults.items():
+                if value:
+                    raw_argv[divider:divider] = [flag, value]
+                    divider += 2
     p=argparse.ArgumentParser(); p.add_argument("--registry"); s=p.add_subparsers(dest="cmd",required=True)
     a=s.add_parser("start"); a.add_argument("--run-id",required=True); a.add_argument("--cwd",required=True); a.add_argument("--log",required=True); a.add_argument("--route",required=True); a.add_argument("--node",required=True); a.add_argument("--smoke-attestation"); a.add_argument("--config-manifest")
     a.add_argument("--parent-attempt-id",help="registered headless attempt that owns this resource child")
@@ -483,7 +532,7 @@ def _main(argv=None, *, controller=None):
         x=s.add_parser(name); x.add_argument("--run-id",required=True)
     s.add_parser("list")
     index_cmd=s.add_parser("index"); index_cmd.add_argument("--registry",required=True)
-    args=p.parse_args(argv)
+    args=p.parse_args(raw_argv)
     if args.cmd=="index":
         registry=Path(args.registry).resolve(strict=True)
         indexed=register_registry(registry)

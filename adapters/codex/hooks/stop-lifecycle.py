@@ -51,6 +51,11 @@ def main() -> int:
     try:
         session_id = "" if _worker() else _sid(payload)
         if session_id:
+            try:
+                import session_tidy_idle
+                session_tidy_idle.launch_observer("codex", payload)
+            except Exception:
+                pass
             from fleet import interaction
             from session_summary_trigger import launch_trigger
 

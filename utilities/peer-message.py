@@ -31,7 +31,7 @@ from dispatch_contract import resolve_dispatch_state_root, stable_state_root  # 
 _KINDS = ("watch", "steer", "handoff", "gate-relay", "notice")
 _SURFACES = (
     "claude-native", "herdr", "codex-queue", "codex-gateway-steer",
-    "opencode-unknown", "manual-paste",
+    "opencode-native", "opencode-unknown", "manual-paste",
 )
 _STATUSES = ("sent", "delivered", "received", "failed", "unknown")
 _SUMMARY_MAX = 200
@@ -120,14 +120,16 @@ def _transfer_path(ref):
     return peer_state_root() / "peer-messages" / "transfers" / f"{ref}.json"
 
 
-def _read_transfer_record(ref):
+def _read_transfer_record(ref, *, roots=None):
     """Read Fleet's trusted ledger roots; a message never supplies a path.
 
     Each writer keeps its canonical jobs root. Multiple records for one ref
     are ambiguous, even when one of them would match the recipient.
+    ``roots`` lets one pending scan resolve the roots once, not per row.
     """
     own_path = _transfer_path(ref)  # Validate before querying any roots.
-    roots, _source = steward_marker_roots()
+    if roots is None:
+        roots, _source = steward_marker_roots()
     paths = [own_path, *(Path(root) / "peer-messages" / "transfers" / own_path.name for root in roots)]
     record, found, seen = None, False, set()
     for path in paths:
@@ -596,7 +598,7 @@ def _pending_target_matches(row, recipient):
     return not _valid_pane_bound_endpoint(original) or target.get("pane_id") == original.get("pane_id")
 
 
-def _read_pending(ref):
+def _read_pending(ref, *, roots=None):
     path = _pending_path(ref)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -610,7 +612,7 @@ def _read_pending(ref):
     if len(raw) > 65536:
         raise ValueError("peer-pending-oversized")
     row = json.loads(raw)
-    transfer = _read_transfer_record(ref)
+    transfer = _read_transfer_record(ref, roots=roots)
     if (not isinstance(row, dict) or not isinstance(transfer, dict)
             or type(row.get("schema_version")) is not int or row["schema_version"] != 1
             or row.get("ref") != ref or row.get("from") != transfer.get("from")
@@ -740,12 +742,23 @@ def _quarantine_pending(path, expected):
         return False
 
 
-def _pending_rows():
+def _pending_rows(*, recipient=None, sender=None, read_context=None):
+    # Every row of one scan reads the same ledger roots; resolving them per row
+    # cost seconds on each prompt once a few thousand rows had accumulated.
+    try:
+        roots, _source = steward_marker_roots()
+    except (OSError, ValueError):
+        roots = None  # each row then resolves (and fails) on its own, as before
+    if read_context is None:
+        from peer_read_context import PeerReadContext
+        read_context = PeerReadContext()
     for path in sorted(_pending_dir().glob("*.json")):
+        if _received_on_disk(path):
+            continue
         expected = None
         try:
             expected = path.lstat()
-            row = _read_pending(path.stem)
+            row = _read_pending(path.stem, roots=roots)
         except (OSError, ValueError) as exc:
             if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
                 # A lock or temporary I/O failure proves no damage; the next
@@ -757,15 +770,46 @@ def _pending_rows():
                 ref = path.stem if re.fullmatch(r"[0-9a-f]{32}", path.stem) else "invalid-ref"
                 print(f"peer-pending-invalid ref={ref}", file=sys.stderr)
             continue
-        if row and row["state"] != "received" and not _registered_delivery_settled(row):
+        if not row or row["state"] == "received":
+            continue
+        receiver_match = recipient is not None and _same_transfer_session(row.get("to"), recipient)
+        sender_match = sender is not None and _same_transfer_session(row.get("from"), sender)
+        if (recipient is not None or sender is not None) and not (receiver_match or sender_match):
+            continue
+        if not _registered_delivery_settled(row, read_context=read_context):
             yield row
 
 
-def _registered_delivery_settled(row):
+def _same_transfer_session(left, right):
+    return (isinstance(left, dict) and isinstance(right, dict)
+            and all(left.get(key) == right.get(key) for key in ("harness", "session_id")))
+
+
+def _received_on_disk(path):
+    """A well-formed row already received: the scan drops it, so it need not verify it.
+
+    Most rows are delivered history; checking each one's transfer record on every
+    prompt cost seconds. Anything unreadable or malformed takes the full read below,
+    which quarantines it as before.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            row = json.loads(fh.read(65537))
+    except (OSError, ValueError):
+        return False
+    return isinstance(row, dict) and row.get("state") == "received"
+
+
+def _registered_delivery_settled(row, *, read_context=None):
     try:
         from peer_obligations import registered_delivery_settled
-        return registered_delivery_settled(row)
-    except (OSError, ValueError, KeyError):
+        return (registered_delivery_settled(row) if read_context is None else
+                registered_delivery_settled(row, read_context=read_context))
+    except (OSError, ValueError, KeyError, RuntimeError):
         return False
 
 
@@ -774,7 +818,7 @@ def pending_messages(recipient):
     if not _valid_transfer_endpoint(recipient):
         return []
     rows = []
-    for row in _pending_rows():
+    for row in _pending_rows(recipient=recipient):
         if all(row["to"].get(k) == recipient.get(k) for k in ("harness", "session_id")):
             rows.append(row)
     return rows
@@ -927,6 +971,24 @@ def mark_pending_queued(ref, *, receipt="delivery-observed"):
         return True
 
 
+def mark_pending_prompt_queued(ref, claim, *, receipt="claude-pty-prompt-submitted"):
+    """Record one exact claimed Claude prompt submission, never its consumption."""
+    if receipt != "claude-pty-prompt-submitted" or not isinstance(claim, dict):
+        return False
+    from dispatch_contract import process_start_ticks
+    current_pid = os.getpid()
+    current_start = process_start_ticks(current_pid)
+    if not current_start or claim.get("pid") != current_pid or claim.get("start") != current_start:
+        return False
+    with pending_lock(ref):
+        row = _read_pending(ref)
+        if (not row or row.get("state") != "unverified" or row.get("no_trailer")
+                or row.get("rpc_claim") != claim):
+            return False
+        _save_pending(dict(row, state="queued", rpc_claim=None, receipt=receipt))
+        return True
+
+
 def release_unsent_herdr_claim(row, *, receipt="target-form-open"):
     """Release this exact claim only when its caller has not submitted the message."""
     with pending_lock(row["ref"]):
@@ -948,11 +1010,13 @@ def deliver_pending_codex(ref, *, timeout=1.0):
         row = _read_pending(ref)
         if not row:
             return {"status": "unsupported", "reason": "peer-pending-missing"}
+        recipient = pending_delivery_recipient(row)
         if row["state"] == "received":
+            _observe_continue_receipt(recipient or {}, ref)
+            _ack_registered_delivery(row)
             return {"status": "received", "reason": "exact-peer-ref"}
         if _registered_delivery_settled(row):
             return {"status": "not-required", "reason": "dispatch-notice-consumed"}
-        recipient = pending_delivery_recipient(row)
         if not _valid_transfer_sender(row["from"]) or not recipient:
             return {"status": "unverified", "reason": "peer-endpoint-unverified"}
         if recipient["harness"] != "codex":
@@ -992,6 +1056,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
         if not current:
             return {"status": "unverified", "reason": "peer-pending-missing-after-rpc"}
         if current["state"] == "received":
+            _ack_registered_delivery(current)
             return {"status": "received", "reason": "exact-peer-ref"}
         if (current.get("rpc_claim") or {}).get("token") != token:
             return {"status": "unverified", "reason": "peer-claim-changed-after-rpc"}
@@ -1013,6 +1078,7 @@ def deliver_pending_codex(ref, *, timeout=1.0):
             received = dict(current, state="received", text=None, rpc_claim=None, receipt="exact-native-history")
             _save_pending(received)
             _ack_registered_delivery(received)
+            _observe_continue_receipt(recipient, ref)
             return {"status": "received", "reason": "exact-native-history"}
         _save_pending(dict(current, state="queued", rpc_claim=None, receipt="native-queue-accepted"))
         return {"status": "queued", "reason": "native-queue-accepted"}
@@ -1133,9 +1199,10 @@ def _peer_notice_exists(ref, recipient):
 def _ack_registered_delivery(received):
     try:
         from peer_obligations import acknowledge_registered_delivery
-        acknowledge_registered_delivery(received)
-    except (OSError, ValueError, KeyError):
+        return acknowledge_registered_delivery(received)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         pass  # The retained courier retries the same receipt, never another send.
+    return False
 
 
 def _ordinary_receiver_guidance():
@@ -1339,6 +1406,7 @@ def receive_peer_message(text, recipient, project="", *, summary_text=""):
     with pending_lock(ref or "legacy-receive"):
         pending = _read_pending(ref) if ref else None
         if pending and pending["state"] == "received":
+            _ack_registered_delivery(pending)
             return 0
         already_received = ref and _peer_notice_exists(ref, recipient)
         rc = 0 if already_received else cmd_record(argparse.Namespace(
@@ -1361,6 +1429,17 @@ def cmd_receive(args):
     rc = receive_peer_message(sys.stdin.read(), recipient, args.from_project)
     retry_receiver_idle(recipient)
     return rc
+
+
+def _observe_continue_receipt(recipient, ref=""):
+    harness, sid = recipient.get("harness"), recipient.get("session_id")
+    if harness not in {"claude", "codex", "opencode"} or not sid:
+        return False
+    try:
+        import session_tidy_clear
+        return session_tidy_clear.observe_continue_receipt(harness, sid, ref)
+    except Exception:
+        return False
 
 
 def retry_receiver_idle(recipient, *, peer=True):
@@ -1403,17 +1482,22 @@ def emit_peer_context(recipient, event=None, *, extra_context="", stream=None):
     claims, warnings, context = [], [], []
     if recipient["harness"] == "codex":
         retry_pending_codex(recipient)
-    rows = list(_pending_rows())
+    rows = list(_pending_rows(recipient=recipient, sender=recipient))
     if recipient["harness"] == "claude":
         for row in rows:
             if len(claims) >= 3:
                 break
             if any(row["to"].get(k) != recipient[k] for k in ("harness", "session_id")):
                 continue
-            # Validate the immutable seal and recipient before publishing context.
-            parsed = parse_peer_trailer(row.get("text"), recipient, include_ref=True)
-            if not parsed or parsed.get("transfer_ref") != row["ref"]:
-                continue
+            # The sole no-trailer context is the booked session-tidy continue;
+            # ordinary peer bodies still require their exact sealed trailer.
+            if row.get("no_trailer"):
+                if row.get("receipt") != "session-tidy-continue":
+                    continue
+            else:
+                parsed = parse_peer_trailer(row.get("text"), recipient, include_ref=True)
+                if not parsed or parsed.get("transfer_ref") != row["ref"]:
+                    continue
             try:
                 claimed = claim_pending_herdr(row["ref"], recipient, receipt="hook-context-inflight")
             except BlockingIOError:
@@ -1477,29 +1561,70 @@ def cmd_context(args):
 
 def cmd_pending(args):
     recipient = {"harness": args.to_harness, "session_id": args.to_session_id}
-    if not args.claim and not args.queued:
-        # OpenCode's existing idle/receive pull retries its unsent tidy booking.
-        # Its native peer transport still owns the returned message rows.
-        retry_receiver_idle(recipient, peer=False)
+    received_ref = getattr(args, "received", None)
+    claim_ref = getattr(args, "claim", None)
+    queued_ref = getattr(args, "queued", None)
+    resuming_ref = getattr(args, "resuming", None)
+    if not claim_ref and not queued_ref and not resuming_ref and not received_ref:
+        # The OpenCode idle callback itself owns delivery. Listing is side-effect
+        # free so it does not recursively start another continuation decision.
         print(json.dumps(pending_messages(recipient)[:5], ensure_ascii=False))
         return 0
-    with pending_lock(args.claim or args.queued):
-        row = _read_pending(args.claim or args.queued)
+    ref = claim_ref or queued_ref or resuming_ref or received_ref
+    with pending_lock(ref):
+        row = _read_pending(ref)
         if not row or any(row["to"].get(k) != recipient.get(k) for k in ("harness", "session_id")):
             return 1
-        if args.queued:
+        if queued_ref:
             if not isinstance(args.message_id, str) or not args.message_id.strip():
                 return 1
             if row["state"] == "received":
+                _ack_registered_delivery(row)
                 return 0
             _save_pending(dict(row, state="queued", receipt="context-api-accepted", actual_message_id=args.message_id))
+            return 0
+        if resuming_ref:
+            message_id = getattr(args, "message_id", None)
+            if (not isinstance(message_id, str) or not message_id.strip()
+                    or row["state"] != "queued" or row.get("actual_message_id") != message_id
+                    or row.get("resume_attempted")):
+                return 1
+            _save_pending(dict(row, resume_attempted=True, resume_attempted_at=time.time()))
+            return 0
+        if received_ref:
+            message_id = getattr(args, "message_id", None)
+            if not isinstance(message_id, str) or not message_id.strip():
+                return 1
+            if row["state"] == "received":
+                return 0 if row.get("actual_message_id") == message_id else 1
+            if row["state"] != "queued" or row.get("actual_message_id") != message_id:
+                return 1
+            if not _peer_notice_exists(ref, recipient):
+                rc = cmd_record(argparse.Namespace(
+                    from_harness=row["from"].get("harness") or "unknown",
+                    from_session_id=row["from"].get("session_id") or "",
+                    from_name=row["from"].get("name"), from_project="",
+                    to_harness=recipient["harness"], to_session_id=recipient["session_id"],
+                    to_name=None, kind="notice", surface="opencode-native",
+                    status="received", receipt="exact-native-history",
+                    ref=[ref, *row.get("refs", [])], transfer_ref=ref,
+                    body_file=None, body_stdin=False))
+                if rc:
+                    return rc
+            received = dict(row, state="received", text=None, rpc_claim=None,
+                            receipt="exact-native-history", received_at=time.time())
+            _save_pending(received)
+            _ack_registered_delivery(received)
+            _observe_continue_receipt(recipient, ref)
+            retry_receiver_idle(recipient, peer=False)
             return 0
         if row["state"] != "pending":
             print("null")
             return 0
         # A failed/expired callback cannot acknowledge or blindly repeat this claim.
-        _save_pending(dict(row, state="unverified", receipt="context-api-inflight"))
-        print(json.dumps(row, ensure_ascii=False))
+        claimed = dict(row, state="unverified", receipt="context-api-inflight")
+        _save_pending(claimed)
+        print(json.dumps(claimed, ensure_ascii=False))
         return 0
 
 
@@ -2050,6 +2175,8 @@ def main(argv=None):
     intent = p_pending.add_mutually_exclusive_group()
     intent.add_argument("--claim")
     intent.add_argument("--queued")
+    intent.add_argument("--resuming")
+    intent.add_argument("--received")
     p_pending.add_argument("--message-id")
     p_pending.set_defaults(func=cmd_pending)
 

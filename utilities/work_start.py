@@ -527,8 +527,9 @@ def _start(route, path, jobs, node, harness, run):
     # input with their inventory run storage through the same request format.
     # Otherwise the request carries what the approved task names (its target
     # table and the roots derived from its text); start/resume share this path.
-    lab_owner = node == "owner" and route.get("capability") == "autopilot-lab"
-    if lab_owner or not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
+    from execution_access import compute_execution_scope
+    compute_owner = node == "owner" and compute_execution_scope(route, owner=True)
+    if compute_owner or not os.environ.get("AGENT_DISPATCH_EXECUTION_ACCESS_FILE"):
         try:
             prepared = prepare_task_request(route, jobs, node=node)
         except ExecutionAccessError as exc:
@@ -1333,7 +1334,8 @@ def _owner_report(route, metadata):
     try:
         from codex_dispatch_terminal import inspect_terminal_attempt
         terminal = inspect_terminal_attempt(metadata.get("log_file"), worktree=route.get("cwd"),
-                                            artifact_root_metadata=route.get("artifact_root"), worker_type="owner")
+                                            artifact_root_metadata=route.get("artifact_root"), worker_type="owner",
+                                            artifact_binding=metadata)
         if (terminal.get("state") != "valid" or terminal.get("artifact_state") != "readable"
                 or not terminal.get("artifact_path_b64")):
             return None
@@ -1659,8 +1661,9 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             supervised = RESOURCE_RESUME.supervisor_alive(resource.get("supervision"))
             artifacts = prepare_route_artifact_env(path, start=True, jobs=jobs)
             output = Path(artifacts["AGENT_ARTIFACT_OUTPUT_DIR"])
+            from resource_run_registry import route_registry_path
             runner_command = shlex.join([sys.executable, entrypoint(ROOT, "utilities/resource-runner.py"),
-                "--registry", str(output / "resource-runs.json"), "start", "--run-id", route["route_id"],
+                "--registry", str(route_registry_path(output)), "start", "--run-id", route["route_id"],
                 "--cwd", route["cwd"], "--log", str(output / "logs/resume-run.log"),
                 "--route", str(path), "--node", "resume-run", "--jobs", str(jobs), "--"])
             if resource["state"] == "resource-running" and not supervised:
@@ -2154,7 +2157,10 @@ def start_work(route, path, jobs, *, wait=False, interview=None, answers=None,
             result.setdefault("next_step", "Inspect the exact diagnostic or result recovery_command. Existing workers retain "
                 "their runtime watcher and completion delivery. Correct the admission input or resolve the reported "
                 "failure, then use resume_command; a usage-limit stop resumes after the limit resets, and a silent death "
-                "is replaced once per logical node. "
+                "with no settled result may be replaced by one successor per exact predecessor, with no cumulative "
+                "generation limit. Intermediate failure notices remain pending while a verified launched successor "
+                "owns the result; only the final result or inability to continue follows the existing delivery path. "
+                "Automatic replacements use the existing controller timing, without a persisted per-generation delay. "
                 "If the correction changes the requested work, ask the user before changing that work.")
     for launch in result.get("launches", []):
         for advisory in OWNER_WRITE_ADVISORY.receipt_advisories(launch.get("receipt", "")):

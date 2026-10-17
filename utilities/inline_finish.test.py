@@ -108,6 +108,7 @@ class PendingForCycleTest(unittest.TestCase):
 class PublicInlineFinishTest(unittest.TestCase):
     CAPABILITY = "autopilot-code"
     CAPABILITY_MODE = "dev"
+    CAMPAIGN_ARGUMENTS = ("--campaign-key", "inline-finish-test")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="inline-finish-test-")
@@ -164,7 +165,7 @@ class PublicInlineFinishTest(unittest.TestCase):
         self.prompt = self.base / "task.md"
         self.prompt.write_text("Exercise the direct inline finish transaction.\n", encoding="utf-8")
         compose = [sys.executable, str(ROOT / "utilities/capability-route.py"), "compose",
-                   "--slug", "inline-finish-test", "--campaign-key", "inline-finish-test",
+                   "--slug", "inline-finish-test", *self.CAMPAIGN_ARGUMENTS,
                    "--shape", "direct", "--capability", self.CAPABILITY, "--capability-mode", self.CAPABILITY_MODE,
                    "--intensity", "direct", "--cwd", str(self.repo),
                    "--artifact-root", str(self.root), "--tracking", "tracked",
@@ -541,6 +542,62 @@ class PublicInlineFinishTest(unittest.TestCase):
                     self.assertEqual(json.loads(result.stdout)["schema"], "finish_receipt_v1")
                 finally:
                     fixture.tearDown()
+
+    def test_unassigned_and_parent_cycle_direct_routes_finish(self):
+        # f7 2026-10-16: a route composed with `--unassigned` or `--parent-cycle` names no
+        # campaign key of its own, and finish refused it as finish-campaign-key-mismatch.
+        for name, arguments in (("unassigned", ("--unassigned",)),
+                                ("parent-cycle", ("--parent-cycle", self.cycle["cycle_id"]))):
+            with self.subTest(selection=name):
+                fixture = type("Fixture", (PublicInlineFinishTest,), {"CAMPAIGN_ARGUMENTS": arguments})(
+                    self._testMethodName)
+                if name == "unassigned":
+                    fixture.setUp()
+                else:
+                    self._compose_child(fixture)
+                try:
+                    self.assertIsNone(fixture.route.get("campaign_key"))
+                    first = fixture.finish()
+                    self.assertEqual(first.returncode, 0, first.stderr)
+                    self.assertEqual(json.loads(first.stdout)["schema"], "finish_receipt_v1")
+                    record = artifact_producer.read_cycle_record(fixture.root, fixture.cycle["cycle_id"])
+                    self.assertEqual(record["state"], "sealed")
+                    replay = fixture.finish()
+                    self.assertEqual(replay.returncode, 0, replay.stderr)
+                    self.assertTrue(json.loads(replay.stdout)["replay"])
+                finally:
+                    if name == "unassigned":
+                        fixture.tearDown()
+
+    def _compose_child(self, fixture):
+        """Compose and start `fixture`'s direct route in this repository, artifact root and registry."""
+        fixture.repo, fixture.root, fixture.env = self.repo, self.root, self.env.copy()
+        prompt = self.base / "child-task.md"
+        prompt.write_text("Finish a direct route that joins its parent cycle.\n", encoding="utf-8")
+        capability_route = [sys.executable, str(ROOT / "utilities/capability-route.py")]
+        composed = subprocess.run([
+            *capability_route, "compose", "--slug", "inline-finish-child", *fixture.CAMPAIGN_ARGUMENTS,
+            "--shape", "direct", "--capability", self.CAPABILITY, "--capability-mode", self.CAPABILITY_MODE,
+            "--intensity", "direct", "--cwd", str(self.repo), "--artifact-root", str(self.root),
+            "--tracking", "tracked", "--prompt-file", str(prompt),
+            "--spec-read", "fixture", "--drift-verdict", "within-spec", "--artifact-guard", "fixture",
+            "--owner", "codex", "--parent-harness", "codex"],
+            cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+        self.assertEqual(composed.returncode, 0, composed.stderr)
+        fixture.route_file = Path(json.loads(composed.stdout)["route_file"])
+        fixture.route = json.loads(fixture.route_file.read_text(encoding="utf-8"))
+        started = subprocess.run([*capability_route, "start", "--route", str(fixture.route_file),
+                                  "--jobs", str(self.jobs)],
+                                 cwd=self.repo, env=os.environ.copy(), capture_output=True, text=True)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        fixture.cycle = artifact_producer.route_cycle_for(self.root, fixture.route)
+        self.assertIsNotNone(fixture.cycle, started.stdout + started.stderr)
+        evidence = artifact_producer.cycle_dir(
+            self.root, fixture.cycle["campaign_id"], fixture.cycle["cycle_id"], fixture.cycle) / "artifacts/documents/evidence.md"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_bytes(b"child terminal evidence\n")
+        fixture.command = [*capability_route, "finish", "--route", str(fixture.route_file),
+                           "--evidence", str(evidence), "--summary-file", str(self.summary)]
 
     def test_public_finish_seals_and_exact_replay_returns_one_receipt(self):
         first = self.finish()

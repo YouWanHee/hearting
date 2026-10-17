@@ -339,7 +339,7 @@ class SessionEndMemorySyncRetirementTests(unittest.TestCase):
                 runtime_activation._merge_claude_settings(source, previous)
             self.assertCountEqual(
                 self._commands(helper._read_user_settings(home)),
-                [FLEET_END, HERDR_END, "echo user-end", 'python3 "$HOME/bin/my-own-mem.py" sync'],
+                [FLEET_END, "echo user-end", 'python3 "$HOME/bin/my-own-mem.py" sync'],
             )
 
     def test_install_without_a_manifest_retires_only_the_managed_sync(self):
@@ -359,8 +359,8 @@ class SessionEndMemorySyncRetirementTests(unittest.TestCase):
             got = self._commands(helper._read_user_settings(home))
             self.assertNotIn(OLD_MEM_SYNC, got)
             self.assertEqual(got.count(FLEET_END), 1)
-            self.assertEqual(got.count(HERDR_END), 1)
-            self.assertEqual(len(got), 2 + 1 + len(lookalikes), got)
+            self.assertEqual(got.count(HERDR_END), 0)
+            self.assertEqual(len(got), 1 + 1 + len(lookalikes), got)
             self.assertIn("echo user-end", got)
             for group in lookalikes:
                 self.assertIn(group["hooks"][0]["command"], got)
@@ -378,11 +378,14 @@ class SessionEndMemorySyncRetirementTests(unittest.TestCase):
         self.assertFalse(settings.remove_retired_hooks(data))
         self.assertEqual(self._commands({"hooks": {"SessionEnd": data["hooks"]["Stop"]}}), [OLD_MEM_SYNC])
 
-    def test_the_shipped_template_has_no_session_end_memory_hook_but_keeps_fleet_and_herdr(self):
+    def test_the_shipped_template_moves_herdr_to_session_start_and_keeps_fleet(self):
         template = json.loads((HERE.parents[1] / "adapters/claude/settings.json").read_text(encoding="utf-8"))
         commands = self._commands(template)
-        self.assertEqual(commands, [FLEET_END, HERDR_END])
+        self.assertEqual(commands, [FLEET_END])
         self.assertFalse([c for c in commands if "mem.py" in c])
+        start = [hook["command"] for group in template["hooks"]["SessionStart"]
+                 for hook in group.get("hooks", [])]
+        self.assertEqual(start.count(runtime_activation.herdr_integration.CLAUDE_SESSION_COMMAND), 1)
 
 
 if __name__ == "__main__":

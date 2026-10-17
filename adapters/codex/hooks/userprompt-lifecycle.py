@@ -134,6 +134,7 @@ def card_context(payload: dict[str, Any], current_cwd: str) -> str:
     try:
         result = subprocess.run(
             command, cwd=str(ROOT), env=os.environ.copy(), text=True,
+            input=json.dumps({"prompt": nested_string(payload, "prompt")}),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -448,7 +449,9 @@ def main() -> int:
     retry_pending_peer(interaction_sid)
     if interaction_sid:
         launch_trigger(
-            "codex", interaction_sid, "initial", anchor_text=current_prompt
+            "codex", interaction_sid, "initial",
+            transcript=nested_string(payload, "transcript_path", "transcriptPath"),
+            anchor_text=current_prompt
         )
     sd111_first_prompt_sweep(sid)
 

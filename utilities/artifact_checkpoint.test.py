@@ -64,6 +64,32 @@ class CheckpointTestBase(F.ProducerTestBase):
 
 
 class InterimManifestTest(CheckpointTestBase):
+    def test_checkpoint_prunes_each_marked_payload_tree_before_limits(self):
+        cycle = Path(self.result["cycle_dir"])
+        cache = cycle / "artifacts" / "experiments" / "cache"
+        cache.mkdir(parents=True)
+        (cache / "CACHEDIR.TAG").write_bytes(P.artifact_payload.CACHEDIR_SIGNATURE)
+        for index in range(8):
+            (cache / f"large-{index}.bin").write_bytes(b"x" * 128)
+        env = cycle / "_internal" / "venv"
+        env.mkdir(parents=True)
+        (env / "pyvenv.cfg").write_bytes(b"")
+        (env / "large.bin").write_bytes(b"y" * 128)
+        report = self.write_output(self.result, "plans/report.md", b"report")
+
+        scan = P._checkpoint_scan(cycle, {}, P.CheckpointLimits(
+            max_walk_entries=1, max_files=1, max_file_bytes=32, max_total_bytes=32,
+        ))
+        self.assertNotIn("skip", scan)
+        self.assertEqual([row[0] for row in scan["facts"]], ["artifacts/plans/report.md"])
+        self.assertEqual(scan["excluded"]["self-excluded"], 2)
+        self.assertEqual(report.read_bytes(), b"report")
+        result = P.checkpoint(self.root, cycle_id=self.cycle_id,
+                              limits=P.CheckpointLimits(max_walk_entries=1, max_files=1,
+                                                        max_file_bytes=32, max_total_bytes=32))
+        self.assertEqual(result["status"], "emitted", result)
+        self.assertEqual(set(_ids_by_path(self.interim())), {"artifacts/plans/report.md"})
+
     def test_checkpoint_prunes_raw_results_before_walk_and_byte_limits(self):
         cycle = Path(self.result["cycle_dir"])
         raw = cycle / "artifacts" / "raw-results"

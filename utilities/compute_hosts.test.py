@@ -349,7 +349,7 @@ class RunGPUObservationTest(unittest.TestCase):
 
 class ComputeHostsTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/var/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.run_root = self.root / "runs"
         self.config = self.root / "compute-hosts.yaml"
@@ -1326,7 +1326,7 @@ class LauncherProvenanceTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/var/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.run_root = self.root / "runs"
         self.config = self.root / "compute-hosts.yaml"

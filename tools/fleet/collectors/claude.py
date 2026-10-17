@@ -612,6 +612,12 @@ def _current_identity(sess, home, record, pane_claim=None):
     return sid, evidence
 
 
+# Native callbacks are one-shot processes: let their first exact pane snapshot
+# finish within the shared observation bound. Fleet collectors keep list_panes'
+# nonblocking default for their fast initial publication.
+_STANDALONE_IDENTITY_WAIT_S = 0.75
+
+
 def session_id_of_process(pid, home=None):
     """The same current identity used by Fleet and the pane reporting guard."""
     from ..model import Session
@@ -629,7 +635,7 @@ def session_id_of_process(pid, home=None):
     # collected foreground observation instead of calling this probe per row.
     from . import herdr
     from ..process_identity import pane_process_claims
-    panes = herdr.list_panes()
+    panes = herdr.list_panes(wait_timeout=_STANDALONE_IDENTITY_WAIT_S)
     if panes is None:
         sess.herdr_attached = True if procscan.provenance(pid) == "herdr" else None
     selected = [p for p in panes or [] if p.get("agent") == "claude"

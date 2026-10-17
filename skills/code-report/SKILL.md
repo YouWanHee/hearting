@@ -40,9 +40,9 @@ Run the `editorial/report` unit (portable `deep editor` role) with this task:
 Generate a final change report.
 
 Plan file: {$ARG}, resolved through the plan-resolution contract
-Log directory: {task root above plan.md}
+Log directory: {directory resolved from the supplied plan.md path}
 Existing audience-language companion plan: {path or none}
-Report output: {log_directory}/final_report.md
+Report output: the code-report node's declared `final_report.md` output
 Artifact language: {explicit audience/artifact language, otherwise conversation language}
 Date: {YYYY-MM-DD}
 
@@ -100,7 +100,7 @@ Return ONLY the report path and a one-line summary. Do not return the report bod
 After the writer returns:
 
 1. Read `final_report.md` once.
-2. Cross-check it against the best available cycle evidence. When in-session, current orchestration context may help; in an isolated stage session, rely on the artifact files: checklist marks, `dev_logs/`, `test_logs/test_report.md`, `_internal/*_reviews/`, and `git log` or `git diff <safety-commit>..HEAD`. Artifacts remain authoritative.
+2. Cross-check it against the best available cycle evidence. When in-session, current orchestration context may help; in an isolated stage session, use the paths supplied by the route for checklist, development/test evidence, reviews, and the source diff. Artifacts remain authoritative.
 3. Verify step counts, critical-finding rounds, test pass/fail counts, commit hashes, file counts, cited `file.py:NNN` locations, resolved versus pending follow-ups, and plan deviations. Correct report wording or data when evidence disagrees.
 4. Apply one in-place polish pass on `{log_directory}/final_report.md` when the polish invocation contract selects it — `roles/units/editorial/polish.md` is the single source for that gating (currently plan-frontmatter `qa_level` standard+). The pass runs inside this stage's `editorial/report` unit, not as a separate dispatch.
 

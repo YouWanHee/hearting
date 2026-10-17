@@ -38,6 +38,19 @@ def _text(segs):
     return "".join(t for t, _k in segs)
 
 
+class PaneObservationWaitTest(unittest.TestCase):
+    def test_only_explicit_callers_wait_for_the_bounded_observation(self):
+        panes = [{"pane_id": "w1:p1", "agent": "claude"}]
+        view = SimpleNamespace(panes=panes)
+        with mock.patch.object(herdr, "observation_view", return_value=view) as observe:
+            self.assertEqual(herdr.list_panes(), panes)
+            observe.assert_called_once_with()
+            observe.reset_mock()
+
+            self.assertEqual(herdr.list_panes(wait_timeout=0.75), panes)
+            observe.assert_called_once_with(wait_timeout=0.75)
+
+
 class DerivedTagTest(unittest.TestCase):
     def test_measured_shapes(self):
         # Measured 2026-09-03 in ~/.claude/sessions/*.json (nameSource=derived).

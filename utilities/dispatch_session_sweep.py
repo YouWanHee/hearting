@@ -183,9 +183,17 @@ def record_jobs(root: Path, record: dict) -> Path | None:
     """Use the receipt's registry or the canonical selection, preserving its filename."""
     from dispatch_contract import resolve_agent_home, resolve_global_registry
     raw = (record.get("receipt") or {}).get("job_registry")
-    jobs = Path(raw) if isinstance(raw, str) and raw else resolve_global_registry(
-        resolve_agent_home(), None, 0, "read").path
-    return jobs if jobs.resolve().parent == Path(root).resolve() else None
+    try:
+        jobs = (Path(raw).expanduser() if isinstance(raw, str) and raw else
+                resolve_global_registry(resolve_agent_home(), None, 0, "read").path)
+        if jobs.is_symlink():
+            return None
+        jobs = jobs.resolve(strict=True)
+        if not jobs.is_file() or jobs.parent != Path(root).resolve():
+            return None
+        return jobs
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def sweep_deliver(
@@ -228,6 +236,11 @@ def sweep_deliver(
         claim_owner = (
             f"session-sweep:{recipient_kind}:{os.getpid()}:{time.monotonic_ns()}"
         )
+        receipt = current.get("receipt") or {}
+        standalone_notice = receipt.get("kind") == "notice"
+        jobs = record_jobs(root, current)
+        if jobs is None and not receipt.get("job_registry") and not standalone_notice:
+            continue
         try:
             record = pending_delivery.claim(
                 root,
@@ -236,12 +249,13 @@ def sweep_deliver(
                 claim_owner=claim_owner,
                 lease_seconds=DELIVER_LEASE_SECONDS,
                 require_generation_proof=False,
+                jobs=jobs,
             )
         except pending_delivery.PendingDeliveryError:
             continue
         from dispatch_notice_state import keep_claim
         try:
-            if not keep_claim(root, storage_key, delivery_id, record, claim_owner):
+            if not keep_claim(root, storage_key, delivery_id, record, claim_owner, jobs=jobs):
                 continue
         except OSError:
             continue
@@ -391,6 +405,10 @@ def sweep(
             claim_owner = (
                 f"session-sweep:{recipient_kind}:{os.getpid()}:{time.monotonic_ns()}"
             )
+            record = pending_delivery.read(root, session_id, delivery_id)
+            jobs = record_jobs(root, record) if record is not None else None
+            if jobs is None and record is not None and not (record.get("receipt") or {}).get("job_registry"):
+                continue
             try:
                 pending_delivery.claim(
                     root,
@@ -399,6 +417,7 @@ def sweep(
                     claim_owner=claim_owner,
                     lease_seconds=SWEEP_LEASE_SECONDS,
                     require_generation_proof=True,
+                    jobs=jobs,
                 )
             except pending_delivery.PendingDeliveryError:
                 continue

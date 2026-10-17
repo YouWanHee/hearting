@@ -16,6 +16,8 @@ from fleet import herdr_projection as projection  # noqa: E402
 from fleet.collectors import procscan  # noqa: E402
 import pane_ownership  # noqa: E402
 
+_RUN = subprocess.run  # setUp replaces subprocess.run with the herdr double
+
 
 THREAD_A = "01a133d1-5d32-7581-ac0c-c2dccaa26b4f"
 THREAD_B = "01a1336e-9aa6-75e2-80fc-cca13b79b1e3"
@@ -206,6 +208,19 @@ class CodexFooterBindingTest(unittest.TestCase):
                 mock.patch("tempfile.gettempdir", return_value=str(self.root)):
             projection._await_tui_and_project(THREAD_A, True)
         return sent
+
+    def test_deferred_reporter_script_reaches_its_proof_and_report_imports(self):
+        # The detached reporter runs this module as a script: its path holds
+        # tools/fleet, never the hook's utilities directory, and it has no package.
+        probe = ("import sys\n"
+                 f"sys.path.insert(0, {str(ROOT / 'tools' / 'fleet')!r})\n"
+                 "import herdr_projection\n"
+                 "herdr_projection._codex_tui_endpoint('not-a-thread')\n"
+                 "print('pane_ownership' in sys.modules)\n"
+                 "print(herdr_projection._session_lifecycle('codex', None, None))\n")
+        done = _RUN([sys.executable, "-I", "-c", probe], capture_output=True,
+                    text=True, timeout=60, check=False)
+        self.assertEqual(done.stdout.split(), ["True", "{}"], done.stderr)
 
     def test_deferred_report_proof_rejects_socket_switch_before_session_report(self):
         pane = "wC:p7"
