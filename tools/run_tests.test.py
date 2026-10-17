@@ -761,6 +761,24 @@ class RetryFixture(RunTestsFixtureBase):
                 (diagnostics / row["stderr_path"]).read_text(encoding="utf-8"),
             )
 
+    def test_retry_budget_reaches_short_suites_before_long_suites(self):
+        order = self.root / "retry-order.txt"
+        for name, delay in (("a-slow", .20), ("b-fast", .01)):
+            write_suite(self.root, name + ".test.py", f"""
+                from pathlib import Path
+                import sys, time
+                count = Path({(name + '.count')!r})
+                n = int(count.read_text()) + 1 if count.exists() else 1
+                count.write_text(str(n))
+                if n == 1:
+                    time.sleep({delay})
+                    sys.exit(1)
+                with open({str(order)!r}, 'a') as stream: stream.write({name!r} + '\\n')
+            """)
+        result, _rows = self.run_fixture([], extra_args=["--retries", "1", "--retry-budget", "1"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(order.read_text().splitlines(), ["b-fast", "a-slow"])
+
 
 class ChildStderrDiagnosticsFixture(RunTestsFixtureBase):
     """A failing suite's diagnostics keep the stderr of a child it captured.
@@ -1233,6 +1251,31 @@ class TimeoutDescendantReclaimFixture(RunTestsFixtureBase):
             os.kill(grandchild_pid, 9)
             self.fail(f"grandchild {grandchild_pid} survived the suite timeout")
         _ = result
+
+    def test_setsid_fixture_is_reaped_before_its_temp_root_is_removed(self):
+        pidfile = self.root / "detached.pid"
+        write_suite(self.root, "detached.test.py", f"""
+            import os, subprocess, sys
+            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                cwd=os.environ['TMPDIR'], start_new_session=True, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            open({str(pidfile)!r}, 'w').write(str(child.pid))
+        """)
+        result, rows = self.run_fixture([], extra_args=["--timeout", "10"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(rows[0]["verdict"], "PASS")
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
+            except (OSError, IndexError):
+                break
+            if fields[0] == b"Z":
+                break
+            time.sleep(.02)
+        else:
+            self.fail(f"setsid fixture {pid} survived suite temp-root cleanup")
 
 
 class FingerprintFixture(unittest.TestCase):

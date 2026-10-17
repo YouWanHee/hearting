@@ -183,7 +183,7 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':
         self.owner_slug = "owner"
 
     def run_cmd(self, command, expected=0):
-        for retry in range(3):
+        for retry in range(1):
             stage_start = str(ROOT / 'utilities/stage-dispatch-fallback.py') in command
             before = self.atomic_state() if stage_start else None
             result = subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=45)
