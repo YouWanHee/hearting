@@ -187,7 +187,8 @@ class HerdrIntegrationLive:
             "AGENT_HOME": str(ROOT),
             "CODEX_HOME": str(Path(self.env["HOME"]) / ".codex"),
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude"),
-            "OPENCODE_CONFIG_DIR": str(Path(self.env["XDG_CONFIG_HOME"]) / "opencode"),
+            # Herdr's upstream installer/status read this official home path.
+            "OPENCODE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".config" / "opencode"),
             "AGENT_PEER_LEDGER_ROOT": str(Path(self.env["XDG_STATE_HOME"]) / "peer-ledger"),
             "HERDR_ENV": "1",
             "HERDR_SESSION": self.session,

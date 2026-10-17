@@ -84,6 +84,23 @@ class NativeDriverContractTest(unittest.TestCase):
             self.assertTrue(row["stdout_hmac"])
             self.assertTrue(row["stderr_reason"] == "exit-0")
 
+    def test_opencode_sentinel_is_seeded_at_the_upstream_home_consumer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "callbacks", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            driver._seed_user_callback("opencode")
+            official = Path(driver.env["HOME"]) / ".config" / "opencode"
+            payload = json.loads((official / "opencode.json").read_text())
+            self.assertEqual(driver.env["OPENCODE_CONFIG_DIR"], str(official))
+            self.assertTrue((official / payload["plugin"][0]).is_file())
+            self.assertNotEqual(official, Path(driver.env["XDG_CONFIG_HOME"]) / "opencode")
+
     def test_busy_probe_uses_command_wrapper_and_records_redacted_native_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
