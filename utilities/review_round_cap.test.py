@@ -482,6 +482,32 @@ class RoundProtocolParityTest(unittest.TestCase):
         block = dispatch_node.round_protocol_block(budget, rows, "review", "plan-check")
         self.assertIn("판정 없음(dead-invalid-envelope)", block)
 
+    def test_first_retry_keeps_shared_history_and_uses_worker_role_guidance(self):
+        dispatch_node_spec = importlib.util.spec_from_file_location(
+            "review_round_cap_protocol_first_retry", ROOT / "utilities/dispatch-node.py")
+        dispatch_node = importlib.util.module_from_spec(dispatch_node_spec)
+        dispatch_node_spec.loader.exec_module(dispatch_node)
+        cols = ["2026-09-26T00:00:00Z", "done", "/repo", "/wt", "slug-r1"]
+
+        for node, worker_type in ((review_node(), "review"), (stage_node(), "stage")):
+            with self.subTest(worker_type=worker_type):
+                meta = {"note": "dead-launch-exit-1", "failure_class": "launch",
+                        "worker_type": worker_type}
+                rows = [(cols, meta)]
+                budget = CAP.round_budget(route("standard", cap=2), node, [("done", meta)])
+                block = dispatch_node.round_protocol_block(budget, rows, worker_type, node["id"])
+                self.assertIn(f"Round protocol (round 2 of route node `{node['id']}`", block)
+                self.assertIn("slug-r1 (판정 없음(dead-launch-exit-1))", block)
+                self.assertIn("verdict-less attempts provide execution context only", block)
+                self.assertNotIn("This is a correction round", block)
+                if worker_type == "review":
+                    self.assertIn("full independent review", block)
+                    self.assertIn("full assigned scope", block)
+                    self.assertNotIn("full execution of the original assigned task", block)
+                else:
+                    self.assertIn("full execution of the original assigned task and scope", block)
+                    self.assertNotIn("full independent review", block)
+
     def test_first_round_renders_no_block(self):
         dispatch_node_spec = importlib.util.spec_from_file_location(
             "review_round_cap_protocol_first_round", ROOT / "utilities/dispatch-node.py")

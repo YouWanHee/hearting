@@ -754,9 +754,8 @@ class MainMaterializationTest(unittest.TestCase):
 
 
 class RoundProtocolTest(unittest.TestCase):
-    """Batched-correction rounds: a node redispatched after prior attempts of the
-    same route/node gets a `Round protocol` block stamped into its assignment,
-    scoping a review to a closure check and a stage to one batched fix."""
+    """Verdict-less history gets full-scope first-pass guidance; real verdicts
+    continue to scope review corrections and stage work to their prior findings."""
 
     def _rows(self, node, n, extra=""):
         # SD-153: `failure_class=fail` makes this a genuine FAIL verdict for a
@@ -840,7 +839,9 @@ class RoundProtocolTest(unittest.TestCase):
                     f"failure_class={failure},attempt_id=att-{note}\n"
                 )
                 prompt, _ = self._launch(node, row)
+                self.assertIn("Round protocol (round 2 of route node `impl-review`", prompt)
                 self.assertIn("full independent review", prompt)
+                self.assertIn("full assigned scope", prompt)
                 self.assertIn(f"판정 없음({note})", prompt)
                 self.assertNotIn("This is a correction round", prompt)
                 self.assertNotIn("Implementation source changed", prompt)
@@ -860,6 +861,23 @@ class RoundProtocolTest(unittest.TestCase):
             ),
         )
         self.assertIn("This is a correction round", prompt)
+
+    def test_verdictless_stage_history_gets_full_original_task_scope(self):
+        node = make_node(depth=1, dispatch_fallback=[])
+        row = (
+            "2026-08-24T00:00:01Z\tdone\t/repo\t/wt\tslug-dead\t"
+            "capability=autopilot-code,attempt_schema_version=2,registered_worker=1,"
+            "route_id=rt-fixture,route_node=execute,worker_type=stage,note=dead-capacity,"
+            "failure_class=capacity,attempt_id=att-dead-capacity\n"
+        )
+        prompt, _ = self._launch(node, row)
+        self.assertIn("Round protocol (round 2 of route node `execute`", prompt)
+        self.assertIn("slug-dead (판정 없음(dead-capacity))", prompt)
+        self.assertIn("full execution of the original assigned task and scope", prompt)
+        self.assertIn("verdict-less attempts provide execution context only", prompt)
+        self.assertNotIn("This is a full independent review", prompt)
+        self.assertNotIn("This is a correction round", prompt)
+        self.assertNotIn("Read the failing review artifact first", prompt)
 
     def test_own_slug_subsession_and_other_routes_are_not_rounds(self):
         node = make_node(depth=1, dispatch_fallback=[])

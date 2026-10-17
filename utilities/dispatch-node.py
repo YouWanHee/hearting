@@ -539,7 +539,7 @@ max_review_rounds = REVIEW_ROUND_CAP.max_review_rounds
 review_budget_recovery_fields = REVIEW_ROUND_CAP.recovery_fields
 
 def round_protocol_block(budget, rows, worker_type, node_id):
- """Render the assignment block that scopes a correction round.
+ """Render the shared attempt history and role-specific retry guidance.
 
  `budget` is the `RoundBudget` `admit_round` already computed for this
  launch; `rows` is the same `(cols, metadata)` census it was built from. A
@@ -557,9 +557,16 @@ def round_protocol_block(budget, rows, worker_type, node_id):
    label=f"판정 없음({note or status or 'open'})" if kind=="verdict-less" else (note or "open")
    history_parts.append(f"{slug} ({label})")
   history="; ".join(history_parts)
-  return ("\n\nThis is a full independent review of the current review subject, not a correction or closure check. "
-          "Earlier findings are context only; verdict-less attempts provide execution context only. "
-          "Report every current blocker and assess the full assigned scope. Prior history: " + history + ".")
+  head=(f"Round protocol (round {budget.next_round} of route node `{node_id}`; prior attempts: {history}):\n")
+  if worker_type=="review":
+   body=("- This is a full independent review of the current review subject, not a correction or closure check. "
+         "Report every current blocker and assess the full assigned scope.\n"
+         "- Earlier findings are context only; verdict-less attempts provide execution context only.\n")
+  else:
+   body=("- This is a full execution of the original assigned task and scope, not a correction or closure check.\n"
+         "- Earlier findings are context only; verdict-less attempts provide execution context only. "
+         "Complete the assigned task and assess its full original scope.\n")
+  return "\n\n"+head+body
  if budget.next_round<2: return ""
  history_parts=[]
  for cols,meta in rows:

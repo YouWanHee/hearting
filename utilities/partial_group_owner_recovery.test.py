@@ -294,9 +294,15 @@ class PartialGroupOwnerRecoveryTest(unittest.TestCase):
         self.assertEqual(replacement["attempt_id"], partial["replacement_attempt_id"])
         self.assertEqual(replacement["child_spawned"], "1")
         self.assertEqual(f.row(replacement["attempt_id"])[1]["parent_attempt_id"], new_owner)
-        self.assertIn(brief, self.prompts[replacement["attempt_id"]])
-        self.assertIn("original sealed request", self.prompts[replacement["attempt_id"]])
-        self.assertIn("Round protocol", self.prompts[replacement["attempt_id"]])
+        replacement_prompt = self.prompts[replacement["attempt_id"]]
+        self.assertIn(brief, replacement_prompt)
+        self.assertIn("original sealed request", replacement_prompt)
+        self.assertIn("Round protocol (round 2 of route node `research-alternative`", replacement_prompt)
+        self.assertIn("판정 없음(dead-launch-exit-1)", replacement_prompt)
+        self.assertIn("full execution of the original assigned task and scope", replacement_prompt)
+        self.assertIn("verdict-less attempts provide execution context only", replacement_prompt)
+        self.assertNotIn("This is a full independent review", replacement_prompt)
+        self.assertNotIn("This is a correction round", replacement_prompt)
         self.complete(replacement)
         with mock.patch.dict(os.environ, self.env, clear=True):
             DC.completion_marker_gate(str(self.path), "review", "start", ROOT, f.jobs)
