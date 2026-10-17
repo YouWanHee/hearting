@@ -4380,12 +4380,20 @@ def _watch_observer_takeover_argvs(watch_id, arm):
         return None
 
 
-def _ensure_watch_observers(*, service_current=None):
+def _ensure_watch_observers(*, service_current=None, entries=None):
     root = _watch_root()
     transports = {}
     try:
-        for watch_id, arm in _watch_entries(root):
-            if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
+        for watch_id, _snapshot_arm in (_watch_entries(root) if entries is None else entries):
+            paths = _watch_paths(watch_id, root)
+            if paths.receipt.exists():
+                continue
+            # The pass snapshot selects work only. Re-read the current arm so
+            # replacement and reattachment use the latest sealed watch intent.
+            arm = _read_json(paths.arm)
+            if not isinstance(arm, dict) or arm.get("watch_id") != watch_id:
+                continue
+            if paths.receipt.exists():
                 continue
             if _settle_terminal_watch_if_unobserved(watch_id, arm, root):
                 continue
@@ -5470,9 +5478,9 @@ def _runner_duty_signature(duties):
     return tuple(sorted(values))
 
 
-def _watch_reconciliation_needed(*, service_current=None):
+def _watch_reconciliation_needed(*, service_current=None, entries=None):
     root = _watch_root()
-    for watch_id, arm in _watch_entries(root):
+    for watch_id, arm in (_watch_entries(root) if entries is None else entries):
         if not isinstance(arm, dict) or _watch_paths(watch_id, root).receipt.exists():
             continue
         if not _watcher_present(arm) or service_current:
@@ -5480,38 +5488,85 @@ def _watch_reconciliation_needed(*, service_current=None):
     return False
 
 
-def _external_obligation_signature():
+def _external_obligation_snapshot():
+    """Read external duty files once for one runner pass.
+
+    The contained arm and record values are scheduling inputs only. Watch and
+    batch mutation paths reread their exact current records before acting.
+    """
+    try:
+        root = _watch_root()
+        watches = tuple(_watch_entries(root))
+        watch_stamp = dispatch_batch_obligations._directory_stamp(root)
+        watch_cacheable = True
+    except Exception:
+        root, watches, watch_stamp, watch_cacheable = None, None, None, False
+    try:
+        batches = dispatch_batch_obligations.pending_observer_snapshot()
+    except Exception:
+        batches = {"signature": (("batch-state-unavailable",),), "paths_by_jobs": {}}
+    return {"watch_root": root, "watches": watches, "watch_stamp": watch_stamp,
+            "watch_cacheable": watch_cacheable, "batches": batches}
+
+
+def _external_obligation_snapshot_unchanged(snapshot):
+    """Cheaply validate the post-unlock read boundary before reusing a scan."""
+    if (not snapshot.get("watch_cacheable") or snapshot.get("watches") is None
+            or not snapshot.get("batches", {}).get("cacheable")):
+        return False
+    root = snapshot.get("watch_root")
+    if dispatch_batch_obligations._directory_stamp(root) != snapshot.get("watch_stamp"):
+        return False
+    batches = snapshot["batches"]
+    for key, path in batches.get("roots_by_jobs", {}).items():
+        if dispatch_batch_obligations._directory_stamp(path) != batches.get(
+                "root_stamps", {}).get(key):
+            return False
+    return True
+
+
+def _external_obligation_signature(snapshot=None):
     """Read pending watch/batch identities for the existing outer runner.
 
     The signature exists only to keep that runner alive and reset its bounded
     backoff when external work changes. It is not delivery or mutation authority.
     """
+    snapshot = _external_obligation_snapshot() if snapshot is None else snapshot
     watches = []
     try:
-        root = _watch_root()
-        for watch_id, arm in _watch_entries(root):
+        root = snapshot["watch_root"]
+        entries = snapshot["watches"]
+        if entries is None:
+            raise OSError("watch-state-unavailable")
+        for watch_id, arm in entries:
             if _watch_paths(watch_id, root).receipt.exists():
                 continue
             watcher = (arm or {}).get("watcher") or {}
             watches.append((watch_id, watcher.get("pid"), watcher.get("pid_start")))
     except Exception:
         watches.append(("watch-state-unavailable",))
-    try:
-        batches = dispatch_batch_obligations.pending_observer_signature()
-    except Exception:
-        batches = (("batch-state-unavailable",),)
+    batches = snapshot["batches"]["signature"]
     return tuple(sorted(watches)), batches
 
 
-def _reconcile_external_obligations(store, *, service_current=None):
+def _reconcile_external_obligations(store, *, service_current=None, snapshot=None,
+                                    settlement_context=None):
     """Reconnect independent recovery owners from the existing lifecycle callback."""
+    watches = None if snapshot is None else snapshot.get("watches")
     try:
-        needs_watch = _watch_reconciliation_needed(service_current=service_current)
+        if snapshot is None:
+            needs_watch = _watch_reconciliation_needed(service_current=service_current)
+        else:
+            needs_watch = _watch_reconciliation_needed(
+                service_current=service_current, entries=watches)
     except Exception:
         needs_watch = True
     if needs_watch:
         try:
-            _ensure_watch_observers(service_current=service_current)
+            if snapshot is None:
+                _ensure_watch_observers(service_current=service_current)
+            else:
+                _ensure_watch_observers(service_current=service_current, entries=watches)
         except Exception:
             pass
     for duty in store.list(states={"complete"}):
@@ -5529,7 +5584,13 @@ def _reconcile_external_obligations(store, *, service_current=None):
         needs_batch = True
     if needs_batch:
         try:
-            dispatch_batch_obligations.ensure_observers(service_current=service_current)
+            if snapshot is None:
+                dispatch_batch_obligations.ensure_observers(service_current=service_current)
+            else:
+                dispatch_batch_obligations.ensure_observers(
+                    service_current=service_current,
+                    observer_snapshot=snapshot.get("batches"),
+                    settlement_context=settlement_context)
         except Exception:
             pass
 
@@ -5569,6 +5630,7 @@ def cmd_obligation_runner(args):
     service_current = getattr(args, "service_current", None)
     delay = 1.0
     previous_signature = None
+    settlement_context = dispatch_batch_obligations.OwnerSettlementReadContext()
     while True:
         duties = store.list()
         from peer_read_context import PeerReadContext
@@ -5579,13 +5641,19 @@ def cmd_obligation_runner(args):
                 args.lock_fd, store.root.parents[1], service_current,
                 herdr_session=_HERDR_SESSION,
             )
+            external_snapshot = _external_obligation_snapshot()
             # This already-owned runner is the retry path for managed external
             # duties too. It closes the activation/old-caller respawn window
             # without creating a second monitor or changing any duty identity.
-            _reconcile_external_obligations(store, service_current=service_current)
+            _reconcile_external_obligations(
+                store, service_current=service_current, snapshot=external_snapshot,
+                settlement_context=settlement_context)
+        else:
+            external_snapshot = None
         current_duties = store.list()
         external_signature = (_external_obligation_signature()
-                              if service_current else ((), ()))
+                              if not service_current else
+                              _external_obligation_signature(external_snapshot))
         if not _runner_duties(store, current_duties):
             # A producer that saw our held lock may already have accepted work.
             # Release before the final read: later producers can start a runner,
@@ -5593,7 +5661,11 @@ def cmd_obligation_runner(args):
             # by the new lock holder.
             fcntl.flock(args.lock_fd, fcntl.LOCK_UN)
             latest_duties = store.list()
-            latest_external = (_external_obligation_signature()
+            latest_snapshot = external_snapshot
+            if (service_current and external_snapshot is not None
+                    and not _external_obligation_snapshot_unchanged(external_snapshot)):
+                latest_snapshot = _external_obligation_snapshot()
+            latest_external = (_external_obligation_signature(latest_snapshot)
                                if service_current else ((), ()))
             if not _runner_duties(store, latest_duties) and not any(latest_external):
                 return 0

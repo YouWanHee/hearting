@@ -184,6 +184,46 @@ class BatchObligationTest(unittest.TestCase):
         obligations.update(self.jobs, duty_id, state="complete")
         self.assertFalse(obligations.has_unowned_work(self.jobs))
 
+    def test_owner_settlement_scan_reuses_unchanged_registry_but_rechecks_leases(self):
+        from dispatch_contract import SUPERVISOR_LEASE_KIND
+
+        row = (
+            "t\topen\t/repo\t/wt\towner\t"
+            f"worker_type=owner,launch_started=1,supervisor_lease={SUPERVISOR_LEASE_KIND},"
+            "supervisor_lease_file=attempt.lock,log_file=attempt.log,attempt_id=att-owner\n"
+        )
+        self.jobs.write_text(row, encoding="utf-8")
+        context = obligations.OwnerSettlementReadContext()
+        original_read_text = Path.read_text
+        reads = []
+
+        def count_registry_read(path, *args, **kwargs):
+            if path == self.jobs:
+                reads.append(path)
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", count_registry_read), \
+             mock.patch("dispatch_contract.supervisor_lease_is_held", return_value=True) as lease, \
+             mock.patch("dispatch_completion_join.settle_finished_attempt") as settle:
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            self.assertEqual(len(reads), 1)
+            self.assertEqual(lease.call_count, 2)
+            settle.assert_not_called()
+
+            # A registry change forces a fresh full read on the next pass.
+            with self.jobs.open("a", encoding="utf-8") as handle:
+                handle.write("t\tdone\t/repo\t/wt\tchild\tattempt_id=att-child\n")
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            self.assertEqual(len(reads), 2)
+
+            # Lease release is checked even while the registry stamp is stable.
+            lease.return_value = False
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            settle.assert_called_once()
+            obligations._resume_owner_settlements(self.jobs, context=context)
+            self.assertEqual(len(reads), 4, "an unresolved unowned row stays retryable")
+
     def test_parent_ended_duty_waits_dormant_until_recipient_returns(self):
         args = Namespace(**vars(self.args))
         args.parent_session_id = "parent-thread"

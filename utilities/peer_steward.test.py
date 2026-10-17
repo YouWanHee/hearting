@@ -3959,6 +3959,74 @@ class ObligationStartupTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(resumed.call_count, 1)
         self.assertEqual(store.get(accepted[0]["id"])["state"], "complete")
 
+    def test_external_batch_created_at_unlock_invalidates_the_runner_snapshot(self):
+        import dispatch_batch_obligations as batch
+
+        store = peer_steward.peer_obligations.ObligationStore()
+        store.root.mkdir(parents=True, exist_ok=True)
+        lock_path = store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME
+        lock = lock_path.open("w")
+        real_flock = fcntl.flock
+        created = []
+        inside_create = False
+        delays = []
+
+        def unlock_and_accept(fd, operation):
+            nonlocal inside_create
+            result = real_flock(fd, operation)
+            if operation == fcntl.LOCK_UN and not inside_create and not created:
+                inside_create = True
+                args = SimpleNamespace(
+                    jobs=self.jobs_path, sealed_batch_id="accepted-at-unlock",
+                    parent_attempt_id="att-parent", parent_session_id=None,
+                    attempt_id=["att-child-unlock"], control_socket=None,
+                    queue_socket=None, thread_id=None, interval=1.0, timeout=2.0,
+                )
+                created.append(batch.create(args)[0])
+                inside_create = False
+            return result
+
+        def settle_before_next_pass(delay):
+            delays.append(delay)
+            batch.update(self.jobs_path, created[0], state="complete",
+                         reason="fixture-settled")
+
+        original_snapshot = peer_steward._external_obligation_snapshot
+        snapshots = []
+
+        def count_snapshot():
+            value = original_snapshot()
+            snapshots.append(value)
+            return value
+
+        try:
+            real_flock(lock.fileno(), fcntl.LOCK_EX)
+            with mock.patch.object(batch, "_jobs_paths", side_effect=lambda jobs=None, strict=True: [
+                    Path(jobs).resolve(strict=False) if jobs else self.jobs_path.resolve()
+                 ]), \
+                 mock.patch.object(peer_steward, "_external_obligation_snapshot",
+                                   side_effect=count_snapshot), \
+                 mock.patch.object(peer_steward, "_reconcile_external_obligations"), \
+                 mock.patch.object(peer_steward.peer_obligations,
+                                   "exec_service_runner", return_value=False), \
+                 mock.patch.object(peer_steward.time, "sleep", side_effect=settle_before_next_pass), \
+                 mock.patch.object(peer_steward.fcntl, "flock", side_effect=unlock_and_accept):
+                self.assertEqual(peer_steward.cmd_obligation_runner(SimpleNamespace(
+                    state_root=self.tmp_root, lock_fd=lock.fileno(),
+                    service_current="/fixture/current")), 0)
+        finally:
+            try:
+                real_flock(lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock.close()
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(delays, [1.0])
+        self.assertEqual(len(snapshots), 3,
+                         "the new batch is reread after unlock and the completed row on the next pass")
+        self.assertEqual(batch.read(self.jobs_path, created[0])["state"], "complete")
+
 
 class SidlessObligationProcessBindingTest(_TmpRootMixin, unittest.TestCase):
     def _row_and_duty(self, *, process_proof=True, submitted=False):
