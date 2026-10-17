@@ -128,6 +128,10 @@ def _idle_shell_run(argv, **kwargs):
     return _herdr_json({"result": {"pane": {}}})
 
 
+PROVEN_THREAD = "01a14890-e7b6-7ef0-9387-3a4cc04f9f5a"
+OTHER_THREAD = "01a14891-11ac-79b0-9e5b-d734f0c56e3b"
+
+
 class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
     def test_message_uses_saved_server_for_readiness_and_transport_and_restores_on_error(self):
         store = peer_steward.peer_obligations.ObligationStore()
@@ -165,6 +169,65 @@ class CompletionConsumerCorrectionTest(_TmpRootMixin, unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     peer_steward._resume_message_obligation(duty, store)
             self.assertEqual(peer_steward._HERDR_SESSION, "caller")
+
+    def _pane_bound_codex_duty(self, store):
+        ident = {"server": "default", "pane": "w9:pA", "harness": "codex", "session_id": None}
+        _text, ref = peer_steward.peer_message.prepare_peer_message(
+            "[steer] pane-bound body", {"harness": "claude", "session_id": "sender"},
+            {"harness": "codex", "session_id": None, "pane_id": "w9:pA", "name": None}, defer=True)
+        duty = store.create("message-" + ref, "message", ident, {"target": "w9:pA", "ref": ref})
+        return duty, ref
+
+    def _resume_pane_bound(self, duty, store, proof, ready=None):
+        ident = {"harness": "codex", "session_id": "-", "pane": "w9:pA"}
+        ready = ready or SimpleNamespace(state="ready", reason="native-idle")
+        with mock.patch.object(peer_steward, "_retire_target", return_value=("idle", ident, 0, None)), \
+             mock.patch.object(peer_steward, "_codex_pane_session", return_value=proof), \
+             mock.patch.object(peer_steward, "_pane_readiness", return_value=ready) as readiness, \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
+                               return_value={"status": "queued"}) as deliver:
+            peer_steward._resume_message_obligation(duty, store)
+        return readiness, deliver
+
+    def test_pane_bound_obligation_binds_to_proven_codex_thread(self):
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty, ref = self._pane_bound_codex_duty(store)
+        info = {"pane_id": "w9:pA"}
+        readiness, deliver = self._resume_pane_bound(duty, store, (PROVEN_THREAD, info))
+        bound = peer_steward.peer_message._read_pending(ref)["bound_to"]
+        self.assertEqual((bound["harness"], bound["session_id"], bound["pane_id"]),
+                         ("codex", PROVEN_THREAD, "w9:pA"))
+        kwargs = readiness.call_args.kwargs
+        self.assertEqual((kwargs["expected_sid"], kwargs["native_session_id"], kwargs["pane_info"]),
+                         (PROVEN_THREAD, PROVEN_THREAD, info))
+        deliver.assert_called_once_with(ref, timeout=0.25)
+
+    def test_pane_bound_obligation_without_proof_stays_unresolved(self):
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty, ref = self._pane_bound_codex_duty(store)
+        with mock.patch.object(peer_steward.peer_message, "bind_pending_recipient",
+                               side_effect=AssertionError("nothing to bind")):
+            readiness, deliver = self._resume_pane_bound(duty, store, (None, None))
+        record = store.get(duty["id"])
+        self.assertEqual(record["state"], "pending")
+        self.assertEqual(record["observation"]["reason"], "target-session-unresolved")
+        readiness.assert_not_called()
+        deliver.assert_not_called()
+        self.assertNotIn("bound_to", peer_steward.peer_message._read_pending(ref))
+
+    def test_pane_bound_obligation_never_rebinds_to_a_foreign_thread(self):
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty, ref = self._pane_bound_codex_duty(store)
+        self._resume_pane_bound(duty, store, (PROVEN_THREAD, {"pane_id": "w9:pA"}))
+        readiness, deliver = self._resume_pane_bound(
+            store.get(duty["id"]), store, (OTHER_THREAD, {"pane_id": "w9:pA"}))
+        record = store.get(duty["id"])
+        self.assertEqual(record["state"], "unknown")
+        self.assertEqual(record["observation"]["reason"], "target-identity-changed")
+        readiness.assert_not_called()
+        deliver.assert_not_called()
+        self.assertEqual(peer_steward.peer_message._read_pending(ref)["bound_to"]["session_id"],
+                         PROVEN_THREAD)
 
     def test_delay_notice_is_minted_once_across_replaced_checkpoints(self):
         store = peer_steward.peer_obligations.ObligationStore()
@@ -2551,6 +2614,8 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload, calls)), \
              mock.patch.object(peer_steward, "_proven_session", return_value=None), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex",
+                               side_effect=AssertionError("no proof, no queue")), \
              mock.patch("builtins.print") as printed:
             rc = peer_steward.main(["prompt", "fresh", "wait for the exact thread"])
         self.assertEqual(rc, 3)
@@ -2559,6 +2624,85 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual((row["state"], row["to"]["session_id"], row["to"]["pane_id"]),
                          ("pending", None, "w1:pX"))
         self.assertEqual(self._pane_io_calls(calls), [])
+
+    def test_codex_prompt_uses_proven_thread_when_herdr_has_no_session(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        calls, queued = [], []
+        payload = _agent_json("codex", None, "fresh", status="idle")
+        info = {"pane_id": "w1:pX"}
+
+        def accept(ref, *, timeout=1.0):
+            row = peer_steward.peer_message._read_pending(ref)
+            queued.append((row["to"]["session_id"], ref))
+            return {"status": "queued", "reason": "native-queue-accepted"}
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload, calls)), \
+             mock.patch.object(peer_steward, "_codex_pane_session", return_value=(PROVEN_THREAD, info)), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=accept), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["prompt", "fresh", "[steer] proven thread"])
+        self.assertEqual(rc, 3)
+        self.assertEqual([sid for sid, _ref in queued], [PROVEN_THREAD])
+        self.assertIn("verify=native-queue-queued", printed.call_args[0][0])
+        self.assertEqual(self._all_records()[-1]["to"]["session_id"], PROVEN_THREAD)
+        kwargs = peer_steward._pane_readiness.call_args.kwargs
+        self.assertEqual((kwargs["native_session_id"], kwargs["pane_info"]), (PROVEN_THREAD, info))
+        self.assertEqual(self._pane_io_calls(calls), [])
+
+    def test_codex_prompt_herdr_session_wins_over_proof(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        queued = []
+        payload = _agent_json("codex", "exact-thread", "child", status="idle")
+
+        def accept(ref, *, timeout=1.0):
+            queued.append(peer_steward.peer_message._read_pending(ref)["to"]["session_id"])
+            return {"status": "queued", "reason": "native-queue-accepted"}
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload)), \
+             mock.patch.object(peer_steward, "_codex_pane_session",
+                               side_effect=AssertionError("herdr already reports a session")), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=accept), \
+             mock.patch("builtins.print"):
+            self.assertEqual(peer_steward.main(["prompt", "child", "[steer] herdr first"]), 3)
+        self.assertEqual(queued, ["exact-thread"])
+
+    def test_codex_prompt_expected_recipient_rejects_a_different_proven_thread(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        queued = []
+        payload = _agent_json("codex", None, "fresh", status="idle")
+        args = peer_steward.build_parser().parse_args(["prompt", "fresh", "[steer] pinned"])
+
+        def accept(ref, *, timeout=1.0):
+            queued.append(ref)
+            return {"status": "queued", "reason": "native-queue-accepted"}
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=self._fake_run(payload)), \
+             mock.patch.object(peer_steward, "_codex_pane_session",
+                               return_value=(PROVEN_THREAD, {"pane_id": "w1:pX"})), \
+             mock.patch.object(peer_steward.peer_message, "deliver_pending_codex", side_effect=accept), \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(peer_steward.cmd_prompt(
+                args, expected_recipient=("codex", OTHER_THREAD)), 5)
+            self.assertIn("prompted=false reason=target-identity-changed", printed.call_args[0][0])
+            self.assertEqual((queued, self._all_records()), ([], []))
+            self.assertEqual(peer_steward.cmd_prompt(
+                args, expected_recipient=("codex", PROVEN_THREAD)), 3)
+        self.assertEqual(len(queued), 1)
+
+    def test_codex_pane_session_requires_the_same_pane(self):
+        foreign = {"pane_id": "w9:pZ", "shell_pid": 1, "foreground_process_group_id": 1,
+                   "foreground_processes": [{"pid": 1}]}
+        import pane_ownership
+        with mock.patch.object(peer_steward, "_retire_pane_info", return_value=foreign), \
+             mock.patch.object(pane_ownership, "current_codex_thread",
+                               side_effect=AssertionError("another pane's process")):
+            self.assertIsNone(peer_steward._codex_pane_session("w1:pX")[0])
+        with mock.patch.object(peer_steward, "_retire_pane_info", return_value=None):
+            self.assertEqual(peer_steward._codex_pane_session("w1:pX"), (None, None))
+        self.assertEqual(peer_steward._codex_pane_session(""), (None, None))
 
     def test_same_sender_recipient_body_retry_reuses_the_same_ref(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
