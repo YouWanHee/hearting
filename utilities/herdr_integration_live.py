@@ -279,7 +279,7 @@ class HerdrIntegrationLive:
 
     def _start_event_tap(self):
         import herdr_observation
-        socket_path = herdr_observation.socket_path_for_endpoint(self.session)
+        socket_path = herdr_observation.socket_path_for_endpoint(self.session, self.env)
         if not socket_path:
             return False
         self.decode_original = herdr_observation._decode_line
@@ -340,6 +340,13 @@ class HerdrIntegrationLive:
         while time.monotonic() < ready_until and self.server.poll() is None:
             rc, stdout, _ = self.herdr_command("private-pane-list-ready", ["pane", "list"], timeout=2)
             if rc == 0 and _json(stdout) is not None:
+                # This is the server just created in our private config root,
+                # not an inherited endpoint or a guessed operating session.
+                api_socket = (Path(self.env["HERDR_CONFIG_PATH"]).parent
+                              / "sessions" / self.session / "herdr.sock")
+                if not api_socket.is_socket():
+                    return False
+                self.env["HERDR_SOCKET_PATH"] = str(api_socket)
                 return True
             time.sleep(min(0.2, max(0.0, ready_until - time.monotonic())))
         with error_path.open("rb") as errors:

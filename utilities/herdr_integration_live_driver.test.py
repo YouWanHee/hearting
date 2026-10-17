@@ -161,6 +161,32 @@ class NativeDriverContractTest(unittest.TestCase):
             self.assertEqual(last["returncode"], 1)
             self.assertTrue(last["stderr_hmac"])
 
+    def test_event_tap_uses_private_endpoint_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            driver = live.HerdrIntegrationLive(live.build_parser().parse_args([
+                "--case", "events-lost", "--output-dir", str(root / "out"),
+                "--project", str(project), "--timeout", "10",
+            ]))
+            self.addCleanup(driver.runtime_dir.cleanup)
+            driver.env["HERDR_SOCKET_PATH"] = "/private/owned/herdr.sock"
+            sys.path.insert(0, str(ROOT / "utilities"))
+            self.addCleanup(sys.path.remove, str(ROOT / "utilities"))
+            import herdr_observation
+            with mock.patch.dict(os.environ, {
+                    "HERDR_SOCKET_PATH": "/foreign/herdr.sock",
+                    "AGENT_HERDR_SESSION": "foreign-session"}), \
+                    mock.patch.object(herdr_observation, "ObservationTransport") as transport:
+                transport.return_value.observe.return_value.complete = True
+                try:
+                    self.assertTrue(driver._start_event_tap())
+                    transport.assert_called_once_with(
+                        driver.session, "/private/owned/herdr.sock", timeout=0.5)
+                finally:
+                    driver._stop_event_tap()
+
 
 if __name__ == "__main__":
     unittest.main()
