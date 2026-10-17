@@ -1936,6 +1936,173 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(sum("agent wait peer-a" in row for row in waits), 1, self.calllog.read_text())
         self.assertEqual(sum("agent wait w1:p9" in row for row in waits), 1, self.calllog.read_text())
 
+    def test_conflicting_admission_result_stays_unknown_across_reattach_and_admits_new_sid(self):
+        identity_path = self.tmp_root / "admission-result-identity.json"
+        env = self._env("held")
+        env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
+        env["FAKE_HERDR_WAIT_STATE"] = "idle"
+        identity_path.write_text(json.dumps({"session_id": "sid-A"}))
+
+        armed = self._run("watch", "peer-a", "--timeout", "60000", env=env)
+        self.assertEqual(armed.returncode, 0, armed.stdout + armed.stderr)
+        watch_id = self._fields(armed.stdout)["watch_id"]
+        arm_path = self.watch_root / f"{watch_id}.json"
+        paths = peer_steward._watch_paths(watch_id, self.watch_root)
+        original_arm = json.loads(arm_path.read_text())
+        self.assertEqual(original_arm["agent"]["session_id"], "sid-A")
+        original_deadline = original_arm["deadline"]
+
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+            observation = json.loads(paths.observation.read_text())
+        wait_record = observation["native_wait"]
+        self.assertEqual(wait_record["state"], "started")
+        self.assertTrue(wait_record.get("pid_start"))
+        self._wait_for_wait_calls(1)
+
+        # Interrupt only this fixture observer, then let its exact native wait
+        # finish with B so the next observer starts from the old poisoned
+        # admission record shape.
+        original_watcher = original_arm["watcher"]
+        if peer_steward._pid_identity_ok(
+                original_watcher["pid"], original_watcher["pid_start"]):
+            os.kill(original_watcher["pid"], signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(
+                original_watcher["pid"], original_watcher["pid_start"])
+                and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            original_watcher["pid"], original_watcher["pid_start"]))
+
+        identity_path.write_text(json.dumps({"session_id": "sid-B"}))
+        self._release()
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(wait_record["pid"], wait_record["pid_start"])
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            wait_record["pid"], wait_record["pid_start"]))
+        payload = json.loads(paths.log.read_text(encoding="utf-8"))
+        state, result_agent, _code, reason = peer_steward._interpret_payload(payload, "peer-a")
+        self.assertEqual((state, result_agent["session_id"]), ("idle", "sid-B"))
+
+        # Recover a disk record produced by the old vulnerable publisher.
+        poisoned = dict(wait_record)
+        poisoned.update({"state": "result", "agent_state": state,
+                         "agent": result_agent, "reason": reason or state})
+        observation["state"] = "waiting"
+        observation["reason"] = "native-wait-running"
+        observation["native_wait"] = poisoned
+        paths.observation.write_text(json.dumps(observation))
+        reattached_processes = []
+        real_popen = peer_steward.subprocess.Popen
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            reattached_processes.append(process)
+            return process
+
+        def cleanup_reattached_processes():
+            for process in reattached_processes:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.addCleanup(cleanup_reattached_processes)
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen):
+                self.assertTrue(peer_steward._spawn_watch_observer(watch_id, original_arm))
+        reattached_arm = json.loads(arm_path.read_text())
+        reattached_watcher = reattached_arm["watcher"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            recovered = json.loads(paths.observation.read_text())
+            if recovered.get("state") == "unknown":
+                break
+            time.sleep(0.01)
+        self.assertEqual(recovered.get("reason"), "target-identity-conflict")
+        self.assertEqual(recovered["native_wait"]["state"], "unknown")
+        self.assertEqual((recovered["native_wait"]["pid"],
+                          recovered["native_wait"]["pid_start"]),
+                         (wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(recovered["native_wait"]["unresolved_result"]["agent"]["session_id"],
+                         "sid-B")
+        self.assertFalse(paths.receipt.exists())
+        self.assertEqual((reattached_arm["agent"]["session_id"],
+                          reattached_arm["deadline"]), ("sid-A", original_deadline))
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(
+                reattached_watcher["pid"], reattached_watcher["pid_start"])
+                and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            reattached_watcher["pid"], reattached_watcher["pid_start"]))
+        self.assertEqual(len(reattached_processes), 1)
+        self.assertEqual(reattached_processes[0].wait(timeout=2), 0)
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1, self.calllog.read_text())
+
+        # Admission now sees the same completed B result. It must not publish
+        # B as A's result; the existing target-replacement lifecycle may then
+        # settle A as pane-exited under its normal terminal-pending contract.
+        retained_arm = json.loads(arm_path.read_text())
+        admitted = self._run("watch", "peer-a", "--timeout", "120000", env=env)
+        self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+        admitted_fields = self._fields(admitted.stdout.splitlines()[0])
+        self.assertEqual(admitted_fields["state"], "armed", admitted.stdout)
+        self.assertNotEqual(admitted_fields["watch_id"], watch_id)
+        admitted_arm = json.loads(
+            (self.watch_root / f"{admitted_fields['watch_id']}.json").read_text())
+        self.assertEqual(admitted_arm["agent"]["session_id"], "sid-B")
+        retained_arm = json.loads(arm_path.read_text())
+        self.assertEqual((retained_arm["agent"]["session_id"], retained_arm["deadline"]),
+                         ("sid-A", original_deadline))
+        self.assertEqual((recovered["state"], recovered["reason"],
+                          recovered["native_wait"]["state"],
+                          recovered["native_wait"]["pid"],
+                          recovered["native_wait"]["pid_start"]),
+                         ("unknown", "target-identity-conflict", "unknown",
+                          wait_record["pid"], wait_record["pid_start"]))
+        self.assertEqual(recovered["native_wait"]["unresolved_result"]["agent"]["session_id"],
+                         "sid-B")
+        receipt = json.loads(paths.receipt.read_text())
+        self.assertEqual((receipt["state"], receipt["reason"]),
+                         ("pane-exited", "session-replaced"))
+        self.assertNotIn(receipt["state"], {"idle", "done"})
+        waits = self._wait_for_wait_calls(2)
+        self.assertEqual(len(waits), 2, self.calllog.read_text())
+        admitted_paths = peer_steward._watch_paths(admitted_fields["watch_id"], self.watch_root)
+        admitted_observation = self._wait_for_observation(admitted_fields["watch_id"])
+        deadline = time.monotonic() + 10
+        while (admitted_observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+            admitted_observation = json.loads(admitted_paths.observation.read_text())
+        admitted_wait = admitted_observation["native_wait"]
+        self.assertEqual(admitted_wait["state"], "started")
+        self._release()
+        admitted_receipt = self._wait_for_receipt(admitted_fields["watch_id"])
+        self.assertEqual((admitted_receipt["state"],
+                          admitted_receipt["agent"]["session_id"]), ("idle", "sid-B"))
+        admitted_watcher = admitted_arm["watcher"]
+        deadline = time.monotonic() + 10
+        while (peer_steward._pid_identity_ok(
+                admitted_watcher["pid"], admitted_watcher["pid_start"])
+                or peer_steward._pid_identity_ok(admitted_wait["pid"], admitted_wait["pid_start"])) \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(peer_steward._pid_identity_ok(
+            admitted_watcher["pid"], admitted_watcher["pid_start"]))
+        self.assertFalse(peer_steward._pid_identity_ok(
+            admitted_wait["pid"], admitted_wait["pid_start"]))
+
     def test_watch_admission_fails_closed_when_pane_or_endpoint_changes(self):
         import contextlib
         import io

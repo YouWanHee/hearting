@@ -2971,48 +2971,105 @@ def _watch_native_binding_evidence(paths, arm):
             payload = parsed
             break
 
-    target_agent = arm.get("agent") or {}
     if payload is not None:
         state, result_agent, _code, reason = _interpret_payload(
             payload, arm.get("target", "-"))
         if state in {"timeout", "agent-not-found", "herdr-unavailable"}:
             return "terminal", None, None
+        result = {"agent_state": state, "agent": result_agent,
+                  "reason": reason or state}
+        identity, sid, _identity_reason = _watch_native_result_identity(arm, result)
+        if identity == "conflict":
+            return "conflict", sid, result
         if reason is not None or state == "unknown":
             return "unknown", None, None
-        sid = result_agent.get("session_id")
-        if (result_agent.get("harness") == target_agent.get("harness")
-                and result_agent.get("pane") == target_agent.get("pane")
-                and isinstance(sid, str) and sid not in {"", "-"}):
-            return "bound", sid, {
-                "agent_state": state, "agent": result_agent,
-                "reason": reason or state,
-            }
+        if identity in {"match", "unbound"}:
+            return "bound", sid, result
         return "unknown", None, None
 
-    if isinstance(wait_record, dict):
+    if isinstance(wait_record, dict) and wait_record.get("state") == "result":
         result_agent = wait_record.get("agent")
         if isinstance(result_agent, dict):
-            sid = result_agent.get("session_id")
-            if (result_agent.get("harness") == target_agent.get("harness")
-                    and result_agent.get("pane") == target_agent.get("pane")
-                    and isinstance(sid, str) and sid not in {"", "-"}):
-                return "bound", sid, {
-                    "agent_state": wait_record.get("agent_state", "unknown"),
-                    "agent": result_agent,
-                    "reason": wait_record.get("reason", "native-wait-result"),
-                }
+            result = {
+                "agent_state": wait_record.get("agent_state", "unknown"),
+                "agent": result_agent,
+                "reason": wait_record.get("reason", "native-wait-result"),
+            }
+            identity, sid, _identity_reason = _watch_native_result_identity(arm, result)
+            if identity in {"match", "unbound"}:
+                return "bound", sid, result
+            if identity == "conflict":
+                return "conflict", sid, result
             return "unknown", None, None
-        if wait_record.get("state") == "unknown" or observation.get("state") == "unknown":
-            return "unknown", None, None
+    if isinstance(wait_record, dict) and wait_record.get("state") == "unknown":
+        return "unknown", None, None
     if observation.get("state") == "unknown" or raw.strip():
         return "unknown", None, None
     return "none", None, None
 
 
+def _watch_native_result_identity(arm, result):
+    """Classify a parsed wait result against the exact durable arm identity."""
+    if not isinstance(arm, dict) or not isinstance(result, dict):
+        return "unknown", None, "target-identity-unverified"
+    if (result.get("terminal_reason")
+            or result.get("agent_state") in {"timeout", "agent-not-found", "herdr-unavailable"}):
+        return "terminal", None, None
+    expected = arm.get("agent")
+    observed = result.get("agent")
+    if not isinstance(expected, dict) or not isinstance(observed, dict):
+        return "unknown", None, "target-identity-unverified"
+    if any(not isinstance(expected.get(key), str) or expected.get(key) in {"", "-"}
+           or observed.get(key) != expected.get(key)
+           for key in ("harness", "pane")):
+        return "unknown", None, "target-identity-unverified"
+    sid = observed.get("session_id")
+    if not isinstance(sid, str) or sid in {"", "-"}:
+        return "unknown", None, "target-identity-unverified"
+    expected_sid = expected.get("session_id")
+    if expected_sid in {None, "", "-"}:
+        return "unbound", sid, None
+    if expected_sid != sid:
+        return "conflict", sid, "target-identity-conflict"
+    return "match", sid, None
+
+
+def _preserve_watch_native_result_unknown(paths, arm, result, reason):
+    """Keep a result unresolved and retain the exact prior wait process identity."""
+    observation = _read_json(paths.observation) or {}
+    previous = observation.get("native_wait")
+    unknown_wait = dict(previous) if isinstance(previous, dict) else {}
+    if isinstance(result, dict):
+        if isinstance(result.get("agent"), dict):
+            unknown_wait["agent"] = result["agent"]
+        if result.get("agent_state") is not None:
+            unknown_wait["agent_state"] = result["agent_state"]
+        if result.get("reason") is not None:
+            unknown_wait["result_reason"] = result["reason"]
+        unknown_wait["unresolved_result"] = dict(result)
+    unknown_wait.update({"state": "unknown", "reason": reason})
+    observation.update({
+        "schema_version": _WATCH_SCHEMA,
+        "watch_id": paths.arm.stem,
+        "server": arm.get("server") or "default",
+        "state": "unknown",
+        "reason": reason,
+        "native_wait": unknown_wait,
+        "observed_ts": _utc_now(),
+    })
+    _write_json_atomic(paths.observation, observation)
+    return unknown_wait, observation
+
+
 def _record_watch_native_result(paths, arm, result):
-    """Keep parsed wait-result identity in the existing observation record."""
+    """Publish only a result attributed to this arm's exact native identity."""
     if not isinstance(result, dict):
-        return
+        return False
+    identity, _sid, identity_reason = _watch_native_result_identity(arm, result)
+    if identity != "match":
+        _preserve_watch_native_result_unknown(
+            paths, arm, result, identity_reason or "target-identity-unverified")
+        return False
     observation = _read_json(paths.observation) or {}
     previous = observation.get("native_wait")
     native_wait = dict(previous) if isinstance(previous, dict) else {}
@@ -3026,6 +3083,7 @@ def _record_watch_native_result(paths, arm, result):
         "observed_ts": _utc_now(),
     })
     _write_json_atomic(paths.observation, observation)
+    return True
 
 
 def _persist_watch_session(args, paths, server, session_id):
@@ -3196,17 +3254,28 @@ def cmd_watch(args):
         evidence, evidence_sid, wait_result = _watch_native_binding_evidence(
             existing_paths, existing_arm)
         if evidence == "bound":
-            _record_watch_native_result(existing_paths, existing_arm, wait_result)
             if existing_sid not in {None, "", "-"} and existing_sid != evidence_sid:
-                # A later native result that conflicts with the durable arm is
-                # not a successful match for either identity. Keep the arm's
-                # established SID and admit a separate current-session watch.
+                _preserve_watch_native_result_unknown(
+                    existing_paths, existing_arm, wait_result,
+                    "target-identity-conflict")
                 continue
             if existing_sid in {None, "", "-"}:
                 _bound, updated_arm = _persist_watch_session_under_alias_lock(
                     existing_paths, server, evidence_sid)
+                if not _bound:
+                    _preserve_watch_native_result_unknown(
+                        existing_paths, existing_arm, wait_result,
+                        "target-identity-unverified")
+                    continue
                 existing_arm = updated_arm or _read_json(existing_paths.arm)
                 by_id[existing_id] = existing_arm
+            if not _record_watch_native_result(existing_paths, existing_arm, wait_result):
+                continue
+        elif evidence == "conflict":
+            _preserve_watch_native_result_unknown(
+                existing_paths, existing_arm, wait_result,
+                "target-identity-conflict")
+            continue
         elif (existing_sid in {None, "", "-"}
               and requested_sid not in {None, "", "-"} and evidence == "none"):
             _bound, updated_arm = _persist_watch_session_under_alias_lock(
@@ -3617,6 +3686,30 @@ def cmd_watch_run(args):
             _write_terminal_watch_receipt(args.watch_id, arm, terminal_reason)
             os._exit(0)
 
+        # Older admission code could persist a conflicting SID as a normal
+        # result. Reattachment must check every such record against the arm
+        # before allowing it into the settlement path.
+        if (isinstance(wait_record, dict) and wait_record.get("state") == "result"
+                and not terminal_reason):
+            identity, result_sid, identity_reason = _watch_native_result_identity(
+                arm, wait_record)
+            if identity == "unbound":
+                bound = _persist_watch_session(args, paths, server, result_sid)
+                arm = _read_json(paths.arm) or arm
+                expected_agent = dict(arm.get("agent") or expected_agent)
+                expected.update({key: expected_agent.get(key, "-")
+                                 for key in ("harness", "session_id", "pane")})
+                identity, _result_sid, identity_reason = _watch_native_result_identity(
+                    arm, wait_record)
+                if identity == "unbound" and not bound:
+                    identity_reason = "target-identity-unverified"
+                    identity = "unknown"
+            if identity not in {"match", "terminal"}:
+                _preserve_watch_native_result_unknown(
+                    paths, arm, wait_record,
+                    identity_reason or "target-identity-unverified")
+                os._exit(0)
+
         if isinstance(wait_record, dict):
             if wait_record.get("state") == "result":
                 state = wait_record.get("agent_state", "unknown")
@@ -3708,7 +3801,7 @@ def cmd_watch_run(args):
 
         def read_wait_result():
             global _LAST_HERDR_EXIT
-            nonlocal arm
+            nonlocal arm, expected_agent
             if wait_proc is not None:
                 try:
                     _LAST_HERDR_EXIT = wait_proc.wait(timeout=0)
@@ -3734,24 +3827,23 @@ def cmd_watch_run(args):
                 return None
             result_state, result_agent, _code, result_reason = _interpret_payload(payload, args.target)
             if result_state not in {"timeout", "agent-not-found", "herdr-unavailable"}:
-                observed_sid = result_agent.get("session_id")
-                exact_pane = (result_agent.get("harness") == expected.get("harness")
-                              and result_agent.get("pane") == expected.get("pane"))
-                if not exact_pane:
-                    return {"unverified": "target-identity-unverified",
-                            "agent": result_agent, "agent_state": result_state,
-                            "reason": result_reason}
-                if expected.get("session_id") in {None, "", "-"}:
-                    if (not isinstance(observed_sid, str) or observed_sid in {"", "-"}
-                            or not _persist_watch_session(args, paths, server, observed_sid)):
-                        return {"unverified": "target-identity-unverified",
-                                "agent": result_agent, "agent_state": result_state,
-                                "reason": result_reason}
-                    expected["session_id"] = observed_sid
-                    expected_agent.update(result_agent)
+                result = {"agent_state": result_state, "agent": result_agent,
+                          "reason": result_reason}
+                identity, observed_sid, identity_reason = _watch_native_result_identity(
+                    arm, result)
+                if identity == "unbound":
+                    bound = _persist_watch_session(args, paths, server, observed_sid)
                     arm = _read_json(paths.arm) or arm
-                elif observed_sid != expected.get("session_id"):
-                    return {"unverified": "target-identity-conflict",
+                    expected_agent = dict(arm.get("agent") or expected_agent)
+                    expected.update({key: expected_agent.get(key, "-")
+                                     for key in ("harness", "session_id", "pane")})
+                    identity, _observed_sid, identity_reason = _watch_native_result_identity(
+                        arm, result)
+                    if identity == "unbound" and not bound:
+                        identity_reason = "target-identity-unverified"
+                        identity = "unknown"
+                if identity != "match":
+                    return {"unverified": identity_reason or "target-identity-unverified",
                             "agent": result_agent, "agent_state": result_state,
                             "reason": result_reason}
             return {"agent_state": result_state, "agent": result_agent,
@@ -3759,21 +3851,8 @@ def cmd_watch_run(args):
 
         def preserve_unknown_wait(reason, wait_result=None):
             """Mark identity unresolved while retaining durable native evidence."""
-            current = _read_json(paths.observation) or observation
-            previous_wait = current.get("native_wait")
-            unknown_wait = dict(previous_wait) if isinstance(previous_wait, dict) else {}
-            if isinstance(wait_result, dict):
-                if isinstance(wait_result.get("agent"), dict):
-                    unknown_wait["agent"] = wait_result["agent"]
-                if wait_result.get("agent_state") is not None:
-                    unknown_wait["agent_state"] = wait_result["agent_state"]
-                if wait_result.get("reason") is not None:
-                    unknown_wait["result_reason"] = wait_result["reason"]
-            unknown_wait.update({"state": "unknown", "reason": reason})
-            current.update({"state": "unknown", "reason": reason,
-                            "native_wait": unknown_wait, "observed_ts": _utc_now()})
-            _write_json_atomic(paths.observation, current)
-            return unknown_wait, current
+            return _preserve_watch_native_result_unknown(
+                paths, arm, wait_result, reason)
 
         # Reattached observers may start after the single native waiter has
         # already exited. Its exact stdout log is the durable result; settle it
