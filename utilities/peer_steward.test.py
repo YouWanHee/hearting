@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for utilities/peer-steward.py (SD-122 (9) steward wait/start)."""
+import concurrent.futures
 import fcntl
 import hashlib
 import importlib.util
@@ -1130,6 +1131,11 @@ if log:
     with open(log, "a", encoding="utf-8") as fh:
         fh.write(" ".join(argv) + " window=" + os.environ.get("FAKE_HERDR_WINDOW_ID", "window-before-move") + "\n")
 
+# The real CLI accepts a selected endpoint before the command. Keep it in the
+# call log while parsing the same command shapes for endpoint-isolation tests.
+if argv[:1] == ["--session"]:
+    argv = argv[2:]
+
 mode = os.environ.get("FAKE_HERDR_MODE", "idle")
 mode_file = os.environ.get("FAKE_HERDR_MODE_FILE")
 if mode_file and os.path.exists(mode_file):
@@ -1327,6 +1333,20 @@ class _WatchMixin(_TmpRootMixin):
     def _arm_records(self):
         return sorted(path for path in self.watch_root.glob("*.json")
                       if re.fullmatch(r"[0-9a-f]{16}\.json", path.name))
+
+    def _wait_calls(self):
+        if not self.calllog.exists():
+            return []
+        return [line for line in self.calllog.read_text().splitlines()
+                if " agent wait " in f" {line} "]
+
+    def _wait_for_wait_calls(self, count, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if len(self._wait_calls()) >= count:
+                return self._wait_calls()
+            time.sleep(0.02)
+        self.fail(f"only {len(self._wait_calls())} native waits appeared; expected {count}")
 
     def _directive(self, stdout):
         """The `parent_next*` fields, read from the directive line only.
@@ -1568,9 +1588,12 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
     def test_pane_armed_watch_keeps_the_session_it_took(self):
         watch_id, arm_path, identity_path, env = self._unbound_watch("held")
         identity_path.write_text(json.dumps({"session_id": "sid-first"}))
-        again = self._run("watch", "peer-a", env=env)
+        again = self._run("watch", "w1:p9", env=env)
         self.assertEqual(self._fields(again.stdout.splitlines()[0]).get("watch_id"), watch_id)
         self.assertIn("state=already-armed", again.stdout)
+        self.assertEqual(json.loads(arm_path.read_text())["target"], "peer-a")
+        self.assertEqual(len(self._arm_records()), 1)
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1)
         self._release()
         receipt = self._wait_for_receipt(watch_id)
         self.assertEqual(receipt["agent"]["session_id"], "sid-first")
@@ -1646,6 +1669,250 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self.assertEqual(len(self._arm_records()), 1)
         self._release()
         self._wait_for_receipt(watch_id)
+
+    def test_name_pane_and_agent_id_aliases_share_one_watch_and_native_wait(self):
+        env = self._env("held")
+        first = self._run("watch", "peer-a", env=env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_fields = self._fields(first.stdout)
+        watch_id = first_fields["watch_id"]
+        self._wait_for_lock(watch_id)
+        original_arm = json.loads((self.watch_root / f"{watch_id}.json").read_text())
+
+        for alias in ("w1:p9", "sid-fake"):
+            with self.subTest(alias=alias):
+                duplicate = self._run("watch", alias, env=env)
+                self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+                fields = self._fields(duplicate.stdout.splitlines()[0])
+                self.assertEqual((fields["state"], fields["watch_id"]),
+                                 ("already-armed", watch_id), duplicate.stdout)
+                self.assertEqual(fields["target"], "peer-a")
+                self.assertEqual(len(self._arm_records()), 1)
+                self.assertEqual(json.loads((self.watch_root / f"{watch_id}.json").read_text())[
+                    "deadline"], original_arm["deadline"])
+
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1, self.calllog.read_text())
+        rows = [row for row in self._all_records() if row["kind"] == "watch"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["to"]["name"], "peer-a")
+        self.assertEqual(json.loads((self.watch_root / f"{watch_id}.json").read_text())["target"],
+                         "peer-a")
+        self._release()
+        self.assertEqual(self._wait_for_receipt(watch_id)["target"], "peer-a")
+
+    def test_concurrent_alias_registration_is_serialized_to_one_arm(self):
+        env = self._env("held")
+        start = threading.Barrier(2)
+
+        def register(target):
+            start.wait(timeout=10)
+            return self._run("watch", target, env=env)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(register, target) for target in ("peer-a", "w1:p9")]
+            results = [future.result(timeout=30) for future in futures]
+
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        heads = [self._fields(result.stdout.splitlines()[0]) for result in results]
+        ids = {head["watch_id"] for head in heads}
+        states = sorted(head["state"] for head in heads)
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(states, ["already-armed", "armed"])
+        watch_id = ids.pop()
+        self._wait_for_lock(watch_id)
+        self.assertEqual(len(self._arm_records()), 1)
+        self.assertEqual(len(self._wait_for_wait_calls(1)), 1, self.calllog.read_text())
+        self._release()
+        self._wait_for_receipt(watch_id)
+
+    def test_alias_reattachment_keeps_legacy_raw_claim_deadline_and_native_wait(self):
+        env = self._env("held")
+        initial = self._fields(self._run(
+            "watch", "peer-a", "--timeout", "60000", env=env).stdout)
+        watch_id = initial["watch_id"]
+        observation = self._wait_for_observation(watch_id)
+        deadline = time.monotonic() + 10
+        while (observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+            observation = json.loads((self.watch_root / f"{watch_id}.observation.json").read_text())
+        native_wait = observation["native_wait"]
+        self.assertEqual(native_wait["state"], "started")
+        self.assertTrue(peer_steward._pid_identity_ok(
+            native_wait["pid"], native_wait["pid_start"]))
+
+        arm_path = self.watch_root / f"{watch_id}.json"
+        arm = json.loads(arm_path.read_text())
+        original_deadline = arm["deadline"]
+        original_target_claim = self.watch_root / (
+            peer_steward._dedupe_key("steward-1", "peer-a", []) + ".arm")
+        self.assertEqual(original_target_claim.read_text().strip(), watch_id)
+        # A pre-fix arm has no logical claim key and is located through its raw claim.
+        arm.pop("claim_key", None)
+        arm_path.write_text(json.dumps(arm))
+
+        old_watcher = int(initial["pid"])
+        os.kill(old_watcher, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while (time.monotonic() < deadline
+               and peer_steward._pid_identity_ok(old_watcher, initial["pid_start"])):
+            time.sleep(0.02)
+
+        duplicate = self._run("watch", "sid-fake", "--timeout", "120000", env=env)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
+        fields = self._fields(duplicate.stdout.splitlines()[0])
+        self.assertEqual((fields["state"], fields["watch_id"]),
+                         ("already-armed", watch_id), duplicate.stdout)
+        reattached = json.loads(arm_path.read_text())
+        self.assertNotEqual(reattached["watcher"]["pid"], old_watcher)
+        self.assertEqual(reattached["target"], "peer-a")
+        self.assertEqual(reattached["timeout"], 60000)
+        self.assertEqual(reattached["deadline"], original_deadline)
+        self.assertNotIn("claim_key", reattached)
+        resumed = json.loads((self.watch_root / f"{watch_id}.observation.json").read_text())
+        self.assertEqual((resumed["native_wait"]["pid"], resumed["native_wait"]["pid_start"]),
+                         (native_wait["pid"], native_wait["pid_start"]))
+        self.assertEqual(len(self._wait_calls()), 1, self.calllog.read_text())
+
+        self._release()
+        receipt = self._wait_for_receipt(watch_id)
+        self.assertEqual(receipt["target"], "peer-a")
+
+    def test_alias_scope_keeps_steward_endpoint_and_until_obligations_distinct(self):
+        first_env = self._env("held", session_id="steward-1")
+        first = self._fields(self._run("watch", "peer-a", env=first_env).stdout)
+
+        other_steward_env = self._env("held", session_id="steward-2")
+        other_steward = self._fields(self._run(
+            "watch", "w1:p9", env=other_steward_env).stdout)
+
+        other_endpoint_env = self._env("held", session_id="steward-1")
+        other_endpoint_env["AGENT_HERDR_SESSION"] = "other-endpoint"
+        other_endpoint = self._fields(self._run(
+            "watch", "sid-fake", env=other_endpoint_env).stdout)
+
+        other_until = self._fields(self._run(
+            "watch", "w1:p9", "--until", "idle", env=first_env).stdout)
+        explicit_default = self._fields(self._run(
+            "watch", "sid-fake", "--until", "idle", "--until", "done", "--until", "blocked",
+            env=first_env).stdout)
+        reordered_default = self._fields(self._run(
+            "watch", "peer-a", "--until", "blocked", "--until", "idle", "--until", "done",
+            env=first_env).stdout)
+
+        ids = {first["watch_id"], other_steward["watch_id"],
+               other_endpoint["watch_id"], other_until["watch_id"],
+               explicit_default["watch_id"]}
+        self.assertEqual(len(ids), 5)
+        self.assertEqual([first["state"], other_steward["state"],
+                          other_endpoint["state"], other_until["state"],
+                          explicit_default["state"]],
+                         ["armed", "armed", "armed", "armed", "armed"])
+        self.assertEqual((reordered_default["state"], reordered_default["watch_id"]),
+                         ("already-armed", explicit_default["watch_id"]))
+        arms = [json.loads(path.read_text()) for path in self._arm_records()]
+        self.assertEqual(len(arms), 5)
+        by_id = {arm["watch_id"]: arm for arm in arms}
+        self.assertEqual(by_id[first["watch_id"]]["server"], "default")
+        self.assertEqual(by_id[other_steward["watch_id"]]["steward"]["session_id"], "steward-2")
+        self.assertEqual(by_id[other_endpoint["watch_id"]]["server"], "other-endpoint")
+        self.assertEqual(by_id[other_until["watch_id"]]["until"], ["idle"])
+        self.assertEqual(set(by_id[explicit_default["watch_id"]]["until"]),
+                         {"idle", "done", "blocked"})
+        self._wait_for_wait_calls(len(arms))
+        for _ in arms:
+            self._release()
+        for watch_id in ids:
+            self._wait_for_receipt(watch_id)
+
+    def test_different_steward_seats_stay_independent_and_successor_retirement_is_separate(self):
+        import contextlib
+        import io
+
+        seat_by_steward = {
+            "steward-1": "seat-A",
+            "steward-2": "seat-B",
+            "steward-3": "seat-A",
+        }
+        real_popen = subprocess.Popen
+        spawned = []
+
+        def tracked_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        def register(session_id, target):
+            output = io.StringIO()
+            env = self._env("held", session_id=session_id)
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(peer_steward.subprocess, "Popen", side_effect=tracked_popen), \
+                    mock.patch.object(
+                        peer_steward, "_steward_seat",
+                        side_effect=lambda _harness, sid: {
+                            "kind": "pane", "key": seat_by_steward[sid],
+                        }), \
+                    contextlib.redirect_stdout(output):
+                rc = peer_steward.main(["watch", target])
+            self.assertEqual(rc, 0, output.getvalue())
+            fields = self._fields(output.getvalue().splitlines()[0])
+            arm = json.loads((self.watch_root / f"{fields['watch_id']}.json").read_text())
+            watcher = next(process for process in spawned
+                           if process.pid == arm["watcher"]["pid"])
+            return fields, watcher
+
+        first, first_watcher = register("steward-1", "peer-a")
+        first_observation = self._wait_for_observation(first["watch_id"])
+        first_deadline = time.monotonic() + 10
+        while (first_observation.get("native_wait", {}).get("state") != "started"
+               and time.monotonic() < first_deadline):
+            time.sleep(0.02)
+            first_observation = json.loads((self.watch_root /
+                f"{first['watch_id']}.observation.json").read_text())
+        first_wait = first_observation["native_wait"]
+        self.assertTrue(peer_steward._pid_identity_ok(
+            first_wait["pid"], first_wait["pid_start"]))
+
+        second, second_watcher = register("steward-2", "w1:p9")
+        self.assertEqual((first["state"], second["state"]), ("armed", "armed"))
+        self.assertNotEqual(first["watch_id"], second["watch_id"])
+        self._wait_for_wait_calls(2)
+
+        # This old observer and its waiter are exact private fixture processes;
+        # freeing its lock lets the successor path settle it synchronously.
+        self.assertTrue(peer_steward._pid_identity_ok(
+            first_watcher.pid, first["pid_start"]))
+        os.kill(first_watcher.pid, signal.SIGKILL)
+        first_watcher.wait(timeout=10)
+        self.assertTrue(peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"]))
+        os.kill(first_wait["pid"], signal.SIGKILL)
+        wait_deadline = time.monotonic() + 10
+        while (time.monotonic() < wait_deadline
+               and peer_steward._pid_identity_ok(first_wait["pid"], first_wait["pid_start"])):
+            time.sleep(0.02)
+
+        successor, successor_watcher = register("steward-3", "sid-fake")
+        self.assertEqual(successor["state"], "armed")
+        self.assertNotEqual(successor["watch_id"], first["watch_id"])
+        self.assertNotEqual(successor["watch_id"], second["watch_id"])
+        retired = self._wait_for_receipt(first["watch_id"])
+        self.assertEqual((retired["state"], retired["reason"]),
+                         ("superseded", "steward-replaced"))
+        self.assertFalse((self.watch_root / f"{second['watch_id']}.receipt.json").exists())
+        self.assertFalse((self.watch_root / f"{successor['watch_id']}.receipt.json").exists())
+        self.assertEqual(len(self._arm_records()), 3)
+
+        self._wait_for_wait_calls(3)
+        self._release()
+        self._release()
+        self._wait_for_receipt(second["watch_id"])
+        self._wait_for_receipt(successor["watch_id"])
+        for process in (second_watcher, successor_watcher):
+            process.wait(timeout=10)
+        for process in spawned:
+            if process.poll() is None:
+                process.wait(timeout=10)
 
     def test_herdr_missing_is_exit_4_with_zero_watch_files(self):
         proc = self._run("watch", "peer-a", env=self._env(with_herdr=False))

@@ -2567,6 +2567,42 @@ def _dedupe_key(steward_sid, target, until, server=None):
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def _logical_watch_claim_key(steward_sid, agent, until, server=None):
+    """Key a watch by its resolved target while retaining the caller's raw claim.
+
+    Pane identity is stable before a new native session exists. Once Herdr knows
+    the session, include it so a reused pane cannot inherit the prior session's
+    watch. The separate pane lock serializes that transition.
+    """
+    session_id = agent.get("session_id")
+    bound = isinstance(session_id, str) and session_id not in {"", "-"}
+    identity = [agent.get("harness"), agent.get("pane"),
+                "session" if bound else "pane", session_id if bound else ""]
+    raw = json.dumps([
+        server or "default", steward_sid, identity, sorted(until or []),
+    ], ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
+    return "logical-" + hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _watch_alias_lock_key(steward_sid, agent, until, server=None):
+    """Serialize registrations that resolve to one pane, including SID binding."""
+    raw = json.dumps([
+        server or "default", steward_sid, agent.get("harness"), agent.get("pane"),
+        sorted(until or []),
+    ], ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
+    return "alias-" + hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _write_watch_claim(lock_fd, watch_id):
+    try:
+        os.ftruncate(lock_fd, 0)
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        os.write(lock_fd, watch_id.encode("ascii"))
+        os.fsync(lock_fd)
+    except OSError:
+        pass
+
+
 def _utc_now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -2841,10 +2877,33 @@ def _watch_identity_matches(expected, observed):
     return observed.get("session_id") == expected.get("session_id")
 
 
+def _watch_arm_matches(arm, server, steward_sid, until, agent):
+    if not isinstance(arm, dict) or (arm.get("server") or "default") != server:
+        return False
+    steward = arm.get("steward") or {}
+    if steward.get("session_id") != steward_sid:
+        return False
+    if tuple(sorted(arm.get("until") or [])) != tuple(sorted(until or [])):
+        return False
+    return _watch_identity_matches(dict(arm.get("agent") or {}), agent)
+
+
 def _persist_watch_session(args, paths, server, session_id):
     """Write the session a pane-armed watch took into its arm, under the arm
-    claim, so dedupe and a restarted observer hold that session from now on."""
-    claim = paths.arm.parent / f"{_dedupe_key(args.steward_session_id, args.target, list(args.until or []), server)}.arm"
+    claim, so dedupe and a restarted observer hold that session from now on.
+
+    New arms use their logical claim. Older arms have only the raw-target claim;
+    keep using that on-disk path until those obligations have settled.
+    """
+    current = _read_json(paths.arm)
+    claim_key = current.get("claim_key") if isinstance(current, dict) else None
+    if isinstance(claim_key, str) and re.fullmatch(r"logical-[0-9a-f]{16}", claim_key):
+        claim = paths.arm.parent / f"{claim_key}.arm"
+    else:
+        raw_target = current.get("target", args.target) if isinstance(current, dict) else args.target
+        claim = paths.arm.parent / (
+            f"{_dedupe_key(args.steward_session_id, raw_target, list(args.until or []), server)}.arm"
+        )
     try:
         claim_fd = _open_lock(claim)
     except OSError:
@@ -2881,19 +2940,23 @@ def cmd_watch(args):
     if wake == "auto":
         wake = "hook" if _caller_is_claude() else "none"
 
-    # Dedupe is its own serialization point, entered BEFORE the herdr pre-checks
-    # and held until the winning watch_id is published. A bare `O_EXCL` create
-    # serializes only the first arm: two callers arriving while a claimed watcher
-    # is dead would both decide to reclaim and both spawn -- the exact
-    # double-spawn the claim exists to prevent. One blocking lock over
-    # decide + spawn + publish removes that whole class, and it lives no longer
-    # than this foreground call.
-    #
-    # `until=[]` (herdr's default set) and `until=["idle","done","blocked"]` are
-    # the same *behaviour* but stay distinct keys on purpose: (10) dedupes on the
-    # "until 집합" as given, and silently normalizing them would suppress a
-    # legitimate second watch.
     server = _HERDR_SESSION or "default"
+    # Resolve before choosing a logical claim: names, pane IDs and agent IDs can
+    # all refer to the same native target. Keep the raw target for the arm,
+    # receipt, ledger and native wait; it remains the operator's accepted text.
+    if _herdr_missing():
+        return _unavailable("herdr-not-found")
+    state, agent, _code, reason = _interpret_payload(_run_herdr_get(target), target)
+    if state == "agent-not-found":
+        print(_typed_line("agent-not-found", "-", "-", target, "-"))
+        return 2
+    if reason is not None:
+        return _unavailable(reason)
+    # An unbound fresh pane is still a valid target. Its pane lock also serializes
+    # the later transition from pane identity to the first native session.
+    if any(agent.get(key) in {None, "", "-"} for key in ("harness", "pane")):
+        return _unavailable("watch-identity-unverified")
+
     seat_fd = None
     if steward_seat is not None:
         seat_claim = _seat_claim_path(root, server, steward_seat)
@@ -2904,10 +2967,45 @@ def cmd_watch(args):
         if not _acquire_bounded(seat_fd, _CLAIM_TIMEOUT_MS):
             os.close(seat_fd)
             return _unavailable("watch-seat-claim-contended")
+
+    # The pane-scoped lock covers aliases and the unbound-pane -> bound-session
+    # transition. The logical claim then names this resolved target; the raw
+    # target claim remains present for older arms and observers on disk.
+    alias_claim = root / f"{_watch_alias_lock_key(steward_sid, agent, until, server)}.lock"
+    try:
+        alias_fd = _open_lock(alias_claim)
+    except OSError as exc:
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable(f"watch-alias-claim-failed-{exc.errno}")
+    if not _acquire_bounded(alias_fd, _CLAIM_TIMEOUT_MS):
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable("watch-alias-claim-contended")
+
+    logical_key = _logical_watch_claim_key(steward_sid, agent, until, server)
+    logical_claim = root / f"{logical_key}.arm"
+    try:
+        logical_fd = _open_lock(logical_claim)
+    except OSError as exc:
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable(f"watch-claim-failed-{exc.errno}")
+    if not _acquire_bounded(logical_fd, _CLAIM_TIMEOUT_MS):
+        os.close(logical_fd)
+        os.close(alias_fd)
+        if seat_fd is not None:
+            os.close(seat_fd)
+        return _unavailable("watch-claim-contended")
+
     claim = root / f"{_dedupe_key(steward_sid, target, until, server)}.arm"
     try:
         claim_fd = _open_lock(claim)
     except OSError as exc:
+        os.close(logical_fd)
+        os.close(alias_fd)
         if seat_fd is not None:
             os.close(seat_fd)
         return _unavailable(f"watch-claim-failed-{exc.errno}")
@@ -2915,37 +3013,33 @@ def cmd_watch(args):
         if not _acquire_bounded(claim_fd, _CLAIM_TIMEOUT_MS):
             return _unavailable("watch-claim-contended")
 
-        existing_id = ""
-        try:
-            existing_id = claim.read_text(encoding="utf-8").strip()
-        except OSError:
-            pass
-        # herdr pre-checks. Nothing beyond the claim exists yet, so an early
-        # return leaves no watch state behind.
-        if _herdr_missing():
-            return _unavailable("herdr-not-found")
-        state, agent, _code, reason = _interpret_payload(_run_herdr_get(target), target)
-        if state == "agent-not-found":
-            print(_typed_line("agent-not-found", "-", "-", target, "-"))
-            return 2
-        if reason is not None:
-            return _unavailable(reason)
-        # The session may not exist yet (a fresh Codex before its first input):
-        # the watcher then follows the pane and takes the first session it reports.
-        if any(agent.get(key) in {None, "", "-"} for key in ("harness", "pane")):
-            return _unavailable("watch-identity-unverified")
-
-        if existing_id:
+        # Resolve either modern logical claims or legacy raw claims first, then
+        # inspect durable arms so aliases from older registrations also dedupe.
+        candidate_ids = []
+        for candidate_claim in (logical_claim, claim):
+            try:
+                candidate_id = candidate_claim.read_text(encoding="utf-8").strip()
+            except OSError:
+                candidate_id = ""
+            if candidate_id and candidate_id not in candidate_ids:
+                candidate_ids.append(candidate_id)
+        entries = _watch_entries(root)
+        by_id = {watch_id: arm for watch_id, arm in entries}
+        ordered_ids = candidate_ids + [watch_id for watch_id, _arm in entries
+                                       if watch_id not in candidate_ids]
+        for existing_id in ordered_ids:
+            existing_arm = by_id.get(existing_id)
             existing_paths = _watch_paths(existing_id, root)
-            existing_arm = _read_json(existing_paths.arm)
-            if (not existing_paths.receipt.exists() and isinstance(existing_arm, dict)
-                    and (existing_arm.get("server") or "default") == server
-                    and _watch_identity_matches(dict(existing_arm.get("agent") or {}), agent)):
-                if not _watcher_present(existing_arm):
-                    _spawn_watch_observer(existing_id, existing_arm)
-                    existing_arm = _read_json(existing_paths.arm) or existing_arm
-                print(_already_armed_line(existing_id, existing_arm, existing_paths))
-                return 0
+            if (existing_paths.receipt.exists()
+                    or not _watch_arm_matches(existing_arm, server, steward_sid, until, agent)):
+                continue
+            if not _watcher_present(existing_arm):
+                _spawn_watch_observer(existing_id, existing_arm)
+                existing_arm = _read_json(existing_paths.arm) or existing_arm
+            _write_watch_claim(logical_fd, existing_id)
+            _write_watch_claim(claim_fd, existing_id)
+            print(_already_armed_line(existing_id, existing_arm, existing_paths))
+            return 0
 
         # A new native session in the same proven seat replaces its previous
         # watch only after the new observer is durably armed. Until-set identity
@@ -2966,7 +3060,7 @@ def cmd_watch(args):
         if isinstance(steward_seat, dict):
             wanted_until = tuple(sorted(until))
             for old_id, old_arm in _watch_entries(root):
-                if (not isinstance(old_arm, dict) or old_id == existing_id
+                if (not isinstance(old_arm, dict)
                         or _watch_paths(old_id, root).receipt.exists()
                         or (old_arm.get("server") or "default") != server
                         or (old_arm.get("steward") or {}).get("session_id") == steward_sid
@@ -3028,6 +3122,7 @@ def cmd_watch(args):
             "schema_version": _WATCH_SCHEMA,
             "watch_id": watch_id,
             "target": target,
+            "claim_key": logical_key,
             "until": until,
             "timeout": args.timeout,
             "refs": list(args.ref or []),
@@ -3051,13 +3146,8 @@ def cmd_watch(args):
         }
         _write_json_atomic(paths.arm, arm)
         # Acceptance and the stable claim precede the observer side effect.
-        try:
-            os.ftruncate(claim_fd, 0)
-            os.lseek(claim_fd, 0, os.SEEK_SET)
-            os.write(claim_fd, watch_id.encode("ascii"))
-            os.fsync(claim_fd)
-        except OSError:
-            pass
+        _write_watch_claim(logical_fd, watch_id)
+        _write_watch_claim(claim_fd, watch_id)
 
         try:
             watcher_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
@@ -3089,6 +3179,7 @@ def cmd_watch(args):
             "schema_version": _WATCH_SCHEMA,
             "watch_id": watch_id,
             "target": target,
+            "claim_key": logical_key,
             "until": until,
             "timeout": args.timeout,
             "refs": list(args.ref or []),
@@ -3139,13 +3230,8 @@ def cmd_watch(args):
             _settle_terminal_watch_if_unobserved(old_id, old_arm, root)
 
         # Publish the winning watch_id into the claim while still holding it.
-        try:
-            os.ftruncate(claim_fd, 0)
-            os.lseek(claim_fd, 0, os.SEEK_SET)
-            os.write(claim_fd, watch_id.encode("ascii"))
-            os.fsync(claim_fd)
-        except OSError:
-            pass
+        _write_watch_claim(logical_fd, watch_id)
+        _write_watch_claim(claim_fd, watch_id)
 
         # `receipt=<watch_id>` is what distinguishes this `kind=watch` row from
         # (9) `wait`'s, which carries no receipt. Written while the claim is
@@ -3161,6 +3247,8 @@ def cmd_watch(args):
                        from_identity=(steward_sid, steward_harness))
     finally:
         os.close(claim_fd)
+        os.close(logical_fd)
+        os.close(alias_fd)
         if seat_fd is not None:
             os.close(seat_fd)
 
